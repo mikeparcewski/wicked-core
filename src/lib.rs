@@ -10,8 +10,12 @@
 
 mod actor;
 mod command;
+mod distribute;
 mod domain;
 mod event;
+mod execute;
+mod pipeline;
+mod plan;
 mod scope;
 
 pub use domain::{
@@ -19,7 +23,19 @@ pub use domain::{
     WorkUnit,
 };
 pub use event::CoreEvent;
+pub use pipeline::SessionResult;
 pub use scope::{resolve_scope, EntityMode};
+pub use wicked_council::AgenticCli;
+
+/// What to run: the problem to decompose, the council roster (`AgenticCli` seats), the scope toggle,
+/// and a stable session id. The roster is passed explicitly so callers (tests, UI) control it; the
+/// UI resolves it from the council registry.
+pub struct LaunchSpec {
+    pub problem: String,
+    pub clis: Vec<AgenticCli>,
+    pub entity_mode: EntityMode,
+    pub session_id: String,
+}
 
 use command::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -55,6 +71,21 @@ impl Core {
         if self.tx.send(Command::Ping(reply)).is_ok() {
             let _ = rx.recv();
         }
+    }
+
+    /// Launch a full governed session. Fire-and-forget: returns the session id immediately while the
+    /// run proceeds on the actor thread, streaming progress (and any failure) as [`CoreEvent`]s.
+    /// `subscribe()` BEFORE calling this to catch the whole sequence.
+    pub fn launch(&self, mut spec: LaunchSpec) -> String {
+        if spec.session_id.trim().is_empty() {
+            spec.session_id = format!(
+                "sess-{}",
+                pipeline::deterministic_id(&[&spec.problem, &spec.clis.len().to_string()])
+            );
+        }
+        let session_id = spec.session_id.clone();
+        let _ = self.tx.send(Command::Launch(spec));
+        session_id
     }
 
     /// The agent session ids currently on the store (P1 read path; richer `ProjectView`s in P2).
@@ -96,5 +127,93 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("a Heartbeat event should arrive");
         assert_eq!(ev, CoreEvent::Heartbeat);
+    }
+
+    // The whole point of COE: a launch composes plan → distribute (council) → execute (governance +
+    // orchestration) and STREAMS the progress as live events, all through the single-writer actor.
+    #[cfg(unix)]
+    #[test]
+    fn launch_runs_the_full_pipeline_and_streams_events() {
+        use std::os::unix::fs::PermissionsExt;
+        use wicked_council::types::{Category, Confidence, InputMode};
+
+        let dir = std::env::temp_dir().join("wicked-core-launch-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str, key: &str| -> std::path::PathBuf {
+            let p = dir.join(name);
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\necho \"RECOMMENDATION: {key}\"\necho \"TOP_RISK: none\"\necho \"CHANGE_MY_MIND: no\"\necho \"DISQUALIFIER: None\"\nexit 0\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let cli = |key: &str, path: &std::path::Path| AgenticCli {
+            key: key.to_string(),
+            display_name: key.to_string(),
+            binary: path.display().to_string(),
+            headless_invocation: format!("{} {{PROMPT}}", path.display()),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+        };
+        let clis = vec![
+            cli("fake-a", &mk("fake-a.sh", "fake-a")),
+            cli("fake-b", &mk("fake-b.sh", "fake-b")),
+        ];
+
+        let db = dir.join("launch.db");
+        let _ = std::fs::remove_file(&db);
+        let core = Core::spawn(db.display().to_string());
+        let events = core.subscribe();
+
+        let sid = core.launch(LaunchSpec {
+            problem: "Do step one. Do step two".to_string(),
+            clis,
+            entity_mode: EntityMode::Shared,
+            session_id: "test-launch".to_string(),
+        });
+        assert_eq!(sid, "test-launch");
+
+        // Collect the live stream until the session completes.
+        let mut got: Vec<CoreEvent> = Vec::new();
+        loop {
+            match events.recv_timeout(Duration::from_secs(20)) {
+                Ok(ev) => {
+                    let done = matches!(ev, CoreEvent::SessionCompleted { .. });
+                    got.push(ev);
+                    if done {
+                        break;
+                    }
+                }
+                Err(_) => panic!("timed out before SessionCompleted; got {got:?}"),
+            }
+        }
+
+        let n = |pred: fn(&CoreEvent) -> bool| got.iter().filter(|e| pred(e)).count();
+        assert_eq!(n(|e| matches!(e, CoreEvent::SessionStarted { .. })), 1);
+        assert_eq!(
+            n(|e| matches!(e, CoreEvent::UnitPlanned { .. })),
+            2,
+            "two units planned"
+        );
+        assert_eq!(n(|e| matches!(e, CoreEvent::UnitDistributed { .. })), 2);
+        assert_eq!(n(|e| matches!(e, CoreEvent::GateDecided { .. })), 2);
+        assert_eq!(
+            n(|e| matches!(e, CoreEvent::UnitDone { .. })),
+            2,
+            "no deny policy registered ⇒ both units approve"
+        );
+
+        // The store reflects the completed session + its two Done units.
+        let store = wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap();
+        let units = session_units(&store, "test-launch").unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.status == UnitStatus::Done));
     }
 }

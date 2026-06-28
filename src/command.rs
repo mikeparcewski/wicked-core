@@ -14,4 +14,7 @@ pub(crate) enum Command {
     Sessions(Sender<anyhow::Result<Vec<String>>>),
     /// Register a live event subscriber.
     Subscribe(Sender<CoreEvent>),
+    /// Run a full governed session (fire-and-forget — progress + outcome arrive as `CoreEvent`s,
+    /// including `CoreEvent::Error` on failure). Runs on the actor thread (the single writer).
+    Launch(crate::LaunchSpec),
 }

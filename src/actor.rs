@@ -4,6 +4,7 @@
 
 use crate::command::Command;
 use crate::event::CoreEvent;
+use crate::{pipeline, LaunchSpec};
 use std::sync::mpsc::{Receiver, Sender};
 
 use wicked_apps_core::{open_store, GraphRead, NodeKind, AGENT_SESSION};
@@ -35,6 +36,32 @@ pub(crate) fn run(path: String, rx: Receiver<Command>) {
                 let _ = reply.send(list_sessions(&store));
             }
             Command::Subscribe(sub) => subscribers.push(sub),
+            Command::Launch(spec) => {
+                let LaunchSpec {
+                    problem,
+                    clis,
+                    entity_mode,
+                    session_id,
+                } = spec;
+                // Runs on this (single-writer) thread, emitting CoreEvents to subscribers as it goes.
+                let res = pipeline::run_session(
+                    &mut store,
+                    clis,
+                    &problem,
+                    entity_mode,
+                    &session_id,
+                    &mut |ev| emit(&mut subscribers, ev),
+                );
+                if let Err(e) = res {
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::Error {
+                            session: Some(session_id),
+                            message: e.to_string(),
+                        },
+                    );
+                }
+            }
         }
     }
 }
