@@ -5,8 +5,11 @@
 //! system-of-record (SQLite, single writer) from the orchestration seam (a command API + events),
 //! so consumers (agent, UI, MCP) stop re-opening and racing on the shared file. See `DESIGN.md`.
 //!
-//! P1 (this file): the actor + command/reply + event fan-out + a read path. The plan → distribute
-//! → execute → evidence pipeline and the lifecycle commands land in P2 (see `DESIGN.md`).
+//! Built: the actor + command/reply + event fan-out, the full plan → distribute → execute →
+//! evidence pipeline ([`Core::launch`], stub execute path), and the read API
+//! ([`Core::sessions_detail`], [`Core::work_output`]). Remaining (see `DESIGN.md`): the wrapped-CLI
+//! execute backend (real subprocess + gate-hook), migrating the GUI onto `Core`, and deleting the
+//! `wicked-agent` crate.
 
 mod actor;
 mod command;

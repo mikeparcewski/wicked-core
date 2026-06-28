@@ -82,11 +82,14 @@ orchestration logic moves here, and what's left of "agent" is a thin subprocess 
 
 - **P1 (done):** StoreActor + command/reply + event fan-out + a read path (`sessions`), proven by a
   test. Builds 0 warnings, 1 test green. ← skeleton.
-- **P2:** port `plan → distribute → execute → evidence` into COE, depending on the engine crates
-  **directly** (`wicked-governance`/`-orchestration`/`-council`/`-estate`) — NOT on wicked-agent.
-  Re-implement session/unit/phase node read+write here (the small `to_node`/`from_node` logic).
-  Emit real `CoreEvent`s at plan/distribute/gate/execute/done. Branch the write path on
-  `shared_writers` (actor for SQLite). Test: `launch()` produces the event sequence.
+- **P2 (DONE):** ported `plan → distribute (council) → execute (governance + orchestration) →
+  evidence` into COE, depending on the engine crates **directly** (no wicked-agent dep). Domain +
+  scope + node read/write live here; `Core::launch` streams real `CoreEvent`s; `Core::sessions_detail`
+  + `Core::work_output` are the read API; the `wicked-core` CLI is the first real consumer. 14 tests
+  green (incl. a fake-CLI launch asserting the event sequence). Stub execute path.
+- **P2b:** the wrapped-CLI execute backend — real subprocess + the per-tool-call `gate-hook`
+  (ADR-0003); the `gate-hook` becomes a subcommand of the `wicked-core` bin. Until then `launch` uses
+  the deterministic stub execute (the composition is identical; only the unit's WORK differs).
 - **P3:** migrate `wicked-agent-ui` onto `Core` — drop direct store polling + binary shelling; the
   terminal "agent" tab renders the live event stream.
 - **P4:** delete the `wicked-agent` crate. What survives is a **thin bin over COE** providing (a) the
