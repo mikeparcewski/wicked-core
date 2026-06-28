@@ -10,9 +10,16 @@
 
 mod actor;
 mod command;
+mod domain;
 mod event;
+mod scope;
 
+pub use domain::{
+    get_session, put_node, session_units, AgentSession, HumanConfirm, SessionStatus, UnitStatus,
+    WorkUnit,
+};
 pub use event::CoreEvent;
+pub use scope::{resolve_scope, EntityMode};
 
 use command::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
