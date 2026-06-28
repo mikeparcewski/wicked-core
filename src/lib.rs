@@ -37,6 +37,19 @@ pub struct LaunchSpec {
     pub session_id: String,
 }
 
+/// Resolve the council roster from the registry (built-ins merged with the user's
+/// `~/.config/wicked-council/clis.toml`), keeping only council-enabled seats. This is what a
+/// consumer passes as [`LaunchSpec::clis`] for a real run.
+pub fn registry_roster() -> Vec<AgenticCli> {
+    let user = std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config/wicked-council/clis.toml"));
+    wicked_council::registry::load(user.as_deref())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.enabled_for_council)
+        .collect()
+}
+
 use command::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
 

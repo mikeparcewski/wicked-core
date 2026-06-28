@@ -5,6 +5,15 @@ edition = "2021"
 license = "MIT"
 description = "In-process composition runtime for the wicked-estate core services: a single-writer store actor + command API + live event stream that the agent, UI, and MCP servers compose through, instead of each re-opening and racing on the shared SQLite file."
 
+[lib]
+name = "wicked_core"
+path = "src/lib.rs"
+
+# Thin operator CLI over the COE library — the agent binary's replacement entry point.
+[[bin]]
+name = "wicked-core"
+path = "src/bin/wicked-core.rs"
+
 [dependencies]
 # The shared kernel + store seam (same pinned versions the rest of the universe uses).
 wicked-apps-core = "0.2.0"
