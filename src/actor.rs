@@ -35,6 +35,12 @@ pub(crate) fn run(path: String, rx: Receiver<Command>) {
             Command::Sessions(reply) => {
                 let _ = reply.send(list_sessions(&store));
             }
+            Command::Projects(reply) => {
+                let _ = reply.send(list_projects(&store));
+            }
+            Command::WorkOutput(unit_id, reply) => {
+                let _ = reply.send(crate::domain::get_work_output(&store, &unit_id));
+            }
             Command::Subscribe(sub) => subscribers.push(sub),
             Command::Launch(spec) => {
                 let LaunchSpec {
@@ -82,4 +88,14 @@ fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
         .into_iter()
         .map(|n| n.name)
         .collect())
+}
+
+/// Read every session + its ordered units (the UI's project list).
+fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionView>> {
+    let mut views = Vec::new();
+    for session in crate::domain::all_sessions(store)? {
+        let units = crate::domain::session_units(store, &session.id)?;
+        views.push(crate::SessionView { session, units });
+    }
+    Ok(views)
 }

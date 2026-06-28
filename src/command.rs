@@ -12,6 +12,10 @@ pub(crate) enum Command {
     Ping(Sender<()>),
     /// Enumerate the agent session ids currently on the store (the read the UI needs first).
     Sessions(Sender<anyhow::Result<Vec<String>>>),
+    /// Every session + its ordered units — what the UI builds its project list from.
+    Projects(Sender<anyhow::Result<Vec<crate::SessionView>>>),
+    /// A unit's captured work output (transcript), if any.
+    WorkOutput(String, Sender<Option<String>>),
     /// Register a live event subscriber.
     Subscribe(Sender<CoreEvent>),
     /// Run a full governed session (fire-and-forget — progress + outcome arrive as `CoreEvent`s,

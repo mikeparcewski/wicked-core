@@ -230,6 +230,37 @@ pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<
     Ok(units)
 }
 
+/// Every session on the store (unordered).
+pub fn all_sessions(store: &dyn GraphRead) -> anyhow::Result<Vec<AgentSession>> {
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(AGENT_SESSION.to_string())],
+        ..Default::default()
+    };
+    Ok(store
+        .find_symbols(&query)?
+        .iter()
+        .filter_map(|n| AgentSession::from_node(n).ok())
+        .collect())
+}
+
+/// A unit's captured work output (the transcript the UI shows), if the unit ran + was approved.
+pub fn get_work_output(store: &dyn GraphRead, unit_id: &str) -> Option<String> {
+    let node = store
+        .get_node(&synthetic_symbol(crate::execute::WORK_OUTPUT, unit_id))
+        .ok()??;
+    node.metadata
+        .get("output")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// A session plus its ordered units — the read the UI builds its project list from.
+#[derive(Debug, Clone)]
+pub struct SessionView {
+    pub session: AgentSession,
+    pub units: Vec<WorkUnit>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,8 +19,8 @@ mod plan;
 mod scope;
 
 pub use domain::{
-    get_session, put_node, session_units, AgentSession, HumanConfirm, SessionStatus, UnitStatus,
-    WorkUnit,
+    all_sessions, get_session, get_work_output, put_node, session_units, AgentSession,
+    HumanConfirm, SessionStatus, SessionView, UnitStatus, WorkUnit,
 };
 pub use event::CoreEvent;
 pub use pipeline::SessionResult;
@@ -88,7 +88,8 @@ impl Core {
         session_id
     }
 
-    /// The agent session ids currently on the store (P1 read path; richer `ProjectView`s in P2).
+    /// The agent session ids currently on the store (lightweight; use [`sessions_detail`] for the
+    /// full project list).
     pub fn sessions(&self) -> anyhow::Result<Vec<String>> {
         let (reply, rx) = channel();
         self.tx
@@ -96,6 +97,25 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Every session + its ordered units — the read the UI builds its project list from.
+    pub fn sessions_detail(&self) -> anyhow::Result<Vec<SessionView>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::Projects(reply))
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// A unit's captured work output (the transcript), if any.
+    pub fn work_output(&self, unit_id: &str) -> Option<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::WorkOutput(unit_id.to_string(), reply))
+            .ok()?;
+        rx.recv().ok().flatten()
     }
 }
 
@@ -210,10 +230,15 @@ mod tests {
             "no deny policy registered ⇒ both units approve"
         );
 
-        // The store reflects the completed session + its two Done units.
-        let store = wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap();
-        let units = session_units(&store, "test-launch").unwrap();
-        assert_eq!(units.len(), 2);
-        assert!(units.iter().all(|u| u.status == UnitStatus::Done));
+        // Read back through COE's read API (exactly what the UI will use — no file polling).
+        let detail = core.sessions_detail().expect("sessions_detail");
+        assert_eq!(detail.len(), 1);
+        assert_eq!(detail[0].session.id, "test-launch");
+        assert_eq!(detail[0].units.len(), 2);
+        assert!(detail[0].units.iter().all(|u| u.status == UnitStatus::Done));
+        let out = core
+            .work_output("test-launch:u1")
+            .expect("unit 1 has captured output");
+        assert!(out.contains("stub-output"), "transcript was: {out}");
     }
 }
