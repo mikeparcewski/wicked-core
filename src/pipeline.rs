@@ -6,7 +6,10 @@
 //! Runs on the actor thread (the single writer). Stub execute path (deterministic, no subprocess);
 //! the wrapped-CLI path is a later phase.
 
+use std::sync::Arc;
+
 use wicked_apps_core::ToNode;
+use wicked_council::types::Dispatcher;
 use wicked_council::AgenticCli;
 
 use crate::domain::{put_node, AgentSession, SessionStatus, UnitStatus};
@@ -36,6 +39,7 @@ pub fn run_session(
     problem: &str,
     entity_mode: EntityMode,
     session_id: &str,
+    dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<SessionResult> {
     let workflow_id = format!("wf-{session_id}");
@@ -87,7 +91,8 @@ pub fn run_session(
     wicked_orchestration::register_workflow(store, &workflow_id, problem, &phase_specs)?;
 
     // ── 2. DISTRIBUTE — the council (in-process, in-memory ledger) picks the CLI per unit. ──
-    let distributions = distribute::distribute_units_on(&units, &clis, session_id, None)?;
+    let distributions =
+        distribute::distribute_units_on(&units, &clis, session_id, None, &dispatcher)?;
     for (u, dist) in units.iter_mut().zip(distributions.iter()) {
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.council_task_ref = dist.council_task_ref.clone();

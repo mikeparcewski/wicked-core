@@ -56,6 +56,7 @@ pub(crate) fn run(path: String, rx: Receiver<Command>) {
                     &problem,
                     entity_mode,
                     &session_id,
+                    crate::distribute::real_dispatcher(),
                     &mut |ev| emit(&mut subscribers, ev),
                 );
                 if let Err(e) = res {

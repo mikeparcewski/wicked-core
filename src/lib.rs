@@ -165,31 +165,35 @@ mod tests {
         assert_eq!(ev, CoreEvent::Heartbeat);
     }
 
-    // The whole point of COE: a launch composes plan → distribute (council) → execute (governance +
-    // orchestration) and STREAMS the progress as live events, all through the single-writer actor.
-    #[cfg(unix)]
+    // The whole point of COE: the pipeline composes plan → distribute (council synthesis) → execute
+    // (governance + orchestration) → evidence, and STREAMS the progress as live events. Uses a STUB
+    // dispatcher so the council runs its real synthesis over deterministic votes — NO subprocess, so
+    // the test is reliable (the real-subprocess dispatch is wicked-council's own concern).
     #[test]
-    fn launch_runs_the_full_pipeline_and_streams_events() {
-        use std::os::unix::fs::PermissionsExt;
-        use wicked_council::types::{Category, Confidence, InputMode};
+    fn pipeline_composes_and_streams_events_deterministically() {
+        use std::sync::Arc;
+        use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+        use wicked_council::CouncilTask;
 
-        let dir = std::env::temp_dir().join("wicked-core-launch-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mk = |name: &str, key: &str| -> std::path::PathBuf {
-            let p = dir.join(name);
-            std::fs::write(
-                &p,
-                format!("#!/bin/sh\necho \"RECOMMENDATION: {key}\"\necho \"TOP_RISK: none\"\necho \"CHANGE_MY_MIND: no\"\necho \"DISQUALIFIER: None\"\nexit 0\n"),
-            )
-            .unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-            p
-        };
-        let cli = |key: &str, path: &std::path::Path| AgenticCli {
-            key: key.to_string(),
-            display_name: key.to_string(),
-            binary: path.display().to_string(),
-            headless_invocation: format!("{} {{PROMPT}}", path.display()),
+        struct Stub;
+        impl Dispatcher for Stub {
+            fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+                Some(Vote {
+                    cli: cli.key.clone(),
+                    recommendation: "fake-a".into(),
+                    top_risk: "none".into(),
+                    change_my_mind: "no".into(),
+                    disqualifier: None,
+                    confidence: Confidence::default(),
+                    provenance: "stub".into(),
+                })
+            }
+        }
+        let cli = |key: &str| AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: "unused {PROMPT}".into(),
             category: Category::default(),
             input_mode: InputMode::default(),
             version_probe: vec![],
@@ -198,63 +202,51 @@ mod tests {
             confidence: Confidence::default(),
             enabled_for_council: true,
         };
-        let clis = vec![
-            cli("fake-a", &mk("fake-a.sh", "fake-a")),
-            cli("fake-b", &mk("fake-b.sh", "fake-b")),
-        ];
 
-        let db = dir.join("launch.db");
+        let dir = std::env::temp_dir().join("wicked-core-pipeline-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("pipeline.db");
         let _ = std::fs::remove_file(&db);
-        let core = Core::spawn(db.display().to_string());
-        let events = core.subscribe();
+        let mut store = wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap();
 
-        let sid = core.launch(LaunchSpec {
-            problem: "Do step one. Do step two".to_string(),
-            clis,
-            entity_mode: EntityMode::Shared,
-            session_id: "test-launch".to_string(),
-        });
-        assert_eq!(sid, "test-launch");
+        let mut events: Vec<CoreEvent> = Vec::new();
+        let result = crate::pipeline::run_session(
+            &mut store,
+            vec![cli("fake-a"), cli("fake-b")],
+            "Do step one. Do step two",
+            EntityMode::Shared,
+            "test-pipeline",
+            Arc::new(Stub),
+            &mut |ev| events.push(ev),
+        )
+        .expect("run_session");
 
-        // Collect the live stream until the session completes.
-        let mut got: Vec<CoreEvent> = Vec::new();
-        loop {
-            match events.recv_timeout(Duration::from_secs(20)) {
-                Ok(ev) => {
-                    let done = matches!(ev, CoreEvent::SessionCompleted { .. });
-                    got.push(ev);
-                    if done {
-                        break;
-                    }
-                }
-                Err(_) => panic!("timed out before SessionCompleted; got {got:?}"),
-            }
-        }
+        // Composition result.
+        assert_eq!(result.units.len(), 2);
+        assert_eq!(result.approved, 2, "no deny policy ⇒ both approve");
+        assert_eq!(result.rejected, 0);
 
-        let n = |pred: fn(&CoreEvent) -> bool| got.iter().filter(|e| pred(e)).count();
+        // Live event sequence — emitted in order, bookended by Started/Completed.
+        let n = |pred: fn(&CoreEvent) -> bool| events.iter().filter(|e| pred(e)).count();
         assert_eq!(n(|e| matches!(e, CoreEvent::SessionStarted { .. })), 1);
-        assert_eq!(
-            n(|e| matches!(e, CoreEvent::UnitPlanned { .. })),
-            2,
-            "two units planned"
-        );
+        assert_eq!(n(|e| matches!(e, CoreEvent::UnitPlanned { .. })), 2);
         assert_eq!(n(|e| matches!(e, CoreEvent::UnitDistributed { .. })), 2);
         assert_eq!(n(|e| matches!(e, CoreEvent::GateDecided { .. })), 2);
-        assert_eq!(
-            n(|e| matches!(e, CoreEvent::UnitDone { .. })),
-            2,
-            "no deny policy registered ⇒ both units approve"
-        );
+        assert_eq!(n(|e| matches!(e, CoreEvent::UnitDone { .. })), 2);
+        assert!(matches!(
+            events.first(),
+            Some(CoreEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(CoreEvent::SessionCompleted { .. })
+        ));
 
-        // Read back through COE's read API (exactly what the UI will use — no file polling).
-        let detail = core.sessions_detail().expect("sessions_detail");
-        assert_eq!(detail.len(), 1);
-        assert_eq!(detail[0].session.id, "test-launch");
-        assert_eq!(detail[0].units.len(), 2);
-        assert!(detail[0].units.iter().all(|u| u.status == UnitStatus::Done));
-        let out = core
-            .work_output("test-launch:u1")
-            .expect("unit 1 has captured output");
-        assert!(out.contains("stub-output"), "transcript was: {out}");
+        // Persisted + readable through the same domain the read API serves.
+        let units = session_units(&store, "test-pipeline").unwrap();
+        assert_eq!(units.len(), 2);
+        assert!(units.iter().all(|u| u.status == UnitStatus::Done));
+        let out = get_work_output(&store, "test-pipeline:u1").expect("unit 1 output");
+        assert!(out.contains("stub-output"), "transcript: {out}");
     }
 }

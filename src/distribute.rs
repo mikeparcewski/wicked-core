@@ -7,12 +7,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use wicked_council::dispatch::RealDispatcher;
+use wicked_council::types::Dispatcher;
 use wicked_council::{
     ids, work_kind_for, AgenticCli, CouncilTask, EstateHandle, EstateRankStore, Ledger,
     NoopEventSink, PollStatus, RankStore, TaskState, Worker,
 };
 
 use crate::domain::WorkUnit;
+
+/// The production dispatcher — spawns real CLI subprocesses to collect council votes. Injected so
+/// tests can substitute a deterministic stub (no subprocess, no flaky dispatch).
+pub fn real_dispatcher() -> Arc<dyn Dispatcher + Send + Sync> {
+    Arc::new(RealDispatcher {
+        timeout: Duration::from_secs(30),
+        local_runner_timeout: Duration::from_secs(30),
+    })
+}
 
 /// The distribution decision for one unit (positionally aligned with the input units).
 #[derive(Debug, Clone)]
@@ -33,11 +43,12 @@ pub fn distribute_units_on(
     clis: &[AgenticCli],
     session_id: &str,
     db_path: Option<&str>,
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
 ) -> anyhow::Result<Vec<Distribution>> {
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     units
         .iter()
-        .map(|unit| distribute_one(unit, clis, &roster_keys, session_id, db_path))
+        .map(|unit| distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher))
         .collect()
 }
 
@@ -47,6 +58,7 @@ fn distribute_one(
     roster_keys: &[String],
     session_id: &str,
     db_path: Option<&str>,
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
 ) -> anyhow::Result<Distribution> {
     let estate = match db_path {
         Some(path) => EstateHandle::new(
@@ -74,13 +86,9 @@ fn distribute_one(
             });
         }
     }
-    let dispatcher = Arc::new(RealDispatcher {
-        timeout: Duration::from_secs(30),
-        local_runner_timeout: Duration::from_secs(30),
-    });
     let worker = Worker::new(
         ledger,
-        dispatcher,
+        dispatcher.clone(),
         rank_store,
         Arc::new(NoopEventSink),
         clis.to_vec(),
