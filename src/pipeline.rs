@@ -30,9 +30,11 @@ pub struct SessionResult {
     pub rejected: usize,
 }
 
-/// Run a full governed session, emitting [`CoreEvent`]s as it progresses. Everything persists on the
-/// ONE `store`: the session node, each work-unit node, phase nodes, conformance claims, and each
-/// approved unit's work-output node.
+/// Run a full governed session SYNCHRONOUSLY, emitting [`CoreEvent`]s as it progresses. Everything
+/// persists on the ONE `store`: the session node, each work-unit node, phase nodes, conformance
+/// claims, and each approved unit's work-output node. This is the straight-through driver (used by
+/// the operator CLI + tests); the actor's interactive engine reuses the same [`plan_and_distribute`]
+/// + [`apply_and_finish_unit`] steps off-thread.
 pub fn run_session(
     store: &mut wicked_apps_core::SqliteStore,
     clis: Vec<AgenticCli>,
@@ -42,23 +44,125 @@ pub fn run_session(
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<SessionResult> {
+    let Planned {
+        mut session,
+        mut units,
+        workflow_id,
+        cli_keys,
+    } = plan_and_distribute(
+        store,
+        &clis,
+        problem,
+        entity_mode,
+        session_id,
+        crate::domain::HumanConfirm::None, // sync path runs straight through (no interactive gates)
+        None,                              // sync path has no registered repo
+        None,
+        &dispatcher,
+        emit,
+    )?;
+
+    // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
+    let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
+    for u in &mut units {
+        emit(CoreEvent::UnitExecuting {
+            session: session_id.to_string(),
+            ord: u.ord,
+        });
+        let output = format!("stub-output for {}", u.description);
+        let outcome = apply_and_finish_unit(
+            store,
+            u,
+            &output,
+            &workflow_id,
+            entity_mode,
+            session_id,
+            &cli_keys,
+            emit,
+        )?;
+        outcomes.push(outcome);
+    }
+
+    // ── complete. ──
+    session.status = SessionStatus::Completed;
+    session.unit_ix = units.len();
+    put_node(store, session.to_node())?;
+    emit(CoreEvent::SessionCompleted {
+        session: session_id.to_string(),
+    });
+
+    let approved = outcomes.iter().filter(|o| o.approved).count();
+    let rejected = outcomes.len() - approved;
+    Ok(SessionResult {
+        session_id: session_id.to_string(),
+        workflow_id,
+        entity_mode,
+        collection_scope: session.collection_scope.clone(),
+        units: outcomes,
+        approved,
+        rejected,
+    })
+}
+
+/// The result of [`plan_and_distribute`] — a session persisted at `Executing`, its ordered units
+/// `Distributed` (each with an assigned CLI), and the registered workflow id + roster.
+pub(crate) struct Planned {
+    pub session: AgentSession,
+    pub units: Vec<crate::domain::WorkUnit>,
+    pub workflow_id: String,
+    pub cli_keys: Vec<String>,
+}
+
+/// PLAN + DISTRIBUTE (shared by both drivers): persist the session, decompose the problem into
+/// units, register the workflow's ordered phase list, and let the council assign a CLI per unit.
+/// Emits `SessionStarted` / `UnitPlanned×n` / `UnitDistributed×n` and leaves the session at
+/// `Executing`. Store-writing, so it runs on the actor (single-writer) thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_and_distribute(
+    store: &mut wicked_apps_core::SqliteStore,
+    clis: &[AgenticCli],
+    problem: &str,
+    entity_mode: EntityMode,
+    session_id: &str,
+    human_confirm: crate::domain::HumanConfirm,
+    repo_ref: Option<String>,
+    workdir: Option<String>,
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    emit: &mut dyn FnMut(CoreEvent),
+) -> anyhow::Result<Planned> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+
+    // FAIL CLOSED before persisting anything: governance deny policies are registered per unit phase
+    // up to `DENY_PHASE_SPAN`. A run with more units than that would execute its tail UNGOVERNED, so
+    // we reject it here rather than let governance silently fail open (the run-level deny contract).
+    let mut units = plan::plan_units(problem, session_id);
+    if units.len() as u32 > crate::actor::DENY_PHASE_SPAN {
+        anyhow::bail!(
+            "run has {} units, exceeding the {}-unit governed limit; split the problem into smaller runs",
+            units.len(),
+            crate::actor::DENY_PHASE_SPAN
+        );
+    }
+
     let collection_scope = match entity_mode {
         EntityMode::Shared => Some(resolve_scope(entity_mode, session_id, "shared")),
         EntityMode::Isolated => None,
     };
 
-    // ── 1. PLAN — persist the session + units. ──
     let mut session = AgentSession {
         id: session_id.to_string(),
         workflow_id: workflow_id.clone(),
         problem: problem.to_string(),
         entity_mode,
-        collection_scope: collection_scope.clone(),
+        collection_scope,
         clis: cli_keys.clone(),
         status: SessionStatus::Planning,
-        human_confirm: crate::domain::HumanConfirm::None,
+        human_confirm,
+        unit_ix: 0,
+        attempt: 0,
+        workdir,
+        repo_ref,
     };
     put_node(store, session.to_node())?;
     emit(CoreEvent::SessionStarted {
@@ -66,7 +170,6 @@ pub fn run_session(
         problem: problem.to_string(),
     });
 
-    let mut units = plan::plan_units(problem, session_id);
     for u in &units {
         put_node(store, u.to_node())?;
         emit(CoreEvent::UnitPlanned {
@@ -90,12 +193,13 @@ pub fn run_session(
         .collect();
     wicked_orchestration::register_workflow(store, &workflow_id, problem, &phase_specs)?;
 
-    // ── 2. DISTRIBUTE — the council (in-process, in-memory ledger) picks the CLI per unit. ──
     let distributions =
-        distribute::distribute_units_on(&units, &clis, session_id, None, &dispatcher)?;
+        distribute::distribute_units_on(&units, clis, session_id, None, dispatcher)?;
     for (u, dist) in units.iter_mut().zip(distributions.iter()) {
         u.assigned_cli = Some(dist.assigned_cli.clone());
+        u.assigned_invocation = dist.assigned_invocation.clone();
         u.council_task_ref = dist.council_task_ref.clone();
+        u.routing = Some(dist.routing.clone());
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
         emit(CoreEvent::UnitDistributed {
@@ -105,85 +209,83 @@ pub fn run_session(
         });
     }
 
-    // ── 3. EXECUTE — per unit: phase → governance → gate, on the shared store. ──
     session.status = SessionStatus::Executing;
     put_node(store, session.to_node())?;
 
-    let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
-    for u in &mut units {
-        emit(CoreEvent::UnitExecuting {
-            session: session_id.to_string(),
-            ord: u.ord,
-        });
-        let mut outcome = execute::execute_unit(store, u, &workflow_id, entity_mode, session_id)?;
+    Ok(Planned {
+        session,
+        units,
+        workflow_id,
+        cli_keys,
+    })
+}
 
-        // evaluator≠creator: a second governance pass on approved units, distinct evaluator identity.
-        if outcome.approved {
-            let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, &cli_keys);
-            let eval_at = execute::EVAL_AT_BASE + u.ord as i64 + 1_000_000;
-            if let Ok(eval) = execute::evaluate_unit(
-                store,
-                u,
-                &format!("stub-output for {}", u.description),
-                &evaluator_cli,
-                &outcome.collection_scope,
-                &format!("unit-{}", u.ord),
-                eval_at,
-            ) {
-                outcome.evaluator_claim_id = Some(eval.claim_id);
-            }
+/// Apply one unit's produced `output` (shared by both drivers): run the governance gate (creator
+/// pass) + the evaluator≠creator second pass, tick the workflow cursor, persist the unit's resolved
+/// status, and emit `GateDecided` + `UnitDone`/`UnitDenied`. The caller emits `UnitExecuting` BEFORE
+/// the work runs. Store-writing, so it runs on the actor (single-writer) thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_and_finish_unit(
+    store: &mut wicked_apps_core::SqliteStore,
+    unit: &mut crate::domain::WorkUnit,
+    output: &str,
+    workflow_id: &str,
+    entity_mode: EntityMode,
+    session_id: &str,
+    cli_keys: &[String],
+    emit: &mut dyn FnMut(CoreEvent),
+) -> anyhow::Result<UnitOutcome> {
+    let mut outcome =
+        execute::apply_unit(store, unit, output, workflow_id, entity_mode, session_id)?;
+
+    // evaluator≠creator: a second governance pass on approved units, distinct evaluator identity.
+    if outcome.approved {
+        let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, cli_keys);
+        let eval_at = execute::EVAL_AT_BASE + unit.ord as i64 + 1_000_000;
+        if let Ok(eval) = execute::evaluate_unit(
+            store,
+            unit,
+            output,
+            &evaluator_cli,
+            &outcome.collection_scope,
+            &format!("unit-{}", unit.ord),
+            eval_at,
+        ) {
+            outcome.evaluator_claim_id = Some(eval.claim_id);
         }
-
-        wicked_orchestration::tick_workflow(store, &workflow_id, outcome.approved)?;
-
-        u.phase_ref = Some(outcome.phase_id.clone());
-        u.conformance_ref = outcome.claim_id.clone();
-        u.phase_status = Some(outcome.phase_status.clone());
-        u.collection_scope = Some(outcome.collection_scope.clone());
-        u.status = if outcome.approved {
-            UnitStatus::Done
-        } else {
-            UnitStatus::Rejected
-        };
-        put_node(store, u.to_node())?;
-
-        emit(CoreEvent::GateDecided {
-            session: session_id.to_string(),
-            ord: u.ord,
-            allow: outcome.approved,
-        });
-        emit(if outcome.approved {
-            CoreEvent::UnitDone {
-                session: session_id.to_string(),
-                ord: u.ord,
-            }
-        } else {
-            CoreEvent::UnitDenied {
-                session: session_id.to_string(),
-                ord: u.ord,
-            }
-        });
-        outcomes.push(outcome);
     }
 
-    // ── 4. complete. ──
-    session.status = SessionStatus::Completed;
-    put_node(store, session.to_node())?;
-    emit(CoreEvent::SessionCompleted {
-        session: session_id.to_string(),
-    });
+    wicked_orchestration::tick_workflow(store, workflow_id, outcome.approved)?;
 
-    let approved = outcomes.iter().filter(|o| o.approved).count();
-    let rejected = outcomes.len() - approved;
-    Ok(SessionResult {
-        session_id: session_id.to_string(),
-        workflow_id,
-        entity_mode,
-        collection_scope,
-        units: outcomes,
-        approved,
-        rejected,
-    })
+    unit.phase_ref = Some(outcome.phase_id.clone());
+    unit.conformance_ref = outcome.claim_id.clone();
+    unit.phase_status = Some(outcome.phase_status.clone());
+    unit.collection_scope = Some(outcome.collection_scope.clone());
+    unit.denial_reason = outcome.denial_reason.clone();
+    unit.status = if outcome.approved {
+        UnitStatus::Done
+    } else {
+        UnitStatus::Rejected
+    };
+    put_node(store, unit.to_node())?;
+
+    emit(CoreEvent::GateDecided {
+        session: session_id.to_string(),
+        ord: unit.ord,
+        allow: outcome.approved,
+    });
+    emit(if outcome.approved {
+        CoreEvent::UnitDone {
+            session: session_id.to_string(),
+            ord: unit.ord,
+        }
+    } else {
+        CoreEvent::UnitDenied {
+            session: session_id.to_string(),
+            ord: unit.ord,
+        }
+    });
+    Ok(outcome)
 }
 
 /// A deterministic short id from parts (sha256 prefix).

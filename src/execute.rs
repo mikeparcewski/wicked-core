@@ -35,6 +35,10 @@ pub struct UnitOutcome {
     /// evaluator≠creator: the claim_id of the second governance pass (set only when approved).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluator_claim_id: Option<String>,
+    /// WHY the gate denied — the firing policies + decision — set only when NOT approved. The UI
+    /// surfaces this as the run's "why it failed" explanation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<String>,
 }
 
 /// The outcome of the evaluator≠creator second-pass governance evaluation (ADR-0003 extension).
@@ -46,10 +50,14 @@ pub struct EvaluationOutcome {
     pub approved: bool,
 }
 
-/// Execute one unit on the shared `store` (stub path). Called only on the actor thread.
-pub fn execute_unit(
+/// Apply one unit's governance gate + writes given an **already-produced** `output`. The worker
+/// produces `output` off-thread (no store handle); the actor calls this on the single-writer thread
+/// to record it. THE INVARIANT: the gate fires on every unit; a `Deny` drives the phase to
+/// `Rejected` through orchestration — never approved by any route (ADR-0003).
+pub(crate) fn apply_unit(
     store: &mut SqliteStore,
     unit: &WorkUnit,
+    output: &str,
     workflow_id: &str,
     entity_mode: EntityMode,
     session_id: &str,
@@ -68,14 +76,13 @@ pub fn execute_unit(
     advance_to_gate_running(store, &phase_id)?;
 
     // 2. the unit's governance context (the gate INPUT).
-    let work_output = format!("stub-output for {}", unit.description);
     let context = serde_json::json!({
         "phase": phase_name,
         "scope": collection_scope,
         "unit_id": unit.id,
         "description": unit.description,
         "assigned_cli": assigned_cli,
-        "work": work_output,
+        "work": output,
     });
 
     // 3. governance SELECT + DECIDE → a ConformanceClaim.
@@ -109,11 +116,29 @@ pub fn execute_unit(
             unit,
             &assigned_cli,
             &collection_scope,
-            &work_output,
+            output,
             &phase_status,
         );
         put_node(store, output_node)?;
     }
+    // On a deny, capture WHY: the decision + the firing policies (governance exposes no policy-read
+    // API, so we cite ids + criteria — honest provenance the UI can show).
+    let denial_reason = (!approved).then(|| {
+        let policies = if claim.policy_ids.is_empty() {
+            "no matching policy (default-deny)".to_string()
+        } else {
+            claim.policy_ids.join(", ")
+        };
+        let criteria = if claim.criteria.is_empty() {
+            String::new()
+        } else {
+            format!(", criteria: {}", claim.criteria)
+        };
+        format!(
+            "Governance DENIED unit {} ({assigned_cli}) — decision={decision_tok}, policies: [{policies}]{criteria}",
+            unit.ord
+        )
+    });
     conform(store, &claim)?;
 
     Ok(UnitOutcome {
@@ -127,6 +152,7 @@ pub fn execute_unit(
         collection_scope,
         approved,
         evaluator_claim_id: None,
+        denial_reason,
     })
 }
 
@@ -177,8 +203,12 @@ pub fn evaluate_unit(
     })
 }
 
-/// Walk a freshly-opened phase `Pending → InProgress → ReadyForGate → GateRunning`.
-fn advance_to_gate_running(store: &mut SqliteStore, phase_id: &str) -> anyhow::Result<()> {
+/// Walk a freshly-opened phase `Pending → InProgress → ReadyForGate → GateRunning`. Shared with the
+/// gate-hook drain ([`crate::gate_hook`]) so both paths walk phases identically.
+pub(crate) fn advance_to_gate_running(
+    store: &mut SqliteStore,
+    phase_id: &str,
+) -> anyhow::Result<()> {
     for (step, to) in [
         PhaseStatus::InProgress,
         PhaseStatus::ReadyForGate,

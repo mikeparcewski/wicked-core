@@ -20,7 +20,15 @@ pub enum SessionStatus {
     Executing,
     /// Paused BEFORE a not-yet-done unit, awaiting a human to resume.
     AwaitingHuman,
+    /// Terminal: every unit was governance-approved and ran without worker failure.
     Completed,
+    /// Terminated by the operator (or a rejected gate) before completing. Terminal.
+    Cancelled,
+    /// Terminal: stopped because a unit was governance-DENIED or its worker reported failure. The
+    /// RUN-LEVEL DENY CONTRACT (decided in P2): a `Completed` run means EVERY unit was approved; a
+    /// governance `Deny` (or a `StepStatus::Failed` worker) halts the run here, never silently
+    /// completing past a rejection.
+    Failed,
 }
 
 /// The human-confirm gate policy for a run — whether to pause BEFORE executing a unit.
@@ -56,6 +64,22 @@ pub struct AgentSession {
     /// The human-confirm gate policy. `#[serde(default)]` so older sessions still deserialize.
     #[serde(default)]
     pub human_confirm: HumanConfirm,
+    /// Resume cursor: the index of the NEXT unit to execute (0-based into the ordered units). The
+    /// interactive engine advances this as each unit's outcome is applied; `ResumeRun` re-enters
+    /// here. `#[serde(default)]` so older sessions deserialize at 0.
+    #[serde(default)]
+    pub unit_ix: usize,
+    /// Retry attempt for the unit at `unit_ix` — folded into event ids so a retried step is not
+    /// deduped as a no-op (P2). `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub attempt: u32,
+    /// The git worktree this run executes in (set when the run targets a registered repo, P3).
+    /// `None` for a repo-less run. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// The registered repo this run targets, if any (P3).
+    #[serde(default)]
+    pub repo_ref: Option<String>,
 }
 
 impl ToNode for AgentSession {
@@ -103,12 +127,28 @@ pub struct WorkUnit {
     pub ord: u32,
     /// The unit's description (becomes the gate's governance `work` context).
     pub description: String,
+    /// The methodology stage this unit belongs to (recon/build/review/test), classified at plan time.
+    /// `#[serde(default)]` (→ `Build`) so older units deserialize.
+    #[serde(default)]
+    pub stage: StageKind,
     /// The CLI the council assigned (set in distribute).
     #[serde(default)]
     pub assigned_cli: Option<String>,
+    /// The assigned CLI's invocation template (from the launch roster) — lets the runner execute an
+    /// AD-HOC CLI not in the council registry. `None` ⇒ the runner resolves the key via the registry.
+    #[serde(default)]
+    pub assigned_invocation: Option<String>,
     /// The council task id whose verdict produced the assignment (provenance).
     #[serde(default)]
     pub council_task_ref: Option<String>,
+    /// WHY the assigned CLI won — the council verdict/ranking made visible (set in distribute). `None`
+    /// for units distributed before this field existed. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub routing: Option<RoutingInfo>,
+    /// WHY the unit was rejected — a governance deny (which policies) or a worker failure. Set only
+    /// when the run halts on this unit. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub denial_reason: Option<String>,
     /// The orchestration phase id backing this unit (set in execute).
     #[serde(default)]
     pub phase_ref: Option<String>,
@@ -135,6 +175,89 @@ pub enum UnitStatus {
     Rejected,
 }
 
+/// The methodology stage a unit belongs to (the recon → build → adversarial-review → functional-test
+/// spine). Classified from the unit's description in [`crate::plan`]; surfaced as a per-unit badge so
+/// the methodology is legible (you can tell a Recon unit from a Build unit from a Review unit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StageKind {
+    /// Decompose / explore / map the problem before building.
+    Recon,
+    /// The main implementation work (the default).
+    #[default]
+    Build,
+    /// Adversarial review — a distinct critic checks the build (evaluator ≠ creator).
+    Review,
+    /// Functional testing — verify the build actually works.
+    Test,
+}
+
+impl StageKind {
+    /// Classify a unit's stage from its description (a v1 keyword heuristic — the spine made visible
+    /// without changing how units are planned).
+    pub fn classify(description: &str) -> StageKind {
+        let d = description.to_lowercase();
+        let has = |words: &[&str]| words.iter().any(|w| d.contains(w));
+        if has(&["test", "verify", "validate", "functional", "qa "]) {
+            StageKind::Test
+        } else if has(&[
+            "review",
+            "audit",
+            "adversarial",
+            "critique",
+            "evaluate",
+            "inspect",
+        ]) {
+            StageKind::Review
+        } else if has(&[
+            "recon",
+            "research",
+            "explore",
+            "investigate",
+            "decompose",
+            "map the",
+            "scope ",
+        ]) {
+            StageKind::Recon
+        } else {
+            StageKind::Build
+        }
+    }
+
+    /// Short label for the UI badge.
+    pub fn label(self) -> &'static str {
+        match self {
+            StageKind::Recon => "recon",
+            StageKind::Build => "build",
+            StageKind::Review => "review",
+            StageKind::Test => "test",
+        }
+    }
+}
+
+/// WHY a particular CLI was assigned to a unit — the council's decision made visible. The verdict is
+/// otherwise computed in [`crate::distribute`] and thrown away; capturing it here is what lets the UI
+/// answer "why *this* CLI". Percentages are `0..=100` (not `f32`) so `WorkUnit` stays `Eq`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum RoutingInfo {
+    /// The council convened and its verdict named the winning seat.
+    Council {
+        winner: String,
+        /// Council agreement ratio, `0..=100`.
+        agreement_pct: u8,
+        /// How many seats returned a vote.
+        returned: u32,
+        /// How many dissenting voices the verdict recorded.
+        dissent: u32,
+    },
+    /// No usable verdict (no quorum, or the winner named no roster seat) — degraded to the first seat.
+    Degraded { reason: String },
+    /// A review/test unit was REASSIGNED off the council's pick to enforce evaluator ≠ creator (the
+    /// critic must differ from the CLI that produced the work it checks). `was` is the council's pick.
+    EvaluatorDistinct { winner: String, was: String },
+}
+
 impl WorkUnit {
     /// Build a fresh `Pending` unit for the plan.
     pub fn pending(
@@ -143,13 +266,18 @@ impl WorkUnit {
         ord: u32,
         description: impl Into<String>,
     ) -> Self {
+        let description = description.into();
         WorkUnit {
             id: id.into(),
             session_id: session_id.into(),
             ord,
-            description: description.into(),
+            stage: StageKind::classify(&description),
+            description,
             assigned_cli: None,
+            assigned_invocation: None,
             council_task_ref: None,
+            routing: None,
+            denial_reason: None,
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,
@@ -275,6 +403,10 @@ mod tests {
             clis: vec!["claude".to_string(), "agy".to_string()],
             status: SessionStatus::Planning,
             human_confirm: HumanConfirm::Before(2),
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
         }
     }
 
@@ -297,6 +429,27 @@ mod tests {
         assert_eq!(
             u, back,
             "WorkUnit must survive a node round-trip losslessly"
+        );
+    }
+
+    #[test]
+    fn units_are_stage_classified_from_their_description() {
+        assert_eq!(StageKind::classify("Add JWT auth"), StageKind::Build);
+        assert_eq!(StageKind::classify("Then review it"), StageKind::Review);
+        assert_eq!(
+            StageKind::classify("Write functional tests"),
+            StageKind::Test
+        );
+        assert_eq!(
+            StageKind::classify("Research the codebase"),
+            StageKind::Recon
+        );
+        // The classification rides through `pending` + the node round-trip.
+        let u = WorkUnit::pending("s:u1", "s", 1, "Adversarial review of the change");
+        assert_eq!(u.stage, StageKind::Review);
+        assert_eq!(
+            WorkUnit::from_node(&u.to_node()).unwrap().stage,
+            StageKind::Review
         );
     }
 

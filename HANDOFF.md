@@ -1,5 +1,76 @@
 # wicked-core — session handoff
 
+## ⭐ Orchestrator build (current thrust) — see `ORCHESTRATOR.md`
+COE is being grown into the **agentic-CLI orchestrator engine**: register a repo, chat with a CLI,
+and run **interactive, resumable, multi-stage workflows** (the methodology spine = **recon →
+adversarial-review (evaluator≠creator) → functional-test**) across one-or-many CLIs, with the egui
+dashboard as the first surface. Full design (adversarially critiqued): **`ORCHESTRATOR.md`** (§1–11),
+phased P0→P7.
+
+**Progress:**
+- **P0 — single-writer gate-hook reconciliation: DONE + GREEN.** The out-of-process gate-hook
+  (`src/gate_hook.rs`, `wicked-core gate-hook` subcommand) no longer writes the store — it appends a
+  `ConformanceClaim` to an absolute `WICKED_DECISIONS_PATH` ndjson; the actor drains it via
+  `Command::ApplyHookDecisions` / `Core::apply_hook_decisions` (the sole writer; idempotent;
+  Deny→veto). Phase-ownership decision locked in `src/workflow.rs`. Proof: `tests/p0_single_writer.rs`
+  (external hook process runs concurrently with 200 actor reads → no `SQLITE_BUSY`; re-drain yields
+  the claim once; Deny→phase `Rejected`). `Core` methods are **sync** (not async as the draft sketched
+  — matches the egui/no-tokio locked decision).
+- **P1 — re-entrant off-thread engine: DONE + GREEN.** `src/workflow.rs` (`StepInput`/`StepOutput`/
+  injectable `StepRunner` + `StubStepRunner`); `src/actor.rs` rewritten to dispatch each unit's slow
+  work to a worker thread (no store handle) that posts `ApplyStepResult` back to the actor (the sole
+  writer) — actor stays responsive; `in_flight` HashSet + `RunBusy` guard prevents double-dispatch;
+  `Core::launch_run`/`resume_run` + cursor fields (`unit_ix`/`attempt`) on `AgentSession`.
+  `pipeline.rs` extracted `plan_and_distribute` + `apply_and_finish_unit` shared by the sync
+  `run_session` and the actor (one composition surface). Proof: `tests/p1_reentrant.rs` (actor serves
+  reads while a step blocks; concurrent mutating cmd → `RunBusy`; fresh Core resumes from the
+  persisted cursor to completion). **DEFERRED from the design's P1** (revisit at P4a): `advance()` as
+  sole phase opener / delete `tick_workflow` / strip `Phase::open` from execute (kept the existing
+  model — works on the stub); explicit event `seq` (actor is already the single emit point).
+- **P1.5 — hardening: DONE + GREEN.** The P0+P1 adversarial-review workflow (`REASSESS-P0-P1.md`)
+  caught a **critical bug**: the actor held its own `self_tx`, so the command channel never closed →
+  the actor never terminated (`drop(core)` didn't stop it; two writable actors could share one db).
+  Fixed: `Command::Shutdown` + a handle-count `ShutdownGuard` (lib.rs) fires when the last `Core`
+  drops; proven by `actor_shuts_down_when_last_core_drops`. Also: `apply_step_result` idempotency/
+  cursor guard (`StepApplied::{Continuing,Finished,Stale}`); `finalize_run` surfaces errors; gate-hook
+  doc honesty (RW-open + no `busy_timeout` = **hard P4b precondition**); off-thread claim scoped to
+  EXECUTE (distribute still sync → P5); strengthened P0/P1 proofs.
+- **4 open product decisions LOCKED** (ORCHESTRATOR.md §9): worktree shared-per-run; functional via
+  host-CLI subprocess; non-claude = loud UNGOVERNED opt-in; default flow Recon→Build→Review→Test.
+- **Revised critical path** (post-reassessment): `P1.5 → P2 → P4a → {P5 ∥ P6}`, with **P3 ∥ P2**,
+  **P4b ∥ P4a**, **P7 last**. **Hard preconditions:** P4a does the `advance()`-sole-opener unification
+  first; P4b makes the hook read-only/`busy_timeout`; P2 decides the run-level deny contract +
+  `StepStatus`.
+- **P2 (interactive gates) — DONE+green**, hardened after its review: pause-before-unit gates
+  (`AwaitingHuman`), `confirm_gate(Approve{amend}|Reject)`, `cancel_run`; COE-level (not the published
+  orchestration reducer). **RUN-LEVEL DENY CONTRACT decided:** a governance Deny / worker Failed →
+  `SessionStatus::Failed` (never silent Completed); operator/reject/worker-cancel → `Cancelled`.
+  **Retry descoped** (operator relaunch/resume). Tests `p2_gates.rs` + `p2_contract.rs`.
+- **P3 (repo registry) — DONE+green**: `register_repo`/`list_repos` (git-validated); run → isolated
+  worktree `<repo>/.wicked/worktrees/<run_id>` as `StepInput.workdir`; Completed keeps it, Cancelled
+  discards; startup orphan reaper. `tests/p3_repo.rs`.
+- **P4a (real wrapped-CLI execution) — DONE+green**: `WrappedCliStepRunner` runs the assigned CLI as a
+  no-shell subprocess in the worktree (concurrent drain + timeout); `Core::spawn` uses it; operator
+  CLI exposes `repos`/`register-repo`/`run`/`resume`/`cancel`. **FUNCTIONAL END-TO-END from the CLI.**
+  `tests/p4a_wrapped.rs`.
+- **P7 (egui dashboard on Core) — IN PROGRESS.** `wicked-agent-ui` repointed off the retired
+  `wicked-agent` crate onto `wicked-core = { path }` (compiles). `App` now holds a `wicked_core::Core`;
+  **launch** → `core.register_repo` (if a repo is chosen) + `core.launch_run`, **resume** →
+  `core.resume_run` — the dashboard drives the engine instead of shelling a binary / polling. Still
+  reads the project list from the store directly (works; live `subscribe()` wiring is a refinement).
+  **Remaining P7:** gate-prompt UI (`confirm_gate` Approve/Reject/amend on `AwaitingHuman`), repo-
+  registry view, `CoreEvent` subscription for the live stream, chat-through-Core; and remove the now-
+  dead launch/worktree helpers in `data.rs` (`spawn_launch`/`spawn_resume`/`create_worktree`/
+  `repo_scoped_problem`/`split_pieces` + their tests — 5 dead-code warnings, UI is warnings-allowed).
+- **NEXT:** finish **P7** (dashboard interactivity) + **P5/P6** (council adversarial-review +
+  wicked-testing functional-test stages) + **P4b** (gate-hook re-home for per-tool-call governance:
+  read-only/`busy_timeout` + the `advance()`-sole-opener unification). See `ORCHESTRATOR.md` §8.
+
+> Test counts as of P4a: `cargo test` → **37 passed**, clippy `-D warnings` clean, fmt clean.
+> Re-verify: `cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --all -- --check`.
+
+---
+
 **State (HEAD `b6f6d44`, re-derived this session):** the COE composition runtime is built and green.
 `cargo test` → **14 passed, 0 failed** (deterministic, ~0.3s); `cargo clippy --all-targets -D warnings`
 → clean; `cargo fmt --all --check` → clean; `wicked-core status --db <demo>` reads real data.
