@@ -12,23 +12,50 @@
 //! `wicked-agent` crate.
 
 mod actor;
+mod applications;
+mod code_graph;
 mod command;
 mod distribute;
+mod docs;
 mod domain;
 mod event;
 mod execute;
+mod execute_wrapped;
+mod gate_hook;
+mod sources;
+mod graph_browser;
+mod knowledge;
+mod memory;
 mod pipeline;
 mod plan;
+mod repo;
+mod repo_intel;
 mod scope;
+mod workflow;
 
+pub use actor::RunBusy;
 pub use domain::{
     all_sessions, get_session, get_work_output, put_node, session_units, AgentSession,
-    HumanConfirm, SessionStatus, SessionView, UnitStatus, WorkUnit,
+    HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind, UnitStatus, WorkUnit,
 };
 pub use event::CoreEvent;
+pub use execute_wrapped::WrappedCliStepRunner;
+pub use gate_hook::{count_claims, run_gate_hook, HookDrainSummary};
+pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
+pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
+pub use graph_browser::{browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote, NodeSummary, SymbolAnnotation};
+pub use applications::{attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo, Application, SeedKind};
+pub use repo_intel::{
+    change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
+};
+pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use knowledge::RecalledKnowledge;
+pub use memory::{now_secs, RecalledMemory};
 pub use pipeline::SessionResult;
+pub use repo::{RepoEntry, RepoSpec};
 pub use scope::{resolve_scope, EntityMode};
 pub use wicked_council::AgenticCli;
+pub use workflow::{HumanDecision, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner};
 
 /// What to run: the problem to decompose, the council roster (`AgenticCli` seats), the scope toggle,
 /// and a stable session id. The roster is passed explicitly so callers (tests, UI) control it; the
@@ -38,6 +65,12 @@ pub struct LaunchSpec {
     pub clis: Vec<AgenticCli>,
     pub entity_mode: EntityMode,
     pub session_id: String,
+    /// The human-confirm gate policy: pause before none / every / a specific unit. Defaults to
+    /// `None` (run straight through) when built without it.
+    pub human_confirm: HumanConfirm,
+    /// The id of a registered repo to run within (P3). When set, COE creates an isolated git
+    /// worktree for the run and executes there; `None` runs without a repo (no worktree).
+    pub repo_ref: Option<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -55,22 +88,60 @@ pub fn registry_roster() -> Vec<AgenticCli> {
 
 use command::Command;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+
+/// Sends `Shutdown` when the LAST `Core` handle drops. The actor holds its own `self_tx` (so workers
+/// can post results back), which means the command channel never closes on its own — this guard is
+/// the real termination signal: when every external `Core` clone is gone, the shared `Arc` drops,
+/// this fires `Shutdown`, the actor breaks its loop, and the store handle + thread are released.
+struct ShutdownGuard {
+    tx: Sender<Command>,
+}
+impl Drop for ShutdownGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Command::Shutdown);
+    }
+}
 
 /// A handle to the core runtime. Clone freely — every clone funnels into the single store-owning
-/// actor thread, so callers compose the core services without contending on the SQLite file.
+/// actor thread, so callers compose the core services without contending on the SQLite file. When
+/// the last clone drops, the actor shuts down (see [`ShutdownGuard`]).
 #[derive(Clone)]
 pub struct Core {
     tx: Sender<Command>,
+    _shutdown: Arc<ShutdownGuard>,
 }
 
 impl Core {
-    /// Spawn the store actor over the estate store at `path`. The actor lives until every `Core`
-    /// handle is dropped.
+    /// Spawn the store actor over the estate store at `path`, with the production engine seams: the
+    /// real council dispatcher + the real wrapped-CLI step runner (runs actual agentic CLIs in the
+    /// run's worktree). The actor lives until every `Core` handle is dropped. Tests use
+    /// [`Core::spawn_with_engine`] to inject a stub runner instead.
     pub fn spawn(path: impl Into<String>) -> Core {
+        Core::spawn_with_engine(
+            path,
+            distribute::real_dispatcher(),
+            std::sync::Arc::new(execute_wrapped::WrappedCliStepRunner::default()),
+        )
+    }
+
+    /// Spawn the store actor with INJECTED engine seams — the council `dispatcher` (vote collection)
+    /// and the `runner` (per-unit slow work). Tests inject a stub dispatcher + a controllable step
+    /// runner to exercise the interactive engine without real subprocesses; `spawn` wires the
+    /// production defaults.
+    pub fn spawn_with_engine(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+    ) -> Core {
         let (tx, rx) = channel();
         let path = path.into();
-        std::thread::spawn(move || actor::run(path, rx));
-        Core { tx }
+        let self_tx = tx.clone();
+        std::thread::spawn(move || actor::run(path, rx, self_tx, dispatcher, runner));
+        Core {
+            tx: tx.clone(),
+            _shutdown: Arc::new(ShutdownGuard { tx }),
+        }
     }
 
     /// Subscribe to the live event stream. Returns a receiver that gets every [`CoreEvent`] emitted
@@ -104,6 +175,196 @@ impl Core {
         session_id
     }
 
+    /// Launch an INTERACTIVE, resumable run. Plans + distributes on the actor, then executes each
+    /// unit off-thread (the actor stays responsive). Returns the run id, or a [`RunBusy`] error if a
+    /// run with that id is already in flight. Progress arrives as [`CoreEvent`]s — `subscribe()`
+    /// first to catch the whole sequence.
+    pub fn launch_run(&self, spec: LaunchSpec) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::LaunchRun { spec, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Resume an interactive run from its persisted cursor (after a pause, crash, or a fresh
+    /// process). Re-dispatches the next not-yet-done unit. Returns the resulting status, or a
+    /// [`RunBusy`] error if the run is already in flight.
+    pub fn resume_run(&self, run_id: &str) -> anyhow::Result<SessionStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ResumeRun {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Resolve a human-confirm gate on a PAUSED run: [`HumanDecision::Approve`] (optionally amending
+    /// the next unit's instruction) resumes execution; [`HumanDecision::Reject`] cancels the run.
+    /// Errors if the run is not currently paused at a gate.
+    pub fn confirm_gate(
+        &self,
+        run_id: &str,
+        decision: HumanDecision,
+    ) -> anyhow::Result<SessionStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ConfirmGate {
+                run_id: run_id.to_string(),
+                decision,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Cancel a run — mark it terminally `Cancelled` and stop advancing it. Safe to call whether the
+    /// run is executing or paused.
+    pub fn cancel_run(&self, run_id: &str) -> anyhow::Result<SessionStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CancelRun {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Register a git repository the orchestrator can run within. Validates it is a git repo with at
+    /// least one commit; returns the persisted [`RepoEntry`] (with its resolved id + default branch).
+    pub fn register_repo(&self, spec: RepoSpec) -> anyhow::Result<RepoEntry> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RegisterRepo { spec, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// List every registered repository.
+    pub fn list_repos(&self) -> anyhow::Result<Vec<RepoEntry>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ListRepos { reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Register a deny policy (real governance) through the actor — blocks any tool-call in `phase`
+    /// whose context contains `trigger` (literal). Single-writer; persists on the shared store.
+    pub fn register_deny_policy(&self, phase: &str, trigger: &str) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RegisterDenyPolicy {
+                phase: phase.to_string(),
+                trigger: trigger.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Capture an episodic memory (a learned fact/decision) into the orchestrator's memory store.
+    pub fn capture_memory(&self, content: &str, scope: &str) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CaptureMemory {
+                content: content.to_string(),
+                scope: scope.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Recall up to `k` memories relevant to `query` (hybrid recall, salience-reranked). Returns an
+    /// empty vec if the memory store is unavailable.
+    pub fn recall_memories(&self, query: &str, k: usize) -> anyhow::Result<Vec<RecalledMemory>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RecallMemory {
+                query: query.to_string(),
+                k,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// LIST captured memories (newest first), up to `limit` — a direct listing, not a similarity
+    /// search. The Memory surface uses this so stored memories always appear.
+    pub fn list_memories(&self, scope: &str, limit: usize) -> anyhow::Result<Vec<RecalledMemory>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ListMemories {
+                scope: scope.to_string(),
+                limit,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Dispatch an MCP JSON-RPC request to the in-process memory tool server (the 6 `memory.*` tools).
+    /// Returns the JSON-RPC response (`None` for a notification). This is the MCP tool surface other
+    /// agents / surfaces call to use the orchestrator's memory.
+    pub fn mcp_call(
+        &self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::McpCall { request, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Ingest a document (title + chunks) into the orchestrator's knowledge base. Returns the chunk
+    /// count.
+    pub fn ingest_knowledge(&self, title: &str, chunks: Vec<String>) -> anyhow::Result<usize> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::IngestKnowledge {
+                title: title.to_string(),
+                chunks,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Recall up to `k` knowledge chunks relevant to `query` (empty if the store is unavailable).
+    pub fn recall_knowledge(
+        &self,
+        query: &str,
+        k: usize,
+    ) -> anyhow::Result<Vec<RecalledKnowledge>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RecallKnowledge {
+                query: query.to_string(),
+                k,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// The agent session ids currently on the store (lightweight; use [`sessions_detail`] for the
     /// full project list).
     pub fn sessions(&self) -> anyhow::Result<Vec<String>> {
@@ -132,6 +393,27 @@ impl Core {
             .send(Command::WorkOutput(unit_id.to_string(), reply))
             .ok()?;
         rx.recv().ok().flatten()
+    }
+
+    /// Drain a run's out-of-process gate-hook decisions (`decisions.ndjson`) into the store. The
+    /// out-of-process hook only appended to the file; this is the single point where those claims
+    /// are written to the store (single-writer). Idempotent — safe to call repeatedly. Returns a
+    /// summary of what was applied this pass.
+    pub fn apply_hook_decisions(
+        &self,
+        run_id: &str,
+        ndjson_path: impl Into<std::path::PathBuf>,
+    ) -> anyhow::Result<HookDrainSummary> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ApplyHookDecisions {
+                run_id: run_id.to_string(),
+                ndjson_path: ndjson_path.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 }
 
