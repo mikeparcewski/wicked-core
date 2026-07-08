@@ -28,6 +28,14 @@ concurrency:
   group: napi-release-${{ github.ref }}
   cancel-in-progress: false
 
+# wicked-core resolves wicked-estate via RELATIVE PATH deps (../wicked-estate/...), and three of them
+# (wicked-estate-memory, -memory-core, -knowledge) are `publish = false` — they will NEVER be on
+# crates.io, so there is no version-dep fallback. The build MUST check out wicked-estate as a SIBLING
+# of wicked-core so the path deps resolve from source (the .node statically bundles the bytes). Pin the
+# estate ref here; bump on each estate release that changes what the addon bundles.
+env:
+  WICKED_ESTATE_REF: v0.13.0
+
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────
   build:
@@ -55,9 +63,18 @@ jobs:
             runner: windows-latest
     defaults:
       run:
-        working-directory: crates/wicked-core-ts
+        working-directory: wicked-core/crates/wicked-core-ts
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Checkout wicked-core
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: wicked-core
+      - name: Checkout wicked-estate (sibling — path deps + publish=false crates build from source)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: mikeparcewski/wicked-estate
+          ref: ${{ env.WICKED_ESTATE_REF }}
+          path: wicked-estate
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -102,8 +119,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bindings-${{ matrix.target }}
-          # path is repo-root-relative (upload-artifact ignores defaults.run.working-directory).
-          path: crates/wicked-core-ts/*.node
+          # path is workspace-root-relative (upload-artifact ignores defaults.run.working-directory);
+          # wicked-core is checked out under ./wicked-core (see the sibling-checkout note above).
+          path: wicked-core/crates/wicked-core-ts/*.node
           if-no-files-found: error
           retention-days: 7
 
