@@ -182,6 +182,19 @@ jobs:
         shell: bash
         run: npx napi version
 
+      # npm --provenance (below) rejects a publish whose package.json repository.url doesn't match the
+      # OIDC provenance source repo (E422). napi's generated platform packages don't carry repository,
+      # so set it explicitly on the main package AND every platform package before publishing.
+      - name: Ensure repository field on all packages (npm provenance requirement)
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_URL="git+https://github.com/mikeparcewski/wicked-core.git"
+          npm pkg set repository.type=git "repository.url=$REPO_URL"
+          for dir in npm/*/; do
+            (cd "$dir" && npm pkg set repository.type=git "repository.url=$REPO_URL")
+          done
+
       - name: Show assembled packages
         shell: bash
         run: |

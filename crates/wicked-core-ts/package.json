@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-process orchestration engine from JS/TS.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikeparcewski/wicked-core.git"
+  },
   "main": "index.js",
   "types": "index.d.ts",
   "files": [
