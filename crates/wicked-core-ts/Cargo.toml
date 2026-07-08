@@ -1,0 +1,32 @@
+[package]
+name = "wicked-core-ts"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-process composition/orchestration runtime (launch runs, resolve gates, live event stream) from JS/TS."
+publish = false
+
+# Standalone napi cdylib — deliberately NOT a cargo workspace member (mirrors the archived
+# wicked-memory-ts pattern). It path-depends on wicked-core (../..) which itself is a standalone
+# package with relative deps on ../../../wicked-estate; keeping this crate out of any workspace
+# preserves that resolution. Build from THIS directory: `cargo build -p wicked-core-ts`.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The runtime we bind. Path dep on the wicked-core package root (two levels up).
+wicked-core = { path = "../.." }
+# Needed to construct AgenticCli seats + implement a stub Dispatcher for the no-LLM test engine.
+wicked-council = { path = "../wicked-council" }
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = "symbols"

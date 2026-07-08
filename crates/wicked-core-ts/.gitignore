@@ -1,0 +1,8 @@
+/target
+# The built addon (staged from the cdylib by the build/smoke scripts) — large, platform-specific.
+index.node
+*.node
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

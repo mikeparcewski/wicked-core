@@ -1,0 +1,5 @@
+# Standalone build config for the napi (Node N-API) cdylib. On macOS the addon resolves Node's
+# symbols at load time, so the linker needs `dynamic_lookup` (the flag the napi CLI injects). This
+# lets a plain `cargo build` link the addon here too, without the full `napi build` CLI.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

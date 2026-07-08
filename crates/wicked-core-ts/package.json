@@ -1,0 +1,17 @@
+{
+  "name": "wicked-core-ts",
+  "version": "0.1.0",
+  "description": "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-process orchestration engine from JS/TS.",
+  "license": "MIT",
+  "main": "index.node",
+  "types": "index.d.ts",
+  "files": [
+    "index.node",
+    "index.d.ts"
+  ],
+  "scripts": {
+    "build": "cargo build -p wicked-core-ts --release && cp target/release/libwicked_core_ts.dylib index.node",
+    "build:debug": "cargo build -p wicked-core-ts && cp target/debug/libwicked_core_ts.dylib index.node",
+    "smoke": "node smoke.mjs"
+  }
+}
