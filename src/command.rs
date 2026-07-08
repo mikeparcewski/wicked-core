@@ -2,6 +2,7 @@
 //! oneshot, modeled with a `std::sync::mpsc` channel) so callers get a typed result back while all
 //! store access stays serialized on the single actor thread.
 
+use crate::campaign::{Campaign, CampaignDef, CampaignGateDecision, CampaignStatus, NodeOutcome};
 use crate::domain::SessionStatus;
 use crate::event::CoreEvent;
 use crate::gate_hook::HookDrainSummary;
@@ -147,6 +148,53 @@ pub(crate) enum Command {
     /// Internal: the reader thread hit EOF (the PTY closed). The actor reaps the child, joins the
     /// thread, and emits `TerminalExited` exactly once (guarded by registry presence).
     TerminalReaderDone { id: String },
+    // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────────────
+    /// Validate + launch a campaign: persist all-`Pending`, mark the in-degree-0 set `Ready`, and
+    /// dispatch up to `max_concurrency`. Reply carries the campaign id (or a validation error).
+    LaunchCampaign {
+        def: CampaignDef,
+        reply: Sender<anyhow::Result<String>>,
+    },
+    /// Resume a campaign from its persisted state (after a pause, crash, or fresh process): re-derive
+    /// the ready set and re-attach any mid-run node — never re-running a completed node.
+    ResumeCampaign {
+        id: String,
+        reply: Sender<anyhow::Result<CampaignStatus>>,
+    },
+    /// Cancel a campaign: cancel every live node's Run, mark the rest `Cancelled`.
+    CancelCampaign {
+        id: String,
+        reply: Sender<anyhow::Result<CampaignStatus>>,
+    },
+    /// Pause a campaign: dispatch nothing new; in-flight nodes continue cooperatively.
+    PauseCampaign {
+        id: String,
+        reply: Sender<anyhow::Result<CampaignStatus>>,
+    },
+    /// Resolve a campaign gate: a per-node HITL gate (`Approve`/`Reject`) or the `HumanGateOnFailure`
+    /// policy gate (`Retry`/`Skip`/`Abort`).
+    ConfirmCampaignGate {
+        id: String,
+        node_id: String,
+        decision: CampaignGateDecision,
+        reply: Sender<anyhow::Result<CampaignStatus>>,
+    },
+    /// Read a campaign's lifecycle status (`None` if the id is unknown).
+    CampaignStatusQuery {
+        id: String,
+        reply: Sender<anyhow::Result<Option<CampaignStatus>>>,
+    },
+    /// Read a campaign's full state (DAG + per-node statuses) for a DAG view.
+    CampaignDetailQuery {
+        id: String,
+        reply: Sender<anyhow::Result<Option<Campaign>>>,
+    },
+    /// Internal: a node's Run reached a terminal state — reconcile the owning campaign (set the node
+    /// terminal, apply the failure policy, dispatch newly-ready nodes). No-op if not campaign-owned.
+    CampaignRunFinished { run_id: String, outcome: NodeOutcome },
+    /// Internal: a HITL gate opened inside a campaign node's Run — free its slot, surface the prompt,
+    /// and dispatch independent work into the freed slot.
+    CampaignNodeAwaiting { run_id: String, prompt: String },
     /// Stop the actor loop and release the store. Sent automatically when the LAST external `Core`
     /// handle drops (the actor holds its own `self_tx` for worker write-back, so channel-close alone
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but

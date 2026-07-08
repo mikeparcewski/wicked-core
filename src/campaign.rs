@@ -570,6 +570,690 @@ pub fn all_campaigns(store: &dyn GraphRead) -> anyhow::Result<Vec<Campaign>> {
         .collect())
 }
 
+// ── DRIVER (side-effecting; runs INSIDE the actor's single-writer command handler) ──────────────
+//
+// Every step below executes on the actor thread, so a "persist then launch" pair is one atomic write
+// boundary (no other writer interleaves). Combined with §2.1's idempotent, attempt-keyed run id and
+// `dispatch()` as the SOLE writer of `node_run_id`, this is crash-safe on either side of the boundary.
+
+use std::collections::HashSet;
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use wicked_apps_core::SqliteStore;
+use wicked_council::types::Dispatcher;
+
+use crate::command::Command;
+use crate::domain::put_node;
+use crate::event::CoreEvent;
+use crate::workflow::StepRunner;
+
+/// The injectable engine seams the driver threads into core's launch / resume / gate machinery
+/// (bundled to keep the driver signatures readable). All shared references — no aliasing with the
+/// `&mut store` / `&mut subscribers` / `&mut in_flight` the driver also carries.
+pub(crate) struct Seams<'a> {
+    pub dispatcher: &'a Arc<dyn Dispatcher + Send + Sync>,
+    pub runner: &'a Arc<dyn StepRunner>,
+    pub self_tx: &'a Sender<Command>,
+}
+
+/// Fan an event out to every live subscriber (mirrors the actor's single-emit-point helper).
+fn emit(subscribers: &mut Vec<Sender<CoreEvent>>, ev: CoreEvent) {
+    subscribers.retain(|s| s.send(ev.clone()).is_ok());
+}
+
+/// Persist the campaign (one node round-trip). Mirrors `pending_decision` into its serde shape first.
+fn persist(store: &mut SqliteStore, campaign: &mut Campaign) -> anyhow::Result<()> {
+    campaign.sync_pending();
+    put_node(store, campaign.to_node())
+}
+
+/// `LaunchCampaign` (DES §4 step 1): validate, persist all-`Pending`, mark the in-degree-0 set
+/// `Ready`, `try_fill()`. Returns the campaign id.
+pub(crate) fn launch(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    def: CampaignDef,
+) -> anyhow::Result<String> {
+    validate(&def).map_err(|e| anyhow::anyhow!("invalid campaign: {e}"))?;
+    let id = def.id.clone();
+    // Clobber guard: refuse to re-launch over an existing non-terminal campaign (resume it instead).
+    if let Ok(Some(existing)) = get_campaign(store, &id) {
+        if !matches!(
+            existing.status,
+            CampaignStatus::Completed
+                | CampaignStatus::PartiallyCompleted
+                | CampaignStatus::Failed
+                | CampaignStatus::Cancelled
+        ) {
+            anyhow::bail!(
+                "campaign {id} already exists (status {:?}); resume or cancel it, or use a new id",
+                existing.status
+            );
+        }
+    }
+    let mut campaign = Campaign::new(def);
+    persist(store, &mut campaign)?;
+    emit(subscribers, CoreEvent::CampaignLaunched { campaign: id.clone() });
+    promote_ready(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    Ok(id)
+}
+
+/// Promote every newly-satisfied `Pending` node to `Ready` (emit `CampaignNodeReady`). Pure ready-set
+/// computation drives it; this is the side-effecting half.
+fn promote_ready(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
+    let rs = ready_set(&campaign.def.nodes, &campaign.def.edges, &campaign.node_status);
+    for node in rs {
+        if campaign.status_of(&node) == NodeStatus::Pending {
+            campaign.node_status.insert(node.clone(), NodeStatus::Ready);
+            emit(
+                subscribers,
+                CoreEvent::CampaignNodeReady {
+                    campaign: campaign.id.clone(),
+                    node,
+                },
+            );
+        }
+    }
+}
+
+/// The ONLY dispatch path (DES §4). Returns early unless the campaign is `Running` (guards Paused AND
+/// Cancelled). Dispatches the lowest-id dispatchable node until the concurrency cap is hit or nothing
+/// is dispatchable. `running_count()` counts only `Running` nodes, so a gating (`AwaitingHuman`) node
+/// frees its slot for independent work.
+fn try_fill(
+    campaign: &mut Campaign,
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+) -> anyhow::Result<()> {
+    if campaign.status != CampaignStatus::Running {
+        return Ok(());
+    }
+    while campaign.running_count() < campaign.def.max_concurrency {
+        let Some(node) = campaign.dispatchable().into_iter().next() else {
+            break;
+        };
+        dispatch(campaign, &node, store, subscribers, in_flight, seams)?;
+    }
+    Ok(())
+}
+
+/// The SOLE launcher and SOLE writer of `node_run_id` (DES §2.1, §4). Handles a fresh start (`Ready`
+/// → `LaunchRun`) and a slot-gated resume of an approved HITL gate (`ReadyToResume` → `confirm_gate`).
+/// Precondition: node status ∈ {`Ready`, `ReadyToResume`}.
+fn dispatch(
+    campaign: &mut Campaign,
+    node_id: &str,
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+) -> anyhow::Result<()> {
+    let was_ready = campaign.status_of(node_id) == NodeStatus::Ready;
+    let run_id = campaign.derive_run_id(node_id); // §2.1 — the only id rule
+    let spec = campaign
+        .def
+        .nodes
+        .iter()
+        .find(|n| n.node_id == node_id)
+        .map(|n| n.run_spec.clone());
+    let Some(spec) = spec else {
+        anyhow::bail!("dispatch: unknown node {node_id}");
+    };
+
+    // Write node_run_id + set Running + PERSIST as one atomic actor step BEFORE launching (§4).
+    campaign.node_run_id.insert(node_id.to_string(), run_id.clone());
+    campaign.node_status.insert(node_id.to_string(), NodeStatus::Running);
+    persist(store, campaign)?;
+
+    let launched = if was_ready {
+        let ls = spec.to_launch_spec(run_id.clone());
+        crate::actor::launch_run_inner(
+            store,
+            subscribers,
+            seams.dispatcher,
+            seams.runner,
+            seams.self_tx,
+            in_flight,
+            ls,
+        )
+        .map(|_| ())
+    } else {
+        // ReadyToResume: re-acquire the slot, then resume the paused Run via confirm_gate (§6.5).
+        let decision = campaign
+            .pending_decision
+            .remove(node_id)
+            .unwrap_or(HumanDecision::Approve { amend: None });
+        persist(store, campaign)?;
+        crate::actor::confirm_gate(
+            store,
+            subscribers,
+            seams.runner,
+            seams.self_tx,
+            in_flight,
+            &run_id,
+            decision,
+        )
+        .map(|_| ())
+    };
+
+    match launched {
+        Ok(()) => {
+            emit(
+                subscribers,
+                CoreEvent::CampaignNodeStarted {
+                    campaign: campaign.id.clone(),
+                    node: node_id.to_string(),
+                    run_id,
+                },
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Launch/resume failed → the node is terminally Failed; reconcile like a run failure so
+            // dependents are handled and the campaign can still finalize (never a stuck Running node).
+            campaign.node_status.insert(node_id.to_string(), NodeStatus::Failed);
+            persist(store, campaign)?;
+            emit(
+                subscribers,
+                CoreEvent::CampaignNodeFailed {
+                    campaign: campaign.id.clone(),
+                    node: node_id.to_string(),
+                },
+            );
+            emit(
+                subscribers,
+                CoreEvent::Error {
+                    session: Some(run_id),
+                    message: format!("campaign node {node_id} failed to launch: {e}"),
+                },
+            );
+            apply_failure_policy(campaign, node_id, store, subscribers, in_flight, seams)?;
+            Ok(())
+        }
+    }
+}
+
+/// Reconcile a per-Run terminal signal (DES §4 step 2): core's `SessionCompleted`/`SessionFailed`/
+/// `RunCancelled` map onto a node outcome. Inverse-lookup the owning campaign+node by run id; a
+/// bounded linear scan (an abandoned prior-attempt id maps to no node and is safely dropped).
+pub(crate) fn on_run_finished(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    run_id: &str,
+    outcome: NodeOutcome,
+) -> anyhow::Result<()> {
+    let Some((mut campaign, node_id)) = find_by_run(store, run_id)? else {
+        return Ok(()); // not a campaign-owned run (or a stale prior-attempt id) → no-op
+    };
+    // Terminal-skip guard (§4 CRIT 3b): a late event after cancel/replacement is ignored (monotonic).
+    if campaign.status_of(&node_id).is_terminal() {
+        return Ok(());
+    }
+    campaign
+        .node_status
+        .insert(node_id.clone(), outcome.as_node_status());
+    persist(store, &mut campaign)?;
+    match outcome {
+        NodeOutcome::Completed => emit(
+            subscribers,
+            CoreEvent::CampaignNodeCompleted {
+                campaign: campaign.id.clone(),
+                node: node_id.clone(),
+            },
+        ),
+        NodeOutcome::Failed => emit(
+            subscribers,
+            CoreEvent::CampaignNodeFailed {
+                campaign: campaign.id.clone(),
+                node: node_id.clone(),
+            },
+        ),
+        // No per-node Cancelled event in the catalog — a cancellation is driven by the operator.
+        NodeOutcome::Cancelled => {}
+    }
+    if outcome != NodeOutcome::Completed {
+        apply_failure_policy(&mut campaign, &node_id, store, subscribers, in_flight, seams)?;
+    }
+    promote_ready(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    Ok(())
+}
+
+/// Handle core's normal-operation `AwaitingHuman` on a campaign node (DES §4 step 3, §6.5): a HITL
+/// gate opened inside the node's Run. Set the node `AwaitingHuman` (FREES its slot), surface the
+/// prompt, and `try_fill()` so independent work uses the freed slot.
+pub(crate) fn on_node_awaiting(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    run_id: &str,
+    prompt: String,
+) -> anyhow::Result<()> {
+    let Some((mut campaign, node_id)) = find_by_run(store, run_id)? else {
+        return Ok(());
+    };
+    // Only a Running node gates (ignore a stale/duplicate signal on an already-terminal/awaiting node).
+    if campaign.status_of(&node_id) != NodeStatus::Running {
+        return Ok(());
+    }
+    campaign
+        .node_status
+        .insert(node_id.clone(), NodeStatus::AwaitingHuman);
+    persist(store, &mut campaign)?;
+    emit(
+        subscribers,
+        CoreEvent::CampaignNodeAwaitingHuman {
+            campaign: campaign.id.clone(),
+            node: node_id,
+            run_id: run_id.to_string(),
+            prompt,
+        },
+    );
+    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    Ok(())
+}
+
+/// Resolve a campaign gate (DES §4 step 4, §5.2). One surface for BOTH the per-node HITL gate
+/// (`Approve`/`Reject` on an `AwaitingHuman` node) and the `HumanGateOnFailure` policy gate
+/// (`Retry`/`Skip`/`Abort` on a queued `Failed` node).
+pub(crate) fn confirm_gate(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    id: &str,
+    node_id: &str,
+    decision: CampaignGateDecision,
+) -> anyhow::Result<CampaignStatus> {
+    let mut campaign =
+        get_campaign(store, id)?.ok_or_else(|| anyhow::anyhow!("campaign not found: {id}"))?;
+    let status = campaign.status_of(node_id);
+
+    match decision {
+        // ── per-node HITL gate ──────────────────────────────────────────────────
+        CampaignGateDecision::Approve { amend } => {
+            if status != NodeStatus::AwaitingHuman {
+                anyhow::bail!("node {node_id} is not awaiting a human gate (status {status:?})");
+            }
+            // Do NOT resume core yet: store the decision, go ReadyToResume, and re-enter the dispatch
+            // queue — the node re-acquires a slot before resuming (keeps the cap a true bound, §6.5).
+            campaign
+                .pending_decision
+                .insert(node_id.to_string(), HumanDecision::Approve { amend });
+            campaign
+                .node_status
+                .insert(node_id.to_string(), NodeStatus::ReadyToResume);
+            persist(store, &mut campaign)?;
+            try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+            finalize_if_done(&mut campaign, subscribers);
+            persist(store, &mut campaign)?;
+        }
+        CampaignGateDecision::Reject => {
+            if status != NodeStatus::AwaitingHuman {
+                anyhow::bail!("node {node_id} is not awaiting a human gate (status {status:?})");
+            }
+            let run_id = campaign
+                .node_run_id
+                .get(node_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("node {node_id} has no live run"))?;
+            // Reject terminates the Run immediately (no slot needed); the ensuing RunCancelled
+            // reconciles the node via `on_run_finished` (deferred).
+            let _ = crate::actor::confirm_gate(
+                store,
+                subscribers,
+                seams.runner,
+                seams.self_tx,
+                in_flight,
+                &run_id,
+                HumanDecision::Reject,
+            );
+        }
+        // ── HumanGateOnFailure policy gate ──────────────────────────────────────
+        CampaignGateDecision::Retry => {
+            require_failure_gate(&campaign, node_id)?;
+            // Bump the attempt + set Ready; `dispatch()` derives the fresh run id from the bumped
+            // attempt (§2.1). Retry never touches node_run_id or calls LaunchRun itself.
+            *campaign.node_attempt.entry(node_id.to_string()).or_insert(0) += 1;
+            campaign
+                .node_status
+                .insert(node_id.to_string(), NodeStatus::Ready);
+            campaign.pending_failure_gates.retain(|n| n != node_id);
+            if campaign.pending_failure_gates.is_empty() {
+                campaign.status = CampaignStatus::Running;
+            }
+            persist(store, &mut campaign)?;
+            try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+            finalize_if_done(&mut campaign, subscribers);
+            persist(store, &mut campaign)?;
+        }
+        CampaignGateDecision::Skip => {
+            require_failure_gate(&campaign, node_id)?;
+            // Treat the node as terminally failed → apply continue-independent blocking.
+            campaign
+                .node_status
+                .insert(node_id.to_string(), NodeStatus::Failed);
+            campaign.pending_failure_gates.retain(|n| n != node_id);
+            apply_blocking(&mut campaign, subscribers);
+            if campaign.pending_failure_gates.is_empty() {
+                campaign.status = CampaignStatus::Running;
+            }
+            persist(store, &mut campaign)?;
+            promote_ready(&mut campaign, subscribers);
+            try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+            finalize_if_done(&mut campaign, subscribers);
+            persist(store, &mut campaign)?;
+        }
+        CampaignGateDecision::Abort => {
+            require_failure_gate(&campaign, node_id)?;
+            campaign.pending_failure_gates.retain(|n| n != node_id);
+            campaign.status = CampaignStatus::Running; // so fail-fast can cancel + finalize
+            fail_fast(&mut campaign, node_id, store, subscribers, in_flight, seams)?;
+            finalize_if_done(&mut campaign, subscribers);
+            persist(store, &mut campaign)?;
+        }
+    }
+    Ok(campaign.status)
+}
+
+/// `PauseCampaign` (DES §4 step 6): stop dispatching new nodes; in-flight continue cooperatively.
+pub(crate) fn pause(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    id: &str,
+) -> anyhow::Result<CampaignStatus> {
+    let mut campaign =
+        get_campaign(store, id)?.ok_or_else(|| anyhow::anyhow!("campaign not found: {id}"))?;
+    if campaign.status == CampaignStatus::Running {
+        campaign.status = CampaignStatus::Paused;
+        persist(store, &mut campaign)?;
+        emit(subscribers, CoreEvent::CampaignPaused { campaign: id.to_string() });
+    }
+    Ok(campaign.status)
+}
+
+/// `CancelCampaign` (DES §4 step 5): set `Cancelled` FIRST (so any in-flight `RunFinished` hits the
+/// terminal-skip guard and `try_fill`'s status guard), `CancelRun` every live node, mark the rest
+/// `Cancelled`.
+pub(crate) fn cancel(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    id: &str,
+) -> anyhow::Result<CampaignStatus> {
+    let mut campaign =
+        get_campaign(store, id)?.ok_or_else(|| anyhow::anyhow!("campaign not found: {id}"))?;
+    if matches!(
+        campaign.status,
+        CampaignStatus::Completed | CampaignStatus::Failed | CampaignStatus::Cancelled
+    ) {
+        return Ok(campaign.status);
+    }
+    campaign.status = CampaignStatus::Cancelled;
+    persist(store, &mut campaign)?;
+
+    let live: Vec<String> = campaign
+        .node_status
+        .iter()
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                NodeStatus::Running | NodeStatus::AwaitingHuman | NodeStatus::ReadyToResume
+            )
+        })
+        .filter_map(|(n, _)| campaign.node_run_id.get(n).cloned())
+        .collect();
+    let non_terminal: Vec<String> = campaign
+        .node_status
+        .iter()
+        .filter(|(_, s)| !s.is_terminal())
+        .map(|(n, _)| n.clone())
+        .collect();
+    for n in &non_terminal {
+        campaign.node_status.insert(n.clone(), NodeStatus::Cancelled);
+    }
+    persist(store, &mut campaign)?;
+    for rid in &live {
+        let _ = crate::actor::cancel_run(store, subscribers, seams.self_tx, rid);
+        in_flight.remove(rid);
+    }
+    emit(subscribers, CoreEvent::CampaignCancelled { campaign: id.to_string() });
+    Ok(CampaignStatus::Cancelled)
+}
+
+/// `ResumeCampaign` / crash-resume (DES §6): reload from the store (authoritative statuses), re-derive
+/// the ready set, re-attach any mid-run node, and fill. Never re-runs a terminal node; never
+/// duplicates (the run id is derived, and `dispatch()` is the sole writer of `node_run_id`).
+pub(crate) fn resume(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+    id: &str,
+) -> anyhow::Result<CampaignStatus> {
+    let mut campaign =
+        get_campaign(store, id)?.ok_or_else(|| anyhow::anyhow!("campaign not found: {id}"))?;
+    if matches!(
+        campaign.status,
+        CampaignStatus::Completed | CampaignStatus::Failed | CampaignStatus::Cancelled
+    ) {
+        return Ok(campaign.status);
+    }
+    // A Paused campaign (operator pause, or human-gate-on-failure with no outstanding gate) resumes to
+    // Running; a crashed Running campaign stays Running.
+    if campaign.status == CampaignStatus::Paused && campaign.pending_failure_gates.is_empty() {
+        campaign.status = CampaignStatus::Running;
+    }
+
+    // Re-attach nodes that were mid-run when the process died: LaunchRun is unavailable (clobber guard
+    // on a non-terminal run), so ResumeRun by id — core's completion sentinel decides re-run vs apply.
+    let running: Vec<(String, String)> = campaign
+        .node_status
+        .iter()
+        .filter(|(_, s)| **s == NodeStatus::Running)
+        .filter_map(|(n, _)| campaign.node_run_id.get(n).map(|r| (n.clone(), r.clone())))
+        .collect();
+    persist(store, &mut campaign)?;
+    for (_node, run_id) in &running {
+        // Idempotent: an already-in-flight run returns busy (harmless); a completed run is a no-op.
+        let _ = crate::actor::resume_run_inner(
+            store,
+            subscribers,
+            seams.runner,
+            seams.self_tx,
+            in_flight,
+            run_id,
+        );
+    }
+
+    promote_ready(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    Ok(campaign.status)
+}
+
+/// Apply the campaign's `FailurePolicy` to a node that ended `Failed`/`Cancelled` (DES §5.2).
+fn apply_failure_policy(
+    campaign: &mut Campaign,
+    failed_node: &str,
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+) -> anyhow::Result<()> {
+    match campaign.def.policy {
+        FailurePolicy::FailFast => {
+            fail_fast(campaign, failed_node, store, subscribers, in_flight, seams)?;
+        }
+        FailurePolicy::ContinueIndependent => {
+            apply_blocking(campaign, subscribers);
+        }
+        FailurePolicy::HumanGateOnFailure => {
+            // Enqueue this failure (ordered by node_id); a later failure on an already-Paused campaign
+            // appends rather than being lost or overwriting (§5.2 SIG-4b).
+            if !campaign
+                .pending_failure_gates
+                .iter()
+                .any(|n| n == failed_node)
+            {
+                campaign.pending_failure_gates.push(failed_node.to_string());
+                campaign.pending_failure_gates.sort();
+            }
+            if campaign.status == CampaignStatus::Running {
+                campaign.status = CampaignStatus::Paused;
+                emit(
+                    subscribers,
+                    CoreEvent::CampaignPaused {
+                        campaign: campaign.id.clone(),
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fail-fast (DES §5.2): cancel every live node's Run (`Running`/`AwaitingHuman`/`ReadyToResume` — a
+/// `ReadyToResume` node's Run is paused at an open gate and must be cancelled too, matching
+/// `CancelCampaign`, else it lingers as a zombie), mark all non-terminal `Cancelled`, trip the
+/// fail-fast flag so `finalize()` lands on `Failed`.
+fn fail_fast(
+    campaign: &mut Campaign,
+    _failed_node: &str,
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+) -> anyhow::Result<()> {
+    campaign.fail_fast_tripped = true;
+    let live: Vec<String> = campaign
+        .node_status
+        .iter()
+        .filter(|(_, s)| {
+            matches!(
+                s,
+                NodeStatus::Running | NodeStatus::AwaitingHuman | NodeStatus::ReadyToResume
+            )
+        })
+        .filter_map(|(n, _)| campaign.node_run_id.get(n).cloned())
+        .collect();
+    let non_terminal: Vec<String> = campaign
+        .node_status
+        .iter()
+        .filter(|(_, s)| !s.is_terminal())
+        .map(|(n, _)| n.clone())
+        .collect();
+    for n in &non_terminal {
+        campaign.node_status.insert(n.clone(), NodeStatus::Cancelled);
+    }
+    persist(store, campaign)?;
+    for rid in &live {
+        let _ = crate::actor::cancel_run(store, subscribers, seams.self_tx, rid);
+        in_flight.remove(rid);
+    }
+    Ok(())
+}
+
+/// Recompute `blocked_by_failure` and mark newly-blocked nodes `Blocked` (emit `CampaignNodeBlocked`).
+fn apply_blocking(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
+    let blocked = blocked_by_failure(&campaign.def.nodes, &campaign.def.edges, &campaign.node_status);
+    for node in blocked {
+        if campaign.status_of(&node) != NodeStatus::Blocked {
+            campaign.node_status.insert(node.clone(), NodeStatus::Blocked);
+            emit(
+                subscribers,
+                CoreEvent::CampaignNodeBlocked {
+                    campaign: campaign.id.clone(),
+                    node,
+                },
+            );
+        }
+    }
+}
+
+/// Finalize the campaign when no further progress is possible (DES §4 step 2): no `Running`, no
+/// `AwaitingHuman`/`ReadyToResume`, and nothing dispatchable. `Completed` if all nodes `Completed`;
+/// `Failed` if fail-fast tripped; else `PartiallyCompleted` (some blocked/failed under
+/// continue-independent). No-op while Paused/terminal (guarded on `Running`).
+fn finalize_if_done(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
+    if campaign.status != CampaignStatus::Running {
+        return;
+    }
+    let any_running = campaign
+        .node_status
+        .values()
+        .any(|s| *s == NodeStatus::Running);
+    let any_waiting = campaign
+        .node_status
+        .values()
+        .any(|s| matches!(s, NodeStatus::AwaitingHuman | NodeStatus::ReadyToResume));
+    if any_running || any_waiting || !campaign.dispatchable().is_empty() {
+        return;
+    }
+    let all_completed = campaign
+        .node_status
+        .values()
+        .all(|s| *s == NodeStatus::Completed);
+    if all_completed {
+        campaign.status = CampaignStatus::Completed;
+        emit(subscribers, CoreEvent::CampaignCompleted { campaign: campaign.id.clone() });
+    } else if campaign.fail_fast_tripped {
+        campaign.status = CampaignStatus::Failed;
+        emit(subscribers, CoreEvent::CampaignFailed { campaign: campaign.id.clone() });
+    } else {
+        campaign.status = CampaignStatus::PartiallyCompleted;
+        emit(subscribers, CoreEvent::CampaignCompleted { campaign: campaign.id.clone() });
+    }
+}
+
+/// Inverse-lookup the non-terminal campaign + node that owns `run_id` (bounded linear scan, §4 step 2).
+fn find_by_run(
+    store: &SqliteStore,
+    run_id: &str,
+) -> anyhow::Result<Option<(Campaign, String)>> {
+    for campaign in all_campaigns(store)? {
+        if matches!(
+            campaign.status,
+            CampaignStatus::Completed | CampaignStatus::Failed | CampaignStatus::Cancelled
+        ) {
+            continue;
+        }
+        if let Some((node, _)) = campaign.node_run_id.iter().find(|(_, rid)| rid.as_str() == run_id) {
+            let node = node.clone();
+            return Ok(Some((campaign, node)));
+        }
+    }
+    Ok(None)
+}
+
+/// Guard: the node must have an outstanding `HumanGateOnFailure` decision.
+fn require_failure_gate(campaign: &Campaign, node_id: &str) -> anyhow::Result<()> {
+    if !campaign.pending_failure_gates.iter().any(|n| n == node_id) {
+        anyhow::bail!("node {node_id} has no pending failure gate");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

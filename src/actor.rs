@@ -178,123 +178,27 @@ pub(crate) fn run(
                 ));
             }
             Command::LaunchRun { spec, reply } => {
-                let run_id = spec.session_id.clone();
-                if in_flight.contains(&run_id) {
-                    let _ = reply.send(Err(RunBusy(run_id).into()));
-                    continue;
-                }
-                // Clobber guard: refuse to re-plan over an existing NON-TERMINAL run (e.g. a paused
-                // one) — re-planning would reset its cursor and wipe its state. Resume it instead.
-                if let Ok(Some(existing)) = crate::domain::get_session(&store, &run_id) {
-                    if !matches!(
-                        existing.status,
-                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
-                    ) {
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "run {run_id} already exists (status {:?}); resume or cancel it, or use a new id",
-                            existing.status
-                        )));
-                        continue;
-                    }
-                }
-                // If the run targets a registered repo, create its isolated worktree first.
-                let (repo_ref, workdir) = match resolve_workdir(&store, &spec.repo_ref, &run_id) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                        continue;
-                    }
-                };
-                // Plan + distribute synchronously (fast store writes), then advance unit 0 off-thread
-                // (or pause at a gate, per the run's human-confirm policy).
-                let planned = pipeline::plan_and_distribute(
+                let res = launch_run_inner(
                     &mut store,
-                    &spec.clis,
-                    &spec.problem,
-                    spec.entity_mode,
-                    &run_id,
-                    spec.human_confirm,
-                    repo_ref,
-                    workdir,
+                    &mut subscribers,
                     &dispatcher,
-                    &mut |ev| emit(&mut subscribers, ev),
+                    &runner,
+                    &self_tx,
+                    &mut in_flight,
+                    spec,
                 );
-                match planned {
-                    Ok(_) => {
-                        match advance_or_pause(
-                            &mut store,
-                            &mut subscribers,
-                            &runner,
-                            &self_tx,
-                            &run_id,
-                            0,
-                        ) {
-                            Ok(Progress::Dispatched) => {
-                                in_flight.insert(run_id.clone());
-                            }
-                            Ok(Progress::Paused) => {} // paused at a gate — not in flight
-                            Ok(Progress::Done) => {
-                                if let Err(e) = finalize_run(&mut store, &mut subscribers, &run_id)
-                                {
-                                    emit_run_error(&mut subscribers, &run_id, e);
-                                }
-                            }
-                            Err(e) => emit_run_error(&mut subscribers, &run_id, e),
-                        }
-                        let _ = reply.send(Ok(run_id));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                    }
-                }
+                let _ = reply.send(res);
             }
             Command::ResumeRun { run_id, reply } => {
-                if in_flight.contains(&run_id) {
-                    let _ = reply.send(Err(RunBusy(run_id).into()));
-                    continue;
-                }
-                let session = match crate::domain::get_session(&store, &run_id) {
-                    Ok(Some(s)) => s,
-                    Ok(None) => {
-                        let _ = reply.send(Err(anyhow::anyhow!("run not found: {run_id}")));
-                        continue;
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                        continue;
-                    }
-                };
-                if matches!(
-                    session.status,
-                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
-                ) {
-                    let _ = reply.send(Ok(session.status));
-                    continue;
-                }
-                // Re-advance from the persisted cursor (dispatch the next unit, or pause at its gate).
-                match advance_or_pause(
+                let res = resume_run_inner(
                     &mut store,
                     &mut subscribers,
                     &runner,
                     &self_tx,
+                    &mut in_flight,
                     &run_id,
-                    session.unit_ix,
-                ) {
-                    Ok(Progress::Dispatched) => {
-                        in_flight.insert(run_id.clone());
-                        let _ = reply.send(Ok(SessionStatus::Executing));
-                    }
-                    Ok(Progress::Paused) => {
-                        let _ = reply.send(Ok(SessionStatus::AwaitingHuman));
-                    }
-                    Ok(Progress::Done) => {
-                        let res = finalize_run(&mut store, &mut subscribers, &run_id);
-                        let _ = reply.send(res.map(|()| SessionStatus::Completed));
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                    }
-                }
+                );
+                let _ = reply.send(res);
             }
             Command::ApplyStepResult { output } => {
                 let run_id = output.run_id.clone();
@@ -336,7 +240,7 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelRun { run_id, reply } => {
-                let res = cancel_run(&mut store, &mut subscribers, &run_id);
+                let res = cancel_run(&mut store, &mut subscribers, &self_tx, &run_id);
                 in_flight.remove(&run_id);
                 let _ = reply.send(res);
             }
@@ -514,6 +418,99 @@ pub(crate) fn run(
                 // Natural EOF: the child exited on its own. Reap + emit `TerminalExited` (once).
                 finish_terminal(&mut terminals, &pty_map, &mut subscribers, &id, false);
             }
+            // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
+            Command::LaunchCampaign { def, reply } => {
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let res = crate::campaign::launch(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    def,
+                );
+                let _ = reply.send(res);
+            }
+            Command::ResumeCampaign { id, reply } => {
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let res = crate::campaign::resume(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    &id,
+                );
+                let _ = reply.send(res);
+            }
+            Command::CancelCampaign { id, reply } => {
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let res = crate::campaign::cancel(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    &id,
+                );
+                let _ = reply.send(res);
+            }
+            Command::PauseCampaign { id, reply } => {
+                let res = crate::campaign::pause(&mut store, &mut subscribers, &id);
+                let _ = reply.send(res);
+            }
+            Command::ConfirmCampaignGate {
+                id,
+                node_id,
+                decision,
+                reply,
+            } => {
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let res = crate::campaign::confirm_gate(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    &id,
+                    &node_id,
+                    decision,
+                );
+                let _ = reply.send(res);
+            }
+            Command::CampaignStatusQuery { id, reply } => {
+                let res = crate::campaign::get_campaign(&store, &id).map(|c| c.map(|c| c.status));
+                let _ = reply.send(res);
+            }
+            Command::CampaignDetailQuery { id, reply } => {
+                let res = crate::campaign::get_campaign(&store, &id);
+                let _ = reply.send(res);
+            }
+            Command::CampaignRunFinished { run_id, outcome } => {
+                // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
+                // points). No-op if the run isn't campaign-owned.
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                if let Err(e) = crate::campaign::on_run_finished(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    &run_id,
+                    outcome,
+                ) {
+                    emit_run_error(&mut subscribers, &run_id, e);
+                }
+            }
+            Command::CampaignNodeAwaiting { run_id, prompt } => {
+                // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                if let Err(e) = crate::campaign::on_node_awaiting(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    &run_id,
+                    prompt,
+                ) {
+                    emit_run_error(&mut subscribers, &run_id, e);
+                }
+            }
             Command::Shutdown => {
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
@@ -588,6 +585,123 @@ enum Progress {
     Done,
 }
 
+/// Bundle the engine seams for the campaign driver (DES-CAMPAIGN-001).
+fn campaign_seams<'a>(
+    dispatcher: &'a Arc<dyn Dispatcher + Send + Sync>,
+    runner: &'a Arc<dyn StepRunner>,
+    self_tx: &'a Sender<Command>,
+) -> crate::campaign::Seams<'a> {
+    crate::campaign::Seams {
+        dispatcher,
+        runner,
+        self_tx,
+    }
+}
+
+/// Notify the campaign layer that a Run reached a terminal state (DES §3): the reconciler maps core's
+/// `SessionCompleted`/`SessionFailed`/`RunCancelled` onto a node outcome. Sent to the actor's own
+/// queue (`self_tx`) so reconciliation runs as a normal command AFTER the current one — no
+/// re-entrancy. Always sent (a non-campaign run is a cheap no-op inverse-lookup on the other side).
+fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::campaign::NodeOutcome) {
+    let _ = self_tx.send(Command::CampaignRunFinished {
+        run_id: run_id.to_string(),
+        outcome,
+    });
+}
+
+/// The body of `Command::LaunchRun` (also the campaign driver's node launcher, DES §4). Plans +
+/// distributes synchronously, then advances unit 0 off-thread (or pauses at a gate). Idempotent by
+/// run id: refuses to re-plan over a live run (resume it instead). Returns the run id.
+pub(crate) fn launch_run_inner(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    spec: LaunchSpec,
+) -> anyhow::Result<String> {
+    let run_id = spec.session_id.clone();
+    if in_flight.contains(&run_id) {
+        return Err(RunBusy(run_id).into());
+    }
+    // Clobber guard: refuse to re-plan over an existing NON-TERMINAL run (would reset its cursor).
+    if let Ok(Some(existing)) = crate::domain::get_session(store, &run_id) {
+        if !matches!(
+            existing.status,
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+        ) {
+            anyhow::bail!(
+                "run {run_id} already exists (status {:?}); resume or cancel it, or use a new id",
+                existing.status
+            );
+        }
+    }
+    // If the run targets a registered repo, create its isolated worktree first.
+    let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
+    pipeline::plan_and_distribute(
+        store,
+        &spec.clis,
+        &spec.problem,
+        spec.entity_mode,
+        &run_id,
+        spec.human_confirm,
+        repo_ref,
+        workdir,
+        dispatcher,
+        &mut |ev| emit(subscribers, ev),
+    )?;
+    match advance_or_pause(store, subscribers, runner, self_tx, &run_id, 0) {
+        Ok(Progress::Dispatched) => {
+            in_flight.insert(run_id.clone());
+        }
+        Ok(Progress::Paused) => {} // paused at a gate — not in flight
+        Ok(Progress::Done) => {
+            if let Err(e) = finalize_run(store, subscribers, self_tx, &run_id) {
+                emit_run_error(subscribers, &run_id, e);
+            }
+        }
+        Err(e) => emit_run_error(subscribers, &run_id, e),
+    }
+    Ok(run_id)
+}
+
+/// The body of `Command::ResumeRun` (also the campaign driver's crash-resume re-attach, DES §6).
+/// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
+pub(crate) fn resume_run_inner(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+) -> anyhow::Result<SessionStatus> {
+    if in_flight.contains(run_id) {
+        return Err(RunBusy(run_id.to_string()).into());
+    }
+    let session = match crate::domain::get_session(store, run_id)? {
+        Some(s) => s,
+        None => anyhow::bail!("run not found: {run_id}"),
+    };
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) {
+        return Ok(session.status);
+    }
+    match advance_or_pause(store, subscribers, runner, self_tx, run_id, session.unit_ix)? {
+        Progress::Dispatched => {
+            in_flight.insert(run_id.to_string());
+            Ok(SessionStatus::Executing)
+        }
+        Progress::Paused => Ok(SessionStatus::AwaitingHuman),
+        Progress::Done => {
+            finalize_run(store, subscribers, self_tx, run_id)?;
+            Ok(SessionStatus::Completed)
+        }
+    }
+}
+
 /// Apply one worker step's output on the single-writer thread: gate the unit, advance the cursor,
 /// and either dispatch the next unit or finalize the run.
 ///
@@ -637,6 +751,7 @@ fn apply_step_result(
                 session: run_id.clone(),
             },
         );
+        notify_campaign(self_tx, &run_id, crate::campaign::NodeOutcome::Cancelled);
         return Ok(StepApplied::Finished);
     }
     // A worker FAILURE halts the run as `Failed` (the run-level contract: never complete past a
@@ -652,7 +767,7 @@ fn apply_step_result(
             format!("Worker FAILED on unit {ord}: {snippet}")
         });
         put_node(store, unit.to_node())?;
-        return Ok(fail_run(store, subscribers, &mut session, ord));
+        return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
     }
 
     let cli_keys = session.clis.clone();
@@ -673,7 +788,7 @@ fn apply_step_result(
     // past a rejection into a silent `Completed`. (`apply_and_finish_unit` already emitted UnitDenied
     // + persisted the Rejected unit.)
     if !outcome.approved {
-        return Ok(fail_run(store, subscribers, &mut session, ord));
+        return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
     }
 
     // Approved → advance the resume cursor past the unit we just applied.
@@ -693,7 +808,7 @@ fn apply_step_result(
         Progress::Dispatched => Ok(StepApplied::Continuing),
         Progress::Paused => Ok(StepApplied::Paused),
         Progress::Done => {
-            finalize_run(store, subscribers, &run_id)?;
+            finalize_run(store, subscribers, self_tx, &run_id)?;
             Ok(StepApplied::Finished)
         }
     }
@@ -704,6 +819,7 @@ fn apply_step_result(
 fn fail_run(
     store: &mut SqliteStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
+    self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
     ord: u32,
 ) -> StepApplied {
@@ -716,6 +832,7 @@ fn fail_run(
             ord,
         },
     );
+    notify_campaign(self_tx, &session.id, crate::campaign::NodeOutcome::Failed);
     StepApplied::Finished
 }
 
@@ -749,9 +866,16 @@ fn advance_or_pause(
             CoreEvent::AwaitingHuman {
                 session: run_id.to_string(),
                 ord: unit.ord,
-                prompt,
+                prompt: prompt.clone(),
             },
         );
+        // If this run is a campaign node, the campaign frees the node's slot for independent work
+        // (DES §6.5). Deferred to a normal command so reconciliation isn't re-entrant; a non-campaign
+        // run is a cheap no-op inverse-lookup on the other side.
+        let _ = self_tx.send(Command::CampaignNodeAwaiting {
+            run_id: run_id.to_string(),
+            prompt,
+        });
         return Ok(Progress::Paused);
     }
 
@@ -850,6 +974,7 @@ fn dispatch_unit(
 fn finalize_run(
     store: &mut SqliteStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
+    self_tx: &Sender<Command>,
     run_id: &str,
 ) -> anyhow::Result<()> {
     if let Some(mut session) = crate::domain::get_session(store, run_id)? {
@@ -862,6 +987,7 @@ fn finalize_run(
             session: run_id.to_string(),
         },
     );
+    notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Completed);
     Ok(())
 }
 
@@ -869,7 +995,7 @@ fn finalize_run(
 /// unit's instruction) clears the pause and dispatches the unit at the cursor directly (no re-pause
 /// on it); `Reject` cancels the run.
 #[allow(clippy::too_many_arguments)]
-fn confirm_gate(
+pub(crate) fn confirm_gate(
     store: &mut SqliteStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
@@ -889,7 +1015,7 @@ fn confirm_gate(
 
     match decision {
         crate::workflow::HumanDecision::Reject => {
-            let s = cancel_run(store, subscribers, run_id)?;
+            let s = cancel_run(store, subscribers, self_tx, run_id)?;
             in_flight.remove(run_id);
             Ok(s)
         }
@@ -921,7 +1047,7 @@ fn confirm_gate(
                 Ok(true) => Ok(SessionStatus::Executing),
                 Ok(false) => {
                     in_flight.remove(run_id);
-                    finalize_run(store, subscribers, run_id)?;
+                    finalize_run(store, subscribers, self_tx, run_id)?;
                     Ok(SessionStatus::Completed)
                 }
                 Err(e) => {
@@ -936,14 +1062,15 @@ fn confirm_gate(
 /// Mark a run terminally `Cancelled` and emit `RunCancelled` (a no-op status change on an already
 /// terminal run). A late worker result for a cancelled run is discarded by `apply_step_result`'s
 /// terminal guard.
-fn cancel_run(
+pub(crate) fn cancel_run(
     store: &mut SqliteStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
+    self_tx: &Sender<Command>,
     run_id: &str,
 ) -> anyhow::Result<SessionStatus> {
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
-    // Already terminal: report the status, do NOT re-emit a terminal event.
+    // Already terminal: report the status, do NOT re-emit a terminal event (or re-notify a campaign).
     match session.status {
         SessionStatus::Completed => return Ok(SessionStatus::Completed), // cannot cancel a finished run
         SessionStatus::Cancelled => return Ok(SessionStatus::Cancelled),
@@ -965,6 +1092,7 @@ fn cancel_run(
             session: run_id.to_string(),
         },
     );
+    notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Cancelled);
     Ok(SessionStatus::Cancelled)
 }
 

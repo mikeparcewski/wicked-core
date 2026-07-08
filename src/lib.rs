@@ -274,6 +274,111 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────
+
+    /// Validate + launch a [`CampaignDef`] — a DAG of Runs. Independent nodes dispatch immediately;
+    /// a dependent node dispatches the instant its deps reach their completion condition, bounded by
+    /// `max_concurrency`. Fire-and-forget: returns the campaign id; progress arrives as `Campaign*`
+    /// [`CoreEvent`]s (`subscribe()` first). Rejects a cycle / empty / duplicate-edge def at launch.
+    pub fn launch_campaign(&self, def: CampaignDef) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::LaunchCampaign { def, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Resume a campaign from its persisted state (after a pause, crash, or a fresh process) — the
+    /// scheduler re-derives the ready set from the persisted terminal statuses and re-attaches any
+    /// mid-run node, never re-running a completed node or duplicating.
+    pub fn resume_campaign(&self, id: &str) -> anyhow::Result<CampaignStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ResumeCampaign {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Cancel a campaign — cancel every in-flight node's Run and mark the rest `Cancelled`.
+    pub fn cancel_campaign(&self, id: &str) -> anyhow::Result<CampaignStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CancelCampaign {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Pause a campaign — dispatch no new nodes; in-flight nodes continue cooperatively.
+    /// `resume_campaign` re-enables dispatch.
+    pub fn pause_campaign(&self, id: &str) -> anyhow::Result<CampaignStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::PauseCampaign {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Resolve a campaign gate. A per-node HITL gate uses [`CampaignGateDecision::Approve`] /
+    /// [`CampaignGateDecision::Reject`] (the node is `AwaitingHuman`); the `HumanGateOnFailure` policy
+    /// gate uses `Retry` / `Skip` / `Abort` (the node `Failed` and is queued).
+    pub fn confirm_campaign_gate(
+        &self,
+        id: &str,
+        node_id: &str,
+        decision: CampaignGateDecision,
+    ) -> anyhow::Result<CampaignStatus> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ConfirmCampaignGate {
+                id: id.to_string(),
+                node_id: node_id.to_string(),
+                decision,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// A campaign's lifecycle status (`None` if the id is unknown).
+    pub fn campaign_status(&self, id: &str) -> anyhow::Result<Option<CampaignStatus>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CampaignStatusQuery {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// A campaign's full state (DAG + per-node statuses + run ids) — the read a DAG view builds from.
+    pub fn campaign_detail(&self, id: &str) -> anyhow::Result<Option<Campaign>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CampaignDetailQuery {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// Register a deny policy (real governance) through the actor — blocks any tool-call in `phase`
     /// whose context contains `trigger` (literal). Single-writer; persists on the shared store.
     pub fn register_deny_policy(&self, phase: &str, trigger: &str) -> anyhow::Result<()> {
