@@ -699,6 +699,34 @@ pub(crate) fn resume_run_inner(
     ) {
         return Ok(session.status);
     }
+    // R1 — crash-during-planning guard. A crash between `plan_and_distribute`'s `session=Planning`
+    // write and the first unit write (or anywhere before `Executing`) leaves the session in a
+    // PRE-EXECUTION status with no complete, distributed unit plan on the store. Advancing from the
+    // cursor would hit `units.get(0) == None → Progress::Done → finalize_run` and mis-finalize a run
+    // that NEVER planned as `Completed` — a campaign node then reconciles Completed having done zero
+    // work (DES §6: resume never re-runs a done node, but a never-planned node is not done). A run
+    // that never planned is not "done": fail it. This matches core's run-level contract (halt +
+    // operator relaunch, never auto-complete past an incomplete plan) and is the single primitive
+    // shared by standalone `ResumeRun` AND the campaign driver's mid-flight re-attach — for a campaign
+    // node the ensuing `notify_campaign(Failed)` reconciles it Failed through the same
+    // `reconcile_terminal → apply_failure_policy` path as any run failure.
+    if matches!(
+        session.status,
+        SessionStatus::Planning | SessionStatus::Distributing
+    ) {
+        let mut session = session;
+        session.status = SessionStatus::Failed;
+        put_node(store, session.to_node())?;
+        emit(
+            subscribers,
+            CoreEvent::SessionFailed {
+                session: run_id.to_string(),
+                ord: 0,
+            },
+        );
+        notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Failed);
+        return Ok(SessionStatus::Failed);
+    }
     match advance_or_pause(store, subscribers, runner, self_tx, run_id, session.unit_ix)? {
         Progress::Dispatched => {
             in_flight.insert(run_id.to_string());

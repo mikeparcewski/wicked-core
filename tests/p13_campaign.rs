@@ -548,13 +548,20 @@ fn sc_c6_crash_resume_never_reruns_a_completed_node() {
 /// node left `Running` at crash (with its derived run id recorded); every other node is `Pending`;
 /// the campaign is `Running`. Models the exact on-store state a mid-dispatch SIGKILL leaves behind.
 fn craft_campaign(def: CampaignDef, running: &str) -> Campaign {
+    craft_campaign_at(def, running, NodeStatus::Running)
+}
+
+/// Like [`craft_campaign`] but the crash-artifact node is left at an arbitrary non-terminal `status`
+/// — `Running` for a mid-dispatch crash, `AwaitingHuman`/`ReadyToResume` for a gate crash. Its
+/// derived run id is recorded; every other node is `Pending`; the campaign is `Running`.
+fn craft_campaign_at(def: CampaignDef, node: &str, status: NodeStatus) -> Campaign {
     let cid = def.id.clone();
     let node_status = def
         .nodes
         .iter()
         .map(|n| {
-            let s = if n.node_id == running {
-                NodeStatus::Running
+            let s = if n.node_id == node {
+                status
             } else {
                 NodeStatus::Pending
             };
@@ -562,7 +569,7 @@ fn craft_campaign(def: CampaignDef, running: &str) -> Campaign {
         })
         .collect();
     let mut node_run_id = BTreeMap::new();
-    node_run_id.insert(running.to_string(), format!("{cid}:{running}:a0"));
+    node_run_id.insert(node.to_string(), format!("{cid}:{node}:a0"));
     Campaign {
         id: cid.clone(),
         def_id: cid,
@@ -578,9 +585,11 @@ fn craft_campaign(def: CampaignDef, running: &str) -> Campaign {
     }
 }
 
-/// A minimal `AgentSession` already at `Completed` — the terminal session an interrupted node's Run
-/// had written before the crash (resume only reads its status to pick the reconcile outcome).
-fn completed_session(run_id: &str) -> AgentSession {
+/// A minimal `AgentSession` at an arbitrary `status` — the persisted session an interrupted node's
+/// Run had written before the crash (resume reads its status to pick the reconcile outcome). A
+/// pre-execution `Planning`/`Distributing` session models a mid-plan crash (no `WorkUnit` nodes are
+/// written by the caller, so `session_units` is empty — the R1 window).
+fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
     AgentSession {
         id: run_id.to_string(),
         workflow_id: format!("wf-{run_id}"),
@@ -588,13 +597,18 @@ fn completed_session(run_id: &str) -> AgentSession {
         entity_mode: EntityMode::Shared,
         collection_scope: None,
         clis: vec![],
-        status: SessionStatus::Completed,
+        status,
         human_confirm: HumanConfirm::None,
-        unit_ix: 1,
+        unit_ix: 0,
         attempt: 0,
         workdir: None,
         repo_ref: None,
     }
+}
+
+/// A minimal `AgentSession` already at `Completed` (F1a's terminal artifact).
+fn completed_session(run_id: &str) -> AgentSession {
+    session_with(run_id, SessionStatus::Completed)
 }
 
 // ── SC-C6 / F1a — resume reconciles a node whose SESSION finished before the crash ──
@@ -688,5 +702,295 @@ fn sc_c6_f1b_resume_launches_a_node_whose_session_was_never_written() {
     assert!(
         ran_b.iter().any(|r| *r == rid(c, "Y")),
         "the dependent Y runs after X completes, got {ran_b:?}"
+    );
+}
+
+// ── SC-C6 / R1 — resume FAILS a node whose Run crashed mid-PLANNING (session=Planning, 0 units) ──
+// Crash window: `plan_and_distribute` writes `session=Planning` (pipeline.rs) BEFORE persisting the
+// first unit. A crash there leaves `session=Planning` with ZERO units. The old resume advanced the
+// cursor → `advance_or_pause` found `units.get(0)==None → Progress::Done → finalize_run` and
+// mis-finalized a run (and its campaign node) as COMPLETED having planned nothing. Resume must FAIL a
+// never-planned run instead, so the node reconciles Failed and its OnSuccess dependents are blocked —
+// a run that never planned is not "done". This is the core resume primitive, shared with standalone
+// `resume_run`.
+#[test]
+fn sc_c6_r1_resume_fails_a_node_that_crashed_mid_planning() {
+    let db = tmp_db("c6-r1");
+    let c = "camp6r1";
+
+    let def = CampaignDef {
+        id: c.into(),
+        name: "r1".into(),
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Y", HumanConfirm::None),
+            cnode("W", HumanConfirm::None),
+        ],
+        edges: vec![edge("X", "Y")], // Y OnSuccess-depends on X; W is independent
+        policy: FailurePolicy::ContinueIndependent,
+        max_concurrency: 3,
+    };
+    // Craft: node X persisted `Running`, its session at `Planning` with NO units written — the exact
+    // mid-plan crash artifact (a session in `Planning`/`Distributing` never finished a distributed plan).
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(&mut store, craft_campaign(def, "X").to_node()).expect("persist campaign");
+        put_node(
+            &mut store,
+            session_with(&rid(c, "X"), SessionStatus::Planning).to_node(),
+        )
+        .expect("persist Planning session");
+    }
+
+    let (ctl_b, h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+    assert!(
+        wait_campaign(&core_b, c, CampaignStatus::PartiallyCompleted),
+        "a never-planned node fails; its independent branch completes → PartiallyCompleted (not Completed)"
+    );
+    assert_eq!(
+        node_status(&core_b, c, "X"),
+        Some(NodeStatus::Failed),
+        "the mid-plan-crashed node is reconciled Failed, NOT mis-finalized Completed"
+    );
+    assert_eq!(
+        node_status(&core_b, c, "Y"),
+        Some(NodeStatus::Blocked),
+        "X's OnSuccess dependent Y is blocked, never promoted behind a phantom completion"
+    );
+    assert_eq!(node_status(&core_b, c, "W"), Some(NodeStatus::Completed));
+    let ran_b = h_b.ran.lock().unwrap().clone();
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "X")),
+        "X never planned; resume must not run it, got {ran_b:?}"
+    );
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "Y")),
+        "the blocked dependent Y must not run, got {ran_b:?}"
+    );
+}
+
+// ── SC-C6 / R2 — resume reconciles a node stuck AwaitingHuman whose Run was Cancelled by a Reject ──
+// Crash window: campaign `confirm_gate(Reject)` → core `cancel_run` persists `session=Cancelled` and
+// DEFERS the node reconcile to `CampaignRunFinished`. A crash in between leaves `session=Cancelled,
+// node=AwaitingHuman` — the symmetric twin of F1a, which the `Running`-only re-derivation never
+// revisited (the node stays wedged and `finalize_if_done`'s `any_waiting` guard never clears). Resume
+// must reconcile the node from its terminal session.
+#[test]
+fn sc_c6_r2_resume_reconciles_an_awaiting_human_node_whose_run_was_cancelled() {
+    let db = tmp_db("c6-r2");
+    let c = "camp6r2";
+
+    let def = CampaignDef {
+        id: c.into(),
+        name: "r2".into(),
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Y", HumanConfirm::None),
+            cnode("W", HumanConfirm::None),
+        ],
+        edges: vec![edge("X", "Y")],
+        policy: FailurePolicy::ContinueIndependent,
+        max_concurrency: 3,
+    };
+    // Craft: node X persisted `AwaitingHuman`, its session ALREADY `Cancelled` (the Reject terminal
+    // write) — but the deferred `CampaignRunFinished` never landed.
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(
+            &mut store,
+            craft_campaign_at(def, "X", NodeStatus::AwaitingHuman).to_node(),
+        )
+        .expect("persist campaign");
+        put_node(
+            &mut store,
+            session_with(&rid(c, "X"), SessionStatus::Cancelled).to_node(),
+        )
+        .expect("persist Cancelled session");
+    }
+
+    let (ctl_b, h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+    assert!(
+        wait_campaign(&core_b, c, CampaignStatus::PartiallyCompleted),
+        "the stuck AwaitingHuman node reconciles Cancelled; the campaign is no longer wedged"
+    );
+    assert_eq!(
+        node_status(&core_b, c, "X"),
+        Some(NodeStatus::Cancelled),
+        "X reconciles from its terminal (Cancelled) session, not stranded AwaitingHuman"
+    );
+    assert_eq!(
+        node_status(&core_b, c, "Y"),
+        Some(NodeStatus::Blocked),
+        "X's OnSuccess dependent Y is blocked by the cancellation"
+    );
+    assert_eq!(node_status(&core_b, c, "W"), Some(NodeStatus::Completed));
+    let ran_b = h_b.ran.lock().unwrap().clone();
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "X")),
+        "X was cancelled — resume must not run it, got {ran_b:?}"
+    );
+}
+
+// ── SC-C6 / R2 (no-regress) — a node LEGITIMATELY paused for a human (its session is STILL
+// AwaitingHuman) must survive resume untouched: it is neither reconciled terminal nor re-attached. ──
+#[test]
+fn sc_c6_r2_resume_leaves_a_genuinely_waiting_node_paused() {
+    let db = tmp_db("c6-r2b");
+    let c = "camp6r2b";
+
+    let def = CampaignDef {
+        id: c.into(),
+        name: "r2b".into(),
+        nodes: vec![cnode("X", HumanConfirm::None), cnode("Y", HumanConfirm::None)],
+        edges: vec![edge("X", "Y")],
+        policy: FailurePolicy::ContinueIndependent,
+        max_concurrency: 2,
+    };
+    // Craft: node X persisted `AwaitingHuman` with its session ALSO `AwaitingHuman` (a genuine, live
+    // human wait — the non-terminal case the R2 re-derivation must leave alone).
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(
+            &mut store,
+            craft_campaign_at(def, "X", NodeStatus::AwaitingHuman).to_node(),
+        )
+        .expect("persist campaign");
+        put_node(
+            &mut store,
+            session_with(&rid(c, "X"), SessionStatus::AwaitingHuman).to_node(),
+        )
+        .expect("persist AwaitingHuman session");
+    }
+
+    let (ctl_b, h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+
+    // Give the resume a beat to settle, then assert the wait held: X stays AwaitingHuman (not cancelled,
+    // not resumed) and the campaign stays Running (blocked on the human), never wedged-finalized.
+    std::thread::sleep(Duration::from_millis(250));
+    assert_eq!(
+        node_status(&core_b, c, "X"),
+        Some(NodeStatus::AwaitingHuman),
+        "a genuine human wait survives a crash-resume untouched"
+    );
+    assert_eq!(
+        core_b.campaign_status(c).ok().flatten(),
+        Some(CampaignStatus::Running),
+        "the campaign stays Running (still needs the human), never mis-finalized"
+    );
+    let ran_b = h_b.ran.lock().unwrap().clone();
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "X")),
+        "the paused node's Run must not be resumed, got {ran_b:?}"
+    );
+}
+
+// ── SC-C6 / R3 — resume reconciles a node whose SESSION FAILED before the crash (blocking path) ──
+// F1a proves the Completed variant; this proves the FAILED variant the blocking / fail-fast behavior
+// rests on (previously only code-shared, never crash-tested). Crash window: `fail_run` persists
+// `session=Failed` then DEFERS the reconcile; a crash leaves `session=Failed, node=Running`. Resume
+// must reconcile Failed AND apply the failure policy — under ContinueIndependent the failed node's
+// OnSuccess dependents are Blocked (not promoted).
+#[test]
+fn sc_c6_r3_resume_reconciles_a_node_whose_session_failed_before_crash() {
+    let db = tmp_db("c6-r3");
+    let c = "camp6r3";
+
+    let def = CampaignDef {
+        id: c.into(),
+        name: "r3".into(),
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Y", HumanConfirm::None),
+            cnode("W", HumanConfirm::None),
+        ],
+        edges: vec![edge("X", "Y")],
+        policy: FailurePolicy::ContinueIndependent,
+        max_concurrency: 3,
+    };
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(&mut store, craft_campaign(def, "X").to_node()).expect("persist campaign");
+        put_node(
+            &mut store,
+            session_with(&rid(c, "X"), SessionStatus::Failed).to_node(),
+        )
+        .expect("persist Failed session");
+    }
+
+    let (ctl_b, h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+    assert!(
+        wait_campaign(&core_b, c, CampaignStatus::PartiallyCompleted),
+        "the failed node blocks its branch; the independent branch completes → PartiallyCompleted"
+    );
+    assert_eq!(
+        node_status(&core_b, c, "X"),
+        Some(NodeStatus::Failed),
+        "X reconciles Failed from its terminal session (never re-run)"
+    );
+    assert_eq!(
+        node_status(&core_b, c, "Y"),
+        Some(NodeStatus::Blocked),
+        "X's OnSuccess dependent Y is Blocked (not promoted) — the failure-policy path fired on resume"
+    );
+    assert_eq!(node_status(&core_b, c, "W"), Some(NodeStatus::Completed));
+    let ran_b = h_b.ran.lock().unwrap().clone();
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "X")),
+        "X is reconciled from its terminal session, never re-run, got {ran_b:?}"
+    );
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "Y")),
+        "the blocked dependent Y must not run, got {ran_b:?}"
+    );
+}
+
+// ── SC-C6 / R3 (fail-fast) — the SAME Failed-at-crash artifact under FailFast: resume reconciles
+// Failed AND the fail-fast policy cancels every other node + drives the campaign to Failed. ──
+#[test]
+fn sc_c6_r3_resume_failed_node_honors_fail_fast_policy() {
+    let db = tmp_db("c6-r3ff");
+    let c = "camp6r3ff";
+
+    let def = CampaignDef {
+        id: c.into(),
+        name: "r3ff".into(),
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Z", HumanConfirm::None), // independent — fail-fast must cancel it
+        ],
+        edges: vec![],
+        policy: FailurePolicy::FailFast,
+        max_concurrency: 2,
+    };
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(&mut store, craft_campaign(def, "X").to_node()).expect("persist campaign");
+        put_node(
+            &mut store,
+            session_with(&rid(c, "X"), SessionStatus::Failed).to_node(),
+        )
+        .expect("persist Failed session");
+    }
+
+    let (ctl_b, _h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+    assert!(
+        wait_campaign(&core_b, c, CampaignStatus::Failed),
+        "fail-fast honored on resume: the reconciled failure fails the whole campaign"
+    );
+    assert_eq!(node_status(&core_b, c, "X"), Some(NodeStatus::Failed));
+    assert_eq!(
+        node_status(&core_b, c, "Z"),
+        Some(NodeStatus::Cancelled),
+        "fail-fast cancels every other (non-terminal) node on the resuming process"
     );
 }

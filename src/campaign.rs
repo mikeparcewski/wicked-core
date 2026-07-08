@@ -1177,6 +1177,38 @@ pub(crate) fn resume(
         }
     }
 
+    // R2 — symmetric to the `Running` re-derivation above, for a node persisted `AwaitingHuman` or
+    // `ReadyToResume` whose Run's session is ALREADY terminal. The per-node HITL gate `Reject` branch
+    // (and any fail/cancel that races a gate) writes the session terminal — `cancel_run` persists
+    // `Cancelled` — and defers the node reconcile to `CampaignRunFinished`. A crash in between leaves
+    // `session=terminal, node=AwaitingHuman/ReadyToResume`, which the `Running`-only re-derivation
+    // never revisits: the node stays wedged and `finalize_if_done`'s `any_waiting` check blocks the
+    // campaign forever. Reconcile it from session truth (one `reconcile_terminal` code path). A node
+    // whose session is still NON-terminal is legitimately paused for a human — leave it untouched (do
+    // NOT reconcile, do NOT resume its Run): the normal AwaitingHuman wait path must survive a crash.
+    let gated: Vec<(String, String)> = campaign
+        .node_status
+        .iter()
+        .filter(|(_, s)| matches!(s, NodeStatus::AwaitingHuman | NodeStatus::ReadyToResume))
+        .filter_map(|(n, _)| campaign.node_run_id.get(n).map(|r| (n.clone(), r.clone())))
+        .collect();
+    for (node, run_id) in &gated {
+        if let Some(session) = get_session(store, run_id)? {
+            let outcome = match session.status {
+                SessionStatus::Completed => Some(NodeOutcome::Completed),
+                SessionStatus::Failed => Some(NodeOutcome::Failed),
+                SessionStatus::Cancelled => Some(NodeOutcome::Cancelled),
+                // Still paused in core (AwaitingHuman) or otherwise non-terminal — a genuine human
+                // wait. Leave the node exactly as persisted; try_fill will resume an approved
+                // ReadyToResume node below just as it would on a clean resume.
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                reconcile_terminal(&mut campaign, node, outcome, store, subscribers, in_flight, seams)?;
+            }
+        }
+    }
+
     promote_ready(&mut campaign, subscribers);
     persist(store, &mut campaign)?;
     try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
