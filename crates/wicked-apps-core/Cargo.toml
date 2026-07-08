@@ -1,0 +1,15 @@
+[package]
+name = "wicked-apps-core"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Vendored into wicked-core (was crates.io 0.2.0, yanked). Domain wrapper over wicked-estate 0.13: shared node/edge/event constants, ToNode/FromNode, Decision/ConformanceClaim, synthetic_symbol, the emit seam, and a convenience open_store."
+publish = false
+
+[dependencies]
+wicked-estate-core = { path = "../../../wicked-estate/crates/wicked-estate-core" }
+wicked-estate-store = { path = "../../../wicked-estate/crates/wicked-estate-store" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }

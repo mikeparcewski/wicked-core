@@ -6,7 +6,7 @@
 //! NOTE: the engine recalls with its default lexical embedder (no `with_embedder` is exposed), so
 //! knowledge recall is keyword-based for now — distinct from memory's semantic (Model2Vec) recall.
 
-use wicked_knowledge_mcp::KnowledgeEngine;
+use wicked_estate_knowledge::KnowledgeEngine;
 
 /// A recalled knowledge chunk, flattened for the Core API.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]

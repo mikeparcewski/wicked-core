@@ -15,33 +15,32 @@ name = "wicked-core"
 path = "src/bin/wicked-core.rs"
 
 [dependencies]
-# The shared kernel + store seam.
-# TODO(wicked-core#migrate): wicked-apps-core/governance/orchestration/council are yanked (archived
-# into wicked-estate v0.13+). Cargo.lock pins still build but cargo update will break. Replace with
-# wicked-estate equivalents — tracked in https://github.com/mikeparcewski/wicked-core/issues
-wicked-apps-core = "0.2.0"
-wicked-estate-core = "0.12.0"
-# The three engines COE composes (in-process, directly — no wicked-agent dependency).
-wicked-governance = "0.3.0"
-wicked-orchestration = "0.3.0"
-wicked-council = "0.2.0"
+# Vendored ex-crates.io crates (yanked 0.2.0/0.3.0) — copied into crates/ and repointed onto
+# wicked-estate 0.13 path deps. apps-core is the domain wrapper (ToNode/FromNode, Decision/
+# ConformanceClaim, event catalog + emit seam, synthetic_symbol, convenience open_store) that has
+# no estate 0.13 equivalent; the three engines COE composes build on it (in-process, no wicked-agent).
+wicked-apps-core = { path = "crates/wicked-apps-core" }
+wicked-governance = { path = "crates/wicked-governance" }
+wicked-orchestration = { path = "crates/wicked-orchestration" }
+wicked-council = { path = "crates/wicked-council" }
+# wicked-estate 0.13 — local, not-yet-published; relative path deps (cross-platform, no cargo update).
+wicked-estate-core = { path = "../wicked-estate/crates/wicked-estate-core" }
+wicked-estate-rank = { path = "../wicked-estate/crates/wicked-estate-rank" }
+wicked-estate-retrieve = { path = "../wicked-estate/crates/wicked-estate-retrieve", features = ["model2vec"] }
+# Memory + knowledge migrated off tombstone wicked-memory/-core/knowledge-mcp onto estate 0.13.
+wicked-estate-memory = { path = "../wicked-estate/crates/wicked-estate-memory" }
+wicked-estate-memory-core = { path = "../wicked-estate/crates/wicked-estate-memory-core" }
+wicked-estate-knowledge = { path = "../wicked-estate/crates/wicked-estate-knowledge" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-# TODO(wicked-core#migrate): wicked-memory/core/knowledge-mcp absorbed into wicked-estate v0.13+.
-# These tombstone versions (0.12.2/0.12.1) still build; migrate to wicked-estate-mcp subprocess.
-wicked-memory = "0.12.2"
-wicked-memory-core = "0.12.2"
-wicked-estate-retrieve = { version = "0.12.0", features = ["model2vec"] }
-wicked-knowledge-mcp = "0.12.2"
-wicked-estate-rank = "0.12.0"
 
 [dev-dependencies]
 # Integration tests reach the engine crates' public APIs directly to seed policies, inject a stub
-# council dispatcher, and read phase state. Same crates.io versions as above, so cargo unifies them
-# to one compilation (shared types).
-wicked-apps-core = "0.2.0"
-wicked-governance = "0.3.0"
-wicked-orchestration = "0.3.0"
-wicked-council = "0.2.0"
+# council dispatcher, and read phase state. Same vendored path crates as above, so cargo unifies
+# them to one compilation (shared types).
+wicked-apps-core = { path = "crates/wicked-apps-core" }
+wicked-governance = { path = "crates/wicked-governance" }
+wicked-orchestration = { path = "crates/wicked-orchestration" }
+wicked-council = { path = "crates/wicked-council" }

@@ -1,0 +1,17 @@
+[package]
+name = "wicked-council"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Vendored into wicked-core (was crates.io 0.2.0, yanked). Multi-CLI council deliberation + ranking over the wicked-estate graph."
+publish = false
+
+[dependencies]
+wicked-apps-core = { path = "../wicked-apps-core" }
+wicked-estate-core = { path = "../../../wicked-estate/crates/wicked-estate-core" }
+wicked-estate-store = { path = "../../../wicked-estate/crates/wicked-estate-store" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+toml = "0.8"

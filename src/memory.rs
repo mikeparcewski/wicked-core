@@ -12,8 +12,8 @@
 //! It also exposes an in-process MCP tool surface ([`RunMemory::mcp`]) so other agents can call
 //! `memory.recall` / `memory.capture` over JSON-RPC.
 
-use wicked_memory::MemoryEngine;
-use wicked_memory_core::{MemKind, Memory, Scope, Tier};
+use wicked_estate_memory::MemoryEngine;
+use wicked_estate_memory_core::{MemKind, Memory, Scope, Tier};
 
 /// A recalled memory, flattened for the Core API (egui-free, serde-friendly).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]

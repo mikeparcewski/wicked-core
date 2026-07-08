@@ -348,7 +348,7 @@ pub(crate) fn run(
                 let res = match memory.as_mut() {
                     Some(m) => m.capture(
                         content,
-                        wicked_memory_core::Scope::parse(&scope),
+                        wicked_estate_memory_core::Scope::parse(&scope),
                         crate::memory::now_secs(),
                     ),
                     None => Err(anyhow::anyhow!("memory store unavailable")),
@@ -364,7 +364,7 @@ pub(crate) fn run(
             }
             Command::ListMemories { scope, limit, reply } => {
                 let res = match memory.as_ref() {
-                    Some(m) => m.list(&wicked_memory_core::Scope::parse(&scope), limit),
+                    Some(m) => m.list(&wicked_estate_memory_core::Scope::parse(&scope), limit),
                     None => Ok(Vec::new()),
                 };
                 let _ = reply.send(res);
@@ -845,7 +845,7 @@ fn capture_run_outcome(
         format!("Run '{brief}' ({run_id}) {outcome}{detail}."),
         // Run outcomes stay at ROOT — the global briefing pool that `recall` (querying at root) draws
         // from. Only APPLICATION memories carry an `app:<id>` scope for per-app listing.
-        wicked_memory_core::Scope::root(),
+        wicked_estate_memory_core::Scope::root(),
         crate::memory::now_secs(),
     ) {
         eprintln!("wicked-core: memory capture failed: {e}");
