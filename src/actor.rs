@@ -13,6 +13,7 @@
 //!    for a run already executing (`RunBusy`) so a run is never double-dispatched.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use wicked_estate_core::SymbolQuery;
 use crate::command::Command;
 use crate::domain::{put_node, SessionStatus};
 use crate::event::CoreEvent;
-use crate::terminal::{self, PtyMap, PtySession};
+use crate::terminal::{self, PtyMap};
 use crate::workflow::{StepInput, StepRunner};
 use crate::{pipeline, LaunchSpec};
 
@@ -34,6 +35,15 @@ use crate::{pipeline, LaunchSpec};
 /// assigned here on the one actor thread so the stream stays ordered.
 struct TermReg {
     next_seq: u64,
+    /// In-flight (sent-but-not-yet-emitted) output bytes for this terminal — the reader reads this
+    /// gauge to pace itself (SIG-1 backpressure); the actor decrements it here as each chunk is
+    /// emitted. Shared `Arc` with the reader thread.
+    in_flight: Arc<AtomicUsize>,
+    /// Cumulative output bytes the reader has DROPPED (drop-oldest overflow). Compared against
+    /// `reported_dropped` so the actor emits a degraded marker only when NEW output was shed.
+    dropped_total: Arc<AtomicU64>,
+    /// The dropped-byte total we've already reported to the consumer (via a degraded marker).
+    reported_dropped: u64,
 }
 
 /// A run id already executing may not be mutated again — surfaced to the caller as this error.
@@ -92,6 +102,11 @@ pub(crate) fn run(
     // The actor-owned PTY terminal registry (id → status + seq). Byte-I/O lives off-actor in
     // `pty_map`; this small map is the single-writer state the actor owns (DES §4).
     let mut terminals: HashMap<String, TermReg> = HashMap::new();
+    // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
+    // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC
+    // (which unwinds past the loop; the old end-of-`run` drain ran only on a NORMAL exit, so a panic
+    // leaked them — the exact failure DES R1 forbids). Holds its own `pty_map` clone.
+    let _pty_reaper = terminal::PtyReaper::new(pty_map.clone());
 
     // Startup orphan reaper: prune worktrees whose run no longer exists on the store (e.g. a crashed
     // run cleaned out of the registry). Runs whose session still exists keep their worktree (resume).
@@ -420,7 +435,7 @@ pub(crate) fn run(
                 // Spawn the off-actor PTY + reader thread FIRST; only register + announce on success
                 // (so a failed open never emits a dangling `TerminalOpened`).
                 match terminal::spawn_pty(&id, &cwd, cmd, cols, rows, &pty_map, self_tx.clone()) {
-                    Ok(()) => {
+                    Ok(spawned) => {
                         // DES §7: an ungoverned operator shell must be a loud, explicit opt-in.
                         if !governed {
                             eprintln!(
@@ -428,7 +443,15 @@ pub(crate) fn run(
                                 cwd.display()
                             );
                         }
-                        terminals.insert(id.clone(), TermReg { next_seq: 0 });
+                        terminals.insert(
+                            id.clone(),
+                            TermReg {
+                                next_seq: 0,
+                                in_flight: spawned.in_flight,
+                                dropped_total: spawned.dropped_total,
+                                reported_dropped: 0,
+                            },
+                        );
                         emit(
                             &mut subscribers,
                             CoreEvent::TerminalOpened {
@@ -448,13 +471,39 @@ pub(crate) fn run(
                 // `TerminalOutput`. A chunk for an already-closed terminal (registry entry gone) is
                 // dropped. Mirrors the `CliOutputDelta` streaming path — no store write.
                 if let Some(reg) = terminals.get_mut(&id) {
+                    let n = bytes.len();
                     let seq = reg.next_seq;
                     reg.next_seq += 1;
                     let bytes_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     emit(
                         &mut subscribers,
-                        CoreEvent::TerminalOutput { id, seq, bytes_b64 },
+                        CoreEvent::TerminalOutput {
+                            id: id.clone(),
+                            seq,
+                            bytes_b64,
+                        },
                     );
+                    // This chunk has left the in-flight window — let the reader send more (SIG-1).
+                    reg.in_flight.fetch_sub(n, Ordering::AcqRel);
+                    // Degraded marker (SIG-1): if the reader shed output since we last told the
+                    // consumer, surface it. `event.rs` is owned by another lane (and the TS binding
+                    // matches every `CoreEvent` variant by hand), so we reuse the existing `Error`
+                    // event rather than add a `TerminalOutputDropped` variant — the consumer still
+                    // learns the stream was lossy.
+                    let dropped = reg.dropped_total.load(Ordering::Acquire);
+                    if dropped > reg.reported_dropped {
+                        let delta = dropped - reg.reported_dropped;
+                        reg.reported_dropped = dropped;
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::Error {
+                                session: Some(id),
+                                message: format!(
+                                    "terminal output degraded: dropped {delta} byte(s) of oldest output to bound memory"
+                                ),
+                            },
+                        );
+                    }
                 }
             }
             Command::CloseTerminal { id, reply } => {
@@ -478,25 +527,18 @@ pub(crate) fn run(
     }
     // Loop exited (last Core dropped): `store` drops here, releasing the writable connection. Any
     // in-flight worker that posts a result now sends into a closed channel and is harmlessly dropped.
-    // Defense-in-depth: kill + reap anything still in the PTY map (there should be nothing — the
-    // Shutdown arm already reaped every registered terminal — but a leaked child/thread is the exact
-    // failure DES R1 forbids, so we guarantee it).
-    let leftovers: Vec<PtySession> = terminal::lock(&pty_map).drain().map(|(_, v)| v).collect();
-    for mut s in leftovers {
-        let _ = s.child.kill();
-        let _ = s.child.wait();
-        if let Some(h) = s.reader.take() {
-            let _ = h.join();
-        }
-    }
+    // The `_pty_reaper` guard (declared above) kills + reaps anything still in the PTY map as it
+    // drops — on this clean exit (the `Shutdown` arm already drained the map ⇒ no-op) AND on a
+    // handler panic (the leak DES R1 forbids). No explicit drain needed here anymore.
 }
 
 /// Tear down one terminal exactly once (idempotent via registry presence): remove it from the shared
-/// I/O map, optionally kill the child, reap it (`wait`), join the reader thread, drop the registry
-/// entry, and emit `TerminalExited`. `kill=true` for an operator close / shutdown; `kill=false` for a
-/// natural EOF (the child already exited — `wait` just reaps and reports its status). A second call
-/// for the same id (e.g. the reader's `TerminalReaderDone` arriving after a `CloseTerminal` already
-/// reaped it) is a no-op, so `TerminalExited` never double-fires.
+/// I/O map, then (via [`terminal::reap_session`]) kill the child's process GROUP on unix + reap it +
+/// BOUNDED-join the reader thread, drop the registry entry, and emit `TerminalExited`. `kill=true` for
+/// an operator close / shutdown; `kill=false` for a natural EOF (the child already exited — we just
+/// reap + join). A second call for the same id (e.g. the reader's `TerminalReaderDone` arriving after
+/// a `CloseTerminal` already reaped it) is a no-op, so `TerminalExited` never double-fires. Crucially,
+/// this can NEVER block the single actor thread indefinitely (CRIT-1).
 fn finish_terminal(
     terminals: &mut HashMap<String, TermReg>,
     map: &PtyMap,
@@ -508,20 +550,14 @@ fn finish_terminal(
         return; // already finished — single-emit guard
     }
     // Take the session out of the shared map, then release the lock BEFORE the (possibly blocking)
-    // kill/wait/join so write/resize on OTHER terminals never wait on this teardown.
+    // kill/reap/join so write/resize/close on OTHER terminals never wait on this teardown.
     let session = terminal::lock(map).remove(id);
     let mut status = None;
     if let Some(mut s) = session {
-        if kill {
-            let _ = s.child.kill();
-        }
-        // Reap the child (no zombie). After a kill the SIGHUP terminates it; on natural EOF it has
-        // already exited, so this returns its real code immediately.
-        status = s.child.wait().ok().map(|st| st.exit_code() as i32);
-        if let Some(h) = s.reader.take() {
-            let _ = h.join(); // the reader hit EOF (from the kill or the child's own exit) → returns
-        }
-        // `s` (writer + master) drops here, closing the master fd.
+        // Kill the child's whole process GROUP (unix) + reap + BOUNDED-join the reader — this can
+        // never block the actor indefinitely (CRIT-1). See `terminal::reap_session`.
+        status = terminal::reap_session(&mut s, kill);
+        // `s` (writer + master Arcs + child) drops here, closing the fds.
     }
     terminals.remove(id);
     emit(

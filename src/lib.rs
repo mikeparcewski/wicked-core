@@ -459,32 +459,47 @@ impl Core {
     /// Write raw input bytes (keystrokes) to a terminal. Acts on the off-actor PTY writer map
     /// DIRECTLY (no store round-trip, DES §4), so high-frequency input never queues behind the store
     /// writer. Fire-and-forget in spirit; errors only if the terminal id is unknown / the write fails.
+    ///
+    /// SIG-2: the shared map lock is held ONLY long enough to clone out this session's per-session
+    /// writer `Arc`; the (possibly blocking) `write_all`+`flush` then runs under the PER-SESSION
+    /// writer lock. So a stuck write on a child that isn't draining its stdin holds only THIS
+    /// terminal's writer lock — it can NEVER stall close/open/resize or I/O on OTHER terminals.
     pub fn write_terminal(&self, id: &str, bytes: &[u8]) -> anyhow::Result<()> {
         use std::io::Write;
-        let mut map = terminal::lock(&self.pty);
-        let s = map
-            .get_mut(id)
-            .ok_or_else(|| anyhow::anyhow!("no such terminal: {id}"))?;
-        s.writer.write_all(bytes)?;
-        s.writer.flush()?;
+        let writer = {
+            let map = terminal::lock(&self.pty);
+            let s = map
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("no such terminal: {id}"))?;
+            s.writer.clone() // clone the Arc, then release the map lock below
+        };
+        let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
+        w.write_all(bytes)?;
+        w.flush()?;
         Ok(())
     }
 
     /// Resize a terminal's PTY to `cols`x`rows`. Acts on the off-actor master map DIRECTLY (no store
     /// round-trip, DES §4). Errors only if the terminal id is unknown / the resize fails.
+    ///
+    /// SIG-2: like `write_terminal`, holds the shared map lock only to clone out the per-session
+    /// master `Arc`, then resizes under the per-session lock — never across the map lock.
     pub fn resize_terminal(&self, id: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
-        let map = terminal::lock(&self.pty);
-        let s = map
-            .get(id)
-            .ok_or_else(|| anyhow::anyhow!("no such terminal: {id}"))?;
-        s.master
-            .resize(portable_pty::PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| anyhow::anyhow!("resize failed: {e}"))?;
+        let master = {
+            let map = terminal::lock(&self.pty);
+            let s = map
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("no such terminal: {id}"))?;
+            s.master.clone() // clone the Arc, then release the map lock below
+        };
+        let m = master.lock().unwrap_or_else(|p| p.into_inner());
+        m.resize(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| anyhow::anyhow!("resize failed: {e}"))?;
         Ok(())
     }
 
