@@ -24,6 +24,16 @@ napi-derive = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Force vendored (statically-linked) OpenSSL on Linux ONLY. wicked-estate-observe pulls
+# reqwest → native-tls → openssl-sys; native-tls links the system OpenSSL on Linux (fine for a
+# native build, but there is no target OpenSSL when cross-compiling to aarch64-unknown-linux-gnu,
+# so that leg fails). The `vendored` feature builds OpenSSL from source (openssl-src), which
+# cross-compiles cleanly under zig and is statically bundled into the .node (consumers need nothing).
+# Linux-only: macOS uses Security.framework and Windows uses SChannel — neither pulls openssl-sys.
+# TODO(follow-up): switch wicked-estate-observe's reqwest to rustls-tls to drop OpenSSL entirely.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 [build-dependencies]
 napi-build = "2"
 
