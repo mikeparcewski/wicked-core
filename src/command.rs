@@ -191,7 +191,10 @@ pub(crate) enum Command {
     },
     /// Internal: a node's Run reached a terminal state — reconcile the owning campaign (set the node
     /// terminal, apply the failure policy, dispatch newly-ready nodes). No-op if not campaign-owned.
-    CampaignRunFinished { run_id: String, outcome: NodeOutcome },
+    CampaignRunFinished {
+        run_id: String,
+        outcome: NodeOutcome,
+    },
     /// Internal: a HITL gate opened inside a campaign node's Run — free its slot, surface the prompt,
     /// and dispatch independent work into the freed slot.
     CampaignNodeAwaiting { run_id: String, prompt: String },

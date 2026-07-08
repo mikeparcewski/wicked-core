@@ -23,9 +23,9 @@ use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 use wicked_core::{
-    put_node, AgentSession, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision, CampaignNode,
-    CampaignStatus, Core, EdgeCondition, EntityMode, FailurePolicy, HumanConfirm, NodeStatus,
-    RunSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
+    put_node, AgentSession, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision,
+    CampaignNode, CampaignStatus, Core, EdgeCondition, EntityMode, FailurePolicy, HumanConfirm,
+    NodeStatus, RunSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 
 // ── stub council (votes without a subprocess; the real dispatcher hangs under the harness) ──
@@ -342,14 +342,21 @@ fn sc_c3_respects_max_concurrency_cap() {
     let first_two = h.drain(2);
     assert_eq!(first_two.len(), 2);
     h.assert_quiet();
-    assert_eq!(running_count(&core, c), 2, "never more than the cap in flight");
+    assert_eq!(
+        running_count(&core, c),
+        2,
+        "never more than the cap in flight"
+    );
 
     // Free one slot → a queued node dispatches; in-flight stays at the cap.
     let one = first_two.iter().next().unwrap().clone();
     h.release(&one);
     let third = h.drain(1);
     assert_eq!(third.len(), 1);
-    assert!(!first_two.contains(third.iter().next().unwrap()), "a NEW node ran");
+    assert!(
+        !first_two.contains(third.iter().next().unwrap()),
+        "a NEW node ran"
+    );
     // Give the completed node's reconcile a beat, then confirm the cap still holds.
     std::thread::sleep(Duration::from_millis(50));
     assert!(running_count(&core, c) <= 2, "the cap is a hard bound");
@@ -383,10 +390,7 @@ fn sc_c4_fail_fast_cancels_in_flight_and_fails_campaign() {
 
     // Both start; hold them, then let "boom" fail.
     let started = h.drain(2);
-    assert_eq!(
-        started,
-        BTreeSet::from([rid(c, "boom"), rid(c, "victim")])
-    );
+    assert_eq!(started, BTreeSet::from([rid(c, "boom"), rid(c, "victim")]));
     h.release(&rid(c, "boom")); // → Failed → fail-fast
 
     assert!(
@@ -500,7 +504,10 @@ fn sc_c6_crash_resume_never_reruns_a_completed_node() {
     let def = CampaignDef {
         id: c.into(),
         name: "resume".into(),
-        nodes: vec![cnode("A", HumanConfirm::None), cnode("B", HumanConfirm::None)],
+        nodes: vec![
+            cnode("A", HumanConfirm::None),
+            cnode("B", HumanConfirm::None),
+        ],
         edges: vec![edge("A", "B")], // B depends on A
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
@@ -533,11 +540,11 @@ fn sc_c6_crash_resume_never_reruns_a_completed_node() {
     // node A — no node runs twice, no duplicate node (SC-C6 / FR7).
     let ran_b = h_b.ran.lock().unwrap().clone();
     assert!(
-        ran_b.iter().any(|r| *r == node_b),
+        ran_b.contains(&node_b),
         "Core B ran B (the interrupted node), got {ran_b:?}"
     );
     assert!(
-        !ran_b.iter().any(|r| *r == node_a),
+        !ran_b.contains(&node_a),
         "Core B must NOT re-run the already-completed node A, got {ran_b:?}"
     );
 
@@ -627,7 +634,10 @@ fn sc_c6_f1a_resume_reconciles_a_node_whose_session_finished_before_crash() {
     let def = CampaignDef {
         id: c.into(),
         name: "f1a".into(),
-        nodes: vec![cnode("X", HumanConfirm::None), cnode("Y", HumanConfirm::None)],
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Y", HumanConfirm::None),
+        ],
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
@@ -672,7 +682,10 @@ fn sc_c6_f1b_resume_launches_a_node_whose_session_was_never_written() {
     let def = CampaignDef {
         id: c.into(),
         name: "f1b".into(),
-        nodes: vec![cnode("X", HumanConfirm::None), cnode("Y", HumanConfirm::None)],
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Y", HumanConfirm::None),
+        ],
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,
@@ -845,7 +858,10 @@ fn sc_c6_r2_resume_leaves_a_genuinely_waiting_node_paused() {
     let def = CampaignDef {
         id: c.into(),
         name: "r2b".into(),
-        nodes: vec![cnode("X", HumanConfirm::None), cnode("Y", HumanConfirm::None)],
+        nodes: vec![
+            cnode("X", HumanConfirm::None),
+            cnode("Y", HumanConfirm::None),
+        ],
         edges: vec![edge("X", "Y")],
         policy: FailurePolicy::ContinueIndependent,
         max_concurrency: 2,

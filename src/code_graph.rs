@@ -66,10 +66,31 @@ fn is_def_kind(k: &NodeKind) -> bool {
 fn is_excluded_path(file: &str) -> bool {
     let f = file.to_lowercase();
     const PATS: &[&str] = &[
-        "/test/", "/tests/", "/__tests__/", "/spec/", "/specs/", ".test.", ".spec.", "_test.",
-        "/test_", "/node_modules/", "/vendor/", "/third_party/", "/dist/", "/build/", "/.next/",
-        "/__generated__/", "/generated/", "/migrations/", "/target/", ".min.", ".bundle.", "_pb.",
-        ".generated.", ".g.dart", "/gen/",
+        "/test/",
+        "/tests/",
+        "/__tests__/",
+        "/spec/",
+        "/specs/",
+        ".test.",
+        ".spec.",
+        "_test.",
+        "/test_",
+        "/node_modules/",
+        "/vendor/",
+        "/third_party/",
+        "/dist/",
+        "/build/",
+        "/.next/",
+        "/__generated__/",
+        "/generated/",
+        "/migrations/",
+        "/target/",
+        ".min.",
+        ".bundle.",
+        "_pb.",
+        ".generated.",
+        ".g.dart",
+        "/gen/",
     ];
     PATS.iter().any(|p| f.contains(p))
 }
@@ -163,7 +184,8 @@ pub fn rank_symbols(graph_path: &str, n: usize) -> anyhow::Result<Vec<RankedSymb
             // (3) ubiquity: referenced from ≥ the adaptive fraction of files (≥4 absolute) ⇒ generic
             // built-in / common-lib, not a domain hotspot.
             let spread = caller_spread(&store, &id);
-            if total_files >= 6 && spread >= 4 && (spread as f32 / total_files as f32) >= ubiq_frac {
+            if total_files >= 6 && spread >= 4 && (spread as f32 / total_files as f32) >= ubiq_frac
+            {
                 return None;
             }
             Some((

@@ -89,7 +89,8 @@ impl TerminalOutputBuffer {
                 Some(old) => {
                     self.buffered -= old.len();
                     self.degraded = true;
-                    self.dropped_total.fetch_add(old.len() as u64, Ordering::AcqRel);
+                    self.dropped_total
+                        .fetch_add(old.len() as u64, Ordering::AcqRel);
                 }
                 None => break, // unreachable while len > 1 — guard against an infinite loop
             }
@@ -233,7 +234,7 @@ pub(crate) fn spawn_pty(
         .spawn_command(builder)
         .map_err(|e| anyhow::anyhow!("spawn in pty failed: {e}"))?;
     drop(pair.slave); // only ever drive the child via the master
-    // Cache the pid up front: on unix it's the process-GROUP id we killpg on teardown (CRIT-1).
+                      // Cache the pid up front: on unix it's the process-GROUP id we killpg on teardown (CRIT-1).
     let child_pid = child.process_id();
 
     // Minor: on any post-spawn setup failure, KILL + REAP the child before returning `Err` — dropping
@@ -275,9 +276,9 @@ pub(crate) fn spawn_pty(
                 Ok(0) | Err(_) => break, // EOF or error → PTY closed (natural exit, or a kill)
                 Ok(n) => {
                     out.push(buf[..n].to_vec()); // bounded drop-oldest (SIG-1)
-                    // Forward toward the actor only up to the in-flight cap: when the actor is busy
-                    // the gauge stays high, the reader stops sending, and `push` sheds the oldest —
-                    // so the command channel can't grow without bound.
+                                                 // Forward toward the actor only up to the in-flight cap: when the actor is busy
+                                                 // the gauge stays high, the reader stops sending, and `push` sheds the oldest —
+                                                 // so the command channel can't grow without bound.
                     while reader_in_flight.load(Ordering::Acquire) < CAP_BYTES {
                         let Some(chunk) = out.pop_oldest() else { break };
                         reader_in_flight.fetch_add(chunk.len(), Ordering::AcqRel);
@@ -459,8 +460,16 @@ mod tests {
         // Overflow the 100-byte cap (40+40+40 = 120): the OLDEST 40-byte chunk (the 1s) is shed.
         b.push(vec![3u8; 40]);
         assert!(b.degraded(), "degraded flag set after overflow");
-        assert_eq!(b.dropped_total(), 40, "shed exactly the oldest 40-byte chunk");
-        assert_eq!(dropped.load(Ordering::Acquire), 40, "shared counter reflects the drop");
+        assert_eq!(
+            b.dropped_total(),
+            40,
+            "shed exactly the oldest 40-byte chunk"
+        );
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            40,
+            "shared counter reflects the drop"
+        );
 
         // The survivors are the NEWER chunks, still in FIFO order; the oldest is gone.
         assert_eq!(b.pop_oldest(), Some(vec![2u8; 40]));
@@ -470,8 +479,15 @@ mod tests {
         // A single chunk larger than the whole cap is kept (we never drop the ONLY chunk to zero the
         // buffer) but is itself over-cap — the next push will shed it.
         b.push(vec![9u8; 250]);
-        assert_eq!(b.dropped_total(), 40, "an only-chunk over cap is not shed on its own push");
+        assert_eq!(
+            b.dropped_total(),
+            40,
+            "an only-chunk over cap is not shed on its own push"
+        );
         b.push(vec![8u8; 10]);
-        assert!(b.dropped_total() >= 40 + 250, "pushing after an over-cap only-chunk sheds it");
+        assert!(
+            b.dropped_total() >= 40 + 250,
+            "pushing after an over-cap only-chunk sheds it"
+        );
     }
 }

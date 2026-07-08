@@ -1,0 +1,73 @@
+# PR + main build/test gate for wicked-core.
+#
+# wicked-core resolves wicked-estate via RELATIVE PATH deps (../wicked-estate/...), and three of them
+# (wicked-estate-memory, -memory-core, -knowledge) are `publish = false` — there is no crates.io
+# fallback. So, exactly like napi-release.yml, CI MUST check out wicked-estate as a SIBLING of
+# wicked-core so the path deps resolve from source. Pinned to the estate release tag the addon is built
+# against; bump in lockstep with napi-release.yml's WICKED_ESTATE_REF on each estate release.
+#
+# Until this workflow existed, wicked-core had NO build/test on PRs — merges rode on locally-run tests
+# only. This is the gate: fmt + clippy(-D warnings) + build + test, all on the estate rustls graph.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in lockstep with napi-release.yml's WICKED_ESTATE_REF.
+  WICKED_ESTATE_REF: v0.13.1
+  # Offline embedder — the memory engine must not download a model in CI (matches the tests' own default).
+  WICKED_MEMORY_EMBEDDER: hash
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · build · test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wicked-core
+    steps:
+      - name: Checkout wicked-core
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: wicked-core
+      - name: Checkout wicked-estate (sibling — path deps + publish=false crates build from source)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: mikeparcewski/wicked-estate
+          ref: ${{ env.WICKED_ESTATE_REF }}
+          path: wicked-estate
+
+      - name: Install Rust toolchain (+ rustfmt, clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wicked-core
+
+      # fmt first — cheapest gate, fails fast on style drift.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (-D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo build
+        run: cargo build --workspace
+
+      - name: cargo test
+        run: cargo test --workspace

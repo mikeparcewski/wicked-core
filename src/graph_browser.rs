@@ -155,7 +155,10 @@ pub fn node_detail(db: &str, id: &str) -> anyhow::Result<Option<NodeDetail>> {
         .iter()
         .take(24)
         .map(|(k, v)| {
-            let s = v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string());
+            let s = v
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| v.to_string());
             (k.clone(), s.chars().take(200).collect::<String>())
         })
         .collect();

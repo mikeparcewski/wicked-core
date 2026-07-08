@@ -64,7 +64,9 @@ fn capture_marker_pid(
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         match events.recv_timeout(Duration::from_millis(200)) {
-            Ok(CoreEvent::TerminalOutput { id: i, bytes_b64, .. }) if i == id => {
+            Ok(CoreEvent::TerminalOutput {
+                id: i, bytes_b64, ..
+            }) if i == id => {
                 if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
                     acc.push_str(&String::from_utf8_lossy(&b));
                 }
@@ -77,7 +79,10 @@ fn capture_marker_pid(
                     if !digits.is_empty() {
                         // Ensure we captured the WHOLE number (a trailing non-digit followed it).
                         let tail = &acc[pos + marker.len()..];
-                        if tail.chars().skip_while(|c| !c.is_ascii_digit()).nth(digits.len())
+                        if tail
+                            .chars()
+                            .skip_while(|c| !c.is_ascii_digit())
+                            .nth(digits.len())
                             .map(|c| !c.is_ascii_digit())
                             .unwrap_or(false)
                         {
@@ -132,31 +137,48 @@ fn pty_roundtrip_and_reap() {
 
     // Open a PTY running `cat` (echoes stdin → stdout; PTY line-discipline also echoes input).
     let id = core
-        .open_terminal(std::env::temp_dir(), Some(vec!["cat".to_string()]), 80, 24, false)
+        .open_terminal(
+            std::env::temp_dir(),
+            Some(vec!["cat".to_string()]),
+            80,
+            24,
+            false,
+        )
         .expect("open_terminal");
 
-    wait_for(&events, "TerminalOpened", |e| {
-        matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == id)
-    });
+    wait_for(
+        &events,
+        "TerminalOpened",
+        |e| matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == id),
+    );
 
     // Write input; assert the echoed bytes come back over TerminalOutput (base64-decoded).
-    core.write_terminal(&id, b"hello-pty\n").expect("write_terminal");
-    wait_for(&events, "TerminalOutput containing 'hello-pty'", |e| match e {
-        CoreEvent::TerminalOutput { id: i, bytes_b64, .. } if *i == id => base64::engine::general_purpose::STANDARD
-            .decode(bytes_b64)
-            .map(|b| String::from_utf8_lossy(&b).contains("hello-pty"))
-            .unwrap_or(false),
-        _ => false,
-    });
+    core.write_terminal(&id, b"hello-pty\n")
+        .expect("write_terminal");
+    wait_for(
+        &events,
+        "TerminalOutput containing 'hello-pty'",
+        |e| match e {
+            CoreEvent::TerminalOutput {
+                id: i, bytes_b64, ..
+            } if *i == id => base64::engine::general_purpose::STANDARD
+                .decode(bytes_b64)
+                .map(|b| String::from_utf8_lossy(&b).contains("hello-pty"))
+                .unwrap_or(false),
+            _ => false,
+        },
+    );
 
     // Resize must not error while the session is live.
     core.resize_terminal(&id, 100, 40).expect("resize_terminal");
 
     // Close → child reaped, reader joined, TerminalExited fires (once).
     core.close_terminal(&id).expect("close_terminal");
-    wait_for(&events, "TerminalExited", |e| {
-        matches!(e, CoreEvent::TerminalExited { id: i, .. } if *i == id)
-    });
+    wait_for(
+        &events,
+        "TerminalExited",
+        |e| matches!(e, CoreEvent::TerminalExited { id: i, .. } if *i == id),
+    );
 
     // No second TerminalExited for the same id (idempotent finish — a late TerminalReaderDone
     // after CloseTerminal must be a no-op).
@@ -172,7 +194,10 @@ fn pty_roundtrip_and_reap() {
             Err(_) => continue,
         }
     }
-    assert!(!extra_exit, "TerminalExited double-fired for the same terminal id");
+    assert!(
+        !extra_exit,
+        "TerminalExited double-fired for the same terminal id"
+    );
 }
 
 /// CRIT-1 (the load-bearing test the `cat` round-trip can't surface): a child that leaves a
@@ -202,9 +227,11 @@ fn close_terminal_kills_process_group_no_orphan_no_hang() {
         ],
     );
 
-    wait_for(&events, "TerminalOpened", |e| {
-        matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == id)
-    });
+    wait_for(
+        &events,
+        "TerminalOpened",
+        |e| matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == id),
+    );
 
     // Grab the backgrounded descendant's pid so we can assert it's dead after close.
     let bg_pid = capture_marker_pid(&events, &id, "BGPID=");
@@ -218,9 +245,11 @@ fn close_terminal_kills_process_group_no_orphan_no_hang() {
         "close_terminal hung ({elapsed:?}) — the reader join was not bounded / the group was not killed"
     );
 
-    wait_for(&events, "TerminalExited", |e| {
-        matches!(e, CoreEvent::TerminalExited { id: i, .. } if *i == id)
-    });
+    wait_for(
+        &events,
+        "TerminalExited",
+        |e| matches!(e, CoreEvent::TerminalExited { id: i, .. } if *i == id),
+    );
 
     // No orphan: the backgrounded descendant must die (killpg hit the whole group). Best-effort —
     // poll briefly for init to reap it after SIGKILL.
@@ -234,7 +263,10 @@ fn close_terminal_kills_process_group_no_orphan_no_hang() {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(dead, "backgrounded descendant pid {pid} survived close_terminal (orphan)");
+        assert!(
+            dead,
+            "backgrounded descendant pid {pid} survived close_terminal (orphan)"
+        );
     } else {
         eprintln!("warning: could not capture BGPID from PTY output — skipping orphan check (no-hang still asserted)");
     }
@@ -251,15 +283,19 @@ fn stuck_write_does_not_block_other_terminals() {
 
     // A: a child that never reads stdin, so a large write fills the PTY input buffer and BLOCKS.
     let a = open_retry(&core, vec!["sleep".to_string(), "60".to_string()]);
-    wait_for(&events, "A opened", |e| {
-        matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == a)
-    });
+    wait_for(
+        &events,
+        "A opened",
+        |e| matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == a),
+    );
 
     // B: the terminal we'll close; must not be blocked by A's stuck write.
     let b = open_retry(&core, vec!["cat".to_string()]);
-    wait_for(&events, "B opened", |e| {
-        matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == b)
-    });
+    wait_for(
+        &events,
+        "B opened",
+        |e| matches!(e, CoreEvent::TerminalOpened { id: i, .. } if *i == b),
+    );
 
     // Kick off a large blocking write to A on another thread (wedges on the full PTY input buffer).
     let core2 = core.clone();
@@ -280,9 +316,11 @@ fn stuck_write_does_not_block_other_terminals() {
         elapsed < Duration::from_secs(5),
         "close_terminal(B) was blocked ({elapsed:?}) by the stuck write on A — the map lock was held across the write"
     );
-    wait_for(&events, "B exited", |e| {
-        matches!(e, CoreEvent::TerminalExited { id: i, .. } if *i == b)
-    });
+    wait_for(
+        &events,
+        "B exited",
+        |e| matches!(e, CoreEvent::TerminalExited { id: i, .. } if *i == b),
+    );
 
     // Cleanup: closing A kills the child, which unblocks (errors) the stuck write so the thread ends.
     let _ = core.close_terminal(&a);

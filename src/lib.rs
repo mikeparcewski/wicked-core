@@ -23,7 +23,6 @@ mod event;
 mod execute;
 mod execute_wrapped;
 mod gate_hook;
-mod sources;
 mod graph_browser;
 mod knowledge;
 mod memory;
@@ -32,15 +31,22 @@ mod plan;
 mod repo;
 mod repo_intel;
 mod scope;
+mod sources;
 mod terminal;
 mod workflow;
 
 pub use actor::RunBusy;
-pub use campaign::{
-    all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied, validate as validate_campaign,
-    Campaign, CampaignDef, CampaignEdge, CampaignGateDecision, CampaignNode, CampaignStatus,
-    EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
+pub use applications::{
+    attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
+    Application, SeedKind,
 };
+pub use campaign::{
+    all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
+    validate as validate_campaign, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision,
+    CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
+};
+pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
+pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
     all_sessions, get_session, get_work_output, put_node, session_units, AgentSession,
     HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind, UnitStatus, WorkUnit,
@@ -48,19 +54,19 @@ pub use domain::{
 pub use event::CoreEvent;
 pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{count_claims, run_gate_hook, HookDrainSummary};
-pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
-pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
-pub use graph_browser::{browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote, NodeSummary, SymbolAnnotation};
-pub use applications::{attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo, Application, SeedKind};
-pub use repo_intel::{
-    change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
+pub use graph_browser::{
+    browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
+    NodeSummary, SymbolAnnotation,
 };
-pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
 pub use knowledge::RecalledKnowledge;
 pub use memory::{now_secs, RecalledMemory};
 pub use pipeline::SessionResult;
 pub use repo::{RepoEntry, RepoSpec};
+pub use repo_intel::{
+    change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
+};
 pub use scope::{resolve_scope, EntityMode};
+pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
 pub use wicked_council::AgenticCli;
 pub use workflow::{HumanDecision, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner};
 
