@@ -64,4 +64,18 @@ pub enum CoreEvent {
         session: Option<String>,
         message: String,
     },
+    // ── PTY terminal sessions (DES-TERMINAL-001) — ride the same single ordered emit point ──
+    /// A PTY terminal session opened; its child is running in `cwd`.
+    TerminalOpened { id: String, cwd: String },
+    /// A chunk of raw PTY output. `bytes_b64` is the raw bytes base64-encoded (CoreEvent → tagged
+    /// JSON can't carry a `Vec<u8>` cleanly). `seq` is per-terminal, monotonically increasing —
+    /// assigned on the single actor thread so the output stream stays ordered.
+    TerminalOutput {
+        id: String,
+        seq: u64,
+        bytes_b64: String,
+    },
+    /// A PTY terminal session ended (its child exited, or it was closed/reaped). `status` is the
+    /// child's exit code when known.
+    TerminalExited { id: String, status: Option<i32> },
 }

@@ -144,6 +144,18 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::Error { session, message } => {
             json!({ "type": "error", "session": session, "message": message })
         }
+        // PTY terminal sessions (DES-TERMINAL-001). Mapped minimally to keep this exhaustive match
+        // compiling now that core carries the terminal capability; the full TS surface (openTerminal
+        // etc.) is a separate follow-on task.
+        CoreEvent::TerminalOpened { id, cwd } => {
+            json!({ "type": "terminalOpened", "id": id, "cwd": cwd })
+        }
+        CoreEvent::TerminalOutput { id, seq, bytes_b64 } => {
+            json!({ "type": "terminalOutput", "id": id, "seq": seq, "bytesB64": bytes_b64 })
+        }
+        CoreEvent::TerminalExited { id, status } => {
+            json!({ "type": "terminalExited", "id": id, "status": status })
+        }
     }
 }
 

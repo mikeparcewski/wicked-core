@@ -12,10 +12,11 @@
 //!    unit runs, yet remains the only writer. An `in_flight` guard rejects a second mutating command
 //!    for a run already executing (`RunBusy`) so a run is never double-dispatched.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use wicked_apps_core::{open_store, GraphRead, NodeKind, SqliteStore, ToNode, AGENT_SESSION};
 use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
@@ -23,8 +24,17 @@ use wicked_estate_core::SymbolQuery;
 use crate::command::Command;
 use crate::domain::{put_node, SessionStatus};
 use crate::event::CoreEvent;
+use crate::terminal::{self, PtyMap, PtySession};
 use crate::workflow::{StepInput, StepRunner};
 use crate::{pipeline, LaunchSpec};
+
+/// The actor-owned terminal registry entry (DES §4 "id → status"). Presence in the registry map IS
+/// the "open" status; removal (on exit/close) is the terminal state — this is the single-emit guard
+/// that keeps `TerminalExited` firing exactly once. `next_seq` is the per-terminal output sequence,
+/// assigned here on the one actor thread so the stream stays ordered.
+struct TermReg {
+    next_seq: u64,
+}
 
 /// A run id already executing may not be mutated again — surfaced to the caller as this error.
 #[derive(Debug)]
@@ -48,6 +58,7 @@ pub(crate) fn run(
     self_tx: Sender<Command>,
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     runner: Arc<dyn StepRunner>,
+    pty_map: PtyMap,
 ) {
     let mut store = match open_store(Some(&path)) {
         Ok(s) => s,
@@ -78,6 +89,9 @@ pub(crate) fn run(
     let mut subscribers: Vec<Sender<CoreEvent>> = Vec::new();
     // Runs with a worker step in flight — guards against double-dispatch (non-idempotent side effects).
     let mut in_flight: HashSet<String> = HashSet::new();
+    // The actor-owned PTY terminal registry (id → status + seq). Byte-I/O lives off-actor in
+    // `pty_map`; this small map is the single-writer state the actor owns (DES §4).
+    let mut terminals: HashMap<String, TermReg> = HashMap::new();
 
     // Startup orphan reaper: prune worktrees whose run no longer exists on the store (e.g. a crashed
     // run cleaned out of the registry). Runs whose session still exists keep their worktree (resume).
@@ -394,11 +408,129 @@ pub(crate) fn run(
                 };
                 let _ = reply.send(res);
             }
-            Command::Shutdown => break,
+            Command::OpenTerminal {
+                cwd,
+                cmd,
+                cols,
+                rows,
+                governed,
+                reply,
+            } => {
+                let id = terminal::new_id();
+                // Spawn the off-actor PTY + reader thread FIRST; only register + announce on success
+                // (so a failed open never emits a dangling `TerminalOpened`).
+                match terminal::spawn_pty(&id, &cwd, cmd, cols, rows, &pty_map, self_tx.clone()) {
+                    Ok(()) => {
+                        // DES §7: an ungoverned operator shell must be a loud, explicit opt-in.
+                        if !governed {
+                            eprintln!(
+                                "wicked-core: opened UNGOVERNED operator terminal {id} in {} — bypasses the gate-hook (opt-in)",
+                                cwd.display()
+                            );
+                        }
+                        terminals.insert(id.clone(), TermReg { next_seq: 0 });
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::TerminalOpened {
+                                id: id.clone(),
+                                cwd: cwd.display().to_string(),
+                            },
+                        );
+                        let _ = reply.send(Ok(id));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            Command::TerminalChunk { id, bytes } => {
+                // The single emit point: assign the per-terminal seq + fan the chunk out as
+                // `TerminalOutput`. A chunk for an already-closed terminal (registry entry gone) is
+                // dropped. Mirrors the `CliOutputDelta` streaming path — no store write.
+                if let Some(reg) = terminals.get_mut(&id) {
+                    let seq = reg.next_seq;
+                    reg.next_seq += 1;
+                    let bytes_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::TerminalOutput { id, seq, bytes_b64 },
+                    );
+                }
+            }
+            Command::CloseTerminal { id, reply } => {
+                finish_terminal(&mut terminals, &pty_map, &mut subscribers, &id, true);
+                let _ = reply.send(());
+            }
+            Command::TerminalReaderDone { id } => {
+                // Natural EOF: the child exited on its own. Reap + emit `TerminalExited` (once).
+                finish_terminal(&mut terminals, &pty_map, &mut subscribers, &id, false);
+            }
+            Command::Shutdown => {
+                // Reap every live PTY: kill children + join reader threads so no process/thread is
+                // leaked when the last `Core` drops (DES §5, R1).
+                let ids: Vec<String> = terminals.keys().cloned().collect();
+                for id in ids {
+                    finish_terminal(&mut terminals, &pty_map, &mut subscribers, &id, true);
+                }
+                break;
+            }
         }
     }
     // Loop exited (last Core dropped): `store` drops here, releasing the writable connection. Any
     // in-flight worker that posts a result now sends into a closed channel and is harmlessly dropped.
+    // Defense-in-depth: kill + reap anything still in the PTY map (there should be nothing — the
+    // Shutdown arm already reaped every registered terminal — but a leaked child/thread is the exact
+    // failure DES R1 forbids, so we guarantee it).
+    let leftovers: Vec<PtySession> = terminal::lock(&pty_map).drain().map(|(_, v)| v).collect();
+    for mut s in leftovers {
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        if let Some(h) = s.reader.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Tear down one terminal exactly once (idempotent via registry presence): remove it from the shared
+/// I/O map, optionally kill the child, reap it (`wait`), join the reader thread, drop the registry
+/// entry, and emit `TerminalExited`. `kill=true` for an operator close / shutdown; `kill=false` for a
+/// natural EOF (the child already exited — `wait` just reaps and reports its status). A second call
+/// for the same id (e.g. the reader's `TerminalReaderDone` arriving after a `CloseTerminal` already
+/// reaped it) is a no-op, so `TerminalExited` never double-fires.
+fn finish_terminal(
+    terminals: &mut HashMap<String, TermReg>,
+    map: &PtyMap,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    id: &str,
+    kill: bool,
+) {
+    if !terminals.contains_key(id) {
+        return; // already finished — single-emit guard
+    }
+    // Take the session out of the shared map, then release the lock BEFORE the (possibly blocking)
+    // kill/wait/join so write/resize on OTHER terminals never wait on this teardown.
+    let session = terminal::lock(map).remove(id);
+    let mut status = None;
+    if let Some(mut s) = session {
+        if kill {
+            let _ = s.child.kill();
+        }
+        // Reap the child (no zombie). After a kill the SIGHUP terminates it; on natural EOF it has
+        // already exited, so this returns its real code immediately.
+        status = s.child.wait().ok().map(|st| st.exit_code() as i32);
+        if let Some(h) = s.reader.take() {
+            let _ = h.join(); // the reader hit EOF (from the kill or the child's own exit) → returns
+        }
+        // `s` (writer + master) drops here, closing the master fd.
+    }
+    terminals.remove(id);
+    emit(
+        subscribers,
+        CoreEvent::TerminalExited {
+            id: id.to_string(),
+            status,
+        },
+    );
 }
 
 /// Outcome of applying a worker step — drives the actor's in-flight bookkeeping.

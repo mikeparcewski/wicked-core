@@ -35,8 +35,16 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# PTY terminal sessions (DES-TERMINAL-001): cross-platform pseudo-terminal (unix + Windows ConPTY).
+# The mechanism is lifted from the retiring egui studio's `portable-pty` usage, minus the egui/vt100
+# coupling — core streams RAW bytes as events; screen emulation (vt100) is a UI concern, not core's.
+portable-pty = "0.8"
+# base64-encode raw PTY output bytes for the `TerminalOutput` event (CoreEvent → tagged JSON).
+base64 = "0.22"
 
 [dev-dependencies]
+# The terminal round-trip test decodes `TerminalOutput.bytes_b64` to assert the echoed bytes.
+base64 = "0.22"
 # Integration tests reach the engine crates' public APIs directly to seed policies, inject a stub
 # council dispatcher, and read phase state. Same vendored path crates as above, so cargo unifies
 # them to one compilation (shared types).

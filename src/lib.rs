@@ -31,6 +31,7 @@ mod plan;
 mod repo;
 mod repo_intel;
 mod scope;
+mod terminal;
 mod workflow;
 
 pub use actor::RunBusy;
@@ -109,6 +110,10 @@ impl Drop for ShutdownGuard {
 #[derive(Clone)]
 pub struct Core {
     tx: Sender<Command>,
+    /// The off-actor PTY writer/master/child map (DES-TERMINAL-001 §4). `write_terminal` /
+    /// `resize_terminal` act on this DIRECTLY — no store round-trip — so keystroke I/O never queues
+    /// behind the single store-writer actor. Shared (cloned) with the actor, which owns open/close.
+    pty: terminal::PtyMap,
     _shutdown: Arc<ShutdownGuard>,
 }
 
@@ -137,9 +142,14 @@ impl Core {
         let (tx, rx) = channel();
         let path = path.into();
         let self_tx = tx.clone();
-        std::thread::spawn(move || actor::run(path, rx, self_tx, dispatcher, runner));
+        // The off-actor PTY I/O map: one clone drives write/resize from `Core`, one is owned by the
+        // actor for open/close/shutdown. Both reach the same sessions behind its mutex.
+        let pty = terminal::new_map();
+        let pty_actor = pty.clone();
+        std::thread::spawn(move || actor::run(path, rx, self_tx, dispatcher, runner, pty_actor));
         Core {
             tx: tx.clone(),
+            pty,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }
@@ -414,6 +424,84 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    // ── PTY terminal sessions (DES-TERMINAL-001) ─────────────────────────────────────────────────
+
+    /// Open a PTY terminal session running `cmd` (or the login shell if `None`) in `cwd`, sized
+    /// `cols`x`rows`. Registry state is written on the actor (single writer); the byte-I/O runs
+    /// off-actor. `governed=false` is a loud, opt-in ungoverned operator shell (bypasses the
+    /// gate-hook — DES §7); default to `true`. Returns the new terminal id. Output arrives as
+    /// [`CoreEvent::TerminalOutput`]; `subscribe()` BEFORE calling to catch `TerminalOpened` + bytes.
+    pub fn open_terminal(
+        &self,
+        cwd: impl Into<std::path::PathBuf>,
+        cmd: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
+        governed: bool,
+    ) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::OpenTerminal {
+                cwd: cwd.into(),
+                cmd,
+                cols,
+                rows,
+                governed,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Write raw input bytes (keystrokes) to a terminal. Acts on the off-actor PTY writer map
+    /// DIRECTLY (no store round-trip, DES §4), so high-frequency input never queues behind the store
+    /// writer. Fire-and-forget in spirit; errors only if the terminal id is unknown / the write fails.
+    pub fn write_terminal(&self, id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut map = terminal::lock(&self.pty);
+        let s = map
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("no such terminal: {id}"))?;
+        s.writer.write_all(bytes)?;
+        s.writer.flush()?;
+        Ok(())
+    }
+
+    /// Resize a terminal's PTY to `cols`x`rows`. Acts on the off-actor master map DIRECTLY (no store
+    /// round-trip, DES §4). Errors only if the terminal id is unknown / the resize fails.
+    pub fn resize_terminal(&self, id: &str, cols: u16, rows: u16) -> anyhow::Result<()> {
+        let map = terminal::lock(&self.pty);
+        let s = map
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("no such terminal: {id}"))?;
+        s.master
+            .resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| anyhow::anyhow!("resize failed: {e}"))?;
+        Ok(())
+    }
+
+    /// Close a terminal: the actor kills the child, joins the reader thread, and drops the registry +
+    /// I/O entries (no orphaned process/thread — DES §5, R1). Blocks until teardown completes; a
+    /// [`CoreEvent::TerminalExited`] is emitted.
+    pub fn close_terminal(&self, id: &str) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::CloseTerminal {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?;
+        Ok(())
     }
 }
 

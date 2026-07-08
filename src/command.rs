@@ -124,6 +124,29 @@ pub(crate) enum Command {
         ord: u32,
         chunk: String,
     },
+    // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────────────────────
+    /// Open a PTY session running `cmd` (or the login shell if `None`) in `cwd`, sized `cols`x`rows`.
+    /// The actor registers the session (id → status + `seq`) — single writer — and spawns the
+    /// off-actor PTY + reader thread. `governed=false` is a loud, opt-in ungoverned operator shell
+    /// (DES §7). Reply carries the new [`crate::terminal`] id (or a spawn error).
+    OpenTerminal {
+        cwd: PathBuf,
+        cmd: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
+        governed: bool,
+        reply: Sender<anyhow::Result<String>>,
+    },
+    /// Close a PTY session: kill the child, join its reader thread, drop the registry + I/O entries,
+    /// emit `TerminalExited` (DES §5, R1 — no orphaned process/thread). The ack fires after teardown.
+    CloseTerminal { id: String, reply: Sender<()> },
+    /// Internal: the off-actor reader thread posts a raw output chunk here; the actor (the single
+    /// emit point) assigns the per-terminal `seq` and fans it out as `CoreEvent::TerminalOutput`.
+    /// Mirrors `CliOutputDelta` — bytes ride the emit point, never a store write.
+    TerminalChunk { id: String, bytes: Vec<u8> },
+    /// Internal: the reader thread hit EOF (the PTY closed). The actor reaps the child, joins the
+    /// thread, and emits `TerminalExited` exactly once (guarded by registry presence).
+    TerminalReaderDone { id: String },
     /// Stop the actor loop and release the store. Sent automatically when the LAST external `Core`
     /// handle drops (the actor holds its own `self_tx` for worker write-back, so channel-close alone
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but
