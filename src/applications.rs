@@ -152,7 +152,8 @@ pub fn create_app(
 
 /// Attach a repo to an application (after it's been added/indexed).
 pub fn attach_repo(app_id: &str, repo: AppRepo) -> anyhow::Result<()> {
-    let mut app = get_app(app_id).ok_or_else(|| anyhow::anyhow!("no such application: {app_id}"))?;
+    let mut app =
+        get_app(app_id).ok_or_else(|| anyhow::anyhow!("no such application: {app_id}"))?;
     if !app.repos.iter().any(|r| r.path == repo.path) {
         app.repos.push(repo);
     }
@@ -161,7 +162,8 @@ pub fn attach_repo(app_id: &str, repo: AppRepo) -> anyhow::Result<()> {
 
 /// Attach a doc to an application.
 pub fn attach_doc(app_id: &str, doc: AppDoc) -> anyhow::Result<()> {
-    let mut app = get_app(app_id).ok_or_else(|| anyhow::anyhow!("no such application: {app_id}"))?;
+    let mut app =
+        get_app(app_id).ok_or_else(|| anyhow::anyhow!("no such application: {app_id}"))?;
     if !app.docs.iter().any(|d| d.path == doc.path) {
         app.docs.push(doc);
     }

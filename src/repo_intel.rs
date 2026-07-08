@@ -86,7 +86,12 @@ pub fn recent_commits(repo: &str, n: usize) -> Vec<Commit> {
 pub fn hotspots(repo: &str, n: usize) -> Vec<Hotspot> {
     let Some(out) = git(
         repo,
-        &["log", "--since=6.months.ago", "--name-only", "--pretty=format:"],
+        &[
+            "log",
+            "--since=6.months.ago",
+            "--name-only",
+            "--pretty=format:",
+        ],
     ) else {
         return vec![];
     };
@@ -131,9 +136,17 @@ pub fn commits_since(repo: &str, days: u32, max: usize) -> Vec<Commit> {
 /// agent's brief so the controlled run reviews the ACTUAL changes, not just commit subjects.
 pub fn change_digest_since(repo: &str, days: u32) -> String {
     let since = format!("--since={days}.days.ago");
-    git(repo, &["log", &since, "--stat", "--pretty=format:%h %an · %ar%n  %s"])
-        .map(|s| s.chars().take(16_000).collect())
-        .unwrap_or_default()
+    git(
+        repo,
+        &[
+            "log",
+            &since,
+            "--stat",
+            "--pretty=format:%h %an · %ar%n  %s",
+        ],
+    )
+    .map(|s| s.chars().take(16_000).collect())
+    .unwrap_or_default()
 }
 
 /// Parse the indexer's `--json` `[{file,kind,name}]` output.

@@ -26,7 +26,9 @@ fn recon_indexes_and_ranks_a_real_codebase() {
         eprintln!("skipping p11: wicked-estate indexer not built (cargo install wicked-estate)");
         return;
     };
-    let _g = INDEX_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = INDEX_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
 
     // Index this crate's OWN src as a small real Rust codebase.
@@ -42,7 +44,9 @@ fn recon_indexes_and_ranks_a_real_codebase() {
         "the top symbol is the PageRank centrality leader (100% relative)"
     );
     assert!(
-        symbols.iter().all(|s| !s.name.is_empty() && !s.file.is_empty()),
+        symbols
+            .iter()
+            .all(|s| !s.name.is_empty() && !s.file.is_empty()),
         "every ranked symbol resolves to a real name + file, got: {symbols:?}"
     );
     // Scores are monotonically non-increasing (ranked).
@@ -59,7 +63,9 @@ fn browse_and_node_detail_on_a_real_graph() {
         eprintln!("skipping p11 browse: indexer not built");
         return;
     };
-    let _g = INDEX_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = INDEX_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let _ = wicked_core::recon_repo(&src, 5).expect("recon indexes the graph");

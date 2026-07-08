@@ -277,7 +277,11 @@ pub(crate) fn run(
                     },
                 );
             }
-            Command::CaptureMemory { content, scope, reply } => {
+            Command::CaptureMemory {
+                content,
+                scope,
+                reply,
+            } => {
                 let res = match memory.as_mut() {
                     Some(m) => m.capture(
                         content,
@@ -295,7 +299,11 @@ pub(crate) fn run(
                 };
                 let _ = reply.send(res);
             }
-            Command::ListMemories { scope, limit, reply } => {
+            Command::ListMemories {
+                scope,
+                limit,
+                reply,
+            } => {
                 let res = match memory.as_ref() {
                     Some(m) => m.list(&wicked_estate_memory_core::Scope::parse(&scope), limit),
                     None => Ok(Vec::new()),

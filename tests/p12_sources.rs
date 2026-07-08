@@ -26,7 +26,9 @@ fn add_source_accepts_local_path_and_rejects_missing() {
 
 #[test]
 fn docs_roundtrip_create_list_edit() {
-    let _g = HOME_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = HOME_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_HOME", tmp_home("docs"));
     let path = wicked_core::new_doc("Auth Recon", "first body").expect("create doc");
     let listed = wicked_core::list_docs();
@@ -38,12 +40,16 @@ fn docs_roundtrip_create_list_edit() {
 
     // Edit + save.
     wicked_core::write_doc(&path, "# Auth Recon\n\nedited body").expect("save edit");
-    assert!(wicked_core::read_doc(&path).unwrap().contains("edited body"));
+    assert!(wicked_core::read_doc(&path)
+        .unwrap()
+        .contains("edited body"));
 }
 
 #[test]
 fn applications_crud_with_repos_and_docs() {
-    let _g = HOME_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = HOME_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_HOME", tmp_home("apps"));
     use wicked_core::{AppDoc, AppRepo, SeedKind};
 
@@ -91,7 +97,9 @@ fn applications_crud_with_repos_and_docs() {
 
 #[test]
 fn enrich_creates_a_recon_doc_per_cli() {
-    let _g = HOME_GUARD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _g = HOME_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_HOME", tmp_home("enrich"));
     let repo = env!("CARGO_MANIFEST_DIR");
     let top = vec![("recall".to_string(), "memory.rs".to_string())];
@@ -105,7 +113,9 @@ fn enrich_creates_a_recon_doc_per_cli() {
         "the recon doc was saved to disk"
     );
     assert!(
-        wicked_core::list_docs().iter().any(|d| d.title.contains("echo recon")),
+        wicked_core::list_docs()
+            .iter()
+            .any(|d| d.title.contains("echo recon")),
         "the recon doc is listed in the docs view"
     );
 }

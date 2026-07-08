@@ -81,19 +81,14 @@ pub struct CampaignNode {
 }
 
 /// When a dependency edge is *satisfied* (DES §5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeCondition {
     /// The dep must reach `Completed` (success only) — the default dependency.
+    #[default]
     OnSuccess,
     /// The dep must reach any terminal outcome `{Completed, Failed, Cancelled}` (cleanup/report path).
     OnTerminal,
-}
-
-impl Default for EdgeCondition {
-    fn default() -> Self {
-        EdgeCondition::OnSuccess
-    }
 }
 
 /// A dependency edge `from -> to`: `to` becomes eligible once `from` satisfies `condition`.
@@ -106,22 +101,17 @@ pub struct CampaignEdge {
 }
 
 /// How a node failure propagates through the campaign (DES §5.2, REQ FR5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FailurePolicy {
     /// Any node failure → cancel every non-terminal node (incl. `ReadyToResume`), campaign `Failed`.
     FailFast,
     /// (default) A failed node blocks only its transitive `OnSuccess`-dependents; independent
     /// branches run on. Ends `PartiallyCompleted` if any node Blocked/Failed, else `Completed`.
+    #[default]
     ContinueIndependent,
     /// A node failure pauses the campaign at a per-node decision (`Retry | Skip | Abort`).
     HumanGateOnFailure,
-}
-
-impl Default for FailurePolicy {
-    fn default() -> Self {
-        FailurePolicy::ContinueIndependent
-    }
 }
 
 /// The static definition of a campaign — validated + persisted verbatim inside the live [`Campaign`]
@@ -323,7 +313,14 @@ impl Campaign {
         self.pending_decision = self
             .pending_decision_amend
             .iter()
-            .map(|(k, amend)| (k.clone(), HumanDecision::Approve { amend: amend.clone() }))
+            .map(|(k, amend)| {
+                (
+                    k.clone(),
+                    HumanDecision::Approve {
+                        amend: amend.clone(),
+                    },
+                )
+            })
             .collect();
     }
 
@@ -369,7 +366,11 @@ pub fn ready_set(
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for n in nodes {
-        match status.get(&n.node_id).copied().unwrap_or(NodeStatus::Pending) {
+        match status
+            .get(&n.node_id)
+            .copied()
+            .unwrap_or(NodeStatus::Pending)
+        {
             NodeStatus::Ready => {
                 out.insert(n.node_id.clone());
             }
@@ -418,8 +419,8 @@ pub fn blocked_by_failure(
                 continue;
             }
             let to_status = status.get(&e.to).copied().unwrap_or(NodeStatus::Pending);
-            let blockable =
-                matches!(to_status, NodeStatus::Pending | NodeStatus::Ready) && !blocked.contains(&e.to);
+            let blockable = matches!(to_status, NodeStatus::Pending | NodeStatus::Ready)
+                && !blocked.contains(&e.to);
             if blockable {
                 blocked.insert(e.to.clone());
                 added = true;
@@ -439,7 +440,9 @@ pub fn blocked_by_failure(
 /// no-edge campaign is valid (dispatches immediately).
 pub fn validate(def: &CampaignDef) -> Result<(), String> {
     if def.nodes.is_empty() {
-        return Err("campaign has no nodes (an empty campaign is rejected, not vacuously completed)".into());
+        return Err(
+            "campaign has no nodes (an empty campaign is rejected, not vacuously completed)".into(),
+        );
     }
     if def.max_concurrency < 1 {
         return Err("max_concurrency must be >= 1".into());
@@ -481,8 +484,11 @@ pub fn validate(def: &CampaignDef) -> Result<(), String> {
 /// Kahn's topo-sort cycle detection. `BTreeMap` in-degree table + a sorted seed queue keep it
 /// deterministic. If fewer than `|nodes|` are visited, a cycle exists.
 fn detect_cycle(def: &CampaignDef) -> Result<(), String> {
-    let mut indeg: BTreeMap<&str, usize> =
-        def.nodes.iter().map(|n| (n.node_id.as_str(), 0usize)).collect();
+    let mut indeg: BTreeMap<&str, usize> = def
+        .nodes
+        .iter()
+        .map(|n| (n.node_id.as_str(), 0usize))
+        .collect();
     for e in &def.edges {
         if let Some(d) = indeg.get_mut(e.to.as_str()) {
             *d += 1;
@@ -542,8 +548,9 @@ impl FromNode for Campaign {
             NodeKind::Other(k) if k == CAMPAIGN => {}
             other => anyhow::bail!("expected NodeKind::Other({CAMPAIGN:?}), got {other:?}"),
         }
-        let mut c: Campaign = serde_json::from_value(serde_json::Value::Object(node.metadata.clone()))
-            .map_err(|e| anyhow::anyhow!("node {} is not a valid Campaign: {e}", node.name))?;
+        let mut c: Campaign =
+            serde_json::from_value(serde_json::Value::Object(node.metadata.clone()))
+                .map_err(|e| anyhow::anyhow!("node {} is not a valid Campaign: {e}", node.name))?;
         c.rehydrate();
         Ok(c)
     }
@@ -636,7 +643,12 @@ pub(crate) fn launch(
     }
     let mut campaign = Campaign::new(def);
     persist(store, &mut campaign)?;
-    emit(subscribers, CoreEvent::CampaignLaunched { campaign: id.clone() });
+    emit(
+        subscribers,
+        CoreEvent::CampaignLaunched {
+            campaign: id.clone(),
+        },
+    );
     promote_ready(&mut campaign, subscribers);
     persist(store, &mut campaign)?;
     try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
@@ -648,7 +660,11 @@ pub(crate) fn launch(
 /// Promote every newly-satisfied `Pending` node to `Ready` (emit `CampaignNodeReady`). Pure ready-set
 /// computation drives it; this is the side-effecting half.
 fn promote_ready(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
-    let rs = ready_set(&campaign.def.nodes, &campaign.def.edges, &campaign.node_status);
+    let rs = ready_set(
+        &campaign.def.nodes,
+        &campaign.def.edges,
+        &campaign.node_status,
+    );
     for node in rs {
         if campaign.status_of(&node) == NodeStatus::Pending {
             campaign.node_status.insert(node.clone(), NodeStatus::Ready);
@@ -710,8 +726,12 @@ fn dispatch(
     };
 
     // Write node_run_id + set Running + PERSIST as one atomic actor step BEFORE launching (§4).
-    campaign.node_run_id.insert(node_id.to_string(), run_id.clone());
-    campaign.node_status.insert(node_id.to_string(), NodeStatus::Running);
+    campaign
+        .node_run_id
+        .insert(node_id.to_string(), run_id.clone());
+    campaign
+        .node_status
+        .insert(node_id.to_string(), NodeStatus::Running);
     persist(store, campaign)?;
 
     let launched = if was_ready {
@@ -760,7 +780,9 @@ fn dispatch(
         Err(e) => {
             // Launch/resume failed → the node is terminally Failed; reconcile like a run failure so
             // dependents are handled and the campaign can still finalize (never a stuck Running node).
-            campaign.node_status.insert(node_id.to_string(), NodeStatus::Failed);
+            campaign
+                .node_status
+                .insert(node_id.to_string(), NodeStatus::Failed);
             persist(store, campaign)?;
             emit(
                 subscribers,
@@ -800,7 +822,15 @@ pub(crate) fn on_run_finished(
     if campaign.status_of(&node_id).is_terminal() {
         return Ok(());
     }
-    reconcile_terminal(&mut campaign, &node_id, outcome, store, subscribers, in_flight, seams)?;
+    reconcile_terminal(
+        &mut campaign,
+        &node_id,
+        outcome,
+        store,
+        subscribers,
+        in_flight,
+        seams,
+    )?;
     promote_ready(&mut campaign, subscribers);
     persist(store, &mut campaign)?;
     try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
@@ -953,7 +983,10 @@ pub(crate) fn confirm_gate(
             require_failure_gate(&campaign, node_id)?;
             // Bump the attempt + set Ready; `dispatch()` derives the fresh run id from the bumped
             // attempt (§2.1). Retry never touches node_run_id or calls LaunchRun itself.
-            *campaign.node_attempt.entry(node_id.to_string()).or_insert(0) += 1;
+            *campaign
+                .node_attempt
+                .entry(node_id.to_string())
+                .or_insert(0) += 1;
             campaign
                 .node_status
                 .insert(node_id.to_string(), NodeStatus::Ready);
@@ -1006,7 +1039,12 @@ pub(crate) fn pause(
     if campaign.status == CampaignStatus::Running {
         campaign.status = CampaignStatus::Paused;
         persist(store, &mut campaign)?;
-        emit(subscribers, CoreEvent::CampaignPaused { campaign: id.to_string() });
+        emit(
+            subscribers,
+            CoreEvent::CampaignPaused {
+                campaign: id.to_string(),
+            },
+        );
     }
     Ok(campaign.status)
 }
@@ -1050,14 +1088,21 @@ pub(crate) fn cancel(
         .map(|(n, _)| n.clone())
         .collect();
     for n in &non_terminal {
-        campaign.node_status.insert(n.clone(), NodeStatus::Cancelled);
+        campaign
+            .node_status
+            .insert(n.clone(), NodeStatus::Cancelled);
     }
     persist(store, &mut campaign)?;
     for rid in &live {
         let _ = crate::actor::cancel_run(store, subscribers, seams.self_tx, rid);
         in_flight.remove(rid);
     }
-    emit(subscribers, CoreEvent::CampaignCancelled { campaign: id.to_string() });
+    emit(
+        subscribers,
+        CoreEvent::CampaignCancelled {
+            campaign: id.to_string(),
+        },
+    );
     Ok(CampaignStatus::Cancelled)
 }
 
@@ -1114,7 +1159,15 @@ pub(crate) fn resume(
                     SessionStatus::Failed => NodeOutcome::Failed,
                     _ => NodeOutcome::Cancelled,
                 };
-                reconcile_terminal(&mut campaign, node, outcome, store, subscribers, in_flight, seams)?;
+                reconcile_terminal(
+                    &mut campaign,
+                    node,
+                    outcome,
+                    store,
+                    subscribers,
+                    in_flight,
+                    seams,
+                )?;
             }
             // No session exists in core: the crash hit BEFORE `plan_and_distribute` wrote it (e.g. the
             // multi-second worktree-create window for a repo-backed node). RunNotFound → launch FRESH
@@ -1146,10 +1199,20 @@ pub(crate) fn resume(
                         subscribers,
                         CoreEvent::Error {
                             session: Some(run_id.clone()),
-                            message: format!("campaign node {node} failed to relaunch on resume: {e}"),
+                            message: format!(
+                                "campaign node {node} failed to relaunch on resume: {e}"
+                            ),
                         },
                     );
-                    reconcile_terminal(&mut campaign, node, NodeOutcome::Failed, store, subscribers, in_flight, seams)?;
+                    reconcile_terminal(
+                        &mut campaign,
+                        node,
+                        NodeOutcome::Failed,
+                        store,
+                        subscribers,
+                        in_flight,
+                        seams,
+                    )?;
                 }
             }
             // Mid-flight: the session exists and is non-terminal. Re-attach — core's completion
@@ -1171,7 +1234,15 @@ pub(crate) fn resume(
                             message: format!("campaign node {node} failed to resume: {e}"),
                         },
                     );
-                    reconcile_terminal(&mut campaign, node, NodeOutcome::Failed, store, subscribers, in_flight, seams)?;
+                    reconcile_terminal(
+                        &mut campaign,
+                        node,
+                        NodeOutcome::Failed,
+                        store,
+                        subscribers,
+                        in_flight,
+                        seams,
+                    )?;
                 }
             }
         }
@@ -1204,7 +1275,15 @@ pub(crate) fn resume(
                 _ => None,
             };
             if let Some(outcome) = outcome {
-                reconcile_terminal(&mut campaign, node, outcome, store, subscribers, in_flight, seams)?;
+                reconcile_terminal(
+                    &mut campaign,
+                    node,
+                    outcome,
+                    store,
+                    subscribers,
+                    in_flight,
+                    seams,
+                )?;
             }
         }
     }
@@ -1289,7 +1368,9 @@ fn fail_fast(
         .map(|(n, _)| n.clone())
         .collect();
     for n in &non_terminal {
-        campaign.node_status.insert(n.clone(), NodeStatus::Cancelled);
+        campaign
+            .node_status
+            .insert(n.clone(), NodeStatus::Cancelled);
     }
     persist(store, campaign)?;
     for rid in &live {
@@ -1301,10 +1382,16 @@ fn fail_fast(
 
 /// Recompute `blocked_by_failure` and mark newly-blocked nodes `Blocked` (emit `CampaignNodeBlocked`).
 fn apply_blocking(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
-    let blocked = blocked_by_failure(&campaign.def.nodes, &campaign.def.edges, &campaign.node_status);
+    let blocked = blocked_by_failure(
+        &campaign.def.nodes,
+        &campaign.def.edges,
+        &campaign.node_status,
+    );
     for node in blocked {
         if campaign.status_of(&node) != NodeStatus::Blocked {
-            campaign.node_status.insert(node.clone(), NodeStatus::Blocked);
+            campaign
+                .node_status
+                .insert(node.clone(), NodeStatus::Blocked);
             emit(
                 subscribers,
                 CoreEvent::CampaignNodeBlocked {
@@ -1341,21 +1428,33 @@ fn finalize_if_done(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEv
         .all(|s| *s == NodeStatus::Completed);
     if all_completed {
         campaign.status = CampaignStatus::Completed;
-        emit(subscribers, CoreEvent::CampaignCompleted { campaign: campaign.id.clone() });
+        emit(
+            subscribers,
+            CoreEvent::CampaignCompleted {
+                campaign: campaign.id.clone(),
+            },
+        );
     } else if campaign.fail_fast_tripped {
         campaign.status = CampaignStatus::Failed;
-        emit(subscribers, CoreEvent::CampaignFailed { campaign: campaign.id.clone() });
+        emit(
+            subscribers,
+            CoreEvent::CampaignFailed {
+                campaign: campaign.id.clone(),
+            },
+        );
     } else {
         campaign.status = CampaignStatus::PartiallyCompleted;
-        emit(subscribers, CoreEvent::CampaignCompleted { campaign: campaign.id.clone() });
+        emit(
+            subscribers,
+            CoreEvent::CampaignCompleted {
+                campaign: campaign.id.clone(),
+            },
+        );
     }
 }
 
 /// Inverse-lookup the non-terminal campaign + node that owns `run_id` (bounded linear scan, §4 step 2).
-fn find_by_run(
-    store: &SqliteStore,
-    run_id: &str,
-) -> anyhow::Result<Option<(Campaign, String)>> {
+fn find_by_run(store: &SqliteStore, run_id: &str) -> anyhow::Result<Option<(Campaign, String)>> {
     for campaign in all_campaigns(store)? {
         if matches!(
             campaign.status,
@@ -1363,7 +1462,11 @@ fn find_by_run(
         ) {
             continue;
         }
-        if let Some((node, _)) = campaign.node_run_id.iter().find(|(_, rid)| rid.as_str() == run_id) {
+        if let Some((node, _)) = campaign
+            .node_run_id
+            .iter()
+            .find(|(_, rid)| rid.as_str() == run_id)
+        {
             let node = node.clone();
             return Ok(Some((campaign, node)));
         }
@@ -1544,7 +1647,10 @@ mod tests {
             ("Y", NodeStatus::Failed),
             ("N", NodeStatus::Pending),
         ]);
-        assert_eq!(ready_set(&nodes, &edges, &s), BTreeSet::from(["N".to_string()]));
+        assert_eq!(
+            ready_set(&nodes, &edges, &s),
+            BTreeSet::from(["N".to_string()])
+        );
         assert!(blocked_by_failure(&nodes, &edges, &s).is_empty());
 
         // Row 2: X Failed, Y Completed → Blocked (an OnSuccess dep failed), NOT ready.
@@ -1563,7 +1669,10 @@ mod tests {
         let edges2 = vec![edge("X", "N", EdgeCondition::OnTerminal)];
         let nodes2 = vec![node("X"), node("N")];
         let s = status_map(&[("X", NodeStatus::Failed), ("N", NodeStatus::Pending)]);
-        assert_eq!(ready_set(&nodes2, &edges2, &s), BTreeSet::from(["N".to_string()]));
+        assert_eq!(
+            ready_set(&nodes2, &edges2, &s),
+            BTreeSet::from(["N".to_string()])
+        );
     }
 
     // ── SC-C7 — cycle rejected; + empty / duplicate-edge / dangling-edge validation ──
@@ -1640,8 +1749,12 @@ mod tests {
         let mut c = Campaign::new(def);
         c.node_status.insert("A".into(), NodeStatus::Completed);
         c.node_run_id.insert("A".into(), "camp1:A:a0".into());
-        c.pending_decision
-            .insert("B".into(), HumanDecision::Approve { amend: Some("go".into()) });
+        c.pending_decision.insert(
+            "B".into(),
+            HumanDecision::Approve {
+                amend: Some("go".into()),
+            },
+        );
         c.sync_pending();
 
         let back = Campaign::from_node(&c.to_node()).expect("from_node");

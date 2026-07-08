@@ -72,7 +72,11 @@ pub fn add_source(origin: &str, name: &str) -> anyhow::Result<String> {
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
                 .unwrap_or(false)
             {
-                let _ = Command::new("git").arg("-C").arg(&dest).args(["fetch", "--unshallow"]).output();
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(&dest)
+                    .args(["fetch", "--unshallow"])
+                    .output();
             }
             let _ = Command::new("git")
                 .arg("-C")
@@ -181,11 +185,25 @@ fn parse_symbol_notes(body: &str, known: &[(String, String)]) -> Vec<(String, St
 
 /// Attach a manual NOTE to a graph node (by stable symbol id). Shows in the node's detail + feeds
 /// recall; provenance = manual, author = the person/agent who wrote it.
-pub fn add_node_note(graph_db: &str, node_id: &str, note: &str, author: &str) -> anyhow::Result<()> {
+pub fn add_node_note(
+    graph_db: &str,
+    node_id: &str,
+    note: &str,
+    author: &str,
+) -> anyhow::Result<()> {
     let bin = crate::code_graph::indexer_bin();
     let out = Command::new(&bin)
-        .args(["annotate", "--symbol", node_id, "--key", "note", "--value", note])
-        .args(["--type", "note", "--provenance", "manual", "--author", author])
+        .args([
+            "annotate", "--symbol", node_id, "--key", "note", "--value", note,
+        ])
+        .args([
+            "--type",
+            "note",
+            "--provenance",
+            "manual",
+            "--author",
+            author,
+        ])
         .args(["--db", graph_db])
         .output()
         .map_err(|e| anyhow::anyhow!("could not run the indexer to annotate ({e})"))?;
@@ -223,7 +241,14 @@ fn annotate_symbol(graph_db: &str, symbol: &str, note: &str, cli: &str) -> bool 
     let bin = crate::code_graph::indexer_bin();
     Command::new(&bin)
         .args(["annotate", symbol, "--key", "role", "--value", note])
-        .args(["--type", "note", "--provenance", "enrichment", "--author", cli])
+        .args([
+            "--type",
+            "note",
+            "--provenance",
+            "enrichment",
+            "--author",
+            cli,
+        ])
         .args(["--db", graph_db])
         .output()
         .map(|o| o.status.success())
@@ -245,7 +270,8 @@ pub fn enrich_source(
     let mut docs = Vec::new();
     for (key, invocation) in clis {
         let prompt = recon_prompt(repo, top);
-        let Some(body) = run_cli(invocation, &prompt, cwd, Duration::from_secs(timeout_secs)) else {
+        let Some(body) = run_cli(invocation, &prompt, cwd, Duration::from_secs(timeout_secs))
+        else {
             continue;
         };
         let notes = parse_symbol_notes(&body, top);
@@ -256,7 +282,10 @@ pub fn enrich_source(
             }
         }
         let title = format!("{key} recon · {source_name}");
-        let md = format!("# {title}\n\n> source: {repo}\n> cli: {key}\n\n{}", body.trim());
+        let md = format!(
+            "# {title}\n\n> source: {repo}\n> cli: {key}\n\n{}",
+            body.trim()
+        );
         let doc_path = crate::docs::new_doc(&title, &md).unwrap_or_default();
         docs.push(ReconDoc {
             cli: key.clone(),

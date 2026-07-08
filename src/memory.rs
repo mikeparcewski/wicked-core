@@ -145,7 +145,8 @@ impl RunMemory {
                     .and_then(|s| s.as_str())
                     .map(Scope::parse)
                     .unwrap_or_else(Scope::root);
-                self.capture(content, scope, now).map_err(|e| e.to_string())?;
+                self.capture(content, scope, now)
+                    .map_err(|e| e.to_string())?;
                 Ok(text("captured".into()))
             }
             other => Err(format!("unknown tool: {other}")),
