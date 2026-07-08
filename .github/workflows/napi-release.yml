@@ -205,8 +205,6 @@ jobs:
       # publishing is via npm trusted publishing (tokenless OIDC), matching the wicked-ci pattern.
       - name: Publish platform packages
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           for dir in npm/*/; do
@@ -216,6 +214,4 @@ jobs:
 
       - name: Publish main package
         shell: bash
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public --provenance
