@@ -4,7 +4,8 @@
 //! ```js
 //! const { Core } = require('./wicked-core.node')
 //! const core = Core.spawnStub('/tmp/core.db')   // stub engine: deterministic, no real LLM CLI
-//! core.subscribe((json) => console.log(JSON.parse(json)))     // live CoreEvent stream
+//! const sub = core.subscribe((err, json) => console.log(JSON.parse(json)))  // live CoreEvent stream
+//! // ... later: sub.close()                      // stop delivery + tear the pump/callback down
 //! const runId = await core.launchRun({
 //!   problem: 'Do step one. Do step two',
 //!   sessionId: 'demo',
@@ -29,7 +30,10 @@
 //! injects the macOS `dynamic_lookup` linker flags so a plain `cargo build` links the addon without
 //! the full `napi build` CLI.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use napi::bindgen_prelude::AsyncTask;
 use napi::threadsafe_function::{
@@ -37,6 +41,12 @@ use napi::threadsafe_function::{
 };
 use napi::{Env, JsFunction, Task};
 use napi_derive::napi;
+
+/// Bound on the live-event [`ThreadsafeFunction`] queue (NIT: backpressure). In napi `0` means an
+/// UNLIMITED queue; a positive bound caps buffered events if a subscriber's JS callback stalls
+/// (excess events are dropped by the NonBlocking `.call()` rather than growing memory unbounded).
+/// Sized well above any single run's event count so a normal stream is never truncated.
+const EVENT_QUEUE_BOUND: usize = 1024;
 
 use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
@@ -296,23 +306,67 @@ impl Core {
         serde_json::to_string(&wicked_core::registry_roster()).map_err(err)
     }
 
-    /// Subscribe to the live [`CoreEvent`] stream. `callback` is invoked once per event with the
-    /// event serialized as a JSON string (`{ type, ...fields }`); parse it in JS. Events arrive in
-    /// emission order. Call this BEFORE `launchRun` to catch the whole sequence.
+    /// Subscribe to the live [`CoreEvent`] stream. `callback` follows the Node error-first
+    /// convention — `(err, eventJson)` — and is invoked once per event with the event serialized as
+    /// a JSON string (`{ type, ...fields }`); parse it in JS. Events arrive in emission order. Call
+    /// this BEFORE `launchRun` to catch the whole sequence, and HOLD the returned [`Subscription`]:
+    /// `close()` / `unsubscribe()` stops delivery and tears the pump thread + callback down.
+    ///
+    /// NOTE (ordering): async methods resolve their Promise off a libuv worker thread, while events
+    /// are delivered from a separate pump thread — so an event emitted by a call MAY be observed by
+    /// this callback slightly AFTER that call's Promise resolves. Await the event you need (as the
+    /// smoke does) rather than assuming it precedes the method's resolution.
     #[napi]
-    pub fn subscribe(&self, callback: JsFunction) -> napi::Result<()> {
-        let tsfn: ThreadsafeFunction<String, ErrorStrategy::Fatal> = callback
-            .create_threadsafe_function(0, |ctx: ThreadSafeCallContext<String>| Ok(vec![ctx.value]))?;
+    pub fn subscribe(&self, env: Env, callback: JsFunction) -> napi::Result<Subscription> {
+        // SIG-1 containment: in napi-rs 2.16 a *throw* inside a ThreadsafeFunction callback escalates
+        // to `napi_fatal_exception` (→ uncaughtException → process death) under BOTH
+        // `ErrorStrategy::Fatal` AND `CalleeHandled` — the `.call()` "Direct" variant routes a pending
+        // exception through `handle_call_js_cb_status` regardless of strategy. So we wrap the user's
+        // callback in a JS try/catch shim: the function we hand napi never throws, so a throwing
+        // subscriber is contained (swallowed) instead of killing the process. `CalleeHandled` (used
+        // for the tsfn + `.call(Ok(..))` below) additionally routes value-conversion failures to the
+        // callback's `err` argument instead of aborting.
+        let factory: JsFunction =
+            env.run_script("(function(cb){return function(err,v){try{cb(err,v)}catch(_e){}}})")?;
+        let wrapped: JsFunction = factory.call(None, &[callback])?.try_into()?;
+
+        let mut tsfn: ThreadsafeFunction<String, ErrorStrategy::CalleeHandled> = wrapped
+            .create_threadsafe_function(EVENT_QUEUE_BOUND, |ctx: ThreadSafeCallContext<String>| {
+                Ok(vec![ctx.value])
+            })?;
+        // SIG-2: unref the tsfn (via the Env) so the pump does NOT hold the libuv loop open — a normal
+        // `main()` return lets Node exit on its own, no `process.exit()` needed. `unref` acts on the
+        // shared handle, so the pump thread's clone is unref'd too.
+        tsfn.unref(&env)?;
+
+        let stop = Arc::new(AtomicBool::new(false));
         let rx = self.inner.subscribe();
-        std::thread::spawn(move || {
-            // One reader thread → FIFO calls into the tsfn preserve CoreEvent emission order. The
-            // loop ends when the actor drops the sender (last Core handle gone), releasing the tsfn.
-            while let Ok(ev) = rx.recv() {
-                let json = event_to_json(&ev).to_string();
-                tsfn.call(json, ThreadsafeFunctionCallMode::NonBlocking);
+        let pump_tsfn = tsfn.clone();
+        let pump_stop = stop.clone();
+        // SIG-3: one dedicated FIFO pump thread. `recv_timeout` lets it observe the stop flag and
+        // exit cleanly on `close()` (instead of blocking on `recv` forever); it also ends when the
+        // actor drops the sender (last Core handle gone). On exit it drops `rx`, so the actor prunes
+        // this subscriber on its next emit (retain-on-send) — re-subscribing never leaves a second
+        // live pump or a duplicated stream.
+        let join = std::thread::spawn(move || loop {
+            if pump_stop.load(Ordering::SeqCst) {
+                break;
+            }
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => {
+                    let json = event_to_json(&ev).to_string();
+                    let _ = pump_tsfn.call(Ok(json), ThreadsafeFunctionCallMode::NonBlocking);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         });
-        Ok(())
+
+        Ok(Subscription {
+            stop,
+            join: Mutex::new(Some(join)),
+            tsfn: Mutex::new(Some(tsfn)),
+        })
     }
 
     /// Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`).
@@ -397,15 +451,15 @@ impl Core {
         let core = self.inner.clone();
         task(move || {
             let views = core.sessions_detail().map_err(err)?;
-            let arr: Vec<serde_json::Value> = views
-                .iter()
-                .map(|v| {
-                    serde_json::json!({
-                        "session": serde_json::to_value(&v.session).unwrap_or(serde_json::Value::Null),
-                        "units": serde_json::to_value(&v.units).unwrap_or(serde_json::Value::Null),
-                    })
-                })
-                .collect();
+            // NIT: surface a serialize failure as a napi error instead of silently substituting
+            // `null` (which would hand the UI a malformed row it can't distinguish from real data).
+            let mut arr: Vec<serde_json::Value> = Vec::with_capacity(views.len());
+            for v in &views {
+                arr.push(serde_json::json!({
+                    "session": serde_json::to_value(&v.session).map_err(err)?,
+                    "units": serde_json::to_value(&v.units).map_err(err)?,
+                }));
+            }
             serde_json::to_string(&arr).map_err(err)
         })
     }
@@ -444,5 +498,54 @@ impl Core {
             let repos = core.list_repos().map_err(err)?;
             serde_json::to_string(&repos).map_err(err)
         })
+    }
+}
+
+// ── the live-event subscription handle ─────────────────────────────────────────
+
+/// A live event subscription returned by [`Core::subscribe`]. Owns the FIFO pump thread + its
+/// [`ThreadsafeFunction`]. `close()` / `unsubscribe()` tears both down deterministically (set the
+/// stop flag → join the pump, which drops the event `Receiver` so the actor prunes its sender →
+/// abort the tsfn). Idempotent; dropping the JS handle without an explicit close also stops the pump.
+#[napi]
+pub struct Subscription {
+    stop: Arc<AtomicBool>,
+    join: Mutex<Option<JoinHandle<()>>>,
+    tsfn: Mutex<Option<ThreadsafeFunction<String, ErrorStrategy::CalleeHandled>>>,
+}
+
+#[napi]
+impl Subscription {
+    /// Stop delivering events and release the pump thread + `ThreadsafeFunction`. Idempotent and
+    /// safe on a normal shutdown path; after it returns the pump is joined and the tsfn aborted, so
+    /// the callback will not fire again. This is the teardown that makes re-subscribe leak-free and
+    /// lets a plain `main()` return promptly.
+    #[napi]
+    pub fn close(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.join.lock().ok().and_then(|mut g| g.take()) {
+            let _ = handle.join();
+        }
+        if let Some(tsfn) = self.tsfn.lock().ok().and_then(|mut g| g.take()) {
+            // abort() releases with `abort` mode + flips the shared `aborted` flag, so any call the
+            // pump had queued/attempts is a no-op (never a use-after-free on env teardown).
+            let _ = tsfn.abort();
+        }
+    }
+
+    /// Alias for [`Subscription::close`].
+    #[napi]
+    pub fn unsubscribe(&self) {
+        self.close();
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // If the JS handle is GC'd without an explicit close(), still signal the pump to stop so it
+        // can't run (and re-deliver) forever. Detach rather than join — Drop may run on the JS
+        // thread, and the pump exits within one `recv_timeout` tick, dropping its `Receiver` + tsfn
+        // clone (whose Drop then releases the tsfn, as it was never aborted).
+        self.stop.store(true, Ordering::SeqCst);
     }
 }

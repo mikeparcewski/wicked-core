@@ -45,7 +45,7 @@ const { Core } = require(addonPath)
 const events = []
 const waiters = []
 
-function onEvent(json) {
+function onEvent(_err, json) {
   const ev = JSON.parse(json)
   events.push(ev)
   for (let i = waiters.length - 1; i >= 0; i--) {
@@ -80,7 +80,7 @@ async function main() {
   console.log(`[smoke] addon: ${addonPath}`)
 
   const core = Core.spawnStub(dbPath)
-  core.subscribe(onEvent)
+  const sub = core.subscribe(onEvent)
 
   // Liveness: the actor is up and the event stream works.
   const pong = await core.ping()
@@ -137,6 +137,7 @@ async function main() {
   console.log('[smoke] ✓ sessionsDetail reflects a completed run')
 
   console.log(`\n[smoke] event stream (${events.length} events): ${events.map((e) => e.type).join(' → ')}`)
+  sub.close() // tidy teardown (also exercises the Subscription handle)
   console.log('\n[smoke] PASS ✅')
   process.exit(0)
 }

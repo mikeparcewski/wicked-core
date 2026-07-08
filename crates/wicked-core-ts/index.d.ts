@@ -46,8 +46,14 @@ export class Core {
   /** Production council roster as a JSON array of `AgenticCli` — pass to `clisJson`. */
   static registryRoster(): string
 
-  /** Subscribe to the live event stream (call before `launchRun`). One JSON string per event. */
-  subscribe(callback: (eventJson: string) => void): void
+  /**
+   * Subscribe to the live event stream (call before `launchRun`). The callback follows the Node
+   * error-first convention: `(err, eventJson)` — `err` is `null` on the normal path, and one JSON
+   * string is delivered per event. A throw inside the callback is contained (swallowed), never
+   * fatal. Returns a {@link Subscription} — hold it and call `close()`/`unsubscribe()` to stop
+   * delivery and let the process exit cleanly.
+   */
+  subscribe(callback: (err: Error | null, eventJson: string) => void): Subscription
 
   /** Liveness probe → resolves `"ok"` after the actor acks a Heartbeat. */
   ping(): Promise<string>
@@ -72,4 +78,16 @@ export class Core {
   registerRepo(name: string, rootPath: string): Promise<string>
   /** List registered repos → resolves a JSON array of `RepoEntry`. */
   listRepos(): Promise<string>
+}
+
+/**
+ * A live event subscription handle returned by {@link Core.subscribe}. Hold it for the lifetime of
+ * the subscription; call {@link Subscription.close} (or its alias {@link Subscription.unsubscribe})
+ * to stop delivery, tear down the pump thread + callback, and let the process exit cleanly.
+ */
+export class Subscription {
+  /** Stop delivery and release the pump thread + callback. Idempotent. */
+  close(): void
+  /** Alias for {@link Subscription.close}. */
+  unsubscribe(): void
 }
