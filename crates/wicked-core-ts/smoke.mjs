@@ -22,23 +22,16 @@ process.env.WICKED_MEMORY_EMBEDDER = 'hash'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const require = createRequire(import.meta.url)
 
-// ── locate + stage the addon as a *.node file Node can require ────────────────
-function stageAddon() {
-  const dst = join(__dirname, 'index.node')
-  const ext = process.platform === 'win32' ? 'dll' : process.platform === 'darwin' ? 'dylib' : 'so'
-  const base = process.platform === 'win32' ? 'wicked_core_ts' : 'libwicked_core_ts'
-  for (const profile of ['release', 'debug']) {
-    const src = join(__dirname, 'target', profile, `${base}.${ext}`)
-    if (fs.existsSync(src)) {
-      fs.copyFileSync(src, dst)
-      return dst
-    }
+// ── load the addon via the napi platform loader (index.js resolves the local *.node) ──
+function loadAddon() {
+  const entry = join(__dirname, 'index.js')
+  if (!fs.existsSync(entry)) {
+    throw new Error('index.js not found — run `npm run build` (napi build --platform --release) first')
   }
-  if (fs.existsSync(dst)) return dst
-  throw new Error('no cdylib found — run `cargo build -p wicked-core-ts` first')
+  return entry
 }
 
-const addonPath = stageAddon()
+const addonPath = loadAddon()
 const { Core } = require(addonPath)
 
 // ── a tiny event bus over the subscribe callback ──────────────────────────────

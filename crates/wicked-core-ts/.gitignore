@@ -1,7 +1,13 @@
 /target
-# The built addon (staged from the cdylib by the build/smoke scripts) — large, platform-specific.
+node_modules/
+# The compiled napi addon — large, platform-specific. Shipped via the per-platform npm packages
+# (npm/*), NOT committed. The generated loader `index.js` + `index.d.ts` ARE committed (source of
+# record for consumers); only the binaries are ignored.
 index.node
 *.node
+# @napi-rs/cli release scratch: per-platform package dirs + downloaded CI artifacts.
+/npm/
+/artifacts/
 *.db
 *.db-shm
 *.db-wal

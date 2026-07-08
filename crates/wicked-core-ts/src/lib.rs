@@ -2,7 +2,7 @@
 //! orchestration runtime from JS/TS.
 //!
 //! ```js
-//! const { Core } = require('./wicked-core.node')
+//! const { Core } = require('wicked-core-ts')     // (or `./index.js` in-tree) — the napi loader
 //! const core = Core.spawnStub('/tmp/core.db')   // stub engine: deterministic, no real LLM CLI
 //! const sub = core.subscribe((err, json) => console.log(JSON.parse(json)))  // live CoreEvent stream
 //! // ... later: sub.close()                      // stop delivery + tear the pump/callback down
@@ -25,10 +25,11 @@
 //! dedicated pump thread that forwards each event (as a JSON string) through a
 //! [`ThreadsafeFunction`], preserving emission order.
 //!
-//! Build: `cargo build -p wicked-core-ts` from this directory (produces the cdylib), then rename /
-//! copy the artifact to `wicked-core.node` for Node to `require()`. The `.cargo/config.toml` here
-//! injects the macOS `dynamic_lookup` linker flags so a plain `cargo build` links the addon without
-//! the full `napi build` CLI.
+//! Build: `npm run build` (`napi build --platform --release`) from this directory emits the
+//! platform-suffixed addon (`wicked-core-ts.<triple>.node`) plus the generated loader `index.js` and
+//! `index.d.ts`. A plain `cargo build -p wicked-core-ts` still links the cdylib too — the
+//! `.cargo/config.toml` here injects the macOS `dynamic_lookup` linker flags — for a napi-CLI-free
+//! dev/IDE loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -357,7 +358,7 @@ impl Core {
     /// are delivered from a separate pump thread — so an event emitted by a call MAY be observed by
     /// this callback slightly AFTER that call's Promise resolves. Await the event you need (as the
     /// smoke does) rather than assuming it precedes the method's resolution.
-    #[napi]
+    #[napi(ts_args_type = "callback: (err: Error | null, eventJson: string) => void")]
     pub fn subscribe(&self, env: Env, callback: JsFunction) -> napi::Result<Subscription> {
         // SIG-1 containment: in napi-rs 2.16 a *throw* inside a ThreadsafeFunction callback escalates
         // to `napi_fatal_exception` (→ uncaughtException → process death) under BOTH
@@ -411,7 +412,7 @@ impl Core {
     }
 
     /// Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`).
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn ping(&self) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -423,7 +424,7 @@ impl Core {
     /// Launch an interactive, resumable run: plans + distributes, then executes each unit off-thread
     /// (or pauses at a human-confirm gate). Resolves to the run id. Progress arrives as `CoreEvent`s
     /// — `subscribe()` first. Rejects with a busy error if a run with that id is already in flight.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn launch_run(&self, opts: LaunchOptions) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -434,7 +435,7 @@ impl Core {
 
     /// Resume an interactive run from its persisted cursor (after a pause, crash, or fresh process).
     /// Resolves to the resulting status token.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn resume_run(&self, run_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || core.resume_run(&run_id).map(status_token).map_err(err))
@@ -443,7 +444,7 @@ impl Core {
     /// Resolve a human-confirm gate on a PAUSED run. `approve=true` proceeds (optionally applying
     /// `amend` to the next unit's instruction); `approve=false` rejects → cancels the run. Resolves
     /// to the resulting status token. Rejects if the run is not paused at a gate.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn confirm_gate(
         &self,
         run_id: String,
@@ -465,7 +466,7 @@ impl Core {
 
     /// Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
     /// token. Safe whether the run is executing or paused.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn cancel_run(&self, run_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || core.cancel_run(&run_id).map(status_token).map_err(err))
@@ -476,7 +477,7 @@ impl Core {
     // Exposing a fake `pauseRun` would misrepresent the engine, so it is omitted (see the report).
 
     /// The agent session ids currently on the store, as a JSON array of strings.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn sessions(&self) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -487,7 +488,7 @@ impl Core {
 
     /// Every session + its ordered units, as a JSON array of `{ session, units }` objects (the read
     /// a UI builds its project list from).
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn sessions_detail(&self) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -506,7 +507,7 @@ impl Core {
     }
 
     /// A unit's captured work output (transcript), as a JSON value — a string, or `null` if none.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn work_output(&self, unit_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -517,7 +518,7 @@ impl Core {
 
     /// Register a git repository the orchestrator can run within. Validates it is a git repo with
     /// ≥1 commit; resolves to the persisted `RepoEntry` as a JSON object.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn register_repo(&self, name: String, root_path: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -532,7 +533,7 @@ impl Core {
     }
 
     /// List every registered repository, as a JSON array of `RepoEntry` objects.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn list_repos(&self) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -552,7 +553,7 @@ impl Core {
     /// `cols`x`rows`. `governed=false` is a loud, opt-in UNGOVERNED operator shell that bypasses the
     /// gate-hook (DES §7); pass `true` for the governed default. Resolves the new terminal id. Output
     /// arrives as `terminalOutput` events, so `subscribe()` FIRST to catch `terminalOpened` + bytes.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn open_terminal(
         &self,
         cwd: String,
@@ -572,7 +573,7 @@ impl Core {
     /// `Vec<u8>` on the Node thread (a cheap memcpy — keystroke payloads are tiny) so the blocking
     /// write can run off-thread without moving a JS-owned Buffer across threads. Resolves `"ok"`;
     /// rejects if the terminal id is unknown or the write fails.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn write_terminal(&self, id: String, bytes: Buffer) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         let data: Vec<u8> = bytes.to_vec();
@@ -584,7 +585,7 @@ impl Core {
 
     /// Resize a terminal's PTY to `cols`x`rows`. Resolves `"ok"`; rejects if the terminal id is
     /// unknown or the resize fails.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn resize_terminal(&self, id: String, cols: u16, rows: u16) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -596,7 +597,7 @@ impl Core {
     /// Close a terminal: the actor kills the child, joins the reader thread, and drops the registry +
     /// I/O entries (no orphaned process/thread). Resolves `"ok"` once teardown completes; a
     /// `terminalExited` event is emitted. Rejects on an unknown id.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn close_terminal(&self, id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {

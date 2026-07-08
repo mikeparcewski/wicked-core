@@ -3,15 +3,47 @@
   "version": "0.1.0",
   "description": "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-process orchestration engine from JS/TS.",
   "license": "MIT",
-  "main": "index.node",
+  "main": "index.js",
   "types": "index.d.ts",
   "files": [
-    "index.node",
+    "index.js",
     "index.d.ts"
   ],
+  "napi": {
+    "name": "wicked-core-ts",
+    "package": {
+      "name": "wicked-core-ts"
+    },
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc"
+      ]
+    }
+  },
+  "engines": {
+    "node": ">= 20"
+  },
   "scripts": {
-    "build": "cargo build -p wicked-core-ts --release && cp target/release/libwicked_core_ts.dylib index.node",
-    "build:debug": "cargo build -p wicked-core-ts && cp target/debug/libwicked_core_ts.dylib index.node",
-    "smoke": "node smoke.mjs"
+    "build": "napi build --platform --release && node scripts/finalize-dts.mjs",
+    "build:debug": "napi build --platform && node scripts/finalize-dts.mjs",
+    "smoke": "node smoke.mjs",
+    "smoke:lifecycle": "node smoke-lifecycle.mjs",
+    "smoke:terminal": "node smoke-terminal.mjs",
+    "smoke:all": "node smoke.mjs && node smoke-lifecycle.mjs && node smoke-terminal.mjs"
+  },
+  "optionalDependencies": {
+    "wicked-core-ts-darwin-x64": "0.1.0",
+    "wicked-core-ts-darwin-arm64": "0.1.0",
+    "wicked-core-ts-linux-x64-gnu": "0.1.0",
+    "wicked-core-ts-linux-arm64-gnu": "0.1.0",
+    "wicked-core-ts-win32-x64-msvc": "0.1.0"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
   }
 }

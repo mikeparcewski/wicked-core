@@ -1,0 +1,184 @@
+# napi → npm release pipeline for `crates/wicked-core-ts` (DES-RELEASE-001 §2.3C).
+#
+# Bespoke (NOT the wicked-ci reusable Node release) because this ships a NATIVE napi addon: it needs
+# a per-target cross-build matrix + the @napi-rs/cli platform-package assembly, which the pure-JS
+# reusable workflow does not model. Fires ONLY on a `core-ts-v*` tag (a separate tag namespace from
+# wicked-estate's `v*`, sharing this monorepo), so a maintainer pushing `core-ts-v0.1.0` starts it.
+#
+# Toolchain note: the binding is built against napi-rs runtime v2 (`napi`/`napi-derive` 2.16, feature
+# `napi8`), so the COMPATIBLE CLI is `@napi-rs/cli` v2 (its `TYPE_DEF_TMP_PATH` type-def protocol
+# matches napi-derive 2.16; the v3 CLI's `NAPI_TYPE_DEF_TMP_FOLDER` protocol does not, and emits an
+# empty index.d.ts). Hence v2 command spellings below: `create-npm-dir` (singular), `artifacts`.
+#
+# Third-party actions are pinned to a commit SHA (matches wicked-ci/.github/workflows/node-release.yml).
+
+name: napi release (wicked-core-ts)
+
+on:
+  push:
+    tags:
+      - 'core-ts-v*'
+
+# `id-token: write` powers npm provenance attestations (--provenance) and OIDC trusted publishing.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: napi-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ── build the native addon once per target triple, upload the per-target *.node ────────────────
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS: aarch64 is native on the (arm64) macos-latest runner; x86_64 cross-links against
+          # the universal Apple SDK that clang already ships — no extra toolchain needed.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+          # Linux x64: native on ubuntu-latest.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          # Linux arm64: cross-compiled with zig as the linker (cargo-zigbuild) — no Docker/QEMU.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            cross: zig
+          # Windows x64: native MSVC on windows-latest.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    defaults:
+      run:
+        working-directory: crates/wicked-core-ts
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '20'
+
+      - name: Install Rust toolchain + target
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+      # zig cross-toolchain only for the aarch64-linux leg.
+      - name: Set up zig
+        if: matrix.cross == 'zig'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: matrix.cross == 'zig'
+        shell: bash
+        run: cargo install cargo-zigbuild --locked
+
+      # --omit=optional: the platform packages in optionalDependencies aren't published yet (and we're
+      # building them here, not consuming them). We only need the @napi-rs/cli devDependency.
+      - name: Install build tooling (@napi-rs/cli)
+        shell: bash
+        run: npm install --omit=optional
+
+      - name: napi build (${{ matrix.target }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross || '' }}" = "zig" ]; then
+            npx napi build --platform --release --target "${{ matrix.target }}" --zig
+          else
+            npx napi build --platform --release --target "${{ matrix.target }}"
+          fi
+          ls -la ./*.node
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bindings-${{ matrix.target }}
+          # path is repo-root-relative (upload-artifact ignores defaults.run.working-directory).
+          path: crates/wicked-core-ts/*.node
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── assemble the platform packages from the artifacts and publish all 6 packages to npm ─────────
+  publish:
+    name: publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/wicked-core-ts
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Provenance + OIDC trusted publishing need a recent npm (>= 11.5); Node 20 ships npm 10.
+      - name: Upgrade npm (provenance-capable)
+        shell: bash
+        run: npm install -g npm@^11
+
+      - name: Install build tooling (@napi-rs/cli)
+        shell: bash
+        run: npm install --omit=optional
+
+      - name: Set version from tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#core-ts-v}"
+          echo "Releasing wicked-core-ts@$VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          # Keep the main package's optionalDependencies in lockstep with the platform packages.
+          for abi in darwin-x64 darwin-arm64 linux-x64-gnu linux-arm64-gnu win32-x64-msvc; do
+            npm pkg set "optionalDependencies.wicked-core-ts-$abi=$VERSION"
+          done
+
+      - name: Create per-platform npm dirs
+        shell: bash
+        run: npx napi create-npm-dir -t .
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: crates/wicked-core-ts/artifacts
+          merge-multiple: true
+
+      - name: Move *.node into the platform packages
+        shell: bash
+        run: npx napi artifacts --dir artifacts --dist npm
+
+      - name: Sync platform package versions
+        shell: bash
+        run: npx napi version
+
+      - name: Show assembled packages
+        shell: bash
+        run: |
+          find npm -maxdepth 2 -name package.json -o -name '*.node' | sort
+
+      # Publish the 5 platform packages first, then the main package (whose optionalDependencies
+      # reference them). --provenance emits a build-provenance attestation via OIDC (id-token: write);
+      # publishing is via npm trusted publishing (tokenless OIDC), matching the wicked-ci pattern.
+      - name: Publish platform packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in npm/*/; do
+            echo "==> npm publish $dir"
+            npm publish "$dir" --access public --provenance
+          done
+
+      - name: Publish main package
+        shell: bash
+        run: npm publish --access public --provenance
