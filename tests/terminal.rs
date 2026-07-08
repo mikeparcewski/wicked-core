@@ -12,14 +12,22 @@ use base64::Engine as _;
 use wicked_core::{Core, CoreEvent};
 
 fn unique_db() -> String {
+    // A per-process atomic counter is the real uniqueness guarantee: the three tests in this file
+    // share one process id and run on parallel threads, so a timestamp alone can collide within a
+    // single clock tick — two `Core`s then open the SAME sqlite file and one gets `database is
+    // locked`. `fetch_add` can never hand out the same value twice, so no two paths collide. (pid +
+    // timestamp are retained only to keep names distinct across separate binary runs.)
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "wicked-core-term-{}-{}.db",
+        "wicked-core-term-{}-{}-{}.db",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        seq
     ));
     p.to_string_lossy().into_owned()
 }
