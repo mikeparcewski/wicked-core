@@ -661,7 +661,17 @@ pub(crate) fn launch_run_inner(
                 emit_run_error(subscribers, &run_id, e);
             }
         }
-        Err(e) => emit_run_error(subscribers, &run_id, e),
+        // A store-write fault dispatching unit 0 would otherwise leave the run with NO worker and NO
+        // terminal signal (wedging a campaign node at `Running` forever). Surface it AND propagate so
+        // the caller — the campaign driver — can reconcile the node as Failed. (No stub-path test hits
+        // this; standalone `LaunchRun` now replies Err instead of a bare Ok+Error event.)
+        Err(e) => {
+            let msg = e.to_string();
+            emit_run_error(subscribers, &run_id, e);
+            return Err(anyhow::anyhow!(
+                "run {run_id} failed to dispatch its first unit: {msg}"
+            ));
+        }
     }
     Ok(run_id)
 }

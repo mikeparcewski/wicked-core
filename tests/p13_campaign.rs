@@ -13,18 +13,19 @@
 //! (SC-C1 diamond join, SC-C7 cycle/validation, SC-C9 100-run determinism, and the mixed-edge truth
 //! table are proven as pure unit tests in `src/campaign.rs`.)
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use wicked_apps_core::{open_store, ToNode};
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 use wicked_core::{
-    CampaignDef, CampaignEdge, CampaignGateDecision, CampaignNode, CampaignStatus, Core,
-    EdgeCondition, EntityMode, FailurePolicy, HumanConfirm, NodeStatus, RunSpec, StepInput,
-    StepOutput, StepRunner, StepStatus,
+    put_node, AgentSession, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision, CampaignNode,
+    CampaignStatus, Core, EdgeCondition, EntityMode, FailurePolicy, HumanConfirm, NodeStatus,
+    RunSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 
 // ── stub council (votes without a subprocess; the real dispatcher hangs under the harness) ──
@@ -541,4 +542,151 @@ fn sc_c6_crash_resume_never_reruns_a_completed_node() {
     );
 
     h_a.release_all(); // let Core A's abandoned B-worker exit (posts into a closed channel, harmless)
+}
+
+/// Build a persisted crash-artifact campaign DIRECTLY (no public `Campaign::new`): `running` is the
+/// node left `Running` at crash (with its derived run id recorded); every other node is `Pending`;
+/// the campaign is `Running`. Models the exact on-store state a mid-dispatch SIGKILL leaves behind.
+fn craft_campaign(def: CampaignDef, running: &str) -> Campaign {
+    let cid = def.id.clone();
+    let node_status = def
+        .nodes
+        .iter()
+        .map(|n| {
+            let s = if n.node_id == running {
+                NodeStatus::Running
+            } else {
+                NodeStatus::Pending
+            };
+            (n.node_id.clone(), s)
+        })
+        .collect();
+    let mut node_run_id = BTreeMap::new();
+    node_run_id.insert(running.to_string(), format!("{cid}:{running}:a0"));
+    Campaign {
+        id: cid.clone(),
+        def_id: cid,
+        status: CampaignStatus::Running,
+        def,
+        node_status,
+        node_run_id,
+        node_attempt: BTreeMap::new(),
+        pending_decision: BTreeMap::new(),
+        pending_decision_amend: BTreeMap::new(),
+        pending_failure_gates: Vec::new(),
+        fail_fast_tripped: false,
+    }
+}
+
+/// A minimal `AgentSession` already at `Completed` — the terminal session an interrupted node's Run
+/// had written before the crash (resume only reads its status to pick the reconcile outcome).
+fn completed_session(run_id: &str) -> AgentSession {
+    AgentSession {
+        id: run_id.to_string(),
+        workflow_id: format!("wf-{run_id}"),
+        problem: "crashed mid-campaign".into(),
+        entity_mode: EntityMode::Shared,
+        collection_scope: None,
+        clis: vec![],
+        status: SessionStatus::Completed,
+        human_confirm: HumanConfirm::None,
+        unit_ix: 1,
+        attempt: 0,
+        workdir: None,
+        repo_ref: None,
+    }
+}
+
+// ── SC-C6 / F1a — resume reconciles a node whose SESSION finished before the crash ──
+// Crash window: `finalize_run`/`fail_run`/`cancel_run` persist the session terminal and THEN queue the
+// campaign reconcile via a LATER command. A crash in between leaves `session=terminal, node=Running`.
+// Resume must reconcile that node from its persisted terminal session (NOT re-run it) and unblock its
+// dependents — otherwise the node stays Running forever and the campaign never finalizes.
+#[test]
+fn sc_c6_f1a_resume_reconciles_a_node_whose_session_finished_before_crash() {
+    let db = tmp_db("c6-f1a");
+    let c = "camp6a";
+
+    // Craft the F1a artifact directly: node X persisted `Running` (with its derived run id), while
+    // X's session ALREADY reached Completed on the store (the pre-crash terminal write) — but the
+    // campaign never got the deferred reconcile. Dependent Y never ran (no session).
+    let def = CampaignDef {
+        id: c.into(),
+        name: "f1a".into(),
+        nodes: vec![cnode("X", HumanConfirm::None), cnode("Y", HumanConfirm::None)],
+        edges: vec![edge("X", "Y")],
+        policy: FailurePolicy::ContinueIndependent,
+        max_concurrency: 2,
+    };
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(&mut store, craft_campaign(def, "X").to_node()).expect("persist campaign");
+        put_node(&mut store, completed_session(&rid(c, "X")).to_node()).expect("persist session");
+    }
+
+    // Core B resumes: X must reconcile from its terminal session (NOT re-run), then Y runs fresh.
+    let (ctl_b, h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+    assert!(
+        wait_campaign(&core_b, c, CampaignStatus::Completed),
+        "resume reconciles the finished node and drives the campaign to Completed (not wedged)"
+    );
+    assert_eq!(node_status(&core_b, c, "X"), Some(NodeStatus::Completed));
+    assert_eq!(node_status(&core_b, c, "Y"), Some(NodeStatus::Completed));
+    let ran_b = h_b.ran.lock().unwrap().clone();
+    assert!(
+        !ran_b.iter().any(|r| *r == rid(c, "X")),
+        "X must be reconciled from its terminal session, never re-run, got {ran_b:?}"
+    );
+    assert!(
+        ran_b.iter().any(|r| *r == rid(c, "Y")),
+        "the dependent Y is promoted + run once X reconciles, got {ran_b:?}"
+    );
+}
+
+// ── SC-C6 / F1b — resume launches a node whose SESSION was never written ──
+// Crash window: `dispatch` persists `node=Running` + `node_run_id` BEFORE `launch_run_inner` writes the
+// session (a multi-second worktree-create window for repo-backed nodes). A crash there leaves the node
+// Running with NO session in core. Resume must LAUNCH it fresh under the same derived id
+// (RunNotFound → Launch, DES §2.1/§6) — not bail + swallow, which stranded the node.
+#[test]
+fn sc_c6_f1b_resume_launches_a_node_whose_session_was_never_written() {
+    let db = tmp_db("c6-f1b");
+    let c = "camp6b";
+
+    let def = CampaignDef {
+        id: c.into(),
+        name: "f1b".into(),
+        nodes: vec![cnode("X", HumanConfirm::None), cnode("Y", HumanConfirm::None)],
+        edges: vec![edge("X", "Y")],
+        policy: FailurePolicy::ContinueIndependent,
+        max_concurrency: 2,
+    };
+
+    // Craft the artifact directly: node X persisted Running with its derived run id, NO session written.
+    {
+        let mut store = open_store(Some(&db)).expect("open store");
+        put_node(&mut store, craft_campaign(def, "X").to_node()).expect("persist crash artifact");
+    }
+
+    // Core B resumes: X has no session → launch fresh under the same id, then Y runs after X completes.
+    let (ctl_b, h_b) = make_runner(true);
+    let core_b = spawn(&db, ctl_b);
+    core_b.resume_campaign(c).expect("resume");
+    assert!(
+        wait_campaign(&core_b, c, CampaignStatus::Completed),
+        "resume launches the never-written node fresh and completes (not wedged)"
+    );
+    assert_eq!(node_status(&core_b, c, "X"), Some(NodeStatus::Completed));
+    assert_eq!(node_status(&core_b, c, "Y"), Some(NodeStatus::Completed));
+    let ran_b = h_b.ran.lock().unwrap().clone();
+    assert!(
+        ran_b.iter().any(|r| *r == rid(c, "X")),
+        "X is launched fresh under its derived id (RunNotFound → Launch), got {ran_b:?}"
+    );
+    assert!(
+        ran_b.iter().any(|r| *r == rid(c, "Y")),
+        "the dependent Y runs after X completes, got {ran_b:?}"
+    );
 }

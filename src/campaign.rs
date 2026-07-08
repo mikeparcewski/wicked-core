@@ -584,7 +584,7 @@ use wicked_apps_core::SqliteStore;
 use wicked_council::types::Dispatcher;
 
 use crate::command::Command;
-use crate::domain::put_node;
+use crate::domain::{get_session, put_node, SessionStatus};
 use crate::event::CoreEvent;
 use crate::workflow::StepRunner;
 
@@ -800,36 +800,58 @@ pub(crate) fn on_run_finished(
     if campaign.status_of(&node_id).is_terminal() {
         return Ok(());
     }
+    reconcile_terminal(&mut campaign, &node_id, outcome, store, subscribers, in_flight, seams)?;
+    promote_ready(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
+    finalize_if_done(&mut campaign, subscribers);
+    persist(store, &mut campaign)?;
+    Ok(())
+}
+
+/// Transition a node to its terminal status from a per-Run outcome, emit its event, and apply the
+/// failure policy on a non-`Completed` outcome. Operates on the in-memory campaign (the caller drives
+/// the follow-on `promote_ready`/`try_fill`/`finalize`) so BOTH the live reconcile ([`on_run_finished`])
+/// and the crash-resume reconcile ([`resume`], for a node whose session was already terminal at crash)
+/// share ONE code path — no fire-and-forget, no divergence. The terminal-skip guard makes it a no-op
+/// on an already-terminal node (monotonic).
+fn reconcile_terminal(
+    campaign: &mut Campaign,
+    node_id: &str,
+    outcome: NodeOutcome,
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    in_flight: &mut HashSet<String>,
+    seams: &Seams,
+) -> anyhow::Result<()> {
+    if campaign.status_of(node_id).is_terminal() {
+        return Ok(());
+    }
     campaign
         .node_status
-        .insert(node_id.clone(), outcome.as_node_status());
-    persist(store, &mut campaign)?;
+        .insert(node_id.to_string(), outcome.as_node_status());
+    persist(store, campaign)?;
     match outcome {
         NodeOutcome::Completed => emit(
             subscribers,
             CoreEvent::CampaignNodeCompleted {
                 campaign: campaign.id.clone(),
-                node: node_id.clone(),
+                node: node_id.to_string(),
             },
         ),
         NodeOutcome::Failed => emit(
             subscribers,
             CoreEvent::CampaignNodeFailed {
                 campaign: campaign.id.clone(),
-                node: node_id.clone(),
+                node: node_id.to_string(),
             },
         ),
         // No per-node Cancelled event in the catalog — a cancellation is driven by the operator.
         NodeOutcome::Cancelled => {}
     }
     if outcome != NodeOutcome::Completed {
-        apply_failure_policy(&mut campaign, &node_id, store, subscribers, in_flight, seams)?;
+        apply_failure_policy(campaign, node_id, store, subscribers, in_flight, seams)?;
     }
-    promote_ready(&mut campaign, subscribers);
-    persist(store, &mut campaign)?;
-    try_fill(&mut campaign, store, subscribers, in_flight, seams)?;
-    finalize_if_done(&mut campaign, subscribers);
-    persist(store, &mut campaign)?;
     Ok(())
 }
 
@@ -1063,8 +1085,10 @@ pub(crate) fn resume(
         campaign.status = CampaignStatus::Running;
     }
 
-    // Re-attach nodes that were mid-run when the process died: LaunchRun is unavailable (clobber guard
-    // on a non-terminal run), so ResumeRun by id — core's completion sentinel decides re-run vs apply.
+    // Re-derive each node that was `Running` at crash from its ACTUAL persisted session status —
+    // never fire-and-forget (that stranded a node whose session finished, or was never written,
+    // during a crash window `on_run_finished`'s deferred reconcile never got to). DES §6 / §2.1
+    // "launch-or-resume by id": branch on the truth in the store.
     let running: Vec<(String, String)> = campaign
         .node_status
         .iter()
@@ -1072,16 +1096,85 @@ pub(crate) fn resume(
         .filter_map(|(n, _)| campaign.node_run_id.get(n).map(|r| (n.clone(), r.clone())))
         .collect();
     persist(store, &mut campaign)?;
-    for (_node, run_id) in &running {
-        // Idempotent: an already-in-flight run returns busy (harmless); a completed run is a no-op.
-        let _ = crate::actor::resume_run_inner(
-            store,
-            subscribers,
-            seams.runner,
-            seams.self_tx,
-            in_flight,
-            run_id,
-        );
+    for (node, run_id) in &running {
+        match get_session(store, run_id)? {
+            // The Run already reached a terminal state, but the campaign never got the deferred
+            // reconcile (crash between the terminal session write and the CampaignRunFinished command,
+            // or between the two on the same store). Reconcile it now so the node transitions terminal,
+            // dependents promote, and any failure policy applies — instead of a permanently-Running node
+            // that blocks finalize and never clears its OnSuccess dependents.
+            Some(session)
+                if matches!(
+                    session.status,
+                    SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
+                ) =>
+            {
+                let outcome = match session.status {
+                    SessionStatus::Completed => NodeOutcome::Completed,
+                    SessionStatus::Failed => NodeOutcome::Failed,
+                    _ => NodeOutcome::Cancelled,
+                };
+                reconcile_terminal(&mut campaign, node, outcome, store, subscribers, in_flight, seams)?;
+            }
+            // No session exists in core: the crash hit BEFORE `plan_and_distribute` wrote it (e.g. the
+            // multi-second worktree-create window for a repo-backed node). RunNotFound → launch FRESH
+            // under the SAME derived run id (DES §2.1/§6). `launch_run_inner`'s clobber guard is safe
+            // here precisely because no session exists.
+            None => {
+                let spec = campaign
+                    .def
+                    .nodes
+                    .iter()
+                    .find(|n| &n.node_id == node)
+                    .map(|n| n.run_spec.clone());
+                let launched = match spec {
+                    Some(spec) => crate::actor::launch_run_inner(
+                        store,
+                        subscribers,
+                        seams.dispatcher,
+                        seams.runner,
+                        seams.self_tx,
+                        in_flight,
+                        spec.to_launch_spec(run_id.clone()),
+                    )
+                    .map(|_| ()),
+                    None => Err(anyhow::anyhow!("resume: unknown node {node}")),
+                };
+                if let Err(e) = launched {
+                    // A fresh launch that fails reconciles the node as Failed (never left Running).
+                    emit(
+                        subscribers,
+                        CoreEvent::Error {
+                            session: Some(run_id.clone()),
+                            message: format!("campaign node {node} failed to relaunch on resume: {e}"),
+                        },
+                    );
+                    reconcile_terminal(&mut campaign, node, NodeOutcome::Failed, store, subscribers, in_flight, seams)?;
+                }
+            }
+            // Mid-flight: the session exists and is non-terminal. Re-attach — core's completion
+            // sentinel decides re-run vs apply-result. Surface (do NOT swallow) a genuine failure so a
+            // broken run reconciles as Failed rather than stranding the node `Running`.
+            Some(_) => {
+                if let Err(e) = crate::actor::resume_run_inner(
+                    store,
+                    subscribers,
+                    seams.runner,
+                    seams.self_tx,
+                    in_flight,
+                    run_id,
+                ) {
+                    emit(
+                        subscribers,
+                        CoreEvent::Error {
+                            session: Some(run_id.clone()),
+                            message: format!("campaign node {node} failed to resume: {e}"),
+                        },
+                    );
+                    reconcile_terminal(&mut campaign, node, NodeOutcome::Failed, store, subscribers, in_flight, seams)?;
+                }
+            }
+        }
     }
 
     promote_ready(&mut campaign, subscribers);
