@@ -33,10 +33,11 @@ concurrency:
 # crates.io, so there is no version-dep fallback. The build MUST check out wicked-estate as a SIBLING
 # of wicked-core so the path deps resolve from source (the .node statically bundles the bytes). Pin the
 # estate ref here; bump on each estate release that changes what the addon bundles.
-# Pinned to the estate commit that switches wicked-estate-observe to rustls-tls (drops openssl-sys so
-# aarch64-linux cross-compiles). Re-pin to the v0.13.1 tag once estate releases it.
+# Pinned to estate main @ PR #38 merge — rustls-observe (drops openssl-sys so aarch64-linux
+# cross-compiles) + publish.sh skip + mcp cfg fixes. Was an unmerged branch commit; now merged main.
+# Re-pin to a v0.13.1 tag once estate cuts a tagged release.
 env:
-  WICKED_ESTATE_REF: 53c26dfdbc2b24c1cdb946c4d97eb547941b67d5
+  WICKED_ESTATE_REF: b2932bec65a274354543f567905aeb2caafcb98d
 
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────
