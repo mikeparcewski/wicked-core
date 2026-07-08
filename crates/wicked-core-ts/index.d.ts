@@ -29,6 +29,8 @@ export interface LaunchOptions {
  * `unitDistributed` `{session, ord, cli}`, `awaitingHuman` `{session, ord, prompt}`,
  * `gateDecided` `{session, ord, allow}`, `unitDone`/`unitExecuting`/`resumed` `{session, ord}`,
  * `sessionCompleted` `{session}`, `sessionFailed` `{session, ord}`, `error` `{session, message}`.
+ * PTY terminal sessions emit `terminalOpened` `{id, cwd}`, `terminalOutput` `{id, seq, bytesB64}`
+ * (raw output base64-encoded in `bytesB64`), and `terminalExited` `{id, status}`.
  */
 export interface CoreEventJson {
   type: string
@@ -78,6 +80,20 @@ export class Core {
   registerRepo(name: string, rootPath: string): Promise<string>
   /** List registered repos → resolves a JSON array of `RepoEntry`. */
   listRepos(): Promise<string>
+
+  /**
+   * Open a PTY terminal session running `cmd` (or the login shell if omitted) in `cwd`, sized
+   * `cols`x`rows`. `governed=false` is a loud, opt-in UNGOVERNED operator shell (bypasses the
+   * gate-hook); pass `true` for the governed default. Resolves the new terminal id. Output arrives
+   * as `terminalOutput` events — call {@link Core.subscribe} FIRST to catch `terminalOpened` + bytes.
+   */
+  openTerminal(cwd: string, cmd: string[] | undefined | null, cols: number, rows: number, governed: boolean): Promise<string>
+  /** Write raw input bytes (keystrokes) to a terminal → resolves `"ok"`. Rejects on an unknown id. */
+  writeTerminal(id: string, bytes: Buffer): Promise<string>
+  /** Resize a terminal's PTY to `cols`x`rows` → resolves `"ok"`. Rejects on an unknown id. */
+  resizeTerminal(id: string, cols: number, rows: number): Promise<string>
+  /** Close a terminal (kill child, join reader, drop entries) → resolves `"ok"` after a `terminalExited` event. */
+  closeTerminal(id: string): Promise<string>
 }
 
 /**

@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use napi::bindgen_prelude::AsyncTask;
+use napi::bindgen_prelude::{AsyncTask, Buffer};
 use napi::threadsafe_function::{
     ErrorStrategy, ThreadSafeCallContext, ThreadsafeFunction, ThreadsafeFunctionCallMode,
 };
@@ -497,6 +497,70 @@ impl Core {
         task(move || {
             let repos = core.list_repos().map_err(err)?;
             serde_json::to_string(&repos).map_err(err)
+        })
+    }
+
+    // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────
+    // Each method runs its (potentially blocking) Core call on a libuv worker thread via the SAME
+    // `CoreTask`/`AsyncTask` pattern as every other method — the Node event loop is never blocked on
+    // PTY open/write/resize/close. Terminal *events* (`terminalOpened` / `terminalOutput` with a
+    // base64 `bytesB64` / `terminalExited`) arrive on the `subscribe` stream; `subscribe()` BEFORE
+    // `openTerminal` to catch the whole sequence.
+
+    /// Open a PTY terminal session running `cmd` (or the login shell if omitted) in `cwd`, sized
+    /// `cols`x`rows`. `governed=false` is a loud, opt-in UNGOVERNED operator shell that bypasses the
+    /// gate-hook (DES §7); pass `true` for the governed default. Resolves the new terminal id. Output
+    /// arrives as `terminalOutput` events, so `subscribe()` FIRST to catch `terminalOpened` + bytes.
+    #[napi]
+    pub fn open_terminal(
+        &self,
+        cwd: String,
+        cmd: Option<Vec<String>>,
+        cols: u16,
+        rows: u16,
+        governed: bool,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.open_terminal(cwd, cmd, cols, rows, governed)
+                .map_err(err)
+        })
+    }
+
+    /// Write raw input bytes (keystrokes) to a terminal. The `bytes` Buffer is copied to an owned
+    /// `Vec<u8>` on the Node thread (a cheap memcpy — keystroke payloads are tiny) so the blocking
+    /// write can run off-thread without moving a JS-owned Buffer across threads. Resolves `"ok"`;
+    /// rejects if the terminal id is unknown or the write fails.
+    #[napi]
+    pub fn write_terminal(&self, id: String, bytes: Buffer) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        let data: Vec<u8> = bytes.to_vec();
+        task(move || {
+            core.write_terminal(&id, &data).map_err(err)?;
+            Ok("ok".to_string())
+        })
+    }
+
+    /// Resize a terminal's PTY to `cols`x`rows`. Resolves `"ok"`; rejects if the terminal id is
+    /// unknown or the resize fails.
+    #[napi]
+    pub fn resize_terminal(&self, id: String, cols: u16, rows: u16) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.resize_terminal(&id, cols, rows).map_err(err)?;
+            Ok("ok".to_string())
+        })
+    }
+
+    /// Close a terminal: the actor kills the child, joins the reader thread, and drops the registry +
+    /// I/O entries (no orphaned process/thread). Resolves `"ok"` once teardown completes; a
+    /// `terminalExited` event is emitted. Rejects on an unknown id.
+    #[napi]
+    pub fn close_terminal(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.close_terminal(&id).map_err(err)?;
+            Ok("ok".to_string())
         })
     }
 }
