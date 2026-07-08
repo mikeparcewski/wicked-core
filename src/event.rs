@@ -78,4 +78,40 @@ pub enum CoreEvent {
     /// A PTY terminal session ended (its child exited, or it was closed/reaped). `status` is the
     /// child's exit code when known.
     TerminalExited { id: String, status: Option<i32> },
+    // ── Campaign DAG scheduler (DES-CAMPAIGN-001) — ride the same single ordered emit point ──
+    /// A campaign was validated + launched; its in-degree-0 nodes are being dispatched.
+    CampaignLaunched { campaign: String },
+    /// A node's every dependency cleared — it is `Ready` and queued for a concurrency slot.
+    CampaignNodeReady { campaign: String, node: String },
+    /// A node's Run was dispatched (`dispatch()` is the sole launcher). `run_id` is the node's live
+    /// Run — per-node CLI output rides the existing `CliOutputDelta` tagged with this id.
+    CampaignNodeStarted {
+        campaign: String,
+        node: String,
+        run_id: String,
+    },
+    /// A HITL gate opened INSIDE a node's Run: the node is `AwaitingHuman` (its slot is freed so
+    /// independent nodes run). The operator resolves it via `confirm_campaign_gate` (Approve/Reject).
+    CampaignNodeAwaitingHuman {
+        campaign: String,
+        node: String,
+        run_id: String,
+        prompt: String,
+    },
+    /// A node reached `Completed`.
+    CampaignNodeCompleted { campaign: String, node: String },
+    /// A node reached `Failed`.
+    CampaignNodeFailed { campaign: String, node: String },
+    /// A node was `Blocked` — a transitive `OnSuccess` dependency failed (continue-independent).
+    CampaignNodeBlocked { campaign: String, node: String },
+    /// The campaign paused (human-gate-on-failure, or an operator `PauseCampaign`).
+    CampaignPaused { campaign: String },
+    /// The campaign finished with no hard failure (`Completed` — all nodes done — or
+    /// `PartiallyCompleted` — some blocked/failed under continue-independent). The precise status is
+    /// readable via `campaign_status`.
+    CampaignCompleted { campaign: String },
+    /// The campaign failed (fail-fast tripped, or an aborted human-gate).
+    CampaignFailed { campaign: String },
+    /// The campaign was cancelled by the operator.
+    CampaignCancelled { campaign: String },
 }

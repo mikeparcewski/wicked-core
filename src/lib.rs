@@ -13,6 +13,7 @@
 
 mod actor;
 mod applications;
+mod campaign;
 mod code_graph;
 mod command;
 mod distribute;
@@ -35,6 +36,11 @@ mod terminal;
 mod workflow;
 
 pub use actor::RunBusy;
+pub use campaign::{
+    all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied, validate as validate_campaign,
+    Campaign, CampaignDef, CampaignEdge, CampaignGateDecision, CampaignNode, CampaignStatus,
+    EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
+};
 pub use domain::{
     all_sessions, get_session, get_work_output, put_node, session_units, AgentSession,
     HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind, UnitStatus, WorkUnit,

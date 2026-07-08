@@ -166,6 +166,47 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::TerminalExited { id, status } => {
             json!({ "type": "terminalExited", "id": id, "status": status })
         }
+        // Campaign DAG scheduler (DES-CAMPAIGN-001). Additive tagged-JSON mappings — the studio
+        // ignores unknown event types, so these never disturb existing consumers. The full campaign
+        // binding surface (launchCampaign etc.) is a separate follow-on task.
+        CoreEvent::CampaignLaunched { campaign } => {
+            json!({ "type": "campaignLaunched", "campaign": campaign })
+        }
+        CoreEvent::CampaignNodeReady { campaign, node } => {
+            json!({ "type": "campaignNodeReady", "campaign": campaign, "node": node })
+        }
+        CoreEvent::CampaignNodeStarted {
+            campaign,
+            node,
+            run_id,
+        } => json!({ "type": "campaignNodeStarted", "campaign": campaign, "node": node, "runId": run_id }),
+        CoreEvent::CampaignNodeAwaitingHuman {
+            campaign,
+            node,
+            run_id,
+            prompt,
+        } => json!({ "type": "campaignNodeAwaitingHuman", "campaign": campaign, "node": node, "runId": run_id, "prompt": prompt }),
+        CoreEvent::CampaignNodeCompleted { campaign, node } => {
+            json!({ "type": "campaignNodeCompleted", "campaign": campaign, "node": node })
+        }
+        CoreEvent::CampaignNodeFailed { campaign, node } => {
+            json!({ "type": "campaignNodeFailed", "campaign": campaign, "node": node })
+        }
+        CoreEvent::CampaignNodeBlocked { campaign, node } => {
+            json!({ "type": "campaignNodeBlocked", "campaign": campaign, "node": node })
+        }
+        CoreEvent::CampaignPaused { campaign } => {
+            json!({ "type": "campaignPaused", "campaign": campaign })
+        }
+        CoreEvent::CampaignCompleted { campaign } => {
+            json!({ "type": "campaignCompleted", "campaign": campaign })
+        }
+        CoreEvent::CampaignFailed { campaign } => {
+            json!({ "type": "campaignFailed", "campaign": campaign })
+        }
+        CoreEvent::CampaignCancelled { campaign } => {
+            json!({ "type": "campaignCancelled", "campaign": campaign })
+        }
     }
 }
 
