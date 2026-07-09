@@ -99,16 +99,22 @@ agreed," **not** "proven."
 | Single-writer actor, CoreEvent stream, worktree exec, resume, governance, council, campaign DAG | ✅ built |
 | WorkflowDef spine as data + registry + `load_dir` + shipped JSON | ✅ built |
 | Data-driven planner (`plan_from_def`) wired into the runtime (`--workflow`) | ✅ built |
-| Per-phase **gate** consumed at runtime — a phase's `GateSpec` (HumanConfirm / HumanConfirmIf / Auto) drives the human-confirm pause, OR'd with the run-level `--confirm` policy | ✅ built |
-| Per-phase **role** (`PhaseRole`) consumed at runtime (the evaluator pass still runs on every approved unit, not gated on `role: Evaluator`) | ⬜ unbuilt |
-| Skills-driven invocation (headless slash form) — **live-verified** end-to-end against real `claude` (`tests/skills_live.rs`) | ✅ built |
+| Per-phase **gate** — a phase's `GateSpec` drives the human-confirm pause, OR'd with the run-level `--confirm` | ✅ built |
+| Per-phase **role** / artifact-passing — an `Evaluator`-role unit reviews the prior `Creator`-role unit's **cold** output | ✅ built |
+| Skills-driven invocation (headless slash form) — **live-verified** vs real `claude` (`tests/skills_live.rs`) | ✅ built |
 | `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
+| **Dual-validator gate core** — deterministic (skill-authored + re-verify) + agent (controlled reviewer) + combination rule; approval-gated + fail-closed + denylist; **live-verified**, adversarially reviewed (14 findings incl. RCE + fail-open, all fixed) | ✅ built |
+| **Validator vault** — content-hash `pin` + `store`/`load` with read-time content-address verification (`validator_vault.rs`) | ✅ built |
+| **Provisioning** — `provision-validator` / `approve-validator` CLI (author→approve→pin, **live-verified**) + a phase's `validator_pin` auto-loaded from the vault at plan time so the gate **engages** | ✅ built |
+| Gate wired into the phase flow — deterministic re-verify + off-thread agent judge fold, deny-dominates, **repo-less runs fail-closed** (agent can't lone-approve) | ✅ built |
+| **Rust↔wicked-bus bridge** — emit/poll matching the JS schema (config TTL), `wicked.run.requested`→launch + `run.launched`, at-least-once retry; **cross-language round-trip verified** (`src/bus.rs`) | ✅ built |
+| **napi bridge** (`../wicked-core-ts`) — `launchRun`/`subscribe`/`confirmGate` over FFI; adversarially reviewed (9 findings incl. tsfn leak + OOM, fixed); Node smoke passes | ✅ built |
+| Real **OS sandbox** for validator execution (the denylist is a backstop, not a boundary) | ⬜ hardening |
+| napi → **studio UI** wiring (the addon exists; the Tauri/React surface consumes it) | ⬜ follow-up |
+| Council-assigns-skill-at-runtime | ⬜ deferred — needs a grounded skill-ranking design (guessing skill names would violate grounding) |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
-| Council-assigns-skill-at-runtime (default path) | ⬜ design'd, unbuilt |
-| Gate mechanism **core** — deterministic validator (skill-authored + re-verify) + agent validator (controlled reviewer seat) + rev0.4 combination rule, **approval-gated + live-verified**, adversarially reviewed (14 findings fixed: RCE via unapproved LLM-shell, fail-open parse, denylist backstop) (`src/validator.rs`, `tests/skills_live.rs`) | ✅ built |
-| Gate mechanism **integration** — estate-vault storage + content-hash pin + real OS sandbox (denylist is a backstop, not a boundary) + wiring into the phase gate flow | ⬜ unbuilt |
-| Event-driven bus seam — substrate **verified working** end-to-end on wicked-bus (both crew round-trips); the reducer + provisioner sidecars (poll-loops) remain to build | 🔨 substrate proven |
-| napi bridge → studio | ⬜ unbuilt |
+
+> **⚠️ Shipped-workflow caveat:** the built-in `feature`/`bug`/`migration` defs ship with `validator_pin: null`, so the dual-validator gate is **inert for the shipped workflows** — it engages only for a def whose phase carries a `validator_pin`. Author + approve a validator with `provision-validator`/`approve-validator`, then put the approved pin into a workflow def's phase. (A seed/CLI step that writes the pin back into a def automatically is the tracked follow-up.)
 
 ## Reference
 
