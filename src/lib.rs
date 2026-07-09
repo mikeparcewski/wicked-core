@@ -68,7 +68,11 @@ pub use repo_intel::{
 pub use scope::{resolve_scope, EntityMode};
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
 pub use wicked_council::AgenticCli;
-pub use workflow::{HumanDecision, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner};
+pub use workflow::{
+    bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
+    PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner, WorkflowDef,
+    WorkflowDefError, WorkflowRegistry,
+};
 
 /// What to run: the problem to decompose, the council roster (`AgenticCli` seats), the scope toggle,
 /// and a stable session id. The roster is passed explicitly so callers (tests, UI) control it; the
