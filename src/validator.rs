@@ -28,7 +28,7 @@ use crate::workflow::{StepInput, StepRunner, StepStatus};
 /// it is `false` on a freshly authored (LLM-generated, untrusted) validator and only becomes `true` via
 /// [`DeterministicValidator::approve`] — the explicit human/council approval step that must sit between
 /// authoring and running (rev0.4 fork 3). [`run_validator`] refuses to run while `approved == false`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeterministicValidator {
     pub criterion: String,
     pub script: String,

@@ -176,6 +176,12 @@ pub struct WorkUnit {
     /// to the run-level policy. `#[serde(default)]` for back-compat with pre-gate-wiring units.
     #[serde(default)]
     pub gate: crate::workflow::GateSpec,
+    /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
+    /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
+    /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
+    /// behavior). `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub validator: Option<crate::validator::DeterministicValidator>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -300,6 +306,7 @@ impl WorkUnit {
             skill_ref: None,
             allowed_skills: Vec::new(),
             gate: crate::workflow::GateSpec::default(),
+            validator: None,
             status: UnitStatus::Pending,
         }
     }

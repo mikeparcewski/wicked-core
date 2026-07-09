@@ -307,6 +307,21 @@ pub(crate) fn apply_and_finish_unit(
         }
     }
 
+    // PINNED VALIDATOR — the rev0.4 deterministic gate re-verify (layer-1), deny-dominates. If the unit
+    // carries an APPROVED validator and the run has a worktree, re-verify it against that worktree; a
+    // FAIL flips the verdict to denied BEFORE the status is persisted. Pure re-verify — no LLM here, so
+    // it is safe on the single-writer actor thread. (The agent-validator half is an LLM and belongs on
+    // the off-thread worker path — a later slice.)
+    if outcome.approved {
+        let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
+        if let Some(reason) =
+            pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new))
+        {
+            outcome.approved = false;
+            outcome.denial_reason = Some(reason);
+        }
+    }
+
     wicked_orchestration::tick_workflow(store, workflow_id, outcome.approved)?;
 
     unit.phase_ref = Some(outcome.phase_id.clone());
@@ -338,6 +353,23 @@ pub(crate) fn apply_and_finish_unit(
         }
     });
     Ok(outcome)
+}
+
+/// Re-verify a unit's APPROVED pinned validator against the worktree (rev0.4 gate layer-1). Returns
+/// `Some(denial_reason)` when the validator fails or errors — the gate then denies the unit
+/// (deny-dominates). `None` means "no denial": no validator, no worktree (an artifact-based validator
+/// needs one; repo-less runs skip it for now), or the validator PASSED. Pure + actor-safe (no LLM).
+fn pinned_validator_denial(
+    unit: &crate::domain::WorkUnit,
+    workdir: Option<&std::path::Path>,
+) -> Option<String> {
+    let v = unit.validator.as_ref()?;
+    let cwd = workdir?;
+    match crate::validator::run_validator(v, cwd) {
+        Ok(true) => None,
+        Ok(false) => Some(format!("pinned validator failed: {}", v.criterion)),
+        Err(e) => Some(format!("pinned validator error: {e}")),
+    }
 }
 
 /// A deterministic short id from parts (sha256 prefix).
@@ -385,5 +417,36 @@ mod resolve_tests {
             err.contains("unknown workflow") && err.contains("feaure-typo-xyz"),
             "error must name the bad id: {err}"
         );
+    }
+
+    #[test]
+    fn pinned_validator_denial_is_deny_dominates_and_fail_closed() {
+        use crate::domain::WorkUnit;
+        use crate::validator::DeterministicValidator;
+        let dir = std::env::temp_dir().join(format!("wicked-pinned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ok.txt"), "hi").unwrap();
+        let mk = |script: &str, approved: bool| DeterministicValidator {
+            criterion: "c".into(),
+            script: script.into(),
+            approved,
+        };
+        let mut unit = WorkUnit::pending("s:u1", "s", 1, "d");
+
+        // No validator ⇒ no denial.
+        assert!(pinned_validator_denial(&unit, Some(&dir)).is_none());
+        // Approved + PASSES ⇒ no denial.
+        unit.validator = Some(mk("test -f ok.txt", true));
+        assert!(pinned_validator_denial(&unit, Some(&dir)).is_none());
+        // Approved + FAILS ⇒ denial (deny-dominates).
+        unit.validator = Some(mk("test -f missing.txt", true));
+        assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
+        // No worktree ⇒ skip (an artifact validator needs one) ⇒ no denial.
+        assert!(pinned_validator_denial(&unit, None).is_none());
+        // UNAPPROVED ⇒ run_validator refuses ⇒ denial (fail-closed).
+        unit.validator = Some(mk("test -f ok.txt", false));
+        assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
