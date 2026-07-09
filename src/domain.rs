@@ -170,6 +170,12 @@ pub struct WorkUnit {
     /// `allowed_skills`. The runner passes it as the invocation's skill/tool scope. Empty ⇒ unscoped.
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// The backing phase's declared human-confirm gate (DES-EXEC-001 §3) — carried from the phase's
+    /// `GateSpec` so the def, not just the run-level `--confirm` flag, drives when a run pauses for a
+    /// human. A phase's gate fires AFTER its work (before the next unit). `Auto` (the default) ⇒ defer
+    /// to the run-level policy. `#[serde(default)]` for back-compat with pre-gate-wiring units.
+    #[serde(default)]
+    pub gate: crate::workflow::GateSpec,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -293,6 +299,7 @@ impl WorkUnit {
             collection_scope: None,
             skill_ref: None,
             allowed_skills: Vec::new(),
+            gate: crate::workflow::GateSpec::default(),
             status: UnitStatus::Pending,
         }
     }

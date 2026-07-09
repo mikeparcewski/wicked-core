@@ -77,6 +77,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // step runner invokes the right skill under least-privilege — pure data from the def.
             unit.skill_ref = phase.skill_ref.clone();
             unit.allowed_skills = phase.allowed_skills.clone();
+            // Carry the phase's declared human-confirm gate (§3) so the DEF drives when the run pauses
+            // for a human, not just the run-level --confirm flag.
+            unit.gate = phase.gate;
             unit
         })
         .collect()

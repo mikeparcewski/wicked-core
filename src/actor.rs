@@ -903,7 +903,7 @@ fn advance_or_pause(
         return Ok(Progress::Done);
     };
 
-    if should_pause(&session, unit.ord) {
+    if should_pause(&session, &units, unit_ix) {
         session.status = SessionStatus::AwaitingHuman;
         put_node(store, session.to_node())?;
         let prompt = format!(
@@ -952,13 +952,35 @@ fn resolve_workdir(
     ))
 }
 
-/// Whether to pause before the unit with `ord`, per the run's human-confirm policy.
-fn should_pause(session: &crate::domain::AgentSession, ord: u32) -> bool {
-    match session.human_confirm {
+/// Whether to pause for a human before dispatching `units[unit_ix]`. Two sources, OR'd:
+///  1. the run-level `--confirm` policy (None / All / Before(ord)); and
+///  2. the DEF-declared gate on the PRECEDING phase (its `GateSpec` fires *after* its work, i.e.
+///     before this unit) — so a `WorkflowDef`'s own HumanConfirm gates drive the run, not just the
+///     run-level flag. `HumanConfirm` always pauses; `HumanConfirmIf(VerdictNotPass)` pauses when the
+///     preceding unit is not a clean pass (`status != Done`); `Auto` defers to the run-level policy.
+fn should_pause(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+) -> bool {
+    let ord = units[unit_ix].ord;
+    let run_level = match session.human_confirm {
         crate::domain::HumanConfirm::None => false,
         crate::domain::HumanConfirm::All => true,
         crate::domain::HumanConfirm::Before(o) => o == ord,
-    }
+    };
+    let def_gate = unit_ix
+        .checked_sub(1)
+        .and_then(|i| units.get(i))
+        .map(|prev| match prev.gate {
+            crate::workflow::GateSpec::Auto => false,
+            crate::workflow::GateSpec::HumanConfirm { .. } => true,
+            crate::workflow::GateSpec::HumanConfirmIf(
+                crate::workflow::GateCond::VerdictNotPass,
+            ) => prev.status != crate::domain::UnitStatus::Done,
+        })
+        .unwrap_or(false);
+    run_level || def_gate
 }
 
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
@@ -1271,4 +1293,99 @@ fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionVie
         views.push(crate::SessionView { session, units });
     }
     Ok(views)
+}
+
+#[cfg(test)]
+mod gate_pause_tests {
+    use super::should_pause;
+    use crate::domain::{AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit};
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateCond, GateSpec};
+
+    fn sess(hc: HumanConfirm) -> AgentSession {
+        AgentSession {
+            id: "s".into(),
+            workflow_id: "wf-s".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: hc,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        }
+    }
+    fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("s:u{ord}"), "s", ord, "d");
+        u.gate = gate;
+        u.status = status;
+        u
+    }
+
+    #[test]
+    fn a_def_humanconfirm_gate_pauses_even_when_run_level_is_none() {
+        // The DEF drives the pause: run-level --confirm is None, yet the preceding phase's
+        // HumanConfirm gate must still pause the run before the next unit.
+        let s = sess(HumanConfirm::None);
+        let units = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirm {
+                    unconditional: false,
+                },
+                UnitStatus::Done,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(should_pause(&s, &units, 1), "preceding def gate must pause");
+        assert!(
+            !should_pause(&s, &units, 0),
+            "no preceding phase ⇒ no def pause"
+        );
+    }
+
+    #[test]
+    fn auto_gate_defers_to_the_run_level_policy() {
+        let units = vec![
+            unit(1, GateSpec::Auto, UnitStatus::Done),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(!should_pause(&sess(HumanConfirm::None), &units, 1));
+        assert!(
+            should_pause(&sess(HumanConfirm::All), &units, 1),
+            "run-level All still pauses when the def gate is Auto"
+        );
+    }
+
+    #[test]
+    fn conditional_gate_pauses_only_when_the_prev_phase_is_not_a_clean_pass() {
+        let s = sess(HumanConfirm::None);
+        let passed = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                UnitStatus::Done,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(
+            !should_pause(&s, &passed, 1),
+            "clean pass (Done) ⇒ no pause"
+        );
+        let not_passed = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                UnitStatus::Rejected,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(
+            should_pause(&s, &not_passed, 1),
+            "not a clean pass ⇒ pause for a human"
+        );
+    }
 }

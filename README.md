@@ -99,7 +99,8 @@ agreed," **not** "proven."
 | Single-writer actor, CoreEvent stream, worktree exec, resume, governance, council, campaign DAG | ✅ built |
 | WorkflowDef spine as data + registry + `load_dir` + shipped JSON | ✅ built |
 | Data-driven planner (`plan_from_def`) wired into the runtime (`--workflow`) | ✅ built |
-| Per-phase **gate/role** consumed at runtime (today runs use the run-level `--confirm` policy; the def's `GateSpec`/`PhaseRole` are declared data, not yet driving `should_pause`) | ⬜ unbuilt |
+| Per-phase **gate** consumed at runtime — a phase's `GateSpec` (HumanConfirm / HumanConfirmIf / Auto) drives the human-confirm pause, OR'd with the run-level `--confirm` policy | ✅ built |
+| Per-phase **role** (`PhaseRole`) consumed at runtime (the evaluator pass still runs on every approved unit, not gated on `role: Evaluator`) | ⬜ unbuilt |
 | Skills-driven invocation (headless slash form) | ✅ built |
 | `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
