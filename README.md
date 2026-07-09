@@ -101,12 +101,12 @@ agreed," **not** "proven."
 | Data-driven planner (`plan_from_def`) wired into the runtime (`--workflow`) | ✅ built |
 | Per-phase **gate** consumed at runtime — a phase's `GateSpec` (HumanConfirm / HumanConfirmIf / Auto) drives the human-confirm pause, OR'd with the run-level `--confirm` policy | ✅ built |
 | Per-phase **role** (`PhaseRole`) consumed at runtime (the evaluator pass still runs on every approved unit, not gated on `role: Evaluator`) | ⬜ unbuilt |
-| Skills-driven invocation (headless slash form) | ✅ built |
+| Skills-driven invocation (headless slash form) — **live-verified** end-to-end against real `claude` (`tests/skills_live.rs`) | ✅ built |
 | `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
 | Council-assigns-skill-at-runtime (default path) | ⬜ design'd, unbuilt |
-| Gate mechanism (generated dual validators, pin, re-verify) | ⬜ design'd (DES-EXEC-001 rev0.4), unbuilt |
-| Event-driven bus seam (`wicked.skill.*` provisioning, cli-runner subscriber) | ⬜ design'd, unbuilt |
+| Gate mechanism (generated dual validators, pin, re-verify) | ⬜ design'd (DES-EXEC-001 rev0.4), unbuilt — the validator-authoring skill is live-invokable here (see skills row), so this is buildable + verifiable in-env |
+| Event-driven bus seam (`wicked.skill.*` provisioning, cli-runner subscriber) | ⬜ design'd, unbuilt — `wicked-bus` + node are present, so buildable + testable in-env |
 | napi bridge → studio | ⬜ unbuilt |
 
 ## Reference
