@@ -34,13 +34,13 @@
 //! unix-only APIs.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use wicked_council::AgenticCli;
@@ -145,16 +145,71 @@ pub struct BusEvent {
     pub payload: serde_json::Value,
 }
 
+/// The subset of the wicked-bus `config.json` the bridge cares about: the two TTL timers JS `emit()`
+/// reads (`config.ttl_hours` / `config.dedup_ttl_hours`). Every other key is ignored so operator/CLI
+/// additions to the file never break parsing (forward-compatible, mirroring JS `loadConfig`).
+#[derive(Debug, Deserialize)]
+struct BusConfig {
+    ttl_hours: Option<i64>,
+    dedup_ttl_hours: Option<i64>,
+}
+
+/// Resolve the wicked-bus data dir the way JS `paths.js`/`config.js` do — for the sole purpose of
+/// locating `config.json`. `WICKED_BUS_DATA_DIR` wins if set (matches `resolveDataDir()`); otherwise
+/// the directory CONTAINING the bus db (the default layout is `<dataDir>/bus.db`, so the db's parent
+/// IS the data dir). `None` when neither yields a directory (a bare-filename db path) → caller uses
+/// the built-in defaults, exactly as JS falls back when the file is absent.
+fn resolve_config_dir(db_path: &str) -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("WICKED_BUS_DATA_DIR") {
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir));
+        }
+    }
+    std::path::Path::new(db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+}
+
+/// Load `(ttl_hours, dedup_ttl_hours)` from `<dataDir>/config.json`, matching JS `loadConfig()`: a
+/// missing file or malformed JSON silently yields the defaults (72/24), and an absent key falls back
+/// to its own default. This is what makes the Rust two-timer TTL agree with JS under a NON-default
+/// operator config — otherwise the JS sweep (which deletes on `dedup_expires_at`) reaps Rust rows on a
+/// different clock than JS-written rows.
+fn load_bus_ttls(db_path: &str) -> (i64, i64) {
+    let cfg = resolve_config_dir(db_path)
+        .map(|dir| dir.join("config.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<BusConfig>(&raw).ok());
+    match cfg {
+        Some(c) => (
+            c.ttl_hours.unwrap_or(DEFAULT_TTL_HOURS),
+            c.dedup_ttl_hours.unwrap_or(DEFAULT_DEDUP_TTL_HOURS),
+        ),
+        None => (DEFAULT_TTL_HOURS, DEFAULT_DEDUP_TTL_HOURS),
+    }
+}
+
 /// A handle to a wicked-bus SQLite event log. Wraps a `rusqlite::Connection` so callers never name
 /// `rusqlite` directly. Open one per thread that emits/polls — SQLite connections are not `Sync`.
 pub struct BusDb {
     conn: Connection,
+    /// Default event TTL in hours (`config.ttl_hours`), loaded from the wicked-bus `config.json` at
+    /// open time (falls back to [`DEFAULT_TTL_HOURS`]). Threaded into [`emit`] so `expires_at` matches
+    /// what JS `emit()` computes under the SAME operator config.
+    default_ttl_hours: i64,
+    /// Dedup-row TTL in hours (`config.dedup_ttl_hours`), same provenance as `default_ttl_hours`
+    /// (falls back to [`DEFAULT_DEDUP_TTL_HOURS`]). Drives `dedup_expires_at`, which the JS sweep
+    /// deletes on — so this must agree with JS or Rust rows are reaped early/late.
+    dedup_ttl_hours: i64,
 }
 
 impl BusDb {
     /// Open (creating if absent) the bus db at `path`, apply the bus's PRAGMAs, and ensure the base
     /// `events` schema exists. Safe against a JS-created db (idempotent DDL) and safe for JS to open
-    /// afterwards (JS layers its migration-3 nullable columns on top).
+    /// afterwards (JS layers its migration-3 nullable columns on top). Also loads the operator's
+    /// `ttl_hours`/`dedup_ttl_hours` from `config.json` so emitted rows carry the SAME two-timer TTL a
+    /// JS `emit()` would under that config.
     pub fn open(path: &str) -> Result<Self> {
         let conn = Connection::open(path).with_context(|| format!("open bus db at {path}"))?;
         // Match wicked-bus lib/db.js PRAGMAs. WAL + a busy timeout so a concurrent JS writer/sweeper
@@ -164,7 +219,12 @@ impl BusDb {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(EVENTS_DDL)
             .context("ensure wicked-bus events schema")?;
-        Ok(Self { conn })
+        let (default_ttl_hours, dedup_ttl_hours) = load_bus_ttls(path);
+        Ok(Self {
+            conn,
+            default_ttl_hours,
+            dedup_ttl_hours,
+        })
     }
 
     /// Publish `event`. Computes the bus's two-timer TTL (`expires_at = emitted_at + ttl`,
@@ -176,9 +236,11 @@ impl BusDb {
     pub fn emit(&self, event: &BusEmit) -> Result<i64> {
         let idempotency_key = event.idempotency_key.clone().unwrap_or_else(fresh_key);
         let emitted_at = now_ms();
-        let ttl_hours = event.ttl_hours.unwrap_or(DEFAULT_TTL_HOURS);
+        // Per-event TTL override wins, else the operator config's `ttl_hours` (mirrors JS `emit`:
+        // `event.ttl_hours != null ? event.ttl_hours : config.ttl_hours`).
+        let ttl_hours = event.ttl_hours.unwrap_or(self.default_ttl_hours);
         let expires_at = emitted_at + ttl_hours * MS_PER_HOUR;
-        let dedup_expires_at = emitted_at + DEFAULT_DEDUP_TTL_HOURS * MS_PER_HOUR;
+        let dedup_expires_at = emitted_at + self.dedup_ttl_hours * MS_PER_HOUR;
         let payload_str = serde_json::to_string(&event.payload)?;
 
         let res = self.conn.execute(
@@ -200,16 +262,28 @@ impl BusDb {
         match res {
             Ok(_) => Ok(self.conn.last_insert_rowid()),
             // A UNIQUE(idempotency_key) collision → the event is already on the bus. Resolve its id
-            // (at-least-once idempotency, not a failure).
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == ErrorCode::ConstraintViolation =>
+            // (at-least-once idempotency, not a failure). Narrowed to the UNIQUE extended code: a
+            // CHECK(length)/NOT NULL breach is ALSO a `ConstraintViolation`, but it is NOT a dedup —
+            // the by-key SELECT would then find no row and we'd surface a confusing
+            // `QueryReturnedNoRows` instead of the real constraint error. So we (a) only treat the
+            // UNIQUE code as dedup, and (b) if the by-key SELECT unexpectedly finds nothing, propagate
+            // the ORIGINAL constraint error rather than a no-rows error.
+            Err(rusqlite::Error::SqliteFailure(e, msg))
+                if e.code == ErrorCode::ConstraintViolation
+                    && e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
             {
-                let id: i64 = self.conn.query_row(
-                    "SELECT event_id FROM events WHERE idempotency_key = ?1",
-                    [&idempotency_key],
-                    |r| r.get(0),
-                )?;
-                Ok(id)
+                let existing: Option<i64> = self
+                    .conn
+                    .query_row(
+                        "SELECT event_id FROM events WHERE idempotency_key = ?1",
+                        [&idempotency_key],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match existing {
+                    Some(id) => Ok(id),
+                    None => Err(rusqlite::Error::SqliteFailure(e, msg).into()),
+                }
             }
             Err(e) => Err(e.into()),
         }
@@ -292,8 +366,11 @@ pub fn matches_filter(event_type: &str, domain: &str, filter: &str) -> bool {
         Some(i) => (&filter[..i], Some(&filter[i + 1..])),
         None => (filter, None),
     };
+    // JS treats an empty domain segment (`type@` / a bare `@`) as a FALSY filter and skips the domain
+    // check entirely (`if (domainFilter && domain !== domainFilter)`). Mirror that truthiness: only a
+    // non-empty domain segment constrains the publisher.
     if let Some(df) = domain_filter {
-        if domain != df {
+        if !df.is_empty() && domain != df {
             return false;
         }
     }
@@ -424,19 +501,28 @@ pub fn spawn_run_requested_poller(
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     // Snapshot the tail SYNCHRONOUSLY on the caller's thread (see the doc comment): once this function
-    // returns, any subsequently-emitted request has a strictly higher id than `floor_init`. A failure
-    // to open here is non-fatal — the spawned thread re-opens and logs the real error — so fall back to
-    // 0 (which at worst replays pre-existing requests, never drops the new one this ordering protects).
-    let floor_init: i64 = BusDb::open(&bus_db_path)
-        .ok()
-        .and_then(|db| {
-            db.conn
-                .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
-                    r.get(0)
-                })
-                .ok()
-        })
-        .unwrap_or(0);
+    // returns, any subsequently-emitted request has a strictly higher id than the floor. If the
+    // snapshot CANNOT be read here, the floor is UNKNOWN — we must NOT fall back to 0. Starting at 0
+    // would replay EVERY non-expired historical `run.requested` (up to the TTL window, ~72h) as a fresh
+    // launch: a mass-duplicate storm. Instead treat the bridge as un-initialized and disable it (the
+    // same posture as the thread-side open-failure path below), spawning a thread that just exits.
+    let floor_init: Option<i64> = BusDb::open(&bus_db_path).ok().and_then(|db| {
+        db.conn
+            .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
+                r.get(0)
+            })
+            .ok()
+    });
+    let floor_init = match floor_init {
+        Some(f) => f,
+        None => {
+            eprintln!(
+                "wicked-core: bus bridge disabled — cannot snapshot cursor floor from bus db \
+                 {bus_db_path}; refusing to replay history"
+            );
+            return std::thread::spawn(|| {});
+        }
+    };
     std::thread::spawn(move || {
         let db = match BusDb::open(&bus_db_path) {
             Ok(d) => d,
@@ -461,18 +547,32 @@ pub fn spawn_run_requested_poller(
                 }
             };
             for ev in events {
-                match launch_from_event(&tx, &db, &roster, entity_mode, &ev) {
-                    Ok(()) => {}
-                    Err(BridgeError::ActorGone) => return, // the Core dropped — nothing to feed
-                    Err(BridgeError::Other(e)) => {
+                match launch_from_event(&tx, &db, &roster, entity_mode, &ev, &stop) {
+                    // Handled (launched OR idempotent redelivery) → advance PAST this request.
+                    Ok(()) => {
+                        floor = ev.event_id;
+                    }
+                    // The Core dropped, or we're stopping — exit the thread so its `join()` returns.
+                    Err(BridgeError::ActorGone) | Err(BridgeError::Stopped) => return,
+                    // Poison payload → advance past it (retrying is futile; don't wedge the batch).
+                    Err(BridgeError::Permanent(e)) => {
                         eprintln!(
-                            "wicked-core: bus bridge could not launch run for event {}: {e}",
+                            "wicked-core: bus bridge dropping unprocessable event {} (permanent): {e}",
                             ev.event_id
                         );
+                        floor = ev.event_id;
+                    }
+                    // Transient fault → do NOT advance the floor; break the batch and re-poll after the
+                    // sleep so this request is RETRIED (at-least-once, not at-most-once).
+                    Err(BridgeError::Retriable(e)) => {
+                        eprintln!(
+                            "wicked-core: bus bridge could not launch run for event {} (transient, \
+                             will retry): {e}",
+                            ev.event_id
+                        );
+                        break;
                     }
                 }
-                // Advance PAST this request only after we've attempted the launch (at-least-once).
-                floor = ev.event_id;
             }
             // Sleep in short slices so `stop` is honored promptly.
             let mut slept = Duration::ZERO;
@@ -488,28 +588,43 @@ pub fn spawn_run_requested_poller(
 enum BridgeError {
     /// The actor's command receiver is gone (Core dropped) — the poller should exit.
     ActorGone,
-    Other(anyhow::Error),
-}
-
-impl From<anyhow::Error> for BridgeError {
-    fn from(e: anyhow::Error) -> Self {
-        BridgeError::Other(e)
-    }
+    /// The stop flag was observed while waiting for the actor's reply — the poller should exit.
+    Stopped,
+    /// A TRANSIENT store/IO/worktree/dispatch fault. The event was NOT handled: do NOT advance the
+    /// floor, re-poll after the sleep so it is retried (at-least-once). This is the retriable class.
+    Retriable(anyhow::Error),
+    /// A PERMANENT fault — a payload that can never parse (poison). Retrying is futile, so the floor
+    /// IS advanced past it (dropping the poison row) rather than wedging the batch forever.
+    Permanent(anyhow::Error),
 }
 
 /// Turn one `wicked.run.requested` event into a `LaunchRun` posted to the actor, then emit
-/// `wicked.run.launched` back onto the bus (proof of the publish path). Errors that mean "the run
-/// already exists" (idempotent redelivery) are swallowed — the launched event is still (idempotently)
-/// emitted so downstream consumers see a stable signal.
+/// `wicked.run.launched` back onto the bus (proof of the publish path). Idempotent redeliveries (the
+/// run is already in flight — [`RunBusy`] — or already exists non-terminally — [`RunExists`]) are
+/// treated as SUCCESS, not failure: the launched event is still (idempotently) emitted so downstream
+/// consumers see a stable signal, and the poller advances its floor past the request.
+///
+/// Error classification (drives whether the caller advances the floor):
+///  * payload can never parse ⇒ [`BridgeError::Permanent`] (poison — advance past it).
+///  * a genuine store/IO/worktree/dispatch fault ⇒ [`BridgeError::Retriable`] (do NOT advance — retry).
+///  * actor channel closed ⇒ [`BridgeError::ActorGone`]; stop flag observed ⇒ [`BridgeError::Stopped`].
+///
+/// `stop` is polled while waiting for the actor's reply so a shutting-down actor (which will never
+/// reply) cannot wedge this thread in an un-cancellable `recv()` — that deadlocked the actor's
+/// `join()` on the poller at shutdown.
 fn launch_from_event(
     tx: &Sender<Command>,
     db: &BusDb,
     roster: &[AgenticCli],
     entity_mode: EntityMode,
     ev: &BusEvent,
+    stop: &Arc<AtomicBool>,
 ) -> Result<(), BridgeError> {
+    // A malformed payload is a PERMANENT poison — it will never parse, so retrying it forever would
+    // wedge every later request behind it. Advance past it instead.
     let req: RunRequested = serde_json::from_value(ev.payload.clone())
-        .with_context(|| format!("parse {RUN_REQUESTED} payload"))?;
+        .with_context(|| format!("parse {RUN_REQUESTED} payload"))
+        .map_err(BridgeError::Permanent)?;
     let session_id = req
         .args
         .session_id
@@ -534,22 +649,39 @@ fn launch_from_event(
         return Err(BridgeError::ActorGone);
     }
     // The actor plans+distributes synchronously then replies with the run id. Blocking here is fine —
-    // this is the poller thread, never the actor thread. A disconnected reply means the actor is gone.
-    match rx.recv() {
-        Ok(Ok(run_id)) => {
-            emit_run_launched(db, &run_id, req.workflow.as_deref(), &req.problem);
+    // this is the poller thread, never the actor thread — BUT the wait MUST be cancellable: at
+    // shutdown the actor breaks its loop without replying, so an un-bounded `recv()` here would hang
+    // forever and the actor's `join()` on this thread would deadlock. Poll `stop` on a short timeout.
+    let reply = loop {
+        if stop.load(Ordering::SeqCst) {
+            return Err(BridgeError::Stopped);
         }
-        Ok(Err(e)) => {
-            // "already exists" ⇒ an idempotent redelivery; still surface a stable launched signal.
-            if e.to_string().contains("already exists") {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(r) => break r,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return Err(BridgeError::ActorGone),
+        }
+    };
+    match reply {
+        Ok(run_id) => {
+            emit_run_launched(db, &run_id, req.workflow.as_deref(), &req.problem);
+            Ok(())
+        }
+        Err(e) => {
+            // TYPED idempotency: a run already in flight (RunBusy) or an existing non-terminal run
+            // (RunExists) is a duplicate REQUEST, not a fault. Both dedup to the live run — surface a
+            // stable launched signal and let the caller advance the floor (no retry). Anything else is
+            // a genuine transient fault → retriable (do NOT advance the floor).
+            if e.downcast_ref::<crate::RunBusy>().is_some()
+                || e.downcast_ref::<crate::RunExists>().is_some()
+            {
                 emit_run_launched(db, &session_id, req.workflow.as_deref(), &req.problem);
+                Ok(())
             } else {
-                return Err(BridgeError::Other(e));
+                Err(BridgeError::Retriable(e))
             }
         }
-        Err(_) => return Err(BridgeError::ActorGone),
     }
-    Ok(())
 }
 
 /// Emit `wicked.run.launched {run_id, workflow, problem}` — deterministically keyed on the run id so
@@ -687,5 +819,311 @@ mod tests {
             "other",
             "wicked.run.requested@core"
         ));
+        // An EMPTY domain segment (a trailing `@`, or a bare `@`) is a FALSY domain filter in JS —
+        // the domain check is skipped, so any publisher matches. Rust used to reject every non-empty
+        // domain here (finding #6).
+        assert!(matches_filter(
+            "wicked.run.requested",
+            "any-domain",
+            "wicked.run.requested@"
+        ));
+        assert!(matches_filter("x.y.z", "core", "x.y.z@"));
+        assert!(matches_filter("anything", "whatever", "*@"));
+    }
+
+    /// Finding #1: under a NON-default operator `config.json` (next to the bus db) the two-timer TTL
+    /// must be read from it — not hardcoded to 72/24 — so Rust rows carry the same `expires_at` /
+    /// `dedup_expires_at` a JS `emit()` would compute (otherwise the JS sweep reaps Rust rows on a
+    /// different clock).
+    #[test]
+    fn emit_uses_config_json_ttls() {
+        let path = tmp_bus("cfgttl");
+        let dir = std::path::Path::new(&path).parent().unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"ttl_hours": 5, "dedup_ttl_hours": 3}"#,
+        )
+        .unwrap();
+        let db = BusDb::open(&path).unwrap();
+        assert_eq!(db.default_ttl_hours, 5, "ttl_hours read from config.json");
+        assert_eq!(
+            db.dedup_ttl_hours, 3,
+            "dedup_ttl_hours read from config.json"
+        );
+
+        let before = now_ms();
+        let id = db
+            .emit(&BusEmit::new(
+                RUN_REQUESTED,
+                "d",
+                "s",
+                serde_json::json!({}),
+            ))
+            .unwrap();
+        let (expires_at, dedup_expires_at): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT expires_at, dedup_expires_at FROM events WHERE event_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        // 5h / 3h from emitted_at (~`before`), NOT the 72h/24h defaults.
+        assert!(
+            expires_at >= before + 5 * MS_PER_HOUR && expires_at < before + 6 * MS_PER_HOUR,
+            "expires_at reflects config ttl_hours=5, got {expires_at} (before={before})"
+        );
+        assert!(
+            dedup_expires_at >= before + 3 * MS_PER_HOUR
+                && dedup_expires_at < before + 4 * MS_PER_HOUR,
+            "dedup_expires_at reflects config dedup_ttl_hours=3"
+        );
+    }
+
+    /// An absent `config.json` (or one missing the keys) falls back to the built-in 72/24 defaults,
+    /// mirroring JS `loadConfig()`.
+    #[test]
+    fn emit_falls_back_to_default_ttls_without_config() {
+        let db = BusDb::open(&tmp_bus("noconfig")).unwrap();
+        assert_eq!(db.default_ttl_hours, DEFAULT_TTL_HOURS);
+        assert_eq!(db.dedup_ttl_hours, DEFAULT_DEDUP_TTL_HOURS);
+    }
+
+    // ── Bridge error-classification + retry tests (findings #2/#9, #4, #5) ──────────────────────────
+    // These drive the real poller / `launch_from_event` against a FAKE actor (a plain
+    // `Receiver<Command>` loop) so no store/engine is needed. The fake actor's reply models each
+    // outcome: transient fault, RunBusy/RunExists idempotency, or success.
+
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc::Receiver;
+
+    fn fake_actor<F>(rx: Receiver<Command>, mut handler: F) -> JoinHandle<()>
+    where
+        F: FnMut(usize) -> anyhow::Result<String> + Send + 'static,
+    {
+        std::thread::spawn(move || {
+            let mut n = 0usize;
+            while let Ok(cmd) = rx.recv() {
+                if let Command::LaunchRun { reply, .. } = cmd {
+                    let res = handler(n);
+                    n += 1;
+                    let _ = reply.send(res);
+                }
+            }
+        })
+    }
+
+    fn requested(event_id: i64, session: &str) -> BusEvent {
+        BusEvent {
+            event_id,
+            event_type: RUN_REQUESTED.to_string(),
+            domain: "d".to_string(),
+            subdomain: "s".to_string(),
+            payload: serde_json::json!({ "problem": "p", "args": { "session_id": session } }),
+        }
+    }
+
+    /// Finding #2/#9: a TRANSIENT launch fault is surfaced as `Retriable` (which the poller uses to
+    /// NOT advance the floor), and a later attempt on the SAME event succeeds — at-least-once, not
+    /// at-most-once.
+    #[test]
+    fn transient_launch_failure_is_retriable_then_succeeds() {
+        let db = BusDb::open(&tmp_bus("retry")).unwrap();
+        let (tx, rx) = channel();
+        let actor = fake_actor(rx, |n| {
+            if n == 0 {
+                anyhow::bail!("transient store/worktree fault")
+            } else {
+                Ok("run-x".to_string())
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let ev = requested(1, "run-x");
+
+        let r1 = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        assert!(
+            matches!(r1, Err(BridgeError::Retriable(_))),
+            "a transient fault is retriable (floor must not advance)"
+        );
+        // No launched signal yet — the run never started.
+        assert_eq!(db.poll(RUN_LAUNCHED, 0, 10).unwrap().len(), 0);
+
+        let r2 = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        assert!(r2.is_ok(), "the retry succeeds");
+        assert_eq!(
+            db.poll(RUN_LAUNCHED, 0, 10).unwrap().len(),
+            1,
+            "launched emitted only after success"
+        );
+
+        drop(tx);
+        actor.join().unwrap();
+    }
+
+    /// Finding #4: a duplicate request against a still-running run (actor replies `RunBusy`) — and an
+    /// existing non-terminal run (`RunExists`) — are IDEMPOTENT redeliveries, not faults. Both resolve
+    /// to `Ok` and still emit a stable `run.launched` signal.
+    #[test]
+    fn runbusy_and_runexists_duplicates_are_idempotent() {
+        let db = BusDb::open(&tmp_bus("idembusy")).unwrap();
+        let (tx, rx) = channel();
+        let actor = fake_actor(rx, |n| {
+            if n == 0 {
+                Err(crate::RunBusy("run-dup".to_string()).into())
+            } else {
+                Err(crate::RunExists("run-dup".to_string(), "Executing".to_string()).into())
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let ev = requested(7, "run-dup");
+
+        let r_busy = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        assert!(
+            r_busy.is_ok(),
+            "RunBusy is an idempotent redelivery, not a fault"
+        );
+
+        let r_exists = launch_from_event(&tx, &db, &[], EntityMode::Shared, &ev, &stop);
+        assert!(
+            r_exists.is_ok(),
+            "RunExists is an idempotent redelivery, not a fault"
+        );
+
+        // Both dedup to the same run id → the launched event is keyed on it and appears once.
+        let launched = db.poll(RUN_LAUNCHED, 0, 10).unwrap();
+        assert_eq!(
+            launched.len(),
+            1,
+            "one stable launched signal (deterministic key)"
+        );
+        assert_eq!(launched[0].payload["run_id"], "run-dup");
+
+        drop(tx);
+        actor.join().unwrap();
+    }
+
+    /// Finding #2/#9 at the POLLER level: a transient failure does NOT advance the floor, so the SAME
+    /// emitted request is re-attempted (>= 2 LaunchRun commands reach the actor) and eventually
+    /// launches — proving the event is never silently dropped.
+    #[test]
+    fn poller_retries_transient_failure_without_dropping() {
+        let path = tmp_bus("pollerretry");
+        let (tx, rx) = channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let a2 = attempts.clone();
+        let actor = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                if let Command::LaunchRun { reply, .. } = cmd {
+                    let n = a2.fetch_add(1, Ordering::SeqCst);
+                    let res: anyhow::Result<String> = if n == 0 {
+                        Err(anyhow::anyhow!("transient"))
+                    } else {
+                        Ok("run-1".to_string())
+                    };
+                    let _ = reply.send(res);
+                }
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        // Connect BEFORE emitting: floor snapshot = 0 on the empty db, so the request (id 1 > 0) is seen.
+        let handle = spawn_run_requested_poller(
+            path.clone(),
+            tx,
+            vec![],
+            EntityMode::Shared,
+            Duration::from_millis(20),
+            stop.clone(),
+        );
+        let db = BusDb::open(&path).unwrap();
+        db.emit(&BusEmit::new(
+            RUN_REQUESTED,
+            "d",
+            "s",
+            serde_json::json!({ "problem": "p", "args": { "session_id": "run-1" } }),
+        ))
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while attempts.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "the transient failure did not advance the floor → the request was retried"
+        );
+
+        // After the retry succeeds, exactly one run.launched lands.
+        let deadline2 = std::time::Instant::now() + Duration::from_secs(3);
+        let mut launched = 0;
+        while std::time::Instant::now() < deadline2 {
+            launched = db.poll(RUN_LAUNCHED, 0, 10).unwrap().len();
+            if launched >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            launched, 1,
+            "launched emitted once after the retry succeeds"
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        handle.join().unwrap();
+        drop(db);
+        actor.join().unwrap();
+    }
+
+    /// Finding #5: the poller's wait for the actor's reply is CANCELLABLE. A shutting-down actor never
+    /// replies; the poller must still observe the stop flag and exit so the actor's `join()` on it
+    /// returns instead of deadlocking. The fake actor here receives the LaunchRun but NEVER replies.
+    #[test]
+    fn poller_reply_wait_is_cancellable_on_stop() {
+        let path = tmp_bus("cancelwait");
+        let (tx, rx) = channel::<Command>();
+        let held: Arc<std::sync::Mutex<Vec<std::sync::mpsc::Sender<anyhow::Result<String>>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let held2 = held.clone();
+        let actor = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                if let Command::LaunchRun { reply, .. } = cmd {
+                    held2.lock().unwrap().push(reply); // deliberately never reply
+                }
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = spawn_run_requested_poller(
+            path.clone(),
+            tx,
+            vec![],
+            EntityMode::Shared,
+            Duration::from_millis(20),
+            stop.clone(),
+        );
+        let db = BusDb::open(&path).unwrap();
+        db.emit(&BusEmit::new(
+            RUN_REQUESTED,
+            "d",
+            "s",
+            serde_json::json!({ "problem": "p" }),
+        ))
+        .unwrap();
+        // Let the poller send LaunchRun and block in the bounded reply-wait.
+        std::thread::sleep(Duration::from_millis(250));
+        stop.store(true, Ordering::SeqCst);
+
+        // The poller MUST exit promptly (bounded-join to avoid hanging the suite on a regression).
+        let (done_tx, done_rx) = channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "poller exited after stop despite an un-answered reply (no deadlock)"
+        );
+
+        drop(db);
+        drop(held);
+        actor.join().unwrap();
     }
 }

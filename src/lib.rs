@@ -38,7 +38,7 @@ mod validator;
 mod validator_vault;
 mod workflow;
 
-pub use actor::RunBusy;
+pub use actor::{RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
     Application, SeedKind,

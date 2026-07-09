@@ -56,6 +56,23 @@ impl std::fmt::Display for RunBusy {
 }
 impl std::error::Error for RunBusy {}
 
+/// A NON-TERMINAL run with this id already exists — re-planning over it would reset its cursor, so the
+/// clobber guard refuses. A TYPED error (not a bare string) so callers — notably the bus bridge — can
+/// recognize this as an idempotent redelivery via `downcast_ref` instead of substring-matching the
+/// message. `.0` is the run id, `.1` its current status rendered for the operator-facing message.
+#[derive(Debug)]
+pub struct RunExists(pub String, pub String);
+impl std::fmt::Display for RunExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "run {} already exists (status {}); resume or cancel it, or use a new id",
+            self.0, self.1
+        )
+    }
+}
+impl std::error::Error for RunExists {}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
@@ -679,10 +696,7 @@ pub(crate) fn launch_run_inner(
             existing.status,
             SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
         ) {
-            anyhow::bail!(
-                "run {run_id} already exists (status {:?}); resume or cancel it, or use a new id",
-                existing.status
-            );
+            return Err(RunExists(run_id, format!("{:?}", existing.status)).into());
         }
     }
     // If the run targets a registered repo, create its isolated worktree first.
