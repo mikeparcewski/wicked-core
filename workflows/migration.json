@@ -1,0 +1,83 @@
+{
+  "id": "migration",
+  "phases": [
+    {
+      "id": "plan",
+      "kind": "recon",
+      "gate_type": "strategy",
+      "gate": {
+        "human_confirm": {
+          "unconditional": false
+        }
+      },
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [],
+      "role": "neutral",
+      "skill_ref": null
+    },
+    {
+      "id": "execute",
+      "kind": "build",
+      "gate_type": "execution",
+      "gate": "auto",
+      "executes_code": true,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "plan"
+      ],
+      "role": "creator",
+      "skill_ref": null
+    },
+    {
+      "id": "cutover",
+      "kind": "build",
+      "gate_type": "execution",
+      "gate": {
+        "human_confirm": {
+          "unconditional": true
+        }
+      },
+      "executes_code": true,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "execute"
+      ],
+      "role": "neutral",
+      "skill_ref": null
+    },
+    {
+      "id": "verify",
+      "kind": "test",
+      "gate_type": "execution",
+      "gate": {
+        "human_confirm_if": "verdict_not_pass"
+      },
+      "executes_code": false,
+      "verified_evidence": true,
+      "required_deliverables": [],
+      "depends_on": [
+        "cutover"
+      ],
+      "role": "evaluator",
+      "skill_ref": null
+    },
+    {
+      "id": "cleanup",
+      "kind": "build",
+      "gate_type": null,
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "verify"
+      ],
+      "role": "neutral",
+      "skill_ref": null
+    }
+  ]
+}

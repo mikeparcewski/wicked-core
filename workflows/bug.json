@@ -1,0 +1,61 @@
+{
+  "id": "bug",
+  "phases": [
+    {
+      "id": "triage",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [],
+      "role": "neutral",
+      "skill_ref": null
+    },
+    {
+      "id": "reproduce",
+      "kind": "test",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "triage"
+      ],
+      "role": "neutral",
+      "skill_ref": null
+    },
+    {
+      "id": "fix",
+      "kind": "build",
+      "gate_type": "execution",
+      "gate": "auto",
+      "executes_code": true,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "reproduce"
+      ],
+      "role": "creator",
+      "skill_ref": null
+    },
+    {
+      "id": "verify",
+      "kind": "test",
+      "gate_type": "execution",
+      "gate": {
+        "human_confirm_if": "verdict_not_pass"
+      },
+      "executes_code": false,
+      "verified_evidence": true,
+      "required_deliverables": [],
+      "depends_on": [
+        "fix"
+      ],
+      "role": "evaluator",
+      "skill_ref": null
+    }
+  ]
+}

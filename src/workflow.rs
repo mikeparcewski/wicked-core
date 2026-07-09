@@ -118,8 +118,10 @@ impl StepRunner for StubStepRunner {
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 use crate::domain::StageKind;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 /// Where a phase's gate sits in the value→strategy→execution ladder (DES-EXEC-001 §3; gcp-sdlc's
 /// three gate positions). `None` = an ungated (e.g. setup/advisory) phase.
@@ -175,26 +177,36 @@ pub enum PhaseRole {
 /// One ordered phase of a workflow — pure DATA the reducer dispatches on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseDef {
-    /// Phase id, unique within the workflow (referenced by `depends_on`).
+    /// Phase id, unique within the workflow (referenced by `depends_on`). The ONLY required field
+    /// in a drop-in JSON file — everything below defaults, so the minimal phase is `{"id":"x"}`.
     pub id: String,
-    /// The methodology badge (demoted from the classifier — declared, not guessed).
+    /// The methodology badge (demoted from the classifier — declared, not guessed). Default: `build`.
+    #[serde(default)]
     pub kind: StageKind,
     /// Where this phase's gate sits in the ladder (`None` = ungated).
+    #[serde(default)]
     pub gate_type: Option<GateType>,
-    /// The confirm policy for this phase's gate.
+    /// The confirm policy for this phase's gate. Default: `auto` (no human pause).
+    #[serde(default)]
     pub gate: GateSpec,
     /// Whether this phase runs code (drives worktree provisioning + code-tool mode).
+    #[serde(default)]
     pub executes_code: bool,
     /// Whether the phase verdict requires re-verified evidence (re-run the pinned verifier).
+    #[serde(default)]
     pub verified_evidence: bool,
     /// Deliverables that MUST be present for the structural gate check (fail-closed if missing).
+    #[serde(default)]
     pub required_deliverables: Vec<String>,
     /// Phase ids in the same workflow that must complete before this one (intra-workflow DAG).
+    #[serde(default)]
     pub depends_on: Vec<String>,
-    /// The evaluator≠creator role this phase plays.
+    /// The evaluator≠creator role this phase plays. Default: `neutral`.
+    #[serde(default)]
     pub role: PhaseRole,
     /// Optional skill to drive the phase (DES-EXEC-001 §4.1 — DEFERRED/spike-gated; `None` = the
     /// authored-prompt path for slice-1).
+    #[serde(default)]
     pub skill_ref: Option<String>,
 }
 
@@ -350,6 +362,48 @@ impl WorkflowRegistry {
         let mut v: Vec<String> = self.defs.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// Overlay every `*.json` workflow file in `dir` (non-recursive) onto this registry, validating
+    /// and registering each in filename order. A file whose `id` matches a built-in REPLACES it, so
+    /// operators tune the shipped workflows and add new ones by dropping a data file — no recompile,
+    /// no edit to this crate (the Law-2 seam). A missing `dir` is `Ok(vec![])` (nothing to overlay).
+    /// A malformed or invalid file is an error naming the file, so a typo fails loud, never silent.
+    /// Returns the ids loaded, in load order.
+    pub fn load_dir(&mut self, dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+        let dir = dir.as_ref();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading workflow dir {}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        paths.sort(); // deterministic load order regardless of filesystem enumeration
+        let mut loaded = Vec::new();
+        for path in paths {
+            let def = Self::def_from_file(&path)?;
+            let id = def.id.clone();
+            self.register(def)
+                .map_err(|e| anyhow::anyhow!("workflow {id} in {}: {e}", path.display()))?;
+            loaded.push(id);
+        }
+        Ok(loaded)
+    }
+
+    /// Parse + validate one [`WorkflowDef`] from a JSON file (no registration). Public so a caller
+    /// (a CLI `workflow lint`, the studio) can check a drop-in file before committing it.
+    pub fn def_from_file(path: impl AsRef<Path>) -> anyhow::Result<WorkflowDef> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading workflow file {}", path.display()))?;
+        let def: WorkflowDef = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing workflow file {}", path.display()))?;
+        def.validate()
+            .map_err(|e| anyhow::anyhow!("invalid workflow in {}: {e}", path.display()))?;
+        Ok(def)
     }
 }
 
@@ -569,5 +623,126 @@ mod workflow_def_tests {
             bad.validate(),
             Err(WorkflowDefError::UnknownDependency { .. })
         ));
+    }
+
+    // ---- data-driven registration (Law 2): a workflow is a JSON file, not a code edit ----
+
+    /// A private, collision-free scratch dir for a filesystem test (no tempfile dep; process id +
+    /// a per-test tag keep parallel tests disjoint). Best-effort cleanup on drop.
+    struct ScratchDir(std::path::PathBuf);
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("wicked-wf-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+        fn write(&self, name: &str, body: &str) {
+            std::fs::write(self.0.join(name), body).unwrap();
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "generator: run with --ignored --nocapture to (re)emit the shipped data files"]
+    fn emit_builtin_data_files() {
+        for def in [feature_def(), bug_def(), migration_def()] {
+            println!("===FILE workflows/{}.json===", def.id);
+            println!("{}", serde_json::to_string_pretty(&def).unwrap());
+        }
+    }
+
+    #[test]
+    fn shipped_data_files_match_the_seed_builders() {
+        // The `workflows/*.json` files are the human-editable, copy-paste mirror of the compiled
+        // seed builders. This guard keeps them in lock-step: if a builder changes, regenerate the
+        // files (emit_builtin_data_files) — otherwise a non-maintainer reads stale example data.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+        for def in [feature_def(), bug_def(), migration_def()] {
+            let path = root.join(format!("{}.json", def.id));
+            let from_file =
+                WorkflowRegistry::def_from_file(&path).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                from_file, def,
+                "{} data file drifted from its builder",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_builtin_def_round_trips_through_json() {
+        // The wire shape a non-maintainer authors IS the in-memory def: serialize → parse → equal.
+        // If this fails, the drop-in JSON contract drifted from the type.
+        let def = feature_def();
+        let json = serde_json::to_string_pretty(&def).unwrap();
+        let back: WorkflowDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(def, back);
+    }
+
+    #[test]
+    fn load_dir_registers_a_dropped_in_workflow_without_touching_code() {
+        // A non-maintainer's brand-new workflow, authored as pure data — no Rust, no builder fn.
+        let dir = ScratchDir::new("dropin");
+        dir.write(
+            "spike.json",
+            r#"{
+                "id": "spike",
+                "phases": [
+                    { "id": "explore", "kind": "recon" },
+                    { "id": "prototype", "kind": "build", "depends_on": ["explore"] }
+                ]
+            }"#,
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        let loaded = reg.load_dir(&dir.0).unwrap();
+        assert_eq!(loaded, vec!["spike"]);
+        let spike = reg.get("spike").expect("spike registered from data");
+        let ids: Vec<&str> = spike.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["explore", "prototype"]);
+        // built-ins still present alongside the drop-in
+        assert!(reg.get("feature").is_some());
+    }
+
+    #[test]
+    fn load_dir_lets_a_data_file_override_a_builtin() {
+        let dir = ScratchDir::new("override");
+        // Same id as a built-in, one phase — replaces the shipped feature workflow.
+        dir.write(
+            "feature.json",
+            r#"{ "id": "feature", "phases": [ { "id": "ship-it", "kind": "build" } ] }"#,
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        reg.load_dir(&dir.0).unwrap();
+        let feature = reg.get("feature").unwrap();
+        assert_eq!(feature.phases.len(), 1);
+        assert_eq!(feature.phases[0].id, "ship-it");
+    }
+
+    #[test]
+    fn load_dir_on_a_missing_dir_is_empty_not_an_error() {
+        let mut reg = WorkflowRegistry::with_defaults();
+        let loaded = reg.load_dir("/no/such/wicked/workflows/dir").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_dir_rejects_an_invalid_data_file_by_name() {
+        let dir = ScratchDir::new("invalid");
+        // Structurally parseable but semantically invalid: a self-referential dependency cycle.
+        dir.write(
+            "broken.json",
+            r#"{ "id": "broken", "phases": [ { "id": "a", "kind": "build", "depends_on": ["a"] } ] }"#,
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        let err = reg.load_dir(&dir.0).unwrap_err().to_string();
+        assert!(
+            err.contains("broken.json"),
+            "error must name the bad file: {err}"
+        );
     }
 }
