@@ -841,6 +841,9 @@ fn apply_step_result(
         return Ok(StepApplied::Stale);
     }
     let ord = unit.ord;
+    // The FINISHING unit's OWN declared gate (Copy) — captured before the mutable borrow below so a
+    // conditional human gate can be evaluated against this unit's own verdict (seam finding #3).
+    let unit_gate = unit.gate;
 
     // A worker that CANCELLED the live unit (e.g. P4a subprocess kill) terminates the run as
     // Cancelled — and clears in_flight via `Finished` (NOT `Stale`, which would wedge the run).
@@ -890,7 +893,30 @@ fn apply_step_result(
     // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit halts the run as `Failed` — never advancing
     // past a rejection into a silent `Completed`. (`apply_and_finish_unit` already emitted UnitDenied
     // + persisted the Rejected unit.)
+    //
+    // EXCEPTION — the CONDITIONAL human gate (seam finding #3): a phase declaring
+    // `HumanConfirmIf(VerdictNotPass)` ESCALATES a not-pass verdict to a HUMAN instead of hard-failing.
+    // This gate was previously UNREACHABLE — it was only ever consulted for the NEXT unit, but a deny
+    // always `fail_ran` first, so the run never advanced to check it. Evaluating it against THIS unit's
+    // own completed verdict (before `fail_run`) is what makes it fire. The cursor is left ON this unit,
+    // so a human `confirm_gate(Approve)` re-runs it and `Reject` cancels; every OTHER gate deny-dominates.
     if !outcome.approved {
+        if matches!(
+            unit_gate,
+            crate::workflow::GateSpec::HumanConfirmIf(crate::workflow::GateCond::VerdictNotPass)
+        ) {
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                format!(
+                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run"
+                ),
+            )?;
+            return Ok(StepApplied::Paused);
+        }
         return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
     }
 
@@ -939,6 +965,37 @@ fn fail_run(
     StepApplied::Finished
 }
 
+/// Pause a run for human confirmation: persist `AwaitingHuman`, emit `AwaitingHuman`, and free a
+/// campaign node's slot (deferred, non-re-entrant). Shared by the pre-unit gate ([`advance_or_pause`]),
+/// the CONDITIONAL verdict gate (seam finding #3), and the TERMINAL gate (seam finding #4) so all three
+/// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
+fn pause_for_human(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    self_tx: &Sender<Command>,
+    session: &mut crate::domain::AgentSession,
+    ord: u32,
+    prompt: String,
+) -> anyhow::Result<()> {
+    session.status = SessionStatus::AwaitingHuman;
+    put_node(store, session.to_node())?;
+    emit(
+        subscribers,
+        CoreEvent::AwaitingHuman {
+            session: session.id.clone(),
+            ord,
+            prompt: prompt.clone(),
+        },
+    );
+    // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
+    // normal command so reconciliation isn't re-entrant; a non-campaign run is a cheap no-op.
+    let _ = self_tx.send(Command::CampaignNodeAwaiting {
+        run_id: session.id.clone(),
+        prompt,
+    });
+    Ok(())
+}
+
 /// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
 /// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
@@ -954,31 +1011,40 @@ fn advance_or_pause(
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
     let Some(unit) = units.get(unit_ix) else {
+        // No unit at the cursor — the run is out of units. But the TERMINAL unit's OWN declared gate
+        // fires AFTER its work, and (unlike a mid-run phase) there is no "next unit" whose `should_pause`
+        // would honor it — so an unconditional `HumanConfirm` on the LAST phase would be SILENTLY dropped
+        // and the run would finalize `Completed` without the required human confirm (seam finding #4).
+        // Evaluate the terminal unit's own gate here: pause before finalize. The human's
+        // `confirm_gate(Approve)` then dispatches the (absent) cursor unit → `finalize_run` → Completed;
+        // `Reject` cancels. A conditional (`HumanConfirmIf`) terminal gate needs NO handling here — a
+        // not-pass terminal verdict already paused at finish (finding #3), and a pass needs no gate.
+        if let Some(term) = unit_ix.checked_sub(1).and_then(|i| units.get(i)) {
+            if matches!(term.gate, crate::workflow::GateSpec::HumanConfirm { .. }) {
+                pause_for_human(
+                    store,
+                    subscribers,
+                    self_tx,
+                    &mut session,
+                    term.ord,
+                    format!(
+                        "Approve completion after the final phase (unit {}): {}",
+                        term.ord, term.description
+                    ),
+                )?;
+                return Ok(Progress::Paused);
+            }
+        }
         return Ok(Progress::Done);
     };
 
     if should_pause(&session, &units, unit_ix) {
-        session.status = SessionStatus::AwaitingHuman;
-        put_node(store, session.to_node())?;
         let prompt = format!(
             "Approve unit {} before it runs: {}",
             unit.ord, unit.description
         );
-        emit(
-            subscribers,
-            CoreEvent::AwaitingHuman {
-                session: run_id.to_string(),
-                ord: unit.ord,
-                prompt: prompt.clone(),
-            },
-        );
-        // If this run is a campaign node, the campaign frees the node's slot for independent work
-        // (DES §6.5). Deferred to a normal command so reconciliation isn't re-entrant; a non-campaign
-        // run is a cheap no-op inverse-lookup on the other side.
-        let _ = self_tx.send(Command::CampaignNodeAwaiting {
-            run_id: run_id.to_string(),
-            prompt,
-        });
+        let ord = unit.ord;
+        pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
         return Ok(Progress::Paused);
     }
 
@@ -1061,6 +1127,15 @@ fn dispatch_unit(
             ord: unit.ord,
         },
     );
+    // §4 ARTIFACT-PASSING for the AGENT validator (seam finding #8): an Evaluator-role unit's agent
+    // judge must review the most-recent prior Creator's COLD output — the work it is evaluating — not
+    // its own output. Resolve it HERE on the actor thread (a store read); the worker holds no store
+    // handle. `None` ⇒ the agent judges the unit's own output (Neutral/Creator, or no prior creator).
+    let agent_review_target = if unit.role == crate::workflow::PhaseRole::Evaluator {
+        pipeline::creator_output_for(store, run_id, unit.ord)
+    } else {
+        None
+    };
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -1100,16 +1175,25 @@ fn dispatch_unit(
         // with no pinned validator gets `None` (no agent judgment). We skip a non-Ok step (a failed /
         // cancelled worker is handled by the actor before any gate). An authoring error fails CLOSED to
         // REJECT (deny-dominates).
-        // Only run the agent LLM for an APPROVED validator: an unapproved one makes layer-1
-        // (`run_validator`) deny at the gate anyway, so paying for a `claude -p` here would be wasted.
-        let agent_verdict = if output.status == crate::workflow::StepStatus::Ok {
+        //
+        // The WORK the agent judges is the creator's COLD output for an Evaluator-role unit
+        // (`agent_review_target`, resolved on the actor above — seam finding #8), else the unit's own
+        // output — so the evaluator's judgment gates the creator's work, matching the governance pass.
+        //
+        // COST GUARD (seam finding #11): skip the (slow, paid) `claude -p` entirely when the run has NO
+        // workdir. Layer-1 (`pinned_validator_denial`) fails CLOSED without a worktree to re-verify
+        // against, so its deny would override any agent verdict anyway — paying for the LLM is wasted.
+        let work_for_agent = agent_review_target.as_deref().unwrap_or(&output.output);
+        let agent_verdict = if output.status == crate::workflow::StepStatus::Ok
+            && input.workdir.is_some()
+        {
             input
                 .unit
                 .validator
                 .as_ref()
                 .filter(|v| v.approved)
                 .map(|v| {
-                    match crate::validator::agent_validate(&v.criterion, &output.output, &*runner) {
+                    match crate::validator::agent_validate(&v.criterion, work_for_agent, &*runner) {
                         Ok(av) => (av.pass, av.reasoning),
                         Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
                     }
@@ -1471,6 +1555,95 @@ mod gate_pause_tests {
         assert!(
             should_pause(&s, &not_passed, 1),
             "not a clean pass ⇒ pause for a human"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_gate_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+            }
+        }
+    }
+
+    fn seed_session(store: &mut SqliteStore, terminal_gate: GateSpec) {
+        let session = AgentSession {
+            id: "r".into(),
+            workflow_id: "wf-r".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 1, // cursor is PAST the single (terminal) unit — the run is out of units
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
+        let mut u = WorkUnit::pending("r:u1", "r", 1, "the final phase");
+        u.gate = terminal_gate;
+        u.status = UnitStatus::Done;
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    /// Seam finding #4: a def-declared unconditional `HumanConfirm` on the TERMINAL phase must PAUSE
+    /// before the run finalizes — it must NOT be silently dropped into a `Completed` finalize.
+    #[test]
+    fn a_terminal_humanconfirm_gate_pauses_before_finalize() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            GateSpec::HumanConfirm {
+                unconditional: true,
+            },
+        );
+        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+
+        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1).unwrap();
+        assert!(
+            matches!(progress, Progress::Paused),
+            "the terminal unit's own HumanConfirm gate must pause before finalize, got a Done finalize"
+        );
+        let session = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+    }
+
+    /// Control: an `Auto` terminal gate finalizes (no spurious pause) — the fix is scoped to the
+    /// terminal unit's OWN declared HumanConfirm gate.
+    #[test]
+    fn a_terminal_auto_gate_finalizes_without_pausing() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, GateSpec::Auto);
+        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+
+        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1).unwrap();
+        assert!(
+            matches!(progress, Progress::Done),
+            "an Auto terminal gate must finalize (Done), never pause"
         );
     }
 }

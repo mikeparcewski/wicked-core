@@ -154,7 +154,14 @@ pub enum GateSpec {
     /// No human — the computed verdict advances or rejects.
     #[default]
     Auto,
-    /// Always require a human to confirm. `unconditional` gates cannot be downgraded by the dial.
+    /// Always require a human to confirm.
+    ///
+    /// `unconditional`: RESERVED / not yet read by the engine (seam finding #10). It is the marker for
+    /// a gate the engagement dial (just-finish|balanced|ask-first) must never downgrade — e.g. the
+    /// migration `cutover`. Until the engagement dial lands, EVERY `HumanConfirm` pauses regardless of
+    /// this flag (`should_pause` / the terminal-gate check match `HumanConfirm { .. }`), so the flag is
+    /// authored-but-inert: it does NOT currently strengthen or weaken any gate. Do not mistake it for an
+    /// active control — it records intent for the dial, nothing more, today.
     HumanConfirm { unconditional: bool },
     /// Require a human only when the condition holds (else auto-advance).
     HumanConfirmIf(GateCond),

@@ -60,3 +60,21 @@ fn usage_advertises_the_validator_subcommands() {
     );
     let _ = std::fs::remove_file(&db);
 }
+
+#[test]
+fn usage_labels_launch_as_a_stub_self_test() {
+    // Seam finding #6: `launch` fabricates deterministic stub success through a gate-less path — it must
+    // be plainly LABELLED as a stub self-test in the usage, never presented as a real `run`.
+    let db = std::env::temp_dir().join(format!("wicked-cli-smoke-stub-{}.db", std::process::id()));
+    let out = Command::new(bin())
+        .args(["bogus-subcommand", "--db"])
+        .arg(&db)
+        .output()
+        .expect("run wicked-core");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("launch") && err.contains("STUB"),
+        "usage must label `launch` as a STUB self-test: {err}"
+    );
+    let _ = std::fs::remove_file(&db);
+}

@@ -8,7 +8,7 @@
 //!       [--repo <id>] [--confirm none|all|before:N] [--session <id>]
 //!   wicked-core resume --session <id>             # resume a paused/interrupted run
 //!   wicked-core cancel --session <id>             # cancel a run
-//!   wicked-core launch --problem "..."            # legacy straight-through run (no gates)
+//!   wicked-core launch --problem "..."            # STUB self-test: deterministic stub output, no real CLI, no gates
 //!   wicked-core gate-hook --scope S --phase P     # PreToolUse governance hook (claude invokes this)
 //!   wicked-core provision-validator --criterion "..."   # author a deterministic validator (UNAPPROVED)
 //!   wicked-core approve-validator --pin <pin>     # approve a vaulted validator → the pin to put in a def
@@ -152,7 +152,10 @@ fn main() {
                 repo_ref: None,
                 workflow: flag(&args, "--workflow"),
             });
-            println!("launched {sid}");
+            println!(
+                "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
+                 use `run` for a real governed run"
+            );
             drain_events(&events, None);
         }
         _ => {
@@ -160,7 +163,7 @@ fn main() {
                 "usage: wicked-core <status | repos | register-repo --path <dir> | \
                  run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] | \
                  resume --session <id> | cancel --session <id> | \
-                 launch --problem \"...\" [--workflow <id>] | \
+                 launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
                  provision-validator --criterion \"...\" | approve-validator --pin <pin>> [--db <path>]"
             );
             std::process::exit(2);

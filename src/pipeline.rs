@@ -67,6 +67,7 @@ pub fn run_session(
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
     let mut outcomes: Vec<UnitOutcome> = Vec::with_capacity(units.len());
+    let mut denied_ord: Option<u32> = None;
     for u in &mut units {
         emit(CoreEvent::UnitExecuting {
             session: session_id.to_string(),
@@ -84,16 +85,35 @@ pub fn run_session(
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             emit,
         )?;
+        let approved = outcome.approved;
+        let ord = u.ord;
         outcomes.push(outcome);
+        // RUN-LEVEL DENY CONTRACT (seam finding #1): the SYNC driver must NOT complete past a rejection.
+        // A governance/validator/evaluator DENY halts the session as `Failed` here — mirroring the
+        // interactive lane's `fail_run` and domain.rs's contract ("a Completed run means EVERY unit was
+        // approved"). Stop at the first denied unit; do not run or gate any unit after it.
+        if !approved {
+            denied_ord = Some(ord);
+            break;
+        }
     }
 
-    // ── complete. ──
-    session.status = SessionStatus::Completed;
-    session.unit_ix = units.len();
-    put_node(store, session.to_node())?;
-    emit(CoreEvent::SessionCompleted {
-        session: session_id.to_string(),
-    });
+    // ── finalize: Completed iff every unit approved; else Failed at the denied unit (finding #1). ──
+    session.unit_ix = outcomes.len();
+    if let Some(ord) = denied_ord {
+        session.status = SessionStatus::Failed;
+        put_node(store, session.to_node())?;
+        emit(CoreEvent::SessionFailed {
+            session: session_id.to_string(),
+            ord,
+        });
+    } else {
+        session.status = SessionStatus::Completed;
+        put_node(store, session.to_node())?;
+        emit(CoreEvent::SessionCompleted {
+            session: session_id.to_string(),
+        });
+    }
 
     let approved = outcomes.iter().filter(|o| o.approved).count();
     let rejected = outcomes.len() - approved;
@@ -346,68 +366,75 @@ pub(crate) fn apply_and_finish_unit(
     agent_verdict: Option<&(bool, String)>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<UnitOutcome> {
-    let mut outcome =
-        execute::apply_unit(store, unit, output, workflow_id, entity_mode, session_id)?;
+    // ── PRE-RESOLVE every deny-dominant signal BEFORE the governance gate resolves the phase, so a
+    //    deny drives the phase to Rejected and NO approved phase / work_output can leak past it (seam
+    //    finding #2 / ADR-0003). Each signal is pure + actor-safe: the deterministic re-verify runs a
+    //    fixed approved script, the agent verdict already ran OFF-THREAD (folded here), and the
+    //    evaluator≠creator pass is deterministic governance.
 
-    // evaluator≠creator: a second governance pass on approved units, distinct evaluator identity.
-    if outcome.approved {
-        let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, cli_keys);
-        let eval_at = execute::EVAL_AT_BASE + unit.ord as i64 + 1_000_000;
-        // ARTIFACT-PASSING (§4): an Evaluator-role unit reviews the COLD output of the most recent
-        // prior Creator-role unit — a real second read of the creator's work, not its own output.
-        // Neutral/Creator units keep the generic per-unit second pass. Falls back to own `output` if
-        // there's no prior creator/output (e.g. a mis-authored def), so behavior never regresses.
-        let review_output = if unit.role == crate::workflow::PhaseRole::Evaluator {
-            creator_output_for(store, session_id, unit.ord).unwrap_or_else(|| output.to_string())
-        } else {
-            output.to_string()
-        };
-        if let Ok(eval) = execute::evaluate_unit(
-            store,
-            unit,
-            &review_output,
-            &evaluator_cli,
-            &outcome.collection_scope,
-            &format!("unit-{}", unit.ord),
-            eval_at,
-        ) {
-            outcome.evaluator_claim_id = Some(eval.claim_id);
-        }
-    }
+    // (layer-1) PINNED VALIDATOR — the rev0.4 deterministic re-verify against the run's worktree. A
+    // FAIL — OR the ABSENCE of a worktree (fail-closed, so the agent LLM can never lone-approve a pinned
+    // phase) — denies. Pure, no LLM.
+    let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
+    let det_denial = pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new));
 
-    // PINNED VALIDATOR — the rev0.4 deterministic gate re-verify (layer-1), deny-dominates. If the unit
-    // carries an APPROVED validator, re-verify it against the run's worktree; a FAIL — OR the ABSENCE of
-    // a worktree to re-verify against (fail-closed, so the agent LLM can never lone-approve a pinned
-    // phase) — flips the verdict to denied BEFORE the status is persisted. Pure re-verify — no LLM here,
-    // so it is safe on the single-writer actor thread. (The agent-validator half is an LLM and folds
-    // just below, layer-2.)
-    if outcome.approved {
-        let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
-        if let Some(reason) =
-            pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new))
-        {
-            outcome.approved = false;
-            outcome.denial_reason = Some(reason);
-        }
-    }
+    // (layer-2) AGENT VALIDATOR — fold the OFF-THREAD semantic verdict (actor::dispatch_unit's closure
+    // ran `claude -p`; here we only interpret its `(pass, reasoning)` via `combine_verdict`). An agent
+    // REJECT denies; the agent can never be the SOLE approver. `None` ⇒ no pinned validator.
+    let agent_denial = agent_verdict_denial(agent_verdict);
 
-    // AGENT VALIDATOR — the rev0.4 dual-validator LAYER-2 (semantic judge), deny-dominates. The verdict
-    // was computed OFF-THREAD by the worker (actor::dispatch_unit's closure), because `agent_validate`
-    // runs `claude -p` and must never touch the single-writer actor thread; here we only FOLD the
-    // already-computed verdict — pure, no LLM, actor-safe. Reached only when the unit still holds (it
-    // passed the deterministic layer-1 above), so `combine_verdict` is applied with the deterministic
-    // side PASS; an agent REJECT flips the unit to denied BEFORE the status is persisted, mirroring the
-    // deterministic `pinned_validator_denial`. Both layers must pass, and `combine_verdict` guarantees
-    // the agent can never be the SOLE approver. `None` ⇒ no pinned validator (structural phase) ⇒ no
-    // change. The criterion is the pinned validator's (chosen in dispatch_unit) — so an Evaluator/
-    // verified phase is judged against the same acceptance criterion it is deterministically re-verified
-    // against.
-    if outcome.approved {
-        if let Some(reason) = agent_verdict_denial(agent_verdict) {
-            outcome.approved = false;
-            outcome.denial_reason = Some(reason);
-        }
-    }
+    // (evaluator≠creator) a SECOND governance pass with a DISTINCT evaluator identity whose verdict now
+    // GATES (finding #9 — previously discarded). For an Evaluator-role unit it reviews the COLD output
+    // of the most recent prior Creator (real artifact-passing, finding #8 on the governance claim);
+    // Neutral/Creator units keep the generic per-unit second pass. Falls back to own `output` when there
+    // is no prior creator/output, so behavior never regresses. Deterministic governance — actor-safe.
+    let assigned_cli = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    let collection_scope = resolve_scope(entity_mode, session_id, &unit.id);
+    let evaluator_cli = next_cli_in_roster(&assigned_cli, cli_keys);
+    let eval_at = execute::EVAL_AT_BASE + unit.ord as i64 + 1_000_000;
+    let review_output = if unit.role == crate::workflow::PhaseRole::Evaluator {
+        creator_output_for(store, session_id, unit.ord).unwrap_or_else(|| output.to_string())
+    } else {
+        output.to_string()
+    };
+    let eval = execute::evaluate_unit(
+        store,
+        unit,
+        &review_output,
+        &evaluator_cli,
+        &collection_scope,
+        &format!("unit-{}", unit.ord),
+        eval_at,
+    )
+    .ok();
+    let evaluator_claim_id = eval.as_ref().map(|e| e.claim_id.clone());
+    let evaluator_denial = eval.as_ref().and_then(|e| {
+        (!e.approved).then(|| {
+            format!(
+                "evaluator ({evaluator_cli}) rejected unit {} (evaluator≠creator second pass, decision={})",
+                unit.ord, e.decision
+            )
+        })
+    });
+
+    // DENY-DOMINATES ordering: deterministic re-verify, then agent judge, then the evaluator pass.
+    let validator_denial = det_denial.or(agent_denial).or(evaluator_denial);
+
+    // Resolve the governance gate WITH the pre-computed deny folded in: a validator/evaluator deny
+    // drives the phase Rejected + suppresses the work_output write (see `execute::apply_unit`).
+    let mut outcome = execute::apply_unit(
+        store,
+        unit,
+        output,
+        workflow_id,
+        entity_mode,
+        session_id,
+        validator_denial,
+    )?;
+    outcome.evaluator_claim_id = evaluator_claim_id;
 
     wicked_orchestration::tick_workflow(store, workflow_id, outcome.approved)?;
 
@@ -500,7 +527,9 @@ fn agent_verdict_denial(agent: Option<&(bool, String)>) -> Option<String> {
 
 /// The cold artifact an Evaluator-role unit reviews (rev0.4 §4 artifact-passing): the work-output of
 /// the most recent prior Creator-role unit. `None` if there is no prior Creator or it has no output.
-fn creator_output_for(
+/// `pub(crate)` so the actor's off-thread agent-validator path (dispatch_unit) can judge the SAME cold
+/// creator output the governance evaluator pass reads (seam finding #8).
+pub(crate) fn creator_output_for(
     store: &wicked_apps_core::SqliteStore,
     session_id: &str,
     evaluator_ord: u32,
@@ -819,5 +848,42 @@ mod resolve_tests {
         assert_eq!(most_recent_prior_creator(&units, 3).unwrap().ord, 2);
         // no creator before ord 2 ⇒ None (the evaluator falls back to its own output)
         assert!(most_recent_prior_creator(&units, 2).is_none());
+    }
+
+    #[test]
+    fn creator_output_for_reads_the_prior_creators_cold_output_from_the_store() {
+        // Seam finding #8: the artifact an Evaluator judges is the most-recent prior Creator's COLD
+        // stored output — the SAME source both the governance evaluator pass and (now) the off-thread
+        // agent validator read. Persist a Creator unit + run its gate so its work_output is stored,
+        // then assert an evaluator at a later ord resolves that exact output.
+        use crate::domain::{put_node, WorkUnit};
+        use crate::workflow::PhaseRole;
+        use wicked_apps_core::{open_store, ToNode};
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut creator = WorkUnit::pending("s:u1", "s", 1, "build it");
+        creator.role = PhaseRole::Creator;
+        creator.assigned_cli = Some("claude".into());
+        put_node(&mut store, creator.to_node()).unwrap();
+        // Run the creator's gate (governance allows) so its cold output is persisted as work_output.
+        crate::execute::apply_unit(
+            &mut store,
+            &creator,
+            "CREATOR-COLD-OUTPUT",
+            "wf-s",
+            EntityMode::Shared,
+            "s",
+            None,
+        )
+        .unwrap();
+
+        // An evaluator at ord 2 resolves the creator's cold output (not its own).
+        assert_eq!(
+            creator_output_for(&store, "s", 2).as_deref(),
+            Some("CREATOR-COLD-OUTPUT"),
+            "the evaluator's artifact is the prior creator's cold stored output"
+        );
+        // No prior creator before ord 1 ⇒ None (the caller falls back to the unit's own output).
+        assert!(creator_output_for(&store, "s", 1).is_none());
     }
 }
