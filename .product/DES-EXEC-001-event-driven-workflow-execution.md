@@ -355,6 +355,23 @@ payload, UNIQUE `idempotency_key` dedup, cursor-poll, at-least-once). wicked-cor
 hot path. The in-process `CoreEvent` broadcast stays as the low-latency studio feed; bus is the
 durable, ecosystem-wide, multi-subscriber substrate.
 
+**VERIFIED working end-to-end (2026-07-09, runnable smoke on wicked-bus v2.2.3).** Both crew seams
+round-tripped through the real bus: `wicked.run.requested {workflow, problem, args}` (emit → reducer
+subscribes `wicked.run.*` → poll → nested args survive → ack) and `wicked.skill.needed → wicked.skill.ready`
+(provisioner sidecar polls needed → emits ready → a reducer cursor scoped to `.ready` polls only that;
+`run_id` correlation survives the chain). The substrate needs **zero new infrastructure**.
+- **Real library API** (the wicked-bus README's programmatic example is STALE): `emit(db, config,
+  {event_type, domain, subdomain, payload})`; `register(db, {plugin, role:'subscriber', filter,
+  cursor_init})` → `{cursor_id}`; `poll(db, cursorId, {batchSize})` → **array of raw rows** (payload is a
+  JSON string — `JSON.parse` it); `ack(db, cursorId, lastEventId)`. Isolate with `WICKED_BUS_DATA_DIR`.
+- **Sidecars = application logic, NOT bus gaps.** The reducer + skill-provisioner are each a persistent
+  `poll → handle → ack` loop (poll is one-shot; a daemon-push path exists but falls back to poll) with:
+  persisted `cursor_id` across restarts (else `latest` skips backlog, `oldest` risks
+  `CURSOR_BEHIND_TTL_WINDOW` past the 72h sweep); **idempotent handlers** (at-least-once re-delivers on a
+  crash between handle and ack); a payload **correlation-id** convention for `needed→ready` matching (+ a
+  `wicked.skill.refresh` timeout/retry); and precise filters (`wicked.skill.*` catches both `needed` and
+  `ready`, so a subscriber must not consume its own emissions). See brain `bus-seam-verified-working`.
+
 ---
 
 ## 3. Gates, evidence, evaluator≠creator (make the fakes real)
