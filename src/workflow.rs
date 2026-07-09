@@ -207,10 +207,15 @@ pub struct PhaseDef {
     /// The evaluator≠creator role this phase plays. Default: `neutral`.
     #[serde(default)]
     pub role: PhaseRole,
-    /// Optional skill to drive the phase (DES-EXEC-001 §4.1 — DEFERRED/spike-gated; `None` = the
-    /// authored-prompt path for slice-1).
+    /// Optional skill to drive the phase (DES-EXEC-001 §4.1 — the headless `/wicked-testing-<skill>`
+    /// invocation). `None` = the authored-prompt path.
     #[serde(default)]
     pub skill_ref: Option<String>,
+    /// The runtime skill ALLOWLIST for this phase's agent (DES-EXEC-001 §4.2) — the set of skills the
+    /// invocation may load, passed as its tool/skill scope (the `--allowedTools` analog). Empty ⇒ no
+    /// extra scoping beyond `skill_ref`. Least-privilege per phase, and pure DATA.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
 }
 
 impl PhaseDef {
@@ -227,6 +232,7 @@ impl PhaseDef {
             depends_on: Vec::new(),
             role: PhaseRole::Neutral,
             skill_ref: None,
+            allowed_skills: Vec::new(),
         }
     }
     fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {
@@ -248,6 +254,12 @@ impl PhaseDef {
     }
     fn after(mut self, dep: &str) -> Self {
         self.depends_on.push(dep.to_string());
+        self
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn skill(mut self, skill_ref: &str, allowed: &[&str]) -> Self {
+        self.skill_ref = Some(skill_ref.to_string());
+        self.allowed_skills = allowed.iter().map(|s| s.to_string()).collect();
         self
     }
 }
@@ -654,6 +666,34 @@ mod workflow_def_tests {
             selfdep.validate(),
             Err(WorkflowDefError::ForwardDependency { .. })
         ));
+    }
+
+    #[test]
+    fn plan_from_def_carries_skill_and_allowlist_onto_units() {
+        // §4.1/§4.2: a phase's skill_ref + runtime allowlist ride onto its unit so the runner invokes
+        // the right skill under least-privilege. A phase without a skill leaves both empty (authored path).
+        let def = WorkflowDef {
+            id: "skilled".to_string(),
+            phases: vec![
+                PhaseDef::new("build", StageKind::Build)
+                    .skill("wicked-testing-execution", &["wicked-testing-authoring"]),
+                PhaseDef::new("review", StageKind::Review).after("build"),
+            ],
+        };
+        let units = crate::plan::plan_from_def(&def, "do it", "s");
+        assert_eq!(
+            units[0].skill_ref.as_deref(),
+            Some("wicked-testing-execution")
+        );
+        assert_eq!(
+            units[0].allowed_skills,
+            vec!["wicked-testing-authoring".to_string()]
+        );
+        assert!(
+            units[1].skill_ref.is_none(),
+            "unskilled phase ⇒ authored path"
+        );
+        assert!(units[1].allowed_skills.is_empty());
     }
 
     #[test]

@@ -11,7 +11,8 @@
       "required_deliverables": [],
       "depends_on": [],
       "role": "neutral",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "reproduce",
@@ -25,7 +26,8 @@
         "triage"
       ],
       "role": "neutral",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "fix",
@@ -39,7 +41,8 @@
         "reproduce"
       ],
       "role": "creator",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "verify",
@@ -55,7 +58,8 @@
         "fix"
       ],
       "role": "evaluator",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     }
   ]
 }

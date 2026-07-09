@@ -161,6 +161,15 @@ pub struct WorkUnit {
     /// The collection scope this unit's output is written to.
     #[serde(default)]
     pub collection_scope: Option<String>,
+    /// The skill that drives this unit's work (DES-EXEC-001 §4.1) — carried from the backing phase's
+    /// `skill_ref` at plan time (def-driven runs). `None` ⇒ the authored-prompt path. `#[serde(default)]`
+    /// for back-compat with units persisted before the skills seam.
+    #[serde(default)]
+    pub skill_ref: Option<String>,
+    /// The runtime skill ALLOWLIST for this unit's agent (DES-EXEC-001 §4.2) — carried from the phase's
+    /// `allowed_skills`. The runner passes it as the invocation's skill/tool scope. Empty ⇒ unscoped.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -282,6 +291,8 @@ impl WorkUnit {
             conformance_ref: None,
             phase_status: None,
             collection_scope: None,
+            skill_ref: None,
+            allowed_skills: Vec::new(),
             status: UnitStatus::Pending,
         }
     }

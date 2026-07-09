@@ -73,6 +73,10 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // lives in the unit id (`<session>:<phase_id>`) — we do NOT touch `phase_ref`, which the
             // execute path owns (it records the orchestration phase, set at execute time).
             unit.stage = phase.kind;
+            // Carry the phase's skill + runtime allowlist (DES-EXEC-001 §4.1/§4.2) onto the unit so the
+            // step runner invokes the right skill under least-privilege — pure data from the def.
+            unit.skill_ref = phase.skill_ref.clone();
+            unit.allowed_skills = phase.allowed_skills.clone();
             unit
         })
         .collect()

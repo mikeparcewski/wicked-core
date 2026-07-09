@@ -15,7 +15,8 @@
       "required_deliverables": [],
       "depends_on": [],
       "role": "neutral",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "design",
@@ -29,7 +30,8 @@
         "clarify"
       ],
       "role": "neutral",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "build",
@@ -43,7 +45,8 @@
         "design"
       ],
       "role": "creator",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "adversarial-review",
@@ -61,7 +64,8 @@
         "build"
       ],
       "role": "evaluator",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "test",
@@ -77,7 +81,8 @@
         "build"
       ],
       "role": "neutral",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     },
     {
       "id": "review",
@@ -91,7 +96,8 @@
         "test"
       ],
       "role": "neutral",
-      "skill_ref": null
+      "skill_ref": null,
+      "allowed_skills": []
     }
   ]
 }

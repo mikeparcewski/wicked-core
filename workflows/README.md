@@ -50,7 +50,8 @@ Only `id` is required on a phase — everything else defaults:
 | `required_deliverables` | `[]` | Files that MUST exist for the structural gate (fail-closed if missing). |
 | `depends_on` | `[]` | Phase ids that must finish first (intra-workflow DAG; validated acyclic). |
 | `role` | `"neutral"` | `creator` (does the work) \| `evaluator` (reviews a creator's output cold) \| `neutral`. |
-| `skill_ref` | `null` | Skill that drives the phase (e.g. `wicked-testing-semantic-reviewer`). |
+| `skill_ref` | `null` | Skill that drives the phase, headless (e.g. `wicked-testing-semantic-reviewer`). |
+| `allowed_skills` | `[]` | Runtime skill allowlist for the phase's agent — the tool/skill scope it may load (least-privilege, like `--allowedTools`). |
 
 ## Gate policies (`gate`)
 

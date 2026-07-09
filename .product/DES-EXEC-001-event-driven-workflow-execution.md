@@ -127,6 +127,42 @@ build/design skills → bridge the evidence format for enforced reviewer isolati
 
 ---
 
+## Revision 0.5 — resolved design tensions (agent critique + operator answers, 2026-07-09)
+
+An agent-perspective critique raised seven risks; the operator resolved each. Recorded so they are not
+relitigated — these are decisions, not open questions.
+
+1. **Verification vs. validation (ship-the-wrong-thing).** Resolved: the **agent validator** (semantic
+   review, §rev0.4 pair) IS the intent-fitness gate — conformance (deterministic) + fitness (agent) are
+   the two pieces on purpose. Refinement kept: at least one seat is prompted to check against the
+   *original intent*, and to surface what the spec left **unspecified** (guards shared-omission).
+2. **"Fixed DAG = waterfall."** Rejected: phases are the **control plane** (failure paths, fan-outs,
+   re-entry, Campaign spawns — as ciq/gcp-sdlc already do), and the **execution mechanism inside a phase
+   is judgment**, not a script. The DAG gives control flow; agents exercise judgment within it. Loopiness
+   lives in the event flows, not in a rigid sequence.
+3. **"Same-model seats aren't independent."** Rejected: independence comes from **context + framing**
+   (like two humans working from different information), not just model weights — the reviewer's
+   cold-evidence isolation is the mechanism; multi-CLI is an added strength. The question and context a
+   seat is given drives divergence.
+4. **"Who approves the validators?"** = **council territory.** Diverse seats decide (not a lone agent →
+   no self-grade; not a forced human → no bottleneck), with human escalation above a threshold (see 6).
+5. **"'Deterministic' is overclaimed."** Clarified: the deterministic validator asserts **any validatable
+   artifact shape** — doc sections present, config keys, code shape, file/content patterns — not just
+   "tests pass." That class genuinely is deterministic.
+6. **"No rigor/cost dial."** Resolved: the **council determines the orchestration path** — it may assign
+   to a CLI and act as the HITL itself via events, bubbling to a **real human only above a threshold**.
+   The dial is the council's routing judgment, not a static config.
+7. **"Event purity is dogma."** Rejected: events enable **sidecars** — standard event types subscribed
+   for audit, extra processing, provisioning — attaching to workflows without touching them. That
+   extensibility is the point.
+
+**Trust model (name it, don't overclaim):** diverse-seat **agent consensus**, on a **deterministic
+structural floor**, with **human escalation above a threshold**. The floor covers structural/factual
+claims; meets-intent / design-sound rest on consensus. A green run means "diverse seats + the escalation
+policy agreed," **not** "proven." Calibrate trust to that.
+
+---
+
 ## Revision 0.4 — generated, grounded evidence-validators as the gate (operator direction, 2026-07-09)
 
 **Supersedes §3 layer-1.** The deterministic gate check is NOT a generic precanned verifier chosen
