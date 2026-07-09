@@ -20,8 +20,9 @@ pub struct DeterministicValidator {
 }
 
 /// Author a deterministic validator for `criterion` by invoking the `acceptance-test-writer` skill
-/// through `runner` (the live headless recipe). The skill returns a shell check; code fences are
-/// stripped. Errors if authoring fails or produces an empty script.
+/// through `runner` (the live headless recipe). The skill returns a shell check, often wrapped in
+/// explanation despite instructions; [`extract_shell_command`] pulls out the bare command. Errors if
+/// authoring fails or produces an empty script.
 pub fn author_deterministic_validator(
     criterion: &str,
     runner: &dyn StepRunner,
@@ -52,7 +53,7 @@ pub fn author_deterministic_validator(
             out.output
         );
     }
-    let script = strip_fences(&out.output);
+    let script = extract_shell_command(&out.output);
     if script.is_empty() {
         anyhow::bail!("validator authoring produced an empty script");
     }
@@ -62,15 +63,67 @@ pub fn author_deterministic_validator(
     })
 }
 
-/// Strip Markdown code fences + surrounding whitespace, returning the inner command(s). LLMs often
-/// wrap a shell answer in ``` fences despite instructions; the pinned artifact should be the raw check.
-fn strip_fences(raw: &str) -> String {
-    raw.lines()
-        .filter(|l| !l.trim_start().starts_with("```"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+/// Extract the single shell command from a writer response that — despite "no prose" instructions —
+/// often wraps the command in explanation ("Here's the check:\n\ntest -f x ...", or a trailing note).
+/// `strip_fences` alone would leave those prose lines in the script, and `sh -c` would run them (a
+/// spurious "command not found" that only doesn't fail the check when the real command happens to land
+/// last). This picks the actual command deterministically: among the non-empty, non-fence lines, the
+/// LAST one that looks like a shell command (so both a preamble and a trailing note are discarded),
+/// falling back to the last non-empty line. A leaked language marker (`bash …`) is then stripped.
+fn extract_shell_command(raw: &str) -> String {
+    let lines: Vec<&str> = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("```"))
+        .collect();
+    let chosen = lines
+        .iter()
+        .rev()
+        .find(|l| looks_like_shell_command(l))
+        .or_else(|| lines.last())
+        .copied()
+        .unwrap_or("");
+    strip_shell_lang_prefix(chosen)
+}
+
+/// Heuristic: does this line read as a shell command (vs. an English explanation)? True when it opens
+/// with a common check command, a `[`/`[[` test, or contains a shell operator (`&&`/`||`/redirect).
+/// Intentionally conservative — it only has to beat prose lines from the same response.
+fn looks_like_shell_command(line: &str) -> bool {
+    const CMDS: &[&str] = &[
+        "test", "grep", "ls", "cat", "find", "stat", "head", "tail", "awk", "sed", "wc", "diff",
+        "cmp", "bash", "sh", "[", "[[", "!",
+    ];
+    let first = line.split_whitespace().next().unwrap_or("");
+    CMDS.contains(&first) || first.starts_with('[') || line.contains("&&") || line.contains("||")
+}
+
+/// Strip a single leaked shell-language marker from the front of an authored command. LLMs sometimes
+/// answer with a code-fence *info string* inlined onto the command itself (e.g. `bash test -f x`)
+/// instead of only on a ``` fence line; `strip_fences` can't see that, so `sh -c` would then run
+/// `bash` with `test` as a *script path* (→ "cannot execute binary file") and the check spuriously
+/// fails. Conservative: only known markers, and never when a flag follows (so a real `sh -c '…'` /
+/// `bash -c '…'` command is left intact).
+fn strip_shell_lang_prefix(s: &str) -> String {
+    const MARKERS: &[&str] = &[
+        "bash",
+        "sh",
+        "shell",
+        "zsh",
+        "shellscript",
+        "console",
+        "posix",
+    ];
+    if let Some((first, rest)) = s.split_once(char::is_whitespace) {
+        let rest = rest.trim_start();
+        if MARKERS.contains(&first.to_ascii_lowercase().as_str())
+            && !rest.is_empty()
+            && !rest.starts_with('-')
+        {
+            return rest.to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// The deterministic RE-VERIFY: run the (approved, pinned) validator's script in `cwd`; `true` iff it
@@ -173,6 +226,30 @@ pub fn combine_verdict(deterministic_pass: bool, agent: Option<&AgentVerdict>) -
     }
 }
 
+/// Gate a phase with the full rev0.4 dual validator, composed: author + re-verify the DETERMINISTIC
+/// check against `cwd` (the phase's artifacts/worktree) AND run the AGENT judge over `work` (the phase
+/// output text), combined by [`combine_verdict`]. This is the single "gate this phase" entry point.
+///
+/// NOTE: this authors the deterministic validator fresh each call. The full flow PINS an approved
+/// validator (author once → approve → re-verify many) — pinning + vault storage is the integration
+/// step. `deterministic_only` skips the agent (structural phases).
+pub fn gate_phase(
+    criterion: &str,
+    work: &str,
+    cwd: &std::path::Path,
+    deterministic_only: bool,
+    runner: &dyn StepRunner,
+) -> anyhow::Result<GateVerdict> {
+    let det = author_deterministic_validator(criterion, runner)?;
+    let det_pass = run_validator(&det, cwd);
+    let agent = if deterministic_only {
+        None
+    } else {
+        Some(agent_validate(criterion, work, runner)?)
+    };
+    Ok(combine_verdict(det_pass, agent.as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,13 +297,52 @@ mod tests {
     }
 
     #[test]
-    fn strip_fences_unwraps_a_fenced_command() {
+    fn extract_shell_command_pulls_the_command_out_of_prose() {
+        // Bare command.
         assert_eq!(
-            strip_fences("```sh\ntest -f README.md\n```"),
-            "test -f README.md"
+            extract_shell_command("test -f greeting.txt && grep -qF 'hello world' greeting.txt"),
+            "test -f greeting.txt && grep -qF 'hello world' greeting.txt"
         );
-        assert_eq!(strip_fences("  test -f x  "), "test -f x");
-        assert_eq!(strip_fences("```\na\nb\n```"), "a\nb");
+        // Leaked code-fence info string inlined as a prefix (the observed `/bin/test` failure).
+        assert_eq!(
+            extract_shell_command("bash test -f greeting.txt && grep -qF 'hi' greeting.txt"),
+            "test -f greeting.txt && grep -qF 'hi' greeting.txt"
+        );
+        // Preamble prose THEN the command (observed live).
+        assert_eq!(
+            extract_shell_command(
+                "Only the exact command, per the instructions:\n\ntest -f x && grep -q y x"
+            ),
+            "test -f x && grep -q y x"
+        );
+        // Command THEN a trailing note — the command-ish line still wins over the note.
+        assert_eq!(
+            extract_shell_command(
+                "grep -q '## Status' README.md\n\nThis checks the status section."
+            ),
+            "grep -q '## Status' README.md"
+        );
+        // Fenced with a language tag and prose around it.
+        assert_eq!(
+            extract_shell_command("Here is the check:\n```bash\ntest -f a.txt\n```"),
+            "test -f a.txt"
+        );
+    }
+
+    #[test]
+    fn strip_shell_lang_prefix_leaves_real_flagged_commands_intact() {
+        // A genuine `sh -c` / `bash -c` command must NOT be mangled.
+        assert_eq!(
+            strip_shell_lang_prefix("sh -c 'test -f x'"),
+            "sh -c 'test -f x'"
+        );
+        assert_eq!(
+            strip_shell_lang_prefix("bash -c 'grep y x'"),
+            "bash -c 'grep y x'"
+        );
+        // But a leaked language marker is dropped.
+        assert_eq!(strip_shell_lang_prefix("bash test -f x"), "test -f x");
+        assert_eq!(strip_shell_lang_prefix("test -f x"), "test -f x");
     }
 
     #[test]

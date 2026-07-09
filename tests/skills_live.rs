@@ -113,3 +113,50 @@ fn dual_validator_gate_approves_good_work_and_rejects_bad() {
     );
     assert_eq!(combine_verdict(true, Some(&bad)), GateVerdict::Reject);
 }
+
+/// LIVE composed gate (rev0.4): gate_phase runs the deterministic check against the worktree AND the
+/// agent judge over the work, combined. A phase whose artifacts + output satisfy the criterion Approves;
+/// a phase whose artifacts do NOT satisfy it Rejects — proving both directions through gate_phase itself.
+///
+/// The criterion is deliberately CONTENT-framed ("the deliverable greeting.txt contains the text …")
+/// rather than existence-framed ("a file … exists in the current directory"). The two gate halves see
+/// different worlds: the deterministic check runs in `dir` (which has the artifact), but the agent
+/// reviewer runs live `claude` in ITS OWN cwd with tool access — an "exists in the cwd" criterion makes
+/// it search its (empty) cwd, find nothing, and REJECT a phase that is actually satisfied. Content
+/// framing lets the reviewer judge the supplied `work` on its merits while the deterministic half owns
+/// the filesystem existence check in `dir`. See root-cause note in the commit that added this.
+#[test]
+#[ignore = "requires real `claude` on PATH + installed wicked-testing skills; run with --ignored"]
+fn gate_phase_approves_a_satisfying_phase_end_to_end() {
+    use wicked_core::{gate_phase, GateVerdict};
+    let runner = WrappedCliStepRunner::default();
+    let criterion = "the deliverable greeting.txt contains the text 'hello world'";
+    let work =
+        "The full content of the delivered greeting.txt file is the single line:\nhello world";
+
+    // Satisfying phase: artifact present with the right content ⇒ deterministic PASS; the content-framed
+    // work satisfies the reviewer ⇒ agent not-REJECT ⇒ Approve.
+    let good = std::env::temp_dir().join(format!("wicked-gate-live-good-{}", std::process::id()));
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::write(good.join("greeting.txt"), "hello world\n").unwrap();
+    let verdict = gate_phase(criterion, work, &good, false, &runner).expect("gate_phase good");
+    assert_eq!(
+        verdict,
+        GateVerdict::Approve,
+        "artifacts + output satisfy the criterion"
+    );
+    let _ = std::fs::remove_dir_all(&good);
+
+    // Non-satisfying phase: artifact has the WRONG content ⇒ deterministic FAIL dominates ⇒ Reject,
+    // regardless of the agent. Proves the composed gate does not rubber-stamp.
+    let bad = std::env::temp_dir().join(format!("wicked-gate-live-bad-{}", std::process::id()));
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("greeting.txt"), "goodbye\n").unwrap();
+    let verdict = gate_phase(criterion, work, &bad, false, &runner).expect("gate_phase bad");
+    assert_eq!(
+        verdict,
+        GateVerdict::Reject,
+        "artifacts do not satisfy the criterion ⇒ deterministic fail ⇒ Reject"
+    );
+    let _ = std::fs::remove_dir_all(&bad);
+}
