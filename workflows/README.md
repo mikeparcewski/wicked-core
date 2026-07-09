@@ -52,6 +52,18 @@ Only `id` is required on a phase — everything else defaults:
 | `role` | `"neutral"` | `creator` (does the work) \| `evaluator` (reviews a creator's output cold) \| `neutral`. |
 | `skill_ref` | `null` | Skill that drives the phase, headless (e.g. `wicked-testing-semantic-reviewer`). |
 | `allowed_skills` | `[]` | Runtime skill allowlist for the phase's agent — the tool/skill scope it may load (least-privilege, like `--allowedTools`). |
+| `validator_pin` | `null` | Content-hash pin of an **approved** deterministic validator in the vault. When set, the run loads it at plan time and the dual-validator gate re-verifies the phase's work against the worktree (deny-dominates). See *Gating a phase* below. |
+
+## Gating a phase (validator_pin)
+
+The built-in defs ship `validator_pin: null` — **ungated**. To gate a phase, author + approve a validator, then reference its pin:
+
+```
+wicked-core provision-validator --criterion "the CHANGELOG has a new dated entry"   # → an UNAPPROVED pin
+wicked-core approve-validator   --pin <that pin>                                     # → the APPROVED pin
+```
+
+Put the **approved** pin on the phase (`"validator_pin": "<approved pin>"`). At runtime the gate loads it from the vault and re-verifies it against the run's worktree (deterministic, deny-dominates) alongside the agent judge. A pin that isn't in the vault, or isn't approved, **fails closed** at plan time (the run won't proceed ungated).
 
 ## Gate policies (`gate`)
 
