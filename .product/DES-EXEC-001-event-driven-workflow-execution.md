@@ -127,6 +127,55 @@ build/design skills → bridge the evidence format for enforced reviewer isolati
 
 ---
 
+## Revision 0.4 — generated, grounded evidence-validators as the gate (operator direction, 2026-07-09)
+
+**Supersedes §3 layer-1.** The deterministic gate check is NOT a generic precanned verifier chosen
+from a closed enum. It is a **grounded, deterministic validation script authored by a test-strategy
+agent for that specific phase/task**, stored in the vault as the phase/task's **evidence evaluator**,
+versioned and **approved**. When the spec changes, the agent regenerates the validator and the update
+goes through approval — validation always tracks the spec; a stale validator can never silently pass
+work. This operates at **phase level, task level, or anything between**.
+
+Why this is strictly stronger than the old ladder-1:
+- **evaluator≠creator becomes deterministic + auditable.** The old evaluator was a second LLM pass you
+  had to trust per run. Here the LLM authors the check **once**, grounded + reviewed; the gate then
+  **re-runs the exact pinned script**. Judgment lives in a reviewed artifact, not a per-run vibe. The
+  "no `llm_eval` at gate time" invariant is preserved — the LLM is offline (authoring), never at the
+  gate.
+- **Resolves review finding #3 (closed-enum capability leak).** `GateCond`/`GateType` need not enumerate
+  every condition (threshold, cannot-reproduce, "no P0 open"). The condition logic lives **in the
+  generated validator**, which returns a structured verdict the gate consumes. New condition = new
+  generated script (data/artifact), never a core enum edit. This retires the 6-kind closed verifier
+  set from old §3.
+- **Layer-2 (structural deliverables) largely collapses in** — the validator asserts its own required
+  artifacts. **Layer-3 (governance deny-dominates) unchanged.** Verdict still `= f(deterministic,
+  governance)` only; the engagement dial still selects WHO confirms, never the verdict.
+
+Mechanism (decisions committed 2026-07-09; forks flagged for operator veto):
+- **Authoring:** the wicked-testing `test-strategist` / `acceptance-test-writer` skill, invoked via the
+  verified headless recipe (`claude -p "/wicked-testing-<skill> …" --output-format json`, one isolated
+  process per reviewer — see brain memory `headless-skill-invocation-recipe`). Grounded with the
+  phase/task spec artifacts (clarify/design outputs + ACs) as input.
+- **Validator form (fork 1):** a wicked-testing **acceptance scenario/plan** (reuses the existing
+  executor + isolated reviewer + evidence-vault format) for outcome checks, with a plain deterministic
+  script escape hatch for non-test assertions. Not a bare bash blob.
+- **Vault (fork 2):** **wicked-estate** holds the *approved validator artifact + pin* (content-addressed,
+  injected `phase→validator` edge, durable); `.wicked-testing/evidence/<run>/` holds each run's
+  *execution evidence*. Estate = source of truth, testing = run log.
+- **Approval + change control (fork 3):** a regenerated validator is **diffed against the pinned one and
+  re-approved** (the same evaluator≠creator + human-confirm-on-change any deliverable gets) before it can
+  gate again.
+- **Data:** `PhaseDef` (and optionally `WorkUnit`) gain a `validator_ref` — a **content-hash pin** so the
+  gate runs the *exact* approved script. `skill_ref` names the **authoring** agent, not the check.
+- **Event-driven fit:** authoring the validator is itself a phase/task emitting events; "validator
+  approved" is gate **state + notification** (not request/reply); running it at the gate is the
+  deterministic re-verify. All consistent with Law 1.
+
+This makes "gate wiring" = building this validator-authoring + pin + re-verify mechanism. The
+`WorkflowDef`→runtime plumbing (plan_from_def driving the reducer) is orthogonal and lands underneath it.
+
+---
+
 ## 0. The two laws (do not violate)
 
 1. **Event-driven.** No component calls another. Everything publishes/subscribes on the bus. The
