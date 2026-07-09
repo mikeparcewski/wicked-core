@@ -217,6 +217,15 @@ Mechanism (decisions committed 2026-07-09; forks flagged for operator veto):
   (reuses the existing executor + isolated reviewer + evidence-vault format), with a plain deterministic
   script escape hatch for non-test assertions; the agent piece is a grounded reviewer prompt/skill. Not a
   bare bash blob.
+  - **BUILT + live-verified (2026-07-09, `src/validator.rs`):** `author_deterministic_validator` invokes
+    the `acceptance-test-writer` skill to author a shell check; `run_validator` re-verifies it (no LLM at
+    gate time); `agent_validate` + `combine_verdict` implement the agent judge + the rule. **Live-testing
+    finding:** the agent piece must be a **controlled reviewer prompt, NOT the `semantic-reviewer` skill**
+    — the skill imposes its own aligned/divergent/missing Gap-Report format that overrode a binary
+    PASS/REJECT instruction (it emitted `"PASS — … so it diverges"` for bad work, fooling the parser). A
+    controlled prompt on a distinct seat gives a clean binary; the two-strategist independence comes from
+    the seat + cold framing, not the skill's format. Remaining: vault storage + content-hash pin +
+    approval + wiring into the phase gate flow.
 - **Vault (fork 2):** **wicked-estate** holds the *approved validator artifact + pin* (content-addressed,
   injected `phase→validator` edge, durable); `.wicked-testing/evidence/<run>/` holds each run's
   *execution evidence*. Estate = source of truth, testing = run log.

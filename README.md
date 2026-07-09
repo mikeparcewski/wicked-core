@@ -105,7 +105,8 @@ agreed," **not** "proven."
 | `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
 | Council-assigns-skill-at-runtime (default path) | ⬜ design'd, unbuilt |
-| Gate mechanism (generated dual validators, pin, re-verify) | ⬜ design'd (DES-EXEC-001 rev0.4), unbuilt — the validator-authoring skill is live-invokable here (see skills row), so this is buildable + verifiable in-env |
+| Gate mechanism **core** — deterministic validator (skill-authored + re-verify) + agent validator (controlled reviewer seat) + rev0.4 combination rule, **live-verified** (`src/validator.rs`, `tests/skills_live.rs`) | ✅ built |
+| Gate mechanism **integration** — vault storage + content-hash pin + approval + wiring into the phase gate flow | ⬜ unbuilt |
 | Event-driven bus seam (`wicked.skill.*` provisioning, cli-runner subscriber) | ⬜ design'd, unbuilt — `wicked-bus` + node are present, so buildable + testable in-env |
 | napi bridge → studio | ⬜ unbuilt |
 
