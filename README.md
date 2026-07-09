@@ -100,7 +100,8 @@ agreed," **not** "proven."
 | WorkflowDef spine as data + registry + `load_dir` + shipped JSON | ✅ built |
 | Data-driven planner (`plan_from_def`) wired into the runtime (`--workflow`) | ✅ built |
 | Skills-driven invocation (headless slash form) | ✅ built |
-| `allowed_skills` enforcement flag (per-CLI) | ⬜ needs a per-CLI spike |
+| `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
+| Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
 | Council-assigns-skill-at-runtime (default path) | ⬜ design'd, unbuilt |
 | Gate mechanism (generated dual validators, pin, re-verify) | ⬜ design'd (DES-EXEC-001 rev0.4), unbuilt |
 | Event-driven bus seam (`wicked.skill.*` provisioning, cli-runner subscriber) | ⬜ design'd, unbuilt |
