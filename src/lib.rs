@@ -34,6 +34,7 @@ mod scope;
 mod sources;
 mod terminal;
 mod validator;
+mod validator_vault;
 mod workflow;
 
 pub use actor::RunBusy;
@@ -73,6 +74,7 @@ pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
     AgentVerdict, DeterministicValidator, GateVerdict,
 };
+pub use validator_vault::{load_validator, pin, store_validator, VALIDATOR_VAULT};
 pub use wicked_council::AgenticCli;
 pub use workflow::{
     bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
