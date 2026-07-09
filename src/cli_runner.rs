@@ -27,8 +27,29 @@
 //!    `(run_id, unit_ix, attempt)`, so a re-emit dedups to one physical row (the bus's UNIQUE key).
 //!  * The `cli-runner` dedups on that key in-process (never runs the same task twice within a run) and,
 //!    across process restarts, a re-run publishes the SAME-keyed completed row (harmless dedup).
-//!  * The actor's existing `apply_step_result` guard (result applied only if `unit_ix == cursor` and the
-//!    unit isn't `Done`) makes a redelivered `task.completed` a no-op (`Stale`) — exactly-once apply.
+//!  * The actor's `apply_step_result` guard applies a `task.completed` only when its `(unit_ix, attempt)`
+//!    is the CURRENT one (`unit_ix == cursor` AND `attempt == session.attempt`) and the unit isn't
+//!    `Done` — a redelivered or SUPERSEDED-attempt result is a no-op (`Stale`), exactly-once apply.
+//!
+//! ## Durability across a crash/restart (the LOST-ON-CRASH fix)
+//! Both consumers persist a DURABLE cursor in the bus db's `core_exec_cursors` table
+//! ([`BusDb::save_cursor`]), advanced ONLY AFTER an event is handled+acked. On start each consumer
+//! RESUMES from its persisted cursor and falls back to the bus tail only on a true first run (no
+//! persisted cursor). So a `task.dispatched` that arrived before a crash but was never handled is
+//! re-polled and run on the next start rather than skipped forever. Complementarily, on actor bootstrap
+//! in ARMED mode any session left `Executing` is RE-DRIVEN (its cursor unit re-dispatched under a bumped
+//! attempt) so a dispatch lost across the restart recovers. Earlier revisions of this module claimed a
+//! cross-restart re-run the code did not actually provide (seam finding #9); it now does.
+//!
+//! ## Known parity gaps (documented, not yet closed)
+//!  * LIVE OUTPUT (#11): the bus-mediated path runs the unit with a NO-OP delta sink — it does NOT
+//!    stream `CliOutputDelta` to subscribers the way the in-process worker does (a `task.output.delta`
+//!    fan-out is a separate, optional §2.2 event). The FINAL output + verdict are identical; only the
+//!    incremental live stream is absent under exec-mediation.
+//!  * TTL (#10): a `task.dispatched`/`task.completed` event is subject to the bus's 72h `expires_at`
+//!    TTL. A consumer offline past the TTL would find the event swept before it polls — an unconsumed
+//!    task event can be dropped. The restart re-drive (above) is the recovery for a lost dispatch; a
+//!    lost completed is recovered the same way (the re-driven unit re-runs and re-publishes).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,10 +70,17 @@ pub const TASK_DISPATCHED: &str = "wicked.task.dispatched";
 /// The event the `cli-runner` publishes and the reducer consumes.
 pub const TASK_COMPLETED: &str = "wicked.task.completed";
 
-/// The `wicked.task.dispatched` payload. Carries everything the `cli-runner` needs to reconstruct the
-/// EXACT [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with
+/// The `wicked.task.dispatched` payload. Carries what the `cli-runner` needs to reconstruct the
+/// [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with
 /// no store handle and no duplicated execution logic. `agent_review_target` is the creator's COLD output
 /// the actor resolved on-thread (seam finding #8) so the evaluator judges the right artifact off-actor.
+///
+/// SECURITY (seam finding #7): the unit's APPROVED deterministic validator's shell SCRIPT is NOT
+/// serialized here. The `cli-runner` needs only the validator's CRITERION (for the LLM agent judge),
+/// never the script — the deterministic script is re-verified at the GATE on the ACTOR, from the unit
+/// the actor reads out of its OWN store. [`strip_validator_script`] blanks the script before the unit
+/// rides the bus; `validator_pin` carries the content-address of the approved validator for provenance
+/// (a re-load-by-pin handle should the cli-runner ever need the full script, which today it does not).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DispatchedTask {
     run_id: String,
@@ -62,12 +90,33 @@ struct DispatchedTask {
     entity_mode: EntityMode,
     /// The run's worktree (the wrapped-CLI runner's cwd). `None` ⇒ the runner's default cwd.
     workdir: Option<String>,
-    /// The full unit (`WorkUnit` is `Serialize`) — carries description, validator, role, skill scope…
+    /// The unit — with its validator's SCRIPT blanked (finding #7); carries description, validator
+    /// criterion, role, skill scope… everything the off-actor runner + agent judge legitimately need.
     unit: crate::domain::WorkUnit,
     /// The creator's cold output an Evaluator-role unit judges (else `None` ⇒ judge the unit's own output).
     agent_review_target: Option<String>,
     /// The assigned CLI key — the routing/filter dimension (§2.2: `task.dispatched` filtered by cli).
     cli: Option<String>,
+    /// The content-address PIN of the unit's approved validator (finding #7) — provenance / re-load
+    /// handle. `None` ⇒ the unit carried no validator.
+    #[serde(default)]
+    validator_pin: Option<String>,
+}
+
+/// Blank the deterministic validator's SHELL SCRIPT before a unit rides the bus (seam finding #7): the
+/// approved script must never be serialized in plaintext onto the event log. Returns the sanitized unit
+/// plus the validator's content-address pin (computed over the ORIGINAL, script-and-all, so it is the
+/// real approved-validator address). The cli-runner uses only the criterion; the gate re-verifies the
+/// script from the actor's own store, so blanking it here changes nothing about the outcome.
+fn strip_validator_script(
+    unit: &crate::domain::WorkUnit,
+) -> (crate::domain::WorkUnit, Option<String>) {
+    let pin = unit.validator.as_ref().map(crate::validator_vault::pin);
+    let mut sanitized = unit.clone();
+    if let Some(v) = sanitized.validator.as_mut() {
+        v.script = String::new();
+    }
+    (sanitized, pin)
 }
 
 /// The `wicked.task.completed` payload — mirrors the fields `Command::ApplyStepResult` carries
@@ -167,6 +216,10 @@ thread_local! {
 pub(crate) fn arm_exec_publisher(bus_db_path: &str) -> bool {
     match BusDb::open(bus_db_path) {
         Ok(db) => {
+            // #8: the publisher INSERT runs on the single-writer actor thread — a 5s busy-wait behind a
+            // concurrent writer would stall every other actor command. A short timeout makes SQLITE_BUSY
+            // surface fast so `try_publish_dispatched` falls back to the in-process worker instead.
+            let _ = db.set_busy_timeout(Duration::from_millis(250));
             EXEC_PUBLISHER.with(|cell| *cell.borrow_mut() = Some(db));
             true
         }
@@ -201,6 +254,8 @@ pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Opt
         let Some(db) = guard.as_ref() else {
             return false;
         };
+        // #7: blank the approved validator's shell SCRIPT before the unit is serialized onto the bus.
+        let (unit, validator_pin) = strip_validator_script(&input.unit);
         let task = DispatchedTask {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
@@ -211,9 +266,10 @@ pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Opt
                 .workdir
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
-            unit: input.unit.clone(),
+            unit,
             agent_review_target: agent_review_target.map(|s| s.to_string()),
             cli: input.unit.assigned_cli.clone(),
+            validator_pin,
         };
         let payload = match serde_json::to_value(&task) {
             Ok(v) => v,
@@ -244,15 +300,114 @@ pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Opt
 
 // ── The cli-runner SUBSCRIBER (off-actor: consumes task.dispatched → runs work → publishes task.completed) ─
 
-/// Snapshot the bus tail SYNCHRONOUSLY on the caller's thread, BEFORE spawning a poller thread, so a
-/// request emitted right after spawn is never missed and history is never replayed (the exact
-/// happens-before guarantee the launch bridge documents). `None` ⇒ the bus db can't be read → the caller
-/// disables that poller (spawns a thread that just exits) rather than replaying from 0.
-fn snapshot_floor(bus_db_path: &str) -> Option<i64> {
-    BusDb::open(bus_db_path)
-        .ok()
-        .and_then(|db| db.tail_event_id().ok())
+// ── Durable-cursor consumer identities + atomic init (findings #1, #4, #5) ───────────────────────────
+
+/// The durable-cursor key for the `cli-runner` subscriber (row in `core_exec_cursors`).
+const CONSUMER_CLI_RUNNER: &str = "wicked-core.cli-runner";
+/// The durable-cursor key for the `task.completed` poller.
+const CONSUMER_TASK_COMPLETED: &str = "wicked-core.task-completed";
+
+/// Resolve a consumer's START floor: its DURABLE cursor if one exists (RESUME across a crash/restart —
+/// the LOST-ON-CRASH fix), else the bus tail on a true first run (start at latest, never replay
+/// history). `None` ⇒ the cursor row could not be read AND the tail could not be snapshotted → the
+/// caller must NOT arm exec-mediation (refuse to replay from 0), leaving the in-process path.
+fn resume_floor(db: &BusDb, consumer: &str) -> Option<i64> {
+    match db.load_cursor(consumer) {
+        Ok(Some(floor)) => Some(floor), // resume from the persisted cursor
+        Ok(None) => db.tail_event_id().ok(), // true first run → start at the tail (no replay)
+        Err(_) => None,                 // cursor unreadable → disable (don't replay from 0)
+    }
 }
+
+/// Persist a consumer's durable cursor, logging (never failing the loop) on a write error. The floor and
+/// the persisted cursor must advance TOGETHER so a restart resumes exactly where the consumer left off.
+fn persist_cursor(db: &BusDb, consumer: &str, id: i64) {
+    if let Err(e) = db.save_cursor(consumer, id) {
+        eprintln!("wicked-core: {consumer} could not persist cursor at {id}: {e}");
+    }
+}
+
+/// Both exec-mediation consumers, each with an OPEN bus connection and a RESOLVED start floor — built on
+/// the actor thread BEFORE the publisher is armed (the ATOMIC-ARM invariant, finding #4). Owning the open
+/// connections here (rather than opening lazily inside each spawned thread) is what makes "both consumers
+/// can initialize" a fact the caller checks before arming: if either can't open its bus db or resolve its
+/// cursor, [`init_exec_consumers`] returns `None` and the caller leaves exec-mediation OFF, so a
+/// `task.dispatched` is never published with no runner to consume it.
+pub(crate) struct ExecConsumers {
+    cli_runner_db: BusDb,
+    cli_runner_floor: i64,
+    completed_db: BusDb,
+    completed_floor: i64,
+}
+
+/// Initialize BOTH consumers against `bus_db_path` (finding #4 — atomicity). Returns `None` if EITHER
+/// consumer cannot open the bus db or resolve its durable cursor; the caller then does NOT arm the
+/// publisher (the in-process path stands). Runs on the actor thread; the opened connections are MOVED
+/// into the consumer threads by [`spawn_exec_consumers`] (`rusqlite::Connection` is `Send`), so a
+/// successful init here == a working bus handle in the thread — no second-open race that could leave the
+/// publisher armed with a dead consumer.
+pub(crate) fn init_exec_consumers(bus_db_path: &str) -> Option<ExecConsumers> {
+    let cli_runner_db = BusDb::open(bus_db_path)
+        .map_err(|e| eprintln!("wicked-core: cli-runner cannot open bus db {bus_db_path}: {e}"))
+        .ok()?;
+    let cli_runner_floor = resume_floor(&cli_runner_db, CONSUMER_CLI_RUNNER)?;
+    let completed_db = BusDb::open(bus_db_path)
+        .map_err(|e| {
+            eprintln!("wicked-core: task.completed poller cannot open bus db {bus_db_path}: {e}")
+        })
+        .ok()?;
+    let completed_floor = resume_floor(&completed_db, CONSUMER_TASK_COMPLETED)?;
+    Some(ExecConsumers {
+        cli_runner_db,
+        cli_runner_floor,
+        completed_db,
+        completed_floor,
+    })
+}
+
+/// Spawn both off-actor consumer threads from a pre-initialized [`ExecConsumers`]. Called ONLY after the
+/// publisher is armed, so arm+consumers land together (finding #4).
+pub(crate) fn spawn_exec_consumers(
+    consumers: ExecConsumers,
+    runner: Arc<dyn StepRunner>,
+    tx: Sender<Command>,
+    poll_interval: Duration,
+    stop: Arc<AtomicBool>,
+) -> Vec<JoinHandle<()>> {
+    let ExecConsumers {
+        cli_runner_db,
+        cli_runner_floor,
+        completed_db,
+        completed_floor,
+    } = consumers;
+    vec![
+        run_cli_runner(
+            cli_runner_db,
+            cli_runner_floor,
+            runner,
+            poll_interval,
+            stop.clone(),
+        ),
+        run_task_completed_poller(completed_db, completed_floor, tx, poll_interval, stop),
+    ]
+}
+
+/// Bounded-join then DETACH an exec consumer thread at shutdown (finding #5). The `cli-runner` may be
+/// mid-CLI (an unbounded subprocess) when `stop` is set — the flag is only observed at poll boundaries,
+/// so a straight `join()` would block shutdown (and the actor's store release) for the CLI's full
+/// duration, unlike the detached in-process worker. We wait up to `timeout` for a clean exit, then detach
+/// (drop the handle) and rely on the stop flag + process exit. The consumer holds NO store handle, so
+/// detaching is store-safe.
+pub(crate) fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = handle.join();
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(timeout);
+}
+
+// ── The cli-runner SUBSCRIBER (off-actor: consumes task.dispatched → runs work → publishes task.completed) ─
 
 /// Sleep `interval` in short slices, honoring `stop` promptly (shared cancellable-wait helper).
 fn cancellable_sleep(stop: &Arc<AtomicBool>, interval: Duration) {
@@ -264,40 +419,28 @@ fn cancellable_sleep(stop: &Arc<AtomicBool>, interval: Duration) {
     }
 }
 
-/// Spawn the `cli-runner` subscriber: poll `wicked.task.dispatched`, run each unit's work via the SAME
-/// `runner`, and publish `wicked.task.completed`. Off-actor, own bus connection, no store handle.
-/// Idempotent: an in-process dedup set skips a `(run, unit, attempt)` already completed, and the completed
-/// event's deterministic key dedups across restarts. At-least-once: the floor advances only after a
+/// The `cli-runner` subscriber loop (own bus connection MOVED in, no store handle): poll
+/// `wicked.task.dispatched` from `floor_init`, run each unit's work via the SAME `runner`, publish
+/// `wicked.task.completed`, and PERSIST the durable cursor after each handled event so a restart RESUMES
+/// here instead of re-snapshotting to the tail (the LOST-ON-CRASH fix, #1). Idempotent: an in-process
+/// dedup set skips a `(run, unit, attempt)` already completed, and the completed event's deterministic
+/// key dedups across restarts. At-least-once: the floor advances (and the cursor persists) only after a
 /// successful publish, so a transient publish fault re-attempts rather than dropping the task.
-pub(crate) fn spawn_cli_runner(
-    bus_db_path: String,
+fn run_cli_runner(
+    db: BusDb,
+    floor_init: i64,
     runner: Arc<dyn StepRunner>,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
-    let Some(floor_init) = snapshot_floor(&bus_db_path) else {
-        eprintln!(
-            "wicked-core: cli-runner disabled — cannot snapshot cursor floor from bus db \
-             {bus_db_path}; refusing to replay history"
-        );
-        return std::thread::spawn(|| {});
-    };
     std::thread::spawn(move || {
-        let db = match BusDb::open(&bus_db_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: cli-runner disabled — cannot open bus db {bus_db_path}: {e}"
-                );
-                return;
-            }
-        };
         let mut floor = floor_init;
         // The `(run, unit, attempt)` keys already completed in THIS process — the at-least-once dedup
         // that stops a redelivered dispatch from re-running the CLI.
         let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // The bus-mediated path does not stream deltas to the studio (a `task.output.delta` fan-out is a
-        // separate, optional §2.2 event); the runner still runs identically with a no-op sink.
+        // The bus-mediated path does NOT stream deltas to the studio (a `task.output.delta` fan-out is a
+        // separate, optional §2.2 event — the live-output parity gap, #11); the runner still runs
+        // identically with a no-op sink and produces the same FINAL output + verdict.
         let noop_delta = |_: &str| {};
 
         while !stop.load(Ordering::SeqCst) {
@@ -321,12 +464,14 @@ pub(crate) fn spawn_cli_runner(
                             ev.event_id
                         );
                         floor = ev.event_id;
+                        persist_cursor(&db, CONSUMER_CLI_RUNNER, floor);
                         continue;
                     }
                 };
                 let dedup = task_key("done", &task.run_id, task.unit_ix, task.attempt);
                 if done.contains(&dedup) {
                     floor = ev.event_id; // already handled — advance past the redelivery
+                    persist_cursor(&db, CONSUMER_CLI_RUNNER, floor);
                     continue;
                 }
                 let input = StepInput {
@@ -361,6 +506,7 @@ pub(crate) fn spawn_cli_runner(
                             task.run_id, task.unit_ix
                         );
                         floor = ev.event_id; // can't ever serialize — don't wedge the batch
+                        persist_cursor(&db, CONSUMER_CLI_RUNNER, floor);
                         continue;
                     }
                 };
@@ -370,7 +516,8 @@ pub(crate) fn spawn_cli_runner(
                 match db.emit(&ev_out) {
                     Ok(_) => {
                         done.insert(dedup);
-                        floor = ev.event_id; // handled — advance the floor
+                        floor = ev.event_id; // handled — advance the floor + persist the durable cursor
+                        persist_cursor(&db, CONSUMER_CLI_RUNNER, floor);
                     }
                     // Transient publish fault → do NOT advance; break the batch and re-poll (at-least-once).
                     Err(e) => {
@@ -390,34 +537,19 @@ pub(crate) fn spawn_cli_runner(
 
 // ── The actor-inbound poller (off-actor: task.completed → Command::ApplyStepResult) ──────────────────
 
-/// Spawn the reducer's inbound poller: read `wicked.task.completed` and post a `Command::ApplyStepResult`
-/// to the actor over `tx` — the same command the in-process worker posts. Off-actor, own bus connection.
-/// The actor's `apply_step_result` idempotency guard makes a redelivered result a no-op, so the floor is
-/// advanced once the command is enqueued (a durable mpsc send). Exits when `stop` is set or the actor is
-/// gone (send fails).
-pub(crate) fn spawn_task_completed_poller(
-    bus_db_path: String,
+/// The reducer's inbound poller loop (own bus connection MOVED in): read `wicked.task.completed` from
+/// `floor_init` and post a `Command::ApplyStepResult` to the actor over `tx` — the same command the
+/// in-process worker posts. The actor's `apply_step_result` idempotency guard makes a redelivered (or
+/// superseded-attempt) result a no-op, so the floor advances — and the DURABLE cursor persists (#1) —
+/// once the command is enqueued (a durable mpsc send). Exits when `stop` is set or the actor is gone.
+fn run_task_completed_poller(
+    db: BusDb,
+    floor_init: i64,
     tx: Sender<Command>,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
-    let Some(floor_init) = snapshot_floor(&bus_db_path) else {
-        eprintln!(
-            "wicked-core: task.completed poller disabled — cannot snapshot cursor floor from bus db \
-             {bus_db_path}; refusing to replay history"
-        );
-        return std::thread::spawn(|| {});
-    };
     std::thread::spawn(move || {
-        let db = match BusDb::open(&bus_db_path) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: task.completed poller disabled — cannot open bus db {bus_db_path}: {e}"
-                );
-                return;
-            }
-        };
         let mut floor = floor_init;
         while !stop.load(Ordering::SeqCst) {
             let events = match db.poll(TASK_COMPLETED, floor, 100) {
@@ -439,6 +571,7 @@ pub(crate) fn spawn_task_completed_poller(
                             ev.event_id
                         );
                         floor = ev.event_id;
+                        persist_cursor(&db, CONSUMER_TASK_COMPLETED, floor);
                         continue;
                     }
                 };
@@ -461,7 +594,8 @@ pub(crate) fn spawn_task_completed_poller(
                 {
                     return;
                 }
-                floor = ev.event_id; // enqueued durably — advance (redelivery is a no-op via the guard)
+                floor = ev.event_id; // enqueued durably — advance + persist (redelivery is a no-op)
+                persist_cursor(&db, CONSUMER_TASK_COMPLETED, floor);
             }
             cancellable_sleep(&stop, poll_interval);
         }
@@ -480,6 +614,71 @@ mod tests {
         // Unknown token fails safe to Ok (the actor's failed/cancelled arms are the deny paths; an
         // unknown status must not spuriously fail a run — Ok goes through the normal gate).
         assert_eq!(status_from_str("garbage"), StepStatus::Ok);
+    }
+
+    /// Seam finding #7: the APPROVED deterministic validator's shell SCRIPT must NOT be serialized onto
+    /// the bus. `try_publish_dispatched` publishes a `task.dispatched` whose unit carries the validator
+    /// CRITERION (the cli-runner's agent judge needs it) but a BLANK script — the deterministic script is
+    /// re-verified at the gate from the actor's own store. The content-address `validator_pin` rides along
+    /// for provenance, computed over the ORIGINAL script so it still addresses the real approved validator.
+    #[test]
+    fn validator_script_is_never_serialized_onto_the_bus() {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-clirunner-v7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_str().unwrap().to_string();
+
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do it");
+        let validator = crate::validator::DeterministicValidator {
+            criterion: "the file exists".into(),
+            script: "test -f /super/secret/path && rm -rf /".into(),
+            approved: true,
+        };
+        let expected_pin = crate::validator_vault::pin(&validator);
+        unit.validator = Some(validator);
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Shared,
+            workdir: None,
+        };
+
+        // Arm the publisher on THIS thread, publish, then disarm (thread-local is per-thread).
+        assert!(arm_exec_publisher(&bus_path), "arm publisher");
+        assert!(
+            try_publish_dispatched(&input, None),
+            "publish task.dispatched"
+        );
+        disarm_exec_publisher();
+
+        let bus = BusDb::open(&bus_path).unwrap();
+        let evs = bus.poll(TASK_DISPATCHED, 0, 10).unwrap();
+        assert_eq!(evs.len(), 1, "one task.dispatched published");
+        // The RAW serialized payload must not contain the script anywhere.
+        let raw = serde_json::to_string(&evs[0].payload).unwrap();
+        assert!(
+            !raw.contains("rm -rf") && !raw.contains("/super/secret/path"),
+            "the validator SCRIPT must never appear in the serialized task.dispatched payload: {raw}"
+        );
+        let task: DispatchedTask = serde_json::from_value(evs[0].payload.clone()).unwrap();
+        let v = task
+            .unit
+            .validator
+            .expect("the criterion + approval still ride (only the script is stripped)");
+        assert_eq!(v.criterion, "the file exists", "criterion is preserved");
+        assert!(v.approved, "approval flag is preserved");
+        assert_eq!(v.script, "", "the script is blanked");
+        assert_eq!(
+            task.validator_pin.as_deref(),
+            Some(expected_pin.as_str()),
+            "the content-address pin (over the ORIGINAL script) rides along for provenance"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

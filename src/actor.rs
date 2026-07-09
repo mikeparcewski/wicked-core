@@ -176,28 +176,42 @@ pub(crate) fn run(
         })
         .flatten()
     });
-    // Arm the actor-thread publisher (thread-local) + spawn the two off-actor exec threads. If the bus
-    // db can't be opened for publishing, exec mode stays OFF (in-process) — no threads spawned.
+    // ARM ATOMICALLY (seam finding #4): the publisher must NOT arm independently of the consumers. A
+    // partial arm — publisher on, but a consumer self-disabled (e.g. its bus-db open failed) — would
+    // publish `task.dispatched` with NO runner AND bypass the in-process fallback → a permanent wedge.
+    // So we first CONFIRM both consumers can initialize (bus-db open ok + durable cursor resolved) via
+    // `init_exec_consumers`; only then do we arm the publisher and spawn the consumer threads. If either
+    // step fails, exec mode stays OFF and the default in-process path stands.
     let exec_stop = Arc::new(AtomicBool::new(false));
     let exec_handles: Vec<std::thread::JoinHandle<()>> = match &exec_bus_db {
-        Some(bus_db) if crate::cli_runner::arm_exec_publisher(bus_db) => {
-            let interval = std::time::Duration::from_millis(100);
-            vec![
-                crate::cli_runner::spawn_cli_runner(
-                    bus_db.clone(),
+        Some(bus_db) => match crate::cli_runner::init_exec_consumers(bus_db) {
+            Some(consumers) if crate::cli_runner::arm_exec_publisher(bus_db) => {
+                let interval = std::time::Duration::from_millis(100);
+                let handles = crate::cli_runner::spawn_exec_consumers(
+                    consumers,
                     runner.clone(),
-                    interval,
-                    exec_stop.clone(),
-                ),
-                crate::cli_runner::spawn_task_completed_poller(
-                    bus_db.clone(),
                     self_tx.clone(),
                     interval,
                     exec_stop.clone(),
-                ),
-            ]
-        }
-        _ => Vec::new(),
+                );
+                // RESTART RECOVERY (seam finding #1): re-drive any session persisted `Executing` — a
+                // dispatch lost across a crash/restart (task.dispatched never completed, or its result
+                // never applied) recovers by re-dispatching the cursor unit under a BUMPED attempt so a
+                // genuinely NEW `task.dispatched` is emitted (a same-keyed re-emit would dedup to the
+                // terminal row the cli-runner's cursor is already past → no re-run). Armed-mode ONLY, so
+                // the default in-process path — which has no cross-restart durability — is untouched.
+                redrive_executing_sessions(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &mut in_flight,
+                );
+                handles
+            }
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
     };
 
     while let Ok(cmd) = rx.recv() {
@@ -630,9 +644,13 @@ pub(crate) fn run(
     }
     // Stop + join the exec-mediation threads (cli-runner + task.completed poller) and disarm the
     // actor-thread publisher, so exec mode leaks no thread past the actor's lifetime (DES §5, R1).
+    // BOUNDED-join, not unbounded (seam finding #5): the cli-runner may be mid-CLI (an unbounded
+    // subprocess) when `stop` is set — the flag is only observed at poll boundaries — so an unbounded
+    // join here would wedge shutdown (and the store release) for the CLI's full duration. Wait briefly,
+    // then detach and rely on the stop flag + process exit. The consumers hold no store handle.
     exec_stop.store(true, Ordering::SeqCst);
     for h in exec_handles {
-        let _ = h.join();
+        crate::cli_runner::join_bounded(h, std::time::Duration::from_millis(500));
     }
     crate::cli_runner::disarm_exec_publisher();
 
@@ -839,6 +857,17 @@ pub(crate) fn resume_run_inner(
         notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Failed);
         return Ok(SessionStatus::Failed);
     }
+    // WEDGE-ON-RE-DISPATCH fix (seam finding #2/#3): a resume RE-DISPATCHES the cursor unit, so bump the
+    // attempt first — otherwise the re-dispatched unit reuses the prior `(run, unit, attempt)` key and,
+    // under exec-mediation, dedups to a terminal task.dispatched row past the cli-runner's cursor → no
+    // worker → wedge. Persist the bump before advancing (dispatch reads `session.attempt` from the store).
+    // Inert on the default in-process path (nothing branches on `attempt`). Only meaningful when the
+    // cursor unit will actually be dispatched (not paused); advancing may pause, which simply no-ops it.
+    {
+        let mut s = session.clone();
+        s.attempt = s.attempt.saturating_add(1);
+        put_node(store, s.to_node())?;
+    }
     match advance_or_pause(store, subscribers, runner, self_tx, run_id, session.unit_ix)? {
         Progress::Dispatched => {
             in_flight.insert(run_id.to_string());
@@ -848,6 +877,66 @@ pub(crate) fn resume_run_inner(
         Progress::Done => {
             finalize_run(store, subscribers, self_tx, run_id)?;
             Ok(SessionStatus::Completed)
+        }
+    }
+}
+
+/// RESTART RECOVERY (seam finding #1) — run ONCE on actor bootstrap when exec-mediation is armed. Any
+/// session persisted `Executing` had a unit dispatched that never reached a terminal apply before the
+/// process died (the `task.dispatched` was lost, or its `task.completed` was consumed but the apply
+/// never persisted). Re-drive it: re-dispatch the cursor unit under a BUMPED attempt so a genuinely NEW
+/// `task.dispatched` is emitted (a same-keyed re-emit would dedup to the terminal row the cli-runner's
+/// cursor is already past → no re-run → wedge). Armed-mode ONLY — the default in-process path has no
+/// cross-restart durability and must stay byte-for-byte unchanged, so it is never re-driven.
+fn redrive_executing_sessions(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+) {
+    let sessions = match crate::domain::all_sessions(store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-core: restart re-drive could not list sessions: {e}");
+            return;
+        }
+    };
+    for s in sessions {
+        if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
+            continue;
+        }
+        let run_id = s.id.clone();
+        let units = crate::domain::session_units(store, &run_id).unwrap_or_default();
+        let mut sess = s;
+        // Skip any cursor unit that already completed before the crash (a crash between the unit-Done
+        // write and the cursor-advance write) so we don't re-dispatch a Done unit → `Stale` wedge.
+        while units
+            .get(sess.unit_ix)
+            .map(|u| u.status == crate::domain::UnitStatus::Done)
+            .unwrap_or(false)
+        {
+            sess.unit_ix += 1;
+            sess.attempt = 0;
+        }
+        // Bump the attempt (findings #1 + #2/#3) and persist BEFORE dispatch (dispatch reads `attempt`
+        // from the store) so the re-dispatch mints a fresh idempotency key.
+        sess.attempt = sess.attempt.saturating_add(1);
+        if let Err(e) = put_node(store, sess.to_node()) {
+            emit_run_error(subscribers, &run_id, e);
+            continue;
+        }
+        match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
+            Ok(true) => {
+                in_flight.insert(run_id);
+            }
+            // No unit at the cursor (every remaining unit is Done) → the run is actually complete.
+            Ok(false) => {
+                if let Err(e) = finalize_run(store, subscribers, self_tx, &run_id) {
+                    emit_run_error(subscribers, &run_id, e);
+                }
+            }
+            Err(e) => emit_run_error(subscribers, &run_id, e),
         }
     }
 }
@@ -880,6 +969,15 @@ fn apply_step_result(
     }
     // Idempotency guard: only the unit the cursor is currently on, and only once.
     if output.unit_ix != session.unit_ix {
+        return Ok(StepApplied::Stale);
+    }
+    // APPLY-IDEMPOTENCY, attempt-authoritative (seam finding #6): reject a completed carrying a
+    // SUPERSEDED attempt of the current cursor unit. The cursor guard above only catches a DIFFERENT
+    // unit; a slow/duplicate worker from a PRIOR re-dispatch of the SAME unit (a lower attempt) would
+    // otherwise pass the cursor+status checks and mis-apply a stale result. `session.attempt` is the
+    // attempt currently in flight for `unit_ix`; anything older is a redelivery — drop it, regardless of
+    // unit status. (Equal attempt is the expected current result → apply; a higher attempt cannot exist.)
+    if output.attempt < session.attempt {
         return Ok(StepApplied::Stale);
     }
     let mut units = crate::domain::session_units(store, &run_id)?;
@@ -1313,6 +1411,15 @@ pub(crate) fn confirm_gate(
             // so it doesn't immediately re-pause on the same unit).
             let mut s = session;
             s.status = SessionStatus::Executing;
+            // WEDGE-ON-RE-DISPATCH fix (seam finding #2/#3): BUMP the attempt before re-dispatching the
+            // SAME cursor unit (a HumanConfirmIf conditional-gate retry, a terminal-gate approve, or an
+            // operator gate approve). Without this, the re-dispatch reuses the identical
+            // `(run, unit, attempt)` idempotency key → `emit()` dedups to the ORIGINAL (now-terminal)
+            // task.dispatched row, `try_publish_dispatched` still returns true (suppressing the in-process
+            // fallback), and the cli-runner's cursor is already past that row → NO worker runs → permanent
+            // wedge. A bumped attempt mints a fresh key so a genuinely new task.dispatched is emitted. The
+            // bump is inert on the default in-process path (nothing there branches on `attempt`).
+            s.attempt = s.attempt.saturating_add(1);
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);

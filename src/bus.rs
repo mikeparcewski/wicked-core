@@ -88,6 +88,27 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at, description)
 VALUES (2, (strftime('%s','now') * 1000), 'add dead_letters and delivery_attempts tables');
 "#;
 
+/// DURABLE per-consumer cursor table for wicked-core's OWN exec-mediation consumers (the `cli-runner`
+/// and the `task.completed` poller). This is the fix for the LOST-ON-CRASH seam finding: without a
+/// persisted cursor, a consumer re-snapshots to the CURRENT bus tail on every start, so a
+/// `task.dispatched`-but-not-`completed` across a crash/restart is skipped forever and the run wedges.
+///
+/// ## Why NOT the JS bus's `cursors` table
+/// wicked-bus already owns a `cursors` table with a COMPLETELY different schema (`cursor_id` PK,
+/// `subscription_id` FK → `subscriptions`, `created_at NOT NULL`, plus migration-3 push-state columns).
+/// Reusing that name would COLLIDE: our `CREATE TABLE IF NOT EXISTS cursors(...)` would no-op against
+/// the JS table (or vice-versa), and one side's reads/writes would hit missing columns. So we use a
+/// DISTINCT, namespaced table the JS bus never touches. The JS `openDb()` only `CREATE ... IF NOT
+/// EXISTS`-es its OWN tables and never validates the table set (it errors only when `schema_migrations`
+/// MAX(version) exceeds its target), so an extra unknown table is silently ignored — interop-safe in
+/// BOTH directions. We deliberately do NOT bump `schema_migrations` (that WOULD break JS via WB-005).
+const CURSORS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS core_exec_cursors (
+    consumer_name  TEXT    PRIMARY KEY,
+    last_event_id  INTEGER NOT NULL
+);
+"#;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -219,6 +240,9 @@ impl BusDb {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(EVENTS_DDL)
             .context("ensure wicked-bus events schema")?;
+        // wicked-core's OWN durable-cursor table (namespaced, JS-bus-ignored — see CURSORS_DDL).
+        conn.execute_batch(CURSORS_DDL)
+            .context("ensure core_exec_cursors table")?;
         let (default_ttl_hours, dedup_ttl_hours) = load_bus_ttls(path);
         Ok(Self {
             conn,
@@ -299,6 +323,44 @@ impl BusDb {
             .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
                 r.get(0)
             })?)
+    }
+
+    /// Override the connection's SQLite busy timeout. Used by the exec-mediation PUBLISHER (finding #8):
+    /// the actor's `task.dispatched` INSERT runs on the single-writer thread, so a 5s busy-wait behind a
+    /// concurrent JS writer/sweeper would stall EVERY other actor command for up to 5s. A short timeout
+    /// makes `SQLITE_BUSY` surface fast → `try_publish_dispatched` returns `false` → the in-process
+    /// fallback runs the unit instead of the actor blocking. (Consumers keep the default 5s — they poll
+    /// off-actor, so a busy-wait there costs nothing on the critical path.)
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.conn.busy_timeout(timeout)?;
+        Ok(())
+    }
+
+    /// Load a DURABLE per-consumer cursor from `core_exec_cursors`. `Ok(None)` ⇒ this consumer has never
+    /// persisted a cursor (a true first run) — the caller then starts at [`tail_event_id`] (no replay).
+    /// A persisted value ⇒ resume STRICTLY after it, so a `task.dispatched`-but-unhandled event that
+    /// existed before a crash/restart is re-polled and run (the LOST-ON-CRASH fix) rather than skipped.
+    pub fn load_cursor(&self, consumer: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT last_event_id FROM core_exec_cursors WHERE consumer_name = ?1",
+                [consumer],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Persist a consumer's cursor (upsert). Called ONLY AFTER an event has been handled+acked (the
+    /// completed event published, or the `ApplyStepResult` enqueued) so the durable floor never advances
+    /// past unfinished work — at-least-once across restarts.
+    pub fn save_cursor(&self, consumer: &str, last_event_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO core_exec_cursors(consumer_name, last_event_id) VALUES (?1, ?2) \
+             ON CONFLICT(consumer_name) DO UPDATE SET last_event_id = excluded.last_event_id",
+            rusqlite::params![consumer, last_event_id],
+        )?;
+        Ok(())
     }
 
     /// Poll up to `batch` events matching `filter`, strictly after `after_event_id`, that have not
@@ -885,6 +947,44 @@ mod tests {
             dedup_expires_at >= before + 3 * MS_PER_HOUR
                 && dedup_expires_at < before + 4 * MS_PER_HOUR,
             "dedup_expires_at reflects config dedup_ttl_hours=3"
+        );
+    }
+
+    /// The DURABLE per-consumer cursor round-trips (the LOST-ON-CRASH fix): an unknown consumer reads
+    /// back `None` (→ caller starts at tail, no replay), a saved cursor reads back exactly, and a
+    /// re-save upserts in place (one row per consumer). Reopening the SAME db resurfaces the value —
+    /// the "resume across a restart" property the cli-runner relies on.
+    #[test]
+    fn durable_cursor_round_trips_and_survives_reopen() {
+        let path = tmp_bus("cursor");
+        {
+            let db = BusDb::open(&path).unwrap();
+            assert_eq!(
+                db.load_cursor("wicked-core.cli-runner").unwrap(),
+                None,
+                "an unknown consumer has no cursor (true first run → start at tail)"
+            );
+            db.save_cursor("wicked-core.cli-runner", 42).unwrap();
+            assert_eq!(db.load_cursor("wicked-core.cli-runner").unwrap(), Some(42));
+            db.save_cursor("wicked-core.cli-runner", 99).unwrap();
+            assert_eq!(
+                db.load_cursor("wicked-core.cli-runner").unwrap(),
+                Some(99),
+                "re-save upserts in place"
+            );
+            let count: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM core_exec_cursors", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 1, "one row per consumer");
+        }
+        // Reopen — the cursor persists (this is what makes a restart resume, not re-snapshot to tail).
+        let db2 = BusDb::open(&path).unwrap();
+        assert_eq!(db2.load_cursor("wicked-core.cli-runner").unwrap(), Some(99));
+        assert_eq!(
+            db2.load_cursor("wicked-core.task-completed").unwrap(),
+            None,
+            "a different consumer is independent"
         );
     }
 
