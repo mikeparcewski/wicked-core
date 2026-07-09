@@ -370,6 +370,29 @@ varies every run; a skill is a fixed contract) and it keeps Law 2: a phase refer
   so adding/swapping a phase's skill is a data edit. New wicked-* skills become new phase options with
   zero core change.
 
+### 4.2 Skills fill the gaps; the skill set is a runtime allowlist; provisioning is an event (operator direction, 2026-07-09)
+
+Skills are the capability-fill for everything the thin reducer doesn't do — phase execution, task
+breakdown, the two validators (§ rev0.4), the reviewer. "Capability as data" at the *execution* layer,
+exactly as `WorkflowDef` is at the *orchestration* layer. Three additions:
+
+- **Per-phase/task skill allowlist, chosen at RUNTIME — like tool permissions.** Beyond the single
+  driving `skill_ref`, a `PhaseDef` (and a task) declares `allowed_skills: [SkillRef]` — the set that
+  agent may use for that step. The cli-runner passes it as the invocation's skill/tool scope (the
+  `claude -p --allowedTools` + skills-dir analog), so each step runs **least-privilege**. Runtime-
+  selected and pure data → a phase's capability surface changes without a core edit.
+- **Provisioning + refresh are EVENTS, never a direct call (Law 1).** If a needed skill is missing or
+  stale, the reducer publishes `wicked.skill.needed {skill_ref, version?, cli}` or
+  `wicked.skill.refresh {scope}`; a **skill-provisioner subscriber** (wraps `wicked-testing:update`,
+  which "refreshes skills across all detected AI CLIs") installs/updates it, then emits
+  `wicked.skill.ready`. This decouples the engine from skill installation and solves the spike's
+  prerequisite (a fresh run env needs the skills present in `~/.claude/skills/` first — see brain
+  `headless-skill-invocation-recipe`). A phase blocked on a missing skill is gate **state +
+  notification** (`AwaitingSkill`), not a synchronous fetch.
+- **Composes with the gate model.** The deterministic-validator author, the agent-validator author,
+  and the reviewer are all just skills with their own per-phase allowlists, provisioned identically.
+  The two-strategist independence (rev0.4) is two skill invocations under two distinct seats.
+
 ---
 
 ## 5. Composition — self-contained by default, Campaign for cross-workflow
