@@ -1058,13 +1058,20 @@ fn dispatch_unit(
         // with no pinned validator gets `None` (no agent judgment). We skip a non-Ok step (a failed /
         // cancelled worker is handled by the actor before any gate). An authoring error fails CLOSED to
         // REJECT (deny-dominates).
+        // Only run the agent LLM for an APPROVED validator: an unapproved one makes layer-1
+        // (`run_validator`) deny at the gate anyway, so paying for a `claude -p` here would be wasted.
         let agent_verdict = if output.status == crate::workflow::StepStatus::Ok {
-            input.unit.validator.as_ref().map(|v| {
-                match crate::validator::agent_validate(&v.criterion, &output.output, &*runner) {
-                    Ok(av) => (av.pass, av.reasoning),
-                    Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
-                }
-            })
+            input
+                .unit
+                .validator
+                .as_ref()
+                .filter(|v| v.approved)
+                .map(|v| {
+                    match crate::validator::agent_validate(&v.criterion, &output.output, &*runner) {
+                        Ok(av) => (av.pass, av.reasoning),
+                        Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
+                    }
+                })
         } else {
             None
         };
