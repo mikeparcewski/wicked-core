@@ -179,6 +179,25 @@ pub(crate) fn run_unit_and_judge(
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
 ) -> (StepOutput, Option<(bool, String)>) {
+    run_unit_and_judge_with_roster(
+        runner,
+        input,
+        agent_review_target,
+        emit_delta,
+        &crate::registry_roster(),
+    )
+}
+
+/// The roster-injectable core of [`run_unit_and_judge`] — split out ONLY so the seat-selection (C1) is
+/// unit-testable with a fabricated roster and no live registry. Production always passes the live
+/// [`crate::registry_roster`].
+fn run_unit_and_judge_with_roster(
+    runner: &Arc<dyn StepRunner>,
+    input: &StepInput,
+    agent_review_target: Option<&str>,
+    emit_delta: &DeltaSink,
+    roster: &[crate::AgenticCli],
+) -> (StepOutput, Option<(bool, String)>) {
     let output = runner.run_unit_streaming(input, emit_delta);
     let work_for_agent = agent_review_target.unwrap_or(&output.output);
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
@@ -188,15 +207,23 @@ pub(crate) fn run_unit_and_judge(
             .as_ref()
             .filter(|v| v.approved)
             .map(|v| {
-                // GAP B: run the agent judge under a council seat DISTINCT from the deterministic
-                // validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) when the live roster offers one —
-                // genuine two-seat independence; falls back to the single default runner otherwise.
-                let roster = crate::registry_roster();
+                // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
+                // BOTH the deterministic validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) AND the
+                // WORK's own author (the unit's `assigned_cli`, falling back to the deterministic author
+                // when unassigned). Excluding the work author is what stops a self-grade — the judge can
+                // never be dispatched under the very seat that WROTE the work. When no identity-distinct
+                // seat exists, `agent_validate` falls back to the single default runner (documented).
+                let work_author = input
+                    .unit
+                    .assigned_cli
+                    .as_deref()
+                    .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
+                let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
                 match crate::validator::agent_validate(
                     &v.criterion,
                     work_for_agent,
-                    crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
-                    &roster,
+                    &excluded,
+                    roster,
                     &**runner,
                 ) {
                     Ok(av) => (av.pass, av.reasoning),
@@ -688,6 +715,121 @@ mod tests {
             "the content-address pin (over the ORIGINAL script) rides along for provenance"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn seat(key: &str, invocation: &str) -> crate::AgenticCli {
+        use wicked_council::{Category, Confidence, InputMode};
+        crate::AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: invocation.into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+        }
+    }
+
+    /// C1 (self-grading in the real path): the agent judge must NOT be dispatched under the seat that
+    /// WROTE the work. `run_unit_and_judge` computes the work author from the unit's `assigned_cli` and
+    /// excludes BOTH it and the deterministic author when selecting the judge seat. Proven via a recording
+    /// stub that captures the assigned_cli of every dispatched unit — the LAST is the judge.
+    #[test]
+    fn agent_judge_excludes_the_work_author_seat_c1() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingRunner {
+            seen: Mutex<Vec<Option<String>>>,
+        }
+        impl StepRunner for RecordingRunner {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(input.unit.assigned_cli.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS recorded".into(),
+                    status: StepStatus::Ok,
+                }
+            }
+        }
+
+        // A work unit AUTHORED BY `agy` (assigned_cli = "agy"), carrying an APPROVED validator so the
+        // agent judge runs. workdir must be Some for the layer-2 judge to fire.
+        let dir = std::env::temp_dir().join(format!("wicked-core-c1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("agy".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // 3-seat roster [claude, agy, pi]: excluding BOTH the det author (claude) and the work author
+        // (agy) leaves `pi` as the ONLY distinct judge — proving exclude-both DISPATCHES a distinct seat.
+        let rec = Arc::new(RecordingRunner::default());
+        let runner: Arc<dyn StepRunner> = rec.clone();
+        let roster3 = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("pi", "pi ask {PROMPT}"),
+        ];
+        let (_out, verdict) = run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3);
+        assert!(
+            verdict.is_some(),
+            "an approved validator + workdir ⇒ a layer-2 verdict runs"
+        );
+        let seen = rec.seen.lock().unwrap();
+        let judge_seat = seen.last().cloned().flatten();
+        assert_eq!(
+            judge_seat.as_deref(),
+            Some("pi"),
+            "the judge must be the distinct seat, NOT the work author (agy) NOR the det author (claude)"
+        );
+        assert_ne!(
+            judge_seat.as_deref(),
+            Some("agy"),
+            "never self-grade under the work author"
+        );
+        drop(seen);
+
+        // 2-seat roster [claude, agy]: both identities excluded ⇒ documented fallback (no explicit seat).
+        let rec2 = Arc::new(RecordingRunner::default());
+        let runner2: Arc<dyn StepRunner> = rec2.clone();
+        let roster2 = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+        ];
+        let _ = run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2);
+        let seen2 = rec2.seen.lock().unwrap();
+        assert_eq!(
+            seen2.last().cloned().flatten(),
+            None,
+            "no distinct seat ⇒ fallback carries no explicit seat (and is NOT agy)"
+        );
+        drop(seen2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -111,7 +111,7 @@ fn dual_validator_gate_approves_good_work_and_rejects_bad() {
     let good = agent_validate(
         criterion,
         "println!(\"hello world\");",
-        DETERMINISTIC_VALIDATOR_SEAT,
+        &[DETERMINISTIC_VALIDATOR_SEAT],
         &roster,
         &runner,
     )
@@ -123,7 +123,7 @@ fn dual_validator_gate_approves_good_work_and_rejects_bad() {
     let bad = agent_validate(
         criterion,
         "println!(\"goodbye\");",
-        DETERMINISTIC_VALIDATOR_SEAT,
+        &[DETERMINISTIC_VALIDATOR_SEAT],
         &roster,
         &runner,
     )
