@@ -1,8 +1,14 @@
-//! PLAN — deterministic decomposition of a free-text problem into ordered work units.
-//! Ported into COE from the retired wicked-agent. Splits on newlines / sentence terminators /
-//! semicolons; the same problem always yields the same ordered units (no randomness, no model).
+//! PLAN — deterministic decomposition of a problem into ordered work units.
+//! Two planners, both pure and deterministic (no randomness, no model):
+//!   * [`plan_units`] — free-text: splits a prose problem on newlines / sentence terminators /
+//!     semicolons and *classifies* each piece's stage by keyword. The legacy path.
+//!   * [`plan_from_def`] — data-driven: derives one unit per [`WorkflowDef`] phase, taking each
+//!     unit's [`StageKind`] from the phase's declared `kind` (never a keyword guess) and recording
+//!     the backing phase in `phase_ref`. The plan is a function of workflow *data* (Law 2), so a
+//!     new workflow changes the plan without touching this module.
 
 use crate::domain::WorkUnit;
+use crate::workflow::WorkflowDef;
 
 /// Decompose `problem` into ordered [`WorkUnit`]s owned by `session_id`. Unit ids are
 /// `<session_id>:u<ord>` (1-based, stable).
@@ -25,6 +31,37 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
         .map(|(i, description)| {
             let ord = (i + 1) as u32;
             WorkUnit::pending(format!("{session_id}:u{ord}"), session_id, ord, description)
+        })
+        .collect()
+}
+
+/// Decompose a run into ordered [`WorkUnit`]s from a [`WorkflowDef`] — one unit per phase, in the
+/// def's phase order. Unlike [`plan_units`], the stage is taken from each phase's declared `kind`
+/// (data-driven, not keyword-classified) and `phase_ref` records the backing phase id. `intent` is
+/// the run's problem statement; each unit's description scopes that intent to its phase so the gate
+/// gets meaningful `work` context. Unit ids are `<session_id>:<phase_id>` (stable across resumes).
+pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<WorkUnit> {
+    let intent = intent.trim();
+    def.phases
+        .iter()
+        .enumerate()
+        .map(|(i, phase)| {
+            let ord = (i + 1) as u32;
+            let description = if intent.is_empty() {
+                phase.id.clone()
+            } else {
+                format!("{} — {intent}", phase.id)
+            };
+            let mut unit = WorkUnit::pending(
+                format!("{session_id}:{}", phase.id),
+                session_id,
+                ord,
+                description,
+            );
+            // Stage is DATA from the def, not a keyword guess over the description.
+            unit.stage = phase.kind;
+            unit.phase_ref = Some(phase.id.clone());
+            unit
         })
         .collect()
 }
@@ -108,5 +145,65 @@ mod tests {
     #[test]
     fn decimal_point_does_not_split() {
         assert_eq!(plan_units("Upgrade to version 3.5 now", "s").len(), 1);
+    }
+
+    // ---- plan_from_def: the data-driven planner (Law 2) ----
+    use crate::workflow::{bug_def, feature_def, migration_def};
+
+    #[test]
+    fn plan_from_def_yields_one_unit_per_phase_in_order() {
+        let def = feature_def();
+        let units = plan_from_def(&def, "add SSO login", "s1");
+        assert_eq!(units.len(), def.phases.len());
+        // 1:1, same order, ids/refs derived from the phase — not from prose splitting.
+        for (unit, phase) in units.iter().zip(def.phases.iter()) {
+            assert_eq!(unit.phase_ref.as_deref(), Some(phase.id.as_str()));
+            assert_eq!(unit.id, format!("s1:{}", phase.id));
+        }
+        assert_eq!(units[0].ord, 1);
+        assert_eq!(units.last().unwrap().ord, units.len() as u32);
+        assert!(units.iter().all(|u| u.status == UnitStatus::Pending));
+    }
+
+    #[test]
+    fn plan_from_def_takes_stage_from_the_phase_not_the_words() {
+        // Every unit shares the SAME prose ("build ..."), which the keyword classifier would
+        // stamp Build for all of them. plan_from_def must instead carry each phase's declared
+        // kind — proving the stage is data from the def, not a guess over the description.
+        let def = feature_def();
+        let units = plan_from_def(&def, "build the thing", "s");
+        for (unit, phase) in units.iter().zip(def.phases.iter()) {
+            assert_eq!(unit.stage, phase.kind, "stage must come from phase.kind");
+        }
+        // And the def genuinely spans more than one kind (otherwise the test is vacuous).
+        let first = units[0].stage;
+        assert!(
+            units.iter().any(|u| u.stage != first),
+            "feature def should span multiple stages"
+        );
+    }
+
+    #[test]
+    fn plan_from_def_scopes_the_intent_into_each_phase() {
+        let units = plan_from_def(&bug_def(), "500 on empty cart", "s");
+        assert!(units
+            .iter()
+            .all(|u| u.description.contains("500 on empty cart")));
+        assert!(units[0].description.starts_with(&bug_def().phases[0].id));
+    }
+
+    #[test]
+    fn plan_from_def_is_deterministic() {
+        let a = plan_from_def(&migration_def(), "move to pg", "s");
+        let b = plan_from_def(&migration_def(), "move to pg", "s");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn plan_from_def_handles_empty_intent() {
+        let units = plan_from_def(&feature_def(), "   ", "s");
+        // Falls back to the bare phase id — never an empty description (gate needs work context).
+        assert_eq!(units[0].description, feature_def().phases[0].id);
+        assert!(units.iter().all(|u| !u.description.is_empty()));
     }
 }

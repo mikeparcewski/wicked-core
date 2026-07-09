@@ -61,6 +61,7 @@ pub use graph_browser::{
 pub use knowledge::RecalledKnowledge;
 pub use memory::{now_secs, RecalledMemory};
 pub use pipeline::SessionResult;
+pub use plan::plan_from_def;
 pub use repo::{RepoEntry, RepoSpec};
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
