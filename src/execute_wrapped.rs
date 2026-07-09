@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::domain::WorkUnit;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus};
 
 /// The real wrapped-CLI runner. Resolves each unit's assigned CLI to its invocation template, runs it
@@ -62,7 +63,7 @@ impl WrappedCliStepRunner {
             .assigned_invocation
             .clone()
             .unwrap_or_else(|| resolve_invocation(&cli_key));
-        let argv = build_argv(&invocation, &input.unit.description);
+        let argv = build_argv(&invocation, &skill_prompt(&input.unit));
 
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
@@ -242,6 +243,21 @@ fn tokenize(s: &str) -> Vec<String> {
 /// element. A POSIX `--` end-of-options guard is inserted before a positional prompt so a flag-shaped
 /// prompt can't smuggle a flag; when `{PROMPT}` is a flag's value (preceding token is an option) the
 /// binding is preserved and no `--` is added.
+/// The prompt for a unit's CLI invocation. When the unit is **skill-driven** (DES-EXEC-001 §4.1), the
+/// prompt LEADS with the headless slash form `/{skill_ref} {description}` so the harness expands the
+/// named skill deterministically (the verified recipe — see brain `headless-skill-invocation-recipe`);
+/// otherwise it's the bare description (the authored-prompt path). Pure + testable without a subprocess.
+///
+/// NOTE: `unit.allowed_skills` (the runtime tool/skill scope, §4.2) is NOT yet injected here — it maps
+/// to a per-CLI flag (e.g. claude's `--allowedTools`) and rides the invocation template, which is the
+/// next increment. The allowlist is carried on the unit already so the wiring is a local change.
+pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
+    match unit.skill_ref.as_deref() {
+        Some(skill) if !skill.is_empty() => format!("/{skill} {}", unit.description),
+        _ => unit.description.clone(),
+    }
+}
+
 pub(crate) fn build_argv(invocation: &str, prompt: &str) -> Vec<String> {
     let toks = tokenize(invocation);
     let mut argv: Vec<String> = Vec::new();
@@ -293,6 +309,38 @@ mod tests {
         assert!(
             out.contains("alpha") && out.contains("gamma"),
             "the full output is still accumulated alongside streaming"
+        );
+    }
+
+    #[test]
+    fn skill_prompt_leads_with_the_headless_slash_form() {
+        let mut u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
+        // authored path: no skill → bare description.
+        assert_eq!(skill_prompt(&u), "add SSO login");
+        // skill-driven: leads with /<skill> so the harness expands the named skill deterministically.
+        u.skill_ref = Some("wicked-testing-semantic-reviewer".to_string());
+        assert_eq!(
+            skill_prompt(&u),
+            "/wicked-testing-semantic-reviewer add SSO login"
+        );
+        // an empty skill_ref is treated as no skill (authored path), never a bare "/ ...".
+        u.skill_ref = Some(String::new());
+        assert_eq!(skill_prompt(&u), "add SSO login");
+    }
+
+    #[test]
+    fn a_skill_prompt_flows_through_build_argv_as_one_guarded_arg() {
+        let mut u = WorkUnit::pending("s:build", "s", 1, "do it");
+        u.skill_ref = Some("wicked-testing-plan".to_string());
+        let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u));
+        assert_eq!(
+            argv,
+            vec![
+                "claude".to_string(),
+                "-p".to_string(),
+                "/wicked-testing-plan do it".to_string(),
+            ],
+            "the skill-led prompt binds as -p's value, one argv element (no shell, no flag smuggling)"
         );
     }
 
