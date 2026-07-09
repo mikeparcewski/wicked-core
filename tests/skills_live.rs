@@ -10,7 +10,10 @@
 //! the runner's argv `claude -p "/wicked-testing-semantic-reviewer <prompt>"` expands the skill and
 //! the model replies in-role at turn 0.
 
-use wicked_core::{EntityMode, StepInput, StepRunner, WorkUnit, WrappedCliStepRunner};
+use wicked_core::{
+    author_deterministic_validator, run_validator, EntityMode, StepInput, StepRunner, WorkUnit,
+    WrappedCliStepRunner,
+};
 
 #[test]
 #[ignore = "requires real `claude` on PATH + installed wicked-testing skills; run with --ignored"]
@@ -50,4 +53,38 @@ fn a_skill_driven_unit_loads_the_named_skill_against_real_claude() {
         out.output,
         out.status
     );
+}
+
+/// LIVE gate-mechanism slice (DES-EXEC-001 rev0.4): the acceptance-test-writer skill AUTHORS a
+/// grounded deterministic validator for a criterion, and the pinned script then discriminates a
+/// satisfying dir from a non-satisfying one — the deterministic re-verify, no LLM at run time.
+#[test]
+#[ignore = "requires real `claude` on PATH + installed wicked-testing skills; run with --ignored"]
+fn writer_skill_authors_a_deterministic_validator_that_discriminates() {
+    let runner = WrappedCliStepRunner::default();
+    let v = author_deterministic_validator(
+        "a file named README.md exists in the current directory and contains a line with '## Status'",
+        &runner,
+    )
+    .expect("authoring should succeed against real claude");
+    eprintln!("authored validator script: {}", v.script);
+
+    let base = std::env::temp_dir().join(format!("wicked-val-live-{}", std::process::id()));
+    let pass = base.join("pass");
+    let fail = base.join("fail");
+    std::fs::create_dir_all(&pass).unwrap();
+    std::fs::create_dir_all(&fail).unwrap();
+    std::fs::write(pass.join("README.md"), "# Title\n\n## Status\nok\n").unwrap();
+
+    assert!(
+        run_validator(&v, &pass),
+        "authored validator must PASS where the criterion holds: {}",
+        v.script
+    );
+    assert!(
+        !run_validator(&v, &fail),
+        "and FAIL where it does not: {}",
+        v.script
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }

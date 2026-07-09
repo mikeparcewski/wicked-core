@@ -33,6 +33,7 @@ mod repo_intel;
 mod scope;
 mod sources;
 mod terminal;
+mod validator;
 mod workflow;
 
 pub use actor::RunBusy;
@@ -68,6 +69,7 @@ pub use repo_intel::{
 };
 pub use scope::{resolve_scope, EntityMode};
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use validator::{author_deterministic_validator, run_validator, DeterministicValidator};
 pub use wicked_council::AgenticCli;
 pub use workflow::{
     bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
