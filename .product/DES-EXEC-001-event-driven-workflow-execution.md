@@ -156,17 +156,35 @@ Mechanism (decisions committed 2026-07-09; forks flagged for operator veto):
   verified headless recipe (`claude -p "/wicked-testing-<skill> …" --output-format json`, one isolated
   process per reviewer — see brain memory `headless-skill-invocation-recipe`). Grounded with the
   phase/task spec artifacts (clarify/design outputs + ACs) as input.
-- **Validator form (fork 1):** a wicked-testing **acceptance scenario/plan** (reuses the existing
-  executor + isolated reviewer + evidence-vault format) for outcome checks, with a plain deterministic
-  script escape hatch for non-test assertions. Not a bare bash blob.
+- **Dual validator, two independent strategists (operator addition, 2026-07-09).** The evidence
+  evaluator is a **pair**, each piece authored by a **different** test-strategist seat (evaluator≠creator
+  pushed into the *authoring* layer — independent seats give uncorrelated blind spots; if one misframes
+  the spec, the other catches it): (a) a **deterministic** validator (the grounded script — precise,
+  auditable, cheap, can't judge semantics) and (b) an **agent-based** validator (judgment: "does this
+  satisfy the intent?" — which no script can encode). Mirrors wicked-testing's own split:
+  `acceptance-test-writer` (deterministic, evidence-gated) + `semantic-reviewer` (judges what the AC
+  *means*). A phase may carry one or both — `commit-exists` needs only deterministic; "feature meets
+  intent" wants both.
+  - **Combination rule (preserves old §3's "a model may never *solely* approve"):** Approve requires the
+    **deterministic** validator to PASS; the **agent** validator can REJECT but is never the sole
+    approver. `Verdict = Approve iff deterministic==pass ∧ agent!=reject ∧ governance!=deny`; either piece
+    failing → Conditional/Reject. This deliberately reintroduces an agent at gate-time, but only as a
+    second, distinct-seat, run-cold piece that can fail-but-not-lone-pass — the auditable deterministic
+    floor stays intact.
+- **Validator form (fork 1):** the deterministic piece is a wicked-testing **acceptance scenario/plan**
+  (reuses the existing executor + isolated reviewer + evidence-vault format), with a plain deterministic
+  script escape hatch for non-test assertions; the agent piece is a grounded reviewer prompt/skill. Not a
+  bare bash blob.
 - **Vault (fork 2):** **wicked-estate** holds the *approved validator artifact + pin* (content-addressed,
   injected `phase→validator` edge, durable); `.wicked-testing/evidence/<run>/` holds each run's
   *execution evidence*. Estate = source of truth, testing = run log.
 - **Approval + change control (fork 3):** a regenerated validator is **diffed against the pinned one and
   re-approved** (the same evaluator≠creator + human-confirm-on-change any deliverable gets) before it can
   gate again.
-- **Data:** `PhaseDef` (and optionally `WorkUnit`) gain a `validator_ref` — a **content-hash pin** so the
-  gate runs the *exact* approved script. `skill_ref` names the **authoring** agent, not the check.
+- **Data:** `PhaseDef` (and optionally `WorkUnit`) gain up to two validator pins — a
+  `deterministic_validator_ref` and an `agent_validator_ref` (each a **content-hash pin** so the gate runs
+  the *exact* approved artifact; either may be absent). `skill_ref` names the **authoring** agent(s), not
+  the check; the two pieces are authored by two distinct strategist seats.
 - **Event-driven fit:** authoring the validator is itself a phase/task emitting events; "validator
   approved" is gate **state + notification** (not request/reply); running it at the gate is the
   deterministic re-verify. All consistent with Law 1.
