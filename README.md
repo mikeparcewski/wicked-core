@@ -1,0 +1,110 @@
+# wicked-core
+
+The in-process composition runtime **and** event-driven execution engine for the wicked-* ecosystem.
+One thread — the **actor** — owns the writable estate store; everything else holds a clonable `Core`
+handle and talks to it via commands + a live `CoreEvent` stream. That single-writer seam is what lets
+multiple consumers (agent, studio, MCP) compose the core services without racing on the shared SQLite
+file — and it's the durable, ordering authority the workflow engine runs on.
+
+## What it is
+
+Two things in one binary:
+
+1. **A single-writer composition runtime** — the actor owns the estate store; reads and writes funnel
+   through it, so there's exactly one writer and no file contention.
+2. **An execution engine** — it drives multi-phase AI development runs (feature / bug / migration) as a
+   function of **workflow data**, executing each phase by invoking a real agentic CLI, and governing
+   every phase transition through a gate.
+
+## Architecture (built)
+
+- **Single-writer `StoreActor`** — owns the SQLite estate store; a command API + `CoreEvent` fan-out is
+  the only way in. Live output streams to subscribers as work happens.
+- **Governed run pipeline** — plan → distribute → execute → evidence, all on the one store. Governance
+  is **deny-dominates** and fail-closed (a run with more units than the governed span is rejected, not
+  run ungoverned).
+- **Real CLI execution** — the wrapped-CLI step runner runs an actual agentic CLI as a subprocess in the
+  run's git worktree, streaming its output; the prompt is a guarded argv element (no shell, no flag
+  smuggling), bounded by a timeout.
+- **Resume / cursor** — runs are resumable from a persisted cursor after a crash.
+- **Council routing** — multi-CLI seats vote/rank to assign a CLI per unit (the seat diversity behind
+  evaluator≠creator).
+- **Campaign DAG** — cross-workflow composition (fan-out, failure edges) as a scheduler primitive.
+
+## Workflows are DATA (not code)
+
+A workflow is a `WorkflowDef` = `{ id, phases: [PhaseDef] }` — pure, serde data. **Adding a workflow is
+dropping a JSON file, not editing this crate** (Law 2):
+
+```rust
+let mut registry = WorkflowRegistry::with_defaults(); // seeds feature / bug / migration
+registry.load_dir("~/.config/wicked-core/workflows")?; // overlay your drop-in *.json files
+```
+
+- The three built-ins ship as `workflows/*.json` (the human-editable mirror of the seed builders,
+  drift-guarded) — see [`workflows/README.md`](workflows/README.md) for the full field contract.
+- Every `PhaseDef` field but `id` defaults, so the minimal phase is `{"id":"x"}`. A misspelled key is a
+  **loud** parse error naming the file (`deny_unknown_fields`), never a silent default.
+- Validation: unique phase ids, resolvable deps, and **declaration order = execution order** (a
+  dependency must point to an earlier phase — which makes the layout a valid topological order and makes
+  cycles unexpressible).
+
+The boundary: **primitives** (`GateType`, `StageKind`, `PhaseRole`) are the engine's typed vocabulary;
+**workflows that compose them are open data**. Event names are free strings, so a new workflow publishes
+/ subscribes new `wicked.*` events with zero code. New primitive = code; new workflow/event = data.
+
+## Data-driven planning
+
+Selecting a workflow makes a run a function of its data. `plan_from_def` derives one work unit per
+phase, taking each unit's stage from the phase's **declared** `kind` (not a keyword guess over the
+prose) — so the def's phases, gates, and roles drive the run, not a sentence-splitter:
+
+```
+wicked-core run --problem "add SSO login" --workflow feature
+```
+
+Without `--workflow`, planning falls back to the legacy free-text planner (prose split + keyword
+classify), so existing callers are unchanged.
+
+## Skills-driven phase execution
+
+A phase's work is driven by a **skill**, not an ad-hoc prompt (consistent control). A `PhaseDef` carries
+an optional `skill_ref` and a runtime `allowed_skills` allowlist (least-privilege tool/skill scope, the
+`--allowedTools` analog); both ride onto the work unit. When a unit is skill-driven, the runner invokes
+`/{skill_ref} {description}` — the verified headless recipe (`claude -p "/wicked-testing-<skill> …"`),
+which the harness expands deterministically. An unskilled unit stays on the authored prompt.
+
+## Gates (design — see DES-EXEC-001)
+
+The gate's deterministic check is **not** a generic precanned verifier. A test-strategy agent authors a
+**grounded, deterministic validation script** for the specific phase/task, stored in the vault as its
+evidence evaluator, versioned + approved; a spec change regenerates it (diff → re-approve). The
+evaluator is a **pair** authored by **two independent strategists** — a deterministic validator +
+an agent-based (semantic) validator — combined so that **Approve requires the deterministic piece to
+PASS; the agent piece can REJECT but is never the sole approver.** This makes evaluator≠creator
+deterministic and auditable, and preserves "a model may never *solely* approve a gate."
+
+**Trust model (named, not overclaimed):** diverse-seat agent consensus, on a deterministic structural
+floor, with human escalation above a threshold. A green run means "diverse seats + the escalation policy
+agreed," **not** "proven."
+
+## Status
+
+| Layer | State |
+|---|---|
+| Single-writer actor, CoreEvent stream, worktree exec, resume, governance, council, campaign DAG | ✅ built |
+| WorkflowDef spine as data + registry + `load_dir` + shipped JSON | ✅ built |
+| Data-driven planner (`plan_from_def`) wired into the runtime (`--workflow`) | ✅ built |
+| Skills-driven invocation (headless slash form) | ✅ built |
+| `allowed_skills` enforcement flag (per-CLI) | ⬜ needs a per-CLI spike |
+| Council-assigns-skill-at-runtime (default path) | ⬜ design'd, unbuilt |
+| Gate mechanism (generated dual validators, pin, re-verify) | ⬜ design'd (DES-EXEC-001 rev0.4), unbuilt |
+| Event-driven bus seam (`wicked.skill.*` provisioning, cli-runner subscriber) | ⬜ design'd, unbuilt |
+| napi bridge → studio | ⬜ unbuilt |
+
+## Reference
+
+- `.product/DES-EXEC-001-event-driven-workflow-execution.md` — the execution-engine design (the two
+  laws, gate model rev0.4/0.5, skills seam §4.1/§4.2, event architecture).
+- `ORCHESTRATOR.md` — the deep orchestrator reference.
+- `workflows/README.md` — the drop-in workflow file contract.
