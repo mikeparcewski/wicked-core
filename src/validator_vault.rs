@@ -19,7 +19,8 @@ use wicked_apps_core::{
 };
 
 use crate::domain::put_node;
-use crate::validator::DeterministicValidator;
+use crate::validator::{author_deterministic_validator, DeterministicValidator};
+use crate::workflow::StepRunner;
 
 /// The estate node-kind tag under which vaulted validators are persisted (mirrors
 /// [`crate::execute::WORK_OUTPUT`] and the domain kinds — a stable string used both as the
@@ -102,6 +103,31 @@ pub fn load_validator(
         }
         None => Ok(None),
     }
+}
+
+/// PROVISION (rev0.4 authoring step): author a deterministic validator for `criterion` via the writer
+/// skill, then vault it **UNAPPROVED**, returning its pin. Approval is a SEPARATE, explicit step
+/// ([`approve_and_store`]) so a human/council review sits between authoring and any execution — the
+/// authored script never becomes gate-ready in one call. (Runs the writer skill: a live-CLI call.)
+pub fn provision_validator(
+    criterion: &str,
+    runner: &dyn StepRunner,
+    store: &mut SqliteStore,
+) -> anyhow::Result<String> {
+    let v = author_deterministic_validator(criterion, runner)?; // approved == false
+    store_validator(store, &v)
+}
+
+/// APPROVE a vaulted validator (the human/council step): load it by `pin`, mark it approved, and
+/// re-vault. Approving changes the `approved` byte, so the approved copy has a DISTINCT pin — returned.
+/// `Ok(None)` if `pin` is unknown. The two pins (unapproved vs approved) are the audit trail: only the
+/// approved pin can gate, and a phase carries THAT pin.
+pub fn approve_and_store(store: &mut SqliteStore, pin: &str) -> anyhow::Result<Option<String>> {
+    let Some(v) = load_validator(store, pin)? else {
+        return Ok(None);
+    };
+    let approved = v.approve();
+    Ok(Some(store_validator(store, &approved)?))
 }
 
 #[cfg(test)]
@@ -189,5 +215,58 @@ mod tests {
         assert!(missing.is_none(), "an unknown pin loads as Ok(None)");
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// LIVE end-to-end of the rev0.4 provision → approve → pin → re-verify flow against real `claude`.
+    #[test]
+    #[ignore = "requires real `claude` + installed wicked-testing skills; run with --ignored"]
+    fn provision_approve_and_reverify_end_to_end() {
+        use crate::execute_wrapped::WrappedCliStepRunner;
+        use crate::validator::run_validator;
+        use wicked_apps_core::open_store;
+
+        let runner = WrappedCliStepRunner::default();
+        let base = std::env::temp_dir().join(format!("wicked-vault-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut store = open_store(Some(base.join("v.db").to_str().unwrap())).unwrap();
+
+        // 1. PROVISION: the writer skill authors a check; it's vaulted UNAPPROVED.
+        let pin_u =
+            provision_validator("a file named greeting.txt exists", &runner, &mut store).unwrap();
+        let unapproved = load_validator(&store, &pin_u).unwrap().unwrap();
+        assert!(
+            !unapproved.approved,
+            "authored validator is vaulted UNAPPROVED"
+        );
+        // An unapproved validator refuses to run (fail-closed).
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("greeting.txt"), "hi").unwrap();
+        assert!(
+            run_validator(&unapproved, &wt).is_err(),
+            "unapproved validator must refuse to run"
+        );
+
+        // 2. APPROVE (the human/council step) → a DISTINCT pin.
+        let pin_a = approve_and_store(&mut store, &pin_u).unwrap().unwrap();
+        assert_ne!(pin_a, pin_u, "approval changes the content hash → new pin");
+        let approved = load_validator(&store, &pin_a).unwrap().unwrap();
+        assert!(approved.approved);
+
+        // 3. RE-VERIFY the approved, pinned validator against a worktree — passes where satisfied,
+        //    fails where not.
+        assert!(
+            run_validator(&approved, &wt).unwrap(),
+            "approved validator passes where greeting.txt exists: {}",
+            approved.script
+        );
+        let empty = base.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            !run_validator(&approved, &empty).unwrap(),
+            "and fails where it does not"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
