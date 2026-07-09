@@ -117,14 +117,20 @@ pub(crate) struct Planned {
 }
 
 /// Resolve a selected workflow id to its validated [`WorkflowDef`]. Seeds the built-ins and overlays
-/// operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else `~/.config/wicked-core/workflows`,
-/// best-effort). `None`/unknown id ⇒ `None`, and the caller falls back to the free-text planner.
-fn resolve_workflow_def(workflow: Option<&str>) -> Option<crate::workflow::WorkflowDef> {
-    let id = workflow?;
+/// operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else `$HOME/.config/wicked-core/workflows`,
+/// best-effort). `None` (no selection) ⇒ `Ok(None)` and the caller uses the free-text planner; a
+/// requested-but-**unknown** id ⇒ `Err` (never a silent fallback).
+fn resolve_workflow_def(
+    workflow: Option<&str>,
+) -> anyhow::Result<Option<crate::workflow::WorkflowDef>> {
+    // No selection ⇒ the caller uses the free-text planner. Only THIS falls through.
+    let Some(id) = workflow else {
+        return Ok(None);
+    };
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
-        // Best-effort: a broken drop-in dir must never wedge a built-in run. Warn, don't fail —
-        // the loud per-file error is available via `def_from_file` for an explicit `workflow lint`.
+        // Best-effort dir read: a broken *overlay dir* must never wedge a built-in run (load_dir
+        // itself already skips individual bad files). Warn, don't fail.
         if let Err(e) = reg.load_dir(&dir) {
             eprintln!(
                 "wicked-core: workflow overlay {} failed to load ({e}); using built-ins only",
@@ -132,7 +138,15 @@ fn resolve_workflow_def(workflow: Option<&str>) -> Option<crate::workflow::Workf
             );
         }
     }
-    reg.get(id).cloned()
+    // A REQUESTED-but-unknown id is a loud error — never a silent fallback to the prose planner (a
+    // `--workflow feaure` typo must not quietly produce a different plan than `--workflow feature`).
+    match reg.get(id) {
+        Some(def) => Ok(Some(def.clone())),
+        None => anyhow::bail!(
+            "unknown workflow `{id}` — known workflows: {}",
+            reg.ids().join(", ")
+        ),
+    }
 }
 
 fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
@@ -165,11 +179,12 @@ pub(crate) fn plan_and_distribute(
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
 
     // DATA-DRIVEN planning when a workflow is selected (Law 2): units come from the def's phases, each
-    // unit's stage from the phase's declared `kind`. `None`/unknown id ⇒ the legacy free-text planner.
+    // unit's stage from the phase's declared `kind`. No selection ⇒ the legacy free-text planner; a
+    // requested-but-unknown id already errored in resolve_workflow_def above.
     // The def is validated (the registry only hands out validated defs), so plan_from_def's unit-id
     // uniqueness precondition holds. The DENY_PHASE_SPAN governed-limit check below applies to BOTH
     // paths — a def with too many phases is rejected exactly like an over-long prose problem.
-    let selected_def = resolve_workflow_def(workflow);
+    let selected_def = resolve_workflow_def(workflow)?;
     let mut units = match &selected_def {
         Some(def) => plan::plan_from_def(def, problem, session_id),
         None => plan::plan_units(problem, session_id),
@@ -346,5 +361,29 @@ fn next_cli_in_roster(creator: &str, roster: &[String]) -> String {
             .first()
             .cloned()
             .unwrap_or_else(|| "wicked-evaluator".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    #[test]
+    fn workflow_selection_resolves_none_known_and_rejects_unknown() {
+        // No selection ⇒ None (the caller uses the free-text planner).
+        assert!(resolve_workflow_def(None).unwrap().is_none());
+        // A known built-in resolves to its def.
+        assert_eq!(
+            resolve_workflow_def(Some("feature")).unwrap().unwrap().id,
+            "feature"
+        );
+        // A requested-but-unknown id is a LOUD error (never a silent fall-through to prose planning).
+        let err = resolve_workflow_def(Some("feaure-typo-xyz"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown workflow") && err.contains("feaure-typo-xyz"),
+            "error must name the bad id: {err}"
+        );
     }
 }

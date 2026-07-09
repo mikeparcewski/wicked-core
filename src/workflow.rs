@@ -391,8 +391,13 @@ impl WorkflowRegistry {
     /// and registering each in filename order. A file whose `id` matches a built-in REPLACES it, so
     /// operators tune the shipped workflows and add new ones by dropping a data file — no recompile,
     /// no edit to this crate (the Law-2 seam). A missing `dir` is `Ok(vec![])` (nothing to overlay).
-    /// A malformed or invalid file is an error naming the file, so a typo fails loud, never silent.
-    /// Returns the ids loaded, in load order.
+    ///
+    /// **Resilient per-file:** a malformed or invalid file is SKIPPED with a warning naming it (so one
+    /// bad drop-in can't disable every other one) — not a hard error that aborts the whole overlay.
+    /// The loud, per-file error is available via [`def_from_file`](WorkflowRegistry::def_from_file) for
+    /// an explicit `workflow lint`. Returns the ids that loaded, in load order. (A caller that requested
+    /// a SPECIFIC workflow still learns if it's missing — see the resolver, which errors on an unknown
+    /// requested id rather than silently falling back.)
     pub fn load_dir(&mut self, dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
         let dir = dir.as_ref();
         if !dir.exists() {
@@ -409,11 +414,20 @@ impl WorkflowRegistry {
         paths.sort(); // deterministic load order regardless of filesystem enumeration
         let mut loaded = Vec::new();
         for path in paths {
-            let def = Self::def_from_file(&path)?;
-            let id = def.id.clone();
-            self.register(def)
-                .map_err(|e| anyhow::anyhow!("workflow {id} in {}: {e}", path.display()))?;
-            loaded.push(id);
+            let outcome = Self::def_from_file(&path).and_then(|def| {
+                let id = def.id.clone();
+                self.register(def)
+                    .map_err(|e| anyhow::anyhow!("workflow {id} in {}: {e}", path.display()))?;
+                Ok(id)
+            });
+            match outcome {
+                Ok(id) => loaded.push(id),
+                // Skip the offending file, keep the rest — but loudly (named), never silently.
+                Err(e) => eprintln!(
+                    "wicked-core: skipping workflow file {} ({e})",
+                    path.display()
+                ),
+            }
         }
         Ok(loaded)
     }
@@ -830,18 +844,29 @@ mod workflow_def_tests {
     }
 
     #[test]
-    fn load_dir_rejects_an_invalid_data_file_by_name() {
+    fn load_dir_skips_an_invalid_file_and_still_loads_the_rest() {
         let dir = ScratchDir::new("invalid");
-        // Structurally parseable but semantically invalid: a self-referential dependency cycle.
+        // A semantically invalid file (self-referential dep) that sorts FIRST, next to a good one.
+        // The old behavior aborted the whole overlay on the first bad file; now it skips + continues.
         dir.write(
-            "broken.json",
+            "aaa-broken.json",
             r#"{ "id": "broken", "phases": [ { "id": "a", "kind": "build", "depends_on": ["a"] } ] }"#,
         );
+        dir.write(
+            "zzz-good.json",
+            r#"{ "id": "custom", "phases": [ { "id": "do", "kind": "build" } ] }"#,
+        );
         let mut reg = WorkflowRegistry::with_defaults();
-        let err = reg.load_dir(&dir.0).unwrap_err().to_string();
+        let loaded = reg.load_dir(&dir.0).unwrap();
+        assert_eq!(
+            loaded,
+            vec!["custom"],
+            "the good drop-in loads; the broken one is skipped"
+        );
+        assert!(reg.get("custom").is_some());
         assert!(
-            err.contains("broken.json"),
-            "error must name the bad file: {err}"
+            reg.get("broken").is_none(),
+            "the invalid file is not registered"
         );
     }
 }

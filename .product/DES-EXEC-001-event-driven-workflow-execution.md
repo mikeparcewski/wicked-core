@@ -97,13 +97,19 @@ the sections are kept for the architecture shape (which held up) but their code 
 
 **§4.1 SKILLS — corrected by adversarial review round 2 (findings 9–12). The skills layer is a
 DEFERRED, SPIKE-GATED refinement, NOT a slice-1 foundation. Corrections:**
-- **No deterministic headless skill-invocation exists (F9, HIGH).** Skills are a Claude Code *plugin*
-  (`wicked-testing/.claude-plugin/plugin.json`) invoked by slash-command (`/wicked-testing:…`) or
-  interactive auto-match — both require the plugin *installed* in the env; `claude -p "{prompt}"`
-  (crew's real template, `registry.rs:76`) has NO machinery to install/name/load a skill. The 40
-  Tier-2 reviewer specialists are `context:fork`-only — **not invocable from outside**; you must invoke
-  a Tier-1 orchestrator that forks them. → **SPIKE required** to prove one deterministic headless
-  recipe (env plugin install + exact invocation form) before ANY design commitment to skills.
+- **F9 (HIGH) — RESOLVED by spike, 2026-07-09 (GO).** The round-2 concern ("no deterministic headless
+  skill-invocation exists") was **spike-tested against real `claude` v2.1.205** and is now GO: a
+  `claude -p` prompt that BEGINS with `/<skill-name>` is harness-expanded deterministically (SKILL.md
+  injected, in-role turn 0); an unknown `/skill` is validated + rejected, so it is a real mechanism not
+  best-effort. **Correction to the original round-2 text:** the Tier-2 reviewer specialists ARE reachable
+  directly by the hyphenated `/wicked-testing-<name>` slash form (NOT Tier-1-orchestrator-only), and
+  `context: fork` is on EVERY wicked-testing SKILL.md (not a Tier-2 marker). PREREQS that remain (do not
+  block, but are real): (1) the skills must be **installed** in `~/.claude/skills/` first (a fresh env
+  provisions them — §4.2 skill-provisioner sidecar); (2) a top-level `/skill` in `-p` runs in the MAIN
+  context, so reviewer independence needs **one isolated `claude -p` process per reviewer** with only
+  evidence paths (not `context: fork`). Full recipe: brain `headless-skill-invocation-recipe`. So the
+  skills layer is no longer spike-gated on invocation — only the per-CLI form for NON-claude seats
+  remains data-to-be-authored (F11).
 - **Reviewer isolation is NOT inherited as claimed (F10).** wicked-testing's enforced cold-evidence
   isolation is a property of Claude Code's fork + its `.wicked-testing/evidence/{run}/…` manifest
   format. On non-Claude seats (`agy`/`pi`) `allowed-tools` is **advisory only**; crew's

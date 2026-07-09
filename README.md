@@ -59,9 +59,9 @@ The boundary: **primitives** (`GateType`, `StageKind`, `PhaseRole`) are the engi
 
 ## Data-driven planning
 
-Selecting a workflow makes a run a function of its data. `plan_from_def` derives one work unit per
-phase, taking each unit's stage from the phase's **declared** `kind` (not a keyword guess over the
-prose) — so the def's phases, gates, and roles drive the run, not a sentence-splitter:
+Selecting a workflow makes **planning** a function of its data. `plan_from_def` derives one work unit
+per phase, taking each unit's stage from the phase's **declared** `kind` (not a keyword guess over the
+prose) — so the def's phase list + stages drive the plan, not a sentence-splitter:
 
 ```
 wicked-core run --problem "add SSO login" --workflow feature
@@ -99,6 +99,7 @@ agreed," **not** "proven."
 | Single-writer actor, CoreEvent stream, worktree exec, resume, governance, council, campaign DAG | ✅ built |
 | WorkflowDef spine as data + registry + `load_dir` + shipped JSON | ✅ built |
 | Data-driven planner (`plan_from_def`) wired into the runtime (`--workflow`) | ✅ built |
+| Per-phase **gate/role** consumed at runtime (today runs use the run-level `--confirm` policy; the def's `GateSpec`/`PhaseRole` are declared data, not yet driving `should_pause`) | ⬜ unbuilt |
 | Skills-driven invocation (headless slash form) | ✅ built |
 | `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
