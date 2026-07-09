@@ -143,6 +143,7 @@ pub(crate) fn run(
                     session_id,
                     human_confirm: _, // legacy straight-through path ignores gates
                     repo_ref: _,      // legacy path has no worktree
+                    workflow,
                 } = spec;
                 // Legacy straight-through path: runs to completion on this thread (stub = fast).
                 let res = pipeline::run_session(
@@ -151,6 +152,7 @@ pub(crate) fn run(
                     &problem,
                     entity_mode,
                     &session_id,
+                    workflow.as_deref(),
                     dispatcher.clone(),
                     &mut |ev| emit(&mut subscribers, ev),
                 );
@@ -656,6 +658,7 @@ pub(crate) fn launch_run_inner(
         spec.human_confirm,
         repo_ref,
         workdir,
+        spec.workflow.as_deref(),
         dispatcher,
         &mut |ev| emit(subscribers, ev),
     )?;

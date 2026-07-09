@@ -77,6 +77,7 @@ fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
         session_id: session_id.into(),
         human_confirm: hc,
         repo_ref: None,
+        workflow: None,
     }
 }
 

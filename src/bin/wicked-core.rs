@@ -138,6 +138,7 @@ fn main() {
                 session_id: String::new(),
                 human_confirm: HumanConfirm::None,
                 repo_ref: None,
+                workflow: flag(&args, "--workflow"),
             });
             println!("launched {sid}");
             drain_events(&events, None);
@@ -145,8 +146,9 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: wicked-core <status | repos | register-repo --path <dir> | \
-                 run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] | \
-                 resume --session <id> | cancel --session <id> | launch --problem \"...\"> [--db <path>]"
+                 run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] | \
+                 resume --session <id> | cancel --session <id> | \
+                 launch --problem \"...\" [--workflow <id>]> [--db <path>]"
             );
             std::process::exit(2);
         }
@@ -170,6 +172,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         session_id,
         human_confirm: parse_confirm(args),
         repo_ref,
+        workflow: flag(args, "--workflow"),
     }) {
         Ok(id) => id,
         Err(e) => {

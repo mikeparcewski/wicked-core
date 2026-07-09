@@ -35,12 +35,14 @@ pub struct SessionResult {
 /// claims, and each approved unit's work-output node. This is the straight-through driver (used by
 /// the operator CLI + tests); the actor's interactive engine reuses the same [`plan_and_distribute`]
 /// + [`apply_and_finish_unit`] steps off-thread.
+#[allow(clippy::too_many_arguments)]
 pub fn run_session(
     store: &mut wicked_apps_core::SqliteStore,
     clis: Vec<AgenticCli>,
     problem: &str,
     entity_mode: EntityMode,
     session_id: &str,
+    workflow: Option<&str>,
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<SessionResult> {
@@ -58,6 +60,7 @@ pub fn run_session(
         crate::domain::HumanConfirm::None, // sync path runs straight through (no interactive gates)
         None,                              // sync path has no registered repo
         None,
+        workflow,
         &dispatcher,
         emit,
     )?;
@@ -113,6 +116,33 @@ pub(crate) struct Planned {
     pub cli_keys: Vec<String>,
 }
 
+/// Resolve a selected workflow id to its validated [`WorkflowDef`]. Seeds the built-ins and overlays
+/// operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else `~/.config/wicked-core/workflows`,
+/// best-effort). `None`/unknown id ⇒ `None`, and the caller falls back to the free-text planner.
+fn resolve_workflow_def(workflow: Option<&str>) -> Option<crate::workflow::WorkflowDef> {
+    let id = workflow?;
+    let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
+    if let Some(dir) = workflow_overlay_dir() {
+        // Best-effort: a broken drop-in dir must never wedge a built-in run. Warn, don't fail —
+        // the loud per-file error is available via `def_from_file` for an explicit `workflow lint`.
+        if let Err(e) = reg.load_dir(&dir) {
+            eprintln!(
+                "wicked-core: workflow overlay {} failed to load ({e}); using built-ins only",
+                dir.display()
+            );
+        }
+    }
+    reg.get(id).cloned()
+}
+
+fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {
+        return Some(std::path::PathBuf::from(d));
+    }
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config/wicked-core/workflows"))
+}
+
 /// PLAN + DISTRIBUTE (shared by both drivers): persist the session, decompose the problem into
 /// units, register the workflow's ordered phase list, and let the council assign a CLI per unit.
 /// Emits `SessionStarted` / `UnitPlanned×n` / `UnitDistributed×n` and leaves the session at
@@ -127,16 +157,23 @@ pub(crate) fn plan_and_distribute(
     human_confirm: crate::domain::HumanConfirm,
     repo_ref: Option<String>,
     workdir: Option<String>,
+    workflow: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<Planned> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
 
-    // FAIL CLOSED before persisting anything: governance deny policies are registered per unit phase
-    // up to `DENY_PHASE_SPAN`. A run with more units than that would execute its tail UNGOVERNED, so
-    // we reject it here rather than let governance silently fail open (the run-level deny contract).
-    let mut units = plan::plan_units(problem, session_id);
+    // DATA-DRIVEN planning when a workflow is selected (Law 2): units come from the def's phases, each
+    // unit's stage from the phase's declared `kind`. `None`/unknown id ⇒ the legacy free-text planner.
+    // The def is validated (the registry only hands out validated defs), so plan_from_def's unit-id
+    // uniqueness precondition holds. The DENY_PHASE_SPAN governed-limit check below applies to BOTH
+    // paths — a def with too many phases is rejected exactly like an over-long prose problem.
+    let selected_def = resolve_workflow_def(workflow);
+    let mut units = match &selected_def {
+        Some(def) => plan::plan_from_def(def, problem, session_id),
+        None => plan::plan_units(problem, session_id),
+    };
     if units.len() as u32 > crate::actor::DENY_PHASE_SPAN {
         anyhow::bail!(
             "run has {} units, exceeding the {}-unit governed limit; split the problem into smaller runs",

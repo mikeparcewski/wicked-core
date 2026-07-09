@@ -89,6 +89,11 @@ pub struct LaunchSpec {
     /// The id of a registered repo to run within (P3). When set, COE creates an isolated git
     /// worktree for the run and executes there; `None` runs without a repo (no worktree).
     pub repo_ref: Option<String>,
+    /// The registered `WorkflowDef` id to run (`feature`/`bug`/`migration` or a drop-in). When set,
+    /// planning is DATA-DRIVEN: units come from the def's phases (stage from the phase's declared
+    /// `kind`) via [`crate::plan_from_def`]. `None` ⇒ the legacy free-text planner (prose split +
+    /// keyword classify), so existing callers are unchanged.
+    pub workflow: Option<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -723,6 +728,7 @@ mod tests {
             "Do step one. Do step two",
             EntityMode::Shared,
             "test-pipeline",
+            None, // free-text planner (legacy path)
             Arc::new(Stub),
             &mut |ev| events.push(ev),
         )
@@ -755,5 +761,46 @@ mod tests {
         assert!(units.iter().all(|u| u.status == UnitStatus::Done));
         let out = get_work_output(&store, "test-pipeline:u1").expect("unit 1 output");
         assert!(out.contains("stub-output"), "transcript: {out}");
+
+        // ── Law 2 AT RUNTIME: selecting a workflow makes the run a function of WorkflowDef DATA. ──
+        // Same driver, same prose, but `Some("feature")` — the units now come from the feature def's
+        // phases (ids + declared stage), NOT the sentence-splitter. This is the proof the slice-1
+        // adversarial review's critical finding demanded: a runtime consumer of the registry.
+        let feature = crate::feature_def();
+        let mut ev2: Vec<CoreEvent> = Vec::new();
+        crate::pipeline::run_session(
+            &mut store,
+            vec![cli("fake-a"), cli("fake-b")],
+            "add SSO login", // under the legacy planner this prose is ONE unit; the def makes it 6
+            EntityMode::Shared,
+            "test-feature",
+            Some("feature"),
+            Arc::new(Stub),
+            &mut |e| ev2.push(e),
+        )
+        .expect("def-driven run_session");
+        let funits = session_units(&store, "test-feature").unwrap();
+        assert_eq!(
+            funits.len(),
+            feature.phases.len(),
+            "one unit per feature phase — the def drove planning, not the prose splitter"
+        );
+        for (u, p) in funits.iter().zip(feature.phases.iter()) {
+            // The unit id encodes the backing phase (plan-time linkage the execute path can't clobber).
+            assert_eq!(
+                u.id,
+                format!("test-feature:{}", p.id),
+                "unit id backs its phase"
+            );
+            assert_eq!(
+                u.stage, p.kind,
+                "stage came from the phase's declared kind, not a keyword guess over the prose"
+            );
+        }
+        assert!(
+            funits.len() > 1,
+            "the free-text planner would have made 1 unit from this prose; the def made {}",
+            funits.len()
+        );
     }
 }

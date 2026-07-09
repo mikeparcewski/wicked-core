@@ -117,6 +117,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         session_id: "run".into(),
         human_confirm: HumanConfirm::None,
         repo_ref: Some(entry.id.clone()),
+        workflow: None,
     })
     .expect("launch");
 

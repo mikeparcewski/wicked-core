@@ -67,6 +67,7 @@ impl RunSpec {
             session_id: run_id,
             human_confirm: self.human_confirm,
             repo_ref: self.repo_ref.clone(),
+            workflow: None, // campaign nodes plan free-text today; a per-node WorkflowDef is future work
         }
     }
 }

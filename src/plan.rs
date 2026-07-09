@@ -3,9 +3,9 @@
 //!   * [`plan_units`] — free-text: splits a prose problem on newlines / sentence terminators /
 //!     semicolons and *classifies* each piece's stage by keyword. The legacy path.
 //!   * [`plan_from_def`] — data-driven: derives one unit per [`WorkflowDef`] phase, taking each
-//!     unit's [`StageKind`] from the phase's declared `kind` (never a keyword guess) and recording
-//!     the backing phase in `phase_ref`. The plan is a function of workflow *data* (Law 2), so a
-//!     new workflow changes the plan without touching this module.
+//!     unit's [`StageKind`] from the phase's declared `kind` (never a keyword guess); the backing
+//!     phase is encoded in the unit id (`<session>:<phase_id>`). The plan is a function of workflow
+//!     *data* (Law 2), so a new workflow changes the plan without touching this module.
 
 use crate::domain::WorkUnit;
 use crate::workflow::WorkflowDef;
@@ -37,9 +37,10 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
 
 /// Decompose a run into ordered [`WorkUnit`]s from a [`WorkflowDef`] — one unit per phase, in the
 /// def's phase order. Unlike [`plan_units`], the stage is taken from each phase's declared `kind`
-/// (data-driven, not keyword-classified) and `phase_ref` records the backing phase id. `intent` is
-/// the run's problem statement; each unit's description scopes that intent to its phase so the gate
-/// gets meaningful `work` context. Unit ids are `<session_id>:<phase_id>` (stable across resumes).
+/// (data-driven, not keyword-classified). `intent` is the run's problem statement; each unit's
+/// description scopes that intent to its phase so the gate gets meaningful `work` context. Unit ids
+/// are `<session_id>:<phase_id>` (stable across resumes) — that id is the backing-phase linkage;
+/// `phase_ref` is left untouched (the execute path owns it).
 pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<WorkUnit> {
     // Precondition: `def` is validated — phase ids are unique, so `<session>:<phase_id>` unit ids
     // are collision-free. The registry only ever hands out validated defs (`register` validates),
@@ -68,9 +69,10 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
                 ord,
                 description,
             );
-            // Stage is DATA from the def, not a keyword guess over the description.
+            // Stage is DATA from the def, not a keyword guess over the description. The phase linkage
+            // lives in the unit id (`<session>:<phase_id>`) — we do NOT touch `phase_ref`, which the
+            // execute path owns (it records the orchestration phase, set at execute time).
             unit.stage = phase.kind;
-            unit.phase_ref = Some(phase.id.clone());
             unit
         })
         .collect()
@@ -165,10 +167,11 @@ mod tests {
         let def = feature_def();
         let units = plan_from_def(&def, "add SSO login", "s1");
         assert_eq!(units.len(), def.phases.len());
-        // 1:1, same order, ids/refs derived from the phase — not from prose splitting.
+        // 1:1, same order, unit id derived from the phase id — not from prose splitting. The unit id
+        // IS the backing-phase linkage; phase_ref is left for the execute path.
         for (unit, phase) in units.iter().zip(def.phases.iter()) {
-            assert_eq!(unit.phase_ref.as_deref(), Some(phase.id.as_str()));
             assert_eq!(unit.id, format!("s1:{}", phase.id));
+            assert!(unit.phase_ref.is_none(), "plan must not pre-set phase_ref");
         }
         assert_eq!(units[0].ord, 1);
         assert_eq!(units.last().unwrap().ord, units.len() as u32);

@@ -102,6 +102,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
         repo_ref: None,
+        workflow: None,
     }
 }
 
