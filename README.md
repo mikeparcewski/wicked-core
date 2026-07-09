@@ -108,13 +108,15 @@ agreed," **not** "proven."
 | **Provisioning** — `provision-validator` / `approve-validator` CLI (author→approve→pin, **live-verified**) + a phase's `validator_pin` auto-loaded from the vault at plan time so the gate **engages** | ✅ built |
 | Gate wired into the phase flow — deterministic re-verify + off-thread agent judge fold, deny-dominates, **repo-less runs fail-closed** (agent can't lone-approve) | ✅ built |
 | **Rust↔wicked-bus bridge** — emit/poll matching the JS schema (config TTL), `wicked.run.requested`→launch + `run.launched`, at-least-once retry; **cross-language round-trip verified** (`src/bus.rs`) | ✅ built |
+| **Law 1 execution-mediation seam** — actor publishes `task.dispatched` → a `cli-runner` subscriber executes off-actor → `task.completed` → actor; **opt-in** (`WICKED_BUS_EXEC`), default stays in-process; round-trip verified identical to in-process (`src/cli_runner.rs`) | ✅ built |
+| **Gate a shipped workflow** — the `gate-phase` CLI authors→approves→pins a validator into a drop-in def (one command) | ✅ built |
 | **napi bridge** (`../wicked-core-ts`) — `launchRun`/`subscribe`/`confirmGate` over FFI; adversarially reviewed (9 findings incl. tsfn leak + OOM, fixed); Node smoke passes | ✅ built |
 | Real **OS sandbox** for validator execution (the denylist is a backstop, not a boundary) | ⬜ hardening |
 | napi → **studio UI** wiring (the addon exists; the Tauri/React surface consumes it) | ⬜ follow-up |
 | Council-assigns-skill-at-runtime | ⬜ deferred — needs a grounded skill-ranking design (guessing skill names would violate grounding) |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
 
-> **⚠️ Shipped-workflow caveat:** the built-in `feature`/`bug`/`migration` defs ship with `validator_pin: null`, so the dual-validator gate is **inert for the shipped workflows** — it engages only for a def whose phase carries a `validator_pin`. Author + approve a validator with `provision-validator`/`approve-validator`, then put the approved pin into a workflow def's phase. (A seed/CLI step that writes the pin back into a def automatically is the tracked follow-up.)
+> **⚠️ Shipped-workflow caveat:** the built-in `feature`/`bug`/`migration` defs ship with `validator_pin: null`, so the dual-validator gate is **inert for the shipped workflows by default** — it engages only for a def whose phase carries a `validator_pin`. Turn it on with one command: `wicked-core gate-phase --workflow feature --phase build --criterion "…"` authors→approves→pins a validator and emits a gated drop-in def you then run with `--workflow <new-id>`.
 
 ## Reference
 
