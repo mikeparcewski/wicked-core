@@ -15,6 +15,7 @@ mod actor;
 mod applications;
 mod bus;
 mod campaign;
+mod cli_runner;
 mod code_graph;
 mod command;
 mod distribute;
@@ -52,6 +53,7 @@ pub use campaign::{
     validate as validate_campaign, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision,
     CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
 };
+pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
 pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
@@ -175,6 +177,30 @@ impl Core {
         dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
         runner: std::sync::Arc<dyn StepRunner>,
     ) -> Core {
+        Core::spawn_inner(path, dispatcher, runner, None)
+    }
+
+    /// Spawn with the Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) turned ON EXPLICITLY against the
+    /// bus db at `bus_db_path` — the actor publishes `wicked.task.dispatched` for a `cli-runner`
+    /// subscriber instead of dispatching units in-process, and consumes `wicked.task.completed` back. This
+    /// is the env-free entry (no `WICKED_BUS_EXEC` global) so a test can prove the round-trip without
+    /// racing other tests on process env. Production opts in via `WICKED_BUS_EXEC` + `WICKED_BUS_DB`
+    /// (read by [`spawn_with_engine`]).
+    pub fn spawn_with_engine_exec(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+        bus_db_path: impl Into<String>,
+    ) -> Core {
+        Core::spawn_inner(path, dispatcher, runner, Some(bus_db_path.into()))
+    }
+
+    fn spawn_inner(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+        exec_bus: Option<String>,
+    ) -> Core {
         let (tx, rx) = channel();
         let path = path.into();
         let self_tx = tx.clone();
@@ -182,7 +208,9 @@ impl Core {
         // actor for open/close/shutdown. Both reach the same sessions behind its mutex.
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
-        std::thread::spawn(move || actor::run(path, rx, self_tx, dispatcher, runner, pty_actor));
+        std::thread::spawn(move || {
+            actor::run(path, rx, self_tx, dispatcher, runner, pty_actor, exec_bus)
+        });
         Core {
             tx: tx.clone(),
             pty,

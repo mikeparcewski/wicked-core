@@ -79,6 +79,7 @@ impl std::error::Error for RunExists {}
 /// `Shutdown` is therefore the real exit. On exit, `store` drops and the writable connection is
 /// released. `dispatcher`/`runner` are the injectable council + step-execution seams (real in prod,
 /// stubbed in tests).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     path: String,
     rx: Receiver<Command>,
@@ -86,6 +87,7 @@ pub(crate) fn run(
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     runner: Arc<dyn StepRunner>,
     pty_map: PtyMap,
+    exec_bus: Option<String>,
 ) {
     let mut store = match open_store(Some(&path)) {
         Ok(s) => s,
@@ -157,6 +159,46 @@ pub(crate) fn run(
                 bus_stop.clone(),
             )
         });
+
+    // Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) — OPT-IN. Resolve the bus db to mediate
+    // execution over: the explicit `spawn_with_engine_exec` override wins; otherwise the env gate
+    // `WICKED_BUS_EXEC` (any non-empty value) turns it on against `WICKED_BUS_DB`. When OFF (the default),
+    // `dispatch_unit` spawns the in-process worker exactly as before and NONE of the exec threads run.
+    let exec_bus_db: Option<String> = exec_bus.or_else(|| {
+        let on = std::env::var("WICKED_BUS_EXEC")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some();
+        on.then(|| {
+            std::env::var("WICKED_BUS_DB")
+                .ok()
+                .filter(|p| !p.is_empty())
+        })
+        .flatten()
+    });
+    // Arm the actor-thread publisher (thread-local) + spawn the two off-actor exec threads. If the bus
+    // db can't be opened for publishing, exec mode stays OFF (in-process) — no threads spawned.
+    let exec_stop = Arc::new(AtomicBool::new(false));
+    let exec_handles: Vec<std::thread::JoinHandle<()>> = match &exec_bus_db {
+        Some(bus_db) if crate::cli_runner::arm_exec_publisher(bus_db) => {
+            let interval = std::time::Duration::from_millis(100);
+            vec![
+                crate::cli_runner::spawn_cli_runner(
+                    bus_db.clone(),
+                    runner.clone(),
+                    interval,
+                    exec_stop.clone(),
+                ),
+                crate::cli_runner::spawn_task_completed_poller(
+                    bus_db.clone(),
+                    self_tx.clone(),
+                    interval,
+                    exec_stop.clone(),
+                ),
+            ]
+        }
+        _ => Vec::new(),
+    };
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -586,6 +628,13 @@ pub(crate) fn run(
     if let Some(h) = bus_bridge {
         let _ = h.join();
     }
+    // Stop + join the exec-mediation threads (cli-runner + task.completed poller) and disarm the
+    // actor-thread publisher, so exec mode leaks no thread past the actor's lifetime (DES §5, R1).
+    exec_stop.store(true, Ordering::SeqCst);
+    for h in exec_handles {
+        let _ = h.join();
+    }
+    crate::cli_runner::disarm_exec_publisher();
 
     // Loop exited (last Core dropped): `store` drops here, releasing the writable connection. Any
     // in-flight worker that posts a result now sends into a closed channel and is harmlessly dropped.
@@ -1145,6 +1194,21 @@ fn dispatch_unit(
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
     };
+
+    // LAW 1 EXECUTION-MEDIATION SEAM (opt-in). When exec-mediation is armed on this (actor) thread, the
+    // reducer does NOT call execution directly: it PUBLISHES `wicked.task.dispatched` and returns. The
+    // off-actor `cli-runner` subscriber runs the unit (via the SAME runner) and publishes
+    // `wicked.task.completed`, which the `task.completed` poller turns back into a `Command::ApplyStepResult`
+    // on this actor — the identical apply the in-process worker below would have produced. `agent_review_target`
+    // (the creator's cold output, resolved on-thread above) rides in the dispatched event so the off-actor
+    // judge sees the right artifact. A publish failure returns `false` → we fall through to the in-process
+    // worker so the run still makes progress rather than wedging with no worker. See `cli_runner.rs`.
+    if crate::cli_runner::is_exec_enabled()
+        && crate::cli_runner::try_publish_dispatched(&input, agent_review_target.as_deref())
+    {
+        return Ok(true);
+    }
+
     let runner = runner.clone();
     let tx = self_tx.clone();
     std::thread::spawn(move || {
@@ -1163,44 +1227,21 @@ fn dispatch_unit(
                 });
             }
         };
-        let output = runner.run_unit_streaming(&input, &emit);
-        // rev0.4 DUAL-VALIDATOR LAYER-2 (the AGENT semantic judge), computed HERE — on the worker
-        // thread, NOT the actor. ACTOR-SAFETY: `agent_validate` runs `claude -p` (an LLM; slow), which
-        // must never execute on the single-writer actor thread or it would stall every other command.
-        // This closure IS the off-thread seam (same place the unit's slow work already runs, holding no
-        // store handle), so the LLM call is off-thread by construction. The verdict rides back on the
-        // `ApplyStepResult` command; the actor folds it into the gate via `combine_verdict`. The
-        // criterion is the unit's PINNED validator's criterion (the natural acceptance criterion), so a
-        // verified/evaluator phase gets BOTH the deterministic re-verify AND this agent judgment. A unit
-        // with no pinned validator gets `None` (no agent judgment). We skip a non-Ok step (a failed /
-        // cancelled worker is handled by the actor before any gate). An authoring error fails CLOSED to
-        // REJECT (deny-dominates).
-        //
+        // rev0.4 DUAL-VALIDATOR LAYER-2 (the AGENT semantic judge) + the unit's slow work run HERE — on the
+        // worker thread, NOT the actor. ACTOR-SAFETY: `run_unit_and_judge` calls the runner (a subprocess)
+        // and `agent_validate` (an LLM `claude -p`; slow), which must never execute on the single-writer
+        // actor thread or it would stall every other command. This closure IS the off-thread seam (holds no
+        // store handle). The SAME helper the `cli-runner` subscriber calls (`cli_runner::run_unit_and_judge`)
+        // — so the in-process path and the bus-mediated path produce a byte-identical `(output, agent_verdict)`.
         // The WORK the agent judges is the creator's COLD output for an Evaluator-role unit
-        // (`agent_review_target`, resolved on the actor above — seam finding #8), else the unit's own
-        // output — so the evaluator's judgment gates the creator's work, matching the governance pass.
-        //
-        // COST GUARD (seam finding #11): skip the (slow, paid) `claude -p` entirely when the run has NO
-        // workdir. Layer-1 (`pinned_validator_denial`) fails CLOSED without a worktree to re-verify
-        // against, so its deny would override any agent verdict anyway — paying for the LLM is wasted.
-        let work_for_agent = agent_review_target.as_deref().unwrap_or(&output.output);
-        let agent_verdict = if output.status == crate::workflow::StepStatus::Ok
-            && input.workdir.is_some()
-        {
-            input
-                .unit
-                .validator
-                .as_ref()
-                .filter(|v| v.approved)
-                .map(|v| {
-                    match crate::validator::agent_validate(&v.criterion, work_for_agent, &*runner) {
-                        Ok(av) => (av.pass, av.reasoning),
-                        Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
-                    }
-                })
-        } else {
-            None
-        };
+        // (`agent_review_target`, seam finding #8), else the unit's own output. The verdict rides back on the
+        // `ApplyStepResult` command; the actor folds it into the gate via `combine_verdict`.
+        let (output, agent_verdict) = crate::cli_runner::run_unit_and_judge(
+            &runner,
+            &input,
+            agent_review_target.as_deref(),
+            &emit,
+        );
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,

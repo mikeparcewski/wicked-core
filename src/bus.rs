@@ -289,6 +289,18 @@ impl BusDb {
         }
     }
 
+    /// The current tail — `MAX(event_id)` (0 on an empty log). Used to snapshot a poller's cursor floor
+    /// SYNCHRONOUSLY before spawning it, so it starts at "latest" (never replays history) yet cannot miss
+    /// an event emitted right after the snapshot. See [`spawn_run_requested_poller`]'s doc for why this
+    /// must be read on the caller's thread, not lazily inside the poller.
+    pub fn tail_event_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
+                r.get(0)
+            })?)
+    }
+
     /// Poll up to `batch` events matching `filter`, strictly after `after_event_id`, that have not
     /// expired. `after_event_id` is the caller's durable cursor floor (the JS bus persists an
     /// equivalent per-cursor `last_event_id`); the caller advances it past what it has handled. Rows
@@ -506,13 +518,9 @@ pub fn spawn_run_requested_poller(
     // would replay EVERY non-expired historical `run.requested` (up to the TTL window, ~72h) as a fresh
     // launch: a mass-duplicate storm. Instead treat the bridge as un-initialized and disable it (the
     // same posture as the thread-side open-failure path below), spawning a thread that just exits.
-    let floor_init: Option<i64> = BusDb::open(&bus_db_path).ok().and_then(|db| {
-        db.conn
-            .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
-                r.get(0)
-            })
-            .ok()
-    });
+    let floor_init: Option<i64> = BusDb::open(&bus_db_path)
+        .ok()
+        .and_then(|db| db.tail_event_id().ok());
     let floor_init = match floor_init {
         Some(f) => f,
         None => {
