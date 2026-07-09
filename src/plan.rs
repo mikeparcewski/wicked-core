@@ -41,6 +41,16 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
 /// the run's problem statement; each unit's description scopes that intent to its phase so the gate
 /// gets meaningful `work` context. Unit ids are `<session_id>:<phase_id>` (stable across resumes).
 pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<WorkUnit> {
+    // Precondition: `def` is validated — phase ids are unique, so `<session>:<phase_id>` unit ids
+    // are collision-free. The registry only ever hands out validated defs (`register` validates),
+    // so the runtime path upholds this; the assert catches a raw unvalidated def in dev.
+    debug_assert!(
+        {
+            let mut seen = std::collections::HashSet::new();
+            def.phases.iter().all(|p| seen.insert(p.id.as_str()))
+        },
+        "plan_from_def requires a validated def (unique phase ids); call WorkflowDef::validate first"
+    );
     let intent = intent.trim();
     def.phases
         .iter()

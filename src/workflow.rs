@@ -175,7 +175,10 @@ pub enum PhaseRole {
 }
 
 /// One ordered phase of a workflow — pure DATA the reducer dispatches on.
+/// `deny_unknown_fields`: a misspelled key in a drop-in JSON is a loud parse error (naming the
+/// file), never a silently-dropped default — matching the workflows/README.md contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhaseDef {
     /// Phase id, unique within the workflow (referenced by `depends_on`). The ONLY required field
     /// in a drop-in JSON file — everything below defaults, so the minimal phase is `{"id":"x"}`.
@@ -251,6 +254,7 @@ impl PhaseDef {
 
 /// A workflow — an id + an ordered list of phases. Pure data; registered in the [`WorkflowRegistry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowDef {
     pub id: String,
     pub phases: Vec<PhaseDef>,
@@ -261,8 +265,18 @@ pub struct WorkflowDef {
 pub enum WorkflowDefError {
     Empty,
     DuplicatePhaseId(String),
-    UnknownDependency { phase: String, dep: String },
-    DependencyCycle,
+    UnknownDependency {
+        phase: String,
+        dep: String,
+    },
+    /// A phase depends on itself or a later-declared phase. Declaration order IS the execution order
+    /// (the planner assigns `ord` from the phase index), so every dependency must point *backward*.
+    /// This makes the Vec order a valid topological order — and any genuine cycle necessarily shows
+    /// up here as a forward edge, so it subsumes cycle detection.
+    ForwardDependency {
+        phase: String,
+        dep: String,
+    },
 }
 
 impl std::fmt::Display for WorkflowDefError {
@@ -273,7 +287,11 @@ impl std::fmt::Display for WorkflowDefError {
             WorkflowDefError::UnknownDependency { phase, dep } => {
                 write!(f, "phase {phase} depends on unknown phase {dep}")
             }
-            WorkflowDefError::DependencyCycle => write!(f, "phase dependency cycle"),
+            WorkflowDefError::ForwardDependency { phase, dep } => write!(
+                f,
+                "phase {phase} depends on {dep}, which is not declared before it \
+                 (declaration order must be execution order — dependencies point backward)"
+            ),
         }
     }
 }
@@ -292,42 +310,35 @@ impl WorkflowDef {
                 return Err(WorkflowDefError::DuplicatePhaseId(p.id.clone()));
             }
         }
-        for p in &self.phases {
-            for d in &p.depends_on {
-                if !ids.contains(d.as_str()) {
-                    return Err(WorkflowDefError::UnknownDependency {
-                        phase: p.id.clone(),
-                        dep: d.clone(),
-                    });
-                }
-            }
-        }
-        // Kahn's algorithm over the depends_on edges (owned keys — no borrow tangle with the mutation).
-        let mut indeg: HashMap<String, usize> = self
+        // Declaration order IS execution order: the planner assigns `ord` from the phase index, so
+        // every dependency must reference an EARLIER phase. This one position check does three jobs —
+        // resolves deps (unknown → error), forbids self/forward edges, and thereby guarantees the Vec
+        // order is a valid topological order, so a genuine cycle can't even be expressed (it would
+        // need a forward edge). Listing the same backward dep twice is harmless and accepted.
+        let pos: HashMap<&str, usize> = self
             .phases
             .iter()
-            .map(|p| (p.id.clone(), p.depends_on.len()))
+            .enumerate()
+            .map(|(i, p)| (p.id.as_str(), i))
             .collect();
-        let mut queue: Vec<String> = indeg
-            .iter()
-            .filter(|(_, d)| **d == 0)
-            .map(|(k, _)| k.clone())
-            .collect();
-        let mut seen = 0usize;
-        while let Some(n) = queue.pop() {
-            seen += 1;
-            for p in &self.phases {
-                if p.depends_on.contains(&n) {
-                    let e = indeg.get_mut(&p.id).unwrap();
-                    *e -= 1;
-                    if *e == 0 {
-                        queue.push(p.id.clone());
+        for (i, p) in self.phases.iter().enumerate() {
+            for d in &p.depends_on {
+                match pos.get(d.as_str()) {
+                    None => {
+                        return Err(WorkflowDefError::UnknownDependency {
+                            phase: p.id.clone(),
+                            dep: d.clone(),
+                        })
                     }
+                    Some(&dp) if dp >= i => {
+                        return Err(WorkflowDefError::ForwardDependency {
+                            phase: p.id.clone(),
+                            dep: d.clone(),
+                        })
+                    }
+                    Some(_) => {}
                 }
             }
-        }
-        if seen != self.phases.len() {
-            return Err(WorkflowDefError::DependencyCycle);
         }
         Ok(())
     }
@@ -379,7 +390,9 @@ impl WorkflowRegistry {
             .with_context(|| format!("reading workflow dir {}", dir.display()))?
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            // A regular file (following symlinks) ending in `.json`. Guards against a subdirectory
+            // or symlink-to-dir named `x.json`, which would otherwise be read and abort the load.
+            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("json"))
             .collect();
         paths.sort(); // deterministic load order regardless of filesystem enumeration
         let mut loaded = Vec::new();
@@ -603,6 +616,8 @@ mod workflow_def_tests {
 
     #[test]
     fn a_cyclic_def_is_rejected() {
+        // A 2-cycle (a↔b) can't be laid out backward-only: whichever phase is declared first
+        // depends on a later one, surfacing as a forward edge.
         let bad = WorkflowDef {
             id: "cyclic".to_string(),
             phases: vec![
@@ -610,7 +625,51 @@ mod workflow_def_tests {
                 PhaseDef::new("b", StageKind::Build).after("a"),
             ],
         };
-        assert_eq!(bad.validate(), Err(WorkflowDefError::DependencyCycle));
+        assert!(matches!(
+            bad.validate(),
+            Err(WorkflowDefError::ForwardDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn a_forward_or_self_dependency_is_rejected() {
+        // Forward: "a" (declared first) depends on the later "b".
+        let forward = WorkflowDef {
+            id: "fwd".to_string(),
+            phases: vec![
+                PhaseDef::new("a", StageKind::Build).after("b"),
+                PhaseDef::new("b", StageKind::Build),
+            ],
+        };
+        assert!(matches!(
+            forward.validate(),
+            Err(WorkflowDefError::ForwardDependency { .. })
+        ));
+        // Self-dependency is also a forward edge (dp == i).
+        let selfdep = WorkflowDef {
+            id: "self".to_string(),
+            phases: vec![PhaseDef::new("a", StageKind::Build).after("a")],
+        };
+        assert!(matches!(
+            selfdep.validate(),
+            Err(WorkflowDefError::ForwardDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn a_backward_dep_listed_twice_is_not_a_false_cycle() {
+        // Regression: the old Kahn indeg miscounted duplicate deps and reported a phantom cycle.
+        let dup = WorkflowDef {
+            id: "dup".to_string(),
+            phases: vec![
+                PhaseDef::new("a", StageKind::Build),
+                PhaseDef {
+                    depends_on: vec!["a".to_string(), "a".to_string()],
+                    ..PhaseDef::new("b", StageKind::Build)
+                },
+            ],
+        };
+        assert_eq!(dup.validate(), Ok(()));
     }
 
     #[test]
