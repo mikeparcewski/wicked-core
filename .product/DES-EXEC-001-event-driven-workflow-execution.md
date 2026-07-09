@@ -198,10 +198,8 @@ Mechanism (decisions committed 2026-07-09; forks flagged for operator veto):
   verified headless recipe (`claude -p "/wicked-testing-<skill> …" --output-format json`, one isolated
   process per reviewer — see brain memory `headless-skill-invocation-recipe`). Grounded with the
   phase/task spec artifacts (clarify/design outputs + ACs) as input.
-- **Dual validator, two independent strategists (operator addition, 2026-07-09).** The evidence
-  evaluator is a **pair**, each piece authored by a **different** test-strategist seat (evaluator≠creator
-  pushed into the *authoring* layer — independent seats give uncorrelated blind spots; if one misframes
-  the spec, the other catches it): (a) a **deterministic** validator (the grounded script — precise,
+- **Dual validator (operator addition, 2026-07-09).** The evidence evaluator is a **pair**: (a) a
+  **deterministic** validator (the grounded script — precise,
   auditable, cheap, can't judge semantics) and (b) an **agent-based** validator (judgment: "does this
   satisfy the intent?" — which no script can encode). Mirrors wicked-testing's own split:
   `acceptance-test-writer` (deterministic, evidence-gated) + `semantic-reviewer` (judges what the AC
@@ -244,7 +242,12 @@ Mechanism (decisions committed 2026-07-09; forks flagged for operator veto):
 - **Data:** `PhaseDef` (and optionally `WorkUnit`) gain up to two validator pins — a
   `deterministic_validator_ref` and an `agent_validator_ref` (each a **content-hash pin** so the gate runs
   the *exact* approved artifact; either may be absent). `skill_ref` names the **authoring** agent(s), not
-  the check; the two pieces are authored by two distinct strategist seats.
+  the check.
+- **Independence — HONEST as-built (integrated review, 2026-07-09).** The two pieces are complementary
+  (structural vs semantic), but as built they are **distinct PROMPTS/framing on the same runner**, not
+  genuinely distinct council SEATS — so "uncorrelated blind spots from independent seats" is the
+  *aspiration*, not today's guarantee. Wiring each piece to a real distinct council seat (different
+  CLI/identity) is the tracked follow-up that would make the independence real.
 - **Event-driven fit:** authoring the validator is itself a phase/task emitting events; "validator
   approved" is gate **state + notification** (not request/reply); running it at the gate is the
   deterministic re-verify. All consistent with Law 1.
@@ -369,6 +372,16 @@ round-tripped through the real bus: `wicked.run.requested {workflow, problem, ar
 subscribes `wicked.run.*` → poll → nested args survive → ack) and `wicked.skill.needed → wicked.skill.ready`
 (provisioner sidecar polls needed → emits ready → a reducer cursor scoped to `.ready` polls only that;
 `run_id` correlation survives the chain). The substrate needs **zero new infrastructure**.
+
+**HONEST SCOPE (integrated review, 2026-07-09) — what the bridge does NOT yet do.** `src/bus.rs` +
+`Core::connect_bus` carry ONLY the **launch-trigger edge** (`wicked.run.requested` → `LaunchRun`, plus a
+`wicked.run.launched` back), and it is **opt-in / env-gated** (`WICKED_BUS_DB`). The design's central
+**mediation seam of Law 1** — the actor PUBLISHING `task.dispatched` for a `cli-runner` subscriber that
+executes off-bus and PUBLISHES `task.completed` back, i.e. "the actor no longer calls execution directly"
+— is **NOT built**: a shipped run still dispatches units in-process (`dispatch_unit` → worker thread →
+`ApplyStepResult`), not over the bus. So **Law 1 is realized for the launch trigger, not for the
+execution seam.** Building the `task.dispatched`/`task.completed` mediation over this proven substrate is
+the tracked follow-up; today the bus is an ingress trigger + lifecycle emitter, not the control plane.
 - **Real library API** (the wicked-bus README's programmatic example is STALE): `emit(db, config,
   {event_type, domain, subdomain, payload})`; `register(db, {plugin, role:'subscriber', filter,
   cursor_init})` → `{cursor_id}`; `poll(db, cursorId, {batchSize})` → **array of raw rows** (payload is a
