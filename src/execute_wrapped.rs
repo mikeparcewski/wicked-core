@@ -63,7 +63,11 @@ impl WrappedCliStepRunner {
             .assigned_invocation
             .clone()
             .unwrap_or_else(|| resolve_invocation(&cli_key));
-        let argv = build_argv(&invocation, &skill_prompt(&input.unit));
+        let argv = build_argv(
+            &invocation,
+            &skill_prompt(&input.unit),
+            &input.unit.allowed_skills,
+        );
 
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
@@ -248,9 +252,9 @@ fn tokenize(s: &str) -> Vec<String> {
 /// named skill deterministically (the verified recipe — see brain `headless-skill-invocation-recipe`);
 /// otherwise it's the bare description (the authored-prompt path). Pure + testable without a subprocess.
 ///
-/// NOTE: `unit.allowed_skills` (the runtime tool/skill scope, §4.2) is NOT yet injected here — it maps
-/// to a per-CLI flag (e.g. claude's `--allowedTools`) and rides the invocation template, which is the
-/// next increment. The allowlist is carried on the unit already so the wiring is a local change.
+/// The runtime skill allowlist (`unit.allowed_skills`, §4.2) rides the invocation template via a
+/// `{SKILLS}` placeholder — see [`build_argv`]. The template author picks the per-CLI flag (e.g.
+/// `claude … --allowedTools {SKILLS}`), so the engine never hard-codes one CLI's semantics.
 pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
     match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => format!("/{skill} {}", unit.description),
@@ -258,10 +262,17 @@ pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
     }
 }
 
-pub(crate) fn build_argv(invocation: &str, prompt: &str) -> Vec<String> {
+/// Build the argv from an invocation template, substituting `{PROMPT}` (the skill-led prompt, guarded
+/// as its own arg) and `{SKILLS}` (the runtime allowlist, §4.2). `{SKILLS}` expands to the allowlist
+/// joined by commas; when the allowlist is EMPTY the placeholder is dropped along with a directly
+/// preceding flag token — so `--allowedTools {SKILLS}` cleanly disappears rather than leaving a
+/// dangling flag. Put `{SKILLS}` (a flag value) BEFORE `{PROMPT}` in the template, since the prompt
+/// pushes a `--` end-of-options guard that would turn a following flag into a positional arg.
+pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> Vec<String> {
     let toks = tokenize(invocation);
     let mut argv: Vec<String> = Vec::new();
     let mut placed = false;
+    let joined = skills.join(",");
     let ensure_guard = |argv: &mut Vec<String>| {
         let prev_is_flag = argv.last().map(|p| p.starts_with('-')).unwrap_or(false);
         if !prev_is_flag && !argv.iter().any(|a| a == "--") {
@@ -269,7 +280,19 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str) -> Vec<String> {
         }
     };
     for t in &toks {
-        if t == "{PROMPT}" {
+        if t == "{SKILLS}" {
+            if skills.is_empty() {
+                // No allowlist ⇒ drop the placeholder and a directly-preceding flag (the whole
+                // `--allowedTools {SKILLS}` pair vanishes).
+                if argv.last().map(|p| p.starts_with('-')).unwrap_or(false) {
+                    argv.pop();
+                }
+            } else {
+                argv.push(joined.clone());
+            }
+        } else if t.contains("{SKILLS}") {
+            argv.push(t.replace("{SKILLS}", &joined));
+        } else if t == "{PROMPT}" {
             ensure_guard(&mut argv);
             argv.push(prompt.to_string());
             placed = true;
@@ -332,7 +355,7 @@ mod tests {
     fn a_skill_prompt_flows_through_build_argv_as_one_guarded_arg() {
         let mut u = WorkUnit::pending("s:build", "s", 1, "do it");
         u.skill_ref = Some("wicked-testing-plan".to_string());
-        let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u));
+        let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u), &[]);
         assert_eq!(
             argv,
             vec![
@@ -345,9 +368,44 @@ mod tests {
     }
 
     #[test]
+    fn skills_placeholder_expands_the_allowlist_before_the_prompt() {
+        let skills = vec![
+            "wicked-testing-execution".to_string(),
+            "wicked-testing-authoring".to_string(),
+        ];
+        let argv = build_argv(
+            "claude -p --allowedTools {SKILLS} {PROMPT}",
+            "do it",
+            &skills,
+        );
+        assert_eq!(
+            argv,
+            vec![
+                "claude".to_string(),
+                "-p".to_string(),
+                "--allowedTools".to_string(),
+                "wicked-testing-execution,wicked-testing-authoring".to_string(),
+                "--".to_string(),
+                "do it".to_string(),
+            ],
+            "the allowlist is one comma-joined value; the prompt still gets its -- guard"
+        );
+    }
+
+    #[test]
+    fn empty_skills_drop_the_placeholder_and_its_flag() {
+        // No allowlist ⇒ the whole `--allowedTools {SKILLS}` pair vanishes, leaving a clean argv.
+        let argv = build_argv("claude -p --allowedTools {SKILLS} {PROMPT}", "do it", &[]);
+        assert_eq!(
+            argv,
+            vec!["claude".to_string(), "-p".to_string(), "do it".to_string(),]
+        );
+    }
+
+    #[test]
     fn prompt_is_a_guarded_standalone_arg() {
         assert_eq!(
-            build_argv("echo {PROMPT}", "--help"),
+            build_argv("echo {PROMPT}", "--help", &[]),
             vec!["echo".to_string(), "--".to_string(), "--help".to_string()]
         );
     }
@@ -355,7 +413,7 @@ mod tests {
     #[test]
     fn flag_value_position_keeps_binding() {
         assert_eq!(
-            build_argv("claude -p {PROMPT}", "hi"),
+            build_argv("claude -p {PROMPT}", "hi", &[]),
             vec!["claude".to_string(), "-p".to_string(), "hi".to_string()]
         );
     }
