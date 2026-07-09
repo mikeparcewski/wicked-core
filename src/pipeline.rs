@@ -81,6 +81,7 @@ pub fn run_session(
             entity_mode,
             session_id,
             &cli_keys,
+            None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             emit,
         )?;
         outcomes.push(outcome);
@@ -285,6 +286,7 @@ pub(crate) fn apply_and_finish_unit(
     entity_mode: EntityMode,
     session_id: &str,
     cli_keys: &[String],
+    agent_verdict: Option<&(bool, String)>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<UnitOutcome> {
     let mut outcome =
@@ -326,6 +328,24 @@ pub(crate) fn apply_and_finish_unit(
         if let Some(reason) =
             pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new))
         {
+            outcome.approved = false;
+            outcome.denial_reason = Some(reason);
+        }
+    }
+
+    // AGENT VALIDATOR — the rev0.4 dual-validator LAYER-2 (semantic judge), deny-dominates. The verdict
+    // was computed OFF-THREAD by the worker (actor::dispatch_unit's closure), because `agent_validate`
+    // runs `claude -p` and must never touch the single-writer actor thread; here we only FOLD the
+    // already-computed verdict — pure, no LLM, actor-safe. Reached only when the unit still holds (it
+    // passed the deterministic layer-1 above), so `combine_verdict` is applied with the deterministic
+    // side PASS; an agent REJECT flips the unit to denied BEFORE the status is persisted, mirroring the
+    // deterministic `pinned_validator_denial`. Both layers must pass, and `combine_verdict` guarantees
+    // the agent can never be the SOLE approver. `None` ⇒ no pinned validator (structural phase) ⇒ no
+    // change. The criterion is the pinned validator's (chosen in dispatch_unit) — so an Evaluator/
+    // verified phase is judged against the same acceptance criterion it is deterministically re-verified
+    // against.
+    if outcome.approved {
+        if let Some(reason) = agent_verdict_denial(agent_verdict) {
             outcome.approved = false;
             outcome.denial_reason = Some(reason);
         }
@@ -378,6 +398,27 @@ fn pinned_validator_denial(
         Ok(true) => None,
         Ok(false) => Some(format!("pinned validator failed: {}", v.criterion)),
         Err(e) => Some(format!("pinned validator error: {e}")),
+    }
+}
+
+/// Fold the OFF-THREAD agent verdict into the gate (rev0.4 dual-validator layer-2) via
+/// [`crate::validator::combine_verdict`], deny-dominates. Called only when the unit already PASSED the
+/// deterministic layer (`outcome.approved` still true), so `deterministic_pass = true` here; an agent
+/// REJECT ⇒ `Some(denial_reason)` (the gate then denies). `None` verdict (no pinned validator /
+/// structural phase) OR an agent PASS ⇒ `None` (no denial). PURE + actor-safe: the LLM already ran on
+/// the worker thread; this only interprets the `(pass, reasoning)` it produced. `combine_verdict`
+/// guarantees the agent can FAIL a gate but is never the sole approver.
+fn agent_verdict_denial(agent: Option<&(bool, String)>) -> Option<String> {
+    let (pass, reasoning) = agent?;
+    let verdict = crate::validator::AgentVerdict {
+        pass: *pass,
+        reasoning: reasoning.clone(),
+    };
+    match crate::validator::combine_verdict(true, Some(&verdict)) {
+        crate::validator::GateVerdict::Approve => None,
+        crate::validator::GateVerdict::Reject => {
+            Some(format!("agent validator rejected: {reasoning}"))
+        }
     }
 }
 
@@ -480,6 +521,55 @@ mod resolve_tests {
         unit.validator = Some(mk("test -f ok.txt", false));
         assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_verdict_denial_folds_the_rev04_combine_rule() {
+        // No agent verdict (no pinned validator / structural phase) ⇒ no denial.
+        assert!(agent_verdict_denial(None).is_none());
+        // Agent PASS ⇒ no denial (deterministic side already passed to reach here).
+        assert!(agent_verdict_denial(Some(&(true, "looks good".into()))).is_none());
+        // Agent REJECT ⇒ denial (deny-dominates); the reason is carried through for the UI.
+        let denial = agent_verdict_denial(Some(&(false, "diverged from criterion".into())));
+        assert!(
+            denial
+                .as_deref()
+                .unwrap()
+                .contains("diverged from criterion"),
+            "agent reject must deny and surface the reason: {denial:?}"
+        );
+    }
+
+    #[test]
+    fn agent_reject_flips_an_approved_unit_to_denied_in_the_gate_fold() {
+        // Exercise the EXACT gate-fold shape from `apply_and_finish_unit` (combine_verdict deny path)
+        // WITHOUT an LLM or a store: the deterministic layer has approved (`approved == true`); the
+        // off-thread agent verdict is REJECT; the fold must flip the unit to denied and record why.
+        let mut approved = true;
+        let mut denial_reason: Option<String> = None;
+        let agent = (
+            false,
+            "output does not satisfy the acceptance criterion".to_string(),
+        );
+        if approved {
+            if let Some(reason) = agent_verdict_denial(Some(&agent)) {
+                approved = false;
+                denial_reason = Some(reason);
+            }
+        }
+        assert!(
+            !approved,
+            "agent REJECT must flip an approved unit to denied"
+        );
+        assert!(denial_reason.unwrap().contains("does not satisfy"));
+
+        // Mirror: an agent PASS leaves an approved unit approved (the agent never lone-approves, but it
+        // also must not spuriously deny a passing unit).
+        let mut approved2 = true;
+        if approved2 && agent_verdict_denial(Some(&(true, "ok".into()))).is_some() {
+            approved2 = false;
+        }
+        assert!(approved2, "agent PASS must not flip an approved unit");
     }
 
     #[test]

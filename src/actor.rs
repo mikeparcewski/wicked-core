@@ -202,9 +202,19 @@ pub(crate) fn run(
                 );
                 let _ = reply.send(res);
             }
-            Command::ApplyStepResult { output } => {
+            Command::ApplyStepResult {
+                output,
+                agent_verdict,
+            } => {
                 let run_id = output.run_id.clone();
-                match apply_step_result(&mut store, &mut subscribers, &runner, &self_tx, output) {
+                match apply_step_result(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    output,
+                    agent_verdict,
+                ) {
                     // Run reached a TERMINAL state → drop from in_flight + remember the outcome.
                     Ok(StepApplied::Finished) => {
                         in_flight.remove(&run_id);
@@ -764,6 +774,7 @@ fn apply_step_result(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
+    agent_verdict: Option<(bool, String)>,
 ) -> anyhow::Result<StepApplied> {
     let run_id = output.run_id.clone();
     let mut session = crate::domain::get_session(store, &run_id)?
@@ -830,6 +841,7 @@ fn apply_step_result(
         entity_mode,
         &run_id,
         &cli_keys,
+        agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
     )?;
 
@@ -1035,7 +1047,31 @@ fn dispatch_unit(
             }
         };
         let output = runner.run_unit_streaming(&input, &emit);
-        let _ = tx.send(Command::ApplyStepResult { output });
+        // rev0.4 DUAL-VALIDATOR LAYER-2 (the AGENT semantic judge), computed HERE — on the worker
+        // thread, NOT the actor. ACTOR-SAFETY: `agent_validate` runs `claude -p` (an LLM; slow), which
+        // must never execute on the single-writer actor thread or it would stall every other command.
+        // This closure IS the off-thread seam (same place the unit's slow work already runs, holding no
+        // store handle), so the LLM call is off-thread by construction. The verdict rides back on the
+        // `ApplyStepResult` command; the actor folds it into the gate via `combine_verdict`. The
+        // criterion is the unit's PINNED validator's criterion (the natural acceptance criterion), so a
+        // verified/evaluator phase gets BOTH the deterministic re-verify AND this agent judgment. A unit
+        // with no pinned validator gets `None` (no agent judgment). We skip a non-Ok step (a failed /
+        // cancelled worker is handled by the actor before any gate). An authoring error fails CLOSED to
+        // REJECT (deny-dominates).
+        let agent_verdict = if output.status == crate::workflow::StepStatus::Ok {
+            input.unit.validator.as_ref().map(|v| {
+                match crate::validator::agent_validate(&v.criterion, &output.output, &*runner) {
+                    Ok(av) => (av.pass, av.reasoning),
+                    Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
+                }
+            })
+        } else {
+            None
+        };
+        let _ = tx.send(Command::ApplyStepResult {
+            output,
+            agent_verdict,
+        });
     });
     Ok(true)
 }
