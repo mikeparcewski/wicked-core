@@ -105,9 +105,9 @@ agreed," **not** "proven."
 | `allowed_skills` injection (`{SKILLS}` template placeholder, CLI-agnostic) | ✅ built |
 | Whether a given CLI *honors* its allowlist flag (e.g. does `--allowedTools` scope skills) | ⬜ per-CLI spike |
 | Council-assigns-skill-at-runtime (default path) | ⬜ design'd, unbuilt |
-| Gate mechanism **core** — deterministic validator (skill-authored + re-verify) + agent validator (controlled reviewer seat) + rev0.4 combination rule, **live-verified** (`src/validator.rs`, `tests/skills_live.rs`) | ✅ built |
-| Gate mechanism **integration** — vault storage + content-hash pin + approval + wiring into the phase gate flow | ⬜ unbuilt |
-| Event-driven bus seam (`wicked.skill.*` provisioning, cli-runner subscriber) | ⬜ design'd, unbuilt — `wicked-bus` + node are present, so buildable + testable in-env |
+| Gate mechanism **core** — deterministic validator (skill-authored + re-verify) + agent validator (controlled reviewer seat) + rev0.4 combination rule, **approval-gated + live-verified**, adversarially reviewed (14 findings fixed: RCE via unapproved LLM-shell, fail-open parse, denylist backstop) (`src/validator.rs`, `tests/skills_live.rs`) | ✅ built |
+| Gate mechanism **integration** — estate-vault storage + content-hash pin + real OS sandbox (denylist is a backstop, not a boundary) + wiring into the phase gate flow | ⬜ unbuilt |
+| Event-driven bus seam — substrate **verified working** end-to-end on wicked-bus (both crew round-trips); the reducer + provisioner sidecars (poll-loops) remain to build | 🔨 substrate proven |
 | napi bridge → studio | ⬜ unbuilt |
 
 ## Reference
