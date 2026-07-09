@@ -88,3 +88,28 @@ fn writer_skill_authors_a_deterministic_validator_that_discriminates() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// LIVE full dual-validator gate (rev0.4): the writer authors a deterministic check AND the
+/// semantic-reviewer judges the work, combined by the rule "Approve iff deterministic PASS and agent
+/// not REJECT". Two distinct skill seats; a model can fail but never lone-approve.
+#[test]
+#[ignore = "requires real `claude` on PATH + installed wicked-testing skills; run with --ignored"]
+fn dual_validator_gate_approves_good_work_and_rejects_bad() {
+    use wicked_core::{agent_validate, combine_verdict, GateVerdict};
+    let runner = WrappedCliStepRunner::default();
+    let criterion = "the greeting says hello to the world";
+
+    // Good work: agent should PASS; combined with a deterministic pass ⇒ Approve.
+    let good = agent_validate(criterion, "println!(\"hello world\");", &runner).expect("agent");
+    eprintln!("agent(good): {:?}", good);
+    assert_eq!(combine_verdict(true, Some(&good)), GateVerdict::Approve);
+
+    // Bad work: agent should REJECT; even with a deterministic pass ⇒ Reject (agent can fail a gate).
+    let bad = agent_validate(criterion, "println!(\"goodbye\");", &runner).expect("agent");
+    eprintln!("agent(bad): {:?}", bad);
+    assert!(
+        !bad.pass,
+        "reviewer should reject work that doesn't meet the criterion"
+    );
+    assert_eq!(combine_verdict(true, Some(&bad)), GateVerdict::Reject);
+}

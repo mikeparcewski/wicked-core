@@ -69,7 +69,10 @@ pub use repo_intel::{
 };
 pub use scope::{resolve_scope, EntityMode};
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
-pub use validator::{author_deterministic_validator, run_validator, DeterministicValidator};
+pub use validator::{
+    agent_validate, author_deterministic_validator, combine_verdict, run_validator, AgentVerdict,
+    DeterministicValidator, GateVerdict,
+};
 pub use wicked_council::AgenticCli;
 pub use workflow::{
     bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
