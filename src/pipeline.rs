@@ -162,12 +162,28 @@ fn attach_pinned_validators(
     units: &mut [crate::domain::WorkUnit],
     def: &crate::workflow::WorkflowDef,
 ) -> anyhow::Result<()> {
+    // NOTE (docs wave): the shipped feature/bug/migration defs all carry `validator_pin = null`, so
+    // this loop is a no-op for them and the dual-validator gate stays INERT until an operator provisions
+    // + pins a validator. The author→approve→vault→pin path is exposed as `wicked-core
+    // provision-validator --criterion "..."` then `wicked-core approve-validator --pin <pin>`; the
+    // approved pin goes into a workflow def's `validator_pin`. (Documented in the docs wave.)
     for (unit, phase) in units.iter_mut().zip(def.phases.iter()) {
         let Some(pin) = phase.validator_pin.as_deref() else {
             continue;
         };
         match crate::validator_vault::load_validator(store, pin)? {
-            Some(validator) => unit.validator = Some(validator),
+            // The pin must resolve to an APPROVED validator (Lane D finding 2). An UNAPPROVED-but-vaulted
+            // pin would attach and then DENY EVERY run at gate time (run_validator fails closed on an
+            // unapproved validator) — a persistent DoS surfaced only as a late, misleading gate error.
+            // Catch it at PLAN time with a message naming the phase + pin and pointing at approval.
+            Some(validator) if validator.approved => unit.validator = Some(validator),
+            Some(_) => anyhow::bail!(
+                "workflow `{}` phase `{}` pins an UNAPPROVED validator `{pin}` — approve it via \
+                 approve_and_store (`wicked-core approve-validator --pin {pin}`) and pin the APPROVED \
+                 pin instead; refusing to run (an unapproved pin denies every run)",
+                def.id,
+                phase.id
+            ),
             None => anyhow::bail!(
                 "workflow `{}` phase `{}` pins validator `{pin}`, which is not in the vault \
                  (author + approve it out of band via provision_validator/approve_and_store before \
@@ -360,10 +376,11 @@ pub(crate) fn apply_and_finish_unit(
     }
 
     // PINNED VALIDATOR — the rev0.4 deterministic gate re-verify (layer-1), deny-dominates. If the unit
-    // carries an APPROVED validator and the run has a worktree, re-verify it against that worktree; a
-    // FAIL flips the verdict to denied BEFORE the status is persisted. Pure re-verify — no LLM here, so
-    // it is safe on the single-writer actor thread. (The agent-validator half is an LLM and belongs on
-    // the off-thread worker path — a later slice.)
+    // carries an APPROVED validator, re-verify it against the run's worktree; a FAIL — OR the ABSENCE of
+    // a worktree to re-verify against (fail-closed, so the agent LLM can never lone-approve a pinned
+    // phase) — flips the verdict to denied BEFORE the status is persisted. Pure re-verify — no LLM here,
+    // so it is safe on the single-writer actor thread. (The agent-validator half is an LLM and folds
+    // just below, layer-2.)
     if outcome.approved {
         let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
         if let Some(reason) =
@@ -426,15 +443,33 @@ pub(crate) fn apply_and_finish_unit(
 }
 
 /// Re-verify a unit's APPROVED pinned validator against the worktree (rev0.4 gate layer-1). Returns
-/// `Some(denial_reason)` when the validator fails or errors — the gate then denies the unit
-/// (deny-dominates). `None` means "no denial": no validator, no worktree (an artifact-based validator
-/// needs one; repo-less runs skip it for now), or the validator PASSED. Pure + actor-safe (no LLM).
+/// `Some(denial_reason)` when the validator fails, errors, OR cannot be re-verified — the gate then
+/// denies the unit (deny-dominates). `None` means "no denial": either the unit has NO pinned validator
+/// (an ungated, pre-gate phase) or the validator PASSED. Pure + actor-safe (no LLM).
+///
+/// FAIL-CLOSED on a missing worktree (Lane D finding 1): a unit that carries a pinned validator but has
+/// NO workdir to re-verify against is DENIED, not skipped. Skipping would leave `deterministic_pass =
+/// true` for the layer-2 fold, making the agent LLM the SOLE approver of the pinned phase — the exact
+/// rev0.4 violation ("Approve requires a deterministic PASS"). "Can't re-verify" is treated as
+/// NOT-passed, never assumed-pass. (Consequence: a repo-less run cannot satisfy a pinned phase — that
+/// is intended; register a repo so the run has a worktree.)
 fn pinned_validator_denial(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&std::path::Path>,
 ) -> Option<String> {
+    // No pinned validator ⇒ ungated phase ⇒ no denial (unchanged pre-gate behavior).
     let v = unit.validator.as_ref()?;
-    let cwd = workdir?;
+    // Pinned but no worktree ⇒ FAIL-CLOSED (see the doc comment): the deterministic floor is REQUIRED
+    // for a pinned phase, so an un-re-verifiable pin denies rather than deferring the whole gate to the
+    // agent LLM.
+    let Some(cwd) = workdir else {
+        return Some(format!(
+            "pinned validator `{}` cannot be re-verified: this run has no workdir to check it \
+             against (fail-closed — a pinned phase REQUIRES the deterministic floor, so an \
+             un-re-verifiable pin is treated as NOT-passed; register a repo so the run has a worktree)",
+            v.criterion
+        ));
+    };
     match crate::validator::run_validator(v, cwd) {
         Ok(true) => None,
         Ok(false) => Some(format!("pinned validator failed: {}", v.criterion)),
@@ -556,8 +591,15 @@ mod resolve_tests {
         // Approved + FAILS ⇒ denial (deny-dominates).
         unit.validator = Some(mk("test -f missing.txt", true));
         assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
-        // No worktree ⇒ skip (an artifact validator needs one) ⇒ no denial.
-        assert!(pinned_validator_denial(&unit, None).is_none());
+        // Pinned validator but NO worktree ⇒ FAIL-CLOSED denial (Lane D finding 1): "can't re-verify"
+        // is NOT-passed, so the agent LLM can never become the sole approver of a pinned phase.
+        assert!(
+            pinned_validator_denial(&unit, None).is_some(),
+            "a pinned validator with no worktree must DENY (fail-closed), not skip"
+        );
+        // A unit with NO pinned validator and no worktree is simply ungated ⇒ no denial.
+        let ungated = WorkUnit::pending("s:u2", "s", 2, "d");
+        assert!(pinned_validator_denial(&ungated, None).is_none());
         // UNAPPROVED ⇒ run_validator refuses ⇒ denial (fail-closed).
         unit.validator = Some(mk("test -f ok.txt", false));
         assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
@@ -682,6 +724,78 @@ mod resolve_tests {
         assert!(
             msg.contains("deadbeefdeadbeef") && msg.contains("not in the vault"),
             "the fail-closed error must name the missing pin: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unapproved_pinned_validator_bails_at_plan_time() {
+        // Lane D finding 2: a phase that pins an UNAPPROVED-but-vaulted validator must be caught at PLAN
+        // time (attach), not attached and then denying every run at gate time. The bail names the phase
+        // + pin and points at approval.
+        use crate::validator::DeterministicValidator;
+        use crate::validator_vault::{pin, store_validator};
+        use wicked_apps_core::open_store;
+
+        let dir = std::env::temp_dir().join(format!("wicked-pin-unappr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        // Vault an UNAPPROVED validator and pin THAT (unapproved) pin from a phase.
+        let unapproved = DeterministicValidator {
+            criterion: "README exists".into(),
+            script: "test -f README.md".into(),
+            approved: false,
+        };
+        let p = store_validator(&mut store, &unapproved).unwrap();
+        assert_eq!(p, pin(&unapproved), "the unapproved validator's pin");
+
+        let def: crate::workflow::WorkflowDef = serde_json::from_str(&format!(
+            r#"{{ "id": "gated", "phases": [ {{ "id": "build", "kind": "build", "validator_pin": "{p}" }} ] }}"#
+        ))
+        .unwrap();
+        def.validate().unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        let err = attach_pinned_validators(&store, &mut units, &def)
+            .expect_err("an unapproved pin must bail at plan time, not attach + DoS every run");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&p) && msg.contains("UNAPPROVED") && msg.contains("approve-validator"),
+            "the bail must name the pin + point at approval: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_unit_validator_survives_the_store_round_trip() {
+        // Lane D finding 4: dispatch/apply read `unit.validator` back from the store (via session_units),
+        // so an attached pinned validator must survive put_node → session_units losslessly. Attach an
+        // APPROVED validator, persist the unit, read it back, and assert the validator is byte-identical.
+        use crate::domain::{put_node, session_units, WorkUnit};
+        use crate::validator::DeterministicValidator;
+        use wicked_apps_core::{open_store, ToNode};
+
+        let dir = std::env::temp_dir().join(format!("wicked-unit-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        let approved = DeterministicValidator {
+            criterion: "README exists".into(),
+            script: "test -f README.md".into(),
+            approved: true,
+        };
+        let mut unit = WorkUnit::pending("rt:u1", "rt", 1, "build the thing");
+        unit.validator = Some(approved.clone());
+        put_node(&mut store, unit.to_node()).unwrap();
+
+        let read = session_units(&store, "rt").unwrap();
+        assert_eq!(read.len(), 1, "one unit persisted for the session");
+        assert_eq!(
+            read[0].validator.as_ref(),
+            Some(&approved),
+            "the approved pinned validator survives put_node → session_units intact (dispatch/apply rely on this)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -10,13 +10,15 @@
 //!   wicked-core cancel --session <id>             # cancel a run
 //!   wicked-core launch --problem "..."            # legacy straight-through run (no gates)
 //!   wicked-core gate-hook --scope S --phase P     # PreToolUse governance hook (claude invokes this)
+//!   wicked-core provision-validator --criterion "..."   # author a deterministic validator (UNAPPROVED)
+//!   wicked-core approve-validator --pin <pin>     # approve a vaulted validator → the pin to put in a def
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
 use std::io::BufRead;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision,
-    LaunchSpec, RepoSpec,
+    LaunchSpec, RepoSpec, WrappedCliStepRunner,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -66,6 +68,16 @@ fn main() {
         let phase = flag(&args, "--phase").unwrap_or_default();
         let db = flag(&args, "--db");
         std::process::exit(run_gate_hook(&scope, &phase, db.as_deref()));
+    }
+
+    // provision-validator / approve-validator drive the rev0.4 pin+vault authoring flow DIRECTLY on the
+    // store (author→approve→vault). Like gate-hook they must NOT spawn the actor — they open the store as
+    // its SOLE writer for a brief command and exit — so handle them before `Core::spawn` (spawning the
+    // actor too would put a second writer on the same SQLite file, breaking the single-writer invariant).
+    match args.get(1).map(String::as_str) {
+        Some("provision-validator") => return provision_validator_cmd(&args),
+        Some("approve-validator") => return approve_validator_cmd(&args),
+        _ => {}
     }
 
     let core = Core::spawn(store_path(&args));
@@ -148,10 +160,62 @@ fn main() {
                 "usage: wicked-core <status | repos | register-repo --path <dir> | \
                  run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] | \
                  resume --session <id> | cancel --session <id> | \
-                 launch --problem \"...\" [--workflow <id>]> [--db <path>]"
+                 launch --problem \"...\" [--workflow <id>] | \
+                 provision-validator --criterion \"...\" | approve-validator --pin <pin>> [--db <path>]"
             );
             std::process::exit(2);
         }
+    }
+}
+
+/// `provision-validator --criterion "..."`: author a deterministic validator for the criterion via the
+/// live writer skill (a real `claude` call) and vault it UNAPPROVED, printing its pin. Opens the store
+/// directly (sole writer; the actor is NOT spawned for this command) — see the note at the call site.
+fn provision_validator_cmd(args: &[String]) {
+    let Some(criterion) = flag(args, "--criterion") else {
+        fail("provision-validator requires --criterion \"...\"");
+        return;
+    };
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("provision-validator: open store failed: {e}"));
+            return;
+        }
+    };
+    let runner = WrappedCliStepRunner::default();
+    match wicked_core::provision_validator(&criterion, &runner, &mut store) {
+        Ok(pin) => {
+            println!("provisioned UNAPPROVED validator, pin: {pin}");
+            println!("approve it with:  wicked-core approve-validator --pin {pin}");
+        }
+        Err(e) => fail(&format!("provision-validator failed: {e}")),
+    }
+}
+
+/// `approve-validator --pin <pin>`: approve a vaulted (unapproved) validator and print the APPROVED pin
+/// the operator drops into a workflow def's `validator_pin`. Opens the store directly (sole writer).
+fn approve_validator_cmd(args: &[String]) {
+    let Some(pin) = flag(args, "--pin") else {
+        fail("approve-validator requires --pin <pin>");
+        return;
+    };
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("approve-validator: open store failed: {e}"));
+            return;
+        }
+    };
+    match wicked_core::approve_and_store(&mut store, &pin) {
+        Ok(Some(approved)) => {
+            println!("approved validator, pin: {approved}");
+            println!("put this pin into a workflow def's `validator_pin`: {approved}");
+        }
+        Ok(None) => fail(&format!(
+            "approve-validator: no vaulted validator with pin {pin}"
+        )),
+        Err(e) => fail(&format!("approve-validator failed: {e}")),
     }
 }
 

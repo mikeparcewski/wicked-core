@@ -99,6 +99,19 @@ pub fn load_validator(
                     node.name
                 )
             })?;
+            // TAMPER-EVIDENCE, reader-enforced: the pin IS the content hash, so a node keyed by `pin`
+            // MUST hash back to `pin`. Recompute it and refuse a mismatch. Without this, a vault node
+            // whose metadata was edited after storage (so its bytes no longer match its key) would load
+            // as a "valid" — possibly approved — validator under a pin it never minted. The writer keys
+            // by hash; the reader must VERIFY it, not merely trust the key (`self::pin` disambiguates
+            // the module fn from the `pin` parameter).
+            let actual = self::pin(&v);
+            if actual != pin {
+                anyhow::bail!(
+                    "vault node keyed {pin} hashes to {actual}: content-address mismatch — the \
+                     vaulted validator was tampered with; refusing to load (fail-closed)"
+                );
+            }
             Ok(Some(v))
         }
         None => Ok(None),
@@ -215,6 +228,57 @@ mod tests {
         assert!(missing.is_none(), "an unknown pin loads as Ok(None)");
 
         let _ = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn load_of_a_tampered_node_bails_on_content_address_mismatch() {
+        // The reader enforces tamper-evidence: write a DIFFERENT validator's bytes UNDER an existing
+        // pin's key (simulating a node edited after storage), then assert load_validator refuses it
+        // because the stored bytes no longer hash to the key.
+        use wicked_apps_core::open_store;
+        let dir = std::env::temp_dir().join(format!("wicked-vault-tamper-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        // Store a validator honestly and capture its (correct) pin.
+        let honest = sample();
+        let p = store_validator(&mut store, &honest).unwrap();
+        // A correctly-stored validator still loads (the check passes for untampered nodes).
+        assert_eq!(load_validator(&store, &p).unwrap().unwrap(), honest);
+
+        // TAMPER: write a validator with a DIFFERENT script under the ORIGINAL pin's key. Its bytes hash
+        // to some other pin, so the key no longer matches its content.
+        let tampered = DeterministicValidator {
+            criterion: honest.criterion.clone(),
+            script: "test -f TAMPERED.md".to_string(),
+            approved: true,
+        };
+        assert_ne!(
+            pin(&tampered),
+            p,
+            "the tampered bytes hash to a different pin"
+        );
+        let mut node = Node::new(
+            synthetic_symbol(VALIDATOR_VAULT, &p), // keyed by the ORIGINAL (honest) pin
+            NodeKind::Other(VALIDATOR_VAULT.to_string()),
+            p.clone(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(format!("{VALIDATOR_VAULT}/{p}"), Span::ZERO),
+        );
+        if let serde_json::Value::Object(map) = serde_json::to_value(&tampered).unwrap() {
+            node.metadata = map;
+        }
+        put_node(&mut store, node).unwrap();
+
+        let err = load_validator(&store, &p)
+            .expect_err("a node whose bytes don't hash to its key must fail to load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("content-address mismatch") && msg.contains(&p),
+            "the mismatch error must name the key: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// LIVE end-to-end of the rev0.4 provision → approve → pin → re-verify flow against real `claude`.

@@ -406,6 +406,15 @@ pub fn connect(
 /// AFTER the bridge came up, never replaying historical requests. At-least-once within a process run:
 /// the floor advances only after a request has been posted to the actor, and the launch is idempotent
 /// by run id (the actor rejects a re-plan of a live run), so a duplicate poll is harmless.
+///
+/// ## The floor is snapshotted SYNCHRONOUSLY (a happens-before guarantee, not a race)
+/// The cursor floor is read from the bus db HERE, on the caller's thread, BEFORE the poller thread is
+/// spawned — not lazily inside the thread. This is load-bearing: a caller that connects the bridge and
+/// THEN emits a request (the `connect_bus` → `emit` ordering the bridge is designed around) is
+/// guaranteed that the floor reflects only events that existed at connect time, so the just-emitted
+/// request always has `event_id > floor` and is delivered. Reading the floor lazily on the spawned
+/// thread made this a race: under load the emit could win, the thread would then read `MAX(event_id)`
+/// as the just-emitted id, set the floor PAST it, and silently drop the only request forever.
 pub fn spawn_run_requested_poller(
     bus_db_path: String,
     tx: Sender<Command>,
@@ -414,6 +423,20 @@ pub fn spawn_run_requested_poller(
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
+    // Snapshot the tail SYNCHRONOUSLY on the caller's thread (see the doc comment): once this function
+    // returns, any subsequently-emitted request has a strictly higher id than `floor_init`. A failure
+    // to open here is non-fatal — the spawned thread re-opens and logs the real error — so fall back to
+    // 0 (which at worst replays pre-existing requests, never drops the new one this ordering protects).
+    let floor_init: i64 = BusDb::open(&bus_db_path)
+        .ok()
+        .and_then(|db| {
+            db.conn
+                .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
+                    r.get(0)
+                })
+                .ok()
+        })
+        .unwrap_or(0);
     std::thread::spawn(move || {
         let db = match BusDb::open(&bus_db_path) {
             Ok(d) => d,
@@ -424,13 +447,9 @@ pub fn spawn_run_requested_poller(
                 return;
             }
         };
-        // Start at the tail: only NEW requests drive launches.
-        let mut floor: i64 = db
-            .conn
-            .query_row("SELECT COALESCE(MAX(event_id), 0) FROM events", [], |r| {
-                r.get(0)
-            })
-            .unwrap_or(0);
+        // Start at the tail SNAPSHOTTED BEFORE SPAWN (above): only requests newer than connect-time
+        // drive launches, and a request emitted right after connect is never missed.
+        let mut floor: i64 = floor_init;
         let filter = RUN_REQUESTED; // exact-match filter
 
         while !stop.load(Ordering::SeqCst) {
