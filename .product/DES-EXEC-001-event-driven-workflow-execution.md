@@ -290,7 +290,9 @@ Published to wicked-bus AND mirrored to the in-process `CoreEvent` stream (studi
 | Event | Publisher | Consumer(s) |
 |---|---|---|
 | `wicked.signal.received` | ingress (CLI/API/webhook) | triage-router |
+| `wicked.run.requested` (workflow, problem, args) — the launch trigger | human CLI / **scheduler sidecar** / campaign | reducer |
 | `wicked.run.triaged` (→ chosen `def_id`) | triage-router | reducer |
+| `wicked.skill.needed` / `wicked.skill.refresh` → `wicked.skill.ready` (§4.2) | reducer | skill-provisioner sidecar |
 | `wicked.run.launched` · `wicked.stage.started` (stage_ix, kind, select_key) | reducer | — |
 | `wicked.task.dispatched` (prompt, workdir, cli, attempt, role) | reducer | **cli-runner** (filtered by cli) |
 | `wicked.task.output.delta` | cli-runner | studio |
@@ -315,6 +317,14 @@ Published to wicked-bus AND mirrored to the in-process `CoreEvent` stream (studi
 - **adversarial reviewer** — the `AdversarialReview` stage's evaluator seat; consumes the creator's
   `task.completed`, publishes a critique as evidence (a REAL 2nd CLI run — fixes the "label" bug).
 - **human-gate UI** — `gate.pending` → renders → human answer becomes a `gate.decided` command.
+- **scheduler sidecar** (operator direction, 2026-07-09) — a **publisher** that turns **schedules
+  (data: cron/interval + workflow id + args)** into `wicked.run.requested {workflow, problem, args}`
+  events on a timer. **Launch is an event**, so the reducer subscribes to `run.requested` and starts a
+  run identically no matter who fired it — a human on the CLI, a Campaign node, or this scheduler. That
+  makes "schedule agents" fall out for free (recurring nightly audit, periodic migration check,
+  scheduled review): adding a schedule is a data row + a sidecar, **never a core change** — the same
+  sidecar pattern (§4.2 / §rev0.5 #7) pointed at time. Idempotency (§2.4) covers a schedule that
+  double-fires.
 
 ### 2.4 The one hard requirement — idempotency
 The bus is at-least-once + unordered. The reducer MUST be idempotent. Every event carries a
