@@ -35,6 +35,11 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): a direct SQLite handle to the wicked-bus event log
+# (a SEPARATE db from the estate store) so core can emit/poll `wicked.*` events the JS bus reads.
+# Pinned to estate's `0.32` + `bundled` so cargo unifies one libsqlite3-sys and it builds with no
+# system sqlite (cross-platform: macOS/Linux/Windows).
+rusqlite = { version = "0.32", features = ["bundled"] }
 # PTY terminal sessions (DES-TERMINAL-001): cross-platform pseudo-terminal (unix + Windows ConPTY).
 # The mechanism is lifted from the retiring egui studio's `portable-pty` usage, minus the egui/vt100
 # coupling — core streams RAW bytes as events; screen emulation (vt100) is a UI concern, not core's.

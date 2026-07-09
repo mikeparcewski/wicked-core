@@ -13,7 +13,7 @@
 //!    for a run already executing (`RunBusy`) so a run is never double-dispatched.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
@@ -118,6 +118,28 @@ pub(crate) fn run(
             crate::repo::reap_orphan_worktrees(&repos, &live);
         }
     }
+
+    // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): if a bus db is configured via `WICKED_BUS_DB`, spawn
+    // the launch poller. It runs on its OWN thread with its OWN SQLite connection to the bus db (a
+    // different file from the estate store this actor owns), and reaches this actor ONLY by sending
+    // `Command::LaunchRun` over `self_tx` — the exact self_tx write-back pattern the unit workers use.
+    // So a blocking bus poll can never stall the single writer. Opt-in via env so existing embeddings
+    // /tests (env unset) are unaffected. The `bus_stop` flag + join on loop-exit below guarantee the
+    // poller thread is not leaked when the last `Core` drops.
+    let bus_stop = Arc::new(AtomicBool::new(false));
+    let bus_bridge: Option<std::thread::JoinHandle<()>> = std::env::var("WICKED_BUS_DB")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(|bus_db| {
+            crate::bus::spawn_run_requested_poller(
+                bus_db,
+                self_tx.clone(),
+                crate::registry_roster(),
+                crate::scope::EntityMode::Shared,
+                std::time::Duration::from_millis(500),
+                bus_stop.clone(),
+            )
+        });
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -542,6 +564,12 @@ pub(crate) fn run(
             }
         }
     }
+    // Stop + join the bus bridge poller (if any) so it is never leaked past the actor's lifetime.
+    bus_stop.store(true, Ordering::SeqCst);
+    if let Some(h) = bus_bridge {
+        let _ = h.join();
+    }
+
     // Loop exited (last Core dropped): `store` drops here, releasing the writable connection. Any
     // in-flight worker that posts a result now sends into a closed channel and is harmlessly dropped.
     // The `_pty_reaper` guard (declared above) kills + reaps anything still in the PTY map as it

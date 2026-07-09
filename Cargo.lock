@@ -2450,6 +2450,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "portable-pty",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

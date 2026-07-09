@@ -13,6 +13,7 @@
 
 mod actor;
 mod applications;
+mod bus;
 mod campaign;
 mod code_graph;
 mod command;
@@ -41,6 +42,10 @@ pub use actor::RunBusy;
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
     Application, SeedKind,
+};
+pub use bus::{
+    deterministic_key, matches_filter, BusBridge, BusDb, BusEmit, BusEvent, CORE_DOMAIN,
+    RUN_LAUNCHED, RUN_REQUESTED,
 };
 pub use campaign::{
     all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
@@ -191,6 +196,27 @@ impl Core {
         let (s, r) = channel();
         let _ = self.tx.send(Command::Subscribe(s));
         r
+    }
+
+    /// Connect this Core to a wicked-bus event log (DES-EXEC-001 §2.5): spawn the launch bridge — a
+    /// dedicated poller thread that turns each `wicked.run.requested {workflow, problem, args}` on the
+    /// bus into a `LaunchRun` on this actor, and emits `wicked.run.launched` back onto the bus when a
+    /// run starts. `roster` is the council seats a launched run runs with (a caller passes
+    /// [`registry_roster`] in production). The returned [`BusBridge`] owns the thread — drop it (or
+    /// call [`BusBridge::stop`]) to stop polling. The poller runs entirely off the actor thread with
+    /// its own SQLite connection to the bus db, reaching the actor only via commands (actor-safe).
+    pub fn connect_bus(
+        &self,
+        bus_db_path: impl Into<String>,
+        roster: Vec<AgenticCli>,
+    ) -> BusBridge {
+        bus::connect(
+            self.tx.clone(),
+            bus_db_path,
+            roster,
+            EntityMode::Shared,
+            std::time::Duration::from_millis(200),
+        )
     }
 
     /// Liveness probe — emits a `Heartbeat` to subscribers and waits for the actor to ack.
