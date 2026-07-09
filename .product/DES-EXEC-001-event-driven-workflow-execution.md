@@ -24,6 +24,36 @@ first-principles:
 > event-driven, evidence-gated multi-agent workflow engine** — reusing the plumbing that already
 > exists, wired onto wicked-bus, with the CLIs mediated by custom subscribers.
 
+## BUILD STATUS (2026-07-09) — as implemented + adversarially reviewed
+
+Built + verified in `wicked-core` (each item adversarially reviewed and its findings fixed; live items
+verified against real `claude`):
+
+- ✅ **Workflows as data** — `WorkflowDef`/`PhaseDef`, registry + `load_dir` drop-in JSON, shipped
+  `workflows/*.json` (drift-guarded); `deny_unknown_fields`; backward-only dependency validation.
+- ✅ **Data-driven planning** — `plan_from_def`, wired to the runtime via `--workflow`.
+- ✅ **Per-phase gate + role** — `GateSpec` drives the human-confirm pause (incl. conditional +
+  terminal-phase gates); `PhaseRole` artifact-passing (Evaluator reviews the prior Creator's cold output).
+- ✅ **Skills-driven execution** — headless `/skill` invocation (live-verified); `{SKILLS}` allowlist.
+- ✅ **Dual-validator gate** — deterministic (skill-authored + re-verify) + agent (off-thread) + the
+  combination rule; approval-gated + fail-closed + denylist; denials fold **before** the gate resolves
+  (no leaked approved output); repo-less runs fail-closed. Author→approve→pin→vault→re-verify is
+  live-verified, incl. the `provision-validator`/`approve-validator` CLI.
+- ✅ **Rust↔wicked-bus bridge** — the **launch-trigger** edge (`run.requested`→launch, `run.launched`
+  back), config-matched TTL, at-least-once retry; cross-language round-trip verified. Reducer +
+  provisioner **sidecars** exist (JS, smoke-verified).
+- ✅ **napi bridge** (`../wicked-core-ts`) — `launchRun`/`subscribe`/`confirmGate` over FFI.
+
+Honest gaps / follow-ups (see §2.5, §rev0.4, §rev0.5):
+- ⬜ **Law 1's execution mediation seam** (actor publishes `task.dispatched` → cli-runner subscriber →
+  `task.completed`) is **NOT built** — a shipped run still dispatches in-process; the bus carries only
+  the launch trigger (env-gated). Law 1 holds for the trigger, not the execution seam.
+- ⬜ **Shipped workflows are ungated** — feature/bug/migration ship `validator_pin: null`, so the dual
+  gate engages only for an operator-pinned def.
+- ⬜ **Validator independence** is distinct-prompt-on-same-runner, not distinct council seats.
+- ⬜ **OS sandbox** around validator execution (denylist is a backstop); **napi→studio UI** wiring;
+  **council-assigns-skill** (needs a grounded skill-ranking design).
+
 ---
 
 ## Revision 0.2 — corrections from adversarial review round 1 (2026-07-08)
