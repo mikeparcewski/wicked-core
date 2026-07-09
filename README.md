@@ -18,8 +18,9 @@ Two things in one binary:
 
 ## Architecture (built)
 
-- **Single-writer `StoreActor`** — owns the SQLite estate store; a command API + `CoreEvent` fan-out is
-  the only way in. Live output streams to subscribers as work happens.
+- **Single-writer actor** (`actor::run` on a dedicated thread, reached through the `Core` handle) —
+  owns the SQLite estate store; a command API + `CoreEvent` fan-out is the only way in. Live output
+  streams to subscribers as work happens.
 - **Governed run pipeline** — plan → distribute → execute → evidence, all on the one store. Governance
   is **deny-dominates** and fail-closed (a run with more units than the governed span is rejected, not
   run ungoverned).
@@ -38,8 +39,11 @@ dropping a JSON file, not editing this crate** (Law 2):
 
 ```rust
 let mut registry = WorkflowRegistry::with_defaults(); // seeds feature / bug / migration
-registry.load_dir("~/.config/wicked-core/workflows")?; // overlay your drop-in *.json files
+registry.load_dir(workflows_dir)?;                    // overlay your drop-in *.json files
 ```
+
+`load_dir` takes an **already-resolved** path (no `~` expansion). At runtime the engine resolves the
+overlay dir itself: `$WICKED_WORKFLOWS_DIR`, else `$HOME/.config/wicked-core/workflows`.
 
 - The three built-ins ship as `workflows/*.json` (the human-editable mirror of the seed builders,
   drift-guarded) — see [`workflows/README.md`](workflows/README.md) for the full field contract.
