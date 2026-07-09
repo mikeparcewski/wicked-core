@@ -226,6 +226,15 @@ Mechanism (decisions committed 2026-07-09; forks flagged for operator veto):
     controlled prompt on a distinct seat gives a clean binary; the two-strategist independence comes from
     the seat + cold framing, not the skill's format. Remaining: vault storage + content-hash pin +
     approval + wiring into the phase gate flow.
+  - **Two validators check DIFFERENT substrates (composition finding, live-tested).** The deterministic
+    validator runs its script in the phase's **worktree/cwd** (the filesystem artifacts); the agent
+    validator judges the **work TEXT** in its own cwd with **no access to that worktree**. So a criterion
+    must be framed to match: **structural/existence** ("file X exists / contains Y") is for the
+    DETERMINISTIC half; **content/semantic** ("the deliverable satisfies the intent") is for the AGENT
+    half. Sending an existence-framed criterion to the agent makes it search its *own* empty cwd and
+    REJECT — a false negative. Also: the `acceptance-test-writer` skill wraps its shell answer in prose
+    despite instructions, so extracting the command needs `extract_shell_command` (pick the last
+    command-like line + strip a leaked language marker), not a naive fence strip.
 - **Vault (fork 2):** **wicked-estate** holds the *approved validator artifact + pin* (content-addressed,
   injected `phase→validator` edge, durable); `.wicked-testing/evidence/<run>/` holds each run's
   *execution evidence*. Estate = source of truth, testing = run log.
