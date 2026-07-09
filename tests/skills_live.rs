@@ -62,11 +62,14 @@ fn a_skill_driven_unit_loads_the_named_skill_against_real_claude() {
 #[ignore = "requires real `claude` on PATH + installed wicked-testing skills; run with --ignored"]
 fn writer_skill_authors_a_deterministic_validator_that_discriminates() {
     let runner = WrappedCliStepRunner::default();
+    // Author (untrusted) → APPROVE (out-of-band gate step) → re-verify. run_validator refuses an
+    // unapproved validator, so the explicit `.approve()` is what authorizes execution.
     let v = author_deterministic_validator(
         "a file named README.md exists in the current directory and contains a line with '## Status'",
         &runner,
     )
-    .expect("authoring should succeed against real claude");
+    .expect("authoring should succeed against real claude")
+    .approve();
     eprintln!("authored validator script: {}", v.script);
 
     let base = std::env::temp_dir().join(format!("wicked-val-live-{}", std::process::id()));
@@ -77,12 +80,12 @@ fn writer_skill_authors_a_deterministic_validator_that_discriminates() {
     std::fs::write(pass.join("README.md"), "# Title\n\n## Status\nok\n").unwrap();
 
     assert!(
-        run_validator(&v, &pass),
+        run_validator(&v, &pass).expect("approved validator runs"),
         "authored validator must PASS where the criterion holds: {}",
         v.script
     );
     assert!(
-        !run_validator(&v, &fail),
+        !run_validator(&v, &fail).expect("approved validator runs"),
         "and FAIL where it does not: {}",
         v.script
     );
@@ -134,12 +137,19 @@ fn gate_phase_approves_a_satisfying_phase_end_to_end() {
     let work =
         "The full content of the delivered greeting.txt file is the single line:\nhello world";
 
+    // FINDING-1: gate_phase no longer authors inline. Author ONCE → APPROVE out of band → gate with the
+    // approved validator. The same approved validator gates both the good and bad worktrees.
+    let validator = author_deterministic_validator(criterion, &runner)
+        .expect("authoring should succeed against real claude")
+        .approve();
+    eprintln!("authored+approved validator script: {}", validator.script);
+
     // Satisfying phase: artifact present with the right content ⇒ deterministic PASS; the content-framed
     // work satisfies the reviewer ⇒ agent not-REJECT ⇒ Approve.
     let good = std::env::temp_dir().join(format!("wicked-gate-live-good-{}", std::process::id()));
     std::fs::create_dir_all(&good).unwrap();
     std::fs::write(good.join("greeting.txt"), "hello world\n").unwrap();
-    let verdict = gate_phase(criterion, work, &good, false, &runner).expect("gate_phase good");
+    let verdict = gate_phase(&validator, work, &good, false, &runner).expect("gate_phase good");
     assert_eq!(
         verdict,
         GateVerdict::Approve,
@@ -152,7 +162,7 @@ fn gate_phase_approves_a_satisfying_phase_end_to_end() {
     let bad = std::env::temp_dir().join(format!("wicked-gate-live-bad-{}", std::process::id()));
     std::fs::create_dir_all(&bad).unwrap();
     std::fs::write(bad.join("greeting.txt"), "goodbye\n").unwrap();
-    let verdict = gate_phase(criterion, work, &bad, false, &runner).expect("gate_phase bad");
+    let verdict = gate_phase(&validator, work, &bad, false, &runner).expect("gate_phase bad");
     assert_eq!(
         verdict,
         GateVerdict::Reject,
