@@ -98,17 +98,36 @@ fn writer_skill_authors_a_deterministic_validator_that_discriminates() {
 #[test]
 #[ignore = "requires real `claude` on PATH + installed wicked-testing skills; run with --ignored"]
 fn dual_validator_gate_approves_good_work_and_rejects_bad() {
-    use wicked_core::{agent_validate, combine_verdict, GateVerdict};
+    use wicked_core::{
+        agent_validate, combine_verdict, registry_roster, GateVerdict, DETERMINISTIC_VALIDATOR_SEAT,
+    };
     let runner = WrappedCliStepRunner::default();
     let criterion = "the greeting says hello to the world";
+    // GAP B: the judge runs under a seat distinct from the deterministic author when the live roster
+    // offers one, else the single default runner. The live roster drives the real seat pick here.
+    let roster = registry_roster();
 
     // Good work: agent should PASS; combined with a deterministic pass ⇒ Approve.
-    let good = agent_validate(criterion, "println!(\"hello world\");", &runner).expect("agent");
+    let good = agent_validate(
+        criterion,
+        "println!(\"hello world\");",
+        DETERMINISTIC_VALIDATOR_SEAT,
+        &roster,
+        &runner,
+    )
+    .expect("agent");
     eprintln!("agent(good): {:?}", good);
     assert_eq!(combine_verdict(true, Some(&good)), GateVerdict::Approve);
 
     // Bad work: agent should REJECT; even with a deterministic pass ⇒ Reject (agent can fail a gate).
-    let bad = agent_validate(criterion, "println!(\"goodbye\");", &runner).expect("agent");
+    let bad = agent_validate(
+        criterion,
+        "println!(\"goodbye\");",
+        DETERMINISTIC_VALIDATOR_SEAT,
+        &roster,
+        &runner,
+    )
+    .expect("agent");
     eprintln!("agent(bad): {:?}", bad);
     assert!(
         !bad.pass,

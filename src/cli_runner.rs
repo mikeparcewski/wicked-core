@@ -188,7 +188,17 @@ pub(crate) fn run_unit_and_judge(
             .as_ref()
             .filter(|v| v.approved)
             .map(|v| {
-                match crate::validator::agent_validate(&v.criterion, work_for_agent, &**runner) {
+                // GAP B: run the agent judge under a council seat DISTINCT from the deterministic
+                // validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) when the live roster offers one —
+                // genuine two-seat independence; falls back to the single default runner otherwise.
+                let roster = crate::registry_roster();
+                match crate::validator::agent_validate(
+                    &v.criterion,
+                    work_for_agent,
+                    crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
+                    &roster,
+                    &**runner,
+                ) {
                     Ok(av) => (av.pass, av.reasoning),
                     Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
                 }
