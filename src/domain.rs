@@ -176,6 +176,11 @@ pub struct WorkUnit {
     /// to the run-level policy. `#[serde(default)]` for back-compat with pre-gate-wiring units.
     #[serde(default)]
     pub gate: crate::workflow::GateSpec,
+    /// The backing phase's evaluator≠creator role (DES-EXEC-001 §4). An `Evaluator`-role unit reviews
+    /// the COLD output of the most recent prior `Creator`-role unit (real artifact-passing), not its
+    /// own. `Neutral` (default) keeps the generic per-unit second pass. `#[serde(default)]` back-compat.
+    #[serde(default)]
+    pub role: crate::workflow::PhaseRole,
     /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
     /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
     /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
@@ -306,6 +311,7 @@ impl WorkUnit {
             skill_ref: None,
             allowed_skills: Vec::new(),
             gate: crate::workflow::GateSpec::default(),
+            role: crate::workflow::PhaseRole::default(),
             validator: None,
             status: UnitStatus::Pending,
         }

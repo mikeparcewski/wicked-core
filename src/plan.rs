@@ -80,6 +80,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Carry the phase's declared human-confirm gate (§3) so the DEF drives when the run pauses
             // for a human, not just the run-level --confirm flag.
             unit.gate = phase.gate;
+            // Carry the evaluator≠creator role (§4) so the gate can do real artifact-passing (an
+            // Evaluator unit reviews the prior Creator's cold output).
+            unit.role = phase.role;
             unit
         })
         .collect()

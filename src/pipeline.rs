@@ -294,10 +294,19 @@ pub(crate) fn apply_and_finish_unit(
     if outcome.approved {
         let evaluator_cli = next_cli_in_roster(&outcome.assigned_cli, cli_keys);
         let eval_at = execute::EVAL_AT_BASE + unit.ord as i64 + 1_000_000;
+        // ARTIFACT-PASSING (§4): an Evaluator-role unit reviews the COLD output of the most recent
+        // prior Creator-role unit — a real second read of the creator's work, not its own output.
+        // Neutral/Creator units keep the generic per-unit second pass. Falls back to own `output` if
+        // there's no prior creator/output (e.g. a mis-authored def), so behavior never regresses.
+        let review_output = if unit.role == crate::workflow::PhaseRole::Evaluator {
+            creator_output_for(store, session_id, unit.ord).unwrap_or_else(|| output.to_string())
+        } else {
+            output.to_string()
+        };
         if let Ok(eval) = execute::evaluate_unit(
             store,
             unit,
-            output,
+            &review_output,
             &evaluator_cli,
             &outcome.collection_scope,
             &format!("unit-{}", unit.ord),
@@ -370,6 +379,29 @@ fn pinned_validator_denial(
         Ok(false) => Some(format!("pinned validator failed: {}", v.criterion)),
         Err(e) => Some(format!("pinned validator error: {e}")),
     }
+}
+
+/// The cold artifact an Evaluator-role unit reviews (rev0.4 §4 artifact-passing): the work-output of
+/// the most recent prior Creator-role unit. `None` if there is no prior Creator or it has no output.
+fn creator_output_for(
+    store: &wicked_apps_core::SqliteStore,
+    session_id: &str,
+    evaluator_ord: u32,
+) -> Option<String> {
+    let units = crate::domain::session_units(store, session_id).ok()?;
+    let creator = most_recent_prior_creator(&units, evaluator_ord)?;
+    crate::domain::get_work_output(store, &creator.id)
+}
+
+/// Pure selector: the highest-`ord` unit before `evaluator_ord` whose role is `Creator`.
+fn most_recent_prior_creator(
+    units: &[crate::domain::WorkUnit],
+    evaluator_ord: u32,
+) -> Option<&crate::domain::WorkUnit> {
+    units
+        .iter()
+        .filter(|u| u.ord < evaluator_ord && u.role == crate::workflow::PhaseRole::Creator)
+        .max_by_key(|u| u.ord)
 }
 
 /// A deterministic short id from parts (sha256 prefix).
@@ -448,5 +480,26 @@ mod resolve_tests {
         unit.validator = Some(mk("test -f ok.txt", false));
         assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn artifact_passing_picks_the_latest_prior_creator() {
+        use crate::domain::WorkUnit;
+        use crate::workflow::PhaseRole;
+        let mk = |ord: u32, role: PhaseRole| {
+            let mut u = WorkUnit::pending(format!("s:u{ord}"), "s", ord, "d");
+            u.role = role;
+            u
+        };
+        let units = vec![
+            mk(1, PhaseRole::Neutral),
+            mk(2, PhaseRole::Creator),
+            mk(3, PhaseRole::Creator), // most recent creator before the evaluator
+            mk(4, PhaseRole::Evaluator),
+        ];
+        assert_eq!(most_recent_prior_creator(&units, 4).unwrap().ord, 3);
+        assert_eq!(most_recent_prior_creator(&units, 3).unwrap().ord, 2);
+        // no creator before ord 2 ⇒ None (the evaluator falls back to its own output)
+        assert!(most_recent_prior_creator(&units, 2).is_none());
     }
 }
