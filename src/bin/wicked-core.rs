@@ -12,13 +12,17 @@
 //!   wicked-core gate-hook --scope S --phase P     # PreToolUse governance hook (claude invokes this)
 //!   wicked-core provision-validator --criterion "..."   # author a deterministic validator (UNAPPROVED)
 //!   wicked-core approve-validator --pin <pin>     # approve a vaulted validator → the pin to put in a def
+//!   wicked-core gate-phase --workflow <base-id> --phase <phase-id> --criterion "..." [--out <dir>]
+//!       # author+approve a validator for the criterion, PIN it onto that phase, and write a gated
+//!       # drop-in workflow (new id) — the one path that turns a shipped, ungated workflow INTO a
+//!       # gated one so the rev0.4 dual-validator gate actually engages
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
 use std::io::BufRead;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision,
-    LaunchSpec, RepoSpec, WrappedCliStepRunner,
+    LaunchSpec, RepoSpec, WorkflowRegistry, WrappedCliStepRunner,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -77,6 +81,7 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("provision-validator") => return provision_validator_cmd(&args),
         Some("approve-validator") => return approve_validator_cmd(&args),
+        Some("gate-phase") => return gate_phase_cmd(&args),
         _ => {}
     }
 
@@ -164,7 +169,9 @@ fn main() {
                  run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] | \
                  resume --session <id> | cancel --session <id> | \
                  launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
-                 provision-validator --criterion \"...\" | approve-validator --pin <pin>> [--db <path>]"
+                 provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
+                 gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
+                 (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]"
             );
             std::process::exit(2);
         }
@@ -220,6 +227,161 @@ fn approve_validator_cmd(args: &[String]) {
         )),
         Err(e) => fail(&format!("approve-validator failed: {e}")),
     }
+}
+
+/// The workflows overlay dir the planner resolves drop-ins from — `$WICKED_WORKFLOWS_DIR`, else
+/// `$HOME/.config/wicked-core/workflows` (mirrors `pipeline::workflow_overlay_dir`). `gate-phase`
+/// both READS this (to overlay operator drop-ins onto the built-ins before resolving `--workflow`)
+/// and, absent `--out`, WRITES the gated def here so the very next `run --workflow <new-id>` sees it.
+fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
+    if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {
+        return Some(std::path::PathBuf::from(d));
+    }
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config/wicked-core/workflows"))
+}
+
+/// `gate-phase --workflow <base-id> --phase <phase-id> --criterion "..." [--out <dir>]`: the one path
+/// that turns a shipped-style, UNGATED workflow into a GATED one. The built-in feature/bug/migration
+/// defs ship with `validator_pin: null` on every phase, so the rev0.4 dual-validator gate is INERT for
+/// them — it only engages for a phase carrying a `validator_pin`. This command closes that: it loads the
+/// base def, AUTHORS + APPROVES a deterministic validator for `--criterion` (a live `claude` call via the
+/// writer skill, exactly like `provision-validator`), PINS the approved pin onto the named phase, and
+/// writes the modified def as a NEW drop-in workflow JSON (fresh id, so it never clobbers the built-in)
+/// into the workflows overlay dir. The operator then runs `run --workflow <new-id>` and the gate engages.
+///
+/// Opens the store directly as its SOLE writer (the actor is NOT spawned — same reason as
+/// provision-validator/approve-validator). Fail-closed on an unknown workflow id or an unknown phase id
+/// (both name the valid choices).
+fn gate_phase_cmd(args: &[String]) {
+    let Some(workflow) = flag(args, "--workflow") else {
+        fail("gate-phase requires --workflow <base-id>");
+        return;
+    };
+    let Some(phase) = flag(args, "--phase") else {
+        fail("gate-phase requires --phase <phase-id>");
+        return;
+    };
+    let Some(criterion) = flag(args, "--criterion") else {
+        fail("gate-phase requires --criterion \"...\"");
+        return;
+    };
+
+    // 1. Resolve the base WorkflowDef: the built-ins overlaid with operator drop-ins (the same seam the
+    //    planner resolves against), so `--workflow` can name a shipped OR a previously dropped-in workflow.
+    let mut reg = WorkflowRegistry::with_defaults();
+    if let Some(dir) = workflow_overlay_dir() {
+        if let Err(e) = reg.load_dir(&dir) {
+            eprintln!(
+                "gate-phase: workflow overlay {} failed to load ({e}); using built-ins only",
+                dir.display()
+            );
+        }
+    }
+    let Some(base) = reg.get(&workflow) else {
+        fail(&format!(
+            "gate-phase: unknown workflow `{workflow}` — known workflows: {}",
+            reg.ids().join(", ")
+        ));
+        return;
+    };
+    let mut def = base.clone();
+
+    // 2. Fail-closed on an unknown phase id, NAMING the valid phases so the operator can correct it.
+    if !def.phases.iter().any(|p| p.id == phase) {
+        let valid: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
+        fail(&format!(
+            "gate-phase: workflow `{workflow}` has no phase `{phase}` — valid phases: {}",
+            valid.join(", ")
+        ));
+        return;
+    }
+
+    // 3. AUTHOR + APPROVE a validator for the criterion (live `claude`), as the sole store writer.
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("gate-phase: open store failed: {e}"));
+            return;
+        }
+    };
+    let runner = WrappedCliStepRunner::default();
+    let unapproved = match wicked_core::provision_validator(&criterion, &runner, &mut store) {
+        Ok(p) => p,
+        Err(e) => {
+            fail(&format!("gate-phase: authoring the validator failed: {e}"));
+            return;
+        }
+    };
+    let approved = match wicked_core::approve_and_store(&mut store, &unapproved) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            fail(&format!(
+                "gate-phase: the just-authored validator (pin {unapproved}) was not found in the \
+                 vault to approve"
+            ));
+            return;
+        }
+        Err(e) => {
+            fail(&format!("gate-phase: approving the validator failed: {e}"));
+            return;
+        }
+    };
+
+    // 4. PIN the approved validator onto the phase and RE-ID the def so the drop-in never clobbers the
+    //    built-in (a fresh id the operator selects with `run --workflow <new-id>`).
+    let new_id = format!("{phase}-gated-{workflow}");
+    def.id = new_id.clone();
+    for p in def.phases.iter_mut() {
+        if p.id == phase {
+            p.validator_pin = Some(approved.clone());
+        }
+    }
+
+    // 5. WRITE the gated def as a drop-in JSON: `--out` wins, else the resolved overlay dir (so the
+    //    very next `run --workflow <new-id>` picks it up without any extra config).
+    let Some(out_dir) = flag(args, "--out")
+        .map(std::path::PathBuf::from)
+        .or_else(workflow_overlay_dir)
+    else {
+        fail(
+            "gate-phase: no output dir — pass --out <dir>, or set $WICKED_WORKFLOWS_DIR / $HOME so the \
+             workflows overlay dir resolves",
+        );
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        fail(&format!(
+            "gate-phase: creating {} failed: {e}",
+            out_dir.display()
+        ));
+        return;
+    }
+    let out_path = out_dir.join(format!("{new_id}.json"));
+    let json = match serde_json::to_string_pretty(&def) {
+        Ok(j) => j,
+        Err(e) => {
+            fail(&format!(
+                "gate-phase: serializing the gated def failed: {e}"
+            ));
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&out_path, &json) {
+        fail(&format!(
+            "gate-phase: writing {} failed: {e}",
+            out_path.display()
+        ));
+        return;
+    }
+
+    println!("gated workflow written: {}", out_path.display());
+    println!("  new workflow id: {new_id}");
+    println!("  phase `{phase}` now pins APPROVED validator: {approved}");
+    println!(
+        "the dual-validator gate now ENGAGES for phase `{phase}`. run it with:\n  \
+         wicked-core run --problem \"...\" --workflow {new_id} --repo <id>"
+    );
 }
 
 /// An interactive governed run: stream events and, at each human-confirm gate, prompt the operator
