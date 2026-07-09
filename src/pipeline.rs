@@ -150,6 +150,36 @@ fn resolve_workflow_def(
     }
 }
 
+/// Attach each phase's PINNED, already-approved validator to its unit (the producer half that makes the
+/// rev0.4 dual-validator gate ENGAGE). Units are 1:1 with `def.phases` in declaration order, so this zips
+/// them and, for every phase that declares a `validator_pin`, LOADS that validator from the vault (a pure
+/// store read — no LLM, so actor-safe) and pins it onto `unit.validator`. A pin that does NOT resolve in
+/// the vault is FAIL-CLOSED: a phase pinning a validator that isn't vaulted is a misconfiguration, so the
+/// run BAILS rather than silently executing an ungated phase. A phase with no `validator_pin` leaves the
+/// unit's validator `None` (the pre-gate, ungated behavior).
+fn attach_pinned_validators(
+    store: &wicked_apps_core::SqliteStore,
+    units: &mut [crate::domain::WorkUnit],
+    def: &crate::workflow::WorkflowDef,
+) -> anyhow::Result<()> {
+    for (unit, phase) in units.iter_mut().zip(def.phases.iter()) {
+        let Some(pin) = phase.validator_pin.as_deref() else {
+            continue;
+        };
+        match crate::validator_vault::load_validator(store, pin)? {
+            Some(validator) => unit.validator = Some(validator),
+            None => anyhow::bail!(
+                "workflow `{}` phase `{}` pins validator `{pin}`, which is not in the vault \
+                 (author + approve it out of band via provision_validator/approve_and_store before \
+                 running this workflow) — refusing to run the phase ungated (fail-closed)",
+                def.id,
+                phase.id
+            ),
+        }
+    }
+    Ok(())
+}
+
 fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {
         return Some(std::path::PathBuf::from(d));
@@ -196,6 +226,17 @@ pub(crate) fn plan_and_distribute(
             units.len(),
             crate::actor::DENY_PHASE_SPAN
         );
+    }
+
+    // ENGAGE THE DUAL-VALIDATOR GATE (the producer side of the rev0.4 pin+vault): for a def-driven run,
+    // any phase that declares a `validator_pin` gets its ALREADY-APPROVED validator LOADED from the vault
+    // and attached to the phase's unit. Units are 1:1 with `def.phases` in declaration order (plan_from_def
+    // zips them), so we zip here too. Loading is a PURE store read — no LLM authoring — so it is actor-safe
+    // on the single-writer thread; authoring/approval happened out of band. Once attached, the gate reads
+    // `unit.validator`: `pinned_validator_denial` re-verifies it deterministically and the off-thread
+    // agent judge renders its semantic verdict — the layers that were INERT with nothing pinning the unit.
+    if let Some(def) = &selected_def {
+        attach_pinned_validators(store, &mut units, def)?;
     }
 
     let collection_scope = match entity_mode {
@@ -570,6 +611,79 @@ mod resolve_tests {
             approved2 = false;
         }
         assert!(approved2, "agent PASS must not flip an approved unit");
+    }
+
+    #[test]
+    fn plan_attaches_an_approved_pinned_validator_so_the_gate_engages() {
+        // The PRODUCER half of the inert-gate fix: a def phase that pins an already-approved validator
+        // must have that validator LOADED from the vault and attached to its unit — so `unit.validator`
+        // is finally non-`None` and the deterministic re-verify + agent judge actually fire. This runs
+        // the EXACT sequence `plan_and_distribute` runs (plan_from_def → attach_pinned_validators),
+        // deterministically and with NO LLM (the validator is constructed + vaulted directly).
+        use crate::validator::DeterministicValidator;
+        use crate::validator_vault::{pin, store_validator};
+        use wicked_apps_core::open_store;
+
+        let dir = std::env::temp_dir().join(format!("wicked-pin-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        // An APPROVED validator, vaulted out of band (authoring is an LLM step; here we build it directly).
+        let approved = DeterministicValidator {
+            criterion: "README exists".into(),
+            script: "test -f README.md".into(),
+            approved: true,
+        };
+        let p = store_validator(&mut store, &approved).unwrap();
+        assert_eq!(p, pin(&approved), "store returns the content-hash pin");
+
+        // A 1-phase def whose phase PINS that approved validator (authored as pure JSON data).
+        let def: crate::workflow::WorkflowDef = serde_json::from_str(&format!(
+            r#"{{ "id": "gated", "phases": [ {{ "id": "build", "kind": "build", "validator_pin": "{p}" }} ] }}"#
+        ))
+        .unwrap();
+        def.validate().unwrap();
+
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        assert!(
+            units[0].validator.is_none(),
+            "before the producer runs, the unit is UNGATED (the inert-gate state)"
+        );
+        attach_pinned_validators(&store, &mut units, &def).unwrap();
+
+        assert_eq!(
+            units[0].validator.as_ref(),
+            Some(&approved),
+            "the phase's approved validator is loaded from the vault and pinned onto the unit — the gate ENGAGES"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unresolvable_validator_pin_fails_closed() {
+        // A phase that pins a validator missing from the vault is a MISCONFIGURATION; rather than run the
+        // phase silently ungated, the producer BAILS (fail-closed) with an error naming the phase + pin.
+        use wicked_apps_core::open_store;
+        let dir = std::env::temp_dir().join(format!("wicked-pin-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        let def: crate::workflow::WorkflowDef = serde_json::from_str(
+            r#"{ "id": "gated", "phases": [ { "id": "build", "kind": "build", "validator_pin": "deadbeefdeadbeef" } ] }"#,
+        )
+        .unwrap();
+        def.validate().unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "do it", "s");
+        let err = attach_pinned_validators(&store, &mut units, &def)
+            .expect_err("an unresolvable pin must bail, not silently run ungated");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deadbeefdeadbeef") && msg.contains("not in the vault"),
+            "the fail-closed error must name the missing pin: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

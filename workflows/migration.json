@@ -16,7 +16,8 @@
       "depends_on": [],
       "role": "neutral",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "execute",
@@ -31,7 +32,8 @@
       ],
       "role": "creator",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "cutover",
@@ -50,7 +52,8 @@
       ],
       "role": "neutral",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "verify",
@@ -67,7 +70,8 @@
       ],
       "role": "evaluator",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "cleanup",
@@ -82,7 +86,8 @@
       ],
       "role": "neutral",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     }
   ]
 }

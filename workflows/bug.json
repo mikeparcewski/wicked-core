@@ -12,7 +12,8 @@
       "depends_on": [],
       "role": "neutral",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "reproduce",
@@ -27,7 +28,8 @@
       ],
       "role": "neutral",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "fix",
@@ -42,7 +44,8 @@
       ],
       "role": "creator",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     },
     {
       "id": "verify",
@@ -59,7 +62,8 @@
       ],
       "role": "evaluator",
       "skill_ref": null,
-      "allowed_skills": []
+      "allowed_skills": [],
+      "validator_pin": null
     }
   ]
 }

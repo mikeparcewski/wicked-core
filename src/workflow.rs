@@ -216,6 +216,16 @@ pub struct PhaseDef {
     /// extra scoping beyond `skill_ref`. Least-privilege per phase, and pure DATA.
     #[serde(default)]
     pub allowed_skills: Vec<String>,
+    /// The content-hash [`pin`](crate::validator_vault::pin) of an ALREADY-APPROVED deterministic
+    /// validator sitting in the [validator vault](crate::validator_vault) (authored + approved OUT OF
+    /// BAND via `provision_validator` → `approve_and_store` — an LLM authoring step that never runs on
+    /// the actor thread). When present, the planner LOADS that validator (a pure store read, no LLM) and
+    /// attaches it to the phase's unit, so the rev0.4 dual-validator gate ENGAGES: the deterministic
+    /// re-verify + agent judge fire against this criterion. Loading is fail-closed — a pin that does not
+    /// resolve in the vault is a misconfiguration and the run bails rather than silently running ungated.
+    /// `None` (the default) ⇒ the phase runs ungated by a pinned validator (the pre-gate behavior).
+    #[serde(default)]
+    pub validator_pin: Option<String>,
 }
 
 impl PhaseDef {
@@ -233,6 +243,7 @@ impl PhaseDef {
             role: PhaseRole::Neutral,
             skill_ref: None,
             allowed_skills: Vec::new(),
+            validator_pin: None,
         }
     }
     fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {
