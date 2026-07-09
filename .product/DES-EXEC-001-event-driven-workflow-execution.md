@@ -44,12 +44,15 @@ verified against real `claude`):
   provisioner **sidecars** exist (JS, smoke-verified).
 - ✅ **napi bridge** (`../wicked-core-ts`) — `launchRun`/`subscribe`/`confirmGate` over FFI.
 
-Honest gaps / follow-ups (see §2.5, §rev0.4, §rev0.5):
-- ⬜ **Law 1's execution mediation seam** (actor publishes `task.dispatched` → cli-runner subscriber →
-  `task.completed`) is **NOT built** — a shipped run still dispatches in-process; the bus carries only
-  the launch trigger (env-gated). Law 1 holds for the trigger, not the execution seam.
-- ⬜ **Shipped workflows are ungated** — feature/bug/migration ship `validator_pin: null`, so the dual
-  gate engages only for an operator-pinned def.
+Gaps closed (2026-07-09, opt-in where noted):
+- ✅ **Law 1's execution mediation seam** — the actor publishes `task.dispatched` → a `cli-runner`
+  subscriber executes off-actor → `task.completed` → actor (`src/cli_runner.rs`, verified round-trip).
+  **Opt-in** (`WICKED_BUS_EXEC`); the default stays in-process. Law 1 now holds for the execution seam too.
+- ✅ **Shipped workflows can be gated** — the `gate-phase` CLI authors→approves→pins a validator into a
+  drop-in def, so a shipped-style workflow engages the dual gate with one command (the built-ins still
+  ship ungated by default).
+
+Remaining honest gaps / follow-ups (see §rev0.4, §rev0.5):
 - ⬜ **Validator independence** is distinct-prompt-on-same-runner, not distinct council seats.
 - ⬜ **OS sandbox** around validator execution (denylist is a backstop); **napi→studio UI** wiring;
   **council-assigns-skill** (needs a grounded skill-ranking design).
@@ -403,15 +406,16 @@ subscribes `wicked.run.*` → poll → nested args survive → ack) and `wicked.
 (provisioner sidecar polls needed → emits ready → a reducer cursor scoped to `.ready` polls only that;
 `run_id` correlation survives the chain). The substrate needs **zero new infrastructure**.
 
-**HONEST SCOPE (integrated review, 2026-07-09) — what the bridge does NOT yet do.** `src/bus.rs` +
-`Core::connect_bus` carry ONLY the **launch-trigger edge** (`wicked.run.requested` → `LaunchRun`, plus a
-`wicked.run.launched` back), and it is **opt-in / env-gated** (`WICKED_BUS_DB`). The design's central
-**mediation seam of Law 1** — the actor PUBLISHING `task.dispatched` for a `cli-runner` subscriber that
-executes off-bus and PUBLISHES `task.completed` back, i.e. "the actor no longer calls execution directly"
-— is **NOT built**: a shipped run still dispatches units in-process (`dispatch_unit` → worker thread →
-`ApplyStepResult`), not over the bus. So **Law 1 is realized for the launch trigger, not for the
-execution seam.** Building the `task.dispatched`/`task.completed` mediation over this proven substrate is
-the tracked follow-up; today the bus is an ingress trigger + lifecycle emitter, not the control plane.
+**SCOPE (updated 2026-07-09 — the mediation seam is now BUILT, opt-in).** `src/bus.rs` + `Core::connect_bus`
+carry the **launch-trigger edge** (`wicked.run.requested` → `LaunchRun` + `wicked.run.launched`). And the
+design's central **mediation seam of Law 1** is now **built** (`src/cli_runner.rs`, verified round-trip):
+the actor PUBLISHES `wicked.task.dispatched`, a `cli-runner` subscriber runs the unit **off-actor** (via the
+same `StepRunner`) and PUBLISHES `wicked.task.completed`, which the actor consumes as `ApplyStepResult` —
+"the actor no longer calls execution directly." It is **opt-in / env-gated** (`WICKED_BUS_EXEC` +
+`WICKED_BUS_DB`, or `Core::spawn_with_engine_exec`): armed, execution flows over the bus (proven identical
+outcomes to in-process, single-writer preserved, exactly-once over at-least-once); **the DEFAULT stays
+in-process** (byte-for-byte unchanged). So Law 1 is realized for BOTH the launch trigger and the execution
+seam — the latter as an opt-in path today, ready to become the default once soaked.
 - **Real library API** (the wicked-bus README's programmatic example is STALE): `emit(db, config,
   {event_type, domain, subdomain, payload})`; `register(db, {plugin, role:'subscriber', filter,
   cursor_init})` → `{cursor_id}`; `poll(db, cursorId, {batchSize})` → **array of raw rows** (payload is a
