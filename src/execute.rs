@@ -54,6 +54,13 @@ pub struct EvaluationOutcome {
 /// produces `output` off-thread (no store handle); the actor calls this on the single-writer thread
 /// to record it. THE INVARIANT: the gate fires on every unit; a `Deny` drives the phase to
 /// `Rejected` through orchestration — never approved by any route (ADR-0003).
+///
+/// DENY-DOMINATES, side-effect-ordered (seam finding #2): `validator_denial` carries an
+/// ALREADY-COMPUTED deny from the dual-validator layers (deterministic re-verify / agent judge) OR the
+/// evaluator≠creator second pass. It is folded into the gate resolution BEFORE the phase resolves and
+/// BEFORE any `work_output` is written, so a validator/evaluator deny drives the phase to `Rejected`
+/// (persisting the hard `gate_decision` veto) and leaves NO approved phase and NO stored `work_output`
+/// to leak (the ADR-0003 violation this parameter closes). `None` ⇒ governance decides alone (unchanged).
 pub(crate) fn apply_unit(
     store: &mut SqliteStore,
     unit: &WorkUnit,
@@ -61,6 +68,7 @@ pub(crate) fn apply_unit(
     workflow_id: &str,
     entity_mode: EntityMode,
     session_id: &str,
+    validator_denial: Option<String>,
 ) -> anyhow::Result<UnitOutcome> {
     let assigned_cli = unit
         .assigned_cli
@@ -95,11 +103,25 @@ pub(crate) fn apply_unit(
         &context,
         evaluated_at,
     );
+    let governance_denied = matches!(claim.decision, Decision::Deny);
     let decision_tok = decision_token(&claim.decision);
 
-    // 4. the gate fires THROUGH orchestration (the invariant).
+    // 4. the gate fires THROUGH orchestration (the invariant). DENY-DOMINATES: the gate denies if
+    //    governance denied OR a dual-validator / evaluator layer denied (`validator_denial`). When ONLY
+    //    a validator denied, synthesize a `Deny` for the gate so the phase resolves `Rejected` and
+    //    PERSISTS the hard `gate_decision` veto — BEFORE `work_output` is written — so no approved phase
+    //    or stored output can leak past a validator deny (seam finding #2 / ADR-0003).
+    let validator_denied = validator_denial.is_some();
     let gate_event_id = format!("gate-{}", unit.id);
-    let gate = apply_gate(store, &phase_id, Some(&claim), &gate_event_id)?;
+    let gate_claim = if validator_denied && !governance_denied {
+        ConformanceClaim {
+            decision: Decision::Deny,
+            ..claim.clone()
+        }
+    } else {
+        claim.clone()
+    };
+    let gate = apply_gate(store, &phase_id, Some(&gate_claim), &gate_event_id)?;
     let resolved_phase = get_phase(store, &phase_id)?;
     let phase_status = resolved_phase
         .as_ref()
@@ -110,7 +132,8 @@ pub(crate) fn apply_unit(
         Some(PhaseStatus::Approved) | Some(PhaseStatus::ApprovedWithConditions)
     );
 
-    // 5. on approval: record the work-output node + durable conformance; on deny: claim only.
+    // 5. on approval: record the work-output node + durable conformance; on deny: claim only. A
+    //    validator/evaluator deny lands here as `!approved`, so it too writes NO work_output.
     if approved {
         let output_node = work_output_node(
             unit,
@@ -121,9 +144,12 @@ pub(crate) fn apply_unit(
         );
         put_node(store, output_node)?;
     }
-    // On a deny, capture WHY: the decision + the firing policies (governance exposes no policy-read
-    // API, so we cite ids + criteria — honest provenance the UI can show).
-    let denial_reason = (!approved).then(|| {
+    // On a deny, capture WHY. A governance deny cites the decision + firing policies (governance exposes
+    // no policy-read API, so we cite ids + criteria — honest provenance the UI can show); a
+    // validator/evaluator-layer deny carries its own reason through unchanged.
+    let denial_reason = if approved {
+        None
+    } else if governance_denied {
         let policies = if claim.policy_ids.is_empty() {
             "no matching policy (default-deny)".to_string()
         } else {
@@ -134,11 +160,16 @@ pub(crate) fn apply_unit(
         } else {
             format!(", criteria: {}", claim.criteria)
         };
-        format!(
+        Some(format!(
             "Governance DENIED unit {} ({assigned_cli}) — decision={decision_tok}, policies: [{policies}]{criteria}",
             unit.ord
-        )
-    });
+        ))
+    } else {
+        // A dual-validator / evaluator deny (deny-dominates over a governance ALLOW).
+        validator_denial
+    };
+    // Record the REAL governance claim (its actual decision) for provenance — the synthesized gate
+    // deny above is the gate's resolution, not a rewrite of what governance decided.
     conform(store, &claim)?;
 
     Ok(UnitOutcome {
@@ -260,4 +291,76 @@ fn work_output_node(
     m.insert("phase_status".into(), s(phase_status));
     m.insert("output".into(), s(output));
     node
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{get_work_output, WorkUnit};
+    use wicked_apps_core::open_store;
+
+    /// Seam finding #2: a dual-validator / evaluator deny (governance itself ALLOWS) must drive the
+    /// phase to `Rejected` and write NO approved `work_output` — no Approved phase and no stale
+    /// "approved" artifact can leak past a validator deny (ADR-0003).
+    #[test]
+    fn a_validator_deny_drives_the_phase_rejected_and_writes_no_work_output() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+
+        // Governance would ALLOW (no policy on the store), but a validator layer denied.
+        let mut denied = WorkUnit::pending("s:u1", "s", 1, "build it");
+        denied.assigned_cli = Some("claude".into());
+        let outcome = apply_unit(
+            &mut store,
+            &denied,
+            "the creator output",
+            "wf-s",
+            EntityMode::Shared,
+            "s",
+            Some("agent validator rejected: diverged from criterion".into()),
+        )
+        .unwrap();
+        assert!(!outcome.approved, "a validator deny must NOT approve");
+        assert_eq!(
+            outcome.phase_status, "rejected",
+            "phase_status must be `rejected`, never `approved`, on a validator-denied unit"
+        );
+        assert!(
+            outcome
+                .denial_reason
+                .as_deref()
+                .unwrap()
+                .contains("diverged from criterion"),
+            "the validator deny reason is carried through: {:?}",
+            outcome.denial_reason
+        );
+        assert!(
+            get_work_output(&store, "s:u1").is_none(),
+            "a validator-denied unit must leak NO approved work_output"
+        );
+
+        // Control: the SAME governance-allow with NO validator deny approves and DOES store output —
+        // proving the suppression is the validator deny, not a broken gate. (Distinct unit/phase id.)
+        let mut ok = WorkUnit::pending("s:u2", "s", 2, "build it");
+        ok.assigned_cli = Some("claude".into());
+        let ok_outcome = apply_unit(
+            &mut store,
+            &ok,
+            "the approved output",
+            "wf-s",
+            EntityMode::Shared,
+            "s",
+            None,
+        )
+        .unwrap();
+        assert!(
+            ok_outcome.approved,
+            "governance-allow + no validator deny approves"
+        );
+        assert_eq!(ok_outcome.phase_status, "approved");
+        assert_eq!(
+            get_work_output(&store, "s:u2").as_deref(),
+            Some("the approved output"),
+            "an approved unit stores its work_output"
+        );
+    }
 }

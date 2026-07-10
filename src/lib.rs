@@ -13,7 +13,9 @@
 
 mod actor;
 mod applications;
+mod bus;
 mod campaign;
+mod cli_runner;
 mod code_graph;
 mod command;
 mod distribute;
@@ -33,18 +35,25 @@ mod repo_intel;
 mod scope;
 mod sources;
 mod terminal;
+mod validator;
+mod validator_vault;
 mod workflow;
 
-pub use actor::RunBusy;
+pub use actor::{RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
     Application, SeedKind,
+};
+pub use bus::{
+    deterministic_key, matches_filter, BusBridge, BusDb, BusEmit, BusEvent, CORE_DOMAIN,
+    RUN_LAUNCHED, RUN_REQUESTED,
 };
 pub use campaign::{
     all_campaigns, blocked_by_failure, get_campaign, ready_set, satisfied,
     validate as validate_campaign, Campaign, CampaignDef, CampaignEdge, CampaignGateDecision,
     CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
 };
+pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
 pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
@@ -61,14 +70,27 @@ pub use graph_browser::{
 pub use knowledge::RecalledKnowledge;
 pub use memory::{now_secs, RecalledMemory};
 pub use pipeline::SessionResult;
+pub use plan::plan_from_def;
 pub use repo::{RepoEntry, RepoSpec};
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
 };
 pub use scope::{resolve_scope, EntityMode};
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
+pub use validator::{
+    agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
+    run_validator_reporting, sandbox_availability, AgentVerdict, DeterministicValidator,
+    GateVerdict, SandboxLevel, DETERMINISTIC_VALIDATOR_SEAT,
+};
+pub use validator_vault::{
+    approve_and_store, load_validator, pin, provision_validator, store_validator, VALIDATOR_VAULT,
+};
 pub use wicked_council::AgenticCli;
-pub use workflow::{HumanDecision, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner};
+pub use workflow::{
+    bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
+    PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner, Usage, WorkflowDef,
+    WorkflowDefError, WorkflowRegistry,
+};
 
 /// What to run: the problem to decompose, the council roster (`AgenticCli` seats), the scope toggle,
 /// and a stable session id. The roster is passed explicitly so callers (tests, UI) control it; the
@@ -84,6 +106,11 @@ pub struct LaunchSpec {
     /// The id of a registered repo to run within (P3). When set, COE creates an isolated git
     /// worktree for the run and executes there; `None` runs without a repo (no worktree).
     pub repo_ref: Option<String>,
+    /// The registered `WorkflowDef` id to run (`feature`/`bug`/`migration` or a drop-in). When set,
+    /// planning is DATA-DRIVEN: units come from the def's phases (stage from the phase's declared
+    /// `kind`) via [`crate::plan_from_def`]. `None` ⇒ the legacy free-text planner (prose split +
+    /// keyword classify), so existing callers are unchanged.
+    pub workflow: Option<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -151,6 +178,30 @@ impl Core {
         dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
         runner: std::sync::Arc<dyn StepRunner>,
     ) -> Core {
+        Core::spawn_inner(path, dispatcher, runner, None)
+    }
+
+    /// Spawn with the Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) turned ON EXPLICITLY against the
+    /// bus db at `bus_db_path` — the actor publishes `wicked.task.dispatched` for a `cli-runner`
+    /// subscriber instead of dispatching units in-process, and consumes `wicked.task.completed` back. This
+    /// is the env-free entry (no `WICKED_BUS_EXEC` global) so a test can prove the round-trip without
+    /// racing other tests on process env. Production opts in via `WICKED_BUS_EXEC` + `WICKED_BUS_DB`
+    /// (read by [`spawn_with_engine`]).
+    pub fn spawn_with_engine_exec(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+        bus_db_path: impl Into<String>,
+    ) -> Core {
+        Core::spawn_inner(path, dispatcher, runner, Some(bus_db_path.into()))
+    }
+
+    fn spawn_inner(
+        path: impl Into<String>,
+        dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
+        runner: std::sync::Arc<dyn StepRunner>,
+        exec_bus: Option<String>,
+    ) -> Core {
         let (tx, rx) = channel();
         let path = path.into();
         let self_tx = tx.clone();
@@ -158,7 +209,9 @@ impl Core {
         // actor for open/close/shutdown. Both reach the same sessions behind its mutex.
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
-        std::thread::spawn(move || actor::run(path, rx, self_tx, dispatcher, runner, pty_actor));
+        std::thread::spawn(move || {
+            actor::run(path, rx, self_tx, dispatcher, runner, pty_actor, exec_bus)
+        });
         Core {
             tx: tx.clone(),
             pty,
@@ -172,6 +225,27 @@ impl Core {
         let (s, r) = channel();
         let _ = self.tx.send(Command::Subscribe(s));
         r
+    }
+
+    /// Connect this Core to a wicked-bus event log (DES-EXEC-001 §2.5): spawn the launch bridge — a
+    /// dedicated poller thread that turns each `wicked.run.requested {workflow, problem, args}` on the
+    /// bus into a `LaunchRun` on this actor, and emits `wicked.run.launched` back onto the bus when a
+    /// run starts. `roster` is the council seats a launched run runs with (a caller passes
+    /// [`registry_roster`] in production). The returned [`BusBridge`] owns the thread — drop it (or
+    /// call [`BusBridge::stop`]) to stop polling. The poller runs entirely off the actor thread with
+    /// its own SQLite connection to the bus db, reaching the actor only via commands (actor-safe).
+    pub fn connect_bus(
+        &self,
+        bus_db_path: impl Into<String>,
+        roster: Vec<AgenticCli>,
+    ) -> BusBridge {
+        bus::connect(
+            self.tx.clone(),
+            bus_db_path,
+            roster,
+            EntityMode::Shared,
+            std::time::Duration::from_millis(200),
+        )
     }
 
     /// Liveness probe — emits a `Heartbeat` to subscribers and waits for the actor to ack.
@@ -718,6 +792,7 @@ mod tests {
             "Do step one. Do step two",
             EntityMode::Shared,
             "test-pipeline",
+            None, // free-text planner (legacy path)
             Arc::new(Stub),
             &mut |ev| events.push(ev),
         )
@@ -750,5 +825,46 @@ mod tests {
         assert!(units.iter().all(|u| u.status == UnitStatus::Done));
         let out = get_work_output(&store, "test-pipeline:u1").expect("unit 1 output");
         assert!(out.contains("stub-output"), "transcript: {out}");
+
+        // ── Law 2 AT RUNTIME: selecting a workflow makes the run a function of WorkflowDef DATA. ──
+        // Same driver, same prose, but `Some("feature")` — the units now come from the feature def's
+        // phases (ids + declared stage), NOT the sentence-splitter. This is the proof the slice-1
+        // adversarial review's critical finding demanded: a runtime consumer of the registry.
+        let feature = crate::feature_def();
+        let mut ev2: Vec<CoreEvent> = Vec::new();
+        crate::pipeline::run_session(
+            &mut store,
+            vec![cli("fake-a"), cli("fake-b")],
+            "add SSO login", // under the legacy planner this prose is ONE unit; the def makes it 6
+            EntityMode::Shared,
+            "test-feature",
+            Some("feature"),
+            Arc::new(Stub),
+            &mut |e| ev2.push(e),
+        )
+        .expect("def-driven run_session");
+        let funits = session_units(&store, "test-feature").unwrap();
+        assert_eq!(
+            funits.len(),
+            feature.phases.len(),
+            "one unit per feature phase — the def drove planning, not the prose splitter"
+        );
+        for (u, p) in funits.iter().zip(feature.phases.iter()) {
+            // The unit id encodes the backing phase (plan-time linkage the execute path can't clobber).
+            assert_eq!(
+                u.id,
+                format!("test-feature:{}", p.id),
+                "unit id backs its phase"
+            );
+            assert_eq!(
+                u.stage, p.kind,
+                "stage came from the phase's declared kind, not a keyword guess over the prose"
+            );
+        }
+        assert!(
+            funits.len() > 1,
+            "the free-text planner would have made 1 unit from this prose; the def made {}",
+            funits.len()
+        );
     }
 }

@@ -49,6 +49,8 @@ impl StepRunner for WorkdirRunner {
             attempt: input.attempt,
             output: "ok".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -114,6 +116,7 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
         repo_ref,
+        workflow: None,
     }
 }
 

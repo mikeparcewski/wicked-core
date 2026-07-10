@@ -56,6 +56,8 @@ impl StepRunner for GatedRunner {
             attempt: input.attempt,
             output: format!("stub-output for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -74,6 +76,8 @@ impl StepRunner for FastRunner {
             attempt: input.attempt,
             output: format!("stub-output for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -102,6 +106,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         session_id: session_id.into(),
         human_confirm: HumanConfirm::None,
         repo_ref: None,
+        workflow: None,
     }
 }
 

@@ -117,7 +117,15 @@ pub(crate) enum Command {
     },
     /// Internal: a worker posts the output of one unit step back to the actor (the single writer),
     /// which applies the governance gate + advances the cursor. Not called by external consumers.
-    ApplyStepResult { output: StepOutput },
+    /// `agent_verdict` is the rev0.4 dual-validator LAYER-2 (semantic judge) result the worker
+    /// computed OFF-THREAD (via `agent_validate`, which runs `claude -p`) — carried on this transport
+    /// message rather than on `StepOutput` so the `StepRunner` trait + its impls stay untouched; the
+    /// actor folds it into the gate via `combine_verdict`. `None` ⇒ the unit carried no pinned
+    /// validator (no agent judgment for this phase). `(pass, reasoning)`.
+    ApplyStepResult {
+        output: StepOutput,
+        agent_verdict: Option<(bool, String)>,
+    },
     /// Internal: a worker streams a live output chunk; the actor (the single emit point) fans it out
     /// as a [`CoreEvent::CliOutputDelta`]. Keeps the single-emit-point invariant while streaming.
     CliOutputDelta {

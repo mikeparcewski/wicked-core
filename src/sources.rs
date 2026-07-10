@@ -124,7 +124,7 @@ pub struct ReconDoc {
 /// Run a CLI invocation with a prompt in `cwd`, killing it after `timeout`. Returns stdout, or None on
 /// spawn failure / timeout / non-zero exit.
 fn run_cli(invocation: &str, prompt: &str, cwd: &Path, timeout: Duration) -> Option<String> {
-    let argv = build_argv(invocation, prompt);
+    let argv = build_argv(invocation, prompt, &[]); // source recon has no skill allowlist
     let (bin, rest) = argv.split_first()?;
     let mut child = Command::new(bin)
         .args(rest)

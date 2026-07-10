@@ -128,6 +128,64 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             ord,
             allow,
         } => json!({ "type": "gateDecided", "session": session, "ord": ord, "allow": allow }),
+        // (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `gateDecided`. camelCase fields;
+        // `criterion`/`agentVerdict`/`agentReasoning`/`denialReason` are nullable (Option → null),
+        // `evaluatorPass` is a nullable bool (`None` = the evaluator≠creator pass did not run).
+        CoreEvent::GateEvaluated {
+            session,
+            ord,
+            criterion,
+            has_deterministic_floor,
+            deterministic_pass,
+            agent_verdict,
+            agent_reasoning,
+            evaluator_pass,
+            denial_reason,
+            combined,
+        } => json!({
+            "type": "gateEvaluated",
+            "session": session,
+            "ord": ord,
+            "criterion": criterion,
+            "hasDeterministicFloor": has_deterministic_floor,
+            "deterministicPass": deterministic_pass,
+            "agentVerdict": agent_verdict,
+            "agentReasoning": agent_reasoning,
+            "evaluatorPass": evaluator_pass,
+            "denialReason": denial_reason,
+            "combined": combined,
+        }),
+        // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`
+        // marks a re-dispatch.
+        CoreEvent::UnitDispatched {
+            session,
+            ord,
+            attempt,
+        } => json!({ "type": "unitDispatched", "session": session, "ord": ord, "attempt": attempt }),
+        // (DES-STUDIO-COCKPIT-001 §3 B3) Token/cost burn for one unit run. `costUsd` is nullable
+        // (`None` → null when the CLI reports no cost and no price table resolves it).
+        CoreEvent::CliUsage {
+            session,
+            ord,
+            attempt,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        } => json!({
+            "type": "cliUsage",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+            "inputTokens": input_tokens,
+            "outputTokens": output_tokens,
+            "costUsd": cost_usd,
+        }),
+        // (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched.
+        CoreEvent::DataUsed {
+            session,
+            ord,
+            files,
+        } => json!({ "type": "dataUsed", "session": session, "ord": ord, "files": files }),
         CoreEvent::UnitDone { session, ord } => {
             json!({ "type": "unitDone", "session": session, "ord": ord })
         }
@@ -208,6 +266,12 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::CampaignCancelled { campaign } => {
             json!({ "type": "campaignCancelled", "campaign": campaign })
         }
+        // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
+        // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
+        // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
+        // than a compile break in the operative napi crate the daemon loads. When a new variant
+        // lands, add an explicit arm ABOVE this one (and pin it in the drift test).
+        _ => json!({ "type": "unknown" }),
     }
 }
 
@@ -290,6 +354,9 @@ pub struct LaunchOptions {
     pub human_confirm: Option<String>,
     /// The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run.
     pub repo_ref: Option<String>,
+    /// A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
+    /// is data-driven from the def's phases; omit for the free-text planner.
+    pub workflow: Option<String>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
@@ -306,6 +373,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         session_id: o.session_id,
         human_confirm: parse_human_confirm(o.human_confirm.as_deref()),
         repo_ref: o.repo_ref,
+        workflow: o.workflow,
     })
 }
 
@@ -653,5 +721,249 @@ impl Drop for Subscription {
         // thread, and the pump exits within one `recv_timeout` tick, dropping its `Receiver` + tsfn
         // clone (whose Drop then releases the tsfn, as it was never aborted).
         self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    /// Assert one hand-mapped variant: its `type` tag and the EXACT set of JSON keys it emits. This
+    /// pins the hand-written `CoreEvent → JSON` mapping (`event_to_json` — the studio's only view of
+    /// the stream) so a renamed key or a wrong tag fails CI instead of silently drifting.
+    fn check(ev: CoreEvent, expected_type: &str, expected_keys: &[&str]) {
+        let v: Value = event_to_json(&ev);
+        let obj = v.as_object().expect("mapping emits a JSON object");
+        assert_eq!(
+            obj.get("type").and_then(Value::as_str),
+            Some(expected_type),
+            "wrong type tag for {expected_type}"
+        );
+        let mut got: Vec<&str> = obj.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = expected_keys.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "key set drift for {expected_type}");
+    }
+
+    /// Pin EVERY mapped `CoreEvent` variant's tag (camelCase) + exact key set. Because `CoreEvent` is
+    /// `#[non_exhaustive]`, a NEW variant no longer breaks the build (the defensive `_` arm catches
+    /// it) — so this test is the tripwire: a new variant with no explicit arm falls through to
+    /// `{"type":"unknown"}` and any missing pin here signals the arm was never added.
+    #[test]
+    fn every_mapped_variant_has_stable_tag_and_keys() {
+        let s = || "s".to_string();
+        check(CoreEvent::Heartbeat, "heartbeat", &["type"]);
+        check(
+            CoreEvent::SessionStarted { session: s(), problem: s() },
+            "sessionStarted",
+            &["type", "session", "problem"],
+        );
+        check(
+            CoreEvent::UnitPlanned { session: s(), ord: 1, description: s() },
+            "unitPlanned",
+            &["type", "session", "ord", "description"],
+        );
+        check(
+            CoreEvent::UnitDistributed { session: s(), ord: 1, cli: s() },
+            "unitDistributed",
+            &["type", "session", "ord", "cli"],
+        );
+        check(
+            CoreEvent::UnitExecuting { session: s(), ord: 1 },
+            "unitExecuting",
+            &["type", "session", "ord"],
+        );
+        check(
+            CoreEvent::CliOutputDelta { session: s(), ord: 1, chunk: s() },
+            "cliOutputDelta",
+            &["type", "session", "ord", "chunk"],
+        );
+        check(
+            CoreEvent::GateDecided { session: s(), ord: 1, allow: true },
+            "gateDecided",
+            &["type", "session", "ord", "allow"],
+        );
+        // ── DES-STUDIO-COCKPIT-001 §3 B-events (the 4 new insight variants) ──
+        check(
+            CoreEvent::GateEvaluated {
+                session: s(),
+                ord: 1,
+                criterion: Some(s()),
+                has_deterministic_floor: true,
+                deterministic_pass: true,
+                agent_verdict: Some(s()),
+                agent_reasoning: Some(s()),
+                evaluator_pass: Some(true),
+                denial_reason: None,
+                combined: true,
+            },
+            "gateEvaluated",
+            &[
+                "type",
+                "session",
+                "ord",
+                "criterion",
+                "hasDeterministicFloor",
+                "deterministicPass",
+                "agentVerdict",
+                "agentReasoning",
+                "evaluatorPass",
+                "denialReason",
+                "combined",
+            ],
+        );
+        check(
+            CoreEvent::UnitDispatched { session: s(), ord: 1, attempt: 0 },
+            "unitDispatched",
+            &["type", "session", "ord", "attempt"],
+        );
+        check(
+            CoreEvent::CliUsage {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                input_tokens: 10,
+                output_tokens: 20,
+                cost_usd: Some(0.4),
+            },
+            "cliUsage",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "inputTokens",
+                "outputTokens",
+                "costUsd",
+            ],
+        );
+        check(
+            CoreEvent::DataUsed { session: s(), ord: 1, files: vec![s()] },
+            "dataUsed",
+            &["type", "session", "ord", "files"],
+        );
+        // ── remaining variants ──
+        check(
+            CoreEvent::UnitDone { session: s(), ord: 1 },
+            "unitDone",
+            &["type", "session", "ord"],
+        );
+        check(
+            CoreEvent::UnitDenied { session: s(), ord: 1 },
+            "unitDenied",
+            &["type", "session", "ord"],
+        );
+        check(
+            CoreEvent::AwaitingHuman { session: s(), ord: 1, prompt: s() },
+            "awaitingHuman",
+            &["type", "session", "ord", "prompt"],
+        );
+        check(
+            CoreEvent::Resumed { session: s(), ord: 1 },
+            "resumed",
+            &["type", "session", "ord"],
+        );
+        check(
+            CoreEvent::RunCancelled { session: s() },
+            "runCancelled",
+            &["type", "session"],
+        );
+        check(
+            CoreEvent::SessionFailed { session: s(), ord: 1 },
+            "sessionFailed",
+            &["type", "session", "ord"],
+        );
+        check(
+            CoreEvent::RepoRegistered { repo_ref: s() },
+            "repoRegistered",
+            &["type", "repoRef"],
+        );
+        check(
+            CoreEvent::SessionCompleted { session: s() },
+            "sessionCompleted",
+            &["type", "session"],
+        );
+        check(
+            CoreEvent::Error { session: Some(s()), message: s() },
+            "error",
+            &["type", "session", "message"],
+        );
+        check(
+            CoreEvent::TerminalOpened { id: s(), cwd: s() },
+            "terminalOpened",
+            &["type", "id", "cwd"],
+        );
+        check(
+            CoreEvent::TerminalOutput { id: s(), seq: 7, bytes_b64: s() },
+            "terminalOutput",
+            &["type", "id", "seq", "bytesB64"],
+        );
+        check(
+            CoreEvent::TerminalExited { id: s(), status: Some(0) },
+            "terminalExited",
+            &["type", "id", "status"],
+        );
+        check(
+            CoreEvent::CampaignLaunched { campaign: s() },
+            "campaignLaunched",
+            &["type", "campaign"],
+        );
+        check(
+            CoreEvent::CampaignNodeReady { campaign: s(), node: s() },
+            "campaignNodeReady",
+            &["type", "campaign", "node"],
+        );
+        check(
+            CoreEvent::CampaignNodeStarted { campaign: s(), node: s(), run_id: s() },
+            "campaignNodeStarted",
+            &["type", "campaign", "node", "runId"],
+        );
+        check(
+            CoreEvent::CampaignNodeAwaitingHuman {
+                campaign: s(),
+                node: s(),
+                run_id: s(),
+                prompt: s(),
+            },
+            "campaignNodeAwaitingHuman",
+            &["type", "campaign", "node", "runId", "prompt"],
+        );
+        check(
+            CoreEvent::CampaignNodeCompleted { campaign: s(), node: s() },
+            "campaignNodeCompleted",
+            &["type", "campaign", "node"],
+        );
+        check(
+            CoreEvent::CampaignNodeFailed { campaign: s(), node: s() },
+            "campaignNodeFailed",
+            &["type", "campaign", "node"],
+        );
+        check(
+            CoreEvent::CampaignNodeBlocked { campaign: s(), node: s() },
+            "campaignNodeBlocked",
+            &["type", "campaign", "node"],
+        );
+        check(
+            CoreEvent::CampaignPaused { campaign: s() },
+            "campaignPaused",
+            &["type", "campaign"],
+        );
+        check(
+            CoreEvent::CampaignCompleted { campaign: s() },
+            "campaignCompleted",
+            &["type", "campaign"],
+        );
+        check(
+            CoreEvent::CampaignFailed { campaign: s() },
+            "campaignFailed",
+            &["type", "campaign"],
+        );
+        check(
+            CoreEvent::CampaignCancelled { campaign: s() },
+            "campaignCancelled",
+            &["type", "campaign"],
+        );
     }
 }

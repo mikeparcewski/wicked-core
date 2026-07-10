@@ -13,7 +13,7 @@
 //!    for a run already executing (`RunBusy`) so a run is never double-dispatched.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
@@ -56,12 +56,30 @@ impl std::fmt::Display for RunBusy {
 }
 impl std::error::Error for RunBusy {}
 
+/// A NON-TERMINAL run with this id already exists — re-planning over it would reset its cursor, so the
+/// clobber guard refuses. A TYPED error (not a bare string) so callers — notably the bus bridge — can
+/// recognize this as an idempotent redelivery via `downcast_ref` instead of substring-matching the
+/// message. `.0` is the run id, `.1` its current status rendered for the operator-facing message.
+#[derive(Debug)]
+pub struct RunExists(pub String, pub String);
+impl std::fmt::Display for RunExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "run {} already exists (status {}); resume or cancel it, or use a new id",
+            self.0, self.1
+        )
+    }
+}
+impl std::error::Error for RunExists {}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
 /// `Shutdown` is therefore the real exit. On exit, `store` drops and the writable connection is
 /// released. `dispatcher`/`runner` are the injectable council + step-execution seams (real in prod,
 /// stubbed in tests).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     path: String,
     rx: Receiver<Command>,
@@ -69,6 +87,7 @@ pub(crate) fn run(
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     runner: Arc<dyn StepRunner>,
     pty_map: PtyMap,
+    exec_bus: Option<String>,
 ) {
     let mut store = match open_store(Some(&path)) {
         Ok(s) => s,
@@ -119,6 +138,82 @@ pub(crate) fn run(
         }
     }
 
+    // Rust↔wicked-bus bridge (DES-EXEC-001 §2.5): if a bus db is configured via `WICKED_BUS_DB`, spawn
+    // the launch poller. It runs on its OWN thread with its OWN SQLite connection to the bus db (a
+    // different file from the estate store this actor owns), and reaches this actor ONLY by sending
+    // `Command::LaunchRun` over `self_tx` — the exact self_tx write-back pattern the unit workers use.
+    // So a blocking bus poll can never stall the single writer. Opt-in via env so existing embeddings
+    // /tests (env unset) are unaffected. The `bus_stop` flag + join on loop-exit below guarantee the
+    // poller thread is not leaked when the last `Core` drops.
+    let bus_stop = Arc::new(AtomicBool::new(false));
+    let bus_bridge: Option<std::thread::JoinHandle<()>> = std::env::var("WICKED_BUS_DB")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(|bus_db| {
+            crate::bus::spawn_run_requested_poller(
+                bus_db,
+                self_tx.clone(),
+                crate::registry_roster(),
+                crate::scope::EntityMode::Shared,
+                std::time::Duration::from_millis(500),
+                bus_stop.clone(),
+            )
+        });
+
+    // Law 1 EXECUTION-MEDIATION SEAM (DES-EXEC-001 §2.3) — OPT-IN. Resolve the bus db to mediate
+    // execution over: the explicit `spawn_with_engine_exec` override wins; otherwise the env gate
+    // `WICKED_BUS_EXEC` (any non-empty value) turns it on against `WICKED_BUS_DB`. When OFF (the default),
+    // `dispatch_unit` spawns the in-process worker exactly as before and NONE of the exec threads run.
+    let exec_bus_db: Option<String> = exec_bus.or_else(|| {
+        let on = std::env::var("WICKED_BUS_EXEC")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some();
+        on.then(|| {
+            std::env::var("WICKED_BUS_DB")
+                .ok()
+                .filter(|p| !p.is_empty())
+        })
+        .flatten()
+    });
+    // ARM ATOMICALLY (seam finding #4): the publisher must NOT arm independently of the consumers. A
+    // partial arm — publisher on, but a consumer self-disabled (e.g. its bus-db open failed) — would
+    // publish `task.dispatched` with NO runner AND bypass the in-process fallback → a permanent wedge.
+    // So we first CONFIRM both consumers can initialize (bus-db open ok + durable cursor resolved) via
+    // `init_exec_consumers`; only then do we arm the publisher and spawn the consumer threads. If either
+    // step fails, exec mode stays OFF and the default in-process path stands.
+    let exec_stop = Arc::new(AtomicBool::new(false));
+    let exec_handles: Vec<std::thread::JoinHandle<()>> = match &exec_bus_db {
+        Some(bus_db) => match crate::cli_runner::init_exec_consumers(bus_db) {
+            Some(consumers) if crate::cli_runner::arm_exec_publisher(bus_db) => {
+                let interval = std::time::Duration::from_millis(100);
+                let handles = crate::cli_runner::spawn_exec_consumers(
+                    consumers,
+                    runner.clone(),
+                    self_tx.clone(),
+                    interval,
+                    exec_stop.clone(),
+                );
+                // RESTART RECOVERY (seam finding #1): re-drive any session persisted `Executing` — a
+                // dispatch lost across a crash/restart (task.dispatched never completed, or its result
+                // never applied) recovers by re-dispatching the cursor unit under a BUMPED attempt so a
+                // genuinely NEW `task.dispatched` is emitted (a same-keyed re-emit would dedup to the
+                // terminal row the cli-runner's cursor is already past → no re-run). Armed-mode ONLY, so
+                // the default in-process path — which has no cross-restart durability — is untouched.
+                redrive_executing_sessions(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &mut in_flight,
+                );
+                handles
+            }
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    };
+
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::Ping(reply) => {
@@ -143,6 +238,7 @@ pub(crate) fn run(
                     session_id,
                     human_confirm: _, // legacy straight-through path ignores gates
                     repo_ref: _,      // legacy path has no worktree
+                    workflow,
                 } = spec;
                 // Legacy straight-through path: runs to completion on this thread (stub = fast).
                 let res = pipeline::run_session(
@@ -151,6 +247,7 @@ pub(crate) fn run(
                     &problem,
                     entity_mode,
                     &session_id,
+                    workflow.as_deref(),
                     dispatcher.clone(),
                     &mut |ev| emit(&mut subscribers, ev),
                 );
@@ -200,9 +297,19 @@ pub(crate) fn run(
                 );
                 let _ = reply.send(res);
             }
-            Command::ApplyStepResult { output } => {
+            Command::ApplyStepResult {
+                output,
+                agent_verdict,
+            } => {
                 let run_id = output.run_id.clone();
-                match apply_step_result(&mut store, &mut subscribers, &runner, &self_tx, output) {
+                match apply_step_result(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    output,
+                    agent_verdict,
+                ) {
                     // Run reached a TERMINAL state → drop from in_flight + remember the outcome.
                     Ok(StepApplied::Finished) => {
                         in_flight.remove(&run_id);
@@ -530,6 +637,23 @@ pub(crate) fn run(
             }
         }
     }
+    // Stop + join the bus bridge poller (if any) so it is never leaked past the actor's lifetime.
+    bus_stop.store(true, Ordering::SeqCst);
+    if let Some(h) = bus_bridge {
+        let _ = h.join();
+    }
+    // Stop + join the exec-mediation threads (cli-runner + task.completed poller) and disarm the
+    // actor-thread publisher, so exec mode leaks no thread past the actor's lifetime (DES §5, R1).
+    // BOUNDED-join, not unbounded (seam finding #5): the cli-runner may be mid-CLI (an unbounded
+    // subprocess) when `stop` is set — the flag is only observed at poll boundaries — so an unbounded
+    // join here would wedge shutdown (and the store release) for the CLI's full duration. Wait briefly,
+    // then detach and rely on the stop flag + process exit. The consumers hold no store handle.
+    exec_stop.store(true, Ordering::SeqCst);
+    for h in exec_handles {
+        crate::cli_runner::join_bounded(h, std::time::Duration::from_millis(500));
+    }
+    crate::cli_runner::disarm_exec_publisher();
+
     // Loop exited (last Core dropped): `store` drops here, releasing the writable connection. Any
     // in-flight worker that posts a result now sends into a closed channel and is harmlessly dropped.
     // The `_pty_reaper` guard (declared above) kills + reaps anything still in the PTY map as it
@@ -639,10 +763,7 @@ pub(crate) fn launch_run_inner(
             existing.status,
             SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
         ) {
-            anyhow::bail!(
-                "run {run_id} already exists (status {:?}); resume or cancel it, or use a new id",
-                existing.status
-            );
+            return Err(RunExists(run_id, format!("{:?}", existing.status)).into());
         }
     }
     // If the run targets a registered repo, create its isolated worktree first.
@@ -656,6 +777,7 @@ pub(crate) fn launch_run_inner(
         spec.human_confirm,
         repo_ref,
         workdir,
+        spec.workflow.as_deref(),
         dispatcher,
         &mut |ev| emit(subscribers, ev),
     )?;
@@ -735,6 +857,17 @@ pub(crate) fn resume_run_inner(
         notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Failed);
         return Ok(SessionStatus::Failed);
     }
+    // WEDGE-ON-RE-DISPATCH fix (seam finding #2/#3): a resume RE-DISPATCHES the cursor unit, so bump the
+    // attempt first — otherwise the re-dispatched unit reuses the prior `(run, unit, attempt)` key and,
+    // under exec-mediation, dedups to a terminal task.dispatched row past the cli-runner's cursor → no
+    // worker → wedge. Persist the bump before advancing (dispatch reads `session.attempt` from the store).
+    // Inert on the default in-process path (nothing branches on `attempt`). Only meaningful when the
+    // cursor unit will actually be dispatched (not paused); advancing may pause, which simply no-ops it.
+    {
+        let mut s = session.clone();
+        s.attempt = s.attempt.saturating_add(1);
+        put_node(store, s.to_node())?;
+    }
     match advance_or_pause(store, subscribers, runner, self_tx, run_id, session.unit_ix)? {
         Progress::Dispatched => {
             in_flight.insert(run_id.to_string());
@@ -744,6 +877,66 @@ pub(crate) fn resume_run_inner(
         Progress::Done => {
             finalize_run(store, subscribers, self_tx, run_id)?;
             Ok(SessionStatus::Completed)
+        }
+    }
+}
+
+/// RESTART RECOVERY (seam finding #1) — run ONCE on actor bootstrap when exec-mediation is armed. Any
+/// session persisted `Executing` had a unit dispatched that never reached a terminal apply before the
+/// process died (the `task.dispatched` was lost, or its `task.completed` was consumed but the apply
+/// never persisted). Re-drive it: re-dispatch the cursor unit under a BUMPED attempt so a genuinely NEW
+/// `task.dispatched` is emitted (a same-keyed re-emit would dedup to the terminal row the cli-runner's
+/// cursor is already past → no re-run → wedge). Armed-mode ONLY — the default in-process path has no
+/// cross-restart durability and must stay byte-for-byte unchanged, so it is never re-driven.
+fn redrive_executing_sessions(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+) {
+    let sessions = match crate::domain::all_sessions(store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-core: restart re-drive could not list sessions: {e}");
+            return;
+        }
+    };
+    for s in sessions {
+        if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
+            continue;
+        }
+        let run_id = s.id.clone();
+        let units = crate::domain::session_units(store, &run_id).unwrap_or_default();
+        let mut sess = s;
+        // Skip any cursor unit that already completed before the crash (a crash between the unit-Done
+        // write and the cursor-advance write) so we don't re-dispatch a Done unit → `Stale` wedge.
+        while units
+            .get(sess.unit_ix)
+            .map(|u| u.status == crate::domain::UnitStatus::Done)
+            .unwrap_or(false)
+        {
+            sess.unit_ix += 1;
+            sess.attempt = 0;
+        }
+        // Bump the attempt (findings #1 + #2/#3) and persist BEFORE dispatch (dispatch reads `attempt`
+        // from the store) so the re-dispatch mints a fresh idempotency key.
+        sess.attempt = sess.attempt.saturating_add(1);
+        if let Err(e) = put_node(store, sess.to_node()) {
+            emit_run_error(subscribers, &run_id, e);
+            continue;
+        }
+        match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
+            Ok(true) => {
+                in_flight.insert(run_id);
+            }
+            // No unit at the cursor (every remaining unit is Done) → the run is actually complete.
+            Ok(false) => {
+                if let Err(e) = finalize_run(store, subscribers, self_tx, &run_id) {
+                    emit_run_error(subscribers, &run_id, e);
+                }
+            }
+            Err(e) => emit_run_error(subscribers, &run_id, e),
         }
     }
 }
@@ -761,6 +954,7 @@ fn apply_step_result(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
+    agent_verdict: Option<(bool, String)>,
 ) -> anyhow::Result<StepApplied> {
     let run_id = output.run_id.clone();
     let mut session = crate::domain::get_session(store, &run_id)?
@@ -777,6 +971,15 @@ fn apply_step_result(
     if output.unit_ix != session.unit_ix {
         return Ok(StepApplied::Stale);
     }
+    // APPLY-IDEMPOTENCY, attempt-authoritative (seam finding #6): reject a completed carrying a
+    // SUPERSEDED attempt of the current cursor unit. The cursor guard above only catches a DIFFERENT
+    // unit; a slow/duplicate worker from a PRIOR re-dispatch of the SAME unit (a lower attempt) would
+    // otherwise pass the cursor+status checks and mis-apply a stale result. `session.attempt` is the
+    // attempt currently in flight for `unit_ix`; anything older is a redelivery — drop it, regardless of
+    // unit status. (Equal attempt is the expected current result → apply; a higher attempt cannot exist.)
+    if output.attempt < session.attempt {
+        return Ok(StepApplied::Stale);
+    }
     let mut units = crate::domain::session_units(store, &run_id)?;
     let unit = units
         .get_mut(output.unit_ix)
@@ -785,6 +988,45 @@ fn apply_step_result(
         return Ok(StepApplied::Stale);
     }
     let ord = unit.ord;
+    // The FINISHING unit's OWN declared gate (Copy) — captured before the mutable borrow below so a
+    // conditional human gate can be evaluated against this unit's own verdict (seam finding #3).
+    let unit_gate = unit.gate;
+
+    // (DES-STUDIO-COCKPIT-001 §3 B3/B4) Emit the unit's burn + data-in-use as soon as its result lands —
+    // the tokens/files were spent regardless of how the gate later rules. Skipped entirely for seats whose
+    // adapter reported nothing (passthrough → `usage: None`, `files: []`), so the default path is silent.
+    // Cost: claude reports it directly; else the overridable price table fills it in, else `None` (tokens
+    // shown without a fabricated dollar figure — NFR-5).
+    if let Some(u) = &output.usage {
+        let cli_key = unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        let cost_usd = u
+            .cost_usd
+            .or_else(|| cost_from_price_table(&cli_key, u.input_tokens, u.output_tokens));
+        emit(
+            subscribers,
+            CoreEvent::CliUsage {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cost_usd,
+            },
+        );
+    }
+    if !output.files.is_empty() {
+        emit(
+            subscribers,
+            CoreEvent::DataUsed {
+                session: run_id.clone(),
+                ord,
+                files: output.files.clone(),
+            },
+        );
+    }
 
     // A worker that CANCELLED the live unit (e.g. P4a subprocess kill) terminates the run as
     // Cancelled — and clears in_flight via `Finished` (NOT `Stale`, which would wedge the run).
@@ -827,13 +1069,37 @@ fn apply_step_result(
         entity_mode,
         &run_id,
         &cli_keys,
+        agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
     )?;
 
     // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit halts the run as `Failed` — never advancing
     // past a rejection into a silent `Completed`. (`apply_and_finish_unit` already emitted UnitDenied
     // + persisted the Rejected unit.)
+    //
+    // EXCEPTION — the CONDITIONAL human gate (seam finding #3): a phase declaring
+    // `HumanConfirmIf(VerdictNotPass)` ESCALATES a not-pass verdict to a HUMAN instead of hard-failing.
+    // This gate was previously UNREACHABLE — it was only ever consulted for the NEXT unit, but a deny
+    // always `fail_ran` first, so the run never advanced to check it. Evaluating it against THIS unit's
+    // own completed verdict (before `fail_run`) is what makes it fire. The cursor is left ON this unit,
+    // so a human `confirm_gate(Approve)` re-runs it and `Reject` cancels; every OTHER gate deny-dominates.
     if !outcome.approved {
+        if matches!(
+            unit_gate,
+            crate::workflow::GateSpec::HumanConfirmIf(crate::workflow::GateCond::VerdictNotPass)
+        ) {
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                format!(
+                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run"
+                ),
+            )?;
+            return Ok(StepApplied::Paused);
+        }
         return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
     }
 
@@ -882,6 +1148,37 @@ fn fail_run(
     StepApplied::Finished
 }
 
+/// Pause a run for human confirmation: persist `AwaitingHuman`, emit `AwaitingHuman`, and free a
+/// campaign node's slot (deferred, non-re-entrant). Shared by the pre-unit gate ([`advance_or_pause`]),
+/// the CONDITIONAL verdict gate (seam finding #3), and the TERMINAL gate (seam finding #4) so all three
+/// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
+fn pause_for_human(
+    store: &mut SqliteStore,
+    subscribers: &mut Vec<Sender<CoreEvent>>,
+    self_tx: &Sender<Command>,
+    session: &mut crate::domain::AgentSession,
+    ord: u32,
+    prompt: String,
+) -> anyhow::Result<()> {
+    session.status = SessionStatus::AwaitingHuman;
+    put_node(store, session.to_node())?;
+    emit(
+        subscribers,
+        CoreEvent::AwaitingHuman {
+            session: session.id.clone(),
+            ord,
+            prompt: prompt.clone(),
+        },
+    );
+    // If this run is a campaign node, free its slot for independent work (DES §6.5). Deferred to a
+    // normal command so reconciliation isn't re-entrant; a non-campaign run is a cheap no-op.
+    let _ = self_tx.send(Command::CampaignNodeAwaiting {
+        run_id: session.id.clone(),
+        prompt,
+    });
+    Ok(())
+}
+
 /// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
 /// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
@@ -897,31 +1194,40 @@ fn advance_or_pause(
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
     let Some(unit) = units.get(unit_ix) else {
+        // No unit at the cursor — the run is out of units. But the TERMINAL unit's OWN declared gate
+        // fires AFTER its work, and (unlike a mid-run phase) there is no "next unit" whose `should_pause`
+        // would honor it — so an unconditional `HumanConfirm` on the LAST phase would be SILENTLY dropped
+        // and the run would finalize `Completed` without the required human confirm (seam finding #4).
+        // Evaluate the terminal unit's own gate here: pause before finalize. The human's
+        // `confirm_gate(Approve)` then dispatches the (absent) cursor unit → `finalize_run` → Completed;
+        // `Reject` cancels. A conditional (`HumanConfirmIf`) terminal gate needs NO handling here — a
+        // not-pass terminal verdict already paused at finish (finding #3), and a pass needs no gate.
+        if let Some(term) = unit_ix.checked_sub(1).and_then(|i| units.get(i)) {
+            if matches!(term.gate, crate::workflow::GateSpec::HumanConfirm { .. }) {
+                pause_for_human(
+                    store,
+                    subscribers,
+                    self_tx,
+                    &mut session,
+                    term.ord,
+                    format!(
+                        "Approve completion after the final phase (unit {}): {}",
+                        term.ord, term.description
+                    ),
+                )?;
+                return Ok(Progress::Paused);
+            }
+        }
         return Ok(Progress::Done);
     };
 
-    if should_pause(&session, unit.ord) {
-        session.status = SessionStatus::AwaitingHuman;
-        put_node(store, session.to_node())?;
+    if should_pause(&session, &units, unit_ix) {
         let prompt = format!(
             "Approve unit {} before it runs: {}",
             unit.ord, unit.description
         );
-        emit(
-            subscribers,
-            CoreEvent::AwaitingHuman {
-                session: run_id.to_string(),
-                ord: unit.ord,
-                prompt: prompt.clone(),
-            },
-        );
-        // If this run is a campaign node, the campaign frees the node's slot for independent work
-        // (DES §6.5). Deferred to a normal command so reconciliation isn't re-entrant; a non-campaign
-        // run is a cheap no-op inverse-lookup on the other side.
-        let _ = self_tx.send(Command::CampaignNodeAwaiting {
-            run_id: run_id.to_string(),
-            prompt,
-        });
+        let ord = unit.ord;
+        pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
         return Ok(Progress::Paused);
     }
 
@@ -949,13 +1255,35 @@ fn resolve_workdir(
     ))
 }
 
-/// Whether to pause before the unit with `ord`, per the run's human-confirm policy.
-fn should_pause(session: &crate::domain::AgentSession, ord: u32) -> bool {
-    match session.human_confirm {
+/// Whether to pause for a human before dispatching `units[unit_ix]`. Two sources, OR'd:
+///  1. the run-level `--confirm` policy (None / All / Before(ord)); and
+///  2. the DEF-declared gate on the PRECEDING phase (its `GateSpec` fires *after* its work, i.e.
+///     before this unit) — so a `WorkflowDef`'s own HumanConfirm gates drive the run, not just the
+///     run-level flag. `HumanConfirm` always pauses; `HumanConfirmIf(VerdictNotPass)` pauses when the
+///     preceding unit is not a clean pass (`status != Done`); `Auto` defers to the run-level policy.
+fn should_pause(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+) -> bool {
+    let ord = units[unit_ix].ord;
+    let run_level = match session.human_confirm {
         crate::domain::HumanConfirm::None => false,
         crate::domain::HumanConfirm::All => true,
         crate::domain::HumanConfirm::Before(o) => o == ord,
-    }
+    };
+    let def_gate = unit_ix
+        .checked_sub(1)
+        .and_then(|i| units.get(i))
+        .map(|prev| match prev.gate {
+            crate::workflow::GateSpec::Auto => false,
+            crate::workflow::GateSpec::HumanConfirm { .. } => true,
+            crate::workflow::GateSpec::HumanConfirmIf(
+                crate::workflow::GateCond::VerdictNotPass,
+            ) => prev.status != crate::domain::UnitStatus::Done,
+        })
+        .unwrap_or(false);
+    run_level || def_gate
 }
 
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
@@ -975,6 +1303,19 @@ fn dispatch_unit(
     let Some(unit) = units.get(unit_ix) else {
         return Ok(false);
     };
+    // (DES-STUDIO-COCKPIT-001 §3 B2) UnitDispatched — the durable-rework signal. `dispatch_unit` is the
+    // SINGLE funnel every dispatch site reaches (initial advance, `confirm_gate` Approve re-dispatch,
+    // `resume_run_inner`, `redrive_executing_sessions`); each of those bumps `session.attempt` in the store
+    // BEFORE calling here, so reading `session.attempt` yields the correct (incrementing) attempt at every
+    // site. Emitted before the exec-mediation branch so BOTH the in-process and bus-mediated paths signal it.
+    emit(
+        subscribers,
+        CoreEvent::UnitDispatched {
+            session: run_id.to_string(),
+            ord: unit.ord,
+            attempt: session.attempt,
+        },
+    );
     emit(
         subscribers,
         CoreEvent::UnitExecuting {
@@ -982,6 +1323,15 @@ fn dispatch_unit(
             ord: unit.ord,
         },
     );
+    // §4 ARTIFACT-PASSING for the AGENT validator (seam finding #8): an Evaluator-role unit's agent
+    // judge must review the most-recent prior Creator's COLD output — the work it is evaluating — not
+    // its own output. Resolve it HERE on the actor thread (a store read); the worker holds no store
+    // handle. `None` ⇒ the agent judges the unit's own output (Neutral/Creator, or no prior creator).
+    let agent_review_target = if unit.role == crate::workflow::PhaseRole::Evaluator {
+        pipeline::creator_output_for(store, run_id, unit.ord)
+    } else {
+        None
+    };
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -991,6 +1341,21 @@ fn dispatch_unit(
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
     };
+
+    // LAW 1 EXECUTION-MEDIATION SEAM (opt-in). When exec-mediation is armed on this (actor) thread, the
+    // reducer does NOT call execution directly: it PUBLISHES `wicked.task.dispatched` and returns. The
+    // off-actor `cli-runner` subscriber runs the unit (via the SAME runner) and publishes
+    // `wicked.task.completed`, which the `task.completed` poller turns back into a `Command::ApplyStepResult`
+    // on this actor — the identical apply the in-process worker below would have produced. `agent_review_target`
+    // (the creator's cold output, resolved on-thread above) rides in the dispatched event so the off-actor
+    // judge sees the right artifact. A publish failure returns `false` → we fall through to the in-process
+    // worker so the run still makes progress rather than wedging with no worker. See `cli_runner.rs`.
+    if crate::cli_runner::is_exec_enabled()
+        && crate::cli_runner::try_publish_dispatched(&input, agent_review_target.as_deref())
+    {
+        return Ok(true);
+    }
+
     let runner = runner.clone();
     let tx = self_tx.clone();
     std::thread::spawn(move || {
@@ -1009,8 +1374,25 @@ fn dispatch_unit(
                 });
             }
         };
-        let output = runner.run_unit_streaming(&input, &emit);
-        let _ = tx.send(Command::ApplyStepResult { output });
+        // rev0.4 DUAL-VALIDATOR LAYER-2 (the AGENT semantic judge) + the unit's slow work run HERE — on the
+        // worker thread, NOT the actor. ACTOR-SAFETY: `run_unit_and_judge` calls the runner (a subprocess)
+        // and `agent_validate` (an LLM `claude -p`; slow), which must never execute on the single-writer
+        // actor thread or it would stall every other command. This closure IS the off-thread seam (holds no
+        // store handle). The SAME helper the `cli-runner` subscriber calls (`cli_runner::run_unit_and_judge`)
+        // — so the in-process path and the bus-mediated path produce a byte-identical `(output, agent_verdict)`.
+        // The WORK the agent judges is the creator's COLD output for an Evaluator-role unit
+        // (`agent_review_target`, seam finding #8), else the unit's own output. The verdict rides back on the
+        // `ApplyStepResult` command; the actor folds it into the gate via `combine_verdict`.
+        let (output, agent_verdict) = crate::cli_runner::run_unit_and_judge(
+            &runner,
+            &input,
+            agent_review_target.as_deref(),
+            &emit,
+        );
+        let _ = tx.send(Command::ApplyStepResult {
+            output,
+            agent_verdict,
+        });
     });
     Ok(true)
 }
@@ -1078,6 +1460,35 @@ pub(crate) fn confirm_gate(
             // so it doesn't immediately re-pause on the same unit).
             let mut s = session;
             s.status = SessionStatus::Executing;
+            // WEDGE-ON-RE-DISPATCH fix (seam finding #2/#3): BUMP the attempt before re-dispatching an
+            // ALREADY-RUN cursor unit (a HumanConfirmIf conditional-gate retry, or a terminal-gate
+            // re-approve). Without this, the re-dispatch reuses the identical `(run, unit, attempt)`
+            // idempotency key → `emit()` dedups to the ORIGINAL (now-terminal) task.dispatched row,
+            // `try_publish_dispatched` still returns true (suppressing the in-process fallback), and the
+            // cli-runner's cursor is already past that row → NO worker runs → permanent wedge. A bumped
+            // attempt mints a fresh key so a genuinely new task.dispatched is emitted. The bump is inert on
+            // the default in-process path (nothing there branches on `attempt`).
+            //
+            // REWORK-HONESTY fix (cockpit adversarial review): bump ONLY when the cursor unit ALREADY RAN
+            // (`Done`/`Rejected`). A PRE-unit human gate (`should_pause` paused BEFORE the unit's FIRST
+            // dispatch — e.g. `human_confirm: all`/`before`) leaves the cursor `Pending` (never run), so
+            // approving it is its FIRST dispatch: bumping there would emit `UnitDispatched{attempt=1}` +
+            // `CliUsage{attempt=1}` for work that was never redone, booking the unit's entire burn as
+            // rework (`attempt>0`) → ~100% false rework under `human_confirm: all`. A first dispatch at
+            // attempt=0 has no prior `task.dispatched` row, so it cannot collide → no wedge, no bump needed.
+            // This keeps the `event.rs` contract ("first dispatch is attempt=0") true for gated units.
+            let cursor_ran = crate::domain::session_units(store, run_id)?
+                .get(s.unit_ix)
+                .map(|u| {
+                    matches!(
+                        u.status,
+                        crate::domain::UnitStatus::Done | crate::domain::UnitStatus::Rejected
+                    )
+                })
+                .unwrap_or(false);
+            if cursor_ran {
+                s.attempt = s.attempt.saturating_add(1);
+            }
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
@@ -1247,6 +1658,21 @@ fn emit(subscribers: &mut Vec<Sender<CoreEvent>>, ev: CoreEvent) {
     subscribers.retain(|s| s.send(ev.clone()).is_ok());
 }
 
+/// Overridable per-CLI price-table fallback for `CliUsage.cost_usd` (DES-STUDIO-COCKPIT-001 §3 B-cost /
+/// NFR-5). claude reports cost directly, so this only fires for a seat that reports TOKENS but no cost.
+/// The table is read from the `WICKED_CLI_PRICES` env var (JSON:
+/// `{ "<cli>": { "input_per_mtok": <f>, "output_per_mtok": <f> } }`) — a cross-platform, file-free
+/// override. Absent / unparseable / no entry ⇒ `None`, so we never assert a dollar figure the CLI didn't
+/// imply (the panel then shows tokens only).
+fn cost_from_price_table(cli: &str, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+    let raw = std::env::var("WICKED_CLI_PRICES").ok()?;
+    let map: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = map.get(cli)?;
+    let in_per = entry.get("input_per_mtok").and_then(|v| v.as_f64())?;
+    let out_per = entry.get("output_per_mtok").and_then(|v| v.as_f64())?;
+    Some(input_tokens as f64 / 1e6 * in_per + output_tokens as f64 / 1e6 * out_per)
+}
+
 /// Read the agent session ids on the store (by their session-node names).
 fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
     let query = SymbolQuery {
@@ -1268,4 +1694,190 @@ fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionVie
         views.push(crate::SessionView { session, units });
     }
     Ok(views)
+}
+
+#[cfg(test)]
+mod gate_pause_tests {
+    use super::should_pause;
+    use crate::domain::{AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit};
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateCond, GateSpec};
+
+    fn sess(hc: HumanConfirm) -> AgentSession {
+        AgentSession {
+            id: "s".into(),
+            workflow_id: "wf-s".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: hc,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        }
+    }
+    fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("s:u{ord}"), "s", ord, "d");
+        u.gate = gate;
+        u.status = status;
+        u
+    }
+
+    #[test]
+    fn a_def_humanconfirm_gate_pauses_even_when_run_level_is_none() {
+        // The DEF drives the pause: run-level --confirm is None, yet the preceding phase's
+        // HumanConfirm gate must still pause the run before the next unit.
+        let s = sess(HumanConfirm::None);
+        let units = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirm {
+                    unconditional: false,
+                },
+                UnitStatus::Done,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(should_pause(&s, &units, 1), "preceding def gate must pause");
+        assert!(
+            !should_pause(&s, &units, 0),
+            "no preceding phase ⇒ no def pause"
+        );
+    }
+
+    #[test]
+    fn auto_gate_defers_to_the_run_level_policy() {
+        let units = vec![
+            unit(1, GateSpec::Auto, UnitStatus::Done),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(!should_pause(&sess(HumanConfirm::None), &units, 1));
+        assert!(
+            should_pause(&sess(HumanConfirm::All), &units, 1),
+            "run-level All still pauses when the def gate is Auto"
+        );
+    }
+
+    #[test]
+    fn conditional_gate_pauses_only_when_the_prev_phase_is_not_a_clean_pass() {
+        let s = sess(HumanConfirm::None);
+        let passed = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                UnitStatus::Done,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(
+            !should_pause(&s, &passed, 1),
+            "clean pass (Done) ⇒ no pause"
+        );
+        let not_passed = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                UnitStatus::Rejected,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert!(
+            should_pause(&s, &not_passed, 1),
+            "not a clean pass ⇒ pause for a human"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_gate_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+            }
+        }
+    }
+
+    fn seed_session(store: &mut SqliteStore, terminal_gate: GateSpec) {
+        let session = AgentSession {
+            id: "r".into(),
+            workflow_id: "wf-r".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 1, // cursor is PAST the single (terminal) unit — the run is out of units
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
+        let mut u = WorkUnit::pending("r:u1", "r", 1, "the final phase");
+        u.gate = terminal_gate;
+        u.status = UnitStatus::Done;
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    /// Seam finding #4: a def-declared unconditional `HumanConfirm` on the TERMINAL phase must PAUSE
+    /// before the run finalizes — it must NOT be silently dropped into a `Completed` finalize.
+    #[test]
+    fn a_terminal_humanconfirm_gate_pauses_before_finalize() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            GateSpec::HumanConfirm {
+                unconditional: true,
+            },
+        );
+        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+
+        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1).unwrap();
+        assert!(
+            matches!(progress, Progress::Paused),
+            "the terminal unit's own HumanConfirm gate must pause before finalize, got a Done finalize"
+        );
+        let session = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+    }
+
+    /// Control: an `Auto` terminal gate finalizes (no spurious pause) — the fix is scoped to the
+    /// terminal unit's OWN declared HumanConfirm gate.
+    #[test]
+    fn a_terminal_auto_gate_finalizes_without_pausing() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, GateSpec::Auto);
+        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+
+        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1).unwrap();
+        assert!(
+            matches!(progress, Progress::Done),
+            "an Auto terminal gate must finalize (Done), never pause"
+        );
+    }
 }

@@ -6,6 +6,7 @@
 /// subscriber). The taxonomy mirrors the plan → distribute → execute → evidence pipeline; P1 emits
 /// only `Heartbeat` (the rest land when the pipeline is lifted in P2).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CoreEvent {
     /// Liveness tick (also the P1 proof that subscribe→emit works end to end).
     Heartbeat,
@@ -36,6 +37,61 @@ pub enum CoreEvent {
         session: String,
         ord: u32,
         allow: bool,
+    },
+    /// (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `GateDecided`: the criterion gated,
+    /// whether the deterministic (layer-1) floor passed, the agent (layer-2) judge's verdict + reasoning
+    /// when one ran, the evaluator≠creator second-pass result, and the final `combined` decision
+    /// (deny-dominance over ALL layers). Emitted just before `GateDecided`; `GateDecided{allow}` is
+    /// retained for back-compat and carries the same bool as `combined`.
+    ///
+    /// HONESTY (M5): `has_deterministic_floor` is `true` iff a pinned validator gated this unit. When
+    /// `false` the phase is UNGATED — nothing deterministic ran — so `criterion` is `None` (the unit
+    /// description is NEVER relabeled a "criterion") and `deterministic_pass` is vacuous (there was no
+    /// floor to pass). `criterion` is `Some` only when `has_deterministic_floor` (the pinned validator's
+    /// criterion).
+    ///
+    /// HONESTY (S2): `evaluator_pass` surfaces the evaluator≠creator second pass — `Some(false)` when
+    /// that layer denied (even though `deterministic_pass == true` and no agent judge ran), `Some(true)`
+    /// when it approved, `None` when it did not run. `denial_reason` carries the WINNING denial's reason
+    /// whenever `combined == false`, so the record can never read "det pass + agent none + combined
+    /// false" with no visible denying layer.
+    GateEvaluated {
+        session: String,
+        ord: u32,
+        criterion: Option<String>,
+        has_deterministic_floor: bool,
+        deterministic_pass: bool,
+        agent_verdict: Option<String>,
+        agent_reasoning: Option<String>,
+        evaluator_pass: Option<bool>,
+        denial_reason: Option<String>,
+        combined: bool,
+    },
+    /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
+    /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;
+    /// the FIRST dispatch is `attempt=0`, so `attempt>0` marks rework (a re-dispatch).
+    UnitDispatched {
+        session: String,
+        ord: u32,
+        attempt: u32,
+    },
+    /// (DES-STUDIO-COCKPIT-001 §3 B3) Token/cost burn for one unit run, emitted after the unit completes.
+    /// `cost_usd` is `Some` when the CLI reports cost directly (claude) or a price table resolves it, else
+    /// `None` (tokens shown without a fabricated dollar figure). Only emitted for seats that report usage.
+    CliUsage {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: Option<f64>,
+    },
+    /// (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched (from `tool_use` file paths),
+    /// emitted after the unit completes when ≥1 file was seen. Absent for seats that report no file access.
+    DataUsed {
+        session: String,
+        ord: u32,
+        files: Vec<String>,
     },
     /// A unit finished (approved + output captured).
     UnitDone { session: String, ord: u32 },

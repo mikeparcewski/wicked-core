@@ -50,6 +50,18 @@ pub enum StepStatus {
     Cancelled,
 }
 
+/// End-of-unit resource usage a runner's `OutputAdapter` parsed from a CLI's
+/// structured output (DES-STUDIO-COCKPIT-001 §3 B3). `cost_usd` is `Some` when the CLI reports cost
+/// directly (claude's `total_cost_usd`) or a price table resolves it, else `None`. Mid-stream totals are
+/// out of scope — this is the end-of-run total. `Serialize`/`Deserialize` so it survives the exec-mediation
+/// bus round-trip (`CompletedTask`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
 /// The result of a worker step — the unit's produced output. Posted back to the actor, which is the
 /// only thing that writes it to the store.
 #[derive(Debug, Clone)]
@@ -60,6 +72,11 @@ pub struct StepOutput {
     pub output: String,
     /// Whether the step succeeded. A worker signals failure here instead of encoding it in `output`.
     pub status: StepStatus,
+    /// End-of-unit token/cost usage when the runner's adapter parsed it (claude stream-json); `None` for
+    /// passthrough seats (DES-STUDIO-COCKPIT-001 §3 B3). Additive — the actor emits `CliUsage` when present.
+    pub usage: Option<Usage>,
+    /// Data files the unit's CLI touched, from `tool_use` file paths (B4). Empty for passthrough seats.
+    pub files: Vec<String>,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`
@@ -104,6 +121,789 @@ impl StepRunner for StubStepRunner {
             attempt: input.attempt,
             output: format!("stub-output for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// WorkflowDef — workflows as DATA (DES-EXEC-001 §4, Law 2: capability lands as data + registration,
+// never a core edit). A `WorkflowDef` is an ordered list of `PhaseDef`s; every field the reducer
+// needs to drive a phase (its gate policy, whether it runs code, whether it needs verified evidence,
+// its role for the evaluator≠creator split, its dependencies) is DATA on the phase. The reducer
+// branches on these fields — never on the workflow `id` and never on a closed `match` over a phase
+// name. Adding feature/bug/migration (below) or a new workflow is a data value, not a core change.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+use crate::domain::StageKind;
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+/// Where a phase's gate sits in the value→strategy→execution ladder (DES-EXEC-001 §3; gcp-sdlc's
+/// three gate positions). `None` = an ungated (e.g. setup/advisory) phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateType {
+    /// Post-clarify: is the problem clear, scoped, testable?
+    Value,
+    /// Post-design: is the approach sound + testable?
+    Strategy,
+    /// Post-build: does the work meet the bar (quality, coverage, risk)?
+    Execution,
+}
+
+/// A condition on a conditional human gate — evaluated from the phase's computed verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateCond {
+    /// Only stop for a human when the phase verdict is not PASS (auto-advance on PASS).
+    VerdictNotPass,
+}
+
+/// The confirm policy for a phase — demotes the run-level `HumanConfirm` enum into per-phase DATA so
+/// a workflow declares its own gates. The engagement dial (just-finish|balanced|ask-first) may
+/// select WHO confirms but NEVER the verdict — and it can never downgrade an `unconditional` gate
+/// (e.g. migration cutover). (DES-EXEC-001 §3, the cardinal invariant of all three priors.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GateSpec {
+    /// No human — the computed verdict advances or rejects.
+    #[default]
+    Auto,
+    /// Always require a human to confirm.
+    ///
+    /// `unconditional`: RESERVED / not yet read by the engine (seam finding #10). It is the marker for
+    /// a gate the engagement dial (just-finish|balanced|ask-first) must never downgrade — e.g. the
+    /// migration `cutover`. Until the engagement dial lands, EVERY `HumanConfirm` pauses regardless of
+    /// this flag (`should_pause` / the terminal-gate check match `HumanConfirm { .. }`), so the flag is
+    /// authored-but-inert: it does NOT currently strengthen or weaken any gate. Do not mistake it for an
+    /// active control — it records intent for the dial, nothing more, today.
+    HumanConfirm { unconditional: bool },
+    /// Require a human only when the condition holds (else auto-advance).
+    HumanConfirmIf(GateCond),
+}
+
+/// Which side of the evaluator≠creator split a phase plays. The Evaluator phase runs under a seat
+/// distinct from the Creator's and reads the creator's `work_output` as cold evidence
+/// (DES-EXEC-001 §3/§4.1). `Neutral` = neither (setup/plan/advisory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseRole {
+    #[default]
+    Neutral,
+    /// Does the work whose output is later reviewed.
+    Creator,
+    /// Reviews the creator's output cold (a real, seat-distinct second run).
+    Evaluator,
+}
+
+/// One ordered phase of a workflow — pure DATA the reducer dispatches on.
+/// `deny_unknown_fields`: a misspelled key in a drop-in JSON is a loud parse error (naming the
+/// file), never a silently-dropped default — matching the workflows/README.md contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseDef {
+    /// Phase id, unique within the workflow (referenced by `depends_on`). The ONLY required field
+    /// in a drop-in JSON file — everything below defaults, so the minimal phase is `{"id":"x"}`.
+    pub id: String,
+    /// The methodology badge (demoted from the classifier — declared, not guessed). Default: `build`.
+    #[serde(default)]
+    pub kind: StageKind,
+    /// Where this phase's gate sits in the ladder (`None` = ungated).
+    #[serde(default)]
+    pub gate_type: Option<GateType>,
+    /// The confirm policy for this phase's gate. Default: `auto` (no human pause).
+    #[serde(default)]
+    pub gate: GateSpec,
+    /// Whether this phase runs code (drives worktree provisioning + code-tool mode).
+    #[serde(default)]
+    pub executes_code: bool,
+    /// Whether the phase verdict requires re-verified evidence (re-run the pinned verifier).
+    #[serde(default)]
+    pub verified_evidence: bool,
+    /// Deliverables that MUST be present for the structural gate check (fail-closed if missing).
+    #[serde(default)]
+    pub required_deliverables: Vec<String>,
+    /// Phase ids in the same workflow that must complete before this one (intra-workflow DAG).
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// The evaluator≠creator role this phase plays. Default: `neutral`.
+    #[serde(default)]
+    pub role: PhaseRole,
+    /// Optional skill to drive the phase (DES-EXEC-001 §4.1 — the headless `/wicked-testing-<skill>`
+    /// invocation). `None` = the authored-prompt path.
+    #[serde(default)]
+    pub skill_ref: Option<String>,
+    /// The runtime skill ALLOWLIST for this phase's agent (DES-EXEC-001 §4.2) — the set of skills the
+    /// invocation may load, passed as its tool/skill scope (the `--allowedTools` analog). Empty ⇒ no
+    /// extra scoping beyond `skill_ref`. Least-privilege per phase, and pure DATA.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    /// The content-hash [`pin`](crate::validator_vault::pin) of an ALREADY-APPROVED deterministic
+    /// validator sitting in the [validator vault](crate::validator_vault) (authored + approved OUT OF
+    /// BAND via `provision_validator` → `approve_and_store` — an LLM authoring step that never runs on
+    /// the actor thread). When present, the planner LOADS that validator (a pure store read, no LLM) and
+    /// attaches it to the phase's unit, so the rev0.4 dual-validator gate ENGAGES: the deterministic
+    /// re-verify + agent judge fire against this criterion. Loading is fail-closed — a pin that does not
+    /// resolve in the vault is a misconfiguration and the run bails rather than silently running ungated.
+    /// `None` (the default) ⇒ the phase runs ungated by a pinned validator (the pre-gate behavior).
+    #[serde(default)]
+    pub validator_pin: Option<String>,
+}
+
+impl PhaseDef {
+    /// A minimal phase: id + kind, no gate, no code, neutral role.
+    fn new(id: &str, kind: StageKind) -> Self {
+        PhaseDef {
+            id: id.to_string(),
+            kind,
+            gate_type: None,
+            gate: GateSpec::Auto,
+            executes_code: false,
+            verified_evidence: false,
+            required_deliverables: Vec::new(),
+            depends_on: Vec::new(),
+            role: PhaseRole::Neutral,
+            skill_ref: None,
+            allowed_skills: Vec::new(),
+            validator_pin: None,
+        }
+    }
+    fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {
+        self.gate_type = Some(gt);
+        self.gate = spec;
+        self
+    }
+    fn codes(mut self) -> Self {
+        self.executes_code = true;
+        self
+    }
+    fn verified(mut self) -> Self {
+        self.verified_evidence = true;
+        self
+    }
+    fn role(mut self, r: PhaseRole) -> Self {
+        self.role = r;
+        self
+    }
+    fn after(mut self, dep: &str) -> Self {
+        self.depends_on.push(dep.to_string());
+        self
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn skill(mut self, skill_ref: &str, allowed: &[&str]) -> Self {
+        self.skill_ref = Some(skill_ref.to_string());
+        self.allowed_skills = allowed.iter().map(|s| s.to_string()).collect();
+        self
+    }
+}
+
+/// A workflow — an id + an ordered list of phases. Pure data; registered in the [`WorkflowRegistry`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDef {
+    pub id: String,
+    pub phases: Vec<PhaseDef>,
+}
+
+/// Why a `WorkflowDef` failed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowDefError {
+    Empty,
+    DuplicatePhaseId(String),
+    UnknownDependency {
+        phase: String,
+        dep: String,
+    },
+    /// A phase depends on itself or a later-declared phase. Declaration order IS the execution order
+    /// (the planner assigns `ord` from the phase index), so every dependency must point *backward*.
+    /// This makes the Vec order a valid topological order — and any genuine cycle necessarily shows
+    /// up here as a forward edge, so it subsumes cycle detection.
+    ForwardDependency {
+        phase: String,
+        dep: String,
+    },
+}
+
+impl std::fmt::Display for WorkflowDefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkflowDefError::Empty => write!(f, "workflow has no phases"),
+            WorkflowDefError::DuplicatePhaseId(p) => write!(f, "duplicate phase id: {p}"),
+            WorkflowDefError::UnknownDependency { phase, dep } => {
+                write!(f, "phase {phase} depends on unknown phase {dep}")
+            }
+            WorkflowDefError::ForwardDependency { phase, dep } => write!(
+                f,
+                "phase {phase} depends on {dep}, which is not declared before it \
+                 (declaration order must be execution order — dependencies point backward)"
+            ),
+        }
+    }
+}
+impl std::error::Error for WorkflowDefError {}
+
+impl WorkflowDef {
+    /// Validate: non-empty, unique phase ids, every `depends_on` resolves, and the depends-on graph
+    /// is acyclic (Kahn) — the same discipline the Campaign DAG enforces on nodes.
+    pub fn validate(&self) -> Result<(), WorkflowDefError> {
+        if self.phases.is_empty() {
+            return Err(WorkflowDefError::Empty);
+        }
+        let mut ids: HashSet<&str> = HashSet::new();
+        for p in &self.phases {
+            if !ids.insert(p.id.as_str()) {
+                return Err(WorkflowDefError::DuplicatePhaseId(p.id.clone()));
+            }
+        }
+        // Declaration order IS execution order: the planner assigns `ord` from the phase index, so
+        // every dependency must reference an EARLIER phase. This one position check does three jobs —
+        // resolves deps (unknown → error), forbids self/forward edges, and thereby guarantees the Vec
+        // order is a valid topological order, so a genuine cycle can't even be expressed (it would
+        // need a forward edge). Listing the same backward dep twice is harmless and accepted.
+        let pos: HashMap<&str, usize> = self
+            .phases
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (p.id.as_str(), i))
+            .collect();
+        for (i, p) in self.phases.iter().enumerate() {
+            for d in &p.depends_on {
+                match pos.get(d.as_str()) {
+                    None => {
+                        return Err(WorkflowDefError::UnknownDependency {
+                            phase: p.id.clone(),
+                            dep: d.clone(),
+                        })
+                    }
+                    Some(&dp) if dp >= i => {
+                        return Err(WorkflowDefError::ForwardDependency {
+                            phase: p.id.clone(),
+                            dep: d.clone(),
+                        })
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The registry of known workflows — id → def. `with_defaults()` seeds feature/bug/migration.
+/// Registering a new workflow is a data insert (Law 2); the reducer only ever `get`s a def.
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowRegistry {
+    defs: HashMap<String, WorkflowDef>,
+}
+
+impl WorkflowRegistry {
+    /// The built-in workflows (feature/bug/migration), each validated at construction.
+    pub fn with_defaults() -> Self {
+        let mut r = WorkflowRegistry::default();
+        for def in [feature_def(), bug_def(), migration_def()] {
+            r.register(def).expect("built-in workflow defs are valid");
+        }
+        r
+    }
+    /// Register (or replace) a workflow. Validates before inserting.
+    pub fn register(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
+        def.validate()?;
+        self.defs.insert(def.id.clone(), def);
+        Ok(())
+    }
+    pub fn get(&self, id: &str) -> Option<&WorkflowDef> {
+        self.defs.get(id)
+    }
+    pub fn ids(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.defs.keys().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// Overlay every `*.json` workflow file in `dir` (non-recursive) onto this registry, validating
+    /// and registering each in filename order. A file whose `id` matches a built-in REPLACES it, so
+    /// operators tune the shipped workflows and add new ones by dropping a data file — no recompile,
+    /// no edit to this crate (the Law-2 seam). A missing `dir` is `Ok(vec![])` (nothing to overlay).
+    ///
+    /// **Resilient per-file:** a malformed or invalid file is SKIPPED with a warning naming it (so one
+    /// bad drop-in can't disable every other one) — not a hard error that aborts the whole overlay.
+    /// The loud, per-file error is available via [`def_from_file`](WorkflowRegistry::def_from_file) for
+    /// an explicit `workflow lint`. Returns the ids that loaded, in load order. (A caller that requested
+    /// a SPECIFIC workflow still learns if it's missing — see the resolver, which errors on an unknown
+    /// requested id rather than silently falling back.)
+    pub fn load_dir(&mut self, dir: impl AsRef<Path>) -> anyhow::Result<Vec<String>> {
+        let dir = dir.as_ref();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading workflow dir {}", dir.display()))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            // A regular file (following symlinks) ending in `.json`. Guards against a subdirectory
+            // or symlink-to-dir named `x.json`, which would otherwise be read and abort the load.
+            .filter(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("json"))
+            .collect();
+        paths.sort(); // deterministic load order regardless of filesystem enumeration
+        let mut loaded = Vec::new();
+        for path in paths {
+            let outcome = Self::def_from_file(&path).and_then(|def| {
+                let id = def.id.clone();
+                self.register(def)
+                    .map_err(|e| anyhow::anyhow!("workflow {id} in {}: {e}", path.display()))?;
+                Ok(id)
+            });
+            match outcome {
+                Ok(id) => loaded.push(id),
+                // Skip the offending file, keep the rest — but loudly (named), never silently.
+                Err(e) => eprintln!(
+                    "wicked-core: skipping workflow file {} ({e})",
+                    path.display()
+                ),
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Parse + validate one [`WorkflowDef`] from a JSON file (no registration). Public so a caller
+    /// (a CLI `workflow lint`, the studio) can check a drop-in file before committing it.
+    pub fn def_from_file(path: impl AsRef<Path>) -> anyhow::Result<WorkflowDef> {
+        let path = path.as_ref();
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading workflow file {}", path.display()))?;
+        let def: WorkflowDef = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing workflow file {}", path.display()))?;
+        def.validate()
+            .map_err(|e| anyhow::anyhow!("invalid workflow in {}: {e}", path.display()))?;
+        Ok(def)
+    }
+}
+
+/// `feature` — clarify(value) → design(strategy) → build(execution) → adversarial-review → test → review.
+/// Gates: HumanConfirm after clarify + after adversarial-review; HumanConfirmIf(¬PASS) on test.
+pub fn feature_def() -> WorkflowDef {
+    WorkflowDef {
+        id: "feature".to_string(),
+        phases: vec![
+            PhaseDef::new("clarify", StageKind::Recon).gate(
+                GateType::Value,
+                GateSpec::HumanConfirm {
+                    unconditional: false,
+                },
+            ),
+            PhaseDef::new("design", StageKind::Recon)
+                .gate(GateType::Strategy, GateSpec::Auto)
+                .after("clarify"),
+            PhaseDef::new("build", StageKind::Build)
+                .gate(GateType::Execution, GateSpec::Auto)
+                .codes()
+                .role(PhaseRole::Creator)
+                .after("design"),
+            PhaseDef::new("adversarial-review", StageKind::Review)
+                .gate(
+                    GateType::Execution,
+                    GateSpec::HumanConfirm {
+                        unconditional: false,
+                    },
+                )
+                .role(PhaseRole::Evaluator)
+                .after("build"),
+            PhaseDef::new("test", StageKind::Test)
+                .gate(
+                    GateType::Execution,
+                    GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                )
+                .verified()
+                .after("build"),
+            PhaseDef::new("review", StageKind::Review)
+                .gate(GateType::Execution, GateSpec::Auto)
+                .after("test"),
+        ],
+    }
+}
+
+/// `bug` — triage(value) → reproduce(value) → fix(execution) → verify. Reproduce-first: `fix`
+/// depends on `reproduce`; a bug is not fixed until the repro goes red→green.
+pub fn bug_def() -> WorkflowDef {
+    WorkflowDef {
+        id: "bug".to_string(),
+        phases: vec![
+            PhaseDef::new("triage", StageKind::Recon).gate(GateType::Value, GateSpec::Auto),
+            PhaseDef::new("reproduce", StageKind::Test)
+                .gate(GateType::Value, GateSpec::Auto)
+                .after("triage"),
+            PhaseDef::new("fix", StageKind::Build)
+                .gate(GateType::Execution, GateSpec::Auto)
+                .codes()
+                .role(PhaseRole::Creator)
+                .after("reproduce"),
+            PhaseDef::new("verify", StageKind::Test)
+                .gate(
+                    GateType::Execution,
+                    GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                )
+                .verified()
+                .role(PhaseRole::Evaluator)
+                .after("fix"),
+        ],
+    }
+}
+
+/// `migration` — plan(strategy) → execute(execution) → cutover(UNCONDITIONAL human) → verify → cleanup(advisory).
+/// `cutover` is the one gate the engagement dial can never downgrade.
+pub fn migration_def() -> WorkflowDef {
+    WorkflowDef {
+        id: "migration".to_string(),
+        phases: vec![
+            PhaseDef::new("plan", StageKind::Recon).gate(
+                GateType::Strategy,
+                GateSpec::HumanConfirm {
+                    unconditional: false,
+                },
+            ),
+            PhaseDef::new("execute", StageKind::Build)
+                .gate(GateType::Execution, GateSpec::Auto)
+                .codes()
+                .role(PhaseRole::Creator)
+                .after("plan"),
+            PhaseDef::new("cutover", StageKind::Build)
+                .gate(
+                    GateType::Execution,
+                    GateSpec::HumanConfirm {
+                        unconditional: true,
+                    },
+                )
+                .codes()
+                .after("execute"),
+            PhaseDef::new("verify", StageKind::Test)
+                .gate(
+                    GateType::Execution,
+                    GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+                )
+                .verified()
+                .role(PhaseRole::Evaluator)
+                .after("cutover"),
+            PhaseDef::new("cleanup", StageKind::Build).after("verify"),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod workflow_def_tests {
+    use super::*;
+
+    #[test]
+    fn registry_seeds_the_three_builtin_workflows() {
+        let r = WorkflowRegistry::with_defaults();
+        assert_eq!(r.ids(), vec!["bug", "feature", "migration"]);
+    }
+
+    #[test]
+    fn feature_has_the_designed_phase_shape() {
+        let def = feature_def();
+        let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "clarify",
+                "design",
+                "build",
+                "adversarial-review",
+                "test",
+                "review"
+            ]
+        );
+    }
+
+    #[test]
+    fn all_builtins_validate() {
+        for def in [feature_def(), bug_def(), migration_def()] {
+            def.validate()
+                .unwrap_or_else(|e| panic!("{} invalid: {e}", def.id));
+        }
+    }
+
+    #[test]
+    fn reducer_can_branch_on_data_not_id() {
+        // Law 2 proof: everything the reducer needs is a data field, reachable without matching on
+        // the workflow id or a phase name. Here we derive "which phases pause a human" purely from
+        // `gate` data — no `if id == "feature"`, no `match phase.id`.
+        let def = feature_def();
+        let human_phases: Vec<&str> = def
+            .phases
+            .iter()
+            .filter(|p| matches!(p.gate, GateSpec::HumanConfirm { .. }))
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(human_phases, vec!["clarify", "adversarial-review"]);
+    }
+
+    #[test]
+    fn evaluator_and_creator_are_distinct_phases() {
+        // The evaluator≠creator split is data: build is the Creator, adversarial-review is the
+        // Evaluator — a real seat-distinct second phase over the creator's output.
+        let def = feature_def();
+        let creator = def
+            .phases
+            .iter()
+            .find(|p| p.role == PhaseRole::Creator)
+            .unwrap();
+        let evaluator = def
+            .phases
+            .iter()
+            .find(|p| p.role == PhaseRole::Evaluator)
+            .unwrap();
+        assert_eq!(creator.id, "build");
+        assert_eq!(evaluator.id, "adversarial-review");
+        assert!(evaluator.depends_on.contains(&"build".to_string()));
+    }
+
+    #[test]
+    fn migration_cutover_is_an_unconditional_gate() {
+        let cutover = migration_def()
+            .phases
+            .into_iter()
+            .find(|p| p.id == "cutover")
+            .unwrap();
+        assert_eq!(
+            cutover.gate,
+            GateSpec::HumanConfirm {
+                unconditional: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_cyclic_def_is_rejected() {
+        // A 2-cycle (a↔b) can't be laid out backward-only: whichever phase is declared first
+        // depends on a later one, surfacing as a forward edge.
+        let bad = WorkflowDef {
+            id: "cyclic".to_string(),
+            phases: vec![
+                PhaseDef::new("a", StageKind::Build).after("b"),
+                PhaseDef::new("b", StageKind::Build).after("a"),
+            ],
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(WorkflowDefError::ForwardDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn a_forward_or_self_dependency_is_rejected() {
+        // Forward: "a" (declared first) depends on the later "b".
+        let forward = WorkflowDef {
+            id: "fwd".to_string(),
+            phases: vec![
+                PhaseDef::new("a", StageKind::Build).after("b"),
+                PhaseDef::new("b", StageKind::Build),
+            ],
+        };
+        assert!(matches!(
+            forward.validate(),
+            Err(WorkflowDefError::ForwardDependency { .. })
+        ));
+        // Self-dependency is also a forward edge (dp == i).
+        let selfdep = WorkflowDef {
+            id: "self".to_string(),
+            phases: vec![PhaseDef::new("a", StageKind::Build).after("a")],
+        };
+        assert!(matches!(
+            selfdep.validate(),
+            Err(WorkflowDefError::ForwardDependency { .. })
+        ));
+    }
+
+    #[test]
+    fn plan_from_def_carries_skill_and_allowlist_onto_units() {
+        // §4.1/§4.2: a phase's skill_ref + runtime allowlist ride onto its unit so the runner invokes
+        // the right skill under least-privilege. A phase without a skill leaves both empty (authored path).
+        let def = WorkflowDef {
+            id: "skilled".to_string(),
+            phases: vec![
+                PhaseDef::new("build", StageKind::Build)
+                    .skill("wicked-testing-execution", &["wicked-testing-authoring"]),
+                PhaseDef::new("review", StageKind::Review).after("build"),
+            ],
+        };
+        let units = crate::plan::plan_from_def(&def, "do it", "s");
+        assert_eq!(
+            units[0].skill_ref.as_deref(),
+            Some("wicked-testing-execution")
+        );
+        assert_eq!(
+            units[0].allowed_skills,
+            vec!["wicked-testing-authoring".to_string()]
+        );
+        assert!(
+            units[1].skill_ref.is_none(),
+            "unskilled phase ⇒ authored path"
+        );
+        assert!(units[1].allowed_skills.is_empty());
+    }
+
+    #[test]
+    fn a_backward_dep_listed_twice_is_not_a_false_cycle() {
+        // Regression: the old Kahn indeg miscounted duplicate deps and reported a phantom cycle.
+        let dup = WorkflowDef {
+            id: "dup".to_string(),
+            phases: vec![
+                PhaseDef::new("a", StageKind::Build),
+                PhaseDef {
+                    depends_on: vec!["a".to_string(), "a".to_string()],
+                    ..PhaseDef::new("b", StageKind::Build)
+                },
+            ],
+        };
+        assert_eq!(dup.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_unknown_dependency_is_rejected() {
+        let bad = WorkflowDef {
+            id: "dangling".to_string(),
+            phases: vec![PhaseDef::new("a", StageKind::Build).after("ghost")],
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(WorkflowDefError::UnknownDependency { .. })
+        ));
+    }
+
+    // ---- data-driven registration (Law 2): a workflow is a JSON file, not a code edit ----
+
+    /// A private, collision-free scratch dir for a filesystem test (no tempfile dep; process id +
+    /// a per-test tag keep parallel tests disjoint). Best-effort cleanup on drop.
+    struct ScratchDir(std::path::PathBuf);
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("wicked-wf-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+        fn write(&self, name: &str, body: &str) {
+            std::fs::write(self.0.join(name), body).unwrap();
+        }
+    }
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    #[ignore = "generator: run with --ignored --nocapture to (re)emit the shipped data files"]
+    fn emit_builtin_data_files() {
+        for def in [feature_def(), bug_def(), migration_def()] {
+            println!("===FILE workflows/{}.json===", def.id);
+            println!("{}", serde_json::to_string_pretty(&def).unwrap());
+        }
+    }
+
+    #[test]
+    fn shipped_data_files_match_the_seed_builders() {
+        // The `workflows/*.json` files are the human-editable, copy-paste mirror of the compiled
+        // seed builders. This guard keeps them in lock-step: if a builder changes, regenerate the
+        // files (emit_builtin_data_files) — otherwise a non-maintainer reads stale example data.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+        for def in [feature_def(), bug_def(), migration_def()] {
+            let path = root.join(format!("{}.json", def.id));
+            let from_file =
+                WorkflowRegistry::def_from_file(&path).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                from_file, def,
+                "{} data file drifted from its builder",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_builtin_def_round_trips_through_json() {
+        // The wire shape a non-maintainer authors IS the in-memory def: serialize → parse → equal.
+        // If this fails, the drop-in JSON contract drifted from the type.
+        let def = feature_def();
+        let json = serde_json::to_string_pretty(&def).unwrap();
+        let back: WorkflowDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(def, back);
+    }
+
+    #[test]
+    fn load_dir_registers_a_dropped_in_workflow_without_touching_code() {
+        // A non-maintainer's brand-new workflow, authored as pure data — no Rust, no builder fn.
+        let dir = ScratchDir::new("dropin");
+        dir.write(
+            "spike.json",
+            r#"{
+                "id": "spike",
+                "phases": [
+                    { "id": "explore", "kind": "recon" },
+                    { "id": "prototype", "kind": "build", "depends_on": ["explore"] }
+                ]
+            }"#,
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        let loaded = reg.load_dir(&dir.0).unwrap();
+        assert_eq!(loaded, vec!["spike"]);
+        let spike = reg.get("spike").expect("spike registered from data");
+        let ids: Vec<&str> = spike.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["explore", "prototype"]);
+        // built-ins still present alongside the drop-in
+        assert!(reg.get("feature").is_some());
+    }
+
+    #[test]
+    fn load_dir_lets_a_data_file_override_a_builtin() {
+        let dir = ScratchDir::new("override");
+        // Same id as a built-in, one phase — replaces the shipped feature workflow.
+        dir.write(
+            "feature.json",
+            r#"{ "id": "feature", "phases": [ { "id": "ship-it", "kind": "build" } ] }"#,
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        reg.load_dir(&dir.0).unwrap();
+        let feature = reg.get("feature").unwrap();
+        assert_eq!(feature.phases.len(), 1);
+        assert_eq!(feature.phases[0].id, "ship-it");
+    }
+
+    #[test]
+    fn load_dir_on_a_missing_dir_is_empty_not_an_error() {
+        let mut reg = WorkflowRegistry::with_defaults();
+        let loaded = reg.load_dir("/no/such/wicked/workflows/dir").unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn load_dir_skips_an_invalid_file_and_still_loads_the_rest() {
+        let dir = ScratchDir::new("invalid");
+        // A semantically invalid file (self-referential dep) that sorts FIRST, next to a good one.
+        // The old behavior aborted the whole overlay on the first bad file; now it skips + continues.
+        dir.write(
+            "aaa-broken.json",
+            r#"{ "id": "broken", "phases": [ { "id": "a", "kind": "build", "depends_on": ["a"] } ] }"#,
+        );
+        dir.write(
+            "zzz-good.json",
+            r#"{ "id": "custom", "phases": [ { "id": "do", "kind": "build" } ] }"#,
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        let loaded = reg.load_dir(&dir.0).unwrap();
+        assert_eq!(
+            loaded,
+            vec!["custom"],
+            "the good drop-in loads; the broken one is skipped"
+        );
+        assert!(reg.get("custom").is_some());
+        assert!(
+            reg.get("broken").is_none(),
+            "the invalid file is not registered"
+        );
     }
 }

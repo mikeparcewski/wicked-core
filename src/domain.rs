@@ -161,6 +161,32 @@ pub struct WorkUnit {
     /// The collection scope this unit's output is written to.
     #[serde(default)]
     pub collection_scope: Option<String>,
+    /// The skill that drives this unit's work (DES-EXEC-001 §4.1) — carried from the backing phase's
+    /// `skill_ref` at plan time (def-driven runs). `None` ⇒ the authored-prompt path. `#[serde(default)]`
+    /// for back-compat with units persisted before the skills seam.
+    #[serde(default)]
+    pub skill_ref: Option<String>,
+    /// The runtime skill ALLOWLIST for this unit's agent (DES-EXEC-001 §4.2) — carried from the phase's
+    /// `allowed_skills`. The runner passes it as the invocation's skill/tool scope. Empty ⇒ unscoped.
+    #[serde(default)]
+    pub allowed_skills: Vec<String>,
+    /// The backing phase's declared human-confirm gate (DES-EXEC-001 §3) — carried from the phase's
+    /// `GateSpec` so the def, not just the run-level `--confirm` flag, drives when a run pauses for a
+    /// human. A phase's gate fires AFTER its work (before the next unit). `Auto` (the default) ⇒ defer
+    /// to the run-level policy. `#[serde(default)]` for back-compat with pre-gate-wiring units.
+    #[serde(default)]
+    pub gate: crate::workflow::GateSpec,
+    /// The backing phase's evaluator≠creator role (DES-EXEC-001 §4). An `Evaluator`-role unit reviews
+    /// the COLD output of the most recent prior `Creator`-role unit (real artifact-passing), not its
+    /// own. `Neutral` (default) keeps the generic per-unit second pass. `#[serde(default)]` back-compat.
+    #[serde(default)]
+    pub role: crate::workflow::PhaseRole,
+    /// The APPROVED, pinned deterministic validator for this unit's phase (rev0.4 gate layer-1). When
+    /// present, the gate RE-VERIFIES it against the worktree after the governance pass — a fail denies
+    /// the unit (deny-dominates). Authored + approved out of band; `None` ⇒ no validator (the pre-gate
+    /// behavior). `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub validator: Option<crate::validator::DeterministicValidator>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -282,6 +308,11 @@ impl WorkUnit {
             conformance_ref: None,
             phase_status: None,
             collection_scope: None,
+            skill_ref: None,
+            allowed_skills: Vec::new(),
+            gate: crate::workflow::GateSpec::default(),
+            role: crate::workflow::PhaseRole::default(),
+            validator: None,
             status: UnitStatus::Pending,
         }
     }

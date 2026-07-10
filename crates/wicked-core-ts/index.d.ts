@@ -20,6 +20,11 @@ export interface LaunchOptions {
   humanConfirm?: string
   /** The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run. */
   repoRef?: string
+  /**
+   * A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
+   * is data-driven from the def's phases; omit for the free-text planner.
+   */
+  workflow?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real

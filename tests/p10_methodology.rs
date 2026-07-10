@@ -38,6 +38,8 @@ impl StepRunner for OkRunner {
             attempt: i.attempt,
             output: "ok".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -95,6 +97,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         session_id: "r".into(),
         human_confirm: HumanConfirm::None,
         repo_ref: None,
+        workflow: None,
     })
     .unwrap();
     assert!(wait_done(&core, "r"), "the run completes");
