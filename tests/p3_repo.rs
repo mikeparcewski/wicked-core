@@ -49,6 +49,8 @@ impl StepRunner for WorkdirRunner {
             attempt: input.attempt,
             output: "ok".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }

@@ -1639,6 +1639,8 @@ mod tests {
                     attempt: input.attempt,
                     output: "PASS recorded".into(),
                     status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
                 }
             }
         }

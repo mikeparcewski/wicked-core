@@ -377,6 +377,9 @@ pub(crate) fn apply_and_finish_unit(
     // phase) — denies. Pure, no LLM.
     let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
     let det_denial = pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new));
+    // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before `det_denial` is
+    // moved into the deny-dominance fold below, so `GateEvaluated` can carry the depth.
+    let deterministic_pass = det_denial.is_none();
 
     // (layer-2) AGENT VALIDATOR — fold the OFF-THREAD semantic verdict (actor::dispatch_unit's closure
     // ran `claude -p`; here we only interpret its `(pass, reasoning)` via `combine_verdict`). An agent
@@ -411,6 +414,10 @@ pub(crate) fn apply_and_finish_unit(
     )
     .ok();
     let evaluator_claim_id = eval.as_ref().map(|e| e.claim_id.clone());
+    // (S2) The evaluator≠creator second-pass result, surfaced on `GateEvaluated` so the denying layer is
+    // visible: `Some(false)` when this layer denied (det may still have passed + no agent judge ran),
+    // `Some(true)` when it approved, `None` when it did not run.
+    let evaluator_pass = eval.as_ref().map(|e| e.approved);
     let evaluator_denial = eval.as_ref().and_then(|e| {
         (!e.approved).then(|| {
             format!(
@@ -450,6 +457,41 @@ pub(crate) fn apply_and_finish_unit(
     };
     put_node(store, unit.to_node())?;
 
+    // (DES-STUDIO-COCKPIT-001 §3 B1) Emit the gate's DEPTH just before the back-compat `GateDecided` bool.
+    // The agent (layer-2) verdict/reasoning are `Some` only when the off-thread judge actually ran (an
+    // approved validator + a workdir); otherwise honestly `None`. `combined` is the full deny-dominance
+    // result (all layers), identical to `GateDecided.allow`.
+    let (agent_verdict_str, agent_reasoning) = match agent_verdict {
+        Some((pass, reasoning)) => (
+            Some(if *pass { "pass" } else { "reject" }.to_string()),
+            Some(reasoning.clone()),
+        ),
+        None => (None, None),
+    };
+    // (M5) HONEST criterion: `Some` ONLY when a pinned validator gated this unit (its criterion); `None`
+    // for an ungated phase — the unit description is never relabeled a "criterion". `has_deterministic_floor`
+    // makes the ungated case explicit so `deterministic_pass` (vacuously true with no floor) isn't misread.
+    let has_deterministic_floor = unit.validator.is_some();
+    let criterion = unit.validator.as_ref().map(|v| v.criterion.clone());
+    // (S2) Surface the WINNING denial reason whenever the combined gate denied, so the record is never
+    // self-contradictory ("det pass + agent none + combined false" with no visible denying layer).
+    let denial_reason = if outcome.approved {
+        None
+    } else {
+        outcome.denial_reason.clone()
+    };
+    emit(CoreEvent::GateEvaluated {
+        session: session_id.to_string(),
+        ord: unit.ord,
+        criterion,
+        has_deterministic_floor,
+        deterministic_pass,
+        agent_verdict: agent_verdict_str,
+        agent_reasoning,
+        evaluator_pass,
+        denial_reason,
+        combined: outcome.approved,
+    });
     emit(CoreEvent::GateDecided {
         session: session_id.to_string(),
         ord: unit.ord,

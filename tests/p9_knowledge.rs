@@ -31,6 +31,8 @@ impl StepRunner for OkRunner {
             attempt: i.attempt,
             output: "ok".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }

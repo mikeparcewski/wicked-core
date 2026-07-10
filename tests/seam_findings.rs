@@ -50,6 +50,8 @@ impl StepRunner for OutRunner {
             attempt: i.attempt,
             output: self.out.clone(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -64,6 +66,8 @@ impl StepRunner for OkRunner {
             attempt: i.attempt,
             output: "ok".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }

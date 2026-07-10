@@ -41,6 +41,8 @@ impl StepRunner for FastRunner {
             attempt: input.attempt,
             output: format!("stub-output for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }

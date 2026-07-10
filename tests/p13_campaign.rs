@@ -82,6 +82,8 @@ impl StepRunner for Ctl {
             attempt: input.attempt,
             output: format!("did {}", input.unit.description),
             status,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }

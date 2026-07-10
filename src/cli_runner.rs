@@ -139,6 +139,13 @@ struct CompletedTask {
     output: String,
     status: String,
     agent_verdict: Option<AgentVerdictWire>,
+    // (DES-STUDIO-COCKPIT-001 §3 B3/B4) The runner's adapter usage/files ride the bus so the armed
+    // (exec-mediated) daemon path emits `CliUsage`/`DataUsed` just like the in-process path. `#[serde(default)]`
+    // keeps older payloads (no usage/files) parseable — absent ⇒ silent (passthrough seats).
+    #[serde(default)]
+    usage: Option<crate::workflow::Usage>,
+    #[serde(default)]
+    files: Vec<String>,
 }
 
 /// The wire form of the `(pass, reasoning)` agent verdict `ApplyStepResult` carries.
@@ -564,6 +571,8 @@ fn run_cli_runner(
                     status: status_to_str(output.status).to_string(),
                     agent_verdict: agent_verdict
                         .map(|(pass, reasoning)| AgentVerdictWire { pass, reasoning }),
+                    usage: output.usage.clone(),
+                    files: output.files.clone(),
                 };
                 let payload = match serde_json::to_value(&completed) {
                     Ok(v) => v,
@@ -648,6 +657,8 @@ fn run_task_completed_poller(
                     attempt: task.attempt,
                     output: task.output,
                     status: status_from_str(&task.status),
+                    usage: task.usage,
+                    files: task.files,
                 };
                 let agent_verdict = task.agent_verdict.map(|v| (v.pass, v.reasoning));
                 // Reach the actor ONLY via the command channel (the self_tx write-back pattern). A closed
@@ -790,6 +801,8 @@ mod tests {
                     attempt: input.attempt,
                     output: "PASS recorded".into(),
                     status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
                 }
             }
         }

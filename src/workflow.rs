@@ -50,6 +50,18 @@ pub enum StepStatus {
     Cancelled,
 }
 
+/// End-of-unit resource usage a runner's `OutputAdapter` parsed from a CLI's
+/// structured output (DES-STUDIO-COCKPIT-001 §3 B3). `cost_usd` is `Some` when the CLI reports cost
+/// directly (claude's `total_cost_usd`) or a price table resolves it, else `None`. Mid-stream totals are
+/// out of scope — this is the end-of-run total. `Serialize`/`Deserialize` so it survives the exec-mediation
+/// bus round-trip (`CompletedTask`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
 /// The result of a worker step — the unit's produced output. Posted back to the actor, which is the
 /// only thing that writes it to the store.
 #[derive(Debug, Clone)]
@@ -60,6 +72,11 @@ pub struct StepOutput {
     pub output: String,
     /// Whether the step succeeded. A worker signals failure here instead of encoding it in `output`.
     pub status: StepStatus,
+    /// End-of-unit token/cost usage when the runner's adapter parsed it (claude stream-json); `None` for
+    /// passthrough seats (DES-STUDIO-COCKPIT-001 §3 B3). Additive — the actor emits `CliUsage` when present.
+    pub usage: Option<Usage>,
+    /// Data files the unit's CLI touched, from `tool_use` file paths (B4). Empty for passthrough seats.
+    pub files: Vec<String>,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`
@@ -104,6 +121,8 @@ impl StepRunner for StubStepRunner {
             attempt: input.attempt,
             output: format!("stub-output for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }

@@ -49,6 +49,8 @@ impl StepRunner for RecordingRunner {
             attempt: input.attempt,
             output: format!("did: {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -227,5 +229,230 @@ fn cancel_run_terminates_a_paused_run() {
         core.confirm_gate("r", HumanDecision::Approve { amend: None })
             .is_err(),
         "confirming a cancelled run must error"
+    );
+}
+
+/// T-D4 (DES-STUDIO-COCKPIT-001 §3 B2) — every dispatch emits `UnitDispatched`, and the `confirm_gate`
+/// Approve re-dispatch site carries the BUMPED attempt (rework signal). All four dispatch sites
+/// (`dispatch_unit`, `confirm_gate` approve, `resume_run_inner`, `redrive_executing_sessions`) funnel
+/// through `dispatch_unit`, which reads `session.attempt` AFTER each site bumps it — so a single emit at
+/// the funnel yields the correct incrementing attempt at every site. Here we drive the funnel + the
+/// approve-bump path.
+#[test]
+fn t_d4_unit_dispatched_emits_at_each_site_with_incrementing_attempt() {
+    let (core, _ran) = new_core("dispatched");
+    let events = core.subscribe();
+    // Pause before unit 2 (ord 2): unit 1 (ord 1) dispatches at attempt 0, then the run pauses.
+    core.launch_run(spec("r", wicked_core::HumanConfirm::Before(2)))
+        .expect("launch");
+    assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
+
+    // Approve → the cursor unit (ord 2) is re-dispatched under a BUMPED attempt (confirm_gate site).
+    core.confirm_gate("r", HumanDecision::Approve { amend: None })
+        .expect("confirm");
+    assert!(wait_status(&core, "r", SessionStatus::Completed));
+
+    // Drain and keep only UnitDispatched, in order.
+    let mut dispatched: Vec<(u32, u32)> = Vec::new();
+    while let Ok(ev) = events.recv_timeout(Duration::from_millis(200)) {
+        if let wicked_core::CoreEvent::UnitDispatched { ord, attempt, .. } = ev {
+            dispatched.push((ord, attempt));
+        }
+    }
+    assert_eq!(
+        dispatched,
+        vec![(1, 0), (2, 1)],
+        "unit 1 dispatched at attempt 0 (advance funnel); unit 2 re-dispatched at attempt 1 after \
+         the confirm_gate approve bump — the attempt increments across the dispatch site"
+    );
+}
+
+/// T-D5 (DES-STUDIO-COCKPIT-001 §3 B1) — the gate emits `GateEvaluated` with the depth, and its fields
+/// agree with `combine_verdict`. This run has no pinned validator (structural phase) ⇒ deterministic
+/// layer passes and no agent judge runs ⇒ `combine_verdict(true, None) == Approve`, so `combined` (and
+/// the back-compat `GateDecided.allow`) must both be `true`. Every `GateEvaluated` is immediately
+/// followed by a `GateDecided` carrying the same bool.
+#[test]
+fn t_d5_gate_evaluated_carries_depth_and_matches_combine_verdict() {
+    use wicked_core::{combine_verdict, CoreEvent, GateVerdict};
+
+    let (core, _ran) = new_core("gate-eval");
+    let events = core.subscribe();
+    core.launch_run(spec("r", wicked_core::HumanConfirm::None))
+        .expect("launch");
+    assert!(wait_status(&core, "r", SessionStatus::Completed));
+
+    // Walk the stream: each GateEvaluated must be followed by a GateDecided with allow == combined.
+    let mut evaluated = 0;
+    let mut pending: Option<bool> = None; // the combined of the last GateEvaluated awaiting its GateDecided
+    while let Ok(ev) = events.recv_timeout(Duration::from_millis(200)) {
+        match ev {
+            CoreEvent::GateEvaluated {
+                deterministic_pass,
+                agent_verdict,
+                agent_reasoning,
+                combined,
+                criterion,
+                has_deterministic_floor,
+                evaluator_pass,
+                denial_reason,
+                ..
+            } => {
+                // No pinned validator on these units ⇒ deterministic floor passes, no agent judge ran.
+                assert!(deterministic_pass, "structural phase passes the det floor");
+                assert_eq!(
+                    agent_verdict, None,
+                    "no agent judge ran (no approved validator)"
+                );
+                assert_eq!(agent_reasoning, None);
+                // (M5) An ungated phase (no pinned validator) has NO deterministic floor, so the criterion
+                // is honestly `None` — the unit description is never relabeled a "criterion".
+                assert!(
+                    !has_deterministic_floor,
+                    "structural phase has no deterministic floor"
+                );
+                assert_eq!(
+                    criterion, None,
+                    "ungated phase carries no criterion (never the description)"
+                );
+                // (S2) These units all approve, so the evaluator≠creator pass approved and there is no
+                // denial reason — the record is consistent.
+                assert_eq!(evaluator_pass, Some(true), "the evaluator pass approved");
+                assert_eq!(
+                    denial_reason, None,
+                    "an approved gate carries no denial reason"
+                );
+                // The emitted `combined` must equal what `combine_verdict` computes from the same depth.
+                let expected = matches!(
+                    combine_verdict(deterministic_pass, None),
+                    GateVerdict::Approve
+                );
+                assert_eq!(
+                    combined, expected,
+                    "combined must agree with combine_verdict"
+                );
+                pending = Some(combined);
+                evaluated += 1;
+            }
+            CoreEvent::GateDecided { allow, .. } => {
+                if let Some(combined) = pending.take() {
+                    assert_eq!(
+                        allow, combined,
+                        "GateDecided.allow must carry the same bool as GateEvaluated.combined"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(evaluated >= 1, "at least one GateEvaluated was emitted");
+    assert!(
+        pending.is_none(),
+        "every GateEvaluated was matched by a GateDecided"
+    );
+}
+
+/// A runner emitting a fixed output — lets a deny policy fire on the gate context's `output`.
+struct FixedOutRunner(String);
+impl StepRunner for FixedOutRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: self.0.clone(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// T-D5 (S2 honesty) — when the deterministic floor PASSES, no agent judge runs, and the
+/// evaluator≠creator second pass REJECTS, `GateEvaluated` must SURFACE the denying layer rather than
+/// read the self-contradictory "deterministic_pass=true, agent_verdict=None, combined=false" with no
+/// reason. The denied unit's event must carry `evaluator_pass=Some(false)` and a `denial_reason` naming
+/// the evaluator, with `combined=false` (== `GateDecided.allow`).
+#[test]
+fn t_d5_gate_evaluated_surfaces_the_evaluator_denial_reason() {
+    use wicked_apps_core::open_store;
+    use wicked_core::CoreEvent;
+    use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+    let dir = std::env::temp_dir().join("wicked-core-p2-gate-eval-deny");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("estate.db").to_str().unwrap().to_string();
+    {
+        // Deny ONLY the evaluator pass on unit 1 (phase `eval-unit-1`); the primary `unit-1` gate ALLOWS
+        // and the unit has no pinned validator, so the deterministic floor vacuously passes.
+        let mut store = open_store(Some(&db)).unwrap();
+        register_policy(
+            &mut store,
+            &Policy {
+                id: "deny-eval-unit-1".into(),
+                kind: "guard".into(),
+                applies_to: vec!["eval-unit-1".into()],
+                effect: Effect::Deny,
+                trigger: Trigger {
+                    contains: Some("EVALDENY".into()),
+                },
+                obligations: vec![],
+                criteria: String::new(),
+                severity: Severity::High,
+                rule: "deny".into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let core = Core::spawn_with_engine(
+        db,
+        Arc::new(StubDispatcher),
+        Arc::new(FixedOutRunner("EVALDENY appears in the output".into())),
+    );
+    let events = core.subscribe();
+    core.launch_run(spec("r", wicked_core::HumanConfirm::None))
+        .expect("launch");
+    assert!(wait_status(&core, "r", SessionStatus::Failed));
+
+    // Find the GateEvaluated for the denied unit (ord 1) and prove the denying layer is visible.
+    let mut saw_evaluator_reject = false;
+    while let Ok(ev) = events.recv_timeout(Duration::from_millis(200)) {
+        if let CoreEvent::GateEvaluated {
+            ord,
+            deterministic_pass,
+            agent_verdict,
+            evaluator_pass,
+            denial_reason,
+            combined,
+            ..
+        } = ev
+        {
+            if ord == 1 {
+                assert!(
+                    deterministic_pass,
+                    "the deterministic floor passed (no pinned validator)"
+                );
+                assert_eq!(agent_verdict, None, "no agent judge ran");
+                assert_eq!(
+                    evaluator_pass,
+                    Some(false),
+                    "the evaluator≠creator second pass REJECTED — surfaced, not hidden"
+                );
+                assert!(!combined, "the combined gate denied");
+                assert!(
+                    denial_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains("evaluator")),
+                    "the denial reason names the evaluator layer (record is not self-contradictory): {denial_reason:?}"
+                );
+                saw_evaluator_reject = true;
+            }
+        }
+    }
+    assert!(
+        saw_evaluator_reject,
+        "a GateEvaluated for the evaluator-denied unit was emitted with the reason surfaced"
     );
 }

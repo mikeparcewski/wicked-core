@@ -50,6 +50,8 @@ impl StepRunner for CountingRunner {
             attempt: input.attempt,
             output: format!("stub-output for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -257,6 +259,8 @@ impl StepRunner for OkRunner {
             attempt: i.attempt,
             output: "ok".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -284,6 +288,8 @@ impl StepRunner for RestartRunner {
                 attempt: input.attempt,
                 output: "blocked".into(),
                 status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
             };
         }
         self.runs.fetch_add(1, Ordering::SeqCst);
@@ -293,6 +299,8 @@ impl StepRunner for RestartRunner {
             attempt: input.attempt,
             output: format!("recovered for {}", input.unit.description),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
 }
@@ -508,13 +516,11 @@ impl StepRunner for StreamingRunner {
             attempt: i.attempt,
             output: "streamed".into(),
             status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
         }
     }
-    fn run_unit_streaming(
-        &self,
-        i: &StepInput,
-        emit: &(dyn Fn(&str) + Send + Sync),
-    ) -> StepOutput {
+    fn run_unit_streaming(&self, i: &StepInput, emit: &(dyn Fn(&str) + Send + Sync)) -> StepOutput {
         // Two incremental chunks — exactly what the studio's live pane accumulates per unit.
         emit("chunk-one ");
         emit("chunk-two");
@@ -553,7 +559,9 @@ fn live_output_streams_from_the_cli_runner_under_exec_mediation() {
             Ok(CoreEvent::CliOutputDelta { session, chunk, .. }) if session == "live-run" => {
                 chunks.push(chunk);
             }
-            Ok(CoreEvent::SessionCompleted { session }) if session == "live-run" => completed = true,
+            Ok(CoreEvent::SessionCompleted { session }) if session == "live-run" => {
+                completed = true
+            }
             Ok(CoreEvent::Error { message, .. }) => panic!("run errored: {message}"),
             _ => continue,
         }

@@ -992,6 +992,42 @@ fn apply_step_result(
     // conditional human gate can be evaluated against this unit's own verdict (seam finding #3).
     let unit_gate = unit.gate;
 
+    // (DES-STUDIO-COCKPIT-001 §3 B3/B4) Emit the unit's burn + data-in-use as soon as its result lands —
+    // the tokens/files were spent regardless of how the gate later rules. Skipped entirely for seats whose
+    // adapter reported nothing (passthrough → `usage: None`, `files: []`), so the default path is silent.
+    // Cost: claude reports it directly; else the overridable price table fills it in, else `None` (tokens
+    // shown without a fabricated dollar figure — NFR-5).
+    if let Some(u) = &output.usage {
+        let cli_key = unit
+            .assigned_cli
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        let cost_usd = u
+            .cost_usd
+            .or_else(|| cost_from_price_table(&cli_key, u.input_tokens, u.output_tokens));
+        emit(
+            subscribers,
+            CoreEvent::CliUsage {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cost_usd,
+            },
+        );
+    }
+    if !output.files.is_empty() {
+        emit(
+            subscribers,
+            CoreEvent::DataUsed {
+                session: run_id.clone(),
+                ord,
+                files: output.files.clone(),
+            },
+        );
+    }
+
     // A worker that CANCELLED the live unit (e.g. P4a subprocess kill) terminates the run as
     // Cancelled — and clears in_flight via `Finished` (NOT `Stale`, which would wedge the run).
     if output.status == crate::workflow::StepStatus::Cancelled {
@@ -1267,6 +1303,19 @@ fn dispatch_unit(
     let Some(unit) = units.get(unit_ix) else {
         return Ok(false);
     };
+    // (DES-STUDIO-COCKPIT-001 §3 B2) UnitDispatched — the durable-rework signal. `dispatch_unit` is the
+    // SINGLE funnel every dispatch site reaches (initial advance, `confirm_gate` Approve re-dispatch,
+    // `resume_run_inner`, `redrive_executing_sessions`); each of those bumps `session.attempt` in the store
+    // BEFORE calling here, so reading `session.attempt` yields the correct (incrementing) attempt at every
+    // site. Emitted before the exec-mediation branch so BOTH the in-process and bus-mediated paths signal it.
+    emit(
+        subscribers,
+        CoreEvent::UnitDispatched {
+            session: run_id.to_string(),
+            ord: unit.ord,
+            attempt: session.attempt,
+        },
+    );
     emit(
         subscribers,
         CoreEvent::UnitExecuting {
@@ -1589,6 +1638,21 @@ fn emit(subscribers: &mut Vec<Sender<CoreEvent>>, ev: CoreEvent) {
     subscribers.retain(|s| s.send(ev.clone()).is_ok());
 }
 
+/// Overridable per-CLI price-table fallback for `CliUsage.cost_usd` (DES-STUDIO-COCKPIT-001 §3 B-cost /
+/// NFR-5). claude reports cost directly, so this only fires for a seat that reports TOKENS but no cost.
+/// The table is read from the `WICKED_CLI_PRICES` env var (JSON:
+/// `{ "<cli>": { "input_per_mtok": <f>, "output_per_mtok": <f> } }`) — a cross-platform, file-free
+/// override. Absent / unparseable / no entry ⇒ `None`, so we never assert a dollar figure the CLI didn't
+/// imply (the panel then shows tokens only).
+fn cost_from_price_table(cli: &str, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+    let raw = std::env::var("WICKED_CLI_PRICES").ok()?;
+    let map: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let entry = map.get(cli)?;
+    let in_per = entry.get("input_per_mtok").and_then(|v| v.as_f64())?;
+    let out_per = entry.get("output_per_mtok").and_then(|v| v.as_f64())?;
+    Some(input_tokens as f64 / 1e6 * in_per + output_tokens as f64 / 1e6 * out_per)
+}
+
 /// Read the agent session ids on the store (by their session-node names).
 fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
     let query = SymbolQuery {
@@ -1727,6 +1791,8 @@ mod terminal_gate_tests {
                 attempt: i.attempt,
                 output: "unused".into(),
                 status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
             }
         }
     }
