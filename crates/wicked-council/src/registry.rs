@@ -108,6 +108,32 @@ pub fn builtin() -> Vec<AgenticCli> {
             confidence: Confidence::Verified,
             enabled_for_council: true,
         },
+        AgenticCli {
+            key: "copilot".into(),
+            display_name: "GitHub Copilot CLI".into(),
+            binary: "copilot".into(),
+            headless_invocation: "copilot -p \"{PROMPT}\"".into(),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec!["copilot".into(), "--version".into()],
+            trust_flags: vec![],
+            alt_binaries: vec!["gh-copilot".into()],
+            confidence: Confidence::Verified,
+            enabled_for_council: true,
+        },
+        AgenticCli {
+            key: "opencode".into(),
+            display_name: "opencode".into(),
+            binary: "opencode".into(),
+            headless_invocation: "opencode run \"{PROMPT}\"".into(),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec!["opencode".into(), "--version".into()],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::Verified,
+            enabled_for_council: true,
+        },
     ]
 }
 
