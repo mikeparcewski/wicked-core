@@ -290,6 +290,9 @@ pub struct LaunchOptions {
     pub human_confirm: Option<String>,
     /// The id of a registered repo to run within (creates an isolated worktree). Omit for a repo-less run.
     pub repo_ref: Option<String>,
+    /// A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
+    /// is data-driven from the def's phases; omit for the free-text planner.
+    pub workflow: Option<String>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
@@ -306,6 +309,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         session_id: o.session_id,
         human_confirm: parse_human_confirm(o.human_confirm.as_deref()),
         repo_ref: o.repo_ref,
+        workflow: o.workflow,
     })
 }
 

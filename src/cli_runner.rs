@@ -41,11 +41,20 @@
 //! attempt) so a dispatch lost across the restart recovers. Earlier revisions of this module claimed a
 //! cross-restart re-run the code did not actually provide (seam finding #9); it now does.
 //!
-//! ## Known parity gaps (documented, not yet closed)
-//!  * LIVE OUTPUT (#11): the bus-mediated path runs the unit with a NO-OP delta sink — it does NOT
-//!    stream `CliOutputDelta` to subscribers the way the in-process worker does (a `task.output.delta`
-//!    fan-out is a separate, optional §2.2 event). The FINAL output + verdict are identical; only the
-//!    incremental live stream is absent under exec-mediation.
+//! ## Live output under exec-mediation (parity gap #11 — now bridged in-process)
+//!  * The `cli-runner` runs IN-PROCESS with the actor (spawned by `actor::run` on its own thread,
+//!    holding no store handle). So it reaches the actor's SINGLE emit point via the exact `self_tx`
+//!    write-back the in-process worker uses: each incremental output chunk becomes a
+//!    `Command::CliOutputDelta` the actor fans out as `CoreEvent::CliOutputDelta`. The studio's live
+//!    pane therefore ticks under exec-mediation with BYTE-IDENTICAL incremental streaming to the
+//!    in-process path (same `run_unit_streaming` sink).
+//!  * HONEST LIMIT: the delta stream does NOT ride the bus. Execution MEDIATION is over the bus
+//!    (`task.dispatched` → run → `task.completed`); the live-output deltas are an in-process UX
+//!    side-channel over the command channel. This is correct precisely because the `cli-runner` is
+//!    co-process with the actor here. If the `cli-runner` were ever moved to a SEPARATE process, live
+//!    output would need the optional §2.2 `task.output.delta` bus event instead (the command channel
+//!    would no longer reach the actor). The FINAL output + verdict already ride the bus and are
+//!    identical on both paths.
 //!  * TTL (#10): a `task.dispatched`/`task.completed` event is subject to the bus's 72h `expires_at`
 //!    TTL. A consumer offline past the TTL would find the event swept before it polls — an unconsumed
 //!    task event can be dropped. The restart re-drive (above) is the recovery for a lost dispatch; a
@@ -422,6 +431,7 @@ pub(crate) fn spawn_exec_consumers(
             cli_runner_db,
             cli_runner_floor,
             runner,
+            tx.clone(),
             poll_interval,
             stop.clone(),
         ),
@@ -463,10 +473,17 @@ fn cancellable_sleep(stop: &Arc<AtomicBool>, interval: Duration) {
 /// dedup set skips a `(run, unit, attempt)` already completed, and the completed event's deterministic
 /// key dedups across restarts. At-least-once: the floor advances (and the cursor persists) only after a
 /// successful publish, so a transient publish fault re-attempts rather than dropping the task.
+///
+/// LIVE OUTPUT (parity gap #11 closed): `actor_tx` is a clone of the actor's `self_tx`. The unit's
+/// incremental output is streamed to the actor's single emit point via `Command::CliOutputDelta` — the
+/// SAME write-back the in-process worker uses — so the studio's live pane ticks under exec-mediation
+/// with byte-identical streaming. This reaches the actor ONLY over the command channel (no store handle)
+/// and works because the `cli-runner` is co-process with the actor (see the module doc's HONEST LIMIT).
 fn run_cli_runner(
     db: BusDb,
     floor_init: i64,
     runner: Arc<dyn StepRunner>,
+    actor_tx: Sender<Command>,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -475,10 +492,6 @@ fn run_cli_runner(
         // The `(run, unit, attempt)` keys already completed in THIS process — the at-least-once dedup
         // that stops a redelivered dispatch from re-running the CLI.
         let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // The bus-mediated path does NOT stream deltas to the studio (a `task.output.delta` fan-out is a
-        // separate, optional §2.2 event — the live-output parity gap, #11); the runner still runs
-        // identically with a no-op sink and produces the same FINAL output + verdict.
-        let noop_delta = |_: &str| {};
 
         while !stop.load(Ordering::SeqCst) {
             let events = match db.poll(TASK_DISPATCHED, floor, 100) {
@@ -520,11 +533,28 @@ fn run_cli_runner(
                     entity_mode: task.entity_mode,
                     workdir: task.workdir.clone().map(std::path::PathBuf::from),
                 };
+                // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
+                // point as a `Command::CliOutputDelta`, exactly as the in-process worker does. The
+                // `Mutex` makes the `!Sync` `Sender` shareable across the runner's concurrent
+                // stdout/stderr drains. Reaches the actor ONLY via the command channel (no store
+                // handle) — the same self_tx write-back posture as the `task.completed` poller.
+                let delta_run_id = task.run_id.clone();
+                let delta_ord = task.unit.ord;
+                let delta_tx = std::sync::Mutex::new(actor_tx.clone());
+                let emit_delta = move |chunk: &str| {
+                    if let Ok(g) = delta_tx.lock() {
+                        let _ = g.send(Command::CliOutputDelta {
+                            run_id: delta_run_id.clone(),
+                            ord: delta_ord,
+                            chunk: chunk.to_string(),
+                        });
+                    }
+                };
                 let (output, agent_verdict) = run_unit_and_judge(
                     &runner,
                     &input,
                     task.agent_review_target.as_deref(),
-                    &noop_delta,
+                    &emit_delta,
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),

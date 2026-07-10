@@ -494,3 +494,83 @@ fn partial_arm_falls_back_to_in_process_when_a_consumer_cannot_init() {
         "the bus was never opened → the publisher never armed"
     );
 }
+
+// ── LIVE OUTPUT under exec-mediation (parity gap #11 — bridged in-process) ────────────────────────────
+
+/// A runner that STREAMS incremental output through the delta sink (like the real wrapped-CLI runner),
+/// so we can prove the cli-runner forwards those chunks to the actor's emit point under exec-mediation.
+struct StreamingRunner;
+impl StepRunner for StreamingRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "streamed".into(),
+            status: StepStatus::Ok,
+        }
+    }
+    fn run_unit_streaming(
+        &self,
+        i: &StepInput,
+        emit: &(dyn Fn(&str) + Send + Sync),
+    ) -> StepOutput {
+        // Two incremental chunks — exactly what the studio's live pane accumulates per unit.
+        emit("chunk-one ");
+        emit("chunk-two");
+        self.run_unit(i)
+    }
+}
+
+/// Parity gap #11: under exec-mediation the OFF-actor cli-runner must still stream `CliOutputDelta`
+/// to subscribers (the studio's live pane). Before the fix it ran with a no-op sink and no delta ever
+/// reached the actor. This drives a STREAMING runner through `spawn_with_engine_exec` and asserts the
+/// subscriber observes the runner's incremental chunks as `CoreEvent::CliOutputDelta` — proving the
+/// in-process bridge (cli-runner → self_tx → actor emit point) is live under the event path.
+#[test]
+fn live_output_streams_from_the_cli_runner_under_exec_mediation() {
+    let dir = tmp_dir("liveoutput");
+    let estate_db = dir.join("estate.db").to_str().unwrap().to_string();
+    let bus_db = dir.join("bus.db").to_str().unwrap().to_string();
+
+    let core = Core::spawn_with_engine_exec(
+        estate_db,
+        Arc::new(StubDispatcher),
+        Arc::new(StreamingRunner),
+        bus_db.clone(),
+    );
+    let events = core.subscribe();
+
+    core.launch_run(spec("live-run")).expect("launch_run");
+
+    // Collect deltas for this run until it completes (or a deadline). The cli-runner runs OFF the actor
+    // and forwards each chunk over the command channel; the actor fans them out as CliOutputDelta.
+    let mut chunks: Vec<String> = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut completed = false;
+    while Instant::now() < deadline && !completed {
+        match events.recv_timeout(Duration::from_secs(1)) {
+            Ok(CoreEvent::CliOutputDelta { session, chunk, .. }) if session == "live-run" => {
+                chunks.push(chunk);
+            }
+            Ok(CoreEvent::SessionCompleted { session }) if session == "live-run" => completed = true,
+            Ok(CoreEvent::Error { message, .. }) => panic!("run errored: {message}"),
+            _ => continue,
+        }
+    }
+    assert!(completed, "the run completed under exec-mediation");
+
+    // The bus round-trip really happened (task.dispatched exists → the actor did NOT run in-process)…
+    let bus = BusDb::open(&bus_db).unwrap();
+    assert!(
+        !bus.poll(TASK_DISPATCHED, 0, 100).unwrap().is_empty(),
+        "the unit was dispatched over the bus (event-mediated, not in-process)"
+    );
+    // …AND the live-output deltas the OFF-actor cli-runner produced reached the subscriber.
+    let joined = chunks.join("");
+    assert!(
+        joined.contains("chunk-one") && joined.contains("chunk-two"),
+        "the cli-runner's streamed chunks surfaced as CliOutputDelta under exec-mediation; got {chunks:?}"
+    );
+    drop(bus);
+}
