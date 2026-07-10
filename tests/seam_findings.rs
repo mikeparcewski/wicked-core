@@ -15,7 +15,7 @@ use wicked_council::{AgenticCli, CouncilTask};
 use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
 
 use wicked_core::{
-    Core, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, SessionStatus, StepInput,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, SessionStatus, StepInput,
     StepOutput, StepRunner, StepStatus, UnitStatus,
 };
 
@@ -214,6 +214,66 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         SessionStatus::Cancelled,
         "rejecting the conditional gate cancels the run"
     );
+}
+
+/// T-D4b (cockpit adversarial review) — a GENUINE re-dispatch DOES bump the attempt, and only that case.
+/// The `HumanConfirmIf(VerdictNotPass)` retry re-runs an ALREADY-RUN (`Rejected`) unit, so
+/// `confirm_gate(Approve)` must dispatch it at `attempt=1`: this both mints a fresh `(run,unit,attempt)`
+/// idempotency key (wedge-avoidance, seam finding #2/#3) AND is the TRUE rework signal the cockpit Burn
+/// panel counts. Contrast `p2_gates::t_d4_pre_unit_gate_approval_is_a_first_dispatch_not_rework`, where a
+/// pre-unit gate approval is a FIRST dispatch (attempt 0, never rework). Together they pin the corrected
+/// contract: `attempt>0` iff the unit was actually re-run.
+#[test]
+fn t_d4b_conditional_gate_retry_bumps_attempt() {
+    let db = db_path("cond-retry");
+    {
+        let mut store = open_store(Some(&db)).unwrap();
+        // Deny ONLY the verify phase (unit-4) so its own verdict is not-pass → escalates every run.
+        register_policy(&mut store, &deny_policy("unit-4", "verify")).unwrap();
+    }
+    let core = Core::spawn_with_engine(db, Arc::new(StubDispatcher), Arc::new(OkRunner));
+    let events = core.subscribe();
+    core.launch_run(LaunchSpec {
+        problem: "fix the bug".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: EntityMode::Shared,
+        session_id: "r".into(),
+        human_confirm: HumanConfirm::None,
+        repo_ref: None,
+        workflow: Some("bug".into()),
+    })
+    .expect("launch bug workflow");
+    assert!(
+        wait_status(&core, "r", SessionStatus::AwaitingHuman),
+        "the verify phase's not-pass verdict escalates to a human (first run, attempt 0)"
+    );
+
+    // Approve → the ALREADY-RUN (Rejected) verify unit re-dispatches at a BUMPED attempt (the retry then
+    // runs in-flight; we assert on the DISPATCH, not on where the re-run lands).
+    core.confirm_gate("r", HumanDecision::Approve { amend: None })
+        .expect("approve the retry");
+
+    // Collect UnitDispatched for the verify unit (ord 4): its first run (attempt 0) THEN the retry
+    // (attempt 1). Drain until the retry dispatch is observed (or a generous ceiling), tolerating latency.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut verify_attempts: Vec<u32> = Vec::new();
+    while Instant::now() < deadline && verify_attempts != vec![0, 1] {
+        if let Ok(CoreEvent::UnitDispatched { ord, attempt, .. }) =
+            events.recv_timeout(Duration::from_millis(200))
+        {
+            if ord == 4 {
+                verify_attempts.push(attempt);
+            }
+        }
+    }
+    assert_eq!(
+        verify_attempts,
+        vec![0, 1],
+        "the verify unit ran first at attempt 0, then the confirm_gate retry re-dispatched it at \
+         attempt 1 — a genuine re-dispatch of an already-run unit DOES bump (wedge-key freshness + real rework)"
+    );
+
+    let _ = core.cancel_run("r"); // clean up the in-flight run
 }
 
 /// Finding #9 (+ #2 in the interactive lane): the evaluator≠creator second-pass verdict GATES — an

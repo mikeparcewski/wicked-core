@@ -1460,15 +1460,35 @@ pub(crate) fn confirm_gate(
             // so it doesn't immediately re-pause on the same unit).
             let mut s = session;
             s.status = SessionStatus::Executing;
-            // WEDGE-ON-RE-DISPATCH fix (seam finding #2/#3): BUMP the attempt before re-dispatching the
-            // SAME cursor unit (a HumanConfirmIf conditional-gate retry, a terminal-gate approve, or an
-            // operator gate approve). Without this, the re-dispatch reuses the identical
-            // `(run, unit, attempt)` idempotency key → `emit()` dedups to the ORIGINAL (now-terminal)
-            // task.dispatched row, `try_publish_dispatched` still returns true (suppressing the in-process
-            // fallback), and the cli-runner's cursor is already past that row → NO worker runs → permanent
-            // wedge. A bumped attempt mints a fresh key so a genuinely new task.dispatched is emitted. The
-            // bump is inert on the default in-process path (nothing there branches on `attempt`).
-            s.attempt = s.attempt.saturating_add(1);
+            // WEDGE-ON-RE-DISPATCH fix (seam finding #2/#3): BUMP the attempt before re-dispatching an
+            // ALREADY-RUN cursor unit (a HumanConfirmIf conditional-gate retry, or a terminal-gate
+            // re-approve). Without this, the re-dispatch reuses the identical `(run, unit, attempt)`
+            // idempotency key → `emit()` dedups to the ORIGINAL (now-terminal) task.dispatched row,
+            // `try_publish_dispatched` still returns true (suppressing the in-process fallback), and the
+            // cli-runner's cursor is already past that row → NO worker runs → permanent wedge. A bumped
+            // attempt mints a fresh key so a genuinely new task.dispatched is emitted. The bump is inert on
+            // the default in-process path (nothing there branches on `attempt`).
+            //
+            // REWORK-HONESTY fix (cockpit adversarial review): bump ONLY when the cursor unit ALREADY RAN
+            // (`Done`/`Rejected`). A PRE-unit human gate (`should_pause` paused BEFORE the unit's FIRST
+            // dispatch — e.g. `human_confirm: all`/`before`) leaves the cursor `Pending` (never run), so
+            // approving it is its FIRST dispatch: bumping there would emit `UnitDispatched{attempt=1}` +
+            // `CliUsage{attempt=1}` for work that was never redone, booking the unit's entire burn as
+            // rework (`attempt>0`) → ~100% false rework under `human_confirm: all`. A first dispatch at
+            // attempt=0 has no prior `task.dispatched` row, so it cannot collide → no wedge, no bump needed.
+            // This keeps the `event.rs` contract ("first dispatch is attempt=0") true for gated units.
+            let cursor_ran = crate::domain::session_units(store, run_id)?
+                .get(s.unit_ix)
+                .map(|u| {
+                    matches!(
+                        u.status,
+                        crate::domain::UnitStatus::Done | crate::domain::UnitStatus::Rejected
+                    )
+                })
+                .unwrap_or(false);
+            if cursor_ran {
+                s.attempt = s.attempt.saturating_add(1);
+            }
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);

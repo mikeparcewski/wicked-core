@@ -232,14 +232,14 @@ fn cancel_run_terminates_a_paused_run() {
     );
 }
 
-/// T-D4 (DES-STUDIO-COCKPIT-001 §3 B2) — every dispatch emits `UnitDispatched`, and the `confirm_gate`
-/// Approve re-dispatch site carries the BUMPED attempt (rework signal). All four dispatch sites
-/// (`dispatch_unit`, `confirm_gate` approve, `resume_run_inner`, `redrive_executing_sessions`) funnel
-/// through `dispatch_unit`, which reads `session.attempt` AFTER each site bumps it — so a single emit at
-/// the funnel yields the correct incrementing attempt at every site. Here we drive the funnel + the
-/// approve-bump path.
+/// T-D4 (DES-STUDIO-COCKPIT-001 §3 B2) — every dispatch emits `UnitDispatched` at the funnel, and the
+/// attempt is the unit's REAL dispatch attempt. REWORK-HONESTY (cockpit adversarial review): a PRE-unit
+/// human gate approval is the gated unit's FIRST dispatch, so it must carry `attempt=0` — NOT a bump.
+/// Bumping there would book the unit's first run as rework (`attempt>0`), reporting false rework (~100%
+/// under `human_confirm: all`). The bump belongs only to a genuine re-dispatch of an ALREADY-RUN unit
+/// (see `t_d4b`). This drives the funnel (unit 1) + a pre-unit-gate approve (unit 2, first dispatch).
 #[test]
-fn t_d4_unit_dispatched_emits_at_each_site_with_incrementing_attempt() {
+fn t_d4_pre_unit_gate_approval_is_a_first_dispatch_not_rework() {
     let (core, _ran) = new_core("dispatched");
     let events = core.subscribe();
     // Pause before unit 2 (ord 2): unit 1 (ord 1) dispatches at attempt 0, then the run pauses.
@@ -247,7 +247,7 @@ fn t_d4_unit_dispatched_emits_at_each_site_with_incrementing_attempt() {
         .expect("launch");
     assert!(wait_status(&core, "r", SessionStatus::AwaitingHuman));
 
-    // Approve → the cursor unit (ord 2) is re-dispatched under a BUMPED attempt (confirm_gate site).
+    // Approve → the cursor unit (ord 2) has NEVER run, so this is its FIRST dispatch: attempt stays 0.
     core.confirm_gate("r", HumanDecision::Approve { amend: None })
         .expect("confirm");
     assert!(wait_status(&core, "r", SessionStatus::Completed));
@@ -261,9 +261,9 @@ fn t_d4_unit_dispatched_emits_at_each_site_with_incrementing_attempt() {
     }
     assert_eq!(
         dispatched,
-        vec![(1, 0), (2, 1)],
-        "unit 1 dispatched at attempt 0 (advance funnel); unit 2 re-dispatched at attempt 1 after \
-         the confirm_gate approve bump — the attempt increments across the dispatch site"
+        vec![(1, 0), (2, 0)],
+        "unit 1 at attempt 0 (advance funnel); unit 2 at attempt 0 — a pre-unit gate approval is the \
+         unit's FIRST dispatch, never rework. A false attempt>0 here reports phantom rework in the cockpit."
     );
 }
 
