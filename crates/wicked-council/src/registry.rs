@@ -7,7 +7,7 @@
 //!
 //! The registry record is the de-drift source of truth — flags are encoded here, never
 //! re-derived per call. The built-in roster uses the CLIs that actually exist in this
-//! environment (**claude, agy, pi**) so a real probe can detect them.
+//! environment (**claude, agy, codex, copilot, opencode, pi**) so a real probe can detect them.
 
 use std::path::{Path, PathBuf};
 
@@ -65,7 +65,7 @@ impl From<TomlCli> for AgenticCli {
 }
 
 /// The built-in, hand-verified registry. These are the agentic CLIs available in this
-/// environment (**claude, agy, pi**). The full roster is data, not logic; it grows by
+/// environment (**claude, agy, codex, copilot, opencode, pi**). The full roster is data, not logic; it grows by
 /// appending records here or via the user TOML.
 pub fn builtin() -> Vec<AgenticCli> {
     vec![
@@ -84,13 +84,26 @@ pub fn builtin() -> Vec<AgenticCli> {
         },
         AgenticCli {
             key: "agy".into(),
-            display_name: "Agency CLI".into(),
+            display_name: "Antigravity".into(),
             binary: "agy".into(),
             headless_invocation: "agy run \"{PROMPT}\"".into(),
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["agy".into(), "--version".into()],
             trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::Verified,
+            enabled_for_council: true,
+        },
+        AgenticCli {
+            key: "codex".into(),
+            display_name: "Codex".into(),
+            binary: "codex".into(),
+            headless_invocation: "codex exec \"{PROMPT}\"".into(),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec!["codex".into(), "--version".into()],
+            trust_flags: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
