@@ -364,22 +364,22 @@ Published to wicked-bus AND mirrored to the in-process `CoreEvent` stream (studi
 | `wicked.crew.campaign.finished` (maps to existing `CampaignRunFinished`) | reducer | reducer (dispatch next ready node) |
 
 ### 2.3 Subscribers (each decoupled; zero direct calls)
-- **triage-router** — `signal.received` → rule table → `run.triaged`. (New; small.)
+- **triage-router** — `wicked.crew.signal.received` → rule table → `wicked.crew.run.triaged`. (New; small.)
 - **reducer** (the actor) — the ONE central, single-writer, durable subscriber. Consumes `*.triaged`,
-  `task.completed/failed`, `gate.decided`, `campaign.node.finished`; owns state; publishes
-  `stage.started`, `task.dispatched`, `gate.pending`, `run.completed`.
-- **cli-runner** (one per CLI or a pool) — `task.dispatched` (filtered) → runs the wrapped subprocess
-  in the run's worktree (**reuse `execute_wrapped.rs`**) → `task.output.delta` → `task.completed/failed`.
+  `wicked.crew.task.completed/failed`, `wicked.crew.gate.decided`, `campaign.node.finished`; owns state; publishes
+  `wicked.crew.stage.started`, `wicked.crew.task.dispatched`, `wicked.crew.gate.pending`, `wicked.crew.run.completed`.
+- **cli-runner** (one per CLI or a pool) — `wicked.crew.task.dispatched` (filtered) → runs the wrapped subprocess
+  in the run's worktree (**reuse `execute_wrapped.rs`**) → `wicked.crew.task.delta` → `wicked.crew.task.completed/failed`.
   **This is the "custom subscriber mediates the non-event-aware CLI" seam** (gcp's auto-runner / rai's
   SQS consumer analogue).
-- **gate-evaluator** — `evidence.recorded` → runs the gate ladder (§3) with an identity **distinct
-  from the creator** → `gate.pending` (needs human) or auto `gate.decided`.
+- **gate-evaluator** — `wicked.crew.evidence.recorded` → runs the gate ladder (§3) with an identity **distinct
+  from the creator** → `wicked.crew.gate.pending` (needs human) or auto `wicked.crew.gate.decided`.
 - **adversarial reviewer** — the `AdversarialReview` stage's evaluator seat; consumes the creator's
-  `task.completed`, publishes a critique as evidence (a REAL 2nd CLI run — fixes the "label" bug).
-- **human-gate UI** — `gate.pending` → renders → human answer becomes a `gate.decided` command.
+  `wicked.crew.task.completed`, publishes a critique as evidence (a REAL 2nd CLI run — fixes the "label" bug).
+- **human-gate UI** — `wicked.crew.gate.pending` → renders → human answer becomes a `wicked.crew.gate.decided` command.
 - **scheduler sidecar** (operator direction, 2026-07-09) — a **publisher** that turns **schedules
   (data: cron/interval + workflow id + args)** into `wicked.crew.run.requested {workflow, problem, args}`
-  events on a timer. **Launch is an event**, so the reducer subscribes to `run.requested` and starts a
+  events on a timer. **Launch is an event**, so the reducer subscribes to `wicked.crew.run.requested` and starts a
   run identically no matter who fired it — a human on the CLI, a Campaign node, or this scheduler. That
   makes "schedule agents" fall out for free (recurring nightly audit, periodic migration check,
   scheduled review): adding a schedule is a data row + a sidecar, **never a core change** — the same

@@ -52,7 +52,7 @@
 //!    (`task.dispatched` → run → `task.completed`); the live-output deltas are an in-process UX
 //!    side-channel over the command channel. This is correct precisely because the `cli-runner` is
 //!    co-process with the actor here. If the `cli-runner` were ever moved to a SEPARATE process, live
-//!    output would need the optional §2.2 `task.output.delta` bus event instead (the command channel
+//!    output would need the optional §2.2 `wicked.crew.task.delta` bus event instead (the command channel
 //!    would no longer reach the actor). The FINAL output + verdict already ride the bus and are
 //!    identical on both paths.
 //!  * TTL (#10): a `task.dispatched`/`task.completed` event is subject to the bus's 72h `expires_at`
