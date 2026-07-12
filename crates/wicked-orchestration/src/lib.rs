@@ -206,7 +206,10 @@ mod tests {
         assert_eq!(out.transitions.len(), 1);
         assert_eq!(out.transitions[0].from, PhaseStatus::Pending);
         assert_eq!(out.transitions[0].to, PhaseStatus::InProgress);
-        assert_eq!(out.transitions[0].event_type, Some("wicked.phase.started"));
+        assert_eq!(
+            out.transitions[0].event_type,
+            Some("wicked.crew.phase.started")
+        );
         assert_eq!(
             get_phase(&s, phase_id).unwrap().unwrap().status,
             PhaseStatus::InProgress

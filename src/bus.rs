@@ -471,9 +471,9 @@ pub fn matches_filter(event_type: &str, domain: &str, filter: &str) -> bool {
 }
 
 /// The event type the launch poller consumes.
-pub const RUN_REQUESTED: &str = "wicked.run.requested";
+pub const RUN_REQUESTED: &str = "wicked.crew.run.requested";
 /// The lifecycle event the launch poller emits back onto the bus when a run starts.
-pub const RUN_LAUNCHED: &str = "wicked.run.launched";
+pub const RUN_LAUNCHED: &str = "wicked.crew.run.launched";
 /// The domain core publishes under.
 pub const CORE_DOMAIN: &str = "wicked-core";
 
