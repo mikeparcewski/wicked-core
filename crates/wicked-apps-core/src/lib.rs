@@ -168,7 +168,8 @@ pub const EVENT_CATALOG: &[&str] = &[
 /// Validate a bus event type against the ecosystem grammar.
 ///
 /// Rules (enforced WITHOUT a regex dependency — a hand-rolled scan of the same shape):
-/// - matches `^wicked\.[a-z0-9_]+(\.[a-z0-9_]+)*$`
+/// - matches `^wicked\.[a-z0-9_]+\.[a-z0-9_]+\.[a-z0-9_]+$` — EXACTLY four
+///   dot-separated segments (`wicked.<domain>.<noun>.<verb>`)
 /// - at most 128 characters
 ///
 /// Note the catalog's `wicked.crew.phase.ready-for-gate` contains a hyphen, which the grammar
@@ -185,7 +186,11 @@ pub fn validate_event_type(s: &str) -> bool {
     if rest.is_empty() {
         return false;
     }
-    // `rest` is one-or-more dot-separated segments, each a non-empty run of [a-z0-9_].
+    // The grammar is EXACTLY four segments: `wicked.<domain>.<noun>.<verb>`.
+    // After the `wicked.` prefix, `rest` must be exactly three non-empty
+    // [a-z0-9_] segments (two dots) — no more (`wicked.a.b.c.d`), no fewer
+    // (`wicked.policy`).
+    let mut segments = 0usize;
     for segment in rest.split('.') {
         if segment.is_empty() {
             return false;
@@ -196,6 +201,10 @@ pub fn validate_event_type(s: &str) -> bool {
         {
             return false;
         }
+        segments += 1;
+    }
+    if segments != 3 {
+        return false;
     }
     true
 }
@@ -387,7 +396,11 @@ mod tests {
         // Empty segment / trailing dot.
         assert!(!validate_event_type("wicked.policy."));
         assert!(!validate_event_type("wicked..registered"));
-        // Bare prefix.
+        // Wrong segment count — the grammar is EXACTLY four segments.
+        assert!(!validate_event_type("wicked.policy")); // 2 segments (too few)
+        assert!(!validate_event_type("wicked.crew.phase")); // 3 segments (too few)
+        assert!(!validate_event_type("wicked.crew.phase.started.extra")); // 5 (too many)
+                                                                          // Bare prefix.
         assert!(!validate_event_type("wicked."));
         assert!(!validate_event_type("wicked"));
         // Over length cap (128).
