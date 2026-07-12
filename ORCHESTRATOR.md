@@ -278,7 +278,7 @@ claude -p '/wicked-testing:acceptance scenarios/<unit>.md --json'   (cwd = run w
 ```
 This runs Writer→Executor→Reviewer inside the host CLI. The scenario `.md` is the input contract (`SCENARIO-FORMAT.md`); the Recon/Build typed evidence (§2.5) feeds scenario authoring — which is itself an LLM/CLI invocation, scoped explicitly into P6 (not folded silently).
 
-**Run-id correlation (the crux, now specified).** The manifest lives at `.wicked-testing/evidence/<testing-run-id>/manifest.json`, where `<testing-run-id>` is wicked-testing's own id, *not* the COE `run_id`. COE **captures `testing-run-id` from the `--json` stdout** of the acceptance invocation and stores it on `Run.testing_run_id`. That id both locates the manifest dir and **filters the global bus** (`wicked.verdict.recorded` is not per-run) so concurrent COE runs don't cross-wire.
+**Run-id correlation (the crux, now specified).** The manifest lives at `.wicked-testing/evidence/<testing-run-id>/manifest.json`, where `<testing-run-id>` is wicked-testing's own id, *not* the COE `run_id`. COE **captures `testing-run-id` from the `--json` stdout** of the acceptance invocation and stores it on `Run.testing_run_id`. That id both locates the manifest dir and **filters the global bus** (`wicked.test.verdict.created` is not per-run) so concurrent COE runs don't cross-wire.
 
 **Verdict flow.** Two sanctioned read seams:
 1. **Manifest file** — parse against `schemas/evidence.json`; gate on `manifest_version`, ignore unknown keys; map `status`/`verdict.value` (PASS/FAIL/PARTIAL/CONDITIONAL/INCONCLUSIVE) into a `work_output` node.
