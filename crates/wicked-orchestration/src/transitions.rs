@@ -14,8 +14,8 @@ use crate::domain::PhaseStatus;
 /// state and the empty terminal states.
 ///
 /// The emitted-type column is faithful to the prototype (e.g. `gate_running -> approved` and
-/// `-> approved_with_conditions` both emit `wicked.phase.approved`); the actual coarse emit the
-/// Rust crate performs is the single `wicked.orchestration.phase_transitioned` fact (see
+/// `-> approved_with_conditions` both emit `wicked.crew.phase.approved`); the actual coarse emit the
+/// Rust crate performs is the single `wicked.crew.phase.transitioned` fact (see
 /// [`crate::reducer`]), so this column documents the prototype's intent and is exercised by
 /// [`emitted_event_type_for`].
 pub const ALLOWED_TRANSITIONS: &[(PhaseStatus, PhaseStatus, Option<&str>)] = &[
@@ -23,7 +23,7 @@ pub const ALLOWED_TRANSITIONS: &[(PhaseStatus, PhaseStatus, Option<&str>)] = &[
     (
         PhaseStatus::Pending,
         PhaseStatus::InProgress,
-        Some("wicked.phase.started"),
+        Some("wicked.crew.phase.started"),
     ),
     (PhaseStatus::Pending, PhaseStatus::Skipped, None),
     // in_progress
@@ -35,14 +35,14 @@ pub const ALLOWED_TRANSITIONS: &[(PhaseStatus, PhaseStatus, Option<&str>)] = &[
     (
         PhaseStatus::InProgress,
         PhaseStatus::ReadyForGate,
-        Some("wicked.phase.ready-for-gate"),
+        Some("wicked.crew.phase.ready-for-gate"),
     ),
     (PhaseStatus::InProgress, PhaseStatus::Skipped, None),
     // awaiting_deliverables
     (
         PhaseStatus::AwaitingDeliverables,
         PhaseStatus::ReadyForGate,
-        Some("wicked.phase.ready-for-gate"),
+        Some("wicked.crew.phase.ready-for-gate"),
     ),
     (
         PhaseStatus::AwaitingDeliverables,
@@ -56,17 +56,17 @@ pub const ALLOWED_TRANSITIONS: &[(PhaseStatus, PhaseStatus, Option<&str>)] = &[
     (
         PhaseStatus::GateRunning,
         PhaseStatus::Approved,
-        Some("wicked.phase.approved"),
+        Some("wicked.crew.phase.approved"),
     ),
     (
         PhaseStatus::GateRunning,
         PhaseStatus::ApprovedWithConditions,
-        Some("wicked.phase.approved"),
+        Some("wicked.crew.phase.approved"),
     ),
     (
         PhaseStatus::GateRunning,
         PhaseStatus::Rejected,
-        Some("wicked.phase.rejected"),
+        Some("wicked.crew.phase.rejected"),
     ),
     (PhaseStatus::GateRunning, PhaseStatus::Skipped, None),
     // Terminal states (approved / approved_with_conditions / rejected / skipped) have no edges.

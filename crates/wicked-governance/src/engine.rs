@@ -10,7 +10,7 @@
 //!   [`Decision::Deny`] (deny DOMINATES); triggered [`Effect::AllowWithConditions`] ⇒ collect
 //!   obligations ⇒ [`Decision::AllowWithConditions`]; else [`Decision::Allow`].
 //! - **conform** — upsert the claim [`Node`] + a policy→claim [`EdgeKind::Governs`] edge, then a
-//!   COARSE fire-and-forget `wicked.governance.conformance_recorded` event (counts/ids only).
+//!   COARSE fire-and-forget `wicked.crew.governance.conformance_recorded` event (counts/ids only).
 //!
 //! Divergence from the prototype (faithful, documented): `evaluated_at` is Unix-seconds (`i64`, the
 //! `wicked_apps_core::ConformanceClaim` field type) rather than the prototype's ISO-8601 string; the claim
@@ -36,10 +36,10 @@ use crate::domain::{Effect, Policy, Trigger};
 pub const EVALUATOR_IDENTITY: &str = "wicked-governance@0.1.0";
 
 /// The coarse bus event emitted by [`conform`]. The build brief specifies this exact literal
-/// (`wicked.governance.conformance_recorded`). NOTE: it is NOT the wicked-apps-core catalog constant
-/// `EV_CONFORMANCE_RECORDED` (= `"wicked.conformance.recorded"`); the brief's literal wins here and
+/// (`wicked.crew.governance.conformance_recorded`). NOTE: it is NOT the wicked-apps-core catalog constant
+/// `EV_CONFORMANCE_RECORDED` (= `"wicked.crew.conformance.recorded"`); the brief's literal wins here and
 /// is grammar-valid per `wicked_apps_core::validate_event_type`. Documented divergence (see crate notes).
-pub const EV_CONFORMANCE_RECORDED_LITERAL: &str = "wicked.governance.conformance_recorded";
+pub const EV_CONFORMANCE_RECORDED_LITERAL: &str = "wicked.crew.governance.conformance_recorded";
 
 /// The resolver-id recorded on the policy→claim governance edge (estate requires `resolved_by`).
 const GOVERNANCE_RESOLVED_BY: &str = "wicked-governance";
@@ -295,7 +295,7 @@ pub fn claim_from_node(node: &Node) -> anyhow::Result<ConformanceClaim> {
 /// Record a conformance claim on the shared store: upsert the claim node and, for each policy that
 /// participated (`policy_ids`), a `policy → claim` edge with the native [`EdgeKind::Governs`]
 /// (a rule governs the thing it was evaluated against — the closest estate-native fit). Then emit a
-/// COARSE fire-and-forget `wicked.governance.conformance_recorded` (counts/ids only, never the
+/// COARSE fire-and-forget `wicked.crew.governance.conformance_recorded` (counts/ids only, never the
 /// context payload). The claim node IS the evidence on the shared graph (the prototype's
 /// wicked-vault EvidencePort is out of scope here — see the crate note).
 pub fn conform(store: &mut dyn GraphStore, claim: &ConformanceClaim) -> anyhow::Result<()> {

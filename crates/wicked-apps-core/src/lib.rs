@@ -112,27 +112,27 @@ pub const EVIDENCES: &str = "evidences";
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Cross-app event catalog — mirrors
 //    `wicked-governance/contracts/events.json` (the canonical Node-era contract).
-//    Convention: `wicked.<noun>.<verb>`. Apps validate emitted types with `validate_event_type`.
+//    Convention: `wicked.<domain>.<noun>.<verb>`. Apps validate emitted types with `validate_event_type`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // wicked.governance.* (producer: wicked-governance)
-pub const EV_POLICY_REGISTERED: &str = "wicked.policy.registered";
-pub const EV_POLICY_EVALUATED: &str = "wicked.policy.evaluated";
-pub const EV_CONFORMANCE_RECORDED: &str = "wicked.conformance.recorded";
-pub const EV_POLICY_VIOLATED: &str = "wicked.policy.violated";
+pub const EV_POLICY_REGISTERED: &str = "wicked.crew.policy.registered";
+pub const EV_POLICY_EVALUATED: &str = "wicked.crew.policy.evaluated";
+pub const EV_CONFORMANCE_RECORDED: &str = "wicked.crew.conformance.recorded";
+pub const EV_POLICY_VIOLATED: &str = "wicked.crew.policy.violated";
 
 // wicked.orchestration.* (producer: wicked-orchestration)
-pub const EV_WORKFLOW_STARTED: &str = "wicked.workflow.started";
-pub const EV_WORKFLOW_COMPLETED: &str = "wicked.workflow.completed";
-pub const EV_PHASE_STARTED: &str = "wicked.phase.started";
-pub const EV_PHASE_READY_FOR_GATE: &str = "wicked.phase.ready-for-gate";
-pub const EV_PHASE_APPROVED: &str = "wicked.phase.approved";
-pub const EV_PHASE_REJECTED: &str = "wicked.phase.rejected";
+pub const EV_WORKFLOW_STARTED: &str = "wicked.crew.workflow.started";
+pub const EV_WORKFLOW_COMPLETED: &str = "wicked.crew.workflow.completed";
+pub const EV_PHASE_STARTED: &str = "wicked.crew.phase.started";
+pub const EV_PHASE_READY_FOR_GATE: &str = "wicked.crew.phase.ready-for-gate";
+pub const EV_PHASE_APPROVED: &str = "wicked.crew.phase.approved";
+pub const EV_PHASE_REJECTED: &str = "wicked.crew.phase.rejected";
 
 // wicked.council.* (producer: wicked-council)
-pub const EV_COUNCIL_REQUESTED: &str = "wicked.council.requested";
-pub const EV_COUNCIL_VOTED: &str = "wicked.council.voted";
-pub const EV_CLI_RANKED: &str = "wicked.cli.ranked";
+pub const EV_COUNCIL_REQUESTED: &str = "wicked.crew.council.requested";
+pub const EV_COUNCIL_VOTED: &str = "wicked.crew.council.voted";
+pub const EV_CLI_RANKED: &str = "wicked.crew.cli.ranked";
 
 // wicked.agent.* (producer: wicked-agent)
 pub const EV_AGENT_SESSION_STARTED: &str = "wicked.agent.session.started";
@@ -171,7 +171,7 @@ pub const EVENT_CATALOG: &[&str] = &[
 /// - matches `^wicked\.[a-z0-9_]+(\.[a-z0-9_]+)*$`
 /// - at most 128 characters
 ///
-/// Note the catalog's `wicked.phase.ready-for-gate` contains a hyphen, which the grammar
+/// Note the catalog's `wicked.crew.phase.ready-for-gate` contains a hyphen, which the grammar
 /// `[a-z0-9_]` does NOT admit. That is faithful to the brief's stated grammar; the hyphenated
 /// name is a known catalog member that this strict validator rejects (see the catalog test, which
 /// asserts the grammar-conformant names pass and documents the hyphen exception).
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn validate_event_type_accepts_catalog_grammar_names() {
         // Every catalog member whose name is grammar-conformant ([a-z0-9_] segments) must pass.
-        // `wicked.phase.ready-for-gate` is the documented hyphen exception (rejected below).
+        // `wicked.crew.phase.ready-for-gate` is the documented hyphen exception (rejected below).
         for &ev in EVENT_CATALOG {
             if ev.contains('-') {
                 continue;
@@ -382,7 +382,7 @@ mod tests {
         // Uppercase not allowed.
         assert!(!validate_event_type("wicked.Policy.Registered"));
         // Hyphen not in the grammar (and this is the known catalog exception).
-        assert!(!validate_event_type("wicked.phase.ready-for-gate"));
+        assert!(!validate_event_type("wicked.crew.phase.ready-for-gate"));
         assert!(!validate_event_type(EV_PHASE_READY_FOR_GATE));
         // Empty segment / trailing dot.
         assert!(!validate_event_type("wicked.policy."));

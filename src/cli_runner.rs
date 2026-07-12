@@ -75,9 +75,9 @@ use crate::scope::EntityMode;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus};
 
 /// The event the reducer publishes and the `cli-runner` consumes (filtered).
-pub const TASK_DISPATCHED: &str = "wicked.task.dispatched";
+pub const TASK_DISPATCHED: &str = "wicked.crew.task.dispatched";
 /// The event the `cli-runner` publishes and the reducer consumes.
-pub const TASK_COMPLETED: &str = "wicked.task.completed";
+pub const TASK_COMPLETED: &str = "wicked.crew.task.completed";
 
 /// The `wicked.task.dispatched` payload. Carries what the `cli-runner` needs to reconstruct the
 /// [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with

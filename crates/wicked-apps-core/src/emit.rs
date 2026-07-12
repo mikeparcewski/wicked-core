@@ -49,7 +49,7 @@ static EMIT_SEQ: AtomicU64 = AtomicU64::new(0);
 /// [`crate::validate_event_type`] before constructing). `payload` is an already-built JSON object.
 #[derive(Debug, Clone)]
 pub struct EmitEvent {
-    /// `wicked.<noun>.<verb>` — e.g. `wicked.policy.evaluated`.
+    /// `wicked.<domain>.<noun>.<verb>` — e.g. `wicked.crew.policy.evaluated`.
     pub event_type: String,
     /// Top-level domain — e.g. `wicked-governance`.
     pub domain: String,

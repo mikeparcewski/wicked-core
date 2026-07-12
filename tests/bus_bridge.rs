@@ -179,7 +179,7 @@ fn cross_language_roundtrip() {
             "--plugin",
             "xlang-js",
             "--filter",
-            "wicked.run.*",
+            "wicked.crew.run.*",
             "--cursor-init",
             "oldest",
             "--once",
@@ -196,10 +196,10 @@ fn cross_language_roundtrip() {
     );
     let js_row: serde_json::Value = stdout
         .lines()
-        .find(|l| l.contains("wicked.run.requested"))
+        .find(|l| l.contains("wicked.crew.run.requested"))
         .map(|l| serde_json::from_str(l).expect("JS emitted valid NDJSON"))
         .expect("JS bus drained the Rust-written event");
-    assert_eq!(js_row["event_type"], "wicked.run.requested");
+    assert_eq!(js_row["event_type"], "wicked.crew.run.requested");
     let payload: serde_json::Value =
         serde_json::from_str(js_row["payload"].as_str().unwrap()).unwrap();
     assert_eq!(
@@ -215,7 +215,7 @@ fn cross_language_roundtrip() {
         .args([
             "emit",
             "--type",
-            "wicked.run.requested",
+            "wicked.crew.run.requested",
             "--domain",
             "wicked-cli",
             "--payload",

@@ -27,7 +27,7 @@ use crate::reducer::{apply_event, get_phase, ApplyOutcome, Event};
 /// The coarse fact this crate emits when a phase transitions (counts / ids only — no payload
 /// content beyond what the bus needs to correlate). Distinct from the prototype's per-edge
 /// `wicked.phase.*` names; this is the single orchestration-domain transition fact.
-pub const EV_PHASE_TRANSITIONED: &str = "wicked.orchestration.phase_transitioned";
+pub const EV_PHASE_TRANSITIONED: &str = "wicked.crew.phase.transitioned";
 
 /// Resolve the target phase status from a governance decision (port of `resolveGate`).
 ///
