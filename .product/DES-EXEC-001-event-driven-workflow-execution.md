@@ -344,42 +344,42 @@ idempotent dedup is how you get exactly-once *effect*. Gates/HITL are **state + 
 request/reply. We adopt this exactly: **the actor is the one durable subscriber (reducer); the
 CLI-runner is the pure pub/sub seam; gates are state + a `gate.pending` notification.**
 
-### 2.2 Event catalog (`wicked.<noun>.<verb>`, past-tense)
+### 2.2 Event catalog (`wicked.<domain>.<noun>.<verb>`, past-tense)
 Published to wicked-bus AND mirrored to the in-process `CoreEvent` stream (studio subscribes to bus):
 
 | Event | Publisher | Consumer(s) |
 |---|---|---|
-| `wicked.signal.received` | ingress (CLI/API/webhook) | triage-router |
-| `wicked.run.requested` (workflow, problem, args) — the launch trigger | human CLI / **scheduler sidecar** / campaign | reducer |
-| `wicked.run.triaged` (→ chosen `def_id`) | triage-router | reducer |
-| `wicked.skill.needed` / `wicked.skill.refresh` → `wicked.skill.ready` (§4.2) | reducer | skill-provisioner sidecar |
-| `wicked.run.launched` · `wicked.stage.started` (stage_ix, kind, select_key) | reducer | — |
-| `wicked.task.dispatched` (prompt, workdir, cli, attempt, role) | reducer | **cli-runner** (filtered by cli) |
-| `wicked.task.output.delta` | cli-runner | studio |
-| `wicked.task.completed` / `wicked.task.failed` (work_output ref, exit) | cli-runner | reducer |
-| `wicked.evidence.recorded` (evidence_kind, envelope_hash) | reducer / cli-runner | gate-evaluator |
-| `wicked.gate.pending` (notification for HITL) | reducer | human-gate UI |
-| `wicked.gate.decided` (Approve{amend}\|Reject\|verdict) — a **command** to the reducer | gate-evaluator / human | reducer |
-| `wicked.stage.completed` (verdict) · `wicked.run.completed`/`failed` | reducer | — |
-| `wicked.campaign.node.finished` (maps to existing `CampaignRunFinished`) | reducer | reducer (dispatch next ready node) |
+| `wicked.crew.signal.received` | ingress (CLI/API/webhook) | triage-router |
+| `wicked.crew.run.requested` (workflow, problem, args) — the launch trigger | human CLI / **scheduler sidecar** / campaign | reducer |
+| `wicked.crew.run.triaged` (→ chosen `def_id`) | triage-router | reducer |
+| `wicked.crew.skill.needed` / `wicked.crew.skill.refresh` → `wicked.crew.skill.ready` (§4.2) | reducer | skill-provisioner sidecar |
+| `wicked.crew.run.launched` · `wicked.crew.stage.started` (stage_ix, kind, select_key) | reducer | — |
+| `wicked.crew.task.dispatched` (prompt, workdir, cli, attempt, role) | reducer | **cli-runner** (filtered by cli) |
+| `wicked.crew.task.delta` (streamed output) | cli-runner | studio |
+| `wicked.crew.task.completed` / `wicked.crew.task.failed` (work_output ref, exit) | cli-runner | reducer |
+| `wicked.crew.evidence.recorded` (evidence_kind, envelope_hash) | reducer / cli-runner | gate-evaluator |
+| `wicked.crew.gate.pending` (notification for HITL) | reducer | human-gate UI |
+| `wicked.crew.gate.decided` (Approve{amend}\|Reject\|verdict) — a **command** to the reducer | gate-evaluator / human | reducer |
+| `wicked.crew.stage.completed` (verdict) · `wicked.crew.run.completed`/`failed` | reducer | — |
+| `wicked.crew.campaign.finished` (maps to existing `CampaignRunFinished`) | reducer | reducer (dispatch next ready node) |
 
 ### 2.3 Subscribers (each decoupled; zero direct calls)
-- **triage-router** — `signal.received` → rule table → `run.triaged`. (New; small.)
+- **triage-router** — `wicked.crew.signal.received` → rule table → `wicked.crew.run.triaged`. (New; small.)
 - **reducer** (the actor) — the ONE central, single-writer, durable subscriber. Consumes `*.triaged`,
-  `task.completed/failed`, `gate.decided`, `campaign.node.finished`; owns state; publishes
-  `stage.started`, `task.dispatched`, `gate.pending`, `run.completed`.
-- **cli-runner** (one per CLI or a pool) — `task.dispatched` (filtered) → runs the wrapped subprocess
-  in the run's worktree (**reuse `execute_wrapped.rs`**) → `task.output.delta` → `task.completed/failed`.
+  `wicked.crew.task.completed/failed`, `wicked.crew.gate.decided`, `campaign.node.finished`; owns state; publishes
+  `wicked.crew.stage.started`, `wicked.crew.task.dispatched`, `wicked.crew.gate.pending`, `wicked.crew.run.completed`.
+- **cli-runner** (one per CLI or a pool) — `wicked.crew.task.dispatched` (filtered) → runs the wrapped subprocess
+  in the run's worktree (**reuse `execute_wrapped.rs`**) → `wicked.crew.task.delta` → `wicked.crew.task.completed/failed`.
   **This is the "custom subscriber mediates the non-event-aware CLI" seam** (gcp's auto-runner / rai's
   SQS consumer analogue).
-- **gate-evaluator** — `evidence.recorded` → runs the gate ladder (§3) with an identity **distinct
-  from the creator** → `gate.pending` (needs human) or auto `gate.decided`.
+- **gate-evaluator** — `wicked.crew.evidence.recorded` → runs the gate ladder (§3) with an identity **distinct
+  from the creator** → `wicked.crew.gate.pending` (needs human) or auto `wicked.crew.gate.decided`.
 - **adversarial reviewer** — the `AdversarialReview` stage's evaluator seat; consumes the creator's
-  `task.completed`, publishes a critique as evidence (a REAL 2nd CLI run — fixes the "label" bug).
-- **human-gate UI** — `gate.pending` → renders → human answer becomes a `gate.decided` command.
+  `wicked.crew.task.completed`, publishes a critique as evidence (a REAL 2nd CLI run — fixes the "label" bug).
+- **human-gate UI** — `wicked.crew.gate.pending` → renders → human answer becomes a `wicked.crew.gate.decided` command.
 - **scheduler sidecar** (operator direction, 2026-07-09) — a **publisher** that turns **schedules
-  (data: cron/interval + workflow id + args)** into `wicked.run.requested {workflow, problem, args}`
-  events on a timer. **Launch is an event**, so the reducer subscribes to `run.requested` and starts a
+  (data: cron/interval + workflow id + args)** into `wicked.crew.run.requested {workflow, problem, args}`
+  events on a timer. **Launch is an event**, so the reducer subscribes to `wicked.crew.run.requested` and starts a
   run identically no matter who fired it — a human on the CLI, a Campaign node, or this scheduler. That
   makes "schedule agents" fall out for free (recurring nightly audit, periodic migration check,
   scheduled review): adding a schedule is a data row + a sidecar, **never a core change** — the same
@@ -393,24 +393,24 @@ folded into event ids); the reducer dedups on it (it already dedups worker resul
 actor gives ordering; the bus is pure transport + fan-out. This reproduces the priors' CAS guard.
 
 ### 2.5 The wicked-bus bridge (Rust ↔ SQLite pub/sub)
-wicked-bus is a local-first **SQLite** event log (`wicked.<noun>.<verb>`, domain/subdomain, JSON
+wicked-bus is a local-first **SQLite** event log (`wicked.<domain>.<noun>.<verb>`, domain/subdomain, JSON
 payload, UNIQUE `idempotency_key` dedup, cursor-poll, at-least-once). wicked-core (Rust) publishes by
 **writing rows to the same SQLite events table** (a thin Rust publisher; precedent: apps-core's native
 `emit_event_to(store,…)` replaced the Node shell-out). Subscribers cursor-poll. No JS bridge on the
 hot path. The in-process `CoreEvent` broadcast stays as the low-latency studio feed; bus is the
 durable, ecosystem-wide, multi-subscriber substrate.
 
-**VERIFIED working end-to-end (2026-07-09, runnable smoke on wicked-bus v2.2.3).** Both crew seams
-round-tripped through the real bus: `wicked.run.requested {workflow, problem, args}` (emit → reducer
-subscribes `wicked.run.*` → poll → nested args survive → ack) and `wicked.skill.needed → wicked.skill.ready`
+**VERIFIED working end-to-end (2026-07-09, runnable smoke on wicked-bus v2.3.0).** Both crew seams
+round-tripped through the real bus: `wicked.crew.run.requested {workflow, problem, args}` (emit → reducer
+subscribes `wicked.crew.run.*` → poll → nested args survive → ack) and `wicked.crew.skill.needed → wicked.crew.skill.ready`
 (provisioner sidecar polls needed → emits ready → a reducer cursor scoped to `.ready` polls only that;
 `run_id` correlation survives the chain). The substrate needs **zero new infrastructure**.
 
 **SCOPE (updated 2026-07-09 — the mediation seam is now BUILT, opt-in).** `src/bus.rs` + `Core::connect_bus`
-carry the **launch-trigger edge** (`wicked.run.requested` → `LaunchRun` + `wicked.run.launched`). And the
+carry the **launch-trigger edge** (`wicked.crew.run.requested` → `LaunchRun` + `wicked.crew.run.launched`). And the
 design's central **mediation seam of Law 1** is now **built** (`src/cli_runner.rs`, verified round-trip):
-the actor PUBLISHES `wicked.task.dispatched`, a `cli-runner` subscriber runs the unit **off-actor** (via the
-same `StepRunner`) and PUBLISHES `wicked.task.completed`, which the actor consumes as `ApplyStepResult` —
+the actor PUBLISHES `wicked.crew.task.dispatched`, a `cli-runner` subscriber runs the unit **off-actor** (via the
+same `StepRunner`) and PUBLISHES `wicked.crew.task.completed`, which the actor consumes as `ApplyStepResult` —
 "the actor no longer calls execution directly." It is **opt-in / env-gated** (`WICKED_BUS_EXEC` +
 `WICKED_BUS_DB`, or `Core::spawn_with_engine_exec`): armed, execution flows over the bus (proven identical
 outcomes to in-process, single-writer preserved, exactly-once over at-least-once); **the DEFAULT stays
@@ -425,7 +425,7 @@ seam — the latter as an opt-in path today, ready to become the default once so
   persisted `cursor_id` across restarts (else `latest` skips backlog, `oldest` risks
   `CURSOR_BEHIND_TTL_WINDOW` past the 72h sweep); **idempotent handlers** (at-least-once re-delivers on a
   crash between handle and ack); a payload **correlation-id** convention for `needed→ready` matching (+ a
-  `wicked.skill.refresh` timeout/retry); and precise filters (`wicked.skill.*` catches both `needed` and
+  `wicked.crew.skill.refresh` timeout/retry); and precise filters (`wicked.crew.skill.*` catches both `needed` and
   `ready`, so a subscriber must not consume its own emissions). See brain `bus-seam-verified-working`.
 
 ---
@@ -516,10 +516,10 @@ exactly as `WorkflowDef` is at the *orchestration* layer. Three additions:
   `claude -p --allowedTools` + skills-dir analog), so each step runs **least-privilege**. Runtime-
   selected and pure data → a phase's capability surface changes without a core edit.
 - **Provisioning + refresh are EVENTS, never a direct call (Law 1).** If a needed skill is missing or
-  stale, the reducer publishes `wicked.skill.needed {skill_ref, version?, cli}` or
-  `wicked.skill.refresh {scope}`; a **skill-provisioner subscriber** (wraps `wicked-testing:update`,
+  stale, the reducer publishes `wicked.crew.skill.needed {skill_ref, version?, cli}` or
+  `wicked.crew.skill.refresh {scope}`; a **skill-provisioner subscriber** (wraps `wicked-testing:update`,
   which "refreshes skills across all detected AI CLIs") installs/updates it, then emits
-  `wicked.skill.ready`. This decouples the engine from skill installation and solves the spike's
+  `wicked.crew.skill.ready`. This decouples the engine from skill installation and solves the spike's
   prerequisite (a fresh run env needs the skills present in `~/.claude/skills/` first — see brain
   `headless-skill-invocation-recipe`). A phase blocked on a missing skill is gate **state +
   notification** (`AwaitingSkill`), not a synchronous fetch.
@@ -572,7 +572,7 @@ the event sequence + reducer state). Real-CLI e2e is `#[ignore]`'d in CI, codifi
 | CLI execution (mediated) | **built** (`execute_wrapped.rs`) | Wrap as the `cli-runner` bus subscriber |
 | evaluator≠creator | **guard designed** (council `AdversarialPair`) | Make the reviewer a REAL 2nd run; reuse the seat guard |
 | Cross-workflow composition | **built + wired** (Campaign DAG) | Use for optional feature→bug / migration fan-out |
-| Event bus | wicked-bus ships (SQLite) | Add the `wicked.<noun>.<verb>` catalog; Rust publisher; idempotency_key |
+| Event bus | wicked-bus ships (SQLite) | Add the `wicked.<domain>.<noun>.<verb>` catalog; Rust publisher; idempotency_key |
 | Real planning | **sentence-splitter** (`plan.rs`) | Replace with a bounded CLI task-breakdown phase |
 | Signal→triage routing | **absent** | Build the triage-router subscriber (rule table) |
 | napi bridge (Campaign/workflows/governance) | **not bridged** | Expose after the slice proves out — closes the product gap |
