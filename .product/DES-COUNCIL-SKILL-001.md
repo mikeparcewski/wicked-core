@@ -138,8 +138,9 @@ Verified by reading the source:
   follow-up, not slice-1).
 
 **The real installed inventory (what the names must come from).** `~/.claude/skills/` holds **51**
-`wicked-testing-*` skills; the SKILL.md `name:` uses the colon form (`wicked-testing:plan`) but the
-**directory + slash-invocation + `skill_ref` value use the hyphen form** (`wicked-testing-plan`). The
+`wicked-testing-*` skills; the SKILL.md `name:`, **directory, and `skill_ref` value all use the hyphen
+form** (`wicked-testing-plan`) — the colon form (`wicked-testing:plan`) is only the Claude plugin
+dispatch / slash-command form. The
 Tier-1 invocable commands in `wicked-testing/commands/` are: `acceptance, authoring, execution, insight,
 plan, review, setup`. Representative rows (id → what it does, per its SKILL.md):
 
@@ -183,7 +184,7 @@ struct SkillDescriptor {
     /// `/{id}` slash form (execute_wrapped::skill_prompt). e.g. "wicked-testing-plan".
     /// MUST resolve under ~/.claude/skills/<id>/SKILL.md (FR-2, lint-checked).
     id: String,
-    /// The SKILL.md `name:` (colon form, e.g. "wicked-testing:plan") — display/provenance only.
+    /// The Claude plugin dispatch / slash-command form (colon, e.g. "wicked-testing:plan") — display/provenance only.
     display_name: String,
     /// One-line capability text, mirrored from the SKILL.md `description:` — this is what the
     /// ranking prompt injects so seats rank on capability, not name overlap (FR-4).

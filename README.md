@@ -1,3 +1,12 @@
+```
+          _      _            _
+__      _(_) ___| | _____  __| |       ___ ___  _ __ ___
+\ \ /\ / / |/ __| |/ / _ \/ _` |_____ / __/ _ \| '__/ _ \
+ \ V  V /| | (__|   <  __/ (_| |_____| (_| (_) | | |  __/
+  \_/\_/ |_|\___|_|\_\___|\__,_|      \___\___/|_|  \___|
+
+```
+
 # wicked-core
 
 **The runtime that makes wicked-estate concurrency-safe.**
@@ -28,18 +37,18 @@ re-opens or races on the shared DB.
   Postgres, the same command/event API across both backends.
 - **One composition surface** for plan → distribute → execute → evidence, plus cross-platform
   PTY terminal sessions streamed as events.
-- **napi-rs Node/TS bindings** (`wicked-core-ts`) so JS/TS callers — the crew daemon, the studio UI —
-  drive runs and consume the event stream.
+- **napi-rs Node/TS bindings** (`wicked-core-ts`) so JS/TS callers — the crew daemon and its bundled
+  studio HITL UI (`wicked-crew/packages/studio`) — drive runs and consume the event stream.
 
 ## Audience
 
 Internal. The consumers are the other wicked-* products — the [wicked-crew](https://github.com/mikeparcewski/wicked-crew)
-daemon, the wicked-studio UI, and the MCP servers — that compose
+daemon (including its bundled studio HITL UI, `wicked-crew/packages/studio`), and the MCP servers — that compose
 [wicked-estate](https://github.com/mikeparcewski/wicked-estate).
 
 ## The foundation
 
-wicked-core is the **runtime** of the [wicked-* foundation](https://we.wickedagile.com): a
+wicked-core is the **runtime** of the [wicked-* foundation](https://wickedagile.com): a
 local-first stack for AI coding agents anchored by
 [wicked-estate](https://github.com/mikeparcewski/wicked-estate) (the code graph), with
 [wicked-bus](https://github.com/mikeparcewski/wicked-bus) (the event substrate),
