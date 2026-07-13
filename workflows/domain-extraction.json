@@ -1,0 +1,107 @@
+{
+  "id": "domain-extraction",
+  "phases": [
+    {
+      "id": "survey",
+      "kind": "recon",
+      "gate_type": null,
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "legacy-graph.digest.txt"
+      ],
+      "depends_on": [],
+      "role": "neutral",
+      "skill_ref": "wicked-garden-survey",
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "analyze",
+      "kind": "recon",
+      "gate_type": null,
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "analysis-report.json"
+      ],
+      "depends_on": [
+        "survey"
+      ],
+      "role": "neutral",
+      "skill_ref": "wicked-garden-analyze",
+      "allowed_skills": [
+        "wicked-brain-vocabulary"
+      ],
+      "validator_pin": null
+    },
+    {
+      "id": "extract",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "annotations.jsonl"
+      ],
+      "depends_on": [
+        "analyze"
+      ],
+      "role": "creator",
+      "skill_ref": "wicked-garden-extract",
+      "allowed_skills": [
+        "wicked-brain-domain"
+      ],
+      "validator_pin": null
+    },
+    {
+      "id": "coverage",
+      "kind": "test",
+      "gate_type": "execution",
+      "gate": {
+        "human_confirm_if": "verdict_not_pass"
+      },
+      "executes_code": false,
+      "verified_evidence": true,
+      "required_deliverables": [
+        "coverage-report.json"
+      ],
+      "depends_on": [
+        "extract"
+      ],
+      "role": "evaluator",
+      "skill_ref": "wicked-garden-coverage-review",
+      "allowed_skills": [
+        "wicked-brain-coverage"
+      ],
+      "validator_pin": "cdef2aaf08bb9317"
+    },
+    {
+      "id": "domain-graph",
+      "kind": "build",
+      "gate_type": "strategy",
+      "gate": {
+        "human_confirm": {
+          "unconditional": false
+        }
+      },
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "requirements_graph.json"
+      ],
+      "depends_on": [
+        "coverage"
+      ],
+      "role": "neutral",
+      "skill_ref": "wicked-garden-domain-graph",
+      "allowed_skills": [
+        "wicked-brain-domain"
+      ],
+      "validator_pin": null
+    }
+  ]
+}

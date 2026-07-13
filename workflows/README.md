@@ -19,9 +19,15 @@ registry.load_dir("~/.wicked/workflows")?;            // overlay: your drop-in f
   entirely new ones by dropping a file.
 - Files load in filename order (deterministic). A malformed or invalid file is a
   **loud error naming the file** — never a silent skip.
-- The `*.json` files in *this* directory are the human-editable mirror of the
-  seed builders (a drift-guard test keeps them identical). Copy one as a starting
-  point.
+- The `feature`/`bug`/`migration` `*.json` files in *this* directory are the
+  human-editable mirror of the seed builders (a drift-guard test keeps them
+  identical). Copy one as a starting point.
+- `domain-extraction.json` is a **shipped drop-in** (not a seeded built-in): it is
+  registered only via `load_dir`, and demonstrates a *gated* workflow — its
+  `coverage` phase carries an approved `validator_pin` (the coverage == 1.0
+  terminal). The authored validator behind that pin lives in
+  `src/domain_extraction.rs`; a test re-derives the pin so the JSON and the vaulted
+  approved validator can never drift. See *Gating a phase* below.
 
 ## The minimal workflow
 
