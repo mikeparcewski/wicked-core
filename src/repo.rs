@@ -14,7 +14,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
-    synthetic_symbol, FromNode, GraphRead, Language, Location, Node, NodeKind, Span, SqliteStore,
+    synthetic_symbol, FromNode, GraphRead, GraphStore, Language, Location, Node, NodeKind, Span,
     ToNode, SYMBOL_SCHEME,
 };
 use wicked_estate_core::SymbolQuery;
@@ -138,7 +138,7 @@ pub fn validate_git_repo(root: &str) -> anyhow::Result<String> {
 }
 
 /// Register a repository: validate it, resolve its id + default branch, persist the [`RepoEntry`].
-pub fn register_repo(store: &mut SqliteStore, spec: RepoSpec) -> anyhow::Result<RepoEntry> {
+pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Result<RepoEntry> {
     let default_branch = validate_git_repo(&spec.root_path)?;
     let entry = RepoEntry {
         id: slug(&spec.name),

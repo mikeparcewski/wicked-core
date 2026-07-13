@@ -174,3 +174,21 @@ PR-B/C/D. Corrections, evidence-cited:
 coverage shape; retarget the workflow skill_ref) + vocabulary miner.
 **PR-E** 3-agent acceptance + cross-product review. **§5 parity note:** backend-parity proves nothing without a
 CI-provisioned Postgres + `--features postgres`; default CI only asserts postgres is *rejected*.
+
+## 9. REVISION 2 — PR-B0 as-built (recon corrected M3's scope; the fix is real)
+Recon on the branch confirmed M3's core claim (the runtime IS `SqliteStore`-pinned) but corrected WHERE and refined
+the mechanism:
+- **The pinned runtime is wicked-core's ROOT `src/` crate** (the workflow engine: `actor.rs`/`campaign.rs`/
+  `pipeline.rs`/`execute.rs`/`gate_hook.rs`/`domain.rs` — 46 `&mut SqliteStore` param sites), NOT the workspace
+  members. The orchestration/governance/council crates were already store-generic or `&dyn`. (The earlier scoping to
+  `crates/` alone was the miss — same class of incomplete-recon that caused the original fork.)
+- **`&mut dyn GraphStore` alone is insufficient.** The read side already mixed `&dyn GraphRead` + `&impl GraphRead`
+  (anonymous generic). A `Box<dyn GraphStore>` owner satisfies NONE of the read-generic styles (`Box<dyn GraphStore>: !GraphRead`; `&dyn GraphStore → &dyn GraphRead` needs upcasting at every call). So the actor owns a **concrete
+  `AnyStore` enum** (apps-core) that forwards `GraphRead`+`GraphWrite` to `Sqlite | Postgres`; `&`/`&mut` of it coerce
+  to every param style AND satisfy `S: GraphRead+GraphWrite` bounds directly. `open_store_any(spec)` dispatches on the
+  spec; the reducer/runner/gate (13 fns) went `&mut dyn GraphStore` so the root's dyn functions can call them.
+- **Sync/async was a non-issue:** estate's `PostgresStore::open` is SYNC and impls the sync `GraphRead`/`GraphWrite`
+  (a `global_rt()` hides the sqlx async), so no runtime/async rewrite in the actor.
+- **Verified:** default build 0 warnings + full suite green (apps-core 10 / orchestration 20 / governance 8 /
+  council 19 / core 148); `cargo build --features postgres` compiles end-to-end; a fail-closed test asserts a
+  `postgres://` spec is REJECTED (not silently SQLite) when the feature is off (§5's rejection assertion).

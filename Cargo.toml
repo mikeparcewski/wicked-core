@@ -47,6 +47,13 @@ portable-pty = "0.8"
 # base64-encode raw PTY output bytes for the `TerminalOutput` event (CoreEvent → tagged JSON).
 base64 = "0.22"
 
+[features]
+default = []
+# Compile in estate's Postgres backend end-to-end (forwards to apps-core → wicked-estate-store).
+# The engine is backend-agnostic (it programs against `dyn GraphStore`); this feature only decides
+# which concrete backend `open_store_dyn` can hand it. SQLite stays the zero-infra default.
+postgres = ["wicked-apps-core/postgres"]
+
 [dev-dependencies]
 # The terminal round-trip test decodes `TerminalOutput.bytes_b64` to assert the echoed bytes.
 base64 = "0.22"

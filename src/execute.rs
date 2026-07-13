@@ -5,8 +5,8 @@
 
 use serde::Serialize;
 use wicked_apps_core::{
-    synthetic_symbol, ConformanceClaim, Decision, Language, Location, Node, NodeKind, Span,
-    SqliteStore, ToNode, SYMBOL_SCHEME,
+    synthetic_symbol, ConformanceClaim, Decision, GraphStore, Language, Location, Node, NodeKind,
+    Span, ToNode, SYMBOL_SCHEME,
 };
 use wicked_governance::{conform, decide, decide_as, select};
 use wicked_orchestration::{apply_event, apply_gate, get_phase, Event, Phase, PhaseStatus};
@@ -62,7 +62,7 @@ pub struct EvaluationOutcome {
 /// (persisting the hard `gate_decision` veto) and leaves NO approved phase and NO stored `work_output`
 /// to leak (the ADR-0003 violation this parameter closes). `None` ⇒ governance decides alone (unchanged).
 pub(crate) fn apply_unit(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     unit: &WorkUnit,
     output: &str,
     workflow_id: &str,
@@ -190,7 +190,7 @@ pub(crate) fn apply_unit(
 /// Run a SECOND governance pass on an approved unit using a DISTINCT evaluator identity
 /// (evaluator≠creator). Call only after the creator pass approved.
 pub fn evaluate_unit(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     unit: &WorkUnit,
     output: &str,
     evaluator_cli: &str,
@@ -237,7 +237,7 @@ pub fn evaluate_unit(
 /// Walk a freshly-opened phase `Pending → InProgress → ReadyForGate → GateRunning`. Shared with the
 /// gate-hook drain ([`crate::gate_hook`]) so both paths walk phases identically.
 pub(crate) fn advance_to_gate_running(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     phase_id: &str,
 ) -> anyhow::Result<()> {
     for (step, to) in [

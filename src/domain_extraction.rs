@@ -70,7 +70,7 @@ pub fn coverage_eq_one_validator() -> DeterministicValidator {
 /// LLM writer skill, because this validator is a hand-authored port of `coverage.py --check`, not an
 /// LLM-generated check. Runs on the actor (single-writer) thread via the vault's `put_node`.
 pub fn provision_and_approve_coverage_validator(
-    store: &mut wicked_apps_core::SqliteStore,
+    store: &mut dyn wicked_apps_core::GraphStore,
 ) -> anyhow::Result<String> {
     // 1. Vault the AUTHORED validator UNAPPROVED (authoring never authorizes running).
     let unapproved_pin =

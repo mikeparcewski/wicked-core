@@ -25,9 +25,12 @@
 //! - The brief asked for `GOVERNS`/`PRODUCES` as `EdgeKind::Other` strings; estate already has
 //!   native `EdgeKind::Governs` / `EdgeKind::Produces` variants. We expose the string constants as
 //!   specified (used with `EdgeKind::Other`) AND document the native variants on each constant.
-//! - `open_store` returns the concrete [`SqliteStore`] (per brief) rather than estate's
-//!   `Box<dyn GraphStore>`; the store's default path is estate's `.wicked-estate/graph.db`
-//!   convention (NOT a "brain.db" — that belongs to the separate wicked-brain system).
+//! - Two openers, both defaulting to estate's `.wicked-estate/graph.db` convention (NOT a
+//!   "brain.db" — that belongs to the separate wicked-brain system): [`open_store`] returns the
+//!   concrete [`SqliteStore`] (a SQLite-only convenience for tests/tools), while [`open_store_any`]
+//!   dispatches on the spec and returns a backend-agnostic [`AnyStore`] (SQLite by default; the
+//!   `postgres://` backend under the `postgres` feature, fail-closed otherwise). The engine's
+//!   single-writer actor uses `open_store_any`, so the runtime is never pinned to one backend.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. Re-export the estate essentials the apps need.
@@ -56,6 +59,13 @@ pub use wicked_estate_core::{
 };
 
 pub use wicked_estate_store::SqliteStore;
+
+// The Postgres backend is compiled only under the `postgres` feature (it pulls in sqlx + tokio).
+// It implements the SAME sync `GraphRead`/`GraphWrite` (hence `GraphStore`) surface as SqliteStore
+// — estate hides the async underneath a one-shot runtime — so the apps program against the store
+// traits and never care which backend they hold.
+#[cfg(feature = "postgres")]
+pub use wicked_estate_store::PostgresStore;
 
 /// The estate metadata bag type (`serde_json::Map<String, serde_json::Value>`), re-exported so
 /// apps build `Node.metadata` without depending on `wicked_estate_core` directly.
@@ -274,6 +284,47 @@ pub fn open_store(path: Option<&str>) -> anyhow::Result<SqliteStore> {
     Ok(store)
 }
 
+/// Open the shared estate graph as a backend-agnostic [`AnyStore`], dispatched on the spec. This is
+/// the opener the engine's owner (the single-writer actor) uses so the runtime is never pinned to
+/// one backend: `AnyStore` is a concrete type, so `&`/`&mut` of it coerce to every store param
+/// style the engine uses (`&dyn GraphRead`, `&impl GraphRead`, `&mut dyn GraphStore`).
+///
+/// Dispatch:
+/// - a `postgres://` / `postgresql://` spec (argument or `WICKED_ESTATE_DB`) selects the Postgres
+///   backend — compiled ONLY under the `postgres` feature;
+/// - anything else is a SQLite path resolved exactly like [`open_store`] (incl. `:memory:`).
+///
+/// **Fail-closed (deny-dominates):** requesting a `postgres://` spec when this binary was built
+/// WITHOUT the `postgres` feature returns a loud error rather than silently opening SQLite. Asking
+/// for a backend you did not compile in must never quietly hand you a different one.
+pub fn open_store_any(spec: Option<&str>) -> anyhow::Result<AnyStore> {
+    let resolved: String = match spec {
+        Some(p) => p.to_string(),
+        None => {
+            std::env::var(ESTATE_DB_ENV).unwrap_or_else(|_| ".wicked-estate/graph.db".to_string())
+        }
+    };
+
+    if resolved.starts_with("postgres://") || resolved.starts_with("postgresql://") {
+        #[cfg(feature = "postgres")]
+        {
+            let store = PostgresStore::open(&resolved)
+                .map_err(|e| anyhow::anyhow!("open estate Postgres store at {resolved:?}: {e}"))?;
+            return Ok(AnyStore::postgres(store));
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            return Err(anyhow::anyhow!(
+                "estate spec {resolved:?} requests the Postgres backend, but this binary was built \
+                 without the `postgres` feature — rebuild with `--features postgres`. Refusing to \
+                 silently fall back to SQLite (deny-dominates)."
+            ));
+        }
+    }
+
+    Ok(AnyStore::sqlite(open_store(Some(&resolved))?))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. ToNode / FromNode — the domain ↔ estate-Node round-trip pattern.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -360,6 +411,10 @@ impl FromNode for SamplePolicy {
 }
 
 pub mod emit;
+
+/// `AnyStore` — the runtime-selected estate backend as one concrete type (see [`open_store_any`]).
+pub mod store_any;
+pub use store_any::AnyStore;
 
 #[cfg(test)]
 mod tests {

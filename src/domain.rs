@@ -4,8 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
-    synthetic_symbol, FromNode, GraphRead, GraphWrite, Language, Location, Node, NodeKind, Span,
-    SqliteStore, ToNode, AGENT_SESSION, SYMBOL_SCHEME, WORK_UNIT,
+    synthetic_symbol, FromNode, GraphRead, GraphStore, Language, Location, Node, NodeKind, Span,
+    ToNode, AGENT_SESSION, SYMBOL_SCHEME, WORK_UNIT,
 };
 use wicked_estate_core::SymbolQuery;
 
@@ -355,7 +355,7 @@ impl FromNode for WorkUnit {
 
 /// Upsert a node onto the store via the batch write path. Called only from the actor thread (the
 /// single writer for `shared_writers=false` backends).
-pub fn put_node(store: &mut SqliteStore, node: Node) -> anyhow::Result<()> {
+pub fn put_node(store: &mut dyn GraphStore, node: Node) -> anyhow::Result<()> {
     store.begin_batch()?;
     store.upsert_nodes(&[node])?;
     store.commit_batch()?;
