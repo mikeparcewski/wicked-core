@@ -19,9 +19,22 @@ registry.load_dir("~/.wicked/workflows")?;            // overlay: your drop-in f
   entirely new ones by dropping a file.
 - Files load in filename order (deterministic). A malformed or invalid file is a
   **loud error naming the file** — never a silent skip.
-- The `*.json` files in *this* directory are the human-editable mirror of the
-  seed builders (a drift-guard test keeps them identical). Copy one as a starting
-  point.
+- The `feature`/`bug`/`migration` `*.json` files in *this* directory are the
+  human-editable mirror of the seed builders (a drift-guard test keeps them
+  identical). Copy one as a starting point.
+- `domain-extraction.json` is a **shipped drop-in** (not a seeded built-in): it is
+  registered only via `load_dir`, and demonstrates a *gated* workflow — its
+  `coverage` phase carries an approved `validator_pin` (the coverage == 1.0
+  terminal). The authored validator behind that pin lives in
+  `src/domain_extraction.rs`; a test re-derives the pin so the JSON and the vaulted
+  approved validator can never drift. See *Gating a phase* below.
+  - **One-time seed step (required to run it).** Because the gate `validator_pin`
+    must resolve to an **approved** validator in your vault, and this deterministic
+    `coverage.py --check` port is not authored by the LLM writer path, run
+    **`wicked-core seed-domain-validators`** once to vault + approve it. Without the
+    seed, a run of this drop-in fails **closed** at plan time ("validator pin not in
+    the vault") — deny-dominates, never a silent pass. The seed is idempotent
+    (content-addressed) and yields exactly the pin embedded in the JSON.
 
 ## The minimal workflow
 
