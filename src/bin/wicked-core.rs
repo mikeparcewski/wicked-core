@@ -16,6 +16,8 @@
 //!       # author+approve a validator for the criterion, PIN it onto that phase, and write a gated
 //!       # drop-in workflow (new id) — the one path that turns a shipped, ungated workflow INTO a
 //!       # gated one so the rev0.4 dual-validator gate actually engages
+//!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
+//!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
 use std::io::BufRead;
@@ -82,6 +84,7 @@ fn main() {
         Some("provision-validator") => return provision_validator_cmd(&args),
         Some("approve-validator") => return approve_validator_cmd(&args),
         Some("gate-phase") => return gate_phase_cmd(&args),
+        Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         _ => {}
     }
 
@@ -170,6 +173,7 @@ fn main() {
                  resume --session <id> | cancel --session <id> | \
                  launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
                  provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
+                 seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
                  gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
                  (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]"
             );
@@ -239,6 +243,32 @@ fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
     }
     std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".config/wicked-core/workflows"))
+}
+
+/// `seed-domain-validators`: seed the DETERMINISTIC, content-pinned coverage validator that the shipped
+/// `workflows/domain-extraction.json` gate carries (`validator_pin`) into the vault, so the drop-in
+/// actually runs instead of failing closed at plan time. Unlike `provision-validator` (a live LLM writer
+/// whose script is nondeterministic and won't reproduce the pin), this vaults + approves the hand-authored
+/// `coverage.py --check` port directly, yielding exactly `COVERAGE_VALIDATOR_PIN`. Idempotent
+/// (content-addressed). Opens the store as its sole writer (actor not spawned), like the other vault
+/// commands.
+fn seed_domain_validators_cmd(args: &[String]) {
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("seed-domain-validators: open store failed: {e}"));
+            return;
+        }
+    };
+    match wicked_core::provision_and_approve_coverage_validator(&mut store) {
+        Ok(pin) => {
+            println!("seeded + approved the domain-extraction coverage validator, pin: {pin}");
+            println!(
+                "(matches workflows/domain-extraction.json `validator_pin`; the drop-in now runs gated)"
+            );
+        }
+        Err(e) => fail(&format!("seed-domain-validators failed: {e}")),
+    }
 }
 
 /// `gate-phase --workflow <base-id> --phase <phase-id> --criterion "..." [--out <dir>]`: the one path

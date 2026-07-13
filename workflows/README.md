@@ -28,6 +28,13 @@ registry.load_dir("~/.wicked/workflows")?;            // overlay: your drop-in f
   terminal). The authored validator behind that pin lives in
   `src/domain_extraction.rs`; a test re-derives the pin so the JSON and the vaulted
   approved validator can never drift. See *Gating a phase* below.
+  - **One-time seed step (required to run it).** Because the gate `validator_pin`
+    must resolve to an **approved** validator in your vault, and this deterministic
+    `coverage.py --check` port is not authored by the LLM writer path, run
+    **`wicked-core seed-domain-validators`** once to vault + approve it. Without the
+    seed, a run of this drop-in fails **closed** at plan time ("validator pin not in
+    the vault") — deny-dominates, never a silent pass. The seed is idempotent
+    (content-addressed) and yields exactly the pin embedded in the JSON.
 
 ## The minimal workflow
 

@@ -31,19 +31,23 @@ pub const COVERAGE_CRITERION: &str =
     "resolved-or-flagged coverage == 1.0 (zero unaccounted behavior-bearing nodes)";
 
 /// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF the phase worktree's
-/// `coverage-report.json` reports `coverage == 1.0` AND `unaccounted == 0`. Built only from
-/// `test`/`grep`/literal paths (the [`author_deterministic_validator`](crate::validator::author_deterministic_validator)
-/// convention) so it passes the [`looks_dangerous`](crate::validator) denylist — no redirection, no
-/// command substitution, no destructive/network token. `coverage` and `unaccounted` are matched
-/// tolerantly (`1`/`1.0`/`1.0000`) so brain's exact float serialization does not make the gate brittle.
-pub const COVERAGE_SCRIPT: &str = r#"test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && grep -Eq '"unaccounted":[[:space:]]*0([,}[:space:]]|$)' coverage-report.json"#;
+/// `coverage-report.json` reports FULL coverage EVERYWHERE. brain's report carries a top-level
+/// `coverage`/`unaccounted` PLUS a per-app breakdown (each app object has its OWN `coverage`/`unaccounted`),
+/// so an unanchored positive grep false-PASSes on a single fully-covered app under a sub-1.0 total. The
+/// gate is therefore: (1) at least one full-coverage marker exists (guards an empty/malformed report),
+/// AND (2) NO `coverage` value is sub-1.0 anywhere — every complete ratio starts with `1` (`1`/`1.0`/
+/// `1.0000`), every incomplete one with `0` (`0`/`0.0`/`0.83`) — AND (3) NO `unaccounted` is non-zero
+/// anywhere. Built only from `test`/`grep`/`!`/literal paths so it passes the
+/// [`looks_dangerous`](crate::validator) denylist (no redirection, command substitution, or
+/// destructive/network token; `!` negation is allowed).
+pub const COVERAGE_SCRIPT: &str = r#"test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The APPROVED content-address pin the `coverage` phase carries in `workflows/domain-extraction.json`.
 /// Content-hash over `(COVERAGE_CRITERION, COVERAGE_SCRIPT, approved=true)` — see
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "cdef2aaf08bb9317";
+pub const COVERAGE_VALIDATOR_PIN: &str = "c4cc487a030d57b7";
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
@@ -340,6 +344,33 @@ mod tests {
         assert!(
             !run_validator(&approved, &empty_wt).unwrap(),
             "absent coverage evidence ⇒ gate FAILS closed"
+        );
+
+        // REGRESSION — the per-app false-pass. brain's coverage-report.json carries a per_app
+        // breakdown, each app object with its OWN coverage/unaccounted. A single fully-covered app
+        // under a sub-1.0 TOTAL must NOT satisfy the gate; the old unanchored positive greps matched
+        // the per_app "coverage":1.0 / "unaccounted":0 lines and false-PASSed. deny-dominates → FAIL.
+        let per_app_wt = base.join("per_app");
+        std::fs::create_dir_all(&per_app_wt).unwrap();
+        std::fs::write(
+            per_app_wt.join("coverage-report.json"),
+            r#"{
+  "total": 42,
+  "behavior_bearing": 30,
+  "resolved": 25,
+  "risk_flagged": 0,
+  "unaccounted": 5,
+  "coverage": 0.8333,
+  "per_app": {
+    "billing": { "coverage": 1.0, "unaccounted": 0 },
+    "shipping": { "coverage": 0.6, "unaccounted": 5 }
+  }
+}"#,
+        )
+        .unwrap();
+        assert!(
+            !run_validator(&approved, &per_app_wt).unwrap(),
+            "sub-1.0 TOTAL with a fully-covered per_app entry ⇒ gate FAILS (no per-app false-pass)"
         );
 
         let _ = std::fs::remove_dir_all(&base);
