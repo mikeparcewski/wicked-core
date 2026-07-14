@@ -2,10 +2,11 @@
 //!
 //! The domain-graph builder ports anti-legacy `domain_graph.py`: it translates estate's annotated
 //! code graph into a `requirements_graph.json` domain model. These serde types are the OUTPUT wire
-//! contract — they MUST round-trip byte-compatibly with the KEPT `wicked-brain/schemas/
-//! domain-model.schema.json` (VERSION 1.1.0), which garden STEERS on and wicked-testing ASSERTS.
-//! (The wrong-severity-vocabulary near-miss in the conformance PR is exactly why this fidelity is
-//! modeled + tested against the schema, not assumed.)
+//! contract — the builder's output MUST validate against the KEPT `wicked-brain/schemas/
+//! domain-model.schema.json` (schema_version **1.0.0**), which garden STEERS on and wicked-testing
+//! ASSERTS. Fidelity is proven by `tests/domain_model_schema.rs` validating built output against the
+//! real JSON Schema (NOT a self-authored literal) — the review of this PR found that a round-trip
+//! literal gives false confidence, so every enum/const/pattern/minItems is now schema-checked.
 //!
 //! [`assert_front_half_coverage`] is the fail-closed precondition: the builder REFUSES to translate
 //! an unannotated graph — the coverage-report MUST show `coverage == 1.0` (every behavior-bearing
@@ -26,8 +27,10 @@ pub struct DomainModel {
 /// Artifact metadata — `schema_version` + `migration_mode` are required by the schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
+    /// Schema bundle version — the schema pins this to const `"1.0.0"`.
     pub schema_version: String,
-    /// `mainframe` (legacy translation) or `modern` (package-dir capability grouping, M5).
+    /// Schema enum: `"functional"` (capability-grouped — what the M5 package-dir grouping emits) or
+    /// `"structural"` (1:1). NOT the internal word "modern".
     pub migration_mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -38,8 +41,11 @@ pub struct Metadata {
 pub struct Domain {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The estate Louvain community index this domain derives from (advisory). Schema-typed as an
+    /// INTEGER — so modern/functional package-dir grouping (no Louvain) OMITS it; the human package
+    /// label rides `description`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cluster_id: Option<String>,
+    pub cluster_id: Option<i64>,
     /// Requirements keyed by requirement key.
     pub requirements: std::collections::BTreeMap<String, Requirement>,
     /// Entities keyed by entity name.
@@ -173,29 +179,53 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
 /// The `business_rule` annotation type — the estate annotations the builder lifts into
 /// [`Requirement::business_rules`].
 const BUSINESS_RULE_ANN: &str = "business_rule";
+/// A custom `risk` annotation type — a risk-flagged node the coverage gate COUNTS as accounted
+/// (numerator = resolved + risk_flagged) but that carries no resolved requirement.
+const RISK_ANN: &str = "risk";
+/// Confidence stamped on a synthesized fallback rule for a behavior-bearing node that produced no
+/// real business rule (the schema's `business_rules` `minItems:1` invariant + `domain_graph.py`'s
+/// defensive fallback). Mid-range: it is a review item, neither asserted nor refuted.
+const REVIEW_CONFIDENCE: f64 = 0.5;
 
 /// The capability boundary for MODERN code (M5): the PARENT directory of a node's source file — NOT
 /// a Louvain community (dense modern code collapses into one near-fully-connected blob). Files at
-/// the repo root group under `(root)`.
+/// the repo root group under `(root)`. Forward-slash normalized so grouping is cross-platform stable.
 fn package_dir(file: &str) -> String {
-    std::path::Path::new(file)
-        .parent()
-        .and_then(|p| p.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("(root)")
-        .to_string()
+    let norm = file.replace('\\', "/");
+    match norm.rfind('/') {
+        Some(i) if i > 0 => norm[..i].to_string(),
+        _ => "(root)".to_string(),
+    }
 }
 
-/// Build the domain model from the annotated estate graph (MODERN mode, M5) — the port of
-/// `domain_graph.py`'s modern path. Gate on front-half coverage (fail-closed), then group every
-/// behavior-bearing node by PACKAGE DIR into a capability domain, lifting each node's `requirement`
-/// semantic + its `business_rule` annotations (confidence-carrying) into a [`Requirement`].
+/// The estate reference a domain fact points at — the node's `file#name` (a REFERENCE, never a copy
+/// of the symbol's structure). Used for `provenance.ref`, `source_ref`, and `legacy_components`.
+fn node_ref(node: &wicked_apps_core::Node) -> String {
+    format!("{}#{}", node.location.file, node.name)
+}
+
+/// Provenance for a fact lifted from `node` — grounded in the code body it was read from.
+fn node_provenance(node: &wicked_apps_core::Node) -> Provenance {
+    Provenance {
+        source: "code-graph".to_string(),
+        reference: node_ref(node),
+        source_kinds: vec!["code-body".to_string()],
+    }
+}
+
+/// Build the domain model from the annotated estate graph — the port of `domain_graph.py`'s modern
+/// path (schema `migration_mode: "functional"` = capability-grouped). Gate on front-half coverage
+/// (fail-closed), then group every behavior-bearing node by PACKAGE DIR into a capability domain.
 ///
-/// "Behavior-bearing" here = the node carries a `requirement` semantic OR ≥1 `business_rule`
-/// annotation; a node with neither is structural scaffolding and is skipped (it is a coverage hole
-/// only if it was flagged behavior-bearing upstream — that is the coverage gate's job, already
-/// asserted above). Confidence-less rules are NOT fabricated: the annotation's own confidence rides
-/// through. Deterministic: nodes/domains are keyed in sorted (BTreeMap) order.
+/// **Keep-set matches the coverage gate's accounted predicate** (resolved + risk-flagged), so nothing
+/// the gate certified is silently dropped: a node counts if it carries a `requirement`/`description`
+/// semantic, a `business_rule` annotation, OR a risk-flag (advisory assumption/question, or a `risk`
+/// custom type). A risk-only / rule-less node still emits a Requirement — with `status: "review"` and
+/// a SYNTHESIZED fallback rule carrying its risk/requirement text — so the schema's
+/// `business_rules minItems:1` invariant holds and the HITL-queued behavior survives into the
+/// artifact. Confidence is NEVER fabricated or clamped: an out-of-`[0,1]` annotation confidence fails
+/// CLOSED. Deterministic: nodes are visited in `SymbolId` order; requirement ids are per-domain
+/// sequential `REQ-NNN` (unique — no bare-name collisions).
 pub fn build_domain_model(
     store: &dyn GraphRead,
     coverage: &CoverageReport,
@@ -205,64 +235,122 @@ pub fn build_domain_model(
 
     let mut domains: std::collections::BTreeMap<String, Domain> = std::collections::BTreeMap::new();
     let mut nodes = store.all_nodes()?;
-    nodes.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic requirement id order
+    nodes.sort_by(|a, b| a.symbol.cmp(&b.symbol)); // stable, UNIQUE visitation order
 
     for node in &nodes {
         let semantics = store.node_semantics(&node.symbol)?;
         let requirement_text = semantics.as_ref().and_then(|s| s.requirement.clone());
+        let description_text = semantics.as_ref().and_then(|s| s.description.clone());
+        let annotations = store.annotations(&node.symbol)?;
 
-        let business_rules: Vec<Rule> = store
-            .annotations(&node.symbol)?
-            .into_iter()
-            .filter(|a| a.r#type == BUSINESS_RULE_ANN)
-            .enumerate()
-            .map(|(i, a)| Rule {
-                id: format!("RULE-{}-{}", node.name, i + 1),
-                statement: a.value,
+        // Real business rules — the annotation's own confidence rides through (fail-closed if out of range).
+        let mut business_rules: Vec<Rule> = Vec::new();
+        for a in annotations.iter().filter(|a| a.r#type == BUSINESS_RULE_ANN) {
+            if !(0.0..=1.0).contains(&a.confidence) {
+                anyhow::bail!(
+                    "node {}: business_rule confidence {} out of [0,1] — never fabricated or clamped",
+                    node.name,
+                    a.confidence
+                );
+            }
+            business_rules.push(Rule {
+                id: String::new(), // sequential id assigned below
+                statement: a.value.clone(),
                 confidence: a.confidence,
-                provenance: Provenance {
-                    source: "code-graph".to_string(),
-                    reference: format!("{}#{}", node.location.file, node.name),
-                    source_kinds: vec!["code-body".to_string()],
-                },
-                source_ref: Some(format!("{}#{}", node.location.file, node.name)),
-            })
+                provenance: node_provenance(node),
+                source_ref: Some(node_ref(node)),
+            });
+        }
+
+        // Risk-flagged = advisory (assumption/question) or a `risk` custom type — the coverage gate
+        // counts these as accounted, so the builder MUST keep them (not drop, not silently lose).
+        let risk_notes: Vec<&_> = annotations
+            .iter()
+            .filter(|a| a.is_advisory() || a.r#type == RISK_ANN)
             .collect();
 
-        // Not behavior-bearing → structural; skip (the coverage gate already vouched completeness).
-        if requirement_text.is_none() && business_rules.is_empty() {
+        let resolved = requirement_text.is_some() || !business_rules.is_empty();
+        // Genuinely structural (nothing accounted) → skip. Everything the gate counted survives.
+        if !resolved && risk_notes.is_empty() && description_text.is_none() {
             continue;
         }
 
+        // minItems:1 — synthesize ONE fallback rule when there is no real business rule (carries the
+        // risk statement if risk-flagged, else the requirement/description text; `domain_graph.py`'s
+        // defensive fallback so rule_objects is never empty).
+        if business_rules.is_empty() {
+            let (statement, confidence) = match risk_notes.first() {
+                Some(risk) => {
+                    if !(0.0..=1.0).contains(&risk.confidence) {
+                        anyhow::bail!(
+                            "node {}: risk annotation confidence {} out of [0,1]",
+                            node.name,
+                            risk.confidence
+                        );
+                    }
+                    (risk.value.clone(), risk.confidence)
+                }
+                None => (
+                    requirement_text
+                        .clone()
+                        .or_else(|| description_text.clone())
+                        .unwrap_or_default(),
+                    REVIEW_CONFIDENCE,
+                ),
+            };
+            business_rules.push(Rule {
+                id: String::new(),
+                statement: if statement.is_empty() {
+                    "RISK".to_string()
+                } else {
+                    statement
+                },
+                confidence,
+                provenance: node_provenance(node),
+                source_ref: Some(node_ref(node)),
+            });
+        }
+
+        // Assign schema-valid, digits-only, per-requirement-unique ids (`^RULE-[0-9]{3,6}$`).
+        for (i, rule) in business_rules.iter_mut().enumerate() {
+            rule.id = format!("RULE-{:03}", i + 1);
+        }
+
+        // status ∈ {active, review, unresolvable}: validated-requirement → active; otherwise (a
+        // risk-flagged / unvalidated / description-only node) → review (HITL-queued).
+        let status = if semantics.as_ref().is_some_and(|s| s.requirement_validated) {
+            "active"
+        } else {
+            "review"
+        };
+
         let package = package_dir(&node.location.file);
         let domain = domains.entry(package.clone()).or_insert_with(|| Domain {
-            cluster_id: Some(format!("pkg:{package}")),
+            // functional/package-dir mode has no Louvain integer → omit cluster_id; label rides description.
+            description: Some(package.clone()),
+            cluster_id: None,
             ..Default::default()
         });
         let requirement = Requirement {
             title: node.name.clone(),
             description: requirement_text
-                .or_else(|| semantics.as_ref().and_then(|s| s.description.clone()))
+                .or(description_text)
                 .unwrap_or_else(|| node.name.clone()),
-            status: semantics.as_ref().map(|s| {
-                if s.requirement_validated {
-                    "validated".to_string()
-                } else {
-                    "unvalidated".to_string()
-                }
-            }),
+            legacy_components: vec![node_ref(node)], // the estate symbol this requirement covers
+            status: Some(status.to_string()),
             business_rules,
             ..Default::default()
         };
-        domain
-            .requirements
-            .insert(format!("REQ-{}", node.name), requirement);
+        // Per-domain sequential requirement id — unique within the domain, deterministic.
+        let req_id = format!("REQ-{:03}", domain.requirements.len() + 1);
+        domain.requirements.insert(req_id, requirement);
     }
 
     Ok(DomainModel {
         metadata: Metadata {
             schema_version: schema_version.to_string(),
-            migration_mode: "modern".to_string(),
+            // M5 package-dir grouping IS the schema's "functional" (capability-grouped) mode.
+            migration_mode: "functional".to_string(),
             source: Some("estate-graph".to_string()),
         },
         domains,
@@ -275,27 +363,29 @@ mod tests {
 
     #[test]
     fn domain_model_round_trips_in_the_wire_shape() {
-        // A minimal MODERN-mode model: one domain, one requirement with a business rule, one entity.
+        // A minimal FUNCTIONAL-mode model, schema-VALID: metadata const 1.0.0 + enum migration_mode;
+        // rule id ^RULE-[0-9]{3,6}$; status enum; business_rules minItems 1; provenance complete.
         let json = serde_json::json!({
-            "metadata": { "schema_version": "1.1.0", "migration_mode": "modern" },
+            "metadata": { "schema_version": "1.0.0", "migration_mode": "functional" },
             "domains": {
                 "billing": {
-                    "cluster_id": "pkg:billing",
+                    "description": "billing",
                     "requirements": {
-                        "REQ-1": {
-                            "title": "charge a customer",
+                        "REQ-001": {
+                            "title": "charge",
                             "description": "process a payment charge",
-                            "legacy_components": [],
+                            "legacy_components": ["billing/charge.py#charge"],
                             "data_access": [],
                             "dependencies": [],
                             "business_rules": [
-                                { "id": "RULE-1", "statement": "amount must be positive",
+                                { "id": "RULE-001", "statement": "amount must be positive",
                                   "confidence": 0.9,
                                   "provenance": { "source": "code-graph", "ref": "billing/charge.py#charge",
                                                   "source_kinds": ["code-body"] } }
                             ],
                             "validations": [],
-                            "error_paths": []
+                            "error_paths": [],
+                            "status": "active"
                         }
                     },
                     "entities": {
@@ -306,15 +396,14 @@ mod tests {
             }
         });
         let model: DomainModel = serde_json::from_value(json.clone()).expect("parse wire shape");
-        assert_eq!(model.metadata.migration_mode, "modern");
-        let dom = model.domains.get("billing").unwrap();
-        let req = dom.requirements.get("REQ-1").unwrap();
+        assert_eq!(model.metadata.migration_mode, "functional");
+        let req = model.domains["billing"]
+            .requirements
+            .get("REQ-001")
+            .unwrap();
         assert_eq!(req.business_rules[0].confidence, 0.9);
-        assert_eq!(
-            req.business_rules[0].provenance.source_kinds,
-            vec!["code-body".to_string()]
-        );
-        // Round-trips back to an equal JSON value (byte-shape fidelity with the kept schema).
+        // Round-trips back to an equal JSON value (serde symmetry; schema conformance is proven by
+        // the integration test in tests/domain_model_schema.rs which validates against the schema).
         assert_eq!(serde_json::to_value(&model).unwrap(), json);
     }
 
@@ -362,13 +451,20 @@ mod tests {
         };
         let charge = mk("charge", "billing/charge.py");
         let login = mk("login", "auth/login.py");
-        let scaffold = mk("helper", "billing/util.py"); // no requirement, no business rule → skipped
+        // A RISK-flagged node: no requirement, no business rule — but the coverage gate COUNTS it as
+        // accounted (risk_flagged), so the builder must KEEP it (regression for the silent-drop bug).
+        let refund = mk("refund", "billing/refund.py");
+        let scaffold = mk("helper", "billing/util.py"); // truly structural → skipped
         store.begin_batch().unwrap();
         store
-            .upsert_nodes(&[charge.clone(), login.clone(), scaffold.clone()])
+            .upsert_nodes(&[
+                charge.clone(),
+                login.clone(),
+                refund.clone(),
+                scaffold.clone(),
+            ])
             .unwrap();
         store.commit_batch().unwrap();
-        // charge: a validated requirement + a business rule. login: a business rule only.
         store
             .set_node_semantics(
                 &charge.symbol,
@@ -391,39 +487,106 @@ mod tests {
                     .with_confidence(0.7),
             )
             .unwrap();
+        store
+            .annotate(
+                &refund.symbol,
+                Annotation::new(
+                    "risk",
+                    "r1",
+                    "unclear whether partial refunds are allowed — HITL",
+                )
+                .with_confidence(0.4),
+            )
+            .unwrap();
 
         let coverage = CoverageReport {
             coverage: 1.0,
             unaccounted: vec![],
         };
-        let model = build_domain_model(&store, &coverage, "1.1.0").unwrap();
+        let model = build_domain_model(&store, &coverage, "1.0.0").unwrap();
 
-        assert_eq!(model.metadata.migration_mode, "modern");
-        // Two package-dir domains (auth, billing) — the scaffold node contributed nothing.
+        assert_eq!(model.metadata.migration_mode, "functional");
+        // Two package-dir domains (auth, billing); scaffold contributed nothing.
         assert_eq!(
             model.domains.keys().collect::<Vec<_>>(),
             vec!["auth", "billing"]
         );
         let billing = &model.domains["billing"];
-        assert_eq!(billing.cluster_id.as_deref(), Some("pkg:billing"));
+        assert_eq!(billing.description.as_deref(), Some("billing"));
+        assert!(
+            billing.cluster_id.is_none(),
+            "functional mode omits the Louvain integer"
+        );
+        // charge (real rule) + refund (risk-flagged, KEPT) — the silent-drop regression.
         assert_eq!(
             billing.requirements.len(),
-            1,
-            "only the behavior-bearing node"
+            2,
+            "charge + risk-flagged refund both survive"
         );
-        let req = &billing.requirements["REQ-charge"];
-        assert_eq!(req.description, "process a payment charge");
-        assert_eq!(req.status.as_deref(), Some("validated"));
-        assert_eq!(req.business_rules[0].confidence, 0.9);
-        assert_eq!(req.business_rules[0].statement, "amount must be positive");
-        // The whole model serializes to the wire shape (schema-valid: required keys present).
-        let v = serde_json::to_value(&model).unwrap();
+
+        // charge → REQ-001 (visited in SymbolId order): validated requirement, real rule.
+        let charge_req = billing
+            .requirements
+            .values()
+            .find(|r| r.title == "charge")
+            .unwrap();
+        assert_eq!(charge_req.status.as_deref(), Some("active"));
+        assert_eq!(charge_req.business_rules[0].id, "RULE-001");
+        assert_eq!(charge_req.business_rules[0].confidence, 0.9);
+
+        // refund → risk-flagged: KEPT as a review requirement with a SYNTHESIZED fallback rule
+        // carrying the risk statement + confidence (minItems:1 held, behavior not lost).
+        let refund_req = billing
+            .requirements
+            .values()
+            .find(|r| r.title == "refund")
+            .unwrap();
+        assert_eq!(refund_req.status.as_deref(), Some("review"));
         assert_eq!(
-            v["domains"]["auth"]["requirements"]["REQ-login"]["business_rules"][0]["confidence"],
-            0.7
+            refund_req.business_rules.len(),
+            1,
+            "synthesized fallback rule"
         );
+        assert_eq!(refund_req.business_rules[0].confidence, 0.4);
+        assert!(refund_req.business_rules[0]
+            .statement
+            .contains("partial refunds"));
+    }
+
+    #[test]
+    fn build_fails_closed_on_out_of_range_confidence() {
+        use wicked_apps_core::{
+            synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
+            SYMBOL_SCHEME,
+        };
+        use wicked_estate_core::Annotation;
+        let mut store = SqliteStore::in_memory().unwrap();
+        let n = Node::new(
+            synthetic_symbol("code", "bad"),
+            NodeKind::Function,
+            "bad".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new("m/bad.py".to_string(), Span::ZERO),
+        );
+        store.begin_batch().unwrap();
+        store.upsert_nodes(&[n.clone()]).unwrap();
+        store.commit_batch().unwrap();
+        store
+            .annotate(
+                &n.symbol,
+                Annotation::new("business_rule", "r", "x").with_confidence(1.5),
+            )
+            .unwrap();
+        let coverage = CoverageReport {
+            coverage: 1.0,
+            unaccounted: vec![],
+        };
+        let err = build_domain_model(&store, &coverage, "1.0.0")
+            .unwrap_err()
+            .to_string();
         assert!(
-            v["domains"]["billing"]["requirements"]["REQ-charge"]["legacy_components"].is_array()
+            err.contains("[0,1]"),
+            "out-of-range confidence must fail closed: {err}"
         );
     }
 }

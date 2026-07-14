@@ -529,15 +529,24 @@ fn print_status(core: &Core) {
 
 /// `wicked-core domain-graph` — translate the annotated estate graph into a `requirements_graph.json`
 /// domain model (DES-OUTGOV-001 PR-D). Reads the front-half coverage report, gates on coverage == 1.0
-/// (FAIL-CLOSED — refuses to translate an unannotated graph), builds the model (modern-mode
-/// package-dir grouping, M5), and writes the artifact. Like the other pre-`Core::spawn` subcommands it
-/// opens the store directly for a brief read and never spawns the actor.
+/// (FAIL-CLOSED — refuses to translate an unannotated graph), builds the model (functional / package-
+/// dir grouping, M5), and writes the artifact. Like the other pre-`Core::spawn` subcommands it opens
+/// the store directly for a brief read and never spawns the actor.
+///
+/// TRUST BOUNDARY (known, tracked): the coverage report is a SEPARATE file, not bound to the store
+/// being translated — a stale report could green-light a different graph. In the workflow this is
+/// safe: `domain-extraction.json` orders `extract → coverage → domain-graph` (phase `depends_on`) over
+/// the same store in one run. The stronger guarantee — recompute front-half coverage directly from the
+/// store — needs the coverage-predicate port (a salvage item from RET-BRAIN-DOMAIN-001) and is a
+/// follow-on, not this increment.
 fn domain_graph_cmd(args: &[String]) {
     let coverage_path = flag(args, "--coverage")
         .unwrap_or_else(|| ".wicked-estate/coverage-report.json".to_string());
     let out_path = flag(args, "--out")
         .unwrap_or_else(|| ".wicked-estate/requirements/requirements_graph.json".to_string());
-    let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
+    // The schema pins metadata.schema_version to const "1.0.0" — a consumer rejects a version it has
+    // no validator for, so the emitted document must carry exactly this.
+    let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.0.0".to_string());
 
     let coverage: wicked_governance::CoverageReport = match std::fs::read_to_string(&coverage_path)
     {

@@ -57,6 +57,9 @@ postgres = ["wicked-apps-core/postgres"]
 [dev-dependencies]
 # The terminal round-trip test decodes `TerminalOutput.bytes_b64` to assert the echoed bytes.
 base64 = "0.22"
+# Validates the domain-graph builder's OUTPUT against the KEPT domain-model.schema.json (the
+# meta-fix for wire-fidelity — catches enum/const/pattern/minItems drift a hand-written literal misses).
+jsonschema = "0.18"
 # Integration tests reach the engine crates' public APIs directly to seed policies, inject a stub
 # council dispatcher, and read phase state. Same vendored path crates as above, so cargo unifies
 # them to one compilation (shared types).
