@@ -37,7 +37,7 @@ pub struct SessionResult {
 /// + [`apply_and_finish_unit`] steps off-thread.
 #[allow(clippy::too_many_arguments)]
 pub fn run_session(
-    store: &mut wicked_apps_core::SqliteStore,
+    store: &mut dyn wicked_apps_core::GraphStore,
     clis: Vec<AgenticCli>,
     problem: &str,
     entity_mode: EntityMode,
@@ -178,7 +178,7 @@ fn resolve_workflow_def(
 /// run BAILS rather than silently executing an ungated phase. A phase with no `validator_pin` leaves the
 /// unit's validator `None` (the pre-gate, ungated behavior).
 fn attach_pinned_validators(
-    store: &wicked_apps_core::SqliteStore,
+    store: &dyn wicked_apps_core::GraphStore,
     units: &mut [crate::domain::WorkUnit],
     def: &crate::workflow::WorkflowDef,
 ) -> anyhow::Result<()> {
@@ -230,7 +230,7 @@ fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
 /// `Executing`. Store-writing, so it runs on the actor (single-writer) thread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_and_distribute(
-    store: &mut wicked_apps_core::SqliteStore,
+    store: &mut dyn wicked_apps_core::GraphStore,
     clis: &[AgenticCli],
     problem: &str,
     entity_mode: EntityMode,
@@ -356,7 +356,7 @@ pub(crate) fn plan_and_distribute(
 /// the work runs. Store-writing, so it runs on the actor (single-writer) thread.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_and_finish_unit(
-    store: &mut wicked_apps_core::SqliteStore,
+    store: &mut dyn wicked_apps_core::GraphStore,
     unit: &mut crate::domain::WorkUnit,
     output: &str,
     workflow_id: &str,
@@ -572,7 +572,7 @@ fn agent_verdict_denial(agent: Option<&(bool, String)>) -> Option<String> {
 /// `pub(crate)` so the actor's off-thread agent-validator path (dispatch_unit) can judge the SAME cold
 /// creator output the governance evaluator pass reads (seam finding #8).
 pub(crate) fn creator_output_for(
-    store: &wicked_apps_core::SqliteStore,
+    store: &dyn wicked_apps_core::GraphStore,
     session_id: &str,
     evaluator_ord: u32,
 ) -> Option<String> {

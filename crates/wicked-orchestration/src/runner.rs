@@ -26,7 +26,7 @@
 //! ```
 
 use anyhow::Result;
-use wicked_apps_core::{synthetic_symbol, FromNode, GraphRead, GraphWrite, ToNode, WORKFLOW};
+use wicked_apps_core::{synthetic_symbol, FromNode, GraphStore, ToNode, WORKFLOW};
 
 use crate::domain::{Phase, PhaseStatus, Workflow, WorkflowStatus};
 use crate::reducer::{apply_event, get_phase, put_phase, Event};
@@ -54,7 +54,7 @@ pub enum AdvanceOutcome {
 }
 
 /// Read a workflow from the store by id, or `Ok(None)` if absent.
-pub fn get_workflow<S: GraphRead>(store: &S, workflow_id: &str) -> Result<Option<Workflow>> {
+pub fn get_workflow(store: &dyn GraphStore, workflow_id: &str) -> Result<Option<Workflow>> {
     let sym = synthetic_symbol(WORKFLOW, workflow_id);
     match store.get_node(&sym)? {
         Some(node) => Ok(Some(Workflow::from_node(&node)?)),
@@ -62,7 +62,7 @@ pub fn get_workflow<S: GraphRead>(store: &S, workflow_id: &str) -> Result<Option
     }
 }
 
-fn put_workflow<S: GraphWrite>(store: &mut S, wf: &Workflow) -> Result<()> {
+fn put_workflow(store: &mut dyn GraphStore, wf: &Workflow) -> Result<()> {
     store.begin_batch()?;
     store.upsert_nodes(&[wf.to_node()])?;
     store.commit_batch()?;
@@ -72,8 +72,8 @@ fn put_workflow<S: GraphWrite>(store: &mut S, wf: &Workflow) -> Result<()> {
 /// Register a workflow with an ordered list of `(phase_id, phase_name)` pairs. Persists the
 /// workflow node but does NOT open any phase — the caller manages individual phase lifecycle.
 /// If `phases` is empty, the workflow is immediately `Complete`.
-pub fn register_workflow<S: GraphRead + GraphWrite>(
-    store: &mut S,
+pub fn register_workflow(
+    store: &mut dyn GraphStore,
     workflow_id: impl Into<String>,
     name: impl Into<String>,
     phases: &[(impl AsRef<str>, impl AsRef<str>)],
@@ -106,8 +106,8 @@ pub fn register_workflow<S: GraphRead + GraphWrite>(
 /// the caller manages phase creation. Returns `Failed` immediately if `approved` is `false`,
 /// `Complete` if this was the last phase, and `Running` otherwise. Idempotent on a `Failed`
 /// workflow: subsequent calls return `Failed` without advancing the cursor.
-pub fn tick_workflow<S: GraphRead + GraphWrite>(
-    store: &mut S,
+pub fn tick_workflow(
+    store: &mut dyn GraphStore,
     workflow_id: &str,
     approved: bool,
 ) -> Result<WorkflowStatus> {
@@ -143,8 +143,8 @@ pub fn tick_workflow<S: GraphRead + GraphWrite>(
 /// Create a workflow with an ordered list of `(phase_id, phase_name)` pairs. Persists the
 /// workflow node and opens the first phase to `InProgress`. If `phases` is empty, the workflow
 /// is immediately `Complete`.
-pub fn create_workflow<S: GraphRead + GraphWrite>(
-    store: &mut S,
+pub fn create_workflow(
+    store: &mut dyn GraphStore,
     workflow_id: impl Into<String>,
     name: impl Into<String>,
     phases: &[(impl AsRef<str>, impl AsRef<str>)],
@@ -180,10 +180,7 @@ pub fn create_workflow<S: GraphRead + GraphWrite>(
 
 /// Advance a workflow: inspect the current phase's terminal status and move the cursor forward.
 /// Idempotent — calling `advance` when no terminal status has been reached returns `Waiting`.
-pub fn advance<S: GraphRead + GraphWrite>(
-    store: &mut S,
-    workflow_id: &str,
-) -> Result<AdvanceOutcome> {
+pub fn advance(store: &mut dyn GraphStore, workflow_id: &str) -> Result<AdvanceOutcome> {
     let wf = get_workflow(store, workflow_id)?
         .ok_or_else(|| anyhow::anyhow!("workflow not found: {workflow_id}"))?;
 
@@ -261,8 +258,8 @@ pub fn advance<S: GraphRead + GraphWrite>(
 
 /// Create a phase in `Pending` and immediately apply the `InProgress` transition. Uses a
 /// deterministic event id so the open is idempotent on re-delivery.
-fn open_phase<S: GraphRead + GraphWrite>(
-    store: &mut S,
+fn open_phase(
+    store: &mut dyn GraphStore,
     phase_id: &str,
     workflow_id: &str,
     phase_name: &str,

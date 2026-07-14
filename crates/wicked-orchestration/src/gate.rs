@@ -75,8 +75,8 @@ pub struct GateOutcome {
 ///
 /// On a real transition a coarse [`EV_PHASE_TRANSITIONED`] fact is emitted via the shared
 /// fire-and-forget seam (counts / ids only).
-pub fn apply_gate<S: wicked_apps_core::GraphRead + wicked_apps_core::GraphWrite>(
-    store: &mut S,
+pub fn apply_gate(
+    store: &mut dyn wicked_apps_core::GraphStore,
     phase_id: &str,
     claim: Option<&ConformanceClaim>,
     event_id: &str,

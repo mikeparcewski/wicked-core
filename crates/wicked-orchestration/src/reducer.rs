@@ -16,8 +16,8 @@
 //! Single-writer: every write goes through this reducer (and the gate, which routes through it).
 
 use wicked_apps_core::{
-    synthetic_symbol, Decision, FromNode, GraphRead, GraphWrite, Language, Location, Node,
-    NodeKind, Span, ToNode, SYMBOL_SCHEME,
+    synthetic_symbol, Decision, FromNode, GraphStore, Language, Location, Node, NodeKind, Span,
+    ToNode, SYMBOL_SCHEME,
 };
 
 use crate::domain::{Phase, PhaseStatus};
@@ -93,14 +93,14 @@ impl ApplyOutcome {
 }
 
 /// Has `event_id` already been applied? (an idempotency-ledger marker node exists for it.)
-pub fn is_processed<S: GraphRead>(store: &S, event_id: &str) -> anyhow::Result<bool> {
+pub fn is_processed(store: &dyn GraphStore, event_id: &str) -> anyhow::Result<bool> {
     let sym = synthetic_symbol(PROCESSED_EVENT, event_id);
     Ok(store.get_node(&sym)?.is_some())
 }
 
 /// Persist the idempotency-ledger marker for `event_id` (a small node keyed by the event id), so a
 /// re-delivery of the same id reads back as already-processed.
-fn mark_processed<S: GraphWrite>(store: &mut S, event_id: &str) -> anyhow::Result<()> {
+fn mark_processed(store: &mut dyn GraphStore, event_id: &str) -> anyhow::Result<()> {
     let sym = synthetic_symbol(PROCESSED_EVENT, event_id);
     let mut node = Node::new(
         sym,
@@ -120,7 +120,7 @@ fn mark_processed<S: GraphWrite>(store: &mut S, event_id: &str) -> anyhow::Resul
 }
 
 /// Read a phase back from the store by id, or `Ok(None)` if absent.
-pub fn get_phase<S: GraphRead>(store: &S, phase_id: &str) -> anyhow::Result<Option<Phase>> {
+pub fn get_phase(store: &dyn GraphStore, phase_id: &str) -> anyhow::Result<Option<Phase>> {
     let sym = synthetic_symbol(wicked_apps_core::PHASE, phase_id);
     match store.get_node(&sym)? {
         Some(node) => Ok(Some(Phase::from_node(&node)?)),
@@ -129,7 +129,7 @@ pub fn get_phase<S: GraphRead>(store: &S, phase_id: &str) -> anyhow::Result<Opti
 }
 
 /// Persist `phase` (full overwrite of its node) through the single-writer batch path.
-pub fn put_phase<S: GraphWrite>(store: &mut S, phase: &Phase) -> anyhow::Result<()> {
+pub fn put_phase(store: &mut dyn GraphStore, phase: &Phase) -> anyhow::Result<()> {
     store.begin_batch()?;
     store.upsert_nodes(&[phase.to_node()])?;
     store.commit_batch()?;
@@ -139,10 +139,7 @@ pub fn put_phase<S: GraphWrite>(store: &mut S, phase: &Phase) -> anyhow::Result<
 /// Apply one event to the projection (single-writer). See the module docs for the exact ordered
 /// contract. `S: GraphStore` (read + write) so the reducer both reads the current phase and writes
 /// the new state through one store handle.
-pub fn apply_event<S: GraphRead + GraphWrite>(
-    store: &mut S,
-    event: &Event,
-) -> anyhow::Result<ApplyOutcome> {
+pub fn apply_event(store: &mut dyn GraphStore, event: &Event) -> anyhow::Result<ApplyOutcome> {
     if event.id.is_empty() {
         return Ok(ApplyOutcome::refused("missing_event_id"));
     }

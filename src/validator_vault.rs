@@ -14,8 +14,7 @@
 //! which [`crate::validator::run_validator`] still checks fail-closed before any execution.
 
 use wicked_apps_core::{
-    synthetic_symbol, GraphRead, Language, Location, Node, NodeKind, Span, SqliteStore,
-    SYMBOL_SCHEME,
+    synthetic_symbol, GraphStore, Language, Location, Node, NodeKind, Span, SYMBOL_SCHEME,
 };
 
 use crate::domain::put_node;
@@ -71,7 +70,7 @@ fn to_vault_node(v: &DeterministicValidator) -> Node {
 /// unapproved validator vaults as unapproved (and will still be refused fail-closed at run time). Runs on
 /// the actor (single-writer) thread via [`put_node`].
 pub fn store_validator(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     v: &DeterministicValidator,
 ) -> anyhow::Result<String> {
     let id = pin(v);
@@ -85,7 +84,7 @@ pub fn store_validator(
 /// gate-ready is decided by its own `approved` flag, which [`crate::validator::run_validator`] checks
 /// fail-closed before it will execute.
 pub fn load_validator(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     pin: &str,
 ) -> anyhow::Result<Option<DeterministicValidator>> {
     match store.get_node(&synthetic_symbol(VALIDATOR_VAULT, pin))? {
@@ -125,7 +124,7 @@ pub fn load_validator(
 pub fn provision_validator(
     criterion: &str,
     runner: &dyn StepRunner,
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
 ) -> anyhow::Result<String> {
     let v = author_deterministic_validator(criterion, runner)?; // approved == false
     store_validator(store, &v)
@@ -135,7 +134,7 @@ pub fn provision_validator(
 /// re-vault. Approving changes the `approved` byte, so the approved copy has a DISTINCT pin — returned.
 /// `Ok(None)` if `pin` is unknown. The two pins (unapproved vs approved) are the audit trail: only the
 /// approved pin can gate, and a phase carries THAT pin.
-pub fn approve_and_store(store: &mut SqliteStore, pin: &str) -> anyhow::Result<Option<String>> {
+pub fn approve_and_store(store: &mut dyn GraphStore, pin: &str) -> anyhow::Result<Option<String>> {
     let Some(v) = load_validator(store, pin)? else {
         return Ok(None);
     };

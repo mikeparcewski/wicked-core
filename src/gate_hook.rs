@@ -38,7 +38,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use wicked_apps_core::{
-    open_store, ConformanceClaim, Decision, GraphRead, NodeKind, SqliteStore, ToNode,
+    open_store, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
     CONFORMANCE_CLAIM,
 };
 use wicked_governance::{conform, decide, select};
@@ -150,7 +150,7 @@ pub struct HookDrainSummary {
 /// reducer dedups a re-drained decision. A missing file is not an error (no decisions yet ⇒ nothing
 /// to apply).
 pub fn apply_hook_decisions(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     run_id: &str,
     ndjson_path: &Path,
 ) -> anyhow::Result<HookDrainSummary> {
@@ -196,7 +196,7 @@ pub fn apply_hook_decisions(
 /// and walk it to the gate; if already opened (the run engine owns it in P1+), leave it as is.
 /// Idempotent: re-running never illegally re-transitions an already-resolved phase.
 fn ensure_phase_at_gate(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     phase_id: &str,
     workflow_id: &str,
     phase_name: &str,

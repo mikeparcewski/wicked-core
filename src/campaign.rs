@@ -588,7 +588,7 @@ use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use wicked_apps_core::SqliteStore;
+use wicked_apps_core::GraphStore;
 use wicked_council::types::Dispatcher;
 
 use crate::command::Command;
@@ -611,7 +611,7 @@ fn emit(subscribers: &mut Vec<Sender<CoreEvent>>, ev: CoreEvent) {
 }
 
 /// Persist the campaign (one node round-trip). Mirrors `pending_decision` into its serde shape first.
-fn persist(store: &mut SqliteStore, campaign: &mut Campaign) -> anyhow::Result<()> {
+fn persist(store: &mut dyn GraphStore, campaign: &mut Campaign) -> anyhow::Result<()> {
     campaign.sync_pending();
     put_node(store, campaign.to_node())
 }
@@ -619,7 +619,7 @@ fn persist(store: &mut SqliteStore, campaign: &mut Campaign) -> anyhow::Result<(
 /// `LaunchCampaign` (DES §4 step 1): validate, persist all-`Pending`, mark the in-degree-0 set
 /// `Ready`, `try_fill()`. Returns the campaign id.
 pub(crate) fn launch(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -686,7 +686,7 @@ fn promote_ready(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent
 /// frees its slot for independent work.
 fn try_fill(
     campaign: &mut Campaign,
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -709,7 +709,7 @@ fn try_fill(
 fn dispatch(
     campaign: &mut Campaign,
     node_id: &str,
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -809,7 +809,7 @@ fn dispatch(
 /// `RunCancelled` map onto a node outcome. Inverse-lookup the owning campaign+node by run id; a
 /// bounded linear scan (an abandoned prior-attempt id maps to no node and is safely dropped).
 pub(crate) fn on_run_finished(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -850,7 +850,7 @@ fn reconcile_terminal(
     campaign: &mut Campaign,
     node_id: &str,
     outcome: NodeOutcome,
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -890,7 +890,7 @@ fn reconcile_terminal(
 /// gate opened inside the node's Run. Set the node `AwaitingHuman` (FREES its slot), surface the
 /// prompt, and `try_fill()` so independent work uses the freed slot.
 pub(crate) fn on_node_awaiting(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -927,7 +927,7 @@ pub(crate) fn on_node_awaiting(
 /// (`Approve`/`Reject` on an `AwaitingHuman` node) and the `HumanGateOnFailure` policy gate
 /// (`Retry`/`Skip`/`Abort` on a queued `Failed` node).
 pub(crate) fn confirm_gate(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -1031,7 +1031,7 @@ pub(crate) fn confirm_gate(
 
 /// `PauseCampaign` (DES §4 step 6): stop dispatching new nodes; in-flight continue cooperatively.
 pub(crate) fn pause(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     id: &str,
 ) -> anyhow::Result<CampaignStatus> {
@@ -1054,7 +1054,7 @@ pub(crate) fn pause(
 /// terminal-skip guard and `try_fill`'s status guard), `CancelRun` every live node, mark the rest
 /// `Cancelled`.
 pub(crate) fn cancel(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -1111,7 +1111,7 @@ pub(crate) fn cancel(
 /// the ready set, re-attach any mid-run node, and fill. Never re-runs a terminal node; never
 /// duplicates (the run id is derived, and `dispatch()` is the sole writer of `node_run_id`).
 pub(crate) fn resume(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -1301,7 +1301,7 @@ pub(crate) fn resume(
 fn apply_failure_policy(
     campaign: &mut Campaign,
     failed_node: &str,
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -1345,7 +1345,7 @@ fn apply_failure_policy(
 fn fail_fast(
     campaign: &mut Campaign,
     _failed_node: &str,
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
@@ -1455,7 +1455,7 @@ fn finalize_if_done(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEv
 }
 
 /// Inverse-lookup the non-terminal campaign + node that owns `run_id` (bounded linear scan, §4 step 2).
-fn find_by_run(store: &SqliteStore, run_id: &str) -> anyhow::Result<Option<(Campaign, String)>> {
+fn find_by_run(store: &dyn GraphStore, run_id: &str) -> anyhow::Result<Option<(Campaign, String)>> {
     for campaign in all_campaigns(store)? {
         if matches!(
             campaign.status,

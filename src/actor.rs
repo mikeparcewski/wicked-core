@@ -18,7 +18,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 use base64::Engine as _;
-use wicked_apps_core::{open_store, GraphRead, NodeKind, SqliteStore, ToNode, AGENT_SESSION};
+use wicked_apps_core::{
+    open_store_any, AnyStore, GraphRead, GraphStore, NodeKind, ToNode, AGENT_SESSION,
+};
 use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
 
@@ -89,7 +91,11 @@ pub(crate) fn run(
     pty_map: PtyMap,
     exec_bus: Option<String>,
 ) {
-    let mut store = match open_store(Some(&path)) {
+    // Backend-agnostic: `path` may be a filesystem path (SQLite, the default) OR a `postgres://`
+    // spec (selects estate's Postgres backend under the `postgres` feature). `AnyStore` is one
+    // concrete type, so the engine below borrows it as `&dyn GraphRead` / `&mut dyn GraphStore`
+    // without ever learning which backend it holds.
+    let mut store: AnyStore = match open_store_any(Some(&path)) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wicked-core: could not open store at {path}: {e}");
@@ -97,9 +103,19 @@ pub(crate) fn run(
         }
     };
 
+    // The memory + knowledge sidecars are SQLite-only local stores keyed off a FILESYSTEM base
+    // (`<base>.mem` / `<base>.knowledge`). When the graph store is a URL backend (e.g.
+    // `postgres://…`), `path` is NOT a filesystem path, so appending `.mem` would yield a bogus
+    // `postgres://….mem`. In that case anchor the sidecars at the local estate default instead.
+    let sidecar_base: String = if path.contains("://") {
+        ".wicked-estate/graph.db".to_string()
+    } else {
+        path.clone()
+    };
+
     // The orchestrator's episodic memory (a SEPARATE single-writer store, sibling of the estate db).
     // Best-effort: a memory-open failure must never stop the engine, so it's an `Option`.
-    let mut memory = match crate::memory::RunMemory::open(&path) {
+    let mut memory = match crate::memory::RunMemory::open(&sidecar_base) {
         Ok(m) => Some(m),
         Err(e) => {
             eprintln!("wicked-core: memory store unavailable ({e}); continuing without recall");
@@ -107,7 +123,7 @@ pub(crate) fn run(
         }
     };
     // The orchestrator's knowledge base (documents) — also a separate single-writer store, best-effort.
-    let mut knowledge = match crate::knowledge::RunKnowledge::open(&path) {
+    let mut knowledge = match crate::knowledge::RunKnowledge::open(&sidecar_base) {
         Ok(k) => Some(k),
         Err(e) => {
             eprintln!("wicked-core: knowledge store unavailable ({e}); continuing without it");
@@ -745,7 +761,7 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
 /// distributes synchronously, then advances unit 0 off-thread (or pauses at a gate). Idempotent by
 /// run id: refuses to re-plan over a live run (resume it instead). Returns the run id.
 pub(crate) fn launch_run_inner(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
@@ -809,7 +825,7 @@ pub(crate) fn launch_run_inner(
 /// The body of `Command::ResumeRun` (also the campaign driver's crash-resume re-attach, DES §6).
 /// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
 pub(crate) fn resume_run_inner(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -889,7 +905,7 @@ pub(crate) fn resume_run_inner(
 /// cursor is already past → no re-run → wedge). Armed-mode ONLY — the default in-process path has no
 /// cross-restart durability and must stay byte-for-byte unchanged, so it is never re-driven.
 fn redrive_executing_sessions(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -949,7 +965,7 @@ fn redrive_executing_sessions(
 /// a superseded run or a re-delivered message — is ignored (`Stale`). This is the defense the
 /// per-actor `in_flight` set cannot provide (it can't see results from a different actor/process).
 fn apply_step_result(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -1129,7 +1145,7 @@ fn apply_step_result(
 /// Halt a run as `Failed` (governance deny or worker failure): persist the terminal status and emit
 /// a terminal `SessionFailed`. Returns `Finished` so the actor clears `in_flight`.
 fn fail_run(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
@@ -1153,7 +1169,7 @@ fn fail_run(
 /// the CONDITIONAL verdict gate (seam finding #3), and the TERMINAL gate (seam finding #4) so all three
 /// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
 fn pause_for_human(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
@@ -1183,7 +1199,7 @@ fn pause_for_human(
 /// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
 fn advance_or_pause(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -1239,7 +1255,7 @@ fn advance_or_pause(
 /// return `(repo_ref, workdir)`. `None` repo ⇒ no worktree. Errors if the repo id isn't registered or
 /// the worktree can't be created.
 fn resolve_workdir(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     repo_ref: &Option<String>,
     run_id: &str,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
@@ -1290,7 +1306,7 @@ fn should_pause(
 /// (no store handle) and posts an `ApplyStepResult` back to the actor. Returns `Ok(false)` if
 /// `unit_ix` is past the last unit (nothing to dispatch — the run is done).
 fn dispatch_unit(
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -1400,7 +1416,7 @@ fn dispatch_unit(
 /// Mark a run `Completed` and emit `SessionCompleted`. Propagates a store-write failure so a failed
 /// finalize surfaces as a run error (rather than silently wedging the run in `in_flight`).
 fn finalize_run(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     self_tx: &Sender<Command>,
     run_id: &str,
@@ -1424,7 +1440,7 @@ fn finalize_run(
 /// on it); `Reject` cancels the run.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_gate(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -1520,7 +1536,7 @@ pub(crate) fn confirm_gate(
 /// terminal run). A late worker result for a cancelled run is discarded by `apply_step_result`'s
 /// terminal guard.
 pub(crate) fn cancel_run(
-    store: &mut SqliteStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
     self_tx: &Sender<Command>,
     run_id: &str,
@@ -1564,7 +1580,7 @@ pub(crate) const DENY_PHASE_SPAN: u32 = 256;
 /// failure, why) so a later recall surfaces "we tried X — it <outcome>". No-op on non-terminal status.
 fn capture_run_outcome(
     memory: Option<&mut crate::memory::RunMemory>,
-    store: &SqliteStore,
+    store: &dyn GraphStore,
     run_id: &str,
 ) {
     let Some(mem) = memory else { return };
@@ -1609,7 +1625,11 @@ fn capture_run_outcome(
 /// regex-escape it (governance matches `Trigger.contains` as a regex over the call context). The
 /// policy is registered against EVERY unit-execution phase (`unit-1..=unit-N`), not the abstract
 /// `phase` label — otherwise it would match no real gate and silently never deny.
-fn register_deny_policy(store: &mut SqliteStore, phase: &str, trigger: &str) -> anyhow::Result<()> {
+fn register_deny_policy(
+    store: &mut dyn GraphStore,
+    phase: &str,
+    trigger: &str,
+) -> anyhow::Result<()> {
     use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
     let applies_to: Vec<String> = (1..=DENY_PHASE_SPAN).map(|n| format!("unit-{n}")).collect();
     let policy = Policy {
@@ -1817,7 +1837,7 @@ mod terminal_gate_tests {
         }
     }
 
-    fn seed_session(store: &mut SqliteStore, terminal_gate: GateSpec) {
+    fn seed_session(store: &mut dyn GraphStore, terminal_gate: GateSpec) {
         let session = AgentSession {
             id: "r".into(),
             workflow_id: "wf-r".into(),
