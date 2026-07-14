@@ -85,15 +85,43 @@ thread_local! {
     static GOV_DB_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// Warn ONCE per actor thread that input governance is off for a non-file store (avoids per-unit spam).
+    static GOV_OFF_WARNED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
+}
+
+/// Whether input governance is ARMED for the current (actor) thread's store — a file-backed store the
+/// gate-hook can open. Mirrors [`in_process_governance`]'s `Some` condition WITHOUT canonicalizing, so the
+/// fold can cheaply decide whether a governed unit's missing evidence should fail closed.
+pub(crate) fn in_process_governance_armed() -> bool {
+    GOV_DB_PATH.with(|c| {
+        c.borrow()
+            .as_deref()
+            .map(|p| p != ":memory:" && !p.contains("://"))
+            .unwrap_or(false)
+    })
+}
+
 /// The governance context for an IN-PROCESS governed unit (DES-OUTGOV-003 §4), or `None` when input
 /// governance cannot apply: no store armed, or a store the SQLite gate-hook subprocess cannot open
 /// independently — `:memory:` (cannot cross processes) or `postgres://` (SQLite-only hook; the
 /// spec-dispatch read-only opener is deferred to core#30). The path is made ABSOLUTE because the hook
 /// runs with cwd = the worktree, so a relative `.wicked-estate/graph.db` would open the wrong/empty
-/// store (finding #6).
+/// store (finding #6). A non-file store surfaces a LOUD one-time operator notice (council [3]/[13]) so a
+/// silently-ungoverned run is not mistaken for a governed one.
 fn in_process_governance() -> Option<crate::workflow::GovernanceContext> {
     let path = GOV_DB_PATH.with(|c| c.borrow().clone())?;
     if path == ":memory:" || path.contains("://") {
+        GOV_OFF_WARNED.with(|w| {
+            if !*w.borrow() {
+                *w.borrow_mut() = true;
+                eprintln!(
+                    "wicked-core: INPUT governance NOT active for this run — store `{path}` is not a \
+                     file-backed SQLite db the gate-hook can open (postgres/:memory: → core#30). \
+                     Wrapped-CLI tool-calls run UNGOVERNED."
+                );
+            }
+        });
         return None;
     }
     let abs = std::fs::canonicalize(&path)

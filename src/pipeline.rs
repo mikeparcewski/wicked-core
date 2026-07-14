@@ -46,6 +46,10 @@ pub fn run_session(
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<SessionResult> {
+    // Clear any prior run's per-run governance dir for this session id (the sync driver, like
+    // launch_run_inner, must not inherit a stale decisions log — a leftover Deny would spuriously fail
+    // this run; council [14]). A brand-new id is a harmless no-op.
+    let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(session_id));
     let Planned {
         mut session,
         mut units,
@@ -411,7 +415,7 @@ pub(crate) fn apply_and_finish_unit(
         &review_output,
         &evaluator_cli,
         &collection_scope,
-        &format!("unit-{}", unit.ord),
+        &crate::scope::unit_phase(unit.ord),
         eval_at,
     )
     .ok();
@@ -434,11 +438,17 @@ pub(crate) fn apply_and_finish_unit(
     // each of THIS phase's claims as durable evidence, and surface any Deny. Inert (`None`) for
     // ungoverned / sync runs (no decisions log written). A denied tool-call thus drives the unit gate
     // Rejected → the run Failed through the UNCHANGED completion path.
+    // A unit was GOVERNED iff it ran claude on a file-backed store (the exact condition the launcher armed
+    // on). This gates evidence-integrity fail-closure: a governed unit whose armed marker is missing
+    // (erased/never-fired) DENIES; an ungoverned unit's fold is inert.
+    let governed = crate::execute_wrapped::unit_uses_claude(unit)
+        && crate::actor::in_process_governance_armed();
     let hook_denial = crate::gate_hook::fold_input_denial(
         store,
         session_id,
         attempt,
-        &format!("unit-{}", unit.ord),
+        &crate::scope::unit_phase(unit.ord),
+        governed,
     )?;
 
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.

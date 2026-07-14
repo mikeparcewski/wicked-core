@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
     HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, WorkflowRegistry, WrappedCliStepRunner,
+    ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -90,9 +91,9 @@ fn main() {
         // Resolve scope/phase/db from argv (standalone) ELSE the env the launcher sets. The injected
         // command carries NONE of these in the shell string (only the trusted exe) — scope/phase/db all
         // travel via env, so caller-controlled ids can't inject shell metacharacters (security fix).
-        let scope = resolve_hook_arg(&args, "--scope", "WICKED_GATE_SCOPE");
-        let phase = resolve_hook_arg(&args, "--phase", "WICKED_GATE_PHASE");
-        let db = flag(&args, "--db").or_else(|| env_nonempty("WICKED_ESTATE_DB"));
+        let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
+        let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
+        let db = flag(&args, "--db").or_else(|| env_nonempty(ESTATE_DB_ENV));
         std::process::exit(run_gate_hook(&scope, &phase, db.as_deref()));
     }
 
@@ -100,9 +101,9 @@ fn main() {
     // governs the generated OUTPUT text (on stdin) instead of a proposed tool input. Also exits with
     // the gate's code (2 = deny) and must run before `Core::spawn`.
     if args.get(1).map(String::as_str) == Some("output-gate-hook") {
-        let scope = resolve_hook_arg(&args, "--scope", "WICKED_GATE_SCOPE");
-        let phase = resolve_hook_arg(&args, "--phase", "WICKED_GATE_PHASE");
-        let db = flag(&args, "--db").or_else(|| env_nonempty("WICKED_ESTATE_DB"));
+        let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
+        let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
+        let db = flag(&args, "--db").or_else(|| env_nonempty(ESTATE_DB_ENV));
         std::process::exit(run_output_gate_hook(&scope, &phase, db.as_deref()));
     }
 

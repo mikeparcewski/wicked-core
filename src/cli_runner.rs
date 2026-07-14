@@ -768,6 +768,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Council [4]: a governed StepInput's `GovernanceContext` must SURVIVE the exec-mediation bus
+    /// round-trip — a `#[serde(default)]` regression in `DispatchedTask` or the reconstruction would
+    /// silently rebuild an UNGOVERNED input, disabling input governance for the WHOLE bus delivery mode
+    /// (the exact silent-off failure class the milestone exists to prevent) with nothing to catch it.
+    #[test]
+    fn governance_context_survives_the_exec_mediation_round_trip() {
+        let dir = std::env::temp_dir().join(format!("wc-clirunner-gov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_str().unwrap().to_string();
+
+        let unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do it");
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Shared,
+            workdir: None,
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: "/abs/estate.db".into(),
+            }),
+        };
+
+        assert!(arm_exec_publisher(&bus_path), "arm publisher");
+        assert!(
+            try_publish_dispatched(&input, None),
+            "publish task.dispatched"
+        );
+        disarm_exec_publisher();
+
+        let bus = BusDb::open(&bus_path).unwrap();
+        let evs = bus.poll(TASK_DISPATCHED, 0, 10).unwrap();
+        assert_eq!(evs.len(), 1);
+        let task: DispatchedTask = serde_json::from_value(evs[0].payload.clone()).unwrap();
+        let gov = task
+            .governance
+            .expect("the governance context survives the bus (NOT dropped to None)");
+        assert_eq!(
+            gov.db_path, "/abs/estate.db",
+            "the store path the off-actor launcher needs to arm the hook is preserved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn seat(key: &str, invocation: &str) -> crate::AgenticCli {
         use wicked_council::{Category, Confidence, InputMode};
         crate::AgenticCli {

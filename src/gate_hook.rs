@@ -65,6 +65,10 @@ pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 pub const GATE_SCOPE_ENV: &str = "WICKED_GATE_SCOPE";
 pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
 
+/// Environment variable carrying the estate store path to the gate-hook subprocess (the injected command
+/// drops `--db`). One exported const so the launcher setter + the bin resolver never drift on the name.
+pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
+
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
 ///
 /// `scope`/`phase` are resolved by the caller (`bin/wicked-core`) from argv (standalone) ELSE the
@@ -99,9 +103,18 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     };
 
     // Read-only use of the store: select reads policies, decide is pure. NO store write here.
+    // On an INFRA failure below we still exit 2 (the tool IS blocked), but we ALSO best-effort append a
+    // synthetic Deny so the block leaves durable evidence — otherwise the fold would see no claim and the
+    // run could Complete despite a governance-infra block (council blocker, infra-exit-2 arm).
     let store = match open_store(db.filter(|s| !s.is_empty())) {
         Ok(s) => s,
         Err(e) => {
+            append_infra_deny(
+                &decisions_path,
+                scope,
+                phase,
+                &format!("store open failed: {e}"),
+            );
             eprintln!("wicked-governance: DENY (open store failed: {e})");
             return 2;
         }
@@ -109,6 +122,12 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     let selected = match select(&store, scope, phase, &context) {
         Ok(s) => s,
         Err(e) => {
+            append_infra_deny(
+                &decisions_path,
+                scope,
+                phase,
+                &format!("policy select failed: {e}"),
+            );
             eprintln!("wicked-governance: DENY (policy select failed: {e})");
             return 2;
         }
@@ -151,6 +170,15 @@ fn store_unavailable(db: Option<&str>) -> Option<String> {
         ),
         Some(s) if s.starts_with("postgres://") || s.starts_with("postgresql://") => Some(
             "governance-in-run is SQLite-only; the hook cannot open a postgres:// store (core#30)"
+                .to_string(),
+        ),
+        // An in-memory store cannot cross into the hook SUBPROCESS — it would open its OWN empty store
+        // (zero policies) and ALLOW everything: the same fail-open the missing-store arm denies. In-run
+        // it's already filtered out (in_process_governance returns None), but deny it here too so a
+        // standalone `gate-hook --db :memory:` can never silently allow (council [10]).
+        Some(":memory:") => Some(
+            "an in-memory store cannot carry the run's policies into the hook subprocess (always the \
+             empty-store fail-open)"
                 .to_string(),
         ),
         Some(_) => None,
@@ -204,7 +232,7 @@ pub fn decisions_path_for(run_id: &str, attempt: u32) -> std::path::PathBuf {
 /// body from its newline, which could interleave and corrupt a line the drain then dropped).
 fn append_decision(path: &Path, claim: &ConformanceClaim) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_private(parent)?;
     }
     let mut line = serde_json::to_string(claim)?;
     line.push('\n');
@@ -243,6 +271,19 @@ fn with_append_lock<T>(
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Reclaim a STALE lock (a crashed holder never unlinked it): if the lockfile is older
+                // than a few seconds, remove it and retry immediately, so the mechanism self-heals
+                // instead of degrading to permanently-unlocked for the rest of the attempt (council [11]).
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|age| age.as_secs() >= 5)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             // Can't create the lockfile (dir gone, permissions) — proceed unlocked rather than block.
@@ -254,6 +295,79 @@ fn with_append_lock<T>(
         let _ = std::fs::remove_file(&lock);
     }
     r
+}
+
+/// Key of the ARMED sentinel line the launcher writes to a governed unit's decisions log BEFORE the CLI
+/// runs. Its PRESENCE proves governance was armed + the log is intact; its ABSENCE for a unit the engine
+/// KNOWS is governed means the log was never written or was erased/truncated — the fold then fails CLOSED.
+/// This makes evidence ERASURE self-defeating (`rm`/truncate ⇒ marker gone ⇒ DENY) and closes the
+/// "governed-but-unevidenced looks clean → Completed" fail-open the council flagged as the blocker. It
+/// does NOT close SELECTIVE deletion of only the Deny lines (marker + Allows kept) — that needs
+/// un-forgeable claims over the bus/store (issue #35).
+const ARMED_MARKER_KEY: &str = "_wicked_gov_armed";
+
+/// `create_dir_all` + restrict the leaf dir to owner-only (0700) on Unix, so another local user on a
+/// shared host cannot traverse in to read a run's policy scope/phase, tool-call context, or denial
+/// reasons (council [9]). The sensitive settings/decisions files live under this dir, so blocking
+/// traversal protects them regardless of individual file mode.
+pub(crate) fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+/// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as claims).
+/// Called by the launcher when it arms input governance for a governed unit, BEFORE the CLI runs.
+pub fn write_armed_marker(decisions_path: &Path, phase: &str) -> anyhow::Result<()> {
+    if let Some(parent) = decisions_path.parent() {
+        create_dir_all_private(parent)?;
+    }
+    let mut line = serde_json::json!({ ARMED_MARKER_KEY: phase }).to_string();
+    line.push('\n');
+    with_append_lock(decisions_path, || {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(decisions_path)?;
+        f.write_all(line.as_bytes())
+    })?;
+    Ok(())
+}
+
+/// Best-effort append of a synthetic Deny when the hook must block a tool-call due to an INFRA failure
+/// (store won't open, policy select failed) — so the block leaves durable evidence the fold will see,
+/// rather than a silent exit-2 the run could Complete past. Errors are swallowed (already failing closed).
+fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
+    let claim = ConformanceClaim {
+        claim_id: format!("infra-deny:{phase}:{scope}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec![],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string()],
+        evaluated_context_ref: "sha256:infra".to_string(),
+        criteria: format!("governance infra failure: {reason}"),
+        evaluator_identity: "wicked-governance-infra".to_string(),
+        evaluated_at: EVAL_AT_BASE,
+    };
+    let _ = append_decision(Path::new(decisions_path), &claim);
+}
+
+/// Whether `line` is the armed marker for exactly `phase`.
+fn is_armed_marker(line: &str, phase: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| {
+            v.get(ARMED_MARKER_KEY)
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(phase)
 }
 
 /// Fold a governed unit's INPUT-hook decisions into a single deny-dominant denial, for the run engine's
@@ -270,16 +384,30 @@ fn with_append_lock<T>(
 /// `Err` would leave the session wedged non-terminal and re-executed on every restart (finding #3/#8).
 /// `Ok(None)` when the log is absent (an ungoverned or not-yet-written attempt) or holds no `Deny` for
 /// `phase`.
+/// `governed` = the engine KNOWS this unit had input governance armed (a claude unit on a file-backed
+/// store). It gates EVIDENCE-INTEGRITY fail-closure: a governed unit whose armed marker is absent (log
+/// missing, erased, or truncated) DENIES — closing the council blocker where an agent could erase its own
+/// Deny evidence (or the hook could silently never fire) and flip the run from Failed to Completed. An
+/// UNGOVERNED unit legitimately has no log, so `governed=false` ⇒ the fold is inert (`Ok(None)`).
 pub fn fold_input_denial(
     store: &mut dyn GraphStore,
     run_id: &str,
     attempt: u32,
     phase: &str,
+    governed: bool,
 ) -> anyhow::Result<Option<String>> {
     let path = decisions_path_for(run_id, attempt);
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // No log at all: a GOVERNED unit MUST have its launcher-written armed marker → its absence means
+        // the evidence was never written or the whole gov dir was erased → fail CLOSED. An ungoverned
+        // unit legitimately has no log.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(governed.then(|| format!(
+                "input governance denied {phase} (fail-closed): governed unit produced NO decisions log \
+                 (hook never fired or evidence erased)"
+            )))
+        }
         // A non-NotFound read error (permission / sharing) is un-evaluable governance evidence ⇒ deny
         // (fail closed) via the normal terminal path, never a run-wedging Err.
         Err(e) => {
@@ -289,10 +417,18 @@ pub fn fold_input_denial(
         }
     };
     let mut denial: Option<String> = None;
+    let mut saw_marker = false;
     for line in raw.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
             continue; // blank / non-claim line — not corruption
+        }
+        if is_armed_marker(line, phase) {
+            saw_marker = true;
+            continue;
+        }
+        if line.contains(ARMED_MARKER_KEY) {
+            continue; // an armed marker for ANOTHER unit — not a claim, don't treat as corrupt
         }
         let claim: ConformanceClaim = match serde_json::from_str(line) {
             Ok(c) => c,
@@ -317,6 +453,14 @@ pub fn fold_input_denial(
                 claim.claim_id
             ));
         }
+    }
+    // A GOVERNED unit whose log is PRESENT but has lost its armed marker was truncated/edited → the
+    // evidence stream is untrustworthy → fail CLOSED (even if no surviving Deny remains).
+    if governed && !saw_marker && denial.is_none() {
+        denial = Some(format!(
+            "input governance denied {phase} (fail-closed): armed marker missing \
+             (decisions log tampered or truncated)"
+        ));
     }
     Ok(denial)
 }
@@ -810,7 +954,7 @@ mod tests {
 
         // Absent log ⇒ None (ungoverned / not-yet-written attempt — the fold is inert).
         assert_eq!(
-            fold_input_denial(&mut store, &run_id, 0, "unit-1").unwrap(),
+            fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap(),
             None
         );
 
@@ -821,7 +965,7 @@ mod tests {
         append_decision(&path, &deny).unwrap();
         append_decision(&path, &allow_claim("a2", "unit-2")).unwrap();
 
-        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1").unwrap();
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap();
         assert!(
             denial.as_deref().is_some_and(|d| d.contains("d1")),
             "a Deny for unit-1 surfaces a denial naming the claim: {denial:?}"
@@ -838,7 +982,7 @@ mod tests {
         // RETRY-POISON FIX: a bumped attempt reads a CLEAN slate — attempt 0's Deny does NOT leak to
         // attempt 1 (so a human `confirm_gate` Approve / resume / redrive is no longer re-failed forever).
         assert_eq!(
-            fold_input_denial(&mut store, &run_id, 1, "unit-1").unwrap(),
+            fold_input_denial(&mut store, &run_id, 1, "unit-1", false).unwrap(),
             None,
             "attempt 1 does not inherit attempt 0's Deny"
         );
@@ -849,12 +993,64 @@ mod tests {
         let _ = std::fs::remove_file(&path2);
         std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
         std::fs::write(&path2, b"{ not valid json\n").unwrap();
-        let corrupt = fold_input_denial(&mut store, &run_id, 1, "unit-1").unwrap();
+        let corrupt = fold_input_denial(&mut store, &run_id, 1, "unit-1", false).unwrap();
         assert!(
             corrupt
                 .as_deref()
                 .is_some_and(|d| d.contains("fail-closed")),
             "a corrupted claim line DENIES (fail-closed), not Err: {corrupt:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    #[test]
+    fn governed_unit_evidence_integrity_fails_closed_on_tamper() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("evtest-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+
+        // (a) GOVERNED unit, NO log at all (erased gov dir / hook never fired) → DENY (fail closed).
+        let d = fold_input_denial(&mut store, &run_id, 0, "unit-1", true).unwrap();
+        assert!(
+            d.as_deref().is_some_and(|s| s.contains("NO decisions log")),
+            "a governed unit with no evidence fails closed: {d:?}"
+        );
+
+        // (b) GOVERNED unit, marker ONLY (legitimate zero-tool-call run) → allowed (Ok(None)).
+        let path = decisions_path_for(&run_id, 1);
+        write_armed_marker(&path, "unit-1").unwrap();
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 1, "unit-1", true).unwrap(),
+            None,
+            "a governed unit that made no tool-calls (marker only) is NOT denied"
+        );
+
+        // (c) GOVERNED unit, marker + a Deny claim → DENY (the real veto).
+        let mut deny = allow_claim("ev-d1", "unit-1");
+        deny.decision = Decision::Deny;
+        append_decision(&path, &deny).unwrap();
+        assert!(
+            fold_input_denial(&mut store, &run_id, 1, "unit-1", true)
+                .unwrap()
+                .is_some(),
+            "a governed unit with a recorded Deny is denied"
+        );
+
+        // (d) GOVERNED unit, claims present but marker ERASED (tampered) → DENY even with no surviving Deny.
+        let path2 = decisions_path_for(&run_id, 2);
+        append_decision(&path2, &allow_claim("ev-a1", "unit-1")).unwrap(); // an Allow, but NO marker
+        let d = fold_input_denial(&mut store, &run_id, 2, "unit-1", true).unwrap();
+        assert!(
+            d.as_deref()
+                .is_some_and(|s| s.contains("armed marker missing")),
+            "a governed unit whose armed marker was stripped fails closed: {d:?}"
+        );
+
+        // (e) UNGOVERNED unit with no log → inert (Ok(None)) — the fail-closure is governed-only.
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 3, "unit-1", false).unwrap(),
+            None,
+            "an ungoverned unit is never denied for missing evidence"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
@@ -867,12 +1063,14 @@ mod tests {
         // No resolvable store → deny (never fall back to a default/empty store — fail-OPEN).
         assert!(store_unavailable(None).is_some());
         assert!(store_unavailable(Some("")).is_some());
-        // A real file / :memory: is usable.
+        // :memory: → deny (a subprocess opens its OWN empty in-memory store → guaranteed allow).
+        assert!(store_unavailable(Some(":memory:")).is_some());
+        // A real file store is usable.
         assert!(store_unavailable(Some("/tmp/estate.db")).is_none());
-        assert!(store_unavailable(Some(":memory:")).is_none());
-        // The hook denies (exit 2) for both cases BEFORE reading stdin — never mis-creates a store.
+        // The hook denies (exit 2) for each fail-open case BEFORE reading stdin — never mis-creates a store.
         assert_eq!(run_gate_hook("s", "unit-1", Some("postgres://h/db")), 2);
         assert_eq!(run_gate_hook("s", "unit-1", None), 2);
+        assert_eq!(run_gate_hook("s", "unit-1", Some(":memory:")), 2);
         assert_eq!(
             run_output_gate_hook("s", "unit-1", Some("postgres://h/db")),
             2

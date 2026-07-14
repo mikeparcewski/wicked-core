@@ -39,6 +39,13 @@ impl EntityMode {
     }
 }
 
+/// The orchestration PHASE id for a unit — the single source of truth. Both the input-governance hook
+/// (via `--phase`) and the actor-side fold key on this exact string, so any drift would land claims at a
+/// phase the fold never queries (a silent allow). Derive it here, never re-`format!` it ad hoc.
+pub fn unit_phase(ord: u32) -> String {
+    format!("unit-{ord}")
+}
+
 /// Resolve the collection scope for `discriminator` under `mode`.
 ///
 /// - `Shared`   → `wicked-agent/<session>/shared` (the discriminator is ignored — all share it).

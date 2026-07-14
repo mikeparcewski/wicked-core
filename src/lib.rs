@@ -69,7 +69,7 @@ pub use event::CoreEvent;
 pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, run_gate_hook, run_output_gate_hook,
-    HookDrainSummary,
+    HookDrainSummary, DECISIONS_PATH_ENV, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
 };
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
