@@ -460,11 +460,15 @@ fn arm_input_governance(
             .write(true)
             .open(&settings_path)
             .or_else(|e| {
-                // Tolerate a legitimate re-arm (same unit, same attempt) by truncating our OWN prior file.
+                // On a clash, UNLINK the existing entry (remove_file removes a SYMLINK itself, never its
+                // target) then re-create fresh with O_EXCL. A truncate-reopen would FOLLOW a pre-placed
+                // symlink and overwrite an arbitrary file (gemini/Copilot security-critical); unlink+
+                // create_new tolerates a legitimate re-arm without ever writing through a symlink.
                 if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(&settings_path);
                     std::fs::OpenOptions::new()
+                        .create_new(true)
                         .write(true)
-                        .truncate(true)
                         .open(&settings_path)
                 } else {
                     Err(e)

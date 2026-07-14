@@ -271,14 +271,17 @@ fn with_append_lock<T>(
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Reclaim a STALE lock (a crashed holder never unlinked it): if the lockfile is older
-                // than a few seconds, remove it and retry immediately, so the mechanism self-heals
-                // instead of degrading to permanently-unlocked for the rest of the attempt (council [11]).
+                // Reclaim a STALE lock (a crashed holder never unlinked it): if the lockfile is old
+                // enough, remove it and retry immediately, so the mechanism self-heals instead of
+                // degrading to permanently-unlocked for the rest of the attempt (council [11]). The
+                // threshold is deliberately generous (30s) — a tiny claim append never takes that long,
+                // so a legitimate-but-IO-stalled writer is not falsely reclaimed into a concurrent-write
+                // race (Copilot), while a truly crashed holder is still recovered promptly.
                 let stale = std::fs::metadata(&lock)
                     .and_then(|m| m.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
-                    .map(|age| age.as_secs() >= 5)
+                    .map(|age| age.as_secs() >= 30)
                     .unwrap_or(false);
                 if stale {
                     let _ = std::fs::remove_file(&lock);
@@ -311,13 +314,22 @@ const ARMED_MARKER_KEY: &str = "_wicked_gov_armed";
 /// reasons (council [9]). The sensitive settings/decisions files live under this dir, so blocking
 /// traversal protects them regardless of individual file mode.
 pub(crate) fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        // Create with 0700 from the START (DirBuilder::mode) — no create-then-chmod window where the dir
+        // is briefly world-traversable (TOCTOU), and a mode failure PROPAGATES rather than silently
+        // leaving looser perms (gemini/Copilot). `recursive` no-ops an existing dir without re-chmod'ing
+        // it, which is fine — we only need the leaf we just made to be private.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+    }
 }
 
 /// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as claims).
@@ -357,17 +369,12 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
     let _ = append_decision(Path::new(decisions_path), &claim);
 }
 
-/// Whether `line` is the armed marker for exactly `phase`.
-fn is_armed_marker(line: &str, phase: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|v| {
-            v.get(ARMED_MARKER_KEY)
-                .and_then(|x| x.as_str())
-                .map(str::to_string)
-        })
-        .as_deref()
-        == Some(phase)
+/// If `v` is an armed-marker object, the phase it marks; else `None`. Checks the ROOT key
+/// (`v.get(ARMED_MARKER_KEY)`), NOT a substring — a substring match would let a crafted claim whose
+/// `criteria`/`obligations` merely CONTAIN the marker string be silently skipped by the fold, bypassing
+/// its Deny (gemini/Copilot security-critical). A real `ConformanceClaim` never carries this root key.
+fn marker_phase(v: &serde_json::Value) -> Option<&str> {
+    v.get(ARMED_MARKER_KEY).and_then(|x| x.as_str())
 }
 
 /// Fold a governed unit's INPUT-hook decisions into a single deny-dominant denial, for the run engine's
@@ -423,17 +430,29 @@ pub fn fold_input_denial(
         if !line.starts_with('{') {
             continue; // blank / non-claim line — not corruption
         }
-        if is_armed_marker(line, phase) {
-            saw_marker = true;
+        // Parse each line ONCE as a JSON value; a `{`-prefixed line that won't parse is un-evaluable
+        // governance evidence ⇒ deny-dominant (fail closed) via the normal terminal path, not a
+        // run-wedging Err.
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                if denial.is_none() {
+                    denial = Some(format!(
+                        "input governance denied {phase} (fail-closed): corrupted decision line: {e}"
+                    ));
+                }
+                continue;
+            }
+        };
+        // Armed marker (root-key check, not substring): note it for THIS phase, skip it as a claim.
+        if let Some(mp) = marker_phase(&v) {
+            if mp == phase {
+                saw_marker = true;
+            }
             continue;
         }
-        if line.contains(ARMED_MARKER_KEY) {
-            continue; // an armed marker for ANOTHER unit — not a claim, don't treat as corrupt
-        }
-        let claim: ConformanceClaim = match serde_json::from_str(line) {
+        let claim: ConformanceClaim = match serde_json::from_value(v) {
             Ok(c) => c,
-            // Un-evaluable governance evidence ⇒ deny-dominant (fail closed), routed through the normal
-            // terminal path rather than a run-wedging `Err`.
             Err(e) => {
                 if denial.is_none() {
                     denial = Some(format!(
@@ -510,9 +529,18 @@ pub fn apply_hook_decisions(
         if !line.starts_with('{') {
             continue;
         }
-        // FAIL CLOSED on a corrupted `{`-prefixed line: un-evaluable governance evidence must never be
-        // silently skipped into an allow (finding #10). A blank / non-`{` line was already `continue`d.
-        let claim: ConformanceClaim = serde_json::from_str(line).map_err(|e| {
+        // Parse once as a value. FAIL CLOSED on a corrupted `{`-prefixed line: un-evaluable governance
+        // evidence must never be silently skipped into an allow (finding #10). A blank / non-`{` line was
+        // already `continue`d.
+        let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+            anyhow::anyhow!("hook-decision drain DENY (fail-closed): corrupted claim line: {e}")
+        })?;
+        // Skip an armed-marker line (root-key check) — it is a launcher sentinel, not a claim, and would
+        // otherwise fail the drain closed.
+        if marker_phase(&v).is_some() {
+            continue;
+        }
+        let claim: ConformanceClaim = serde_json::from_value(v).map_err(|e| {
             anyhow::anyhow!("hook-decision drain DENY (fail-closed): corrupted claim line: {e}")
         })?;
         conform(store, &claim)?;
@@ -1051,6 +1079,22 @@ mod tests {
             fold_input_denial(&mut store, &run_id, 3, "unit-1", false).unwrap(),
             None,
             "an ungoverned unit is never denied for missing evidence"
+        );
+
+        // (f) SECURITY: a Deny claim whose CRITERIA merely CONTAINS the marker key string must STILL be
+        // detected — a substring match (the pre-fix bug) would misclassify it as a marker and skip it,
+        // bypassing the Deny. Key-based detection parses it as a claim → the Deny fires.
+        let path3 = decisions_path_for(&run_id, 4);
+        write_armed_marker(&path3, "unit-1").unwrap();
+        let mut evil = allow_claim("ev-evil", "unit-1");
+        evil.decision = Decision::Deny;
+        evil.criteria = format!("crafted to evade the fold: {ARMED_MARKER_KEY}");
+        append_decision(&path3, &evil).unwrap();
+        assert!(
+            fold_input_denial(&mut store, &run_id, 4, "unit-1", true)
+                .unwrap()
+                .is_some(),
+            "a Deny whose criteria contains the marker string is NOT skipped (no substring bypass)"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
