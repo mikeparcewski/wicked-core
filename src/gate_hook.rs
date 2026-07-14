@@ -207,9 +207,16 @@ fn encode_run_id(run_id: &str) -> String {
 /// so a prior terminal run's stale decisions can't fail a new run — see the launcher; resume/redrive
 /// deliberately do NOT clear it (they continue the same run's log).
 pub fn gov_run_dir(run_id: &str) -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join("wicked-core-gov")
-        .join(encode_run_id(run_id))
+    // Never resolve to the bare `wicked-core-gov` ROOT: an empty (or fully-escaped-away) run_id would
+    // otherwise make callers like `run_session`'s fresh-launch `remove_dir_all` wipe EVERY run's gov
+    // artifacts (Copilot). A non-empty placeholder keeps each run under its own subdir.
+    let enc = encode_run_id(run_id);
+    let enc = if enc.is_empty() {
+        "_empty".to_string()
+    } else {
+        enc
+    };
+    std::env::temp_dir().join("wicked-core-gov").join(enc)
 }
 
 /// The absolute decisions-log path that BOTH the launcher (which sets `WICKED_DECISIONS_PATH` on the

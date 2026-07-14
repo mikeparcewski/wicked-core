@@ -51,6 +51,7 @@ impl StepRunner for RecordingRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }
@@ -364,6 +365,7 @@ impl StepRunner for FixedOutRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }

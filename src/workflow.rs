@@ -97,6 +97,12 @@ pub struct StepOutput {
     pub usage: Option<Usage>,
     /// Data files the unit's CLI touched, from `tool_use` file paths (B4). Empty for passthrough seats.
     pub files: Vec<String>,
+    /// Whether the RUNNER armed input governance for this unit (wrote the decisions-log armed marker). Set
+    /// only by the wrapped-CLI runner when it injects the PreToolUse gate-hook; `false` for stub/test
+    /// runners and ungoverned units. The actor-side fold uses THIS (not unit properties) to decide whether
+    /// a missing/erased decisions log is a tamper DENY — so a claude-assigned STUB unit is never
+    /// false-denied for a log the wrapped runner never wrote (DES-OUTGOV-003 evidence integrity).
+    pub governed: bool,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`
@@ -143,6 +149,7 @@ impl StepRunner for StubStepRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }

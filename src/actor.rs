@@ -90,18 +90,6 @@ thread_local! {
     static GOV_OFF_WARNED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
 }
 
-/// Whether input governance is ARMED for the current (actor) thread's store — a file-backed store the
-/// gate-hook can open. Mirrors [`in_process_governance`]'s `Some` condition WITHOUT canonicalizing, so the
-/// fold can cheaply decide whether a governed unit's missing evidence should fail closed.
-pub(crate) fn in_process_governance_armed() -> bool {
-    GOV_DB_PATH.with(|c| {
-        c.borrow()
-            .as_deref()
-            .map(|p| p != ":memory:" && !p.contains("://"))
-            .unwrap_or(false)
-    })
-}
-
 /// The governance context for an IN-PROCESS governed unit (DES-OUTGOV-003 §4), or `None` when input
 /// governance cannot apply: no store armed, or a store the SQLite gate-hook subprocess cannot open
 /// independently — `:memory:` (cannot cross processes) or `postgres://` (SQLite-only hook; the
@@ -1206,6 +1194,8 @@ fn apply_step_result(
         // The applied output's attempt matches the launcher's `input.attempt`, so the fold reads the
         // SAME attempt-scoped decisions log the hook wrote (a bumped-attempt retry starts clean).
         output.attempt,
+        // The runner's authority on whether IT armed input governance (wrote the marker).
+        output.governed,
         &cli_keys,
         agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
@@ -1958,6 +1948,7 @@ mod terminal_gate_tests {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                governed: false,
             }
         }
     }

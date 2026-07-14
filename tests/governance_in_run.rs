@@ -182,6 +182,7 @@ impl StepRunner for HookDenyRunner {
             status: StepStatus::Ok, // the CLI itself SUCCEEDS — only governance denies
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }

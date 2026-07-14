@@ -58,6 +58,7 @@ impl StepRunner for GatedRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }
@@ -78,6 +79,7 @@ impl StepRunner for FastRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }

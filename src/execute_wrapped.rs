@@ -191,22 +191,6 @@ fn binary_is_claude(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether this unit's resolved invocation runs `claude` (the binary input governance targets). Mirrors
-/// `exec`'s `is_claude` decision — the first argv token after resolving the template — so the actor-side
-/// fold can independently determine a unit WAS governed (a claude unit on a file-backed store), which
-/// gates evidence-integrity fail-closure without threading a flag through `StepOutput`.
-pub(crate) fn unit_uses_claude(unit: &WorkUnit) -> bool {
-    let cli_key = unit.assigned_cli.as_deref().unwrap_or("claude");
-    let invocation = unit
-        .assigned_invocation
-        .clone()
-        .unwrap_or_else(|| resolve_invocation(cli_key));
-    tokenize(&invocation)
-        .first()
-        .map(|b| binary_is_claude(b))
-        .unwrap_or(false)
-}
-
 /// Append claude's `--output-format stream-json --verbose` flags to an already-built argv, INSERTED
 /// before any `--` end-of-options guard so they are parsed as flags (never demoted to positional args
 /// after the prompt). Per-binary rule — only applied when the resolved binary is `claude`; no other
@@ -303,7 +287,8 @@ impl WrappedCliStepRunner {
                         status: StepStatus::Failed,
                         usage: None,
                         files: Vec::new(),
-                    }
+                        governed: false, // arming failed → not governed (and the unit fails anyway)
+                    };
                 }
             },
             _ => None,
@@ -373,6 +358,10 @@ impl WrappedCliStepRunner {
             status,
             usage,
             files,
+            // The wrapped-CLI runner is the ONLY authority on whether input governance was armed (it wrote
+            // the armed marker). The fold trusts this, not unit properties, so a stub/test runner never
+            // false-denies a claude-assigned unit for a marker it never wrote.
+            governed: gov_env.is_some(),
         }
     }
 }

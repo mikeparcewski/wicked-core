@@ -151,6 +151,10 @@ struct CompletedTask {
     usage: Option<crate::workflow::Usage>,
     #[serde(default)]
     files: Vec<String>,
+    /// Whether the off-actor runner armed input governance (wrote the armed marker) — carried so the
+    /// actor-side fold applies evidence-integrity fail-closure identically for the bus delivery mode.
+    #[serde(default)]
+    governed: bool,
 }
 
 /// The wire form of the `(pass, reasoning)` agent verdict `ApplyStepResult` carries.
@@ -581,6 +585,7 @@ fn run_cli_runner(
                         .map(|(pass, reasoning)| AgentVerdictWire { pass, reasoning }),
                     usage: output.usage.clone(),
                     files: output.files.clone(),
+                    governed: output.governed,
                 };
                 let payload = match serde_json::to_value(&completed) {
                     Ok(v) => v,
@@ -667,6 +672,7 @@ fn run_task_completed_poller(
                     status: status_from_str(&task.status),
                     usage: task.usage,
                     files: task.files,
+                    governed: task.governed,
                 };
                 let agent_verdict = task.agent_verdict.map(|v| (v.pass, v.reasoning));
                 // Reach the actor ONLY via the command channel (the self_tx write-back pattern). A closed
@@ -858,6 +864,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    governed: false,
                 }
             }
         }

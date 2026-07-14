@@ -86,6 +86,7 @@ pub fn run_session(
             entity_mode,
             session_id,
             0, // sync straight-through path is ungoverned (stub work) — the fold is inert (no log)
+            false, // the stub sync path never arms governance
             &cli_keys,
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             emit,
@@ -368,6 +369,7 @@ pub(crate) fn apply_and_finish_unit(
     entity_mode: EntityMode,
     session_id: &str,
     attempt: u32,
+    governed: bool,
     cli_keys: &[String],
     agent_verdict: Option<&(bool, String)>,
     emit: &mut dyn FnMut(CoreEvent),
@@ -438,11 +440,10 @@ pub(crate) fn apply_and_finish_unit(
     // each of THIS phase's claims as durable evidence, and surface any Deny. Inert (`None`) for
     // ungoverned / sync runs (no decisions log written). A denied tool-call thus drives the unit gate
     // Rejected → the run Failed through the UNCHANGED completion path.
-    // A unit was GOVERNED iff it ran claude on a file-backed store (the exact condition the launcher armed
-    // on). This gates evidence-integrity fail-closure: a governed unit whose armed marker is missing
-    // (erased/never-fired) DENIES; an ungoverned unit's fold is inert.
-    let governed = crate::execute_wrapped::unit_uses_claude(unit)
-        && crate::actor::in_process_governance_armed();
+    // `governed` is the RUNNER's authority (it armed the hook + wrote the marker), NOT a derivation from
+    // unit properties — so a claude-assigned STUB/test unit (which never armed) is never false-denied for
+    // a missing log. It gates evidence-integrity fail-closure: a governed unit whose armed marker is
+    // missing (erased/never-fired) DENIES; an ungoverned unit's fold is inert.
     let hook_denial = crate::gate_hook::fold_input_denial(
         store,
         session_id,

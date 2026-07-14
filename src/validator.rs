@@ -1647,6 +1647,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    governed: false,
                 }
             }
         }
