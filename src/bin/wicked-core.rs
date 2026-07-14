@@ -596,7 +596,22 @@ fn domain_graph_cmd(args: &[String]) {
                         || file.resolved != coverage.resolved
                         || file.risk_flagged != coverage.risk_flagged
                         || file.unaccounted != coverage.unaccounted;
-                    if ints_disagree || (file.coverage - coverage.coverage).abs() > 1e-4 {
+                    // Also compare the actual HOLE SET (unaccounted symbol_ids) — a file whose top-level
+                    // counts match but whose holes are a different set is a stale/different graph.
+                    let hole_set = |r: &wicked_governance::CoverageReport| {
+                        let mut v: Vec<&str> = r
+                            .unaccounted_nodes
+                            .iter()
+                            .map(|n| n.symbol_id.as_str())
+                            .collect();
+                        v.sort_unstable();
+                        v.join(",")
+                    };
+                    let holes_disagree = hole_set(&file) != hole_set(&coverage);
+                    if ints_disagree
+                        || holes_disagree
+                        || (file.coverage - coverage.coverage).abs() > 1e-4
+                    {
                         fail(&format!(
                             "domain-graph: supplied --coverage {coverage_path} DISAGREES with the store \
                              recompute (file coverage={:.4}/unaccounted={}, store coverage={:.4}/unaccounted={}) \
@@ -607,8 +622,11 @@ fn domain_graph_cmd(args: &[String]) {
                     }
                 }
                 Err(e) => {
+                    // A deserialize error here is EITHER invalid JSON OR a valid-JSON-but-wrong-shape file
+                    // (deny_unknown_fields rejects a stray/extra key) — say so rather than only "invalid JSON".
                     fail(&format!(
-                        "domain-graph: supplied --coverage {coverage_path} is not valid JSON: {e}"
+                        "domain-graph: supplied --coverage {coverage_path} does not match the coverage \
+                         schema (invalid JSON or an unexpected/missing field): {e}"
                     ));
                     return;
                 }

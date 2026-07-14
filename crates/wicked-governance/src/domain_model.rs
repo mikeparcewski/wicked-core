@@ -404,6 +404,7 @@ pub fn recompute_front_half_coverage_with(
     let mut behavior_bearing: u64 = 0;
     let mut resolved: u64 = 0;
     let mut risk_flagged: u64 = 0;
+    let mut unaccounted: u64 = 0;
     let mut confidences: Vec<f64> = Vec::new();
     let mut unaccounted_nodes: Vec<UnaccountedNode> = Vec::new();
 
@@ -428,6 +429,7 @@ pub fn recompute_front_half_coverage_with(
                 acc.risk_flagged += 1;
             }
             Bucket::Unaccounted => {
+                unaccounted += 1;
                 acc.unaccounted += 1;
                 unaccounted_nodes.push(UnaccountedNode {
                     symbol_id: node.symbol.as_str().to_string(),
@@ -439,7 +441,9 @@ pub fn recompute_front_half_coverage_with(
             }
         }
     }
-    let unaccounted = behavior_bearing - resolved - risk_flagged;
+    // `unaccounted` is COUNTED directly (not derived by subtraction) so it can never u64-underflow-wrap
+    // in release; the three buckets partition the behavior-bearing set by construction.
+    debug_assert_eq!(resolved + risk_flagged + unaccounted, behavior_bearing);
 
     // Surface any unrecognized Other tag once (release-safe — eprintln!, not debug_assert!).
     for tag in &unknown_other {
