@@ -133,12 +133,12 @@ pub fn normalize_bundle(
         let mut rule: ConformanceRule = serde_json::from_value(raw.clone()).map_err(|e| {
             anyhow::anyhow!("conformance rule from {source:?} failed to parse: {e}")
         })?;
-        // Stamp the connector as `provenance.source` (the ingest legitimately knows it). But `ref`
-        // (WHERE in the source) and `source_kinds` (the evidence kind) the ingest CANNOT infer — the
-        // wire schema requires them, so a doc that omits them is a HARD failure, never fabricated.
-        if rule.provenance.source.is_empty() {
-            rule.provenance.source = source.to_string();
-        }
+        // Stamp the connector as `provenance.source` AUTHORITATIVELY (always overwrite): the adapter
+        // that actually read the doc is the source of truth, so a doc cannot spoof a different source.
+        // But `ref` (WHERE in the source) and `source_kinds` (the evidence kind) the ingest CANNOT
+        // infer — the wire schema requires them, so a doc that omits them is a HARD failure, never
+        // fabricated.
+        rule.provenance.source = source.to_string();
         if rule.provenance.reference.is_none() || rule.provenance.source_kinds.is_empty() {
             anyhow::bail!(
                 "conformance rule {:?} from {source:?} has incomplete provenance — the wire contract \
@@ -372,7 +372,8 @@ mod tests {
 
     #[test]
     fn filesystem_adapter_reads_json_bundles_in_order() {
-        let dir = std::env::temp_dir().join("wicked-gov-ingest-fs-test");
+        // Per-process unique dir so concurrent test binaries don't collide on a fixed path.
+        let dir = std::env::temp_dir().join(format!("wicked-gov-ingest-fs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(

@@ -236,7 +236,7 @@ pub struct RuleQuery {
 /// Recall the conformance rules that apply to `query`. Facet semantics (ported from
 /// `conformance-store.recallRules`): `language`/`layer`/`framework` match when the rule's facet is
 /// ABSENT (wildcard — applies broadly) OR equals the query; `severity`/`rule_type` are exact.
-/// Results are ordered severity-first (critical→low) then rule id — deterministic + enforcement-ready.
+/// Results are ordered severity-first (critical→info) then rule id — deterministic + enforcement-ready.
 pub fn recall_rules(
     store: &dyn GraphRead,
     query: &RuleQuery,
@@ -259,6 +259,13 @@ pub fn recall_rules(
 
     let mut matched: Vec<ConformanceRule> = Vec::new();
     for node in store.find_symbols(&sym_query)? {
+        // A SHARED estate store may hold other `NodeKind::Rule` nodes (e.g. estate's W15 rules
+        // engine). Only OUR conformance rules carry the `conformance_rule/<id>` synthetic symbol —
+        // identify by that round-trip and skip foreign Rule nodes, so recall never fails on someone
+        // else's node (from_node still surfaces corruption in OUR own nodes below).
+        if node.symbol != synthetic_symbol(CONFORMANCE_RULE, &node.name) {
+            continue;
+        }
         let rule = ConformanceRule::from_node(&node)?;
         if facet_matches(&rule.targets.language, &query.language)
             && facet_matches(&rule.targets.layer, &query.layer)
@@ -282,7 +289,7 @@ pub fn recall_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wicked_apps_core::open_store;
+    use wicked_apps_core::{open_store, GraphWrite};
 
     fn rule(id: &str, ty: RuleType, sev: ConfSeverity, targets: Targets) -> ConformanceRule {
         ConformanceRule {
@@ -542,6 +549,38 @@ mod tests {
         assert!(
             register_rule(&mut store, &bad).is_err(),
             "INV-C1 blocks the write"
+        );
+    }
+
+    #[test]
+    fn recall_skips_foreign_rule_nodes() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-001",
+                RuleType::Pattern,
+                ConfSeverity::Info,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        // A foreign NodeKind::Rule node (NOT a conformance rule — e.g. estate's W15 rules engine).
+        let foreign = Node::new(
+            synthetic_symbol("w15_rule", "R-42"),
+            NodeKind::Rule,
+            "R-42".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new("w15_rule/R-42".to_string(), Span::ZERO),
+        );
+        store.begin_batch().unwrap();
+        store.upsert_nodes(&[foreign]).unwrap();
+        store.commit_batch().unwrap();
+        // recall must SUCCEED (not error on the foreign node) and return only our conformance rule.
+        let got = recall_rules(&store, &RuleQuery::default()).unwrap();
+        assert_eq!(
+            got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-001"]
         );
     }
 }
