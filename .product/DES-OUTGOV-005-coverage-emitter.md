@@ -39,8 +39,9 @@ predicates**, and the numerator MUST EXCLUDE description.
     - estate-structural / any other `Other(_)` → structural:
       `{"dataset","cics_map","ims_database","ims_segment","parent", …}` and every unrecognized tag. NOTE
       this Other-default is fail-OPEN (a NEW behavior extractor's tag silently escapes) — the ONLY residual
-      fail-open path, mitigated by the config seam + a `debug_assert`/log on an unrecognized `Other` tag so
-      it is surfaced, not silent.
+      fail-open path, mitigated by the config seam + an `eprintln!` WARN (NOT `debug_assert!`, which is
+      compiled out of release) on each distinct unrecognized `Other` tag, so it is surfaced in production,
+      not silent.
   - `has_behavior_out` = precomputed ONCE from `all_edges()`: an edge whose source == node.symbol and kind
     ∈ `{Calls, References, Evaluates, Produces, Governs, Other("uses"), Other("accesses"), Other("invokes")}`.
     (Verified against the real `EdgeKind` enum, node.rs — the native rule-engine edges `Evaluates`/
@@ -64,8 +65,18 @@ predicates**, and the numerator MUST EXCLUDE description.
   `resolved` = (requirement present AND `requirement_validated == true`) OR (business_rule ann with
   `confidence >= resolve_threshold`, default 0.75). `risk_flagged` = accounted-but-not-resolved. Note:
   `NodeSemantics` has NO confidence field → requirement nodes split on `requirement_validated` (bool);
-  annotation nodes split on `annotation.confidence` vs threshold. `mean_confidence` averages only settled
-  nodes carrying a numeric confidence (annotation-backed).
+  annotation nodes split on `annotation.confidence` vs threshold. `mean_confidence` averages only
+  **RESOLVED** nodes carrying a numeric confidence (annotation-backed) — coverage.py appends conf solely
+  inside the `state == "resolved"` branch (coverage.py:536-540) and labels the field `mean_confidence
+  (resolved)` (:625); risk-bucketed nodes (below-threshold business_rule, or risk rows) are EXCLUDED. (The
+  schema prose at coverage.schema.json:91 says "across settled nodes" — imprecise; per §Wire-shape "take
+  only the ALGORITHM from coverage.py" the port follows the CODE = resolved-only.) So
+  `resolved_rate = resolved/(resolved+risk_flagged)` is the settled-driven ratio; `mean_confidence` is NOT.
+- **Confidence-range guard (fail-closed, NEVER clamp)**: before any `annotation.confidence` feeds the
+  resolved/risk split OR the `mean_confidence` average, recompute MUST reject an out-of-range value —
+  `if !(0.0..=1.0).contains(&conf) { bail!(<symbol_id> + value) }` — identical to build_domain_model
+  (domain_model.rs:249/284). The standalone `wicked-core coverage` path never calls build_domain_model, so
+  without this the "only sanctioned producer" could emit a schema-invalid `mean_confidence > 1.0`.
 
 ## Wire shape — `CoverageReport` (schema-exact; the wire mismatch fix)
 Current `{coverage: f64, unaccounted: Vec<String>}` (domain_model.rs:150-156) does NOT match the kept
@@ -112,22 +123,45 @@ Current `{coverage: f64, unaccounted: Vec<String>}` (domain_model.rs:150-156) do
    - `Namespace`/`Trait`/`Constructor` are behavior-bearing; `RuleSet`/`Condition`/`Action`/`Fact`/
      `Synthetic` structural. This is the single most gate-soundness-sensitive decision — under-counting the
      denominator silently passes holes, so the native match is exhaustive/compiler-enforced.
-2. **Behavior-out EdgeKind set** (Module dead-shell test): {Calls, References, Other("uses"/"accesses"/
-   "invokes")}. Imports/Instantiates/Implements/InvokedBy EXCLUDED (structural/inverse). Only affects
-   Module nodes (rare in the functional path) — pinned for determinism.
-3. **`per_app` grouping**: group by the builder's private `package_dir` fn (reuse it); a store with no
-   package structure collapses to a single synthetic app `"graph"` (matches coverage.py's default).
-   Emit the ARRAY form (the grep-validator's mock uses an object — the emitter must emit the schema array).
+2. **Behavior-out EdgeKind set** (Module dead-shell test) — the normative set lives in §Two-predicate
+   (above): `{Calls, References, Evaluates, Produces, Governs, Other("uses"/"accesses"/"invokes")}`. This
+   is RATIONALE only: the set intentionally EXTENDS coverage.py's `BEHAVIOR_EDGE_KINDS` (coverage.py:96)
+   with the native rule-engine edges `Evaluates`/`Produces`/`Governs` (verified in the real `EdgeKind`
+   enum, `edge.rs` — NOT node.rs, which holds NodeKind) so a live rules Module is never falsely
+   dead-shell-excluded (denominator-generous = fail-closed-safe). `Contains`/`Defines`/`Imports`/`Extends`/
+   `Implements`/`HasType`/`Returns`/`Instantiates`/`Overrides`/`InvokedBy` EXCLUDED (structural/inverse).
+3. **`per_app` grouping**: group by the builder's private `package_dir` fn (reuse it). A store whose nodes
+   are all at repo root collapses to a single app named **`"(root)"`** — `package_dir`'s actual root
+   sentinel (consistent with the Domain grouping at domain_model.rs:327-330). This DIVERGES from
+   coverage.py deliberately: coverage.py's `"graph"` is its injected-nodes test fallback and its production
+   per_app is keyed by estate DB, neither of which maps onto wicked-core's single-store `all_nodes()`
+   recompute — there is NO `"graph"` fallback here. Emit the ARRAY form (the grep-validator's mock uses an
+   object — the emitter must emit the schema array). The per_app test asserts the `"(root)"` label.
 4. **`--out` path collision**: the grep validator reads bare `coverage-report.json` from the phase
    worktree cwd (domain_extraction.rs:43) while domain-graph defaults `--coverage` to
    `.wicked-estate/coverage-report.json`. **DECISION: make domain-graph's internal recompute PRIMARY** so
    the file location stops mattering for the gate consumer; `coverage --out` defaults to bare
-   `coverage-report.json` (cwd) to match the grep validator when run standalone.
+   `coverage-report.json` (cwd) to match the grep validator when run standalone. The current
+   hard-fail-on-missing-file path (bin:579-584, the `Err(e) => fail("… cannot read coverage report …")`
+   arm) MUST change to recompute-from-store when `--coverage` is absent/unsupplied; fail ONLY on a
+   supplied-but-corrupt file or on a cross-check disagreement — else `--coverage` is not truly optional.
 5. **Internal-recompute vs existing tests** (LOAD-BEARING): the unconditional store-recompute + fail-closed
    breaks builder unit tests that seed a bare/description-only node while passing a hand-fed `coverage:1.0`
-   (those stores are genuinely `<1.0` under a faithful recompute). **DECISION: re-author those fixtures**
-   to seed genuinely-accounted nodes (add a `business_rule`/`requirement` ann) so recomputed coverage is
-   really 1.0 — do NOT weaken the recompute. Fix the false doc comment at domain_model.rs:220-228.
+   (those stores are genuinely `<1.0` under a faithful recompute). **DECISION: re-author those fixtures —
+   TWO distinct cases** (a blanket "add an annotation" is WRONG for the drop-proving test):
+   - (a) A node whose PRESENCE in the output is the point → add a `business_rule`/`requirement` annotation
+     so it is genuinely ACCOUNTED (and kept). Applies to nodes that should appear as kept requirements.
+   - (b) A bare node that exists to DEMONSTRATE the builder DROPS structural nodes — specifically
+     `scaffold` in `build_domain_model_groups_behavior_by_package_dir` (domain_model.rs:457) — must NOT be
+     annotated (annotating it makes it accounted AND kept via the keep-set at :272-274, adding a 3rd
+     billing requirement and breaking `assert_eq!(billing.requirements.len(), 2)` at :521-525). Instead
+     RE-TYPE it to a structural `NodeKind` (`Field` or `Constant` — both in the §Two-predicate structural
+     set) so it leaves the coverage denominator entirely (no longer behavior-bearing → not counted →
+     recompute stays 1.0) while still proving the drop.
+   Do NOT weaken the recompute. Fix the false doc comment at domain_model.rs:220-228, AND the stale TRUST
+   BOUNDARY doc block at src/bin/wicked-core.rs:547-558 (its closing sentence says store-bound recompute
+   "is a follow-on, not this increment" — this increment now delivers it; the new comment states recompute
+   is PRIMARY and a supplied `--coverage` file is an optional cross-check that must agree).
 6. **Consumer deserialize compat**: +9 required fields break deserializing an older/hand-written report.
    **DECISION: hard error (schema-faithful fail-closed)** — a report missing the fields is not trustworthy;
    the emitter is the only sanctioned producer.
