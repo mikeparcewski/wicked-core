@@ -20,8 +20,11 @@
 //!       # gated one so the rev0.4 dual-validator gate actually engages
 //!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
 //!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
+//!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
+//!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
-//!       # requirements_graph.json (gates FAIL-CLOSED on front-half coverage == 1.0; modern package-dir grouping)
+//!       # requirements_graph.json (front-half coverage RECOMPUTED from the store, FAIL-CLOSED on < 1.0;
+//!       # a supplied --coverage file is an optional cross-check that must agree; modern package-dir grouping)
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
 use std::io::BufRead;
@@ -117,6 +120,7 @@ fn main() {
         Some("gate-phase") => return gate_phase_cmd(&args),
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
+        Some("coverage") => return coverage_cmd(&args),
         _ => {}
     }
 
@@ -550,39 +554,17 @@ fn print_status(core: &Core) {
 /// dir grouping, M5), and writes the artifact. Like the other pre-`Core::spawn` subcommands it opens
 /// the store directly for a brief read and never spawns the actor.
 ///
-/// TRUST BOUNDARY (known, tracked): the coverage report is a SEPARATE file, not bound to the store
-/// being translated — a stale report could green-light a different graph. In the workflow this is
-/// safe: `domain-extraction.json` orders `extract → coverage → domain-graph` (phase `depends_on`) over
-/// the same store in one run. The stronger guarantee — recompute front-half coverage directly from the
-/// store — needs the coverage-predicate port (a salvage item from RET-BRAIN-DOMAIN-001) and is a
-/// follow-on, not this increment.
+/// STORE-BOUND coverage (core#25): front-half coverage is now RECOMPUTED directly from the store as the
+/// PRIMARY source — the gate no longer trusts a separate file. A supplied `--coverage <file>` is an
+/// optional cross-check that must AGREE with the recompute (fail-closed on disagreement). This closes the
+/// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
+/// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
-    let coverage_path = flag(args, "--coverage")
-        .unwrap_or_else(|| ".wicked-estate/coverage-report.json".to_string());
     let out_path = flag(args, "--out")
         .unwrap_or_else(|| ".wicked-estate/requirements/requirements_graph.json".to_string());
     // The schema pins metadata.schema_version to const "1.0.0" — a consumer rejects a version it has
     // no validator for, so the emitted document must carry exactly this.
     let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.0.0".to_string());
-
-    let coverage: wicked_governance::CoverageReport = match std::fs::read_to_string(&coverage_path)
-    {
-        Ok(s) => match serde_json::from_str(&s) {
-            Ok(c) => c,
-            Err(e) => {
-                fail(&format!(
-                    "domain-graph: coverage report {coverage_path} is not valid JSON: {e}"
-                ));
-                return;
-            }
-        },
-        Err(e) => {
-            fail(&format!(
-                "domain-graph: cannot read coverage report {coverage_path}: {e} — run extraction + coverage first"
-            ));
-            return;
-        }
-    };
 
     let store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
@@ -592,7 +574,50 @@ fn domain_graph_cmd(args: &[String]) {
         }
     };
 
-    // Fail-closed: `build_domain_model` bails when coverage < 1.0 (never translates a partial graph).
+    // Front-half coverage is RECOMPUTED from the store (PRIMARY — the store is the source of truth, not a
+    // trusted external file). A supplied `--coverage <file>` is an optional CROSS-CHECK that must AGREE;
+    // an absent/unsupplied file is NOT an error (recompute stands). (DES-OUTGOV-005 decision #4.)
+    let coverage = match wicked_governance::recompute_front_half_coverage(&store) {
+        Ok(c) => c,
+        Err(e) => {
+            fail(&format!("domain-graph: coverage recompute failed: {e}"));
+            return;
+        }
+    };
+    if let Some(coverage_path) = flag(args, "--coverage") {
+        match std::fs::read_to_string(&coverage_path) {
+            Ok(s) => match serde_json::from_str::<wicked_governance::CoverageReport>(&s) {
+                Ok(file) => {
+                    if (file.coverage - coverage.coverage).abs() > f64::EPSILON
+                        || file.unaccounted != coverage.unaccounted
+                    {
+                        fail(&format!(
+                            "domain-graph: supplied --coverage {coverage_path} DISAGREES with the store \
+                             recompute (file coverage={:.4}/unaccounted={}, store coverage={:.4}/unaccounted={}) \
+                             — refusing (fail-closed)",
+                            file.coverage, file.unaccounted, coverage.coverage, coverage.unaccounted
+                        ));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    fail(&format!(
+                        "domain-graph: supplied --coverage {coverage_path} is not valid JSON: {e}"
+                    ));
+                    return;
+                }
+            },
+            Err(e) => {
+                fail(&format!(
+                    "domain-graph: supplied --coverage {coverage_path} cannot be read: {e}"
+                ));
+                return;
+            }
+        }
+    }
+
+    // Fail-closed: `build_domain_model` bails when coverage < 1.0 (never translates a partial graph) AND
+    // recomputes internally, so a store hole denies even if the passed report claimed 1.0.
     let model = match wicked_governance::build_domain_model(&store, &coverage, &schema_version) {
         Ok(m) => m,
         Err(e) => {
@@ -617,6 +642,47 @@ fn domain_graph_cmd(args: &[String]) {
             model.domains.len()
         ),
         Err(e) => fail(&format!("domain-graph: cannot write {out_path}: {e}")),
+    }
+}
+
+/// `wicked-core coverage [--out F]` — recompute the front-half coverage report DIRECTLY from the store
+/// and emit `coverage-report.json` (schema-exact). `--out` defaults to a bare `coverage-report.json` in
+/// the cwd so the shipped grep validator (which reads that path from the phase worktree) finds it
+/// (DES-OUTGOV-005 decision #4). Opens the store directly for a brief read; never spawns the actor.
+fn coverage_cmd(args: &[String]) {
+    let out_path = flag(args, "--out").unwrap_or_else(|| "coverage-report.json".to_string());
+    let store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("coverage: open store failed: {e}"));
+            return;
+        }
+    };
+    let report = match wicked_governance::recompute_front_half_coverage(&store) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("coverage: recompute failed: {e}"));
+            return;
+        }
+    };
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                fail(&format!(
+                    "coverage: cannot create {}: {e}",
+                    parent.display()
+                ));
+                return;
+            }
+        }
+    }
+    let json = serde_json::to_string_pretty(&report).expect("CoverageReport serializes to JSON");
+    match std::fs::write(&out_path, json) {
+        Ok(()) => println!(
+            "coverage: {:.4} ({} behavior-bearing, {} unaccounted) → {out_path}",
+            report.coverage, report.behavior_bearing, report.unaccounted
+        ),
+        Err(e) => fail(&format!("coverage: cannot write {out_path}: {e}")),
     }
 }
 

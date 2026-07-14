@@ -43,9 +43,10 @@ pub use conformance::{
 
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).
 pub use domain_model::{
-    assert_front_half_coverage, build_domain_model, CoverageReport, Domain, DomainModel, Entity,
-    EntityField, ErrorPath, Metadata as DomainMetadata, Provenance as DomainProvenance,
-    Requirement, Rule as DomainRule, Validation,
+    assert_front_half_coverage, build_domain_model, recompute_front_half_coverage,
+    recompute_front_half_coverage_with, CoverageConfig, CoverageReport, Domain, DomainModel, Entity,
+    EntityField, ErrorPath, Metadata as DomainMetadata, PerApp, Provenance as DomainProvenance,
+    Requirement, Rule as DomainRule, UnaccountedNode, Validation, DEFAULT_RESOLVE_THRESHOLD,
 };
 pub use ingest::{
     ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,

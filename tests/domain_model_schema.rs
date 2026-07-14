@@ -73,7 +73,7 @@ fn built_domain_model_validates_against_the_kept_schema() {
 
     let coverage = CoverageReport {
         coverage: 1.0,
-        unaccounted: vec![],
+        ..Default::default()
     };
     let model = build_domain_model(&store, &coverage, "1.0.0").expect("build");
     let instance = serde_json::to_value(&model).unwrap();
