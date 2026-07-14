@@ -316,15 +316,17 @@ const ARMED_MARKER_KEY: &str = "_wicked_gov_armed";
 pub(crate) fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        // Create with 0700 from the START (DirBuilder::mode) — no create-then-chmod window where the dir
-        // is briefly world-traversable (TOCTOU), and a mode failure PROPAGATES rather than silently
-        // leaving looser perms (gemini/Copilot). `recursive` no-ops an existing dir without re-chmod'ing
-        // it, which is fine — we only need the leaf we just made to be private.
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        // Create with 0700 from the START (DirBuilder::mode) — dirs it CREATES have no create-then-chmod
+        // window where they are briefly world-traversable.
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
+            .create(dir)?;
+        // `DirBuilder::mode` does NOT re-chmod an ALREADY-EXISTING leaf (a prior run's dir, or one an
+        // attacker pre-created loose after the fresh-launch clear), so tighten the leaf explicitly and
+        // PROPAGATE any failure — never silently leave governance artifacts world-readable (gemini/Copilot).
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
     }
     #[cfg(not(unix))]
     {

@@ -449,8 +449,9 @@ fn arm_input_governance(
         .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
     crate::gate_hook::create_dir_all_private(&dir)?;
     // Per-unit settings file. Written with `create_new` (O_EXCL) so a local attacker who predicts the
-    // deterministic temp path can't pre-place a symlink and redirect the write (council [6] TOCTOU); a
-    // clash means either a re-arm of the same unit or an attack — either way fail closed by erroring.
+    // deterministic temp path can't pre-place a symlink and redirect the write (council [6] TOCTOU). On a
+    // clash we UNLINK the existing entry (removing a symlink itself, not its target) and re-create fresh
+    // with O_EXCL — tolerating a legitimate re-arm without ever writing through a pre-placed symlink.
     let settings_path = dir.join(format!("settings-{phase}.json"));
     let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
     {
