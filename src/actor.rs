@@ -383,6 +383,26 @@ pub(crate) fn run(
                     Ok(StepApplied::Stale) => {}
                     Err(e) => {
                         emit_run_error(&mut subscribers, &run_id, e);
+                        // Never leave a run non-terminal on an apply error — that would wedge the session
+                        // at `Executing` (and a campaign node at `Running`) and re-execute the unit on
+                        // every restart. Drive a clean terminal `Failed`, mirroring the deny path, so
+                        // resume/redrive/relaunch recover cleanly.
+                        if let Ok(Some(mut session)) = crate::domain::get_session(&store, &run_id) {
+                            if !matches!(
+                                session.status,
+                                SessionStatus::Completed
+                                    | SessionStatus::Cancelled
+                                    | SessionStatus::Failed
+                            ) {
+                                let _ = fail_run(
+                                    &mut store,
+                                    &mut subscribers,
+                                    &self_tx,
+                                    &mut session,
+                                    0,
+                                );
+                            }
+                        }
                         in_flight.remove(&run_id);
                     }
                 }
@@ -798,6 +818,25 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
     });
 }
 
+/// Reject a session id carrying shell-hostile or control characters. Governance now passes scope/phase
+/// (which embed the id) to the gate-hook via ENV, so such characters can no longer inject the shell hook
+/// command — but rejecting them at ingress is defense-in-depth: a hostile id is a caller/attacker signal,
+/// never a legitimate run id, and it also keeps the derived scope strings clean.
+fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
+    const HOSTILE: &[char] = &[
+        '"', '\'', '`', '$', ';', '|', '&', '<', '>', '\\', '\n', '\r', '\0',
+    ];
+    if run_id
+        .chars()
+        .any(|c| HOSTILE.contains(&c) || c.is_control())
+    {
+        anyhow::bail!(
+            "invalid session id (contains a shell-hostile or control character): {run_id:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The body of `Command::LaunchRun` (also the campaign driver's node launcher, DES §4). Plans +
 /// distributes synchronously, then advances unit 0 off-thread (or pauses at a gate). Idempotent by
 /// run id: refuses to re-plan over a live run (resume it instead). Returns the run id.
@@ -811,6 +850,7 @@ pub(crate) fn launch_run_inner(
     spec: LaunchSpec,
 ) -> anyhow::Result<String> {
     let run_id = spec.session_id.clone();
+    validate_session_id(&run_id)?;
     if in_flight.contains(&run_id) {
         return Err(RunBusy(run_id).into());
     }
@@ -823,6 +863,10 @@ pub(crate) fn launch_run_inner(
             return Err(RunExists(run_id, format!("{:?}", existing.status)).into());
         }
     }
+    // FRESH (re-)launch: clear any prior TERMINAL run's per-run governance dir so a stale Deny from that
+    // run can't spuriously fail this one (decisions_path_for is never otherwise truncated). resume_run_inner
+    // / redrive do NOT clear — they continue the same run's log. A brand-new id has no dir (harmless no-op).
+    let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
     pipeline::plan_and_distribute(
@@ -1125,6 +1169,9 @@ fn apply_step_result(
         &workflow_id,
         entity_mode,
         &run_id,
+        // The applied output's attempt matches the launcher's `input.attempt`, so the fold reads the
+        // SAME attempt-scoped decisions log the hook wrote (a bumped-attempt retry starts clean).
+        output.attempt,
         &cli_keys,
         agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),

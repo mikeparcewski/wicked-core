@@ -81,6 +81,7 @@ pub fn run_session(
             &workflow_id,
             entity_mode,
             session_id,
+            0, // sync straight-through path is ungoverned (stub work) — the fold is inert (no log)
             &cli_keys,
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             emit,
@@ -362,6 +363,7 @@ pub(crate) fn apply_and_finish_unit(
     workflow_id: &str,
     entity_mode: EntityMode,
     session_id: &str,
+    attempt: u32,
     cli_keys: &[String],
     agent_verdict: Option<&(bool, String)>,
     emit: &mut dyn FnMut(CoreEvent),
@@ -432,8 +434,12 @@ pub(crate) fn apply_and_finish_unit(
     // each of THIS phase's claims as durable evidence, and surface any Deny. Inert (`None`) for
     // ungoverned / sync runs (no decisions log written). A denied tool-call thus drives the unit gate
     // Rejected → the run Failed through the UNCHANGED completion path.
-    let hook_denial =
-        crate::gate_hook::fold_input_denial(store, session_id, &format!("unit-{}", unit.ord))?;
+    let hook_denial = crate::gate_hook::fold_input_denial(
+        store,
+        session_id,
+        attempt,
+        &format!("unit-{}", unit.ord),
+    )?;
 
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
     let validator_denial = det_denial

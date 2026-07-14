@@ -57,12 +57,21 @@ const EVAL_AT_BASE: i64 = 1_750_000_000;
 /// file.
 pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 
+/// Environment variables the launcher sets to carry the unit's governance `scope`/`phase` to the
+/// gate-hook subprocess. Passing them via env (NOT interpolated into the shell-executed hook command)
+/// is what keeps caller-controlled data out of the command string — closing the injection / fail-open
+/// hole a naive double-quoted argv would open (`$(…)`, backticks, embedded `"`). Claude propagates its
+/// environment to hook subprocesses, so the hook still receives them.
+pub const GATE_SCOPE_ENV: &str = "WICKED_GATE_SCOPE";
+pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
+
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
 ///
-/// `scope`/`phase` come from the hook's argv (the launcher writes them into a per-run settings file it
-/// passes as `claude --settings <file>`, pinned to the unit's real `resolve_scope(...)` / `unit-{ord}`);
-/// `db` is the shared estate store, used only to *read* policies (we never write governance/claim/
-/// domain data — see the module-level note about the open path + the read-only follow-up).
+/// `scope`/`phase` are resolved by the caller (`bin/wicked-core`) from argv (standalone) ELSE the
+/// `WICKED_GATE_SCOPE`/`WICKED_GATE_PHASE` env the launcher sets — pinned to the unit's real
+/// `resolve_scope(...)` / `unit-{ord}`. They ride env (NOT the shell hook command) so caller-controlled
+/// ids can't inject the command. `db` is the shared estate store, used only to *read* policies (we never
+/// write governance/claim/domain data — see the module-level note about the open path).
 /// Fails CLOSED (returns 2) if the decisions path is unset, the store can't be opened, or governance
 /// can't decide — an un-evaluable tool-call is never silently allowed.
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
@@ -139,24 +148,42 @@ fn postgres_unsupported(db: Option<&str>) -> Option<String> {
         })
 }
 
-/// The absolute, per-run decisions-log path that BOTH the launcher (which sets `WICKED_DECISIONS_PATH`
-/// on the wrapped CLI) and the actor-side fold ([`fold_input_denial`]) derive identically from `run_id`.
-/// It lives OUTSIDE any worktree (a governed run must never pollute the target repo) and is a pure
-/// function of `run_id` (no threaded state to keep in sync). `run_id` is sanitized to a safe dir name.
-pub fn decisions_path_for(run_id: &str) -> std::path::PathBuf {
-    let safe: String = run_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
+/// INJECTIVE, filesystem-safe encoding of a raw `run_id` into a single path segment. Escapes every byte
+/// outside `[A-Za-z0-9-]` — INCLUDING `_`, the escape sentinel — as `_<hex>`, so distinct run_ids can
+/// NEVER collide onto one governance dir. A lossy char-replace (the prior impl) mapped `a:b`, `a_b`, and
+/// `a/b` all to `a_b` → they would share one decisions log (cross-run veto contamination) and one
+/// settings file (last-writer-wins fail-open) — a bypass an attacker could aim by choosing a session id.
+fn encode_run_id(run_id: &str) -> String {
+    run_id
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b == b'-' {
+                (b as char).to_string()
             } else {
-                '_'
+                format!("_{b:02x}")
             }
         })
-        .collect();
+        .collect()
+}
+
+/// The per-run governance directory (outside any worktree). Cleared on a FRESH (re-)launch of a run id
+/// so a prior terminal run's stale decisions can't fail a new run — see the launcher; resume/redrive
+/// deliberately do NOT clear it (they continue the same run's log).
+pub fn gov_run_dir(run_id: &str) -> std::path::PathBuf {
     std::env::temp_dir()
         .join("wicked-core-gov")
-        .join(safe)
+        .join(encode_run_id(run_id))
+}
+
+/// The absolute decisions-log path that BOTH the launcher (which sets `WICKED_DECISIONS_PATH` on the
+/// wrapped CLI) and the actor-side fold ([`fold_input_denial`]) derive identically from `(run_id,
+/// attempt)`. Partitioned by `attempt` so a bumped-attempt RETRY (a human `confirm_gate` Approve on a
+/// `HumanConfirmIf(VerdictNotPass)` deny, resume, or redrive) reads a CLEAN slate — a stale prior-attempt
+/// Deny can no longer re-fail an approved retry. A pure function of `(run_id, attempt)` (no threaded
+/// state to keep in sync), living OUTSIDE any worktree.
+pub fn decisions_path_for(run_id: &str, attempt: u32) -> std::path::PathBuf {
+    gov_run_dir(run_id)
+        .join(format!("attempt-{attempt}"))
         .join("decisions.ndjson")
 }
 
@@ -189,15 +216,18 @@ fn append_decision(path: &Path, claim: &ConformanceClaim) -> anyhow::Result<()> 
 /// `Rejected` → the run `Failed` through the UNCHANGED completion path — never a second phase resolver.
 ///
 /// FAILS CLOSED on a corrupted claim line (a `{`-prefixed line that will not parse is un-evaluable
-/// governance evidence — it is surfaced as an error, never silently skipped into an allow, finding #10).
-/// `Ok(None)` when the log is absent (an ungoverned or not-yet-written run) or holds no `Deny` for
+/// governance evidence) by returning it AS A DENIAL (deny dominates), NOT an `Err`: the denial rides the
+/// normal `validator_denial` path → unit gate `Rejected` → run terminally `Failed`, whereas a propagated
+/// `Err` would leave the session wedged non-terminal and re-executed on every restart (finding #3/#8).
+/// `Ok(None)` when the log is absent (an ungoverned or not-yet-written attempt) or holds no `Deny` for
 /// `phase`.
 pub fn fold_input_denial(
     store: &mut dyn GraphStore,
     run_id: &str,
+    attempt: u32,
     phase: &str,
 ) -> anyhow::Result<Option<String>> {
-    let path = decisions_path_for(run_id);
+    let path = decisions_path_for(run_id, attempt);
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -209,9 +239,19 @@ pub fn fold_input_denial(
         if !line.starts_with('{') {
             continue; // blank / non-claim line — not corruption
         }
-        let claim: ConformanceClaim = serde_json::from_str(line).map_err(|e| {
-            anyhow::anyhow!("input-governance DENY (fail-closed): corrupted decision line: {e}")
-        })?;
+        let claim: ConformanceClaim = match serde_json::from_str(line) {
+            Ok(c) => c,
+            // Un-evaluable governance evidence ⇒ deny-dominant (fail closed), routed through the normal
+            // terminal path rather than a run-wedging `Err`.
+            Err(e) => {
+                if denial.is_none() {
+                    denial = Some(format!(
+                        "input governance denied {phase} (fail-closed): corrupted decision line: {e}"
+                    ));
+                }
+                continue;
+            }
+        };
         if claim.phase != phase {
             continue; // another unit's claim — folded when that unit finishes
         }
@@ -710,12 +750,12 @@ mod tests {
     fn fold_input_denial_denies_conforms_by_phase_and_fails_closed() {
         let mut store = open_store(Some(":memory:")).unwrap();
         let run_id = format!("foldtest-{}", std::process::id());
-        let path = decisions_path_for(&run_id);
+        let path = decisions_path_for(&run_id, 0);
         let _ = std::fs::remove_file(&path);
 
-        // Absent log ⇒ None (ungoverned / not-yet-written run — the fold is inert).
+        // Absent log ⇒ None (ungoverned / not-yet-written attempt — the fold is inert).
         assert_eq!(
-            fold_input_denial(&mut store, &run_id, "unit-1").unwrap(),
+            fold_input_denial(&mut store, &run_id, 0, "unit-1").unwrap(),
             None
         );
 
@@ -726,7 +766,7 @@ mod tests {
         append_decision(&path, &deny).unwrap();
         append_decision(&path, &allow_claim("a2", "unit-2")).unwrap();
 
-        let denial = fold_input_denial(&mut store, &run_id, "unit-1").unwrap();
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1").unwrap();
         assert!(
             denial.as_deref().is_some_and(|d| d.contains("d1")),
             "a Deny for unit-1 surfaces a denial naming the claim: {denial:?}"
@@ -740,17 +780,28 @@ mod tests {
             "another unit's claim is not conformed when folding unit-1"
         );
 
-        // A corrupted `{`-prefixed line ⇒ fail closed (never a silent skip into allow).
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        f.write_all(b"{ not valid json\n").unwrap();
-        assert!(
-            fold_input_denial(&mut store, &run_id, "unit-1").is_err(),
-            "a corrupted claim line fails the fold CLOSED"
+        // RETRY-POISON FIX: a bumped attempt reads a CLEAN slate — attempt 0's Deny does NOT leak to
+        // attempt 1 (so a human `confirm_gate` Approve / resume / redrive is no longer re-failed forever).
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 1, "unit-1").unwrap(),
+            None,
+            "attempt 1 does not inherit attempt 0's Deny"
         );
-        let _ = std::fs::remove_file(&path);
+
+        // A corrupted `{`-prefixed line ⇒ fail closed AS A DENIAL (routed through the normal terminal
+        // path, not a run-wedging Err). Use a fresh attempt so only the corrupt line is present.
+        let path2 = decisions_path_for(&run_id, 1);
+        let _ = std::fs::remove_file(&path2);
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(&path2, b"{ not valid json\n").unwrap();
+        let corrupt = fold_input_denial(&mut store, &run_id, 1, "unit-1").unwrap();
+        assert!(
+            corrupt
+                .as_deref()
+                .is_some_and(|d| d.contains("fail-closed")),
+            "a corrupted claim line DENIES (fail-closed), not Err: {corrupt:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
     #[test]
@@ -769,23 +820,35 @@ mod tests {
     }
 
     #[test]
-    fn decisions_path_is_outside_any_worktree_deterministic_and_sanitized() {
-        let a = decisions_path_for("run-abc");
+    fn decisions_path_is_outside_any_worktree_deterministic_injective_and_attempt_scoped() {
+        let a = decisions_path_for("run-abc", 0);
         assert_eq!(
             a,
-            decisions_path_for("run-abc"),
-            "deterministic from run_id"
+            decisions_path_for("run-abc", 0),
+            "deterministic from (run_id, attempt)"
         );
         assert!(
             a.starts_with(std::env::temp_dir()),
             "the decisions log lives under the temp dir, never a target worktree: {a:?}"
         );
-        // A path-hostile run_id is sanitized — no traversal / nested dirs escape the gov root.
-        let p = decisions_path_for("a/../b:c");
+        // A path-hostile run_id is escaped — no traversal / nested dirs escape the gov root.
+        let p = decisions_path_for("a/../b:c", 0);
         assert!(p.starts_with(std::env::temp_dir()));
         assert!(
             !p.to_string_lossy().contains(".."),
-            "no `..` survives sanitization: {p:?}"
+            "no `..` survives encoding: {p:?}"
+        );
+        // INJECTIVE: distinct run_ids that a lossy replace would collide must map to DISTINCT dirs.
+        assert_ne!(
+            decisions_path_for("a:b", 0),
+            decisions_path_for("a_b", 0),
+            "encode_run_id is injective — `a:b` and `a_b` never share a governance dir"
+        );
+        // ATTEMPT-SCOPED: a bumped attempt reads a different (clean) log.
+        assert_ne!(
+            decisions_path_for("run-abc", 0),
+            decisions_path_for("run-abc", 1),
+            "each attempt gets its own decisions log"
         );
     }
 

