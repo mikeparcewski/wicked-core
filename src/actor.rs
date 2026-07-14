@@ -75,6 +75,43 @@ impl std::fmt::Display for RunExists {
 }
 impl std::error::Error for RunExists {}
 
+thread_local! {
+    /// The estate store path for GOVERNED in-process dispatch (DES-OUTGOV-003 §4). Armed at actor
+    /// startup; read by [`in_process_governance`] when building a governed unit's `StepInput`. A
+    /// thread-local (mirroring [`crate::cli_runner`]'s `EXEC_PUBLISHER`) makes the store path reachable
+    /// deep in `dispatch_unit` WITHOUT threading a parameter through
+    /// redrive/advance_or_pause/confirm_gate; it is per-actor-thread, so tests spawning multiple actors
+    /// (each with its own store) never cross-talk.
+    static GOV_DB_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The governance context for an IN-PROCESS governed unit (DES-OUTGOV-003 §4), or `None` when input
+/// governance cannot apply: no store armed, or a store the SQLite gate-hook subprocess cannot open
+/// independently — `:memory:` (cannot cross processes) or `postgres://` (SQLite-only hook; the
+/// spec-dispatch read-only opener is deferred to core#30). The path is made ABSOLUTE because the hook
+/// runs with cwd = the worktree, so a relative `.wicked-estate/graph.db` would open the wrong/empty
+/// store (finding #6).
+fn in_process_governance() -> Option<crate::workflow::GovernanceContext> {
+    let path = GOV_DB_PATH.with(|c| c.borrow().clone())?;
+    if path == ":memory:" || path.contains("://") {
+        return None;
+    }
+    let abs = std::fs::canonicalize(&path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            let p = std::path::Path::new(&path);
+            if p.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()
+                    .map(|d| d.join(p).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.clone())
+            }
+        });
+    Some(crate::workflow::GovernanceContext { db_path: abs })
+}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
@@ -102,6 +139,10 @@ pub(crate) fn run(
             return;
         }
     };
+
+    // Arm the governance store path for in-process governed dispatch (DES-OUTGOV-003 §4). The store now
+    // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
+    GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
 
     // The memory + knowledge sidecars are SQLite-only local stores keyed off a FILESYSTEM base
     // (`<base>.mem` / `<base>.knowledge`). When the graph store is a URL backend (e.g.
@@ -1356,6 +1397,9 @@ fn dispatch_unit(
         workflow_id: session.workflow_id.clone(),
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
+        // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
+        // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
+        governance: in_process_governance(),
     };
 
     // LAW 1 EXECUTION-MEDIATION SEAM (opt-in). When exec-mediation is armed on this (actor) thread, the

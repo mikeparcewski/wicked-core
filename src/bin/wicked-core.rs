@@ -76,7 +76,13 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("gate-hook") {
         let scope = flag(&args, "--scope").unwrap_or_default();
         let phase = flag(&args, "--phase").unwrap_or_default();
-        let db = flag(&args, "--db");
+        // Resolve `--db`, else the `WICKED_ESTATE_DB` env the launcher sets (the injected command drops
+        // `--db` to avoid cross-platform quoting of the store path — DES-OUTGOV-003 §8 / finding #6).
+        let db = flag(&args, "--db").or_else(|| {
+            std::env::var("WICKED_ESTATE_DB")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
         std::process::exit(run_gate_hook(&scope, &phase, db.as_deref()));
     }
 
@@ -86,7 +92,11 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("output-gate-hook") {
         let scope = flag(&args, "--scope").unwrap_or_default();
         let phase = flag(&args, "--phase").unwrap_or_default();
-        let db = flag(&args, "--db");
+        let db = flag(&args, "--db").or_else(|| {
+            std::env::var("WICKED_ESTATE_DB")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
         std::process::exit(run_output_gate_hook(&scope, &phase, db.as_deref()));
     }
 

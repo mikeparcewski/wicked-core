@@ -9,15 +9,15 @@
 //!    claim, or domain data to the store** — the actor remains the sole writer of those. The hook
 //!    only *reads* policies (`select`).
 //!
-//!    ⚠️ HONEST CAVEAT (P4b precondition): `open_store` currently opens the SQLite file READ-WRITE and,
-//!    on open, writes the WAL pragma + ensures schema (a wicked-estate-store detail), with **no
-//!    `busy_timeout`**. As long as the hook is invoked NOT concurrently with an actor write (true in
-//!    P0/P1 — it's driven directly by tests), this is harmless. But once the hook is a real
-//!    per-tool-call subprocess racing the actor's writes (P4a/P4b), this open path could take the
-//!    write lock and, with `busy_timeout = 0`, fail closed → a *spurious* DENY. **P4b must** open with
-//!    `SQLITE_OPEN_READ_ONLY` (skipping pragma/DDL — the actor owns schema) or set a `busy_timeout`.
-//!    Until then the domain/claim single-writer guarantee holds, but the hook's open is not yet the
-//!    pure reader this module aspires to. Fails CLOSED: exit 2 = deny ⇒ Claude aborts the call.
+//!    HYGIENE NOTE (P4b, de-risked): `open_store` opens the SQLite file READ-WRITE and, on open, runs
+//!    the WAL pragma + `execute_batch(SCHEMA)`/`migrate_schema` DDL (a wicked-estate-store detail). The
+//!    open already sets `PRAGMA busy_timeout=5000` (estate `sqlite.rs`, since PR#47), so a hook racing
+//!    the actor's write BLOCKS up to 5s and absorbs the contention — it does NOT fail-close into a
+//!    *spurious* DENY (the earlier worry, now known false). The residual is purity, not correctness: a
+//!    subprocess that only `select`s/`decide`s/`recall`s should not run schema DDL against a store the
+//!    single-writer actor owns. The pure-reader opener (`SQLITE_OPEN_READ_ONLY`, skip DDL) is tracked as
+//!    a follow-up (estate `SqliteStore::open_readonly` + an apps-core delegate), NOT a blocker for
+//!    governance-in-run. Fails CLOSED throughout: exit 2 = deny ⇒ Claude aborts the call.
 //!
 //!  * [`apply_hook_decisions`] is the actor-side drain. It runs ON the single store-owning actor
 //!    thread, reads the NDJSON the hook produced, and is the ONLY place those claims hit the store:
@@ -59,12 +59,17 @@ pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
 ///
-/// `scope`/`phase` come from the hook's argv (the launcher bakes them into `.claude/settings.json`);
+/// `scope`/`phase` come from the hook's argv (the launcher writes them into a per-run settings file it
+/// passes as `claude --settings <file>`, pinned to the unit's real `resolve_scope(...)` / `unit-{ord}`);
 /// `db` is the shared estate store, used only to *read* policies (we never write governance/claim/
-/// domain data — see the module-level honest caveat about the open path + the P4b read-only fix).
+/// domain data — see the module-level note about the open path + the read-only follow-up).
 /// Fails CLOSED (returns 2) if the decisions path is unset, the store can't be opened, or governance
 /// can't decide — an un-evaluable tool-call is never silently allowed.
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+    if let Some(reason) = postgres_unsupported(db) {
+        eprintln!("wicked-governance: DENY ({reason})");
+        return 2;
+    }
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         // An unreadable (e.g. non-UTF-8) tool call is UN-EVALUABLE — fail closed, never allow.
@@ -122,19 +127,103 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     }
 }
 
-/// Append one serialized [`ConformanceClaim`] line to the absolute decisions NDJSON path, creating
-/// the file (and parent dir) if needed. Append-only so concurrent hook processes never clobber.
+/// A backend the SQLite-only hook cannot open: governance-in-run is SQLite-only for now (a `postgres://`
+/// store's read-only spec-dispatch opener is core#30). Returns a fail-closed reason for a URL spec so the
+/// hook DENIES loudly instead of silently creating a garbage SQLite file at the literal `postgres://…`
+/// path (findings #13/#18). `None` ⇒ the spec is a file/`:memory:` the hook can open.
+fn postgres_unsupported(db: Option<&str>) -> Option<String> {
+    db.filter(|s| s.starts_with("postgres://") || s.starts_with("postgresql://"))
+        .map(|_| {
+            "governance-in-run is SQLite-only; the hook cannot open a postgres:// store (core#30)"
+                .to_string()
+        })
+}
+
+/// The absolute, per-run decisions-log path that BOTH the launcher (which sets `WICKED_DECISIONS_PATH`
+/// on the wrapped CLI) and the actor-side fold ([`fold_input_denial`]) derive identically from `run_id`.
+/// It lives OUTSIDE any worktree (a governed run must never pollute the target repo) and is a pure
+/// function of `run_id` (no threaded state to keep in sync). `run_id` is sanitized to a safe dir name.
+pub fn decisions_path_for(run_id: &str) -> std::path::PathBuf {
+    let safe: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir()
+        .join("wicked-core-gov")
+        .join(safe)
+        .join("decisions.ndjson")
+}
+
+/// Append one serialized [`ConformanceClaim`] line to the absolute decisions NDJSON path, creating the
+/// file (and parent dir) if needed. Append-only so concurrent hook processes never clobber. The
+/// complete `json + '\n'` line is written in a SINGLE `write_all`: a lone append write of a small buffer
+/// is atomic on both POSIX (`O_APPEND`) and Windows (`FILE_APPEND_DATA`), so parallel per-tool-call hook
+/// subprocesses cannot interleave a claim (finding #10 — the prior two-syscall `writeln!` split the JSON
+/// body from its newline, which could interleave and corrupt a line the drain then dropped).
 fn append_decision(path: &Path, claim: &ConformanceClaim) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_string(claim)?;
+    let mut line = serde_json::to_string(claim)?;
+    line.push('\n');
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(f, "{json}")?;
+    f.write_all(line.as_bytes())?;
     Ok(())
+}
+
+/// Fold a governed unit's INPUT-hook decisions into a single deny-dominant denial, for the run engine's
+/// existing per-unit gate (DES-OUTGOV-003 §1). Reads the run's decisions log; for each claim that
+/// targets THIS unit's `phase`, `conform`s it as durable evidence (idempotent upsert by claim symbol)
+/// and, if it is a `Deny`, records the denial (deny dominates — the FIRST Deny wins, the rest still
+/// conform). Runs ON the actor (single writer). The returned `Some(reason)` folds into
+/// `apply_and_finish_unit`'s `validator_denial` seam, so a denied tool-call drives the unit gate
+/// `Rejected` → the run `Failed` through the UNCHANGED completion path — never a second phase resolver.
+///
+/// FAILS CLOSED on a corrupted claim line (a `{`-prefixed line that will not parse is un-evaluable
+/// governance evidence — it is surfaced as an error, never silently skipped into an allow, finding #10).
+/// `Ok(None)` when the log is absent (an ungoverned or not-yet-written run) or holds no `Deny` for
+/// `phase`.
+pub fn fold_input_denial(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    phase: &str,
+) -> anyhow::Result<Option<String>> {
+    let path = decisions_path_for(run_id);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut denial: Option<String> = None;
+    for line in raw.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue; // blank / non-claim line — not corruption
+        }
+        let claim: ConformanceClaim = serde_json::from_str(line).map_err(|e| {
+            anyhow::anyhow!("input-governance DENY (fail-closed): corrupted decision line: {e}")
+        })?;
+        if claim.phase != phase {
+            continue; // another unit's claim — folded when that unit finishes
+        }
+        conform(store, &claim)?;
+        if denial.is_none() && claim.decision == Decision::Deny {
+            denial = Some(format!(
+                "input governance denied a tool-call in {phase} (claim {})",
+                claim.claim_id
+            ));
+        }
+    }
+    Ok(denial)
 }
 
 /// Summary of a single drain pass — what the actor applied from the decisions log.
@@ -182,10 +271,11 @@ pub fn apply_hook_decisions(
         if !line.starts_with('{') {
             continue;
         }
-        let claim: ConformanceClaim = match serde_json::from_str(line) {
-            Ok(c) => c,
-            Err(_) => continue, // a malformed line never blocks the rest of the drain
-        };
+        // FAIL CLOSED on a corrupted `{`-prefixed line: un-evaluable governance evidence must never be
+        // silently skipped into an allow (finding #10). A blank / non-`{` line was already `continue`d.
+        let claim: ConformanceClaim = serde_json::from_str(line).map_err(|e| {
+            anyhow::anyhow!("hook-decision drain DENY (fail-closed): corrupted claim line: {e}")
+        })?;
         conform(store, &claim)?;
         summary.applied += 1;
         by_phase.entry(claim.phase.clone()).or_default().push(claim);
@@ -318,6 +408,10 @@ pub const OUTPUT_FRAMEWORK_ENV: &str = "WICKED_OUTPUT_FRAMEWORK";
 /// entry point is the DETERMINISTIC half: policy-over-output + recall wiring. Fails CLOSED (exit 2)
 /// exactly like the input hook — an un-evaluable or un-recordable output is never silently allowed.
 pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+    if let Some(reason) = postgres_unsupported(db) {
+        eprintln!("wicked-governance: DENY ({reason})");
+        return 2;
+    }
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         // An unreadable (e.g. non-UTF-8) output is UN-EVALUABLE — fail closed, never allow.
@@ -610,6 +704,109 @@ mod tests {
             PhaseStatus::Rejected,
             "deny DOMINATES the same-phase Allow regardless of arrival order"
         );
+    }
+
+    #[test]
+    fn fold_input_denial_denies_conforms_by_phase_and_fails_closed() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("foldtest-{}", std::process::id());
+        let path = decisions_path_for(&run_id);
+        let _ = std::fs::remove_file(&path);
+
+        // Absent log ⇒ None (ungoverned / not-yet-written run — the fold is inert).
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, "unit-1").unwrap(),
+            None
+        );
+
+        // unit-1: Allow then Deny (deny dominates). unit-2: an Allow that must NOT be folded here.
+        append_decision(&path, &allow_claim("a1", "unit-1")).unwrap();
+        let mut deny = allow_claim("d1", "unit-1");
+        deny.decision = Decision::Deny;
+        append_decision(&path, &deny).unwrap();
+        append_decision(&path, &allow_claim("a2", "unit-2")).unwrap();
+
+        let denial = fold_input_denial(&mut store, &run_id, "unit-1").unwrap();
+        assert!(
+            denial.as_deref().is_some_and(|d| d.contains("d1")),
+            "a Deny for unit-1 surfaces a denial naming the claim: {denial:?}"
+        );
+        // Durable evidence: unit-1's claims conformed; unit-2's is filtered out (folded by its own unit).
+        assert_eq!(count_claims(&store, "a1").unwrap(), 1);
+        assert_eq!(count_claims(&store, "d1").unwrap(), 1);
+        assert_eq!(
+            count_claims(&store, "a2").unwrap(),
+            0,
+            "another unit's claim is not conformed when folding unit-1"
+        );
+
+        // A corrupted `{`-prefixed line ⇒ fail closed (never a silent skip into allow).
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"{ not valid json\n").unwrap();
+        assert!(
+            fold_input_denial(&mut store, &run_id, "unit-1").is_err(),
+            "a corrupted claim line fails the fold CLOSED"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn postgres_store_is_denied_loudly_by_the_hook() {
+        assert!(postgres_unsupported(Some("postgres://h/db")).is_some());
+        assert!(postgres_unsupported(Some("postgresql://h/db")).is_some());
+        assert!(postgres_unsupported(Some("/tmp/estate.db")).is_none());
+        assert!(postgres_unsupported(Some(":memory:")).is_none());
+        assert!(postgres_unsupported(None).is_none());
+        // The hook denies (exit 2) for a postgres store BEFORE reading stdin — never mis-creates a file.
+        assert_eq!(run_gate_hook("s", "unit-1", Some("postgres://h/db")), 2);
+        assert_eq!(
+            run_output_gate_hook("s", "unit-1", Some("postgres://h/db")),
+            2
+        );
+    }
+
+    #[test]
+    fn decisions_path_is_outside_any_worktree_deterministic_and_sanitized() {
+        let a = decisions_path_for("run-abc");
+        assert_eq!(
+            a,
+            decisions_path_for("run-abc"),
+            "deterministic from run_id"
+        );
+        assert!(
+            a.starts_with(std::env::temp_dir()),
+            "the decisions log lives under the temp dir, never a target worktree: {a:?}"
+        );
+        // A path-hostile run_id is sanitized — no traversal / nested dirs escape the gov root.
+        let p = decisions_path_for("a/../b:c");
+        assert!(p.starts_with(std::env::temp_dir()));
+        assert!(
+            !p.to_string_lossy().contains(".."),
+            "no `..` survives sanitization: {p:?}"
+        );
+    }
+
+    #[test]
+    fn drain_fails_closed_on_a_corrupted_claim_line() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let dir = std::env::temp_dir().join(format!("wc-drain-malformed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decisions.ndjson");
+        let _ = std::fs::remove_file(&path);
+        append_decision(&path, &allow_claim("ok-1", "exec")).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(b"{ broken json here\n").unwrap();
+        assert!(
+            apply_hook_decisions(&mut store, "run-x", &path).is_err(),
+            "a corrupted `{{` line fails the drain CLOSED (never a silent skip→allow)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.

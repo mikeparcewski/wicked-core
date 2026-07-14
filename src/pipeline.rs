@@ -427,8 +427,19 @@ pub(crate) fn apply_and_finish_unit(
         })
     });
 
-    // DENY-DOMINATES ordering: deterministic re-verify, then agent judge, then the evaluator pass.
-    let validator_denial = det_denial.or(agent_denial).or(evaluator_denial);
+    // (input governance — DES-OUTGOV-003 §1) Fold this unit's INPUT-hook decisions into the SAME
+    // deny-dominant gate rather than a competing phase resolver: read the run's decisions log, conform
+    // each of THIS phase's claims as durable evidence, and surface any Deny. Inert (`None`) for
+    // ungoverned / sync runs (no decisions log written). A denied tool-call thus drives the unit gate
+    // Rejected → the run Failed through the UNCHANGED completion path.
+    let hook_denial =
+        crate::gate_hook::fold_input_denial(store, session_id, &format!("unit-{}", unit.ord))?;
+
+    // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
+    let validator_denial = det_denial
+        .or(agent_denial)
+        .or(evaluator_denial)
+        .or(hook_denial);
 
     // Resolve the governance gate WITH the pre-computed deny folded in: a validator/evaluator deny
     // drives the phase Rejected + suppresses the work_output write (see `execute::apply_unit`).

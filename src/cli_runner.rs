@@ -110,6 +110,11 @@ struct DispatchedTask {
     /// handle. `None` ⇒ the unit carried no validator.
     #[serde(default)]
     validator_pin: Option<String>,
+    /// GOVERNANCE OPT-IN carried across the bus (DES-OUTGOV-003 §5): without this the off-actor
+    /// cli-runner would rebuild an UNGOVERNED `StepInput`, silently disabling input governance for the
+    /// whole exec-mediation delivery mode. `None` ⇒ ungoverned (default preserves old wire compat).
+    #[serde(default)]
+    governance: Option<crate::workflow::GovernanceContext>,
 }
 
 /// Blank the deterministic validator's SHELL SCRIPT before a unit rides the bus (seam finding #7): the
@@ -323,6 +328,7 @@ pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Opt
             agent_review_target: agent_review_target.map(|s| s.to_string()),
             cli: input.unit.assigned_cli.clone(),
             validator_pin,
+            governance: input.governance.clone(),
         };
         let payload = match serde_json::to_value(&task) {
             Ok(v) => v,
@@ -539,6 +545,8 @@ fn run_cli_runner(
                     workflow_id: task.workflow_id.clone(),
                     entity_mode: task.entity_mode,
                     workdir: task.workdir.clone().map(std::path::PathBuf::from),
+                    // §5: carry governance across the bus so the off-actor launcher governs identically.
+                    governance: task.governance.clone(),
                 };
                 // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does. The
@@ -723,6 +731,7 @@ mod tests {
             workflow_id: "wf-r".into(),
             entity_mode: EntityMode::Shared,
             workdir: None,
+            governance: None,
         };
 
         // Arm the publisher on THIS thread, publish, then disarm (thread-local is per-thread).
@@ -827,6 +836,7 @@ mod tests {
             workflow_id: "wf-r".into(),
             entity_mode: EntityMode::Isolated,
             workdir: Some(dir.clone()),
+            governance: None,
         };
         let noop: &DeltaSink = &|_: &str| {};
 

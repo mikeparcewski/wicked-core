@@ -269,6 +269,30 @@ impl WrappedCliStepRunner {
             inject_claude_stream_flags(&mut argv);
         }
 
+        // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
+        // file declaring a PreToolUse gate-hook (every tool; exit 2 = deny ⇒ claude aborts the call),
+        // insert `--settings <file>`, and return the child env (decisions log + absolute store path).
+        // `--settings` MERGES (the user's own settings stay intact) and lives OUTSIDE the worktree.
+        // Non-claude CLIs + ungoverned internal calls (`governance: None`) are untouched.
+        let gov_env: Option<(PathBuf, String)> = match (&input.governance, is_claude) {
+            (Some(gov), true) => match arm_input_governance(input, gov, &mut argv) {
+                Ok(env) => Some(env),
+                // A governed unit whose governance cannot be armed must NOT run ungoverned — fail it.
+                Err(e) => {
+                    return StepOutput {
+                        run_id: input.run_id.clone(),
+                        unit_ix: input.unit_ix,
+                        attempt: input.attempt,
+                        output: format!("(could not arm input governance: {e})"),
+                        status: StepStatus::Failed,
+                        usage: None,
+                        files: Vec::new(),
+                    }
+                }
+            },
+            _ => None,
+        };
+
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
@@ -289,6 +313,12 @@ impl WrappedCliStepRunner {
             };
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).current_dir(&cwd);
+            // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log +
+            // the absolute estate store path it opens read-only to select policies (DES-OUTGOV-003 §8).
+            if let Some((decisions_path, db_path)) = &gov_env {
+                cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, decisions_path);
+                cmd.env("WICKED_ESTATE_DB", db_path);
+            }
             match run_bounded(cmd, self.timeout, emit, adapter) {
                 Ok((0, out, _, usage, files)) => (StepStatus::Ok, out, usage, files),
                 Ok((-1, _, err, _, _)) if err == TIMED_OUT => (
@@ -332,6 +362,52 @@ fn sandbox_for(input: &StepInput) -> PathBuf {
     std::env::temp_dir()
         .join("wicked-core-sandbox")
         .join(&input.run_id)
+}
+
+/// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
+/// `resolve_scope(...)` / `unit-{ord}` (so the hook's policy `select` + the recorded `claim.phase` match
+/// the run engine's own per-unit gate, findings #1/#7), write a per-run `--settings` file declaring the
+/// `PreToolUse` gate-hook, insert `--settings <file>` into `argv` (before the prompt / any `--` guard),
+/// and return the `(decisions_path, db_path)` env the launcher sets on the child. The settings +
+/// decisions live under a per-run dir OUTSIDE the worktree (no repo pollution). The gate-hook command
+/// DROPS `--db` (the child's `WICKED_ESTATE_DB` env supplies the absolute path) and double-quotes each
+/// interpolated value, which is valid in both POSIX `sh -c` and Windows `cmd` for a value with spaces
+/// (finding #6).
+fn arm_input_governance(
+    input: &StepInput,
+    gov: &crate::workflow::GovernanceContext,
+    argv: &mut Vec<String>,
+) -> std::io::Result<(PathBuf, String)> {
+    let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
+    let phase = format!("unit-{}", input.unit.ord);
+    let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id);
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "wicked-core".to_string());
+    // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool.
+    let command = format!("\"{exe}\" gate-hook --scope \"{scope}\" --phase \"{phase}\"");
+    let settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
+            ]
+        }
+    });
+    let dir = decisions_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
+    std::fs::create_dir_all(&dir)?;
+    // Per-UNIT settings file (each unit pins its own scope/phase) — never a shared per-run file two
+    // overlapping units could clobber.
+    let settings_path = dir.join(format!("settings-{phase}.json"));
+    let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
+    std::fs::write(&settings_path, bytes)?;
+    // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
+    // prompt / a `--` guard).
+    argv.insert(1, settings_path.to_string_lossy().into_owned());
+    argv.insert(1, "--settings".to_string());
+    Ok((decisions_path, gov.db_path.clone()))
 }
 
 /// Resolve a CLI key to its headless invocation template. Reads the council registry (built-ins +
@@ -583,6 +659,76 @@ mod tests {
             out.contains("alpha") && out.contains("gamma"),
             "the full output is still accumulated alongside streaming"
         );
+    }
+
+    #[test]
+    fn arm_input_governance_writes_a_pretool_settings_file_and_returns_env() {
+        let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
+        u.assigned_cli = Some("claude".to_string());
+        let gov = crate::workflow::GovernanceContext {
+            db_path: "/abs/estate.db".to_string(),
+        };
+        let input = StepInput {
+            run_id: format!("armtest-{}", std::process::id()),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: Some(gov.clone()),
+        };
+        let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
+        let (decisions_path, db_path) = arm_input_governance(&input, &gov, &mut argv).unwrap();
+
+        assert_eq!(
+            db_path, "/abs/estate.db",
+            "the child gets the absolute store path"
+        );
+        // `--settings <file>` inserted right after the binary (parses as a flag, before the prompt).
+        assert_eq!(argv[0], "claude");
+        assert_eq!(argv[1], "--settings");
+        let settings_path = std::path::PathBuf::from(&argv[2]);
+        assert!(settings_path.exists(), "the settings file was written");
+        assert!(
+            settings_path.starts_with(std::env::temp_dir()),
+            "settings live OUTSIDE any worktree (no repo pollution): {settings_path:?}"
+        );
+        assert!(
+            decisions_path.starts_with(std::env::temp_dir()),
+            "the decisions log lives outside any worktree"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            json["hooks"]["PreToolUse"][0]["matcher"], "*",
+            "the hook governs EVERY tool"
+        );
+        let cmd = json["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("gate-hook"),
+            "runs the gate-hook subcommand: {cmd}"
+        );
+        assert!(
+            cmd.contains("--phase \"unit-3\""),
+            "phase pinned to the unit's real ord (unit-3): {cmd}"
+        );
+        assert!(
+            cmd.contains("--scope \"wicked-agent/"),
+            "scope pinned to resolve_scope: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--db"),
+            "--db is dropped; the WICKED_ESTATE_DB env supplies the store path: {cmd}"
+        );
+        assert!(
+            cmd.trim_start().starts_with('"'),
+            "the exe path is double-quoted (Windows/space-safe): {cmd}"
+        );
+        let _ = std::fs::remove_dir_all(decisions_path.parent().unwrap());
     }
 
     #[test]

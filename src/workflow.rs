@@ -38,6 +38,26 @@ pub struct StepInput {
     /// The git worktree to run in (set when the run targets a registered repo, P3). `None` ⇒ the
     /// runner uses its own default cwd. The real wrapped-CLI backend (P4a) runs the subprocess here.
     pub workdir: Option<std::path::PathBuf>,
+    /// GOVERNANCE OPT-IN (DES-OUTGOV-003 §4). `Some` ⇒ a GOVERNED campaign unit: the wrapped-CLI
+    /// launcher injects the `PreToolUse` gate-hook (input governance) + sets the decisions/store env, so
+    /// the CLI's tool-calls are governed and a deny folds into the unit gate. `None` ⇒ an UNGOVERNED
+    /// invocation — the engine's OWN internal agent-judge / validator-authoring `claude` calls, which
+    /// must never self-govern against an empty scope. `None` is the unambiguous ungoverned signal
+    /// (distinct from a governed unit that merely has an empty scope).
+    pub governance: Option<GovernanceContext>,
+}
+
+/// The governance context threaded to a GOVERNED wrapped-CLI unit (DES-OUTGOV-003 §4). Carries the ONE
+/// value the worker cannot derive from a [`StepInput`] — the estate store path (the worker holds no
+/// store handle); the hook's `scope` (`resolve_scope`), `phase` (`unit-{ord}`), and the decisions-log
+/// path are all derived from the `StepInput`'s own fields. `Serialize`/`Deserialize` so it survives the
+/// exec-mediation bus round-trip on `DispatchedTask`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GovernanceContext {
+    /// ABSOLUTE filesystem path of the estate SQLite store the gate-hook subprocess opens to read
+    /// policies (never `:memory:` — an in-memory store cannot cross processes — nor `postgres://`,
+    /// which the SQLite-only hook cannot open; the launcher only sets this for a file-backed store).
+    pub db_path: String,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill
