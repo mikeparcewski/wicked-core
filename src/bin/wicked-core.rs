@@ -588,8 +588,11 @@ fn domain_graph_cmd(args: &[String]) {
         match std::fs::read_to_string(&coverage_path) {
             Ok(s) => match serde_json::from_str::<wicked_governance::CoverageReport>(&s) {
                 Ok(file) => {
-                    if (file.coverage - coverage.coverage).abs() > f64::EPSILON
-                        || file.unaccounted != coverage.unaccounted
+                    // The DEFINITIVE agreement check is the exact integer `unaccounted` (the field the
+                    // gate keys on); `coverage` is a rounded ratio, so compare it only with a generous
+                    // tolerance to avoid spurious DISAGREE on JSON-parse/round drift (not f64::EPSILON).
+                    if file.unaccounted != coverage.unaccounted
+                        || (file.coverage - coverage.coverage).abs() > 1e-4
                     {
                         fail(&format!(
                             "domain-graph: supplied --coverage {coverage_path} DISAGREES with the store \

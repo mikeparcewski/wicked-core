@@ -236,8 +236,8 @@ fn is_behavior_out_edge(kind: &wicked_apps_core::EdgeKind) -> bool {
     match kind {
         Calls | References | Evaluates | Produces | Governs => true,
         Other(t) => matches!(t.as_str(), "uses" | "accesses" | "invokes"),
-        Contains | Defines | Imports | Instantiates | Implements | Extends | Overrides | HasType
-        | Returns | InvokedBy => false,
+        Contains | Defines | Imports | Instantiates | Implements | Extends | Overrides
+        | HasType | Returns | InvokedBy => false,
     }
 }
 
@@ -257,12 +257,14 @@ fn is_behavior_bearing(
     match &node.kind {
         // Behavior-bearing: the atomic units of logic. Namespace≈Module, Trait≈Interface,
         // Constructor≈Method; Rule is the atomic unit a rules-engine extractor emits (bare until annotated).
-        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait | Rule => true,
+        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait | Rule => {
+            true
+        }
         // Module counts unless it is a dead shell (a pure container with no outgoing behavior edge).
         Module => has_behavior_out.contains(node.symbol.as_str()),
         // Structural leaves + rule-engine containers/sub-clauses (annotation target is the Rule node).
-        File | Import | Field | Constant | Variable | Parameter | TypeAlias | Enum | Macro | RuleSet
-        | Condition | Action | Fact | Synthetic => false,
+        File | Import | Field | Constant | Variable | Parameter | TypeAlias | Enum | Macro
+        | RuleSet | Condition | Action | Fact | Synthetic => false,
         // Open domain: estate-behavior tags count; every other tag is structural (fail-OPEN default —
         // surfaced via `unknown_other` so a new behavior extractor's tag is not silent).
         Other(tag) => {
@@ -270,8 +272,13 @@ fn is_behavior_bearing(
                 true
             } else {
                 // Known-structural estate tags are expected; only truly-unrecognized tags warrant a warn.
-                const KNOWN_STRUCTURAL: &[&str] =
-                    &["dataset", "cics_map", "ims_database", "ims_segment", "parent"];
+                const KNOWN_STRUCTURAL: &[&str] = &[
+                    "dataset",
+                    "cics_map",
+                    "ims_database",
+                    "ims_segment",
+                    "parent",
+                ];
                 if !KNOWN_STRUCTURAL.contains(&tag.as_str()) {
                     unknown_other.insert(tag.clone());
                 }
@@ -440,7 +447,13 @@ pub fn recompute_front_half_coverage_with(
     // `coverage` (and per_app coverage) is vacuously 1.0 on an empty denominator (matches coverage.py
     // `_ratio`). But resolved_rate + mean_confidence are 0.0 on the empty case (matches coverage.py — a
     // graph with zero settled/confidence evidence must NOT read as "fully resolved / maximal confidence").
-    let ratio = |num: u64, den: u64| if den == 0 { 1.0 } else { round4(num as f64 / den as f64) };
+    let ratio = |num: u64, den: u64| {
+        if den == 0 {
+            1.0
+        } else {
+            round4(num as f64 / den as f64)
+        }
+    };
     let coverage = ratio(resolved + risk_flagged, behavior_bearing);
     let settled = resolved + risk_flagged;
     let resolved_rate = if settled == 0 {
@@ -579,7 +592,10 @@ pub fn build_domain_model(
 ) -> anyhow::Result<DomainModel> {
     // Gate on the PASSED report (back-compat) AND, defense-in-depth, on a fresh STORE recompute — so a
     // hand-fed `coverage:1.0` can never translate a graph that actually has an unaccounted behavior node
-    // (DES-OUTGOV-005 decision #4). The store is the source of truth; the file is a cross-check.
+    // (DES-OUTGOV-005 decision #4). The store is the source of truth; the file is a cross-check. The extra
+    // store traversal here is a DELIBERATE correctness-over-perf choice for a fail-closed governance gate:
+    // trusting the caller's report would reintroduce the trust-boundary hole this milestone closes. It is
+    // a single O(nodes) pass, run once per build (not hot-path).
     assert_front_half_coverage(coverage)?;
     let recomputed = recompute_front_half_coverage(store)?;
     assert_front_half_coverage(&recomputed)?;
@@ -1019,7 +1035,10 @@ mod tests {
             let r = cov(&s);
             assert_eq!(r.behavior_bearing, 1);
             assert_eq!(r.unaccounted, 1);
-            assert!(r.coverage < 1.0, "a bare behavior node fails the gate: {r:?}");
+            assert!(
+                r.coverage < 1.0,
+                "a bare behavior node fails the gate: {r:?}"
+            );
             assert_eq!(r.unaccounted_nodes.len(), 1);
         }
 
@@ -1053,13 +1072,21 @@ mod tests {
             // Estate-behavior regression guard: cics_program/db2_table are behavior-bearing; dataset/
             // racf_user are structural (not counted).
             let mut s = store();
-            node(&mut s, "PGM1", NodeKind::Other("cics_program".into()), "a.cbl");
+            node(
+                &mut s,
+                "PGM1",
+                NodeKind::Other("cics_program".into()),
+                "a.cbl",
+            );
             node(&mut s, "T1", NodeKind::Other("db2_table".into()), "a.cbl");
             node(&mut s, "DS1", NodeKind::Other("dataset".into()), "a.cbl");
             node(&mut s, "U1", NodeKind::Other("racf_user".into()), "a.cbl");
             let r = cov(&s);
             assert_eq!(r.behavior_bearing, 2, "only cics_program + db2_table count");
-            assert!(r.coverage < 1.0, "bare mainframe behavior nodes DENY: {r:?}");
+            assert!(
+                r.coverage < 1.0,
+                "bare mainframe behavior nodes DENY: {r:?}"
+            );
         }
 
         #[test]
@@ -1117,7 +1144,10 @@ mod tests {
             )
             .unwrap();
             let err = recompute_front_half_coverage(&s).unwrap_err().to_string();
-            assert!(err.contains("[0,1]"), "emitter path guards confidence: {err}");
+            assert!(
+                err.contains("[0,1]"),
+                "emitter path guards confidence: {err}"
+            );
         }
 
         #[test]
@@ -1146,7 +1176,10 @@ mod tests {
             let err = recompute_front_half_coverage_with(&s, &cfg)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("[0,1]"), "an out-of-schema threshold fails closed: {err}");
+            assert!(
+                err.contains("[0,1]"),
+                "an out-of-schema threshold fails closed: {err}"
+            );
         }
 
         #[test]
@@ -1158,7 +1191,10 @@ mod tests {
             let r = cov(&s);
             assert_eq!(r.resolved, 0);
             assert_eq!(r.resolved_rate, 0.0, "no settled node ⇒ resolved_rate 0.0");
-            assert_eq!(r.mean_confidence, 0.0, "no confidence evidence ⇒ mean_confidence 0.0");
+            assert_eq!(
+                r.mean_confidence, 0.0,
+                "no confidence evidence ⇒ mean_confidence 0.0"
+            );
         }
 
         #[test]
@@ -1172,7 +1208,11 @@ mod tests {
                 .unwrap();
             let r = cov(&s);
             let apps: Vec<&str> = r.per_app.iter().map(|p| p.app.as_str()).collect();
-            assert_eq!(apps, vec!["(root)", "billing"], "root sentinel is '(root)', not 'graph'");
+            assert_eq!(
+                apps,
+                vec!["(root)", "billing"],
+                "root sentinel is '(root)', not 'graph'"
+            );
         }
     }
 }
