@@ -300,7 +300,12 @@ fn classify_node(
     threshold: f64,
 ) -> anyhow::Result<Bucket> {
     let semantics = store.node_semantics(&node.symbol)?;
-    let has_requirement = semantics.as_ref().is_some_and(|s| s.requirement.is_some());
+    // A requirement counts as present ONLY when non-blank — an empty/whitespace `requirement` is NOT
+    // real accounting (coverage.py truthy-checks `req`); counting it would be a vacuous-gate fail-open.
+    let has_requirement = semantics
+        .as_ref()
+        .and_then(|s| s.requirement.as_deref())
+        .is_some_and(|r| !r.trim().is_empty());
     let requirement_validated = semantics.as_ref().is_some_and(|s| s.requirement_validated);
     let annotations = store.annotations(&node.symbol)?;
 
@@ -352,6 +357,15 @@ pub fn recompute_front_half_coverage_with(
     store: &dyn GraphRead,
     cfg: &CoverageConfig,
 ) -> anyhow::Result<CoverageReport> {
+    // Fail-closed on an out-of-schema threshold (the schema constrains resolve_threshold to [0,1]) — the
+    // public `..._with` entry point could otherwise emit a schema-invalid report. Mirrors the annotation
+    // confidence guard below.
+    if !(0.0..=1.0).contains(&cfg.resolve_threshold) {
+        anyhow::bail!(
+            "CoverageConfig.resolve_threshold {} out of [0,1] — the coverage schema constrains it to [0,1]",
+            cfg.resolve_threshold
+        );
+    }
     let mut nodes = store.all_nodes()?;
     nodes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     let total = nodes.len() as u64;
@@ -423,16 +437,19 @@ pub fn recompute_front_half_coverage_with(
         );
     }
 
+    // `coverage` (and per_app coverage) is vacuously 1.0 on an empty denominator (matches coverage.py
+    // `_ratio`). But resolved_rate + mean_confidence are 0.0 on the empty case (matches coverage.py — a
+    // graph with zero settled/confidence evidence must NOT read as "fully resolved / maximal confidence").
     let ratio = |num: u64, den: u64| if den == 0 { 1.0 } else { round4(num as f64 / den as f64) };
     let coverage = ratio(resolved + risk_flagged, behavior_bearing);
     let settled = resolved + risk_flagged;
     let resolved_rate = if settled == 0 {
-        1.0
+        0.0
     } else {
         round4(resolved as f64 / settled as f64)
     };
     let mean_confidence = if confidences.is_empty() {
-        1.0
+        0.0
     } else {
         round4(confidences.iter().sum::<f64>() / confidences.len() as f64)
     };
@@ -480,13 +497,14 @@ fn round4(x: f64) -> f64 {
 }
 
 /// Fail-closed front-half precondition (port of `domain_graph.py::assert_front_half_coverage`, §I5):
-/// the builder REFUSES to translate an unannotated graph. `coverage` MUST be `1.0` (every
-/// behavior-bearing node resolved or risk-flagged); otherwise bail, surfacing the unaccounted
-/// SymbolIds so the operator knows exactly what is missing. Never translates a partial graph.
+/// the builder REFUSES to translate an unannotated graph. Every behavior-bearing node must be resolved
+/// or risk-flagged; otherwise bail, surfacing the unaccounted SymbolIds. Never translates a partial graph.
 pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()> {
-    // Exact 1.0 (floats compared with a tiny epsilon — coverage is a ratio of integer counts, so it
-    // is exactly 1.0 when complete, but guard against representation drift).
-    if (report.coverage - 1.0).abs() > f64::EPSILON {
+    // Gate on the EXACT integer `unaccounted`, NOT the 4-dp-rounded `coverage` float. On a large graph a
+    // single hole (e.g. 1/20000) rounds up to coverage==1.0, so a float-epsilon test would fail OPEN and
+    // translate a graph with a real hole. `unaccounted == 0` is the definitive completeness condition and
+    // preserves the vacuous pass (empty graph ⇒ behavior_bearing==0 ⇒ unaccounted==0 ⇒ Ok).
+    if report.unaccounted != 0 {
         let shown: Vec<&str> = report
             .unaccounted_nodes
             .iter()
@@ -494,9 +512,8 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
             .map(|n| n.symbol_id.as_str())
             .collect();
         anyhow::bail!(
-            "front-half coverage {:.4} < 1.0 — {} behavior-bearing node(s) unaccounted; run \
-             extraction + coverage first (refusing to translate an unannotated graph). First \
-             unaccounted: {:?}",
+            "front-half coverage {:.4} — {} behavior-bearing node(s) unaccounted; run extraction + \
+             coverage first (refusing to translate an unannotated graph). First unaccounted: {:?}",
             report.coverage,
             report.unaccounted,
             shown
@@ -603,7 +620,12 @@ pub fn build_domain_model(
             .filter(|a| a.is_advisory() || a.r#type == RISK_ANN)
             .collect();
 
-        let resolved = requirement_text.is_some() || !business_rules.is_empty();
+        // A blank/whitespace requirement is NOT accounting (consistent with `classify_node` + coverage.py),
+        // so it neither keeps a node nor synthesizes a placeholder rule.
+        let has_requirement = requirement_text
+            .as_deref()
+            .is_some_and(|r| !r.trim().is_empty());
+        let resolved = has_requirement || !business_rules.is_empty();
         // Genuinely structural (nothing accounted) → skip. Everything the gate counted survives.
         if !resolved && risk_notes.is_empty() && description_text.is_none() {
             continue;
@@ -759,7 +781,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("< 1.0") && err.contains("refund"),
+            err.contains("unaccounted") && err.contains("refund"),
             "got: {err}"
         );
 
@@ -770,6 +792,25 @@ mod tests {
         assert!(
             assert_front_half_coverage(&complete).is_ok(),
             "coverage 1.0 translates"
+        );
+
+        // ROUNDING FAIL-OPEN GUARD: a large graph with a single hole rounds coverage to 1.0000, but the
+        // gate keys on the EXACT integer `unaccounted`, so it still DENIES (the vacuous-gate the review
+        // caught). A float-epsilon gate would have passed this.
+        let rounds_to_one = CoverageReport {
+            behavior_bearing: 20000,
+            resolved: 19999,
+            unaccounted: 1,
+            coverage: 1.0, // round4(19999/20000) == 1.0
+            unaccounted_nodes: vec![node("sym:hole")],
+            ..Default::default()
+        };
+        let err = assert_front_half_coverage(&rounds_to_one)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unaccounted") && err.contains("hole"),
+            "a hole that rounds coverage to 1.0 must STILL fail closed: {err}"
         );
     }
 
@@ -1077,6 +1118,47 @@ mod tests {
             .unwrap();
             let err = recompute_front_half_coverage(&s).unwrap_err().to_string();
             assert!(err.contains("[0,1]"), "emitter path guards confidence: {err}");
+        }
+
+        #[test]
+        fn blank_requirement_is_unaccounted() {
+            // An empty/whitespace requirement is NOT accounting (coverage.py truthy-checks it) — a node
+            // carrying only a blank requirement is a HOLE, not covered.
+            for req in ["", "   "] {
+                let mut s = store();
+                let n = node(&mut s, "widget", NodeKind::Function, "a.rs");
+                s.set_node_semantics(&n.symbol, None, Some(req), Some(true))
+                    .unwrap();
+                let r = cov(&s);
+                assert_eq!(r.unaccounted, 1, "blank requirement {req:?} is a hole");
+                assert!(r.coverage < 1.0);
+            }
+        }
+
+        #[test]
+        fn out_of_range_resolve_threshold_bails() {
+            let mut s = store();
+            node(&mut s, "A", NodeKind::Function, "a.rs");
+            let cfg = CoverageConfig {
+                resolve_threshold: 1.5,
+                ..Default::default()
+            };
+            let err = recompute_front_half_coverage_with(&s, &cfg)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[0,1]"), "an out-of-schema threshold fails closed: {err}");
+        }
+
+        #[test]
+        fn empty_case_rates_are_zero_not_one() {
+            // coverage.py parity: on a graph with no resolved/settled/confidence evidence, resolved_rate
+            // and mean_confidence are 0.0 (NOT 1.0 — must not read as "fully resolved / maximal confidence").
+            let mut s = store();
+            node(&mut s, "A", NodeKind::Function, "a.rs"); // bare → unaccounted, none resolved
+            let r = cov(&s);
+            assert_eq!(r.resolved, 0);
+            assert_eq!(r.resolved_rate, 0.0, "no settled node ⇒ resolved_rate 0.0");
+            assert_eq!(r.mean_confidence, 0.0, "no confidence evidence ⇒ mean_confidence 0.0");
         }
 
         #[test]
