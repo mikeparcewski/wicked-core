@@ -269,6 +269,30 @@ impl WrappedCliStepRunner {
             inject_claude_stream_flags(&mut argv);
         }
 
+        // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
+        // file declaring a PreToolUse gate-hook (every tool; exit 2 = deny ⇒ claude aborts the call),
+        // insert `--settings <file>`, and return the child env (decisions log + absolute store path).
+        // `--settings` MERGES (the user's own settings stay intact) and lives OUTSIDE the worktree.
+        // Non-claude CLIs + ungoverned internal calls (`governance: None`) are untouched.
+        let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
+            (Some(gov), true) => match arm_input_governance(input, gov, &mut argv) {
+                Ok(env) => Some(env),
+                // A governed unit whose governance cannot be armed must NOT run ungoverned — fail it.
+                Err(e) => {
+                    return StepOutput {
+                        run_id: input.run_id.clone(),
+                        unit_ix: input.unit_ix,
+                        attempt: input.attempt,
+                        output: format!("(could not arm input governance: {e})"),
+                        status: StepStatus::Failed,
+                        usage: None,
+                        files: Vec::new(),
+                    }
+                }
+            },
+            _ => None,
+        };
+
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
@@ -289,6 +313,16 @@ impl WrappedCliStepRunner {
             };
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).current_dir(&cwd);
+            // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
+            // the absolute estate store path, and the unit's scope/phase. Scope/phase travel via ENV
+            // (NOT interpolated into the shell hook command) so caller-controlled ids can never inject
+            // shell metacharacters — the command string carries only the trusted exe (DES-OUTGOV-003 §8).
+            if let Some(g) = &gov_env {
+                cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
+                cmd.env("WICKED_ESTATE_DB", &g.db_path);
+                cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
+                cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
+            }
             match run_bounded(cmd, self.timeout, emit, adapter) {
                 Ok((0, out, _, usage, files)) => (StepStatus::Ok, out, usage, files),
                 Ok((-1, _, err, _, _)) if err == TIMED_OUT => (
@@ -332,6 +366,87 @@ fn sandbox_for(input: &StepInput) -> PathBuf {
     std::env::temp_dir()
         .join("wicked-core-sandbox")
         .join(&input.run_id)
+}
+
+/// The `PreToolUse` hook command — the exe path quoted for the platform's shell so a `$`/backtick/space
+/// in the install path can't be expanded or split. POSIX single-quotes disable all expansion (with the
+/// standard `'\''` escape for an embedded quote); Windows cmd double-quotes (it does not expand `$`).
+fn quote_exe_command(exe: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("'{}' gate-hook", exe.replace('\'', "'\\''"))
+    }
+    #[cfg(not(unix))]
+    {
+        format!("\"{exe}\" gate-hook")
+    }
+}
+
+/// What the launcher sets on the wrapped CLI's `Command` to arm INPUT governance. Scope/phase are set as
+/// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
+/// metacharacters.
+struct GovLaunch {
+    decisions_path: PathBuf,
+    db_path: String,
+    scope: String,
+    phase: String,
+}
+
+/// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
+/// `resolve_scope(...)` / `unit-{ord}` (so the hook's policy `select` + the recorded `claim.phase` match
+/// the run engine's own per-unit gate, findings #1/#7), write a per-(unit,attempt) `--settings` file
+/// declaring the `PreToolUse` gate-hook, insert `--settings <file>` into `argv` (before the prompt / any
+/// `--` guard), and return the env the launcher sets on the child. Settings + decisions live under a
+/// per-run/attempt dir OUTSIDE the worktree (no repo pollution).
+///
+/// SECURITY: the hook command is a CONSTANT (`"<exe>" gate-hook`) — only the trusted `current_exe()` is
+/// interpolated (double-quoted for spaces; it contains no shell metacharacters). Scope/phase (which
+/// embed the caller-controlled `session_id`/`unit.id`) travel via `WICKED_GATE_SCOPE`/`WICKED_GATE_PHASE`
+/// env, so no attacker-controlled data ever reaches the shell-executed command string — closing the
+/// injection / fail-open hole a naive double-quoted argv would open.
+fn arm_input_governance(
+    input: &StepInput,
+    gov: &crate::workflow::GovernanceContext,
+    argv: &mut Vec<String>,
+) -> std::io::Result<GovLaunch> {
+    let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
+    let phase = format!("unit-{}", input.unit.ord);
+    let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "wicked-core".to_string());
+    // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the exe is
+    // interpolated (scope/phase go via env). Quote it per-platform so a `$`/backtick in the install path
+    // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
+    // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
+    let command = quote_exe_command(&exe);
+    let settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
+            ]
+        }
+    });
+    let dir = decisions_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
+    std::fs::create_dir_all(&dir)?;
+    // Per-UNIT settings file (each unit pins its own scope/phase) — never a shared per-run file two
+    // overlapping units could clobber.
+    let settings_path = dir.join(format!("settings-{phase}.json"));
+    let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
+    std::fs::write(&settings_path, bytes)?;
+    // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
+    // prompt / a `--` guard).
+    argv.insert(1, settings_path.to_string_lossy().into_owned());
+    argv.insert(1, "--settings".to_string());
+    Ok(GovLaunch {
+        decisions_path,
+        db_path: gov.db_path.clone(),
+        scope,
+        phase,
+    })
 }
 
 /// Resolve a CLI key to its headless invocation template. Reads the council registry (built-ins +
@@ -583,6 +698,84 @@ mod tests {
             out.contains("alpha") && out.contains("gamma"),
             "the full output is still accumulated alongside streaming"
         );
+    }
+
+    #[test]
+    fn arm_input_governance_writes_a_pretool_settings_file_and_returns_env() {
+        let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
+        u.assigned_cli = Some("claude".to_string());
+        let gov = crate::workflow::GovernanceContext {
+            db_path: "/abs/estate.db".to_string(),
+        };
+        let input = StepInput {
+            run_id: format!("armtest-{}", std::process::id()),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: Some(gov.clone()),
+        };
+        let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
+        let g = arm_input_governance(&input, &gov, &mut argv).unwrap();
+
+        assert_eq!(g.db_path, "/abs/estate.db", "the child gets the store path");
+        // scope/phase ride the RETURNED struct (→ env), pinned to the unit's real values.
+        assert_eq!(g.phase, "unit-3", "phase pinned to the unit's real ord");
+        assert!(
+            g.scope.starts_with("wicked-agent/"),
+            "scope pinned to resolve_scope: {}",
+            g.scope
+        );
+        // `--settings <file>` inserted right after the binary (parses as a flag, before the prompt).
+        assert_eq!(argv[0], "claude");
+        assert_eq!(argv[1], "--settings");
+        let settings_path = std::path::PathBuf::from(&argv[2]);
+        assert!(settings_path.exists(), "the settings file was written");
+        assert!(
+            settings_path.starts_with(std::env::temp_dir()),
+            "settings live OUTSIDE any worktree (no repo pollution): {settings_path:?}"
+        );
+        assert!(
+            g.decisions_path.starts_with(std::env::temp_dir()),
+            "the decisions log lives outside any worktree"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            json["hooks"]["PreToolUse"][0]["matcher"], "*",
+            "the hook governs EVERY tool"
+        );
+        let cmd = json["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(
+            cmd.contains("gate-hook"),
+            "runs the gate-hook subcommand: {cmd}"
+        );
+        // SECURITY: the command carries NO caller-controlled data — scope/phase go via env, not the shell
+        // string. Only the (trusted, double-quoted) exe is interpolated.
+        assert!(
+            !cmd.contains("--scope") && !cmd.contains("--phase") && !cmd.contains("--db"),
+            "no scope/phase/db interpolated into the shell-executed hook command: {cmd}"
+        );
+        assert!(
+            !cmd.contains("wicked-agent/"),
+            "the caller-controlled scope must NOT appear in the shell command: {cmd}"
+        );
+        let q = if cfg!(unix) { '\'' } else { '"' };
+        assert!(
+            cmd.trim_start().starts_with(q),
+            "the exe path is quoted per-platform ({q}) so $/backtick/space can't be expanded: {cmd}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir_for_test(&input.run_id));
+    }
+
+    // The gov run dir for cleanup — mirrors gate_hook::gov_run_dir without exposing it beyond the crate.
+    fn gov_run_dir_for_test(run_id: &str) -> std::path::PathBuf {
+        crate::gate_hook::gov_run_dir(run_id)
     }
 
     #[test]

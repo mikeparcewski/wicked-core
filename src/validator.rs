@@ -130,6 +130,9 @@ pub fn author_deterministic_validator(
         workflow_id: "wf-validator".to_string(),
         entity_mode: EntityMode::Isolated,
         workdir: None,
+        // UNGOVERNED: this is the engine's OWN internal claude call (agent-judge / validator authoring).
+        // It must never self-govern against an empty scope — `None` suppresses all hook injection.
+        governance: None,
     };
     let out = runner.run_unit(&input);
     if out.status != StepStatus::Ok {
@@ -848,6 +851,9 @@ pub fn agent_validate(
         workflow_id: "wf-validator".to_string(),
         entity_mode: EntityMode::Isolated,
         workdir: None,
+        // UNGOVERNED: this is the engine's OWN internal claude call (agent-judge / validator authoring).
+        // It must never self-govern against an empty scope — `None` suppresses all hook injection.
+        governance: None,
     };
     let out = runner.run_unit(&input);
     if out.status != StepStatus::Ok {

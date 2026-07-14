@@ -75,6 +75,43 @@ impl std::fmt::Display for RunExists {
 }
 impl std::error::Error for RunExists {}
 
+thread_local! {
+    /// The estate store path for GOVERNED in-process dispatch (DES-OUTGOV-003 §4). Armed at actor
+    /// startup; read by [`in_process_governance`] when building a governed unit's `StepInput`. A
+    /// thread-local (mirroring [`crate::cli_runner`]'s `EXEC_PUBLISHER`) makes the store path reachable
+    /// deep in `dispatch_unit` WITHOUT threading a parameter through
+    /// redrive/advance_or_pause/confirm_gate; it is per-actor-thread, so tests spawning multiple actors
+    /// (each with its own store) never cross-talk.
+    static GOV_DB_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The governance context for an IN-PROCESS governed unit (DES-OUTGOV-003 §4), or `None` when input
+/// governance cannot apply: no store armed, or a store the SQLite gate-hook subprocess cannot open
+/// independently — `:memory:` (cannot cross processes) or `postgres://` (SQLite-only hook; the
+/// spec-dispatch read-only opener is deferred to core#30). The path is made ABSOLUTE because the hook
+/// runs with cwd = the worktree, so a relative `.wicked-estate/graph.db` would open the wrong/empty
+/// store (finding #6).
+fn in_process_governance() -> Option<crate::workflow::GovernanceContext> {
+    let path = GOV_DB_PATH.with(|c| c.borrow().clone())?;
+    if path == ":memory:" || path.contains("://") {
+        return None;
+    }
+    let abs = std::fs::canonicalize(&path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            let p = std::path::Path::new(&path);
+            if p.is_absolute() {
+                path.clone()
+            } else {
+                std::env::current_dir()
+                    .map(|d| d.join(p).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.clone())
+            }
+        });
+    Some(crate::workflow::GovernanceContext { db_path: abs })
+}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
@@ -102,6 +139,10 @@ pub(crate) fn run(
             return;
         }
     };
+
+    // Arm the governance store path for in-process governed dispatch (DES-OUTGOV-003 §4). The store now
+    // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
+    GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
 
     // The memory + knowledge sidecars are SQLite-only local stores keyed off a FILESYSTEM base
     // (`<base>.mem` / `<base>.knowledge`). When the graph store is a URL backend (e.g.
@@ -342,6 +383,28 @@ pub(crate) fn run(
                     Ok(StepApplied::Stale) => {}
                     Err(e) => {
                         emit_run_error(&mut subscribers, &run_id, e);
+                        // Never leave a run non-terminal on an apply error — that would wedge the session
+                        // at `Executing` (and a campaign node at `Running`) and re-execute the unit on
+                        // every restart. Drive a clean terminal `Failed`, mirroring the deny path, so
+                        // resume/redrive/relaunch recover cleanly.
+                        if let Ok(Some(mut session)) = crate::domain::get_session(&store, &run_id) {
+                            if !matches!(
+                                session.status,
+                                SessionStatus::Completed
+                                    | SessionStatus::Cancelled
+                                    | SessionStatus::Failed
+                            ) {
+                                // Report the unit that was actually executing, not a misleading 0.
+                                let ord = session.unit_ix as u32;
+                                let _ = fail_run(
+                                    &mut store,
+                                    &mut subscribers,
+                                    &self_tx,
+                                    &mut session,
+                                    ord,
+                                );
+                            }
+                        }
                         in_flight.remove(&run_id);
                     }
                 }
@@ -757,6 +820,29 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
     });
 }
 
+/// Reject a session id carrying shell-hostile or control characters. Governance now passes scope/phase
+/// (which embed the id) to the gate-hook via ENV, so such characters can no longer inject the shell hook
+/// command — but rejecting them at ingress is defense-in-depth: a hostile id is a caller/attacker signal,
+/// never a legitimate run id, and it also keeps the derived scope strings clean.
+fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
+    // `/` (and `\`) are rejected because the raw run_id also forms filesystem paths (e.g.
+    // `sandbox_for`), where a separator enables directory traversal / absolute-path escape.
+    const HOSTILE: &[char] = &[
+        '"', '\'', '`', '$', ';', '|', '&', '<', '>', '\\', '/', '\n', '\r', '\0',
+    ];
+    if run_id.is_empty()
+        || run_id.contains("..")
+        || run_id
+            .chars()
+            .any(|c| HOSTILE.contains(&c) || c.is_control())
+    {
+        anyhow::bail!(
+            "invalid session id (empty, `..`, or a shell/path-hostile character): {run_id:?}"
+        );
+    }
+    Ok(())
+}
+
 /// The body of `Command::LaunchRun` (also the campaign driver's node launcher, DES §4). Plans +
 /// distributes synchronously, then advances unit 0 off-thread (or pauses at a gate). Idempotent by
 /// run id: refuses to re-plan over a live run (resume it instead). Returns the run id.
@@ -770,6 +856,7 @@ pub(crate) fn launch_run_inner(
     spec: LaunchSpec,
 ) -> anyhow::Result<String> {
     let run_id = spec.session_id.clone();
+    validate_session_id(&run_id)?;
     if in_flight.contains(&run_id) {
         return Err(RunBusy(run_id).into());
     }
@@ -782,6 +869,10 @@ pub(crate) fn launch_run_inner(
             return Err(RunExists(run_id, format!("{:?}", existing.status)).into());
         }
     }
+    // FRESH (re-)launch: clear any prior TERMINAL run's per-run governance dir so a stale Deny from that
+    // run can't spuriously fail this one (decisions_path_for is never otherwise truncated). resume_run_inner
+    // / redrive do NOT clear — they continue the same run's log. A brand-new id has no dir (harmless no-op).
+    let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
     pipeline::plan_and_distribute(
@@ -1084,6 +1175,9 @@ fn apply_step_result(
         &workflow_id,
         entity_mode,
         &run_id,
+        // The applied output's attempt matches the launcher's `input.attempt`, so the fold reads the
+        // SAME attempt-scoped decisions log the hook wrote (a bumped-attempt retry starts clean).
+        output.attempt,
         &cli_keys,
         agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
@@ -1356,6 +1450,9 @@ fn dispatch_unit(
         workflow_id: session.workflow_id.clone(),
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
+        // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
+        // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
+        governance: in_process_governance(),
     };
 
     // LAW 1 EXECUTION-MEDIATION SEAM (opt-in). When exec-mediation is armed on this (actor) thread, the

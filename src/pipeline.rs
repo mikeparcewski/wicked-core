@@ -81,6 +81,7 @@ pub fn run_session(
             &workflow_id,
             entity_mode,
             session_id,
+            0, // sync straight-through path is ungoverned (stub work) — the fold is inert (no log)
             &cli_keys,
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             emit,
@@ -362,6 +363,7 @@ pub(crate) fn apply_and_finish_unit(
     workflow_id: &str,
     entity_mode: EntityMode,
     session_id: &str,
+    attempt: u32,
     cli_keys: &[String],
     agent_verdict: Option<&(bool, String)>,
     emit: &mut dyn FnMut(CoreEvent),
@@ -427,8 +429,23 @@ pub(crate) fn apply_and_finish_unit(
         })
     });
 
-    // DENY-DOMINATES ordering: deterministic re-verify, then agent judge, then the evaluator pass.
-    let validator_denial = det_denial.or(agent_denial).or(evaluator_denial);
+    // (input governance — DES-OUTGOV-003 §1) Fold this unit's INPUT-hook decisions into the SAME
+    // deny-dominant gate rather than a competing phase resolver: read the run's decisions log, conform
+    // each of THIS phase's claims as durable evidence, and surface any Deny. Inert (`None`) for
+    // ungoverned / sync runs (no decisions log written). A denied tool-call thus drives the unit gate
+    // Rejected → the run Failed through the UNCHANGED completion path.
+    let hook_denial = crate::gate_hook::fold_input_denial(
+        store,
+        session_id,
+        attempt,
+        &format!("unit-{}", unit.ord),
+    )?;
+
+    // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
+    let validator_denial = det_denial
+        .or(agent_denial)
+        .or(evaluator_denial)
+        .or(hook_denial);
 
     // Resolve the governance gate WITH the pre-computed deny folded in: a validator/evaluator deny
     // drives the phase Rejected + suppresses the work_output write (see `execute::apply_unit`).

@@ -39,6 +39,7 @@ fn a_skill_driven_unit_loads_the_named_skill_against_real_claude() {
         workflow_id: "wf-live".to_string(),
         entity_mode: EntityMode::Shared,
         workdir: None,
+        governance: None,
     };
 
     let runner = WrappedCliStepRunner::default();
