@@ -23,13 +23,25 @@
 //! DOMINATES); triggered [`Effect::AllowWithConditions`] ⇒ union obligations; else
 //! [`wicked_apps_core::Decision::Allow`]. Same context ⇒ same claim (re-derivable, attestable — ADR-0003).
 
+mod conformance;
 mod domain;
 mod engine;
+mod ingest;
 
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
     claim_from_node, claim_symbol, claim_to_node, conform, decide, decide_as, register_policy,
     select, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
+};
+
+// Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B).
+pub use conformance::{
+    recall_rules, register_rule, Compliance, ConfSeverity, ConformanceRule, RuleProvenance,
+    RuleQuery, RuleType, Targets,
+};
+pub use ingest::{
+    ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,
+    NoopFramework, SourceAdapter, StubAdapter,
 };
 
 // Re-export the claim wire type so callers program against one path.

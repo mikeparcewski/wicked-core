@@ -177,7 +177,12 @@ fn deny_policy(phase: &str, pattern: &str) -> Policy {
 }
 
 fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 20s (was 5s): the heaviest case, `deny_policy_fires_on_a_unit_beyond_the_64th`, drives a
+    // 65-unit run and intermittently exceeded 5s on loaded CI runners (flaked twice, passed on
+    // re-run). The status this polls for is a TERMINAL state, so a longer budget only absorbs CI
+    // scheduling jitter — it can never mask a correctness bug (a wrong deny reaches `Complete`, never
+    // `Failed`, so `want` is never reached regardless of the deadline). Fast paths return early.
+    let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == run_id) {
