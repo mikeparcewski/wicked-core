@@ -13,7 +13,7 @@
       ],
       "depends_on": [],
       "role": "neutral",
-      "skill_ref": "wicked-garden-survey",
+      "skill_ref": "wicked-garden-modernize",
       "allowed_skills": [],
       "validator_pin": null
     },
@@ -31,10 +31,8 @@
         "survey"
       ],
       "role": "neutral",
-      "skill_ref": "wicked-garden-analyze",
-      "allowed_skills": [
-        "wicked-brain-vocabulary"
-      ],
+      "skill_ref": "wicked-garden-modernize",
+      "allowed_skills": [],
       "validator_pin": null
     },
     {
@@ -51,10 +49,8 @@
         "analyze"
       ],
       "role": "creator",
-      "skill_ref": "wicked-garden-extract",
-      "allowed_skills": [
-        "wicked-brain-domain"
-      ],
+      "skill_ref": "wicked-garden-modernize-extractor",
+      "allowed_skills": [],
       "validator_pin": null
     },
     {
@@ -73,10 +69,8 @@
         "extract"
       ],
       "role": "evaluator",
-      "skill_ref": "wicked-garden-coverage-review",
-      "allowed_skills": [
-        "wicked-brain-coverage"
-      ],
+      "skill_ref": "wicked-garden-modernize-antagonist",
+      "allowed_skills": [],
       "validator_pin": "c4cc487a030d57b7"
     },
     {
@@ -97,10 +91,8 @@
         "coverage"
       ],
       "role": "neutral",
-      "skill_ref": "wicked-garden-domain-graph",
-      "allowed_skills": [
-        "wicked-brain-domain"
-      ],
+      "skill_ref": "wicked-garden-modernize-translator",
+      "allowed_skills": [],
       "validator_pin": null
     }
   ]
