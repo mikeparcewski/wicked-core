@@ -148,8 +148,12 @@ pub struct Provenance {
 
 /// The front-half coverage report — the schema-exact wire shape (`coverage.schema.json`, all 11 fields
 /// required, `additionalProperties:false`). `coverage = (resolved + risk_flagged) / behavior_bearing`
-/// (vacuously 1.0 when `behavior_bearing == 0`); the builder gates on `coverage == 1.0`.
+/// (vacuously 1.0 when `behavior_bearing == 0`); the builder gates on the exact integer `unaccounted == 0`
+/// (NOT the rounded `coverage` float — see [`assert_front_half_coverage`]). `deny_unknown_fields` makes
+/// DESERIALIZE fail-closed on an extra key, mirroring the schema's `additionalProperties:false` — a
+/// hand-written/older report with a stray field is rejected, not silently accepted.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CoverageReport {
     /// Total nodes in the graph (all kinds).
     pub total: u64,
@@ -178,6 +182,7 @@ pub struct CoverageReport {
 /// Per-app coverage breakdown (`coverage.schema.json` `perApp`; NO `db`/`total` — the schema forbids
 /// them, so the WIRE shape is anchored on the schema, not coverage.py).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerApp {
     pub app: String,
     pub behavior_bearing: u64,
@@ -190,6 +195,7 @@ pub struct PerApp {
 /// A behavior-bearing node that reached neither RESOLVED nor RISK — the coverage hole. Only `symbol_id`
 /// is schema-required; the rest are omitted-when-absent (never serialized as null).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnaccountedNode {
     pub symbol_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
