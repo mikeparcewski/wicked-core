@@ -20,6 +20,8 @@
 //!       # gated one so the rev0.4 dual-validator gate actually engages
 //!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
 //!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
+//!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
+//!       # requirements_graph.json (gates FAIL-CLOSED on front-half coverage == 1.0; modern package-dir grouping)
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
 
 use std::io::BufRead;
@@ -97,6 +99,7 @@ fn main() {
         Some("approve-validator") => return approve_validator_cmd(&args),
         Some("gate-phase") => return gate_phase_cmd(&args),
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
+        Some("domain-graph") => return domain_graph_cmd(&args),
         _ => {}
     }
 
@@ -521,6 +524,73 @@ fn print_status(core: &Core) {
             }
         }
         Err(e) => fail(&format!("status failed: {e}")),
+    }
+}
+
+/// `wicked-core domain-graph` — translate the annotated estate graph into a `requirements_graph.json`
+/// domain model (DES-OUTGOV-001 PR-D). Reads the front-half coverage report, gates on coverage == 1.0
+/// (FAIL-CLOSED — refuses to translate an unannotated graph), builds the model (modern-mode
+/// package-dir grouping, M5), and writes the artifact. Like the other pre-`Core::spawn` subcommands it
+/// opens the store directly for a brief read and never spawns the actor.
+fn domain_graph_cmd(args: &[String]) {
+    let coverage_path = flag(args, "--coverage")
+        .unwrap_or_else(|| ".wicked-estate/coverage-report.json".to_string());
+    let out_path = flag(args, "--out")
+        .unwrap_or_else(|| ".wicked-estate/requirements/requirements_graph.json".to_string());
+    let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
+
+    let coverage: wicked_governance::CoverageReport = match std::fs::read_to_string(&coverage_path)
+    {
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                fail(&format!(
+                    "domain-graph: coverage report {coverage_path} is not valid JSON: {e}"
+                ));
+                return;
+            }
+        },
+        Err(e) => {
+            fail(&format!(
+                "domain-graph: cannot read coverage report {coverage_path}: {e} — run extraction + coverage first"
+            ));
+            return;
+        }
+    };
+
+    let store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("domain-graph: open store failed: {e}"));
+            return;
+        }
+    };
+
+    // Fail-closed: `build_domain_model` bails when coverage < 1.0 (never translates a partial graph).
+    let model = match wicked_governance::build_domain_model(&store, &coverage, &schema_version) {
+        Ok(m) => m,
+        Err(e) => {
+            fail(&format!("domain-graph: {e}"));
+            return;
+        }
+    };
+
+    if let Some(parent) = std::path::Path::new(&out_path).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            fail(&format!(
+                "domain-graph: cannot create {}: {e}",
+                parent.display()
+            ));
+            return;
+        }
+    }
+    let json = serde_json::to_string_pretty(&model).expect("DomainModel serializes to JSON");
+    match std::fs::write(&out_path, json) {
+        Ok(()) => println!(
+            "domain-graph: wrote {} domain(s) → {out_path}",
+            model.domains.len()
+        ),
+        Err(e) => fail(&format!("domain-graph: cannot write {out_path}: {e}")),
     }
 }
 

@@ -13,6 +13,7 @@
 //! `domain_graph.py::assert_front_half_coverage`, §I5).
 
 use serde::{Deserialize, Serialize};
+use wicked_apps_core::GraphRead;
 
 /// The primary artifact: `{ metadata, domains }` (schema root).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -169,6 +170,105 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
     Ok(())
 }
 
+/// The `business_rule` annotation type — the estate annotations the builder lifts into
+/// [`Requirement::business_rules`].
+const BUSINESS_RULE_ANN: &str = "business_rule";
+
+/// The capability boundary for MODERN code (M5): the PARENT directory of a node's source file — NOT
+/// a Louvain community (dense modern code collapses into one near-fully-connected blob). Files at
+/// the repo root group under `(root)`.
+fn package_dir(file: &str) -> String {
+    std::path::Path::new(file)
+        .parent()
+        .and_then(|p| p.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(root)")
+        .to_string()
+}
+
+/// Build the domain model from the annotated estate graph (MODERN mode, M5) — the port of
+/// `domain_graph.py`'s modern path. Gate on front-half coverage (fail-closed), then group every
+/// behavior-bearing node by PACKAGE DIR into a capability domain, lifting each node's `requirement`
+/// semantic + its `business_rule` annotations (confidence-carrying) into a [`Requirement`].
+///
+/// "Behavior-bearing" here = the node carries a `requirement` semantic OR ≥1 `business_rule`
+/// annotation; a node with neither is structural scaffolding and is skipped (it is a coverage hole
+/// only if it was flagged behavior-bearing upstream — that is the coverage gate's job, already
+/// asserted above). Confidence-less rules are NOT fabricated: the annotation's own confidence rides
+/// through. Deterministic: nodes/domains are keyed in sorted (BTreeMap) order.
+pub fn build_domain_model(
+    store: &dyn GraphRead,
+    coverage: &CoverageReport,
+    schema_version: &str,
+) -> anyhow::Result<DomainModel> {
+    assert_front_half_coverage(coverage)?;
+
+    let mut domains: std::collections::BTreeMap<String, Domain> = std::collections::BTreeMap::new();
+    let mut nodes = store.all_nodes()?;
+    nodes.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic requirement id order
+
+    for node in &nodes {
+        let semantics = store.node_semantics(&node.symbol)?;
+        let requirement_text = semantics.as_ref().and_then(|s| s.requirement.clone());
+
+        let business_rules: Vec<Rule> = store
+            .annotations(&node.symbol)?
+            .into_iter()
+            .filter(|a| a.r#type == BUSINESS_RULE_ANN)
+            .enumerate()
+            .map(|(i, a)| Rule {
+                id: format!("RULE-{}-{}", node.name, i + 1),
+                statement: a.value,
+                confidence: a.confidence,
+                provenance: Provenance {
+                    source: "code-graph".to_string(),
+                    reference: format!("{}#{}", node.location.file, node.name),
+                    source_kinds: vec!["code-body".to_string()],
+                },
+                source_ref: Some(format!("{}#{}", node.location.file, node.name)),
+            })
+            .collect();
+
+        // Not behavior-bearing → structural; skip (the coverage gate already vouched completeness).
+        if requirement_text.is_none() && business_rules.is_empty() {
+            continue;
+        }
+
+        let package = package_dir(&node.location.file);
+        let domain = domains.entry(package.clone()).or_insert_with(|| Domain {
+            cluster_id: Some(format!("pkg:{package}")),
+            ..Default::default()
+        });
+        let requirement = Requirement {
+            title: node.name.clone(),
+            description: requirement_text
+                .or_else(|| semantics.as_ref().and_then(|s| s.description.clone()))
+                .unwrap_or_else(|| node.name.clone()),
+            status: semantics.as_ref().map(|s| {
+                if s.requirement_validated {
+                    "validated".to_string()
+                } else {
+                    "unvalidated".to_string()
+                }
+            }),
+            business_rules,
+            ..Default::default()
+        };
+        domain
+            .requirements
+            .insert(format!("REQ-{}", node.name), requirement);
+    }
+
+    Ok(DomainModel {
+        metadata: Metadata {
+            schema_version: schema_version.to_string(),
+            migration_mode: "modern".to_string(),
+            source: Some("estate-graph".to_string()),
+        },
+        domains,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +339,91 @@ mod tests {
         assert!(
             assert_front_half_coverage(&complete).is_ok(),
             "coverage 1.0 translates"
+        );
+    }
+
+    #[test]
+    fn build_domain_model_groups_behavior_by_package_dir() {
+        use wicked_apps_core::{
+            synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
+            SYMBOL_SCHEME,
+        };
+        use wicked_estate_core::Annotation;
+
+        let mut store = SqliteStore::in_memory().unwrap();
+        let mk = |name: &str, file: &str| {
+            Node::new(
+                synthetic_symbol("code", name),
+                NodeKind::Function,
+                name.to_string(),
+                Language::new(SYMBOL_SCHEME),
+                Location::new(file.to_string(), Span::ZERO),
+            )
+        };
+        let charge = mk("charge", "billing/charge.py");
+        let login = mk("login", "auth/login.py");
+        let scaffold = mk("helper", "billing/util.py"); // no requirement, no business rule → skipped
+        store.begin_batch().unwrap();
+        store
+            .upsert_nodes(&[charge.clone(), login.clone(), scaffold.clone()])
+            .unwrap();
+        store.commit_batch().unwrap();
+        // charge: a validated requirement + a business rule. login: a business rule only.
+        store
+            .set_node_semantics(
+                &charge.symbol,
+                None,
+                Some("process a payment charge"),
+                Some(true),
+            )
+            .unwrap();
+        store
+            .annotate(
+                &charge.symbol,
+                Annotation::new("business_rule", "r1", "amount must be positive")
+                    .with_confidence(0.9),
+            )
+            .unwrap();
+        store
+            .annotate(
+                &login.symbol,
+                Annotation::new("business_rule", "r1", "rate-limit failed logins")
+                    .with_confidence(0.7),
+            )
+            .unwrap();
+
+        let coverage = CoverageReport {
+            coverage: 1.0,
+            unaccounted: vec![],
+        };
+        let model = build_domain_model(&store, &coverage, "1.1.0").unwrap();
+
+        assert_eq!(model.metadata.migration_mode, "modern");
+        // Two package-dir domains (auth, billing) — the scaffold node contributed nothing.
+        assert_eq!(
+            model.domains.keys().collect::<Vec<_>>(),
+            vec!["auth", "billing"]
+        );
+        let billing = &model.domains["billing"];
+        assert_eq!(billing.cluster_id.as_deref(), Some("pkg:billing"));
+        assert_eq!(
+            billing.requirements.len(),
+            1,
+            "only the behavior-bearing node"
+        );
+        let req = &billing.requirements["REQ-charge"];
+        assert_eq!(req.description, "process a payment charge");
+        assert_eq!(req.status.as_deref(), Some("validated"));
+        assert_eq!(req.business_rules[0].confidence, 0.9);
+        assert_eq!(req.business_rules[0].statement, "amount must be positive");
+        // The whole model serializes to the wire shape (schema-valid: required keys present).
+        let v = serde_json::to_value(&model).unwrap();
+        assert_eq!(
+            v["domains"]["auth"]["requirements"]["REQ-login"]["business_rules"][0]["confidence"],
+            0.7
+        );
+        assert!(
+            v["domains"]["billing"]["requirements"]["REQ-charge"]["legacy_components"].is_array()
         );
     }
 }

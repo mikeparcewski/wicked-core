@@ -219,3 +219,16 @@ Source: `archived/anti-legacy/skills/anti-legacy-expert/scripts/antilegacy_core/
   artifacts) — the same composition-root pattern as `gate-hook`/`seed-domain-validators`. Fail-closed on coverage < 1.0.
 - **PR-E** then adds the 3-agent acceptance pipeline over the builder's artifacts + the cross-product review + the
   CI-provisioned Postgres parity run (`--features postgres`).
+
+### 10.1 PR-D split (as-built vs follow-on)
+The **wicked-core side is self-contained and lands first**: the native Rust builder (`wicked-governance::
+build_domain_model`, modern-mode package-dir grouping), the wire types round-trip-tested vs the kept schema, the
+fail-closed coverage gate, and the `wicked-core domain-graph` subcommand. What genuinely spans OTHER repos / a workflow
+design decision is deferred to a follow-on so this PR stays clean: (a) **workflow/garden retarget (M10)** —
+`domain-extraction.json`'s `domain-graph` phase is skill-driven (`wicked-garden-domain-graph` + `wicked-brain-domain`);
+pointing it at the deterministic native CLI means the garden skill invokes `wicked-core domain-graph` (or the phase
+becomes `executes_code`), plus re-approving `validator_pin c4cc487a030d57b7` if the coverage-report byte-shape moves —
+a garden + workflow change, not a wicked-core one; (b) the **vocabulary miner** (glossary-direct naming — port
+`vocabulary.py`'s two-axis miner); (c) the **mainframe Louvain path** (legacy dense-code grouping — the modern
+package-dir path is what M5 emphasizes and what ships here). All three are honest, scoped follow-ons; none block the
+native builder's value.
