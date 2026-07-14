@@ -41,7 +41,7 @@ use wicked_apps_core::{
     open_store, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
     CONFORMANCE_CLAIM,
 };
-use wicked_governance::{conform, decide, select};
+use wicked_governance::{conform, decide, recall_rules, select, RuleQuery};
 use wicked_orchestration::{apply_gate, get_phase, Phase};
 
 use crate::domain::put_node;
@@ -270,6 +270,136 @@ fn claude_pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::V
     (context, tool)
 }
 
+/// Environment variables the launcher may set to scope OUTPUT-governance recall to the produced
+/// artifact's facets. Unset ⇒ a wildcard for that facet (every conformance rule matches — the
+/// fail-toward-surfacing default; set them to narrow recall to the artifact's language/layer/framework).
+pub const OUTPUT_LANGUAGE_ENV: &str = "WICKED_OUTPUT_LANGUAGE";
+pub const OUTPUT_LAYER_ENV: &str = "WICKED_OUTPUT_LAYER";
+pub const OUTPUT_FRAMEWORK_ENV: &str = "WICKED_OUTPUT_FRAMEWORK";
+
+/// Body of the `wicked-core output-gate-hook` subcommand — the PER-OUTPUT governance guardrail
+/// (DES-OUTGOV-001 PR-C, M2/M6). Where [`run_gate_hook`] governs a proposed tool INPUT, this governs
+/// the generated OUTPUT text:
+///  1. it evaluates the output through the SAME deterministic `select`+`decide` engine (a policy
+///     whose trigger matches the output DENIES it — hard→deny; an allow-with-conditions rides
+///     obligations — soft→advise), then
+///  2. RECALLS the conformance rules applicable to the output's facets and attaches them as
+///     obligations (the applicable ruleset the output must conform to — M6/M7 recall→gate wiring).
+///
+/// The claim is appended to the SAME decisions NDJSON as the input hook, so [`apply_hook_decisions`]
+/// composes its verdict at the phase gate (deny dominates via the reducer) — there is NO separate
+/// compose path (M1).
+///
+/// **Honest seam:** whether the output *violates* a pattern conformance rule is a SEMANTIC check (the
+/// rule carries no regex) — that verification is the downstream per-turn checker's job (garden). This
+/// entry point is the DETERMINISTIC half: policy-over-output + recall wiring. Fails CLOSED (exit 2)
+/// exactly like the input hook — an un-evaluable or un-recordable output is never silently allowed.
+pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let context = claude_output_context(&raw, scope, phase);
+
+    let decisions_path = match std::env::var(DECISIONS_PATH_ENV) {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            eprintln!(
+                "wicked-governance: DENY ({DECISIONS_PATH_ENV} unset — cannot record output decision)"
+            );
+            return 2;
+        }
+    };
+    let store = match open_store(db.filter(|s| !s.is_empty())) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-governance: DENY (open store failed: {e})");
+            return 2;
+        }
+    };
+    let selected = match select(&store, scope, phase, &context) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-governance: DENY (policy select failed: {e})");
+            return 2;
+        }
+    };
+    let mut claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
+
+    // Wire recall INTO the output gate (M6/M7): the conformance rules applicable to the output's
+    // facets become obligations on the claim. A recall failure is a governance failure (fail
+    // closed) — never silently drop the ruleset.
+    if let Err(e) = attach_recalled_rules(&store, &output_rule_query(), &mut claim) {
+        eprintln!("wicked-governance: DENY (conformance-rule recall failed: {e})");
+        return 2;
+    }
+
+    if let Err(e) = append_decision(Path::new(&decisions_path), &claim) {
+        eprintln!("wicked-governance: DENY (could not append output decision: {e})");
+        return 2;
+    }
+
+    match claim.decision {
+        Decision::Deny => {
+            eprintln!("wicked-governance: DENY output (claim {})", claim.claim_id);
+            2
+        }
+        _ => 0,
+    }
+}
+
+/// Parse the produced OUTPUT into the governance evaluation context. Accepts the wrapped CLI's raw
+/// stdout, OR a JSON envelope (`{"output"|"stdout"|"text"|"content": "…"}` — e.g. a Stop/SubagentStop
+/// event). The output text becomes `work`, the field `select`/`decide` evaluate over.
+fn claude_output_context(raw: &str, scope: &str, phase: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    let output_text = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| {
+            ["output", "stdout", "text", "content"]
+                .iter()
+                .find_map(|k| {
+                    v.get(*k)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    serde_json::json!({
+        "phase": phase,
+        "scope": scope,
+        "output": output_text,
+        "work": output_text,
+    })
+}
+
+/// Attach the conformance rules applicable to `query` as obligations on `claim` — the M6/M7
+/// recall→gate wiring. Each obligation is `conform:<Severity>:<id>:<statement>` so a downstream
+/// checker/human sees the applicable ruleset (and its severity) that the output must conform to. A
+/// recall error propagates so the caller can fail closed.
+fn attach_recalled_rules(
+    store: &dyn GraphRead,
+    query: &RuleQuery,
+    claim: &mut ConformanceClaim,
+) -> anyhow::Result<()> {
+    for r in recall_rules(store, query)? {
+        claim
+            .obligations
+            .push(format!("conform:{:?}:{}:{}", r.severity, r.id, r.statement));
+    }
+    Ok(())
+}
+
+/// Build the conformance-rule recall query from the optional output-facet env vars (unset ⇒ wildcard).
+fn output_rule_query() -> RuleQuery {
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    RuleQuery {
+        language: env(OUTPUT_LANGUAGE_ENV),
+        layer: env(OUTPUT_LAYER_ENV),
+        framework: env(OUTPUT_FRAMEWORK_ENV),
+        severity: None,
+        rule_type: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +439,65 @@ mod tests {
             .map(str::to_string)
             .collect();
         assert_eq!(lines.len(), 2, "append-only: both claims present");
+    }
+
+    #[test]
+    fn output_context_extracts_raw_and_enveloped_output() {
+        // Raw stdout → work.
+        let ctx = claude_output_context("fn main() { unsafe {} }", "s", "review");
+        assert_eq!(ctx["work"], "fn main() { unsafe {} }");
+        assert_eq!(ctx["phase"], "review");
+        // JSON envelope (Stop/SubagentStop-style) → the `output` field becomes work.
+        let ctx = claude_output_context(r#"{"output":"SELECT * FROM users"}"#, "s", "review");
+        assert_eq!(ctx["work"], "SELECT * FROM users");
+    }
+
+    #[test]
+    fn attach_recalled_rules_adds_applicable_rules_as_obligations() {
+        use wicked_governance::{
+            register_rule, ConfSeverity, ConformanceRule, RuleProvenance, RuleQuery, RuleType,
+            Targets,
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &ConformanceRule {
+                id: "POL-001".into(),
+                rule_type: RuleType::Policy,
+                statement: "no plaintext secrets in output".into(),
+                severity: ConfSeverity::Critical,
+                confidence: 0.9,
+                targets: Targets::default(),
+                symbol_ref: None,
+                compliance: None,
+                provenance: RuleProvenance::default(),
+            },
+        )
+        .unwrap();
+
+        let mut claim = ConformanceClaim {
+            claim_id: "c1".into(),
+            scope: "s".into(),
+            phase: "review".into(),
+            policy_ids: vec![],
+            decision: Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:x".into(),
+            criteria: String::new(),
+            evaluator_identity: "wicked-governance".into(),
+            evaluated_at: EVAL_AT_BASE,
+        };
+        // A wildcard query (no facets) recalls the applicable rule and attaches it as an obligation.
+        attach_recalled_rules(&store, &RuleQuery::default(), &mut claim).unwrap();
+        assert_eq!(
+            claim.obligations.len(),
+            1,
+            "the applicable rule is wired in as an obligation"
+        );
+        assert!(
+            claim.obligations[0].contains("Critical") && claim.obligations[0].contains("POL-001"),
+            "obligation carries severity + rule id: {:?}",
+            claim.obligations[0]
+        );
     }
 }
