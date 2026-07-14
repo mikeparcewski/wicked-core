@@ -103,9 +103,19 @@ pub(crate) fn run(
         }
     };
 
+    // The memory + knowledge sidecars are SQLite-only local stores keyed off a FILESYSTEM base
+    // (`<base>.mem` / `<base>.knowledge`). When the graph store is a URL backend (e.g.
+    // `postgres://…`), `path` is NOT a filesystem path, so appending `.mem` would yield a bogus
+    // `postgres://….mem`. In that case anchor the sidecars at the local estate default instead.
+    let sidecar_base: String = if path.contains("://") {
+        ".wicked-estate/graph.db".to_string()
+    } else {
+        path.clone()
+    };
+
     // The orchestrator's episodic memory (a SEPARATE single-writer store, sibling of the estate db).
     // Best-effort: a memory-open failure must never stop the engine, so it's an `Option`.
-    let mut memory = match crate::memory::RunMemory::open(&path) {
+    let mut memory = match crate::memory::RunMemory::open(&sidecar_base) {
         Ok(m) => Some(m),
         Err(e) => {
             eprintln!("wicked-core: memory store unavailable ({e}); continuing without recall");
@@ -113,7 +123,7 @@ pub(crate) fn run(
         }
     };
     // The orchestrator's knowledge base (documents) — also a separate single-writer store, best-effort.
-    let mut knowledge = match crate::knowledge::RunKnowledge::open(&path) {
+    let mut knowledge = match crate::knowledge::RunKnowledge::open(&sidecar_base) {
         Ok(k) => Some(k),
         Err(e) => {
             eprintln!("wicked-core: knowledge store unavailable ({e}); continuing without it");
