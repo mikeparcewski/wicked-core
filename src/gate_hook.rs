@@ -79,6 +79,11 @@ pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 /// Fails CLOSED (returns 2) if the decisions path is unset, the store can't be opened, or governance
 /// can't decide — an un-evaluable tool-call is never silently allowed.
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+    // A store-unavailable DENY leaves no synthetic claim (there may be no resolvable decisions path yet),
+    // unlike the store-open/select infra failures below. That is fine: in a GOVERNED run the launcher only
+    // ever arms a file-backed store (`in_process_governance` filters `:memory:`/`postgres://`), so this
+    // arm is unreachable in-run — it only fires for a mis-invoked STANDALONE `gate-hook`, where no fold
+    // consumes the log. So there is no in-run audit hole (Copilot).
     if let Some(reason) = store_unavailable(db) {
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
@@ -364,7 +369,10 @@ pub fn write_armed_marker(decisions_path: &Path, phase: &str) -> anyhow::Result<
 /// rather than a silent exit-2 the run could Complete past. Errors are swallowed (already failing closed).
 fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
     let claim = ConformanceClaim {
-        claim_id: format!("infra-deny:{phase}:{scope}"),
+        // Keyed on `phase` only — NOT the scope, which embeds `/` (`wicked-agent/<sess>/unit/<id>`) and
+        // would make an unsafe/unbounded claim symbol (Copilot). One infra-deny node per phase is enough
+        // (any infra failure denies the phase); the real scope still rides `claim.scope` below.
+        claim_id: format!("infra-deny:{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
         policy_ids: vec![],
