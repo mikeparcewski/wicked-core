@@ -31,6 +31,9 @@ pub const CONFORMANCE_RULE: &str = "conformance_rule";
 const OUTGOV_EXTRACTOR: &str = "outgov-v1";
 /// The concrete `resolved_by` id estate requires on every edge.
 const CONFORMANCE_RESOLVED_BY: &str = "wicked-governance-conformance";
+/// The shared `provenance.source_kinds` wire enum — identical in the conformance-rules AND
+/// domain-model schemas ($defs/provenance). Enforced at the fail-closed write boundary (INV-C4).
+const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
 
 /// A conformance rule's kind. The id prefix MUST agree (INV-C1): `PAT-*` ⇔ pattern, `POL-*` ⇔ policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +153,17 @@ impl ConformanceRule {
                 "INV-C2: confidence must be a number in [0,1], got {}",
                 self.confidence
             );
+        }
+        // INV-C4: provenance.source_kinds must be drawn from the shared wire enum — the conformance
+        // AND domain-model schemas both constrain it. Fail closed here (the write-time boundary all
+        // persist paths route through) so a wicked-core producer can never emit an out-of-enum
+        // source_kind its cross-product consumers' schema would reject.
+        for sk in &self.provenance.source_kinds {
+            if !VALID_SOURCE_KINDS.contains(&sk.as_str()) {
+                anyhow::bail!(
+                    "INV-C4: provenance.source_kinds contains {sk:?}, not one of {VALID_SOURCE_KINDS:?}"
+                );
+            }
         }
         Ok(())
     }
@@ -394,6 +408,18 @@ mod tests {
         );
         r.confidence = 1.5;
         assert!(r.validate().unwrap_err().to_string().contains("INV-C2"));
+        // INV-C4: an out-of-enum source_kind (the shared wire enum) fails closed.
+        r = rule(
+            "PAT-001",
+            RuleType::Pattern,
+            ConfSeverity::Info,
+            Targets::default(),
+        );
+        r.provenance.source_kinds = vec!["banana".to_string()];
+        assert!(r.validate().unwrap_err().to_string().contains("INV-C4"));
+        // A valid source_kind passes.
+        r.provenance.source_kinds = vec!["code-body".to_string()];
+        assert!(r.validate().is_ok());
     }
 
     #[test]

@@ -71,3 +71,12 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+      # Backend-parity compile check (DES-OUTGOV-001 §5): estate's Postgres backend, wired through
+      # the engine's `dyn GraphStore` seam + `AnyStore`, must keep COMPILING under `--features
+      # postgres` (it pulls sqlx + tokio). No Postgres SERVICE is needed for the compile — a
+      # CI-provisioned Postgres + real round-trip parity is a follow-on. The default gate above
+      # already asserts the OTHER half of §5: a `postgres://` spec is REJECTED (fail-closed) when the
+      # feature is OFF (the `postgres_spec_fails_closed_without_feature` test).
+      - name: cargo build --features postgres (backend compile-parity)
+        run: cargo build --features postgres

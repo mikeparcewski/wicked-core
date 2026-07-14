@@ -125,13 +125,17 @@ pub const EVIDENCES: &str = "evidences";
 //    Convention: `wicked.<domain>.<noun>.<verb>`. Apps validate emitted types with `validate_event_type`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// wicked.governance.* (producer: wicked-governance)
+// All events share the single `wicked.crew.*` producer domain (canonical per DES-EXEC-001 /
+// DES-OUTGOV-001) — the subsystem is the NOUN, not the domain segment, so one `wicked.crew.*`
+// subscriber catches the whole ecosystem.
+
+// wicked.crew.* — governance subsystem (producer: wicked-governance)
 pub const EV_POLICY_REGISTERED: &str = "wicked.crew.policy.registered";
 pub const EV_POLICY_EVALUATED: &str = "wicked.crew.policy.evaluated";
 pub const EV_CONFORMANCE_RECORDED: &str = "wicked.crew.conformance.recorded";
 pub const EV_POLICY_VIOLATED: &str = "wicked.crew.policy.violated";
 
-// wicked.orchestration.* (producer: wicked-orchestration)
+// wicked.crew.* — orchestration subsystem (producer: wicked-orchestration)
 pub const EV_WORKFLOW_STARTED: &str = "wicked.crew.workflow.started";
 pub const EV_WORKFLOW_COMPLETED: &str = "wicked.crew.workflow.completed";
 pub const EV_PHASE_STARTED: &str = "wicked.crew.phase.started";
@@ -139,17 +143,18 @@ pub const EV_PHASE_READY_FOR_GATE: &str = "wicked.crew.phase.ready-for-gate";
 pub const EV_PHASE_APPROVED: &str = "wicked.crew.phase.approved";
 pub const EV_PHASE_REJECTED: &str = "wicked.crew.phase.rejected";
 
-// wicked.council.* (producer: wicked-council)
+// wicked.crew.* — council subsystem (producer: wicked-council)
 pub const EV_COUNCIL_REQUESTED: &str = "wicked.crew.council.requested";
 pub const EV_COUNCIL_VOTED: &str = "wicked.crew.council.voted";
 pub const EV_CLI_RANKED: &str = "wicked.crew.cli.ranked";
 
-// wicked.agent.* (producer: wicked-agent)
-pub const EV_AGENT_SESSION_STARTED: &str = "wicked.agent.session.started";
-pub const EV_AGENT_PLAN_CREATED: &str = "wicked.agent.plan.created";
-pub const EV_AGENT_WORK_DISTRIBUTED: &str = "wicked.agent.work.distributed";
-pub const EV_AGENT_TASK_COMPLETED: &str = "wicked.agent.task.completed";
-pub const EV_AGENT_SESSION_COMPLETED: &str = "wicked.agent.session.completed";
+// wicked.crew.* — agent subsystem (producer: wicked-crew). Agent-qualified nouns keep them under
+// the crew domain without colliding with the cli-runner `wicked.crew.task.completed` (DES-EXEC-001).
+pub const EV_AGENT_SESSION_STARTED: &str = "wicked.crew.agent_session.started";
+pub const EV_AGENT_PLAN_CREATED: &str = "wicked.crew.agent_plan.created";
+pub const EV_AGENT_WORK_DISTRIBUTED: &str = "wicked.crew.agent_work.distributed";
+pub const EV_AGENT_TASK_COMPLETED: &str = "wicked.crew.agent_task.completed";
+pub const EV_AGENT_SESSION_COMPLETED: &str = "wicked.crew.agent_session.completed";
 
 /// Every event type in the catalog, in declaration order. The source of truth is
 /// `wicked-governance/contracts/events.json`; this array mirrors it for in-process validation
@@ -427,12 +432,18 @@ mod tests {
         // Every catalog member whose name is grammar-conformant ([a-z0-9_] segments) must pass.
         // `wicked.crew.phase.ready-for-gate` is the documented hyphen exception (rejected below).
         for &ev in EVENT_CATALOG {
+            // Domain-consistency guard (cross-product review): the WHOLE catalog shares the single
+            // `wicked.crew.*` producer domain — no subsystem gets its own domain segment.
+            assert!(
+                ev.starts_with("wicked.crew."),
+                "catalog event must be under the crew domain: {ev}"
+            );
             if ev.contains('-') {
                 continue;
             }
             assert!(validate_event_type(ev), "catalog event must validate: {ev}");
         }
-        // Spot-check one from each domain explicitly.
+        // Spot-check one from each subsystem explicitly.
         assert!(validate_event_type(EV_POLICY_REGISTERED));
         assert!(validate_event_type(EV_WORKFLOW_STARTED));
         assert!(validate_event_type(EV_COUNCIL_VOTED));
