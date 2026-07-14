@@ -192,3 +192,43 @@ the mechanism:
 - **Verified:** default build 0 warnings + full suite green (apps-core 10 / orchestration 20 / governance 8 /
   council 19 / core 148); `cargo build --features postgres` compiles end-to-end; a fail-closed test asserts a
   `postgres://` spec is REJECTED (not silently SQLite) when the feature is off (§5's rejection assertion).
+
+## 10. PR-D as-designed — domain-graph builder (recon of anti-legacy `domain_graph.py`)
+Source: `archived/anti-legacy/skills/anti-legacy-expert/scripts/antilegacy_core/{domain_graph,coverage,vocabulary}.py`
+(1772-line builder). It is engine-independent — funnels through `wicked_estate` + `coverage` + `vocabulary`. Port shape:
+
+- **The extraction front-half already exists** (domain-brain phase-2): estate#61 `nodes --json --semantics` emits
+  `requirement`/`requirement_validated`/`rule_confidence(max over business_rule anns)`/`out_edges`; brain#93 proved
+  coverage on the live estate DB (charge=resolved, coverage 0.33, gate denies). So the READ surfaces the builder needs
+  are on estate. PR-D does NOT rebuild extraction — it consumes `clusters --json --summary` + `nodes --json --semantics`.
+- **Front-half coverage GATE (fail-closed):** port `assert_front_half_coverage` — the coverage-report MUST show
+  `coverage == 1.0` before translating; else bail listing the unaccounted SymbolIds (§I5 refuses to translate an
+  unannotated graph). Predicate salvaged in RET-BRAIN-DOMAIN-001: `(resolved+risk)/behavior_bearing == 1.0`, dead-shell excluded.
+- **Grouping (M5):** modern code partitions by **PACKAGE DIR (parent source directory)**, NOT Louvain — Louvain only
+  for dense legacy blobs (`domain_graph.py:91-102`). The "never file-derived" line in §4 was wrong: for modern code the
+  capability boundary IS the package dir.
+- **Output:** `requirements_graph.json` = `{metadata, domains[]}`, each domain carrying `requirements[]` → `rules[]`
+  (rule shape `{id, statement, confidence}`, seq ids `VAL-`/`ERR-`/`RULE-`), entities with typed fields. Byte-shape must
+  match the KEPT `schemas/domain-model.schema.json` wire contract (garden/wicked-testing consume it). Vocab miner
+  (`vocabulary.py`) drives glossary-direct naming — port the two-axis miner (salvaged shape in RET-BRAIN-DOMAIN-001).
+- **Coverage artifact + workflow retarget (M10):** emit `coverage-report.json` in the salvaged shape AND retarget
+  `wicked-core/workflows/domain-extraction.json` — the `domain-graph` phase `skill_ref` (`wicked-garden-domain-graph`)
+  and the `coverage` phase `allowed_skills` (`wicked-brain-coverage`, retiring) → the new Rust builder; **re-approve the
+  `validator_pin c4cc487a030d57b7`** if the coverage-report byte-shape changes (`src/domain_extraction.rs` + the pin test).
+- **Home:** a `wicked-core domain-graph` subcommand consuming `wicked-apps-core` (reads estate in-process, emits the two
+  artifacts) — the same composition-root pattern as `gate-hook`/`seed-domain-validators`. Fail-closed on coverage < 1.0.
+- **PR-E** then adds the 3-agent acceptance pipeline over the builder's artifacts + the cross-product review + the
+  CI-provisioned Postgres parity run (`--features postgres`).
+
+### 10.1 PR-D split (as-built vs follow-on)
+The **wicked-core side is self-contained and lands first**: the native Rust builder (`wicked-governance::
+build_domain_model`, modern-mode package-dir grouping), the wire types round-trip-tested vs the kept schema, the
+fail-closed coverage gate, and the `wicked-core domain-graph` subcommand. What genuinely spans OTHER repos / a workflow
+design decision is deferred to a follow-on so this PR stays clean: (a) **workflow/garden retarget (M10)** —
+`domain-extraction.json`'s `domain-graph` phase is skill-driven (`wicked-garden-domain-graph` + `wicked-brain-domain`);
+pointing it at the deterministic native CLI means the garden skill invokes `wicked-core domain-graph` (or the phase
+becomes `executes_code`), plus re-approving `validator_pin c4cc487a030d57b7` if the coverage-report byte-shape moves —
+a garden + workflow change, not a wicked-core one; (b) the **vocabulary miner** (glossary-direct naming — port
+`vocabulary.py`'s two-axis miner); (c) the **mainframe Louvain path** (legacy dense-code grouping — the modern
+package-dir path is what M5 emphasizes and what ships here). All three are honest, scoped follow-ons; none block the
+native builder's value.
