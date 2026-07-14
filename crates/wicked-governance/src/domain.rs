@@ -52,14 +52,19 @@ impl Severity {
 /// JSON of the evaluated context (decide.mjs `triggers`). `None` ⇒ the policy fires whenever it
 /// was phase-selected (a blanket allow / obligation policy).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Trigger {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contains: Option<String>,
 }
 
 /// A governance policy — the typed projection of a rule. Field set mirrors the prototype's
-/// normalized policy (store.mjs `normalizePolicy`).
+/// normalized policy (store.mjs `normalizePolicy`). `deny_unknown_fields` makes a typo'd field a LOUD
+/// parse error rather than a silently-ignored key — so a mis-authored `policies/*.json` (e.g. `applies`
+/// instead of `applies_to`) can't register a policy that then enforces nothing (the fail-open the
+/// `rules ingest` population path must never allow).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub id: String,
     pub kind: String,
@@ -78,6 +83,27 @@ pub struct Policy {
     /// Human-prose statement of the rule.
     #[serde(default)]
     pub rule: String,
+}
+
+impl Policy {
+    /// Fail-closed write-time invariant: a policy with an EMPTY `applies_to` is selected for NO phase
+    /// (`select` matches `applies_to.contains(phase)`), so it enforces NOTHING — registering it would be
+    /// a silent fail-open (the store looks "governed" but the gate never fires). Reject it loudly, so an
+    /// omitted/typo'd/empty `applies_to` can never populate a non-enforcing policy. Mirrors
+    /// `ConformanceRule::validate`.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.id.trim().is_empty() {
+            anyhow::bail!("policy has an empty id");
+        }
+        if self.applies_to.is_empty() {
+            anyhow::bail!(
+                "policy {:?} has empty applies_to — it is selected for no phase and enforces nothing \
+                 (fail-loud: a non-enforcing policy must not silently register)",
+                self.id
+            );
+        }
+        Ok(())
+    }
 }
 
 impl ToNode for Policy {

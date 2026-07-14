@@ -732,11 +732,23 @@ fn coverage_cmd(args: &[String]) {
 /// (0 policies + 0 rules) errors (a silent no-op population would read as "governed" while enforcing
 /// nothing). A missing `policies/` or `rules/` subdir is tolerated (a ruleset may carry only one kind).
 fn rules_ingest_cmd(args: &[String]) {
-    let dir = match flag(args, "--dir").or_else(|| {
-        args.get(3)
-            .filter(|a| !a.starts_with("--"))
-            .map(|s| s.to_string())
-    }) {
+    // The <dir> is the first NON-FLAG token after `rules ingest` (index 3+), skipping any `--flag value`
+    // pair — so `rules ingest --db x /dir` and `rules ingest /dir --db x` both resolve the dir.
+    let positional_dir = || -> Option<String> {
+        let mut i = 3;
+        while i < args.len() {
+            let a = &args[i];
+            if let Some(stripped) = a.strip_prefix("--") {
+                // `--db` etc. consume a following value; bare `--flag` (none here) would not.
+                let _ = stripped;
+                i += 2;
+            } else {
+                return Some(a.clone());
+            }
+        }
+        None
+    };
+    let dir = match flag(args, "--dir").or_else(positional_dir) {
         Some(d) => d,
         None => {
             fail("rules ingest requires a directory: wicked-core rules ingest <dir> [--db F]");
@@ -784,20 +796,40 @@ fn rules_ingest_cmd(args: &[String]) {
     // Governance policies (the deterministic deny path).
     let policies_dir = root.join("policies");
     if policies_dir.is_dir() {
-        let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&policies_dir) {
-            Ok(rd) => rd
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| {
-                    p.extension()
-                        .is_some_and(|x| x.eq_ignore_ascii_case("json"))
-                })
-                .collect(),
+        // Enumerate explicitly, PROPAGATING a mid-readdir fault (never `.ok()`-drop it — a silent skip
+        // would truncate the DENY set and fail governance OPEN, the exact hazard the conformance adapter
+        // was written to avoid).
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let rd = match std::fs::read_dir(&policies_dir) {
+            Ok(rd) => rd,
             Err(e) => {
                 fail(&format!("rules ingest: cannot read {policies_dir:?}: {e}"));
                 return;
             }
         };
+        for entry in rd {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    fail(&format!(
+                        "rules ingest: cannot enumerate {policies_dir:?}: {e}"
+                    ));
+                    return;
+                }
+            };
+            let p = entry.path();
+            if p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("json"))
+            {
+                files.push(p);
+            }
+        }
         files.sort(); // deterministic ingest order
+                      // INV-C3-style dedup on the DENY path: a duplicate policy id would silently OVERWRITE at register
+                      // (both map to `policy/<id>`; a Deny could be clobbered by a weaker Allow) while the count
+                      // over-reports. Fail loud on a collision across the whole `policies/` bundle.
+        let mut seen_policy_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for p in files {
             let text = match std::fs::read_to_string(&p) {
                 Ok(t) => t,
@@ -821,6 +853,15 @@ fn rules_ingest_cmd(args: &[String]) {
                     },
                 };
             for pol in &policies {
+                if !seen_policy_ids.insert(pol.id.clone()) {
+                    fail(&format!(
+                        "rules ingest: duplicate policy id {:?} across policies/*.json — a later policy \
+                         would silently overwrite an earlier one at register (both map to policy/<id>, \
+                         e.g. a Deny replaced by an Allow); refusing (fail-loud)",
+                        pol.id
+                    ));
+                    return;
+                }
                 if let Err(e) = wicked_governance::register_policy(&mut store, pol) {
                     fail(&format!(
                         "rules ingest: register policy {} failed: {e}",

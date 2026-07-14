@@ -159,6 +159,118 @@ fn empty_ruleset_dir_fails_loud() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// Write a single policy file with the given JSON object; returns the ruleset dir.
+fn ruleset_with_policy(base: &std::path::Path, policy: serde_json::Value) -> std::path::PathBuf {
+    let ruleset = base.join("ruleset");
+    std::fs::create_dir_all(ruleset.join("policies")).unwrap();
+    std::fs::write(ruleset.join("policies/p.json"), policy.to_string()).unwrap();
+    ruleset
+}
+
+#[test]
+fn a_policy_with_empty_applies_to_fails_loud() {
+    // CRITICAL fail-open guard: a policy selected for NO phase enforces nothing — registering it would
+    // read as "governed" while the gate never fires. Must fail loud, not silently populate.
+    let base = scratch("noapply");
+    let db = base.join("estate.db");
+    let ruleset = ruleset_with_policy(
+        &base,
+        serde_json::json!({
+            "id": "pol-x", "kind": "k", "applies_to": [], "effect": "deny",
+            "trigger": { "contains": "BAD" }, "obligations": [], "criteria": "c",
+            "severity": "high", "rule": "r"
+        }),
+    );
+    let out = ingest(db.to_str().unwrap(), &ruleset);
+    assert!(!out.status.success(), "empty applies_to must fail loud");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("applies_to"),
+        "the error names the non-enforcing policy: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_policy_with_a_typoed_field_fails_loud() {
+    // deny_unknown_fields: `applies` (typo for applies_to) is a LOUD parse error, not a silently-ignored
+    // key that leaves the policy selected for no phase.
+    let base = scratch("typo");
+    let db = base.join("estate.db");
+    let ruleset = ruleset_with_policy(
+        &base,
+        serde_json::json!({
+            "id": "pol-x", "kind": "k", "applies": ["build"], "effect": "deny",
+            "trigger": { "contains": "BAD" }, "obligations": [], "criteria": "c",
+            "severity": "high", "rule": "r"
+        }),
+    );
+    let out = ingest(db.to_str().unwrap(), &ruleset);
+    assert!(
+        !out.status.success(),
+        "a typo'd policy field must fail loud (deny_unknown_fields)"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn duplicate_policy_id_fails_loud() {
+    let base = scratch("dup");
+    let db = base.join("estate.db");
+    let ruleset = base.join("ruleset");
+    std::fs::create_dir_all(ruleset.join("policies")).unwrap();
+    // Two policies with the SAME id (one Deny, one Allow) — a silent overwrite could clobber the Deny.
+    std::fs::write(
+        ruleset.join("policies/dup.json"),
+        serde_json::json!([
+            { "id": "pol-dup", "kind": "k", "applies_to": ["build"], "effect": "deny",
+              "trigger": { "contains": "X" }, "obligations": [], "criteria": "c", "severity": "high", "rule": "r" },
+            { "id": "pol-dup", "kind": "k", "applies_to": ["build"], "effect": "allow",
+              "trigger": {}, "obligations": [], "criteria": "c", "severity": "low", "rule": "r" }
+        ])
+        .to_string(),
+    )
+    .unwrap();
+    let out = ingest(db.to_str().unwrap(), &ruleset);
+    assert!(
+        !out.status.success(),
+        "a duplicate policy id must fail loud"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate policy id"));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn flags_before_the_dir_still_resolve() {
+    // `rules ingest --db x <dir>` (flag before the positional) must resolve the dir.
+    let base = scratch("flagorder");
+    let db = base.join("estate.db");
+    let ruleset = ruleset_with_policy(
+        &base,
+        serde_json::json!({
+            "id": "pol-x", "kind": "k", "applies_to": ["build"], "effect": "deny",
+            "trigger": { "contains": "BAD" }, "obligations": [], "criteria": "c",
+            "severity": "high", "rule": "r"
+        }),
+    );
+    let out = Command::new(BIN)
+        .args([
+            "rules",
+            "ingest",
+            "--db",
+            db.to_str().unwrap(),
+            ruleset.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "flag-before-dir must resolve: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn policies_only_ruleset_works() {
     // A ruleset with ONLY policies (no rules/ subdir) is tolerated.
