@@ -66,7 +66,11 @@ pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 /// can't decide — an un-evaluable tool-call is never silently allowed.
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
+    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+        // An unreadable (e.g. non-UTF-8) tool call is UN-EVALUABLE — fail closed, never allow.
+        eprintln!("wicked-governance: DENY (could not read tool call for evaluation: {e})");
+        return 2;
+    }
     let (context, tool) = claude_pretool_context(&raw, scope, phase);
 
     // Fail closed if the launcher didn't wire an absolute decisions path.
@@ -164,6 +168,15 @@ pub fn apply_hook_decisions(
 
     let workflow_id = format!("wf-{run_id}");
     let mut summary = HookDrainSummary::default();
+
+    // Pass 1: `conform` every claim (durable per-claim evidence — idempotent, order-independent) and
+    // GROUP by the governance phase it targets. Grouping is what makes deny DOMINATE: a phase gate is
+    // resolved ONCE from the composed verdict, not first-writer-wins across claims. Without this, an
+    // Allow drained before a Deny (the common input-hook-then-output-hook file order) would resolve
+    // the phase to a TERMINAL Approved, and the reducer would then refuse the Deny (`from_mismatch`)
+    // — silently dropping the veto. (BTreeMap → deterministic phase iteration order.)
+    let mut by_phase: std::collections::BTreeMap<String, Vec<ConformanceClaim>> =
+        std::collections::BTreeMap::new();
     for line in raw.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -173,19 +186,29 @@ pub fn apply_hook_decisions(
             Ok(c) => c,
             Err(_) => continue, // a malformed line never blocks the rest of the drain
         };
-
-        // 1. durable evidence — the single-writer ingest of the out-of-process decision.
         conform(store, &claim)?;
         summary.applied += 1;
+        by_phase.entry(claim.phase.clone()).or_default().push(claim);
+    }
 
-        // 2. resolve the gate on the run's phase. Phase id mirrors the engine's convention
-        //    (`{workflow_id}:{phase_name}`); claim.phase is the governance phase the hook evaluated.
-        let phase_id = format!("{workflow_id}:{}", claim.phase);
-        ensure_phase_at_gate(store, &phase_id, &workflow_id, &claim.phase)?;
-        let gate_event_id = format!("hookgate-{}", claim.claim_id);
-        apply_gate(store, &phase_id, Some(&claim), &gate_event_id)?;
-
-        if claim.decision == Decision::Deny {
+    // Pass 2: resolve each phase's gate ONCE from the deny-dominating verdict
+    // (Deny ≻ AllowWithConditions ≻ Allow). Deny wins regardless of the claims' arrival order.
+    for (phase_name, claims) in &by_phase {
+        let phase_id = format!("{workflow_id}:{phase_name}");
+        ensure_phase_at_gate(store, &phase_id, &workflow_id, phase_name)?;
+        let verdict = claims
+            .iter()
+            .find(|c| c.decision == Decision::Deny)
+            .or_else(|| {
+                claims
+                    .iter()
+                    .find(|c| c.decision == Decision::AllowWithConditions)
+            })
+            .unwrap_or(&claims[0]);
+        let gate_event_id = format!("hookgate-{}", verdict.claim_id);
+        let outcome = apply_gate(store, &phase_id, Some(verdict), &gate_event_id)?;
+        // Count a veto only when the Deny actually resolved the gate (never mask a refused transition).
+        if verdict.decision == Decision::Deny && outcome.applied {
             summary.denied += 1;
         }
     }
@@ -296,7 +319,11 @@ pub const OUTPUT_FRAMEWORK_ENV: &str = "WICKED_OUTPUT_FRAMEWORK";
 /// exactly like the input hook — an un-evaluable or un-recordable output is never silently allowed.
 pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
+    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+        // An unreadable (e.g. non-UTF-8) output is UN-EVALUABLE — fail closed, never allow.
+        eprintln!("wicked-governance: DENY (could not read output for evaluation: {e})");
+        return 2;
+    }
     let context = claude_output_context(&raw, scope, phase);
 
     let decisions_path = match std::env::var(DECISIONS_PATH_ENV) {
@@ -348,7 +375,18 @@ pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
 
 /// Parse the produced OUTPUT into the governance evaluation context. Accepts the wrapped CLI's raw
 /// stdout, OR a JSON envelope (`{"output"|"stdout"|"text"|"content": "…"}` — e.g. a Stop/SubagentStop
-/// event). The output text becomes `work`, the field `select`/`decide` evaluate over.
+/// event). The extracted output text becomes `work` (the canonical evaluated value); the FULL raw
+/// input is ALSO carried as `raw` so a policy trigger can never fail to fire on a violation living in
+/// a discarded envelope field — extraction narrows the DISPLAY value, never the governed surface
+/// (fail-CLOSED direction: `select`/`decide` scan the whole context object, so scanning more is safe).
+///
+/// KNOWN LIMITATION (inherited, tracked as a follow-up — affects BOTH hooks): `decide`'s triggers
+/// match over the CANONICAL JSON of this context (`serde_json::to_string`), where newlines are
+/// escaped to `\n`, so a policy trigger authored with a real-newline / `(?m)^…$` line anchor will not
+/// match interior lines of multiline output. Fixing it means decoupling the trigger haystack from the
+/// attestation fingerprint in `wicked-governance::decide` (keep the canonical bytes for
+/// `evaluated_context_ref` / ADR-0003 re-derivability, match against the raw string) — a governance-
+/// engine change out of this per-output entry point's scope.
 fn claude_output_context(raw: &str, scope: &str, phase: &str) -> serde_json::Value {
     let trimmed = raw.trim();
     let output_text = serde_json::from_str::<serde_json::Value>(trimmed)
@@ -366,7 +404,7 @@ fn claude_output_context(raw: &str, scope: &str, phase: &str) -> serde_json::Val
     serde_json::json!({
         "phase": phase,
         "scope": scope,
-        "output": output_text,
+        "raw": trimmed,
         "work": output_text,
     })
 }
@@ -499,5 +537,94 @@ mod tests {
             "obligation carries severity + rule id: {:?}",
             claim.obligations[0]
         );
+    }
+
+    #[test]
+    fn attach_recalled_rules_narrows_by_facet() {
+        use wicked_governance::{
+            register_rule, ConfSeverity, ConformanceRule, RuleProvenance, RuleQuery, RuleType,
+            Targets,
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mk = |id: &str, lang: &str| ConformanceRule {
+            id: id.into(),
+            rule_type: RuleType::Pattern,
+            statement: "s".into(),
+            severity: ConfSeverity::Warn,
+            confidence: 0.5,
+            targets: Targets {
+                language: Some(lang.into()),
+                ..Default::default()
+            },
+            symbol_ref: None,
+            compliance: None,
+            provenance: RuleProvenance::default(),
+        };
+        register_rule(&mut store, &mk("PAT-001", "python")).unwrap();
+        register_rule(&mut store, &mk("PAT-002", "rust")).unwrap();
+
+        let mut claim = allow_claim("c1", "review");
+        // A FACETED query attaches ONLY the matching rule — proving narrowing (not "attach all").
+        attach_recalled_rules(
+            &store,
+            &RuleQuery {
+                language: Some("python".into()),
+                ..Default::default()
+            },
+            &mut claim,
+        )
+        .unwrap();
+        assert_eq!(claim.obligations.len(), 1, "only the python rule matches");
+        assert!(claim.obligations[0].contains("PAT-001"));
+    }
+
+    #[test]
+    fn drain_deny_dominates_when_two_claims_share_a_phase() {
+        use wicked_orchestration::{get_phase, PhaseStatus};
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-drain-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decisions.ndjson");
+        let _ = std::fs::remove_file(&path);
+
+        // Allow drained BEFORE Deny — the common input-hook-then-output-hook file order that used to
+        // resolve the phase to a TERMINAL Approved and silently drop the later Deny (from_mismatch).
+        append_decision(&path, &allow_claim("allow-1", "exec")).unwrap();
+        let mut deny = allow_claim("deny-1", "exec");
+        deny.decision = Decision::Deny;
+        append_decision(&path, &deny).unwrap();
+
+        let summary = apply_hook_decisions(&mut store, "run1", &path).unwrap();
+        assert_eq!(
+            summary.applied, 2,
+            "both claims conformed as durable evidence"
+        );
+        assert_eq!(
+            summary.denied, 1,
+            "the phase's Deny verdict resolved the gate"
+        );
+        let phase = get_phase(&store, "wf-run1:exec").unwrap().unwrap();
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Rejected,
+            "deny DOMINATES the same-phase Allow regardless of arrival order"
+        );
+    }
+
+    /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.
+    fn allow_claim(id: &str, phase: &str) -> ConformanceClaim {
+        ConformanceClaim {
+            claim_id: id.to_string(),
+            scope: "s".into(),
+            phase: phase.to_string(),
+            policy_ids: vec![],
+            decision: Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: format!("sha256:{id}"),
+            criteria: String::new(),
+            evaluator_identity: "wicked-governance".into(),
+            evaluated_at: EVAL_AT_BASE,
+        }
     }
 }
