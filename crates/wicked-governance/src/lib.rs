@@ -25,6 +25,7 @@
 
 mod conformance;
 mod domain;
+mod domain_model;
 mod engine;
 mod ingest;
 
@@ -38,6 +39,13 @@ pub use engine::{
 pub use conformance::{
     recall_rules, register_rule, Compliance, ConfSeverity, ConformanceRule, RuleProvenance,
     RuleQuery, RuleType, Targets,
+};
+
+// Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).
+pub use domain_model::{
+    assert_front_half_coverage, CoverageReport, Domain, DomainModel, Entity, EntityField,
+    ErrorPath, Metadata as DomainMetadata, Provenance as DomainProvenance, Requirement,
+    Rule as DomainRule, Validation,
 };
 pub use ingest::{
     ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,
