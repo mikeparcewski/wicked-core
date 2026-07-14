@@ -84,6 +84,7 @@ impl StepRunner for Ctl {
             status,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }

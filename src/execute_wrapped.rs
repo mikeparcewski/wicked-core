@@ -287,7 +287,8 @@ impl WrappedCliStepRunner {
                         status: StepStatus::Failed,
                         usage: None,
                         files: Vec::new(),
-                    }
+                        governed: false, // arming failed → not governed (and the unit fails anyway)
+                    };
                 }
             },
             _ => None,
@@ -319,7 +320,7 @@ impl WrappedCliStepRunner {
             // shell metacharacters — the command string carries only the trusted exe (DES-OUTGOV-003 §8).
             if let Some(g) = &gov_env {
                 cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
-                cmd.env("WICKED_ESTATE_DB", &g.db_path);
+                cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
                 cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
                 cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
             }
@@ -357,6 +358,10 @@ impl WrappedCliStepRunner {
             status,
             usage,
             files,
+            // The wrapped-CLI runner is the ONLY authority on whether input governance was armed (it wrote
+            // the armed marker). The fold trusts this, not unit properties, so a stub/test runner never
+            // false-denies a claude-assigned unit for a marker it never wrote.
+            governed: gov_env.is_some(),
         }
     }
 }
@@ -410,7 +415,7 @@ fn arm_input_governance(
     argv: &mut Vec<String>,
 ) -> std::io::Result<GovLaunch> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
-    let phase = format!("unit-{}", input.unit.ord);
+    let phase = crate::scope::unit_phase(input.unit.ord);
     let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
@@ -431,12 +436,41 @@ fn arm_input_governance(
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
-    std::fs::create_dir_all(&dir)?;
-    // Per-UNIT settings file (each unit pins its own scope/phase) — never a shared per-run file two
-    // overlapping units could clobber.
+    crate::gate_hook::create_dir_all_private(&dir)?;
+    // Per-unit settings file. Written with `create_new` (O_EXCL) so a local attacker who predicts the
+    // deterministic temp path can't pre-place a symlink and redirect the write (council [6] TOCTOU). On a
+    // clash we UNLINK the existing entry (removing a symlink itself, not its target) and re-create fresh
+    // with O_EXCL — tolerating a legitimate re-arm without ever writing through a pre-placed symlink.
     let settings_path = dir.join(format!("settings-{phase}.json"));
     let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
-    std::fs::write(&settings_path, bytes)?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&settings_path)
+            .or_else(|e| {
+                // On a clash, UNLINK the existing entry (remove_file removes a SYMLINK itself, never its
+                // target) then re-create fresh with O_EXCL. A truncate-reopen would FOLLOW a pre-placed
+                // symlink and overwrite an arbitrary file (gemini/Copilot security-critical); unlink+
+                // create_new tolerates a legitimate re-arm without ever writing through a symlink.
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(&settings_path);
+                    std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&settings_path)
+                } else {
+                    Err(e)
+                }
+            })?;
+        f.write_all(&bytes)?;
+    }
+    // Write the ARMED marker BEFORE the CLI runs: its presence lets the actor-side fold distinguish a
+    // governed unit that legitimately made no tool-calls (marker only) from one whose evidence was erased
+    // or whose hook never fired (marker absent → fail closed). Closes the council evidence-integrity blocker.
+    crate::gate_hook::write_armed_marker(&decisions_path, &phase)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
     // prompt / a `--` guard).
     argv.insert(1, settings_path.to_string_lossy().into_owned());

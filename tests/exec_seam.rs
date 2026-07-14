@@ -52,6 +52,7 @@ impl StepRunner for CountingRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }
@@ -261,6 +262,7 @@ impl StepRunner for OkRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }
@@ -290,6 +292,7 @@ impl StepRunner for RestartRunner {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                governed: false,
             };
         }
         self.runs.fetch_add(1, Ordering::SeqCst);
@@ -301,6 +304,7 @@ impl StepRunner for RestartRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
 }
@@ -518,6 +522,7 @@ impl StepRunner for StreamingRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            governed: false,
         }
     }
     fn run_unit_streaming(&self, i: &StepInput, emit: &(dyn Fn(&str) + Send + Sync)) -> StepOutput {

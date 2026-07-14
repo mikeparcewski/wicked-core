@@ -151,6 +151,10 @@ struct CompletedTask {
     usage: Option<crate::workflow::Usage>,
     #[serde(default)]
     files: Vec<String>,
+    /// Whether the off-actor runner armed input governance (wrote the armed marker) — carried so the
+    /// actor-side fold applies evidence-integrity fail-closure identically for the bus delivery mode.
+    #[serde(default)]
+    governed: bool,
 }
 
 /// The wire form of the `(pass, reasoning)` agent verdict `ApplyStepResult` carries.
@@ -581,6 +585,7 @@ fn run_cli_runner(
                         .map(|(pass, reasoning)| AgentVerdictWire { pass, reasoning }),
                     usage: output.usage.clone(),
                     files: output.files.clone(),
+                    governed: output.governed,
                 };
                 let payload = match serde_json::to_value(&completed) {
                     Ok(v) => v,
@@ -667,6 +672,7 @@ fn run_task_completed_poller(
                     status: status_from_str(&task.status),
                     usage: task.usage,
                     files: task.files,
+                    governed: task.governed,
                 };
                 let agent_verdict = task.agent_verdict.map(|v| (v.pass, v.reasoning));
                 // Reach the actor ONLY via the command channel (the self_tx write-back pattern). A closed
@@ -768,6 +774,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Council [4]: a governed StepInput's `GovernanceContext` must SURVIVE the exec-mediation bus
+    /// round-trip — a `#[serde(default)]` regression in `DispatchedTask` or the reconstruction would
+    /// silently rebuild an UNGOVERNED input, disabling input governance for the WHOLE bus delivery mode
+    /// (the exact silent-off failure class the milestone exists to prevent) with nothing to catch it.
+    #[test]
+    fn governance_context_survives_the_exec_mediation_round_trip() {
+        let dir = std::env::temp_dir().join(format!("wc-clirunner-gov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_str().unwrap().to_string();
+
+        let unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do it");
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Shared,
+            workdir: None,
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: "/abs/estate.db".into(),
+            }),
+        };
+
+        assert!(arm_exec_publisher(&bus_path), "arm publisher");
+        assert!(
+            try_publish_dispatched(&input, None),
+            "publish task.dispatched"
+        );
+        disarm_exec_publisher();
+
+        let bus = BusDb::open(&bus_path).unwrap();
+        let evs = bus.poll(TASK_DISPATCHED, 0, 10).unwrap();
+        assert_eq!(evs.len(), 1);
+        let task: DispatchedTask = serde_json::from_value(evs[0].payload.clone()).unwrap();
+        let gov = task
+            .governance
+            .expect("the governance context survives the bus (NOT dropped to None)");
+        assert_eq!(
+            gov.db_path, "/abs/estate.db",
+            "the store path the off-actor launcher needs to arm the hook is preserved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn seat(key: &str, invocation: &str) -> crate::AgenticCli {
         use wicked_council::{Category, Confidence, InputMode};
         crate::AgenticCli {
@@ -812,6 +864,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    governed: false,
                 }
             }
         }

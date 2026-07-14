@@ -85,15 +85,31 @@ thread_local! {
     static GOV_DB_PATH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// Warn ONCE per actor thread that input governance is off for a non-file store (avoids per-unit spam).
+    static GOV_OFF_WARNED: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
+}
+
 /// The governance context for an IN-PROCESS governed unit (DES-OUTGOV-003 §4), or `None` when input
 /// governance cannot apply: no store armed, or a store the SQLite gate-hook subprocess cannot open
 /// independently — `:memory:` (cannot cross processes) or `postgres://` (SQLite-only hook; the
 /// spec-dispatch read-only opener is deferred to core#30). The path is made ABSOLUTE because the hook
 /// runs with cwd = the worktree, so a relative `.wicked-estate/graph.db` would open the wrong/empty
-/// store (finding #6).
+/// store (finding #6). A non-file store surfaces a LOUD one-time operator notice (council [3]/[13]) so a
+/// silently-ungoverned run is not mistaken for a governed one.
 fn in_process_governance() -> Option<crate::workflow::GovernanceContext> {
     let path = GOV_DB_PATH.with(|c| c.borrow().clone())?;
     if path == ":memory:" || path.contains("://") {
+        GOV_OFF_WARNED.with(|w| {
+            if !*w.borrow() {
+                *w.borrow_mut() = true;
+                eprintln!(
+                    "wicked-core: INPUT governance NOT active for this run — store `{path}` is not a \
+                     file-backed SQLite db the gate-hook can open (postgres/:memory: → core#30). \
+                     Wrapped-CLI tool-calls run UNGOVERNED."
+                );
+            }
+        });
         return None;
     }
     let abs = std::fs::canonicalize(&path)
@@ -1178,6 +1194,8 @@ fn apply_step_result(
         // The applied output's attempt matches the launcher's `input.attempt`, so the fold reads the
         // SAME attempt-scoped decisions log the hook wrote (a bumped-attempt retry starts clean).
         output.attempt,
+        // The runner's authority on whether IT armed input governance (wrote the marker).
+        output.governed,
         &cli_keys,
         agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
@@ -1930,6 +1948,7 @@ mod terminal_gate_tests {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                governed: false,
             }
         }
     }

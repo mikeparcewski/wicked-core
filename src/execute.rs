@@ -74,7 +74,7 @@ pub(crate) fn apply_unit(
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
-    let phase_name = format!("unit-{}", unit.ord);
+    let phase_name = crate::scope::unit_phase(unit.ord);
     let phase_id = format!("{workflow_id}:{phase_name}");
     let collection_scope = resolve_scope(entity_mode, session_id, &unit.id);
 
