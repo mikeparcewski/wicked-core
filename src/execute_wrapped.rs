@@ -368,6 +368,20 @@ fn sandbox_for(input: &StepInput) -> PathBuf {
         .join(&input.run_id)
 }
 
+/// The `PreToolUse` hook command — the exe path quoted for the platform's shell so a `$`/backtick/space
+/// in the install path can't be expanded or split. POSIX single-quotes disable all expansion (with the
+/// standard `'\''` escape for an embedded quote); Windows cmd double-quotes (it does not expand `$`).
+fn quote_exe_command(exe: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("'{}' gate-hook", exe.replace('\'', "'\\''"))
+    }
+    #[cfg(not(unix))]
+    {
+        format!("\"{exe}\" gate-hook")
+    }
+}
+
 /// What the launcher sets on the wrapped CLI's `Command` to arm INPUT governance. Scope/phase are set as
 /// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
 /// metacharacters.
@@ -401,9 +415,11 @@ fn arm_input_governance(
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "wicked-core".to_string());
-    // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the trusted exe
-    // is interpolated (double-quoted for spaces) — scope/phase go via env, never the shell string.
-    let command = format!("\"{exe}\" gate-hook");
+    // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the exe is
+    // interpolated (scope/phase go via env). Quote it per-platform so a `$`/backtick in the install path
+    // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
+    // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
+    let command = quote_exe_command(&exe);
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
@@ -749,9 +765,10 @@ mod tests {
             !cmd.contains("wicked-agent/"),
             "the caller-controlled scope must NOT appear in the shell command: {cmd}"
         );
+        let q = if cfg!(unix) { '\'' } else { '"' };
         assert!(
-            cmd.trim_start().starts_with('"'),
-            "the exe path is double-quoted (Windows/space-safe): {cmd}"
+            cmd.trim_start().starts_with(q),
+            "the exe path is quoted per-platform ({q}) so $/backtick/space can't be expanded: {cmd}"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir_for_test(&input.run_id));
     }

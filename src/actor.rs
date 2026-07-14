@@ -394,12 +394,14 @@ pub(crate) fn run(
                                     | SessionStatus::Cancelled
                                     | SessionStatus::Failed
                             ) {
+                                // Report the unit that was actually executing, not a misleading 0.
+                                let ord = session.unit_ix as u32;
                                 let _ = fail_run(
                                     &mut store,
                                     &mut subscribers,
                                     &self_tx,
                                     &mut session,
-                                    0,
+                                    ord,
                                 );
                             }
                         }
@@ -823,15 +825,19 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
 /// command — but rejecting them at ingress is defense-in-depth: a hostile id is a caller/attacker signal,
 /// never a legitimate run id, and it also keeps the derived scope strings clean.
 fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
+    // `/` (and `\`) are rejected because the raw run_id also forms filesystem paths (e.g.
+    // `sandbox_for`), where a separator enables directory traversal / absolute-path escape.
     const HOSTILE: &[char] = &[
-        '"', '\'', '`', '$', ';', '|', '&', '<', '>', '\\', '\n', '\r', '\0',
+        '"', '\'', '`', '$', ';', '|', '&', '<', '>', '\\', '/', '\n', '\r', '\0',
     ];
-    if run_id
-        .chars()
-        .any(|c| HOSTILE.contains(&c) || c.is_control())
+    if run_id.is_empty()
+        || run_id.contains("..")
+        || run_id
+            .chars()
+            .any(|c| HOSTILE.contains(&c) || c.is_control())
     {
         anyhow::bail!(
-            "invalid session id (contains a shell-hostile or control character): {run_id:?}"
+            "invalid session id (empty, `..`, or a shell/path-hostile character): {run_id:?}"
         );
     }
     Ok(())

@@ -75,7 +75,7 @@ pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
 /// Fails CLOSED (returns 2) if the decisions path is unset, the store can't be opened, or governance
 /// can't decide — an un-evaluable tool-call is never silently allowed.
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
-    if let Some(reason) = postgres_unsupported(db) {
+    if let Some(reason) = store_unavailable(db) {
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -136,16 +136,25 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     }
 }
 
-/// A backend the SQLite-only hook cannot open: governance-in-run is SQLite-only for now (a `postgres://`
-/// store's read-only spec-dispatch opener is core#30). Returns a fail-closed reason for a URL spec so the
-/// hook DENIES loudly instead of silently creating a garbage SQLite file at the literal `postgres://…`
-/// path (findings #13/#18). `None` ⇒ the spec is a file/`:memory:` the hook can open.
-fn postgres_unsupported(db: Option<&str>) -> Option<String> {
-    db.filter(|s| s.starts_with("postgres://") || s.starts_with("postgresql://"))
-        .map(|_| {
+/// A fail-closed reason the hook must DENY on rather than proceed, or `None` if the store is usable:
+///  - No resolvable store (`--db`/`WICKED_ESTATE_DB` both unset): `open_store(None)` would fall back to a
+///    default `.wicked-estate/graph.db` (and may CREATE an empty one), evaluating against ZERO policies —
+///    a silent fail-OPEN. A governed hook MUST have the run's store; deny loudly instead.
+///  - A `postgres://` spec: governance-in-run is SQLite-only for now (the read-only spec-dispatch opener
+///    is core#30); deny loudly instead of silently creating a garbage SQLite file (findings #13/#18).
+fn store_unavailable(db: Option<&str>) -> Option<String> {
+    match db.filter(|s| !s.is_empty()) {
+        None => Some(
+            "no estate store resolvable (set --db or WICKED_ESTATE_DB) — refusing to evaluate against \
+             a default/empty store (fail-closed)"
+                .to_string(),
+        ),
+        Some(s) if s.starts_with("postgres://") || s.starts_with("postgresql://") => Some(
             "governance-in-run is SQLite-only; the hook cannot open a postgres:// store (core#30)"
-                .to_string()
-        })
+                .to_string(),
+        ),
+        Some(_) => None,
+    }
 }
 
 /// INJECTIVE, filesystem-safe encoding of a raw `run_id` into a single path segment. Escapes every byte
@@ -199,12 +208,52 @@ fn append_decision(path: &Path, claim: &ConformanceClaim) -> anyhow::Result<()> 
     }
     let mut line = serde_json::to_string(claim)?;
     line.push('\n');
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(line.as_bytes())?;
+    // Serialize concurrent per-tool-call hook subprocesses with a cross-platform advisory lockfile (an
+    // atomic `create_new`), so a claim whose canonical JSON exceeds the OS single-append atomicity bound
+    // can never interleave with another appender's (DES-OUTGOV-003 §7). Belt-and-suspenders on top of the
+    // single `write_all` + the drain/fold's fail-CLOSED handling of any torn line.
+    with_append_lock(path, || {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        f.write_all(line.as_bytes())
+    })?;
     Ok(())
+}
+
+/// Run `write` while holding an exclusive advisory lock on `<log>.lock` (a cross-platform, dep-free
+/// `create_new` lockfile). Bounded spin — if a crashed holder left a STALE lock, proceed after the
+/// timeout: the single `write_all` is still atomic for a typical claim, and a torn line fails CLOSED in
+/// the drain/fold, so the worst case degrades, never a silent allow. The lock is always removed if held.
+fn with_append_lock<T>(
+    log: &Path,
+    write: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let lock = log.with_extension("lock");
+    let mut held = false;
+    for _ in 0..100 {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock)
+        {
+            Ok(_) => {
+                held = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // Can't create the lockfile (dir gone, permissions) — proceed unlocked rather than block.
+            Err(_) => break,
+        }
+    }
+    let r = write();
+    if held {
+        let _ = std::fs::remove_file(&lock);
+    }
+    r
 }
 
 /// Fold a governed unit's INPUT-hook decisions into a single deny-dominant denial, for the run engine's
@@ -231,7 +280,13 @@ pub fn fold_input_denial(
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+        // A non-NotFound read error (permission / sharing) is un-evaluable governance evidence ⇒ deny
+        // (fail closed) via the normal terminal path, never a run-wedging Err.
+        Err(e) => {
+            return Ok(Some(format!(
+                "input governance denied {phase} (fail-closed): could not read decisions log: {e}"
+            )))
+        }
     };
     let mut denial: Option<String> = None;
     for line in raw.lines() {
@@ -448,7 +503,7 @@ pub const OUTPUT_FRAMEWORK_ENV: &str = "WICKED_OUTPUT_FRAMEWORK";
 /// entry point is the DETERMINISTIC half: policy-over-output + recall wiring. Fails CLOSED (exit 2)
 /// exactly like the input hook — an un-evaluable or un-recordable output is never silently allowed.
 pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
-    if let Some(reason) = postgres_unsupported(db) {
+    if let Some(reason) = store_unavailable(db) {
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -805,18 +860,24 @@ mod tests {
     }
 
     #[test]
-    fn postgres_store_is_denied_loudly_by_the_hook() {
-        assert!(postgres_unsupported(Some("postgres://h/db")).is_some());
-        assert!(postgres_unsupported(Some("postgresql://h/db")).is_some());
-        assert!(postgres_unsupported(Some("/tmp/estate.db")).is_none());
-        assert!(postgres_unsupported(Some(":memory:")).is_none());
-        assert!(postgres_unsupported(None).is_none());
-        // The hook denies (exit 2) for a postgres store BEFORE reading stdin — never mis-creates a file.
+    fn hook_fails_closed_on_postgres_or_missing_store() {
+        // postgres:// → deny (SQLite-only for now).
+        assert!(store_unavailable(Some("postgres://h/db")).is_some());
+        assert!(store_unavailable(Some("postgresql://h/db")).is_some());
+        // No resolvable store → deny (never fall back to a default/empty store — fail-OPEN).
+        assert!(store_unavailable(None).is_some());
+        assert!(store_unavailable(Some("")).is_some());
+        // A real file / :memory: is usable.
+        assert!(store_unavailable(Some("/tmp/estate.db")).is_none());
+        assert!(store_unavailable(Some(":memory:")).is_none());
+        // The hook denies (exit 2) for both cases BEFORE reading stdin — never mis-creates a store.
         assert_eq!(run_gate_hook("s", "unit-1", Some("postgres://h/db")), 2);
+        assert_eq!(run_gate_hook("s", "unit-1", None), 2);
         assert_eq!(
             run_output_gate_hook("s", "unit-1", Some("postgres://h/db")),
             2
         );
+        assert_eq!(run_output_gate_hook("s", "unit-1", None), 2);
     }
 
     #[test]
