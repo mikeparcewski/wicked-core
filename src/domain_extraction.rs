@@ -184,12 +184,14 @@ mod tests {
     fn every_phase_carries_a_garden_skill_ref_in_dash_form() {
         // CONTRACT-4 §3 SKILL NAMING: dash-form `wicked-<product>-<skill>`, never a colon namespace.
         let def = load_shipped_def();
+        // Retargeted to the REAL garden `modernize` surface (core#27) — the old
+        // `wicked-garden-{survey,analyze,extract,coverage-review,domain-graph}` skills no longer exist.
         let expected = [
-            ("survey", "wicked-garden-survey"),
-            ("analyze", "wicked-garden-analyze"),
-            ("extract", "wicked-garden-extract"),
-            ("coverage", "wicked-garden-coverage-review"),
-            ("domain-graph", "wicked-garden-domain-graph"),
+            ("survey", "wicked-garden-modernize"),
+            ("analyze", "wicked-garden-modernize"),
+            ("extract", "wicked-garden-modernize-extractor"),
+            ("coverage", "wicked-garden-modernize-antagonist"),
+            ("domain-graph", "wicked-garden-modernize-translator"),
         ];
         for (phase_id, skill) in expected {
             let phase = def.phases.iter().find(|p| p.id == phase_id).unwrap();
@@ -207,6 +209,16 @@ mod tests {
                 "{skill} is a garden skill"
             );
         }
+        // The `wicked-brain-*` allowed_skills are RETIRED — every phase's allowlist is now empty, so a
+        // leftover on ANY phase (not just the two pinned below) fails CI (reviewed correction).
+        for phase in &def.phases {
+            assert!(
+                phase.allowed_skills.is_empty(),
+                "phase {} still carries a dead allowed_skills entry: {:?}",
+                phase.id,
+                phase.allowed_skills
+            );
+        }
     }
 
     #[test]
@@ -216,19 +228,19 @@ mod tests {
         let def = load_shipped_def();
         let units = plan_from_def(&def, "mine the legacy payments service", "s1");
         assert_eq!(units.len(), 5);
-        assert_eq!(units[2].skill_ref.as_deref(), Some("wicked-garden-extract"));
         assert_eq!(
-            units[2].allowed_skills,
-            vec!["wicked-brain-domain".to_string()]
+            units[2].skill_ref.as_deref(),
+            Some("wicked-garden-modernize-extractor")
+        );
+        assert!(
+            units[2].allowed_skills.is_empty(),
+            "the retired brain allowlist is gone"
         );
         assert_eq!(
             units[3].skill_ref.as_deref(),
-            Some("wicked-garden-coverage-review")
+            Some("wicked-garden-modernize-antagonist")
         );
-        assert_eq!(
-            units[3].allowed_skills,
-            vec!["wicked-brain-coverage".to_string()]
-        );
+        assert!(units[3].allowed_skills.is_empty());
         // The evaluator≠creator role survives onto the units.
         assert_eq!(units[2].role, PhaseRole::Creator);
         assert_eq!(units[3].role, PhaseRole::Evaluator);
