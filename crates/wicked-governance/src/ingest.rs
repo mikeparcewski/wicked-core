@@ -41,10 +41,23 @@ impl SourceAdapter for FilesystemAdapter {
     fn fetch(&self) -> anyhow::Result<Vec<serde_json::Value>> {
         let entries = std::fs::read_dir(&self.root)
             .map_err(|e| anyhow::anyhow!("filesystem adapter: cannot read {:?}: {e}", self.root))?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .collect();
+        // Propagate a mid-stream enumeration error (readdir can fault) rather than `.ok()`-dropping
+        // it — a silent skip would truncate the rule set and fail governance OPEN (fail-loud contract).
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                anyhow::anyhow!("filesystem adapter: cannot enumerate {:?}: {e}", self.root)
+            })?;
+            let path = entry.path();
+            // Case-INSENSITIVE extension: `Rules.JSON` on a case-insensitive FS is still a bundle
+            // (cross-platform mandate — macOS/Windows produce mixed-case extensions).
+            if path
+                .extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("json"))
+            {
+                paths.push(path);
+            }
+        }
         paths.sort(); // deterministic ingest order
         let mut docs = Vec::with_capacity(paths.len());
         for p in paths {
@@ -120,8 +133,18 @@ pub fn normalize_bundle(
         let mut rule: ConformanceRule = serde_json::from_value(raw.clone()).map_err(|e| {
             anyhow::anyhow!("conformance rule from {source:?} failed to parse: {e}")
         })?;
+        // Stamp the connector as `provenance.source` (the ingest legitimately knows it). But `ref`
+        // (WHERE in the source) and `source_kinds` (the evidence kind) the ingest CANNOT infer — the
+        // wire schema requires them, so a doc that omits them is a HARD failure, never fabricated.
         if rule.provenance.source.is_empty() {
             rule.provenance.source = source.to_string();
+        }
+        if rule.provenance.reference.is_none() || rule.provenance.source_kinds.is_empty() {
+            anyhow::bail!(
+                "conformance rule {:?} from {source:?} has incomplete provenance — the wire contract \
+                 requires `ref` and a non-empty `source_kinds` (never fabricated)",
+                rule.id
+            );
         }
         rule.validate()?; // INV-C1 / INV-C2
         if !seen.insert(rule.id.clone()) {
@@ -135,11 +158,24 @@ pub fn normalize_bundle(
     Ok(rules)
 }
 
-/// Fetch + normalize every document an adapter holds, in the adapter's deterministic order.
+/// Fetch + normalize every document an adapter holds, in the adapter's deterministic order. INV-C3
+/// is enforced across the WHOLE run (not just per document): the same rule id appearing in two files
+/// from one source fails loud rather than silently overwriting at register (both map to the same
+/// `conformance_rule/<id>` symbol).
 pub fn ingest_from(adapter: &dyn SourceAdapter) -> anyhow::Result<Vec<ConformanceRule>> {
     let mut all = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for doc in adapter.fetch()? {
-        all.extend(normalize_bundle(&doc, adapter.name())?);
+        for rule in normalize_bundle(&doc, adapter.name())? {
+            if !seen.insert(rule.id.clone()) {
+                anyhow::bail!(
+                    "INV-C3: duplicate rule id {:?} across documents from the {:?} source",
+                    rule.id,
+                    adapter.name()
+                );
+            }
+            all.push(rule);
+        }
     }
     Ok(all)
 }
@@ -197,19 +233,25 @@ impl FrameworkRegistry {
 mod tests {
     use super::*;
 
+    /// A valid provenance block (the wire contract requires `ref` + `source_kinds`).
+    fn prov() -> serde_json::Value {
+        serde_json::json!({ "ref": "handbook#sec-1", "source_kinds": ["doc"] })
+    }
+
     #[test]
     fn normalize_bundle_stamps_source_and_parses_rules() {
         let doc = serde_json::json!({
             "rules": [
-                { "id": "PAT-1", "rule_type": "pattern", "statement": "no eval", "severity": "high", "confidence": 0.9,
-                  "targets": { "language": "python" } },
-                { "id": "POL-1", "rule_type": "policy", "statement": "encrypt at rest", "severity": "critical",
-                  "confidence": 1.0, "compliance": { "framework": "soc2", "control_id": "CC6.1" } }
+                { "id": "PAT-001", "rule_type": "pattern", "statement": "no eval", "severity": "error", "confidence": 0.9,
+                  "targets": { "language": "python" }, "provenance": prov() },
+                { "id": "POL-001", "rule_type": "policy", "statement": "encrypt at rest", "severity": "critical",
+                  "confidence": 1.0, "compliance": { "framework": "soc2", "control_id": "CC6.1" }, "provenance": prov() }
             ]
         });
         let rules = normalize_bundle(&doc, "filesystem").unwrap();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].provenance.source, "filesystem", "source stamped");
+        assert_eq!(rules[0].provenance.source_kinds, vec!["doc".to_string()]);
         assert_eq!(rules[0].targets.language.as_deref(), Some("python"));
         assert_eq!(
             rules[1].compliance.as_ref().unwrap().control_id,
@@ -222,7 +264,7 @@ mod tests {
     fn normalize_fails_loud_on_missing_field() {
         // no `statement` — must fail, never fabricate.
         let doc = serde_json::json!({ "rules": [
-            { "id": "PAT-1", "rule_type": "pattern", "severity": "high", "confidence": 0.5 }
+            { "id": "PAT-001", "rule_type": "pattern", "severity": "error", "confidence": 0.5, "provenance": prov() }
         ]});
         let err = normalize_bundle(&doc, "filesystem")
             .unwrap_err()
@@ -231,15 +273,62 @@ mod tests {
     }
 
     #[test]
-    fn normalize_enforces_inv_c3_unique_ids() {
+    fn normalize_fails_loud_on_incomplete_provenance() {
+        // All rule fields present, but provenance omits ref/source_kinds — schema-required, never fabricated.
         let doc = serde_json::json!({ "rules": [
-            { "id": "PAT-1", "rule_type": "pattern", "statement": "a", "severity": "low", "confidence": 0.5 },
-            { "id": "PAT-1", "rule_type": "pattern", "statement": "b", "severity": "low", "confidence": 0.5 }
+            { "id": "PAT-001", "rule_type": "pattern", "statement": "s", "severity": "info", "confidence": 0.5 }
+        ]});
+        let err = normalize_bundle(&doc, "filesystem")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provenance"), "got: {err}");
+    }
+
+    #[test]
+    fn normalize_accepts_a_bare_single_rule() {
+        // A doc with NO `rules` key is a single bare rule (the explicit second branch).
+        let doc = serde_json::json!(
+            { "id": "PAT-001", "rule_type": "pattern", "statement": "s", "severity": "info", "confidence": 0.5, "provenance": prov() }
+        );
+        let rules = normalize_bundle(&doc, "confluence").unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "PAT-001");
+        assert_eq!(rules[0].provenance.source, "confluence");
+    }
+
+    #[test]
+    fn normalize_enforces_inv_c3_unique_ids_within_a_bundle() {
+        let doc = serde_json::json!({ "rules": [
+            { "id": "PAT-001", "rule_type": "pattern", "statement": "a", "severity": "info", "confidence": 0.5, "provenance": prov() },
+            { "id": "PAT-001", "rule_type": "pattern", "statement": "b", "severity": "info", "confidence": 0.5, "provenance": prov() }
         ]});
         let err = normalize_bundle(&doc, "filesystem")
             .unwrap_err()
             .to_string();
         assert!(err.contains("INV-C3"), "got: {err}");
+    }
+
+    #[test]
+    fn ingest_enforces_inv_c3_across_documents() {
+        // The SAME id in two files from one adapter must fail loud (would silently overwrite at register).
+        struct TwoDocs;
+        impl SourceAdapter for TwoDocs {
+            fn name(&self) -> &str {
+                "twodocs"
+            }
+            fn fetch(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+                let r = serde_json::json!({ "rules": [
+                    { "id": "PAT-001", "rule_type": "pattern", "statement": "s", "severity": "info", "confidence": 0.5,
+                      "provenance": { "ref": "x", "source_kinds": ["doc"] } }
+                ]});
+                Ok(vec![r.clone(), r])
+            }
+        }
+        let err = ingest_from(&TwoDocs).unwrap_err().to_string();
+        assert!(
+            err.contains("INV-C3"),
+            "cross-document dup must fail: {err}"
+        );
     }
 
     #[test]
@@ -288,13 +377,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("a.json"),
-            r#"{"rules":[{"id":"PAT-a","rule_type":"pattern","statement":"s","severity":"low","confidence":0.5}]}"#,
+            r#"{"rules":[{"id":"PAT-001","rule_type":"pattern","statement":"s","severity":"info","confidence":0.5,"provenance":{"ref":"x","source_kinds":["doc"]}}]}"#,
         )
         .unwrap();
         std::fs::write(dir.join("ignore.txt"), "not json").unwrap();
         let rules = ingest_from(&FilesystemAdapter::new(&dir)).unwrap();
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].id, "PAT-a");
+        assert_eq!(rules[0].id, "PAT-001");
         assert_eq!(rules[0].provenance.source, "filesystem");
     }
 }

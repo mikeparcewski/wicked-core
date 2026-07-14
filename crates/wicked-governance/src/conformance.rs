@@ -3,30 +3,29 @@
 //! Ported from the retired `wicked-brain` JS `conformance-store` (RET-BRAIN-DOMAIN-001) onto
 //! estate's NATIVE rules-engine vocabulary: a [`ConformanceRule`] persists as a
 //! `Node(kind = NodeKind::Rule)` (not an `Other(...)` string kind), every field encoded in
-//! `Node.metadata`, keyed by the stable synthetic symbol `conformance_rule/<id>`. When a rule names
-//! a `symbol_ref`, a `rule → symbol` [`EdgeKind::Governs`] edge is emitted carrying the rule's
-//! OWN confidence via a struct-literal [`Edge`] (a fixed `ResolutionTier` cannot carry an arbitrary
-//! `0.72`, and the rule was not produced by a resolver — its provenance is
-//! `Provenance::Extractor("outgov-v1")`).
+//! `Node.metadata`, keyed by the stable synthetic symbol `conformance_rule/<id>`. A rule's
+//! `symbol_ref` (an unresolved code-symbol name) rides in that metadata; the `rule → symbol`
+//! [`EdgeKind::Governs`] edge is NOT emitted here — [`ConformanceRule::governs_edge`] builds it (a
+//! struct-literal [`Edge`] carrying the rule's OWN confidence via `Confidence::new` +
+//! `Provenance::Extractor("outgov-v1")`, since a fixed `ResolutionTier` cannot carry an arbitrary
+//! `0.72`), but only PR-C's recall→gate step, once `symbol_ref` resolves to a REAL indexed symbol —
+//! an edge to a synthetic placeholder would dangle and be pruned by `compact`.
 //!
 //! Recall (`recall_rules`) returns the rules that apply to a query slice: `language`/`layer`/
 //! `framework` are WILDCARD facets (an ABSENT facet applies to all), `severity`/`rule_type` are
-//! exact, results ordered severity-first (critical→low) then id — deterministic, enforcement-ready.
+//! exact, results ordered severity-first (critical→info) then id — deterministic, enforcement-ready.
 //! (Wiring recall INTO the per-output gate is PR-C; this module is the population + query half.)
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
     synthetic_symbol, Edge, EdgeKind, FromNode, GraphRead, GraphStore, Language, Location,
-    Metadata, Node, NodeKind, Span, ToNode, SYMBOL_SCHEME,
+    Metadata, Node, NodeKind, Span, SymbolId, ToNode, SYMBOL_SCHEME,
 };
 use wicked_estate_core::{Confidence, Provenance, SymbolQuery};
 
 /// Symbol-namespace prefix for conformance-rule symbols (the synthetic id; the NODE kind is the
 /// native [`NodeKind::Rule`]).
 pub const CONFORMANCE_RULE: &str = "conformance_rule";
-/// Symbol-namespace prefix for a rule's declared governance TARGET (`symbol_ref`). PR-C's
-/// recall→gate wiring resolves rules to REAL indexed code symbols; this records the declared intent.
-const GOVERNED_SYMBOL: &str = "governed_symbol";
 /// Provenance tag stamped on the Governs edges this module emits (M4: the rule's arbitrary
 /// confidence rides a struct-literal `Edge`, NOT a fixed `ResolutionTier`).
 const OUTGOV_EXTRACTOR: &str = "outgov-v1";
@@ -51,14 +50,16 @@ impl RuleType {
     }
 }
 
-/// Enforcement precedence — recall orders critical→low.
+/// Enforcement precedence — mirrors the `conformance-rules` WIRE SCHEMA severity vocabulary
+/// (`info | warn | error | critical`), NOT governance's internal Policy `Severity`. This is the
+/// cross-product contract garden STEERS on and wicked-testing ASSERTS. Recall orders critical→info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfSeverity {
+    Info,
+    Warn,
+    Error,
     Critical,
-    High,
-    Medium,
-    Low,
 }
 
 impl ConfSeverity {
@@ -66,9 +67,9 @@ impl ConfSeverity {
     pub fn rank(self) -> u8 {
         match self {
             ConfSeverity::Critical => 4,
-            ConfSeverity::High => 3,
-            ConfSeverity::Medium => 2,
-            ConfSeverity::Low => 1,
+            ConfSeverity::Error => 3,
+            ConfSeverity::Warn => 2,
+            ConfSeverity::Info => 1,
         }
     }
 }
@@ -96,6 +97,9 @@ pub struct Compliance {
 /// Where a rule came from (ingest provenance — the source connector + reference + evidence kinds).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleProvenance {
+    /// The source connector. A raw ingest doc may omit it (the ingest STAMPS the adapter name); it
+    /// defaults to empty so `normalize_bundle` can fill it before the completeness check.
+    #[serde(default)]
     pub source: String,
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
@@ -128,12 +132,17 @@ impl ConformanceRule {
     /// Fail-closed write-time invariants (ported from `conformance-store` INV-C1/INV-C2). INV-C3
     /// (bundle-unique ids) is enforced at ingest, where the whole bundle is visible.
     pub fn validate(&self) -> anyhow::Result<()> {
+        // INV-C1: the id must match the wire contract `^(PAT|POL)-[0-9]{3,6}$` AND its prefix must
+        // agree with rule_type (PAT-⇔pattern, POL-⇔policy).
         let prefix = self.rule_type.id_prefix();
-        if !self.id.starts_with(prefix) {
+        let ordinal_ok = self.id.strip_prefix(prefix).is_some_and(|ord| {
+            (3..=6).contains(&ord.len()) && ord.bytes().all(|b| b.is_ascii_digit())
+        });
+        if !ordinal_ok {
             anyhow::bail!(
-                "INV-C1: rule_type {:?} requires an id with prefix {prefix:?}, got {:?}",
-                self.rule_type,
-                self.id
+                "INV-C1: rule id {:?} must match `{prefix}<3-6 digits>` for rule_type {:?}",
+                self.id,
+                self.rule_type
             );
         }
         if !(0.0..=1.0).contains(&self.confidence) {
@@ -145,21 +154,25 @@ impl ConformanceRule {
         Ok(())
     }
 
-    /// The `rule → governed-symbol` Governs edge, when the rule names a `symbol_ref`. M4: a
-    /// struct-literal `Edge` carries the rule's ARBITRARY confidence (a `ResolutionTier` cannot) and
-    /// tags provenance as an extractor output (`outgov-v1`), never a code resolver.
-    pub fn governs_edge(&self) -> Option<Edge> {
-        let target = self.symbol_ref.as_ref()?;
-        Some(Edge {
+    /// Build the `rule → governed-symbol` Governs edge for an ALREADY-RESOLVED target symbol. M4: a
+    /// struct-literal `Edge` carries the rule's ARBITRARY confidence (a fixed `ResolutionTier`
+    /// cannot) and tags provenance as an extractor output (`outgov-v1`), never a code resolver.
+    ///
+    /// PR-B does NOT emit this at register time: a rule's `symbol_ref` is an unresolved NAME, and an
+    /// edge to a synthetic placeholder symbol would DANGLE (deleted by estate's `compact` /
+    /// `prune_dangling_edges`) and never reach the real code symbol. PR-C's recall→gate step
+    /// resolves `symbol_ref` to the REAL indexed [`SymbolId`] and calls this to link it durably.
+    pub fn governs_edge(&self, target: SymbolId) -> Edge {
+        Edge {
             source: synthetic_symbol(CONFORMANCE_RULE, &self.id),
-            target: synthetic_symbol(GOVERNED_SYMBOL, target),
+            target,
             kind: EdgeKind::Governs,
             confidence: Confidence::new(self.confidence),
             provenance: Provenance::Extractor(OUTGOV_EXTRACTOR.to_string()),
             resolved_by: CONFORMANCE_RESOLVED_BY.to_string(),
             location: None,
             metadata: Metadata::new(),
-        })
+        }
     }
 }
 
@@ -197,15 +210,15 @@ impl FromNode for ConformanceRule {
     }
 }
 
-/// Persist one rule: validate (fail-closed), then upsert its native `Rule` node and — when it names
-/// a `symbol_ref` — its struct-literal Governs edge, through the single-writer batch path.
+/// Persist one rule: validate (fail-closed), then upsert its native `Rule` node through the
+/// single-writer batch path. The rule's `symbol_ref` (an unresolved name) rides in the node
+/// metadata; the `rule → symbol` Governs edge is emitted later by PR-C's recall→gate step, once
+/// `symbol_ref` resolves to a REAL indexed symbol — an edge to a synthetic placeholder here would
+/// dangle and be pruned by `compact` (review finding), so PR-B persists the node only.
 pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyhow::Result<()> {
     rule.validate()?;
     store.begin_batch()?;
     store.upsert_nodes(&[rule.to_node()])?;
-    if let Some(edge) = rule.governs_edge() {
-        store.upsert_edges(&[edge])?;
-    }
     store.commit_batch()?;
     Ok(())
 }
@@ -285,12 +298,19 @@ mod tests {
         }
     }
 
+    fn lang(l: &str) -> Targets {
+        Targets {
+            language: Some(l.into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn to_node_is_native_rule_kind_and_round_trips() {
         let r = rule(
-            "PAT-1",
+            "PAT-100",
             RuleType::Pattern,
-            ConfSeverity::High,
+            ConfSeverity::Error,
             Targets::default(),
         );
         let node = r.to_node();
@@ -300,18 +320,37 @@ mod tests {
     }
 
     #[test]
+    fn from_node_rejects_non_rule_kind() {
+        // A non-Rule node (here an Other("policy")) must never deserialize into a ConformanceRule.
+        let node = Node::new(
+            synthetic_symbol("policy", "POL-001"),
+            NodeKind::Other("policy".to_string()),
+            "POL-001".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new("policy/POL-001".to_string(), Span::ZERO),
+        );
+        let err = ConformanceRule::from_node(&node).unwrap_err().to_string();
+        assert!(err.contains("NodeKind::Rule"), "got: {err}");
+    }
+
+    #[test]
     fn governs_edge_carries_rule_confidence_via_struct_literal() {
-        // M4: a ResolutionTier's confidence is FIXED; the rule's 0.72 must ride a struct-literal edge.
-        let mut r = rule(
-            "POL-9",
+        // M4: a ResolutionTier's confidence is FIXED; the rule's 0.72 must ride a struct-literal edge
+        // built for an ALREADY-RESOLVED target (PR-C resolves symbol_ref → real SymbolId).
+        let r = rule(
+            "POL-009",
             RuleType::Policy,
             ConfSeverity::Critical,
             Targets::default(),
         );
-        assert!(r.governs_edge().is_none(), "no symbol_ref → no edge");
-        r.symbol_ref = Some("charge".to_string());
-        let edge = r.governs_edge().expect("symbol_ref → Governs edge");
+        let target = synthetic_symbol("symbol", "charge");
+        let edge = r.governs_edge(target.clone());
         assert_eq!(edge.kind, EdgeKind::Governs);
+        assert_eq!(edge.source, synthetic_symbol(CONFORMANCE_RULE, "POL-009"));
+        assert_eq!(
+            edge.target, target,
+            "targets the RESOLVED symbol, not a placeholder"
+        );
         assert_eq!(edge.confidence.get(), 0.72);
         assert_eq!(
             edge.provenance,
@@ -321,19 +360,29 @@ mod tests {
 
     #[test]
     fn invariants_fail_closed() {
-        // INV-C1: a POL- id declared as a pattern.
+        // INV-C1 prefix: a POL- id declared as a pattern.
         let mut r = rule(
-            "POL-1",
+            "POL-001",
             RuleType::Pattern,
-            ConfSeverity::Low,
+            ConfSeverity::Info,
             Targets::default(),
         );
         assert!(r.validate().unwrap_err().to_string().contains("INV-C1"));
-        // INV-C2: confidence out of [0,1].
+        // INV-C1 ordinal shape: too-short and non-numeric ordinals both fail (wire `[0-9]{3,6}`).
         r = rule(
             "PAT-1",
             RuleType::Pattern,
-            ConfSeverity::Low,
+            ConfSeverity::Info,
+            Targets::default(),
+        );
+        assert!(r.validate().unwrap_err().to_string().contains("INV-C1"));
+        r.id = "PAT-abcd".to_string();
+        assert!(r.validate().unwrap_err().to_string().contains("INV-C1"));
+        // INV-C2: confidence out of [0,1].
+        r = rule(
+            "PAT-001",
+            RuleType::Pattern,
+            ConfSeverity::Info,
             Targets::default(),
         );
         r.confidence = 1.5;
@@ -343,36 +392,29 @@ mod tests {
     #[test]
     fn register_persists_and_recall_filters_by_facet_and_severity() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        // A python-only high rule, a wildcard-language critical rule, a rust-only low rule.
         let py = rule(
-            "PAT-py",
+            "PAT-100",
             RuleType::Pattern,
-            ConfSeverity::High,
-            Targets {
-                language: Some("python".into()),
-                ..Default::default()
-            },
+            ConfSeverity::Error,
+            lang("python"),
         );
         let wild = rule(
-            "POL-wild",
+            "POL-200",
             RuleType::Policy,
             ConfSeverity::Critical,
             Targets::default(),
         );
         let rust = rule(
-            "PAT-rust",
+            "PAT-300",
             RuleType::Pattern,
-            ConfSeverity::Low,
-            Targets {
-                language: Some("rust".into()),
-                ..Default::default()
-            },
+            ConfSeverity::Info,
+            lang("rust"),
         );
         for r in [&py, &wild, &rust] {
             register_rule(&mut store, r).unwrap();
         }
 
-        // Query python: the python rule + the wildcard rule apply; the rust rule does NOT.
+        // Query python: the python rule + the wildcard-language rule apply; the rust rule does NOT.
         let got = recall_rules(
             &store,
             &RuleQuery {
@@ -381,10 +423,9 @@ mod tests {
             },
         )
         .unwrap();
-        let ids: Vec<&str> = got.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(
-            ids,
-            vec!["POL-wild", "PAT-py"],
+            got.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["POL-200", "PAT-100"],
             "wildcard+python, critical-first, then id"
         );
 
@@ -399,7 +440,93 @@ mod tests {
         .unwrap();
         assert_eq!(
             crit.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
-            vec!["POL-wild"]
+            vec!["POL-200"]
+        );
+
+        // Exact rule_type filter — only the policy rule.
+        let pols = recall_rules(
+            &store,
+            &RuleQuery {
+                rule_type: Some(RuleType::Policy),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            pols.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["POL-200"]
+        );
+
+        // Empty query recalls all three, ordered critical→info then id.
+        let all = recall_rules(&store, &RuleQuery::default()).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["POL-200", "PAT-100", "PAT-300"]
+        );
+    }
+
+    #[test]
+    fn recall_filters_by_layer_and_framework_wildcards() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let svc = rule(
+            "PAT-401",
+            RuleType::Pattern,
+            ConfSeverity::Warn,
+            Targets {
+                layer: Some("service".into()),
+                ..Default::default()
+            },
+        );
+        let django = rule(
+            "PAT-402",
+            RuleType::Pattern,
+            ConfSeverity::Warn,
+            Targets {
+                framework: Some("django".into()),
+                ..Default::default()
+            },
+        );
+        let wild = rule(
+            "POL-403",
+            RuleType::Policy,
+            ConfSeverity::Warn,
+            Targets::default(),
+        );
+        for r in [&svc, &django, &wild] {
+            register_rule(&mut store, r).unwrap();
+        }
+
+        // Layer facet: service-layer rule + wildcard apply; the django-framework rule is excluded
+        // (its framework facet is set but the query omits framework, so it's unconstrained — it's
+        // the LAYER mismatch that excludes... actually django has no layer, so it's a layer-wildcard).
+        let by_layer = recall_rules(
+            &store,
+            &RuleQuery {
+                layer: Some("service".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            by_layer.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-401", "PAT-402", "POL-403"],
+            "service-layer + layer-wildcards (django+wild)"
+        );
+
+        // Framework facet exact: django + wildcards; the service-layer rule's framework is absent
+        // (wildcard) so it ALSO matches — only a rule with a DIFFERENT framework would be excluded.
+        let by_fw = recall_rules(
+            &store,
+            &RuleQuery {
+                framework: Some("rails".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            by_fw.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-401", "POL-403"],
+            "rails query: django rule EXCLUDED (framework mismatch), wildcards kept"
         );
     }
 
@@ -409,7 +536,7 @@ mod tests {
         let bad = rule(
             "POL-x",
             RuleType::Pattern,
-            ConfSeverity::Low,
+            ConfSeverity::Info,
             Targets::default(),
         );
         assert!(
