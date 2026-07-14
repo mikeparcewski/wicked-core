@@ -592,10 +592,16 @@ fn domain_graph_cmd(args: &[String]) {
                     // the gate field, but a mismatch in any count means a different/stale graph); `coverage`
                     // is a rounded ratio, so compare it only with a generous tolerance (not f64::EPSILON,
                     // which spuriously fails on JSON-parse/round drift).
-                    let ints_disagree = file.behavior_bearing != coverage.behavior_bearing
+                    // Every EXACT field: total (all nodes — a different graph) + the four bucket counts +
+                    // resolve_threshold (a different config re-buckets resolved/risk). With these + the
+                    // hole set matching, the derived float ratios (coverage/resolved_rate/mean_confidence)
+                    // are determined, so this is a COMPLETE agreement check.
+                    let ints_disagree = file.total != coverage.total
+                        || file.behavior_bearing != coverage.behavior_bearing
                         || file.resolved != coverage.resolved
                         || file.risk_flagged != coverage.risk_flagged
-                        || file.unaccounted != coverage.unaccounted;
+                        || file.unaccounted != coverage.unaccounted
+                        || (file.resolve_threshold - coverage.resolve_threshold).abs() > 1e-9;
                     // Also compare the actual HOLE SET (unaccounted symbol_ids) — a file whose top-level
                     // counts match but whose holes are a different set is a stale/different graph.
                     let hole_set = |r: &wicked_governance::CoverageReport| {
