@@ -20,6 +20,8 @@
 //!       # gated one so the rev0.4 dual-validator gate actually engages
 //!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
 //!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
+//!   wicked-core rules ingest <dir>               # populate governance policies (deny) + conformance
+//!       # rules (recall→obligation) into the store: <dir>/policies/*.json + <dir>/rules/*.json
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -121,6 +123,11 @@ fn main() {
         Some("seed-domain-validators") => return seed_domain_validators_cmd(&args),
         Some("domain-graph") => return domain_graph_cmd(&args),
         Some("coverage") => return coverage_cmd(&args),
+        // `rules ingest <dir>` populates a run's store with governance policies + conformance rules so
+        // the output guardrail has something to deny/recall against (core#26). Opens the store directly.
+        Some("rules") if args.get(2).map(String::as_str) == Some("ingest") => {
+            return rules_ingest_cmd(&args)
+        }
         _ => {}
     }
 
@@ -714,6 +721,128 @@ fn coverage_cmd(args: &[String]) {
         ),
         Err(e) => fail(&format!("coverage: cannot write {out_path}: {e}")),
     }
+}
+
+/// `wicked-core rules ingest <dir> [--db F]` — populate the store with governance POLICIES (the
+/// deterministic deny path) + CONFORMANCE RULES (recall→obligation), so the output guardrail
+/// (`output-gate-hook`) has real rules to enforce (core#26, DES-OUTGOV-006). Layout:
+///   <dir>/policies/*.json  — each a `Policy` or `[Policy]` → register_policy (deny on a matching output)
+///   <dir>/rules/*.json     — conformance-rule bundles → ingest_from + register_rule (recall→obligation)
+/// FAIL-LOUD: a malformed/unreadable file errors (never a partial silent load); an EMPTY effective load
+/// (0 policies + 0 rules) errors (a silent no-op population would read as "governed" while enforcing
+/// nothing). A missing `policies/` or `rules/` subdir is tolerated (a ruleset may carry only one kind).
+fn rules_ingest_cmd(args: &[String]) {
+    let dir = match flag(args, "--dir").or_else(|| {
+        args.get(3)
+            .filter(|a| !a.starts_with("--"))
+            .map(|s| s.to_string())
+    }) {
+        Some(d) => d,
+        None => {
+            fail("rules ingest requires a directory: wicked-core rules ingest <dir> [--db F]");
+            return;
+        }
+    };
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules ingest: open store failed: {e}"));
+            return;
+        }
+    };
+
+    let root = std::path::Path::new(&dir);
+    let mut n_policies = 0usize;
+    let mut n_rules = 0usize;
+
+    // Conformance rules (recall→obligation).
+    let rules_dir = root.join("rules");
+    if rules_dir.is_dir() {
+        let adapter = wicked_governance::FilesystemAdapter::new(&rules_dir);
+        match wicked_governance::ingest_from(&adapter) {
+            Ok(rules) => {
+                for r in &rules {
+                    if let Err(e) = wicked_governance::register_rule(&mut store, r) {
+                        fail(&format!(
+                            "rules ingest: register conformance rule {} failed: {e}",
+                            r.id
+                        ));
+                        return;
+                    }
+                    n_rules += 1;
+                }
+            }
+            Err(e) => {
+                fail(&format!(
+                    "rules ingest: reading conformance rules under {rules_dir:?}: {e}"
+                ));
+                return;
+            }
+        }
+    }
+
+    // Governance policies (the deterministic deny path).
+    let policies_dir = root.join("policies");
+    if policies_dir.is_dir() {
+        let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(&policies_dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|x| x.eq_ignore_ascii_case("json"))
+                })
+                .collect(),
+            Err(e) => {
+                fail(&format!("rules ingest: cannot read {policies_dir:?}: {e}"));
+                return;
+            }
+        };
+        files.sort(); // deterministic ingest order
+        for p in files {
+            let text = match std::fs::read_to_string(&p) {
+                Ok(t) => t,
+                Err(e) => {
+                    fail(&format!("rules ingest: cannot read {p:?}: {e}"));
+                    return;
+                }
+            };
+            // A file is either a single Policy or an array of Policies.
+            let policies: Vec<wicked_governance::Policy> =
+                match serde_json::from_str::<wicked_governance::Policy>(&text) {
+                    Ok(one) => vec![one],
+                    Err(_) => match serde_json::from_str::<Vec<wicked_governance::Policy>>(&text) {
+                        Ok(many) => many,
+                        Err(e) => {
+                            fail(&format!(
+                                "rules ingest: {p:?} is not a Policy or [Policy]: {e}"
+                            ));
+                            return;
+                        }
+                    },
+                };
+            for pol in &policies {
+                if let Err(e) = wicked_governance::register_policy(&mut store, pol) {
+                    fail(&format!(
+                        "rules ingest: register policy {} failed: {e}",
+                        pol.id
+                    ));
+                    return;
+                }
+                n_policies += 1;
+            }
+        }
+    }
+
+    if n_policies == 0 && n_rules == 0 {
+        fail(&format!(
+            "rules ingest: NO policies or conformance rules found under {dir} (expected \
+             <dir>/policies/*.json and/or <dir>/rules/*.json) — refusing an empty population (fail-loud)"
+        ));
+        return;
+    }
+    println!(
+        "rules ingest: registered {n_policies} policies + {n_rules} conformance rules from {dir}"
+    );
 }
 
 fn fail(msg: &str) {
