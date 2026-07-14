@@ -41,7 +41,7 @@ use wicked_apps_core::{
     open_store, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
     CONFORMANCE_CLAIM,
 };
-use wicked_governance::{conform, decide, select};
+use wicked_governance::{conform, decide, recall_rules, select, RuleQuery};
 use wicked_orchestration::{apply_gate, get_phase, Phase};
 
 use crate::domain::put_node;
@@ -66,7 +66,11 @@ pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 /// can't decide — an un-evaluable tool-call is never silently allowed.
 pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
+    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+        // An unreadable (e.g. non-UTF-8) tool call is UN-EVALUABLE — fail closed, never allow.
+        eprintln!("wicked-governance: DENY (could not read tool call for evaluation: {e})");
+        return 2;
+    }
     let (context, tool) = claude_pretool_context(&raw, scope, phase);
 
     // Fail closed if the launcher didn't wire an absolute decisions path.
@@ -164,6 +168,15 @@ pub fn apply_hook_decisions(
 
     let workflow_id = format!("wf-{run_id}");
     let mut summary = HookDrainSummary::default();
+
+    // Pass 1: `conform` every claim (durable per-claim evidence — idempotent, order-independent) and
+    // GROUP by the governance phase it targets. Grouping is what makes deny DOMINATE: a phase gate is
+    // resolved ONCE from the composed verdict, not first-writer-wins across claims. Without this, an
+    // Allow drained before a Deny (the common input-hook-then-output-hook file order) would resolve
+    // the phase to a TERMINAL Approved, and the reducer would then refuse the Deny (`from_mismatch`)
+    // — silently dropping the veto. (BTreeMap → deterministic phase iteration order.)
+    let mut by_phase: std::collections::BTreeMap<String, Vec<ConformanceClaim>> =
+        std::collections::BTreeMap::new();
     for line in raw.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -173,19 +186,29 @@ pub fn apply_hook_decisions(
             Ok(c) => c,
             Err(_) => continue, // a malformed line never blocks the rest of the drain
         };
-
-        // 1. durable evidence — the single-writer ingest of the out-of-process decision.
         conform(store, &claim)?;
         summary.applied += 1;
+        by_phase.entry(claim.phase.clone()).or_default().push(claim);
+    }
 
-        // 2. resolve the gate on the run's phase. Phase id mirrors the engine's convention
-        //    (`{workflow_id}:{phase_name}`); claim.phase is the governance phase the hook evaluated.
-        let phase_id = format!("{workflow_id}:{}", claim.phase);
-        ensure_phase_at_gate(store, &phase_id, &workflow_id, &claim.phase)?;
-        let gate_event_id = format!("hookgate-{}", claim.claim_id);
-        apply_gate(store, &phase_id, Some(&claim), &gate_event_id)?;
-
-        if claim.decision == Decision::Deny {
+    // Pass 2: resolve each phase's gate ONCE from the deny-dominating verdict
+    // (Deny ≻ AllowWithConditions ≻ Allow). Deny wins regardless of the claims' arrival order.
+    for (phase_name, claims) in &by_phase {
+        let phase_id = format!("{workflow_id}:{phase_name}");
+        ensure_phase_at_gate(store, &phase_id, &workflow_id, phase_name)?;
+        let verdict = claims
+            .iter()
+            .find(|c| c.decision == Decision::Deny)
+            .or_else(|| {
+                claims
+                    .iter()
+                    .find(|c| c.decision == Decision::AllowWithConditions)
+            })
+            .unwrap_or(&claims[0]);
+        let gate_event_id = format!("hookgate-{}", verdict.claim_id);
+        let outcome = apply_gate(store, &phase_id, Some(verdict), &gate_event_id)?;
+        // Count a veto only when the Deny actually resolved the gate (never mask a refused transition).
+        if verdict.decision == Decision::Deny && outcome.applied {
             summary.denied += 1;
         }
     }
@@ -270,6 +293,151 @@ fn claude_pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::V
     (context, tool)
 }
 
+/// Environment variables the launcher may set to scope OUTPUT-governance recall to the produced
+/// artifact's facets. Unset ⇒ a wildcard for that facet (every conformance rule matches — the
+/// fail-toward-surfacing default; set them to narrow recall to the artifact's language/layer/framework).
+pub const OUTPUT_LANGUAGE_ENV: &str = "WICKED_OUTPUT_LANGUAGE";
+pub const OUTPUT_LAYER_ENV: &str = "WICKED_OUTPUT_LAYER";
+pub const OUTPUT_FRAMEWORK_ENV: &str = "WICKED_OUTPUT_FRAMEWORK";
+
+/// Body of the `wicked-core output-gate-hook` subcommand — the PER-OUTPUT governance guardrail
+/// (DES-OUTGOV-001 PR-C, M2/M6). Where [`run_gate_hook`] governs a proposed tool INPUT, this governs
+/// the generated OUTPUT text:
+///  1. it evaluates the output through the SAME deterministic `select`+`decide` engine (a policy
+///     whose trigger matches the output DENIES it — hard→deny; an allow-with-conditions rides
+///     obligations — soft→advise), then
+///  2. RECALLS the conformance rules applicable to the output's facets and attaches them as
+///     obligations (the applicable ruleset the output must conform to — M6/M7 recall→gate wiring).
+///
+/// The claim is appended to the SAME decisions NDJSON as the input hook, so [`apply_hook_decisions`]
+/// composes its verdict at the phase gate (deny dominates via the reducer) — there is NO separate
+/// compose path (M1).
+///
+/// **Honest seam:** whether the output *violates* a pattern conformance rule is a SEMANTIC check (the
+/// rule carries no regex) — that verification is the downstream per-turn checker's job (garden). This
+/// entry point is the DETERMINISTIC half: policy-over-output + recall wiring. Fails CLOSED (exit 2)
+/// exactly like the input hook — an un-evaluable or un-recordable output is never silently allowed.
+pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+    let mut raw = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
+        // An unreadable (e.g. non-UTF-8) output is UN-EVALUABLE — fail closed, never allow.
+        eprintln!("wicked-governance: DENY (could not read output for evaluation: {e})");
+        return 2;
+    }
+    let context = claude_output_context(&raw, scope, phase);
+
+    let decisions_path = match std::env::var(DECISIONS_PATH_ENV) {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            eprintln!(
+                "wicked-governance: DENY ({DECISIONS_PATH_ENV} unset — cannot record output decision)"
+            );
+            return 2;
+        }
+    };
+    let store = match open_store(db.filter(|s| !s.is_empty())) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-governance: DENY (open store failed: {e})");
+            return 2;
+        }
+    };
+    let selected = match select(&store, scope, phase, &context) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-governance: DENY (policy select failed: {e})");
+            return 2;
+        }
+    };
+    let mut claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
+
+    // Wire recall INTO the output gate (M6/M7): the conformance rules applicable to the output's
+    // facets become obligations on the claim. A recall failure is a governance failure (fail
+    // closed) — never silently drop the ruleset.
+    if let Err(e) = attach_recalled_rules(&store, &output_rule_query(), &mut claim) {
+        eprintln!("wicked-governance: DENY (conformance-rule recall failed: {e})");
+        return 2;
+    }
+
+    if let Err(e) = append_decision(Path::new(&decisions_path), &claim) {
+        eprintln!("wicked-governance: DENY (could not append output decision: {e})");
+        return 2;
+    }
+
+    match claim.decision {
+        Decision::Deny => {
+            eprintln!("wicked-governance: DENY output (claim {})", claim.claim_id);
+            2
+        }
+        _ => 0,
+    }
+}
+
+/// Parse the produced OUTPUT into the governance evaluation context. Accepts the wrapped CLI's raw
+/// stdout, OR a JSON envelope (`{"output"|"stdout"|"text"|"content": "…"}` — e.g. a Stop/SubagentStop
+/// event). The extracted output text becomes `work` (the canonical evaluated value); the FULL raw
+/// input is ALSO carried as `raw` so a policy trigger can never fail to fire on a violation living in
+/// a discarded envelope field — extraction narrows the DISPLAY value, never the governed surface
+/// (fail-CLOSED direction: `select`/`decide` scan the whole context object, so scanning more is safe).
+///
+/// KNOWN LIMITATION (inherited, tracked as a follow-up — affects BOTH hooks): `decide`'s triggers
+/// match over the CANONICAL JSON of this context (`serde_json::to_string`), where newlines are
+/// escaped to `\n`, so a policy trigger authored with a real-newline / `(?m)^…$` line anchor will not
+/// match interior lines of multiline output. Fixing it means decoupling the trigger haystack from the
+/// attestation fingerprint in `wicked-governance::decide` (keep the canonical bytes for
+/// `evaluated_context_ref` / ADR-0003 re-derivability, match against the raw string) — a governance-
+/// engine change out of this per-output entry point's scope.
+fn claude_output_context(raw: &str, scope: &str, phase: &str) -> serde_json::Value {
+    let trimmed = raw.trim();
+    let output_text = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| {
+            ["output", "stdout", "text", "content"]
+                .iter()
+                .find_map(|k| {
+                    v.get(*k)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .unwrap_or_else(|| trimmed.to_string());
+    serde_json::json!({
+        "phase": phase,
+        "scope": scope,
+        "raw": trimmed,
+        "work": output_text,
+    })
+}
+
+/// Attach the conformance rules applicable to `query` as obligations on `claim` — the M6/M7
+/// recall→gate wiring. Each obligation is `conform:<Severity>:<id>:<statement>` so a downstream
+/// checker/human sees the applicable ruleset (and its severity) that the output must conform to. A
+/// recall error propagates so the caller can fail closed.
+fn attach_recalled_rules(
+    store: &dyn GraphRead,
+    query: &RuleQuery,
+    claim: &mut ConformanceClaim,
+) -> anyhow::Result<()> {
+    for r in recall_rules(store, query)? {
+        claim
+            .obligations
+            .push(format!("conform:{:?}:{}:{}", r.severity, r.id, r.statement));
+    }
+    Ok(())
+}
+
+/// Build the conformance-rule recall query from the optional output-facet env vars (unset ⇒ wildcard).
+fn output_rule_query() -> RuleQuery {
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    RuleQuery {
+        language: env(OUTPUT_LANGUAGE_ENV),
+        layer: env(OUTPUT_LAYER_ENV),
+        framework: env(OUTPUT_FRAMEWORK_ENV),
+        severity: None,
+        rule_type: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +477,154 @@ mod tests {
             .map(str::to_string)
             .collect();
         assert_eq!(lines.len(), 2, "append-only: both claims present");
+    }
+
+    #[test]
+    fn output_context_extracts_raw_and_enveloped_output() {
+        // Raw stdout → work.
+        let ctx = claude_output_context("fn main() { unsafe {} }", "s", "review");
+        assert_eq!(ctx["work"], "fn main() { unsafe {} }");
+        assert_eq!(ctx["phase"], "review");
+        // JSON envelope (Stop/SubagentStop-style) → the `output` field becomes work.
+        let ctx = claude_output_context(r#"{"output":"SELECT * FROM users"}"#, "s", "review");
+        assert_eq!(ctx["work"], "SELECT * FROM users");
+    }
+
+    #[test]
+    fn attach_recalled_rules_adds_applicable_rules_as_obligations() {
+        use wicked_governance::{
+            register_rule, ConfSeverity, ConformanceRule, RuleProvenance, RuleQuery, RuleType,
+            Targets,
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &ConformanceRule {
+                id: "POL-001".into(),
+                rule_type: RuleType::Policy,
+                statement: "no plaintext secrets in output".into(),
+                severity: ConfSeverity::Critical,
+                confidence: 0.9,
+                targets: Targets::default(),
+                symbol_ref: None,
+                compliance: None,
+                provenance: RuleProvenance::default(),
+            },
+        )
+        .unwrap();
+
+        let mut claim = ConformanceClaim {
+            claim_id: "c1".into(),
+            scope: "s".into(),
+            phase: "review".into(),
+            policy_ids: vec![],
+            decision: Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:x".into(),
+            criteria: String::new(),
+            evaluator_identity: "wicked-governance".into(),
+            evaluated_at: EVAL_AT_BASE,
+        };
+        // A wildcard query (no facets) recalls the applicable rule and attaches it as an obligation.
+        attach_recalled_rules(&store, &RuleQuery::default(), &mut claim).unwrap();
+        assert_eq!(
+            claim.obligations.len(),
+            1,
+            "the applicable rule is wired in as an obligation"
+        );
+        assert!(
+            claim.obligations[0].contains("Critical") && claim.obligations[0].contains("POL-001"),
+            "obligation carries severity + rule id: {:?}",
+            claim.obligations[0]
+        );
+    }
+
+    #[test]
+    fn attach_recalled_rules_narrows_by_facet() {
+        use wicked_governance::{
+            register_rule, ConfSeverity, ConformanceRule, RuleProvenance, RuleQuery, RuleType,
+            Targets,
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mk = |id: &str, lang: &str| ConformanceRule {
+            id: id.into(),
+            rule_type: RuleType::Pattern,
+            statement: "s".into(),
+            severity: ConfSeverity::Warn,
+            confidence: 0.5,
+            targets: Targets {
+                language: Some(lang.into()),
+                ..Default::default()
+            },
+            symbol_ref: None,
+            compliance: None,
+            provenance: RuleProvenance::default(),
+        };
+        register_rule(&mut store, &mk("PAT-001", "python")).unwrap();
+        register_rule(&mut store, &mk("PAT-002", "rust")).unwrap();
+
+        let mut claim = allow_claim("c1", "review");
+        // A FACETED query attaches ONLY the matching rule — proving narrowing (not "attach all").
+        attach_recalled_rules(
+            &store,
+            &RuleQuery {
+                language: Some("python".into()),
+                ..Default::default()
+            },
+            &mut claim,
+        )
+        .unwrap();
+        assert_eq!(claim.obligations.len(), 1, "only the python rule matches");
+        assert!(claim.obligations[0].contains("PAT-001"));
+    }
+
+    #[test]
+    fn drain_deny_dominates_when_two_claims_share_a_phase() {
+        use wicked_orchestration::{get_phase, PhaseStatus};
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-drain-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("decisions.ndjson");
+        let _ = std::fs::remove_file(&path);
+
+        // Allow drained BEFORE Deny — the common input-hook-then-output-hook file order that used to
+        // resolve the phase to a TERMINAL Approved and silently drop the later Deny (from_mismatch).
+        append_decision(&path, &allow_claim("allow-1", "exec")).unwrap();
+        let mut deny = allow_claim("deny-1", "exec");
+        deny.decision = Decision::Deny;
+        append_decision(&path, &deny).unwrap();
+
+        let summary = apply_hook_decisions(&mut store, "run1", &path).unwrap();
+        assert_eq!(
+            summary.applied, 2,
+            "both claims conformed as durable evidence"
+        );
+        assert_eq!(
+            summary.denied, 1,
+            "the phase's Deny verdict resolved the gate"
+        );
+        let phase = get_phase(&store, "wf-run1:exec").unwrap().unwrap();
+        assert_eq!(
+            phase.status,
+            PhaseStatus::Rejected,
+            "deny DOMINATES the same-phase Allow regardless of arrival order"
+        );
+    }
+
+    /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.
+    fn allow_claim(id: &str, phase: &str) -> ConformanceClaim {
+        ConformanceClaim {
+            claim_id: id.to_string(),
+            scope: "s".into(),
+            phase: phase.to_string(),
+            policy_ids: vec![],
+            decision: Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: format!("sha256:{id}"),
+            criteria: String::new(),
+            evaluator_identity: "wicked-governance".into(),
+            evaluated_at: EVAL_AT_BASE,
+        }
     }
 }

@@ -10,6 +10,8 @@
 //!   wicked-core cancel --session <id>             # cancel a run
 //!   wicked-core launch --problem "..."            # STUB self-test: deterministic stub output, no real CLI, no gates
 //!   wicked-core gate-hook --scope S --phase P     # PreToolUse governance hook (claude invokes this)
+//!   wicked-core output-gate-hook --scope S --phase P  # per-OUTPUT guardrail: governs generated
+//!       # output text on stdin (policy-over-output + conformance-rule recall) → decisions.ndjson
 //!   wicked-core provision-validator --criterion "..."   # author a deterministic validator (UNAPPROVED)
 //!   wicked-core approve-validator --pin <pin>     # approve a vaulted validator → the pin to put in a def
 //!   wicked-core gate-phase --workflow <base-id> --phase <phase-id> --criterion "..." [--out <dir>]
@@ -23,8 +25,8 @@
 use std::io::BufRead;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
-    registry_roster, run_gate_hook, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision,
-    LaunchSpec, RepoSpec, WorkflowRegistry, WrappedCliStepRunner,
+    registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
+    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, WorkflowRegistry, WrappedCliStepRunner,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -74,6 +76,16 @@ fn main() {
         let phase = flag(&args, "--phase").unwrap_or_default();
         let db = flag(&args, "--db");
         std::process::exit(run_gate_hook(&scope, &phase, db.as_deref()));
+    }
+
+    // output-gate-hook is the PER-OUTPUT sibling: same read-only-then-append discipline, but it
+    // governs the generated OUTPUT text (on stdin) instead of a proposed tool input. Also exits with
+    // the gate's code (2 = deny) and must run before `Core::spawn`.
+    if args.get(1).map(String::as_str) == Some("output-gate-hook") {
+        let scope = flag(&args, "--scope").unwrap_or_default();
+        let phase = flag(&args, "--phase").unwrap_or_default();
+        let db = flag(&args, "--db");
+        std::process::exit(run_output_gate_hook(&scope, &phase, db.as_deref()));
     }
 
     // provision-validator / approve-validator drive the rev0.4 pin+vault authoring flow DIRECTLY on the
