@@ -267,15 +267,18 @@ fn bus_request_agent_verdict(
         .ok()?;
     let key = deterministic_key(&["gate-eval-req", &eval_id]);
     let ev = BusEmit::new(GATE_EVAL_REQUESTED, CORE_DOMAIN, "core.gate", payload).with_key(key);
-    db.emit(&ev)
+    // Capture the emitted event_id so polling starts AFTER this request — no historical rescans.
+    let floor_start = db
+        .emit(&ev)
         .map_err(|e| eprintln!("wicked-core: gate eval — cannot publish request: {e}"))
         .ok()?;
 
-    eprintln!("wicked-core: gate eval request published (eval_id={eval_id}); waiting up to {GATE_EVAL_TIMEOUT:?}");
+    eprintln!("wicked-core: gate eval request published (eval_id={eval_id}, floor={floor_start}); waiting up to {GATE_EVAL_TIMEOUT:?}");
 
-    // Poll for the matching response (by eval_id) until timeout.
+    // Poll for the matching response (by eval_id) until timeout. Start from the request event_id
+    // so we never replay historical GATE_EVAL_RESPONDED events from prior runs.
     let start = std::time::Instant::now();
-    let mut floor: i64 = 0;
+    let mut floor: i64 = floor_start;
     while start.elapsed() < GATE_EVAL_TIMEOUT {
         let events = match db.poll(GATE_EVAL_RESPONDED, floor, 20) {
             Ok(evs) => evs,
