@@ -1,0 +1,12 @@
+{
+  "id": "97dadaa1-ccda-4985-93eb-92fda1e4dc95",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "name": "domain-graph-fail-closed",
+  "source_path": ".wicked-testing/scenarios/domain-graph-fail-closed.md",
+  "format_version": "1.0",
+  "body": "wicked-core domain-graph refuses to build when coverage < 1.0 (unaccounted nodes)",
+  "created_at": "2026-07-15T21:01:26.204Z",
+  "updated_at": "2026-07-15T21:01:26.204Z",
+  "deleted": 0,
+  "deleted_at": null
+}

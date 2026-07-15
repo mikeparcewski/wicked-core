@@ -1,0 +1,2 @@
+coverage: 0.0000 (2 behavior-bearing, 2 unaccounted) → /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/coverage-check.txt
+exit=0

@@ -1,0 +1,160 @@
+{
+  "run_id": "34656084-fd1b-4804-843e-3139f411afea",
+  "scenario_id": "domain-graph-happy-path",
+  "executed_at": "2026-07-15T20:56:39Z",
+  "executor": "acceptance-test-executor",
+  "steps": [
+    {
+      "step": 0,
+      "name": "Cleanup prior state",
+      "timestamp": "2026-07-15T20:55:22Z",
+      "result": "completed",
+      "notes": "Removed stale fixture dir, db file, and output JSON if present"
+    },
+    {
+      "step": 1,
+      "name": "Create fixture source directory and Rust file",
+      "timestamp": "2026-07-15T20:55:22Z",
+      "result": "completed",
+      "observations": {
+        "step-1-fn-count": 2,
+        "file_path": "/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-domgraph-fixture/src/lib.rs"
+      }
+    },
+    {
+      "step": 2,
+      "name": "Index fixture into fresh estate store",
+      "timestamp": "2026-07-15T20:55:22Z",
+      "result": "completed",
+      "observations": {
+        "index_exit": 0,
+        "db_exists": true,
+        "index_output": "indexed /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-domgraph-fixture/src (/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-domgraph-fixture.db) → 3 nodes, 2 edges, 1 files\n  \"contains\" = 2"
+      },
+      "artifact": "index-output.txt"
+    },
+    {
+      "step": 3,
+      "name": "Annotate process_payment with RULE-001",
+      "timestamp": "2026-07-15T20:55:47Z",
+      "result": "completed",
+      "observations": {
+        "annotate1_exit": 0,
+        "annotate_output": "annotated 1 symbol(s) with [business_rule] RULE-001=process_payment charges the customer; amount must be positive"
+      },
+      "artifact": "annotate-1-output.txt"
+    },
+    {
+      "step": 4,
+      "name": "Annotate validate_order with RULE-002",
+      "timestamp": "2026-07-15T20:55:53Z",
+      "result": "completed",
+      "observations": {
+        "annotate2_exit": 0,
+        "annotate_output": "annotated 1 symbol(s) with [business_rule] RULE-002=validate_order returns true if and only if the order_id is positive"
+      },
+      "artifact": "annotate-2-output.txt"
+    },
+    {
+      "step": 5,
+      "name": "Run wicked-core domain-graph and capture output",
+      "timestamp": "2026-07-15T20:56:09Z",
+      "result": "completed",
+      "observations": {
+        "domain_graph_exit": 0,
+        "stdout": "domain-graph: wrote 1 domain(s) → /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/requirements_graph.json",
+        "contains_wrote_1_domain": true
+      },
+      "artifact": "domgraph-stdout.txt"
+    },
+    {
+      "step": 6,
+      "name": "Verify file existence and JSON validity",
+      "timestamp": "2026-07-15T20:56:15Z",
+      "result": "completed",
+      "observations": {
+        "file_exists": true,
+        "json_valid": true,
+        "top_level_keys": ["metadata", "domains"]
+      },
+      "artifact": "requirements_graph.json"
+    },
+    {
+      "step": 7,
+      "name": "Verify metadata.schema_version",
+      "timestamp": "2026-07-15T20:56:20Z",
+      "result": "completed",
+      "observations": {
+        "schema_version": "1.0.0",
+        "a3_exit": 0
+      }
+    },
+    {
+      "step": 8,
+      "name": "Verify domains key is non-empty",
+      "timestamp": "2026-07-15T20:56:25Z",
+      "result": "completed",
+      "observations": {
+        "domains_type": "dict",
+        "domains_count": 1,
+        "domain_keys": ["(root)"],
+        "a4_exit": 0
+      }
+    },
+    {
+      "step": 9,
+      "name": "Verify at least one domain has a requirement with non-empty business_rules",
+      "timestamp": "2026-07-15T20:56:31Z",
+      "result": "completed",
+      "observations": {
+        "found_domain": "(root)",
+        "found_req": "REQ-001",
+        "rules_count": 1,
+        "a5_exit": 0
+      }
+    },
+    {
+      "step": 10,
+      "name": "Verify all business rules have confidence in (0.0, 1.0] and non-empty statement",
+      "timestamp": "2026-07-15T20:56:39Z",
+      "result": "completed",
+      "observations": {
+        "rules_checked": [
+          {"loc": "(root)/REQ-001/rule[0]", "confidence": 0.95, "statement_nonempty": true},
+          {"loc": "(root)/REQ-002/rule[0]", "confidence": 0.95, "statement_nonempty": true}
+        ],
+        "a6_pass": true,
+        "a6_exit": 0
+      }
+    }
+  ],
+  "assertions": {
+    "step-1-fn-count EQUALS 2": {"observed": 2, "step": 1},
+    "index-exit-code EQUALS 0": {"observed": 0, "step": 2},
+    "db-file EXISTS": {"observed": true, "step": 2},
+    "annotate-1-exit-code EQUALS 0": {"observed": 0, "step": 3},
+    "annotate-2-exit-code EQUALS 0": {"observed": 0, "step": 4},
+    "A1 domain-graph-exit-code EQUALS 0": {"observed": 0, "step": 5},
+    "A7 domgraph-stdout CONTAINS wrote 1 domain(s)": {"observed": true, "step": 5},
+    "A2 file-exists EQUALS true": {"observed": true, "step": 6},
+    "A2 json-valid EQUALS true": {"observed": true, "step": 6},
+    "A3 schema_version EQUALS 1.0.0": {"observed": "1.0.0", "step": 7},
+    "A4 domains-type EQUALS dict": {"observed": "dict", "step": 8},
+    "A4 domains-count COUNT_GTE 1": {"observed": 1, "step": 8},
+    "A5 a5-exit-code EQUALS 0": {"observed": 0, "step": 9},
+    "A6 a6-exit-code EQUALS 0": {"observed": 0, "step": 10}
+  },
+  "artifacts": {
+    "index-output.txt": "indexed 3 nodes, 2 edges, 1 files",
+    "annotate-1-output.txt": "annotated 1 symbol(s) with [business_rule] RULE-001",
+    "annotate-2-output.txt": "annotated 1 symbol(s) with [business_rule] RULE-002",
+    "domgraph-stdout.txt": "domain-graph: wrote 1 domain(s) → ...",
+    "requirements_graph.json": "copied verbatim; top-level keys: metadata, domains"
+  },
+  "notable_observations": [
+    "MISMATCH-1: domain key is '(root)' — wicked-estate index stored basename-stripped path; package_dir() fell back to (root) sentinel rather than absolute parent dir",
+    "MISMATCH-4: wicked-estate annotate flags matched test plan exactly (--key, --value, --type, --confidence) — no adaptation needed",
+    "requirements_graph.json: REQ-002 business_rule id is 'RULE-001' (not 'RULE-002') — this appears to be an implementation detail where the rule id is assigned sequentially per requirement rather than using the annotation key from wicked-estate",
+    "Both requirements carry status: 'review' as predicted by Implementation Note 3 in the test plan"
+  ]
+}

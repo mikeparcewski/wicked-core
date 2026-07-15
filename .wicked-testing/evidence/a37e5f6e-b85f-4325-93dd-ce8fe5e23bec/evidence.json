@@ -1,0 +1,82 @@
+{
+  "run_id": "a37e5f6e-b85f-4325-93dd-ce8fe5e23bec",
+  "recorded_at": "2026-07-15T00:00:00Z",
+  "executor": "acceptance-test-executor",
+  "note": "No verdicts or pass/fail judgments — raw observations only",
+  "tmpdir": "/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T",
+  "steps": [
+    {
+      "step": "Step 1: Create fixture and index into isolated DB",
+      "timestamp": "2026-07-15",
+      "commands": [
+        "mkdir -p /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture/src",
+        "cat > /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture/src/lib.rs << EOF ... EOF",
+        "wicked-estate index /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture/src --db /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture.db"
+      ],
+      "exit_code": 0,
+      "observed_output": "indexed /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture/src (/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture.db) → 3 nodes, 2 edges, 1 files\n  \"contains\" = 2",
+      "evidence_file": "index-output.txt"
+    },
+    {
+      "step": "Step 2: Confirm coverage is below 1.0",
+      "timestamp": "2026-07-15",
+      "commands": [
+        "wicked-core coverage --db /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture.db --out /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/coverage-report.json"
+      ],
+      "exit_code": 0,
+      "observed_output": "coverage: 0.0000 (2 behavior-bearing, 2 unaccounted) → /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/coverage-report.json",
+      "evidence_file": "coverage-check.txt"
+    },
+    {
+      "step": "Step 3: Attempt domain-graph build (expect failure)",
+      "timestamp": "2026-07-15",
+      "commands": [
+        "wicked-core domain-graph --db /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-uncovered-fixture.db --out /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/requirements_graph_should_not_exist.json"
+      ],
+      "exit_code": 0,
+      "observed_output": "domain-graph: front-half coverage 0.0000 — 2 behavior-bearing node(s) unaccounted; run extraction + coverage first (refusing to translate an unannotated graph). First unaccounted: [\"ts-rust . . . lib/process_payment().\", \"ts-rust . . . lib/validate_order().\"]",
+      "evidence_file": "domgraph-fail-stdout.txt"
+    },
+    {
+      "step": "Step 4: Confirm output file was not created",
+      "timestamp": "2026-07-15",
+      "commands": [
+        "ls -la /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/requirements_graph_should_not_exist.json"
+      ],
+      "exit_code": 1,
+      "observed_output": "ls: /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/requirements_graph_should_not_exist.json: No such file or directory",
+      "note": "ls exit code was 1 because the file does not exist; that is the expected absence signal",
+      "evidence_file": "ls-output.txt"
+    }
+  ],
+  "assertions_observed": {
+    "A1_domain_graph_exit_nonzero": {
+      "expected": "exit code non-zero (1 or 2)",
+      "observed_exit_code": 0,
+      "note": "domain-graph exited 0, not non-zero"
+    },
+    "A2_output_file_absent": {
+      "expected": "output file does not exist",
+      "observed": "ls returned 'No such file or directory'; file is absent"
+    },
+    "A3_stderr_mentions_unaccounted_and_2": {
+      "expected": "stderr mentions 'unaccounted' or 'coverage' and the number 2",
+      "observed": "output contains 'unaccounted', 'coverage', and '2': '2 behavior-bearing node(s) unaccounted'"
+    },
+    "A4_stderr_no_wrote": {
+      "expected": "stderr does NOT contain 'wrote'",
+      "observed": "the word 'wrote' does not appear in the domain-graph output"
+    },
+    "A5_coverage_zero": {
+      "expected": "coverage: 0.0000",
+      "observed": "coverage: 0.0000 (2 behavior-bearing, 2 unaccounted)"
+    }
+  },
+  "evidence_files": [
+    "index-output.txt",
+    "coverage-check.txt",
+    "domgraph-fail-stdout.txt",
+    "ls-output.txt",
+    "evidence.json"
+  ]
+}

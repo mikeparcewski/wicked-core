@@ -1,0 +1,12 @@
+{
+  "id": "77e600fd-adb6-4724-84e0-4800e08978f1",
+  "run_id": "a53a6024-0635-4543-bf43-a619e3009e26",
+  "verdict": "PASS",
+  "evidence_path": ".wicked-testing/evidence/a53a6024-0635-4543-bf43-a619e3009e26",
+  "reviewer": "acceptance-test-reviewer",
+  "reason": "All 13 plan assertions and all evidence gates pass. Coverage emitter correctly classified 3 total nodes (1 file/structural, 2 function/behavior-bearing), resolved both via business_rule annotations at confidence 0.95, emitted schema-exact coverage-report.json with coverage=1.0, unaccounted=0, resolved=2.",
+  "created_at": "2026-07-15T20:45:19.096Z",
+  "updated_at": "2026-07-15T20:45:19.096Z",
+  "deleted": 0,
+  "deleted_at": null
+}

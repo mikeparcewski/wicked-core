@@ -1,0 +1,81 @@
+{
+  "manifest_version": "1.1.0",
+  "run_id": "34656084-fd1b-4804-843e-3139f411afea",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "scenario_id": "3d0e68e0-d95c-490a-a9b3-5366d78bc095",
+  "scenario_name": "domain-graph-happy-path",
+  "scenario_path": ".wicked-testing/scenarios/domain-graph-happy-path.md",
+  "started_at": "2026-07-15T20:48:01.076Z",
+  "finished_at": "2026-07-15T21:00:03.744Z",
+  "duration_ms": 722668,
+  "status": "passed",
+  "verdict": {
+    "value": "PASS",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "All seven assertions (A1–A7) confirmed by evidence files. domain-graph exited 0, emitted \"wrote 1 domain(s)\", requirements_graph.json is valid JSON with schema_version 1.0.0, one domain \"(root)\" with two requirements each containing a business rule at confidence 0.95.",
+    "recorded_at": "2026-07-15T21:00:04.349Z"
+  },
+  "environment": {
+    "os": "darwin 25.5.0",
+    "node": "26.0.0",
+    "wicked_testing_version": "0.9.0"
+  },
+  "artifacts": [
+    {
+      "name": "annotate-1-output.txt",
+      "kind": "misc",
+      "path": "annotate-1-output.txt",
+      "bytes": 114,
+      "sha256": "cbfb5c549888ebbcb870014d7c769e453c5a8a2b674a4681cddace3ba41831e8",
+      "captured_at": "2026-07-15T20:55:48.135Z"
+    },
+    {
+      "name": "annotate-2-output.txt",
+      "kind": "misc",
+      "path": "annotate-2-output.txt",
+      "bytes": 120,
+      "sha256": "57dfd4c68a4cf3c049634c5d33f0cdf3310c32b426051bd24d39eb2e04066578",
+      "captured_at": "2026-07-15T20:55:53.392Z"
+    },
+    {
+      "name": "domgraph-stdout.txt",
+      "kind": "misc",
+      "path": "domgraph-stdout.txt",
+      "bytes": 109,
+      "sha256": "05bf1720a845d6156d1d494c9b8d7bf73f02b2655234bdc57ed5895bd8d578a4",
+      "captured_at": "2026-07-15T20:56:09.785Z"
+    },
+    {
+      "name": "evidence.json",
+      "kind": "misc",
+      "path": "evidence.json",
+      "bytes": 6269,
+      "sha256": "6bab039a6d1689e348d9d0d94a6c3f9bf026eb0015df907a194dfd51e81f4541",
+      "captured_at": "2026-07-15T20:57:26.012Z"
+    },
+    {
+      "name": "index-output.txt",
+      "kind": "misc",
+      "path": "index-output.txt",
+      "bytes": 202,
+      "sha256": "3589c2ae3a594d48985e315cb659cb63ccbb03a2422d47cbbd309c5de49148a7",
+      "captured_at": "2026-07-15T20:55:22.430Z"
+    },
+    {
+      "name": "requirements_graph.json",
+      "kind": "misc",
+      "path": "requirements_graph.json",
+      "bytes": 1932,
+      "sha256": "6d83f0365351280885eb2555103b16bd47025bb1f3de29e37dbe7a57b1dd73ed",
+      "captured_at": "2026-07-15T20:56:15.951Z"
+    },
+    {
+      "name": "test-plan.md",
+      "kind": "misc",
+      "path": "test-plan.md",
+      "bytes": 13297,
+      "sha256": "d8687a0764421a1c4833b431d8c1da96dd0f7ca5d7b98e99dbde30683dc832a3",
+      "captured_at": "2026-07-15T20:54:29.774Z"
+    }
+  ]
+}

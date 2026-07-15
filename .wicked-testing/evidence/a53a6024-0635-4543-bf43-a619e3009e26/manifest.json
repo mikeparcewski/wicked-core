@@ -1,0 +1,88 @@
+{
+  "manifest_version": "1.1.0",
+  "run_id": "a53a6024-0635-4543-bf43-a619e3009e26",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "scenario_id": "8514f10d-f65c-4dfe-9874-557e965548fe",
+  "scenario_name": "coverage-emitter",
+  "started_at": "2026-07-15T20:36:00.606Z",
+  "finished_at": "2026-07-15T20:45:18.544Z",
+  "duration_ms": 557938,
+  "status": "passed",
+  "verdict": {
+    "value": "PASS",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "All 13 plan assertions and all evidence gates pass. Coverage emitter correctly classified 3 total nodes (1 file/structural, 2 function/behavior-bearing), resolved both via business_rule annotations at confidence 0.95, emitted schema-exact coverage-report.json with coverage=1.0, unaccounted=0, resolved=2.",
+    "recorded_at": "2026-07-15T20:45:19.096Z"
+  },
+  "environment": {
+    "os": "darwin 25.5.0",
+    "node": "26.0.0",
+    "wicked_testing_version": "0.9.0"
+  },
+  "artifacts": [
+    {
+      "name": ".tmpdir_base",
+      "kind": "misc",
+      "path": ".tmpdir_base",
+      "bytes": 64,
+      "sha256": "49b090b59e6fee9581e111a01ffe68f7eedead0af53b7ce08508a94e04f498a5",
+      "captured_at": "2026-07-15T20:42:18.482Z"
+    },
+    {
+      "name": "annotate-1-output.txt",
+      "kind": "misc",
+      "path": "annotate-1-output.txt",
+      "bytes": 114,
+      "sha256": "cbfb5c549888ebbcb870014d7c769e453c5a8a2b674a4681cddace3ba41831e8",
+      "captured_at": "2026-07-15T20:42:49.120Z"
+    },
+    {
+      "name": "annotate-2-output.txt",
+      "kind": "misc",
+      "path": "annotate-2-output.txt",
+      "bytes": 120,
+      "sha256": "57dfd4c68a4cf3c049634c5d33f0cdf3310c32b426051bd24d39eb2e04066578",
+      "captured_at": "2026-07-15T20:42:49.501Z"
+    },
+    {
+      "name": "coverage-report.json",
+      "kind": "coverage",
+      "path": "coverage-report.json",
+      "bytes": 401,
+      "sha256": "01fed43d6ee440c1b4cbb52ba2af5b71319cdcec74a58d8b329ade3b4649a893",
+      "captured_at": "2026-07-15T20:43:12.804Z"
+    },
+    {
+      "name": "coverage-stdout.txt",
+      "kind": "coverage",
+      "path": "coverage-stdout.txt",
+      "bytes": 142,
+      "sha256": "8e77c06d23f7de1b6a42592fcdd5f446fefce01c6f9dcbbfa0cc00f5ac7f8b3b",
+      "captured_at": "2026-07-15T20:43:02.890Z"
+    },
+    {
+      "name": "evidence.json",
+      "kind": "misc",
+      "path": "evidence.json",
+      "bytes": 3496,
+      "sha256": "0a11f2c19c37166531bab88f8170f8cafd36a39330630f8ff916079c00d4e30f",
+      "captured_at": "2026-07-15T20:43:37.694Z"
+    },
+    {
+      "name": "index-output.txt",
+      "kind": "misc",
+      "path": "index-output.txt",
+      "bytes": 232,
+      "sha256": "a882f2057a6010de3976766bcec3ad49344c484be0607db12b97e5bca1900dab",
+      "captured_at": "2026-07-15T20:42:32.228Z"
+    },
+    {
+      "name": "test-plan.md",
+      "kind": "misc",
+      "path": "test-plan.md",
+      "bytes": 8326,
+      "sha256": "daf9320a5c751d7af50eb936b2f008d616125cdc91e194faac84e4f819709815",
+      "captured_at": "2026-07-15T20:41:25.696Z"
+    }
+  ]
+}

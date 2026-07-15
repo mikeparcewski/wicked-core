@@ -1,0 +1,11 @@
+Step 1: Index the unannotated fixture
+Timestamp: 2026-07-15T21:20:48Z
+
+=== wicked-estate index output ===
+Command: wicked-estate index /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/wc-uncovered-fixture/src --db /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/wc-uncovered-fixture.db
+Exit code: 0
+Output: indexed /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/wc-uncovered-fixture/src (/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/wc-uncovered-fixture.db) → 3 nodes, 2 edges, 1 files
+  "contains" = 2
+
+=== ls -la db file ===
+-rw-r--r--@ 1 michael.parcewski  staff  172032 Jul 15 17:20 /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/wc-uncovered-fixture.db

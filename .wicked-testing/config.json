@@ -1,0 +1,13 @@
+{
+  "project": "wicked-core",
+  "version": "1.0",
+  "capabilities": {
+    "playwright": false,
+    "cypress": false,
+    "k6": false,
+    "curl": true,
+    "pa11y": false
+  },
+  "created_at": "2026-07-15T20:27:21.348899Z",
+  "claim_nudge": false
+}

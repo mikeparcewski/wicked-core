@@ -1,0 +1,73 @@
+{
+  "manifest_version": "1.1.0",
+  "run_id": "4f893526-3610-403e-852e-d5676a147d08",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "scenario_id": "97dadaa1-ccda-4985-93eb-92fda1e4dc95",
+  "scenario_name": "domain-graph-fail-closed",
+  "scenario_path": ".wicked-testing/scenarios/domain-graph-fail-closed.md",
+  "started_at": "2026-07-15T21:20:48.000Z",
+  "finished_at": "2026-07-15T21:21:44.000Z",
+  "duration_ms": 56000,
+  "status": "passed",
+  "verdict": {
+    "value": "PASS",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "All 5 assertions (A1–A5) pass. wicked-core domain-graph exited with code 1, produced the expected unaccounted-node error message naming both functions (process_payment, validate_order), wrote no output file, and the prior coverage check confirmed the store was correctly populated with exactly 2 unannotated behavior-bearing nodes before the fail-closed attempt ran.",
+    "recorded_at": "2026-07-15T22:00:00.000Z"
+  },
+  "environment": {
+    "os": "darwin 25.5.0",
+    "node": "26.0.0",
+    "wicked_testing_version": "0.9.0"
+  },
+  "artifacts": [
+    {
+      "name": "coverage-cmd-stdout.txt",
+      "kind": "coverage",
+      "path": "coverage-cmd-stdout.txt",
+      "bytes": 147,
+      "sha256": "c852f4c76efe92714b1ad71399622446ce96da162aad544a2320e6836ff4de9c",
+      "captured_at": "2026-07-15T21:21:04.000Z"
+    },
+    {
+      "name": "domgraph-fail-output.txt",
+      "kind": "misc",
+      "path": "domgraph-fail-output.txt",
+      "bytes": 274,
+      "sha256": "5dfe5bf36d7fc91826f088a5b9926b5bae25e97def5a8cc774703e450880b432",
+      "captured_at": "2026-07-15T21:21:11.000Z"
+    },
+    {
+      "name": "evidence.json",
+      "kind": "misc",
+      "path": "evidence.json",
+      "bytes": 2771,
+      "sha256": "ecc8f36a87527b50d8ccbb7284d2910d0b4551daf98cb34907b121a501e4477b",
+      "captured_at": "2026-07-15T21:21:44.000Z"
+    },
+    {
+      "name": "ls-output.txt",
+      "kind": "misc",
+      "path": "ls-output.txt",
+      "bytes": 136,
+      "sha256": "aa1daad7e168993f7dd39d0ed0008ef9b82105078b64bdd7959f6f80ead9f0ef",
+      "captured_at": "2026-07-15T21:21:23.000Z"
+    },
+    {
+      "name": "setup-index.txt",
+      "kind": "misc",
+      "path": "setup-index.txt",
+      "bytes": 744,
+      "sha256": "e8ea33ee61bc878ca2fe1156f48348e906e825ccc8f1af938ab410c3f3a9303d",
+      "captured_at": "2026-07-15T21:20:57.000Z"
+    },
+    {
+      "name": "test-plan.md",
+      "kind": "misc",
+      "path": "test-plan.md",
+      "bytes": 9481,
+      "sha256": "181341f72afe769b0daa759a0fc9490ec0d6cfa6b22c20e5786e15d649a19cde",
+      "captured_at": "2026-07-15T21:20:00.000Z"
+    }
+  ]
+}

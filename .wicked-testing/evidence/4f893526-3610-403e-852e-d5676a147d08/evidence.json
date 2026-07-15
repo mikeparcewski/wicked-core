@@ -1,0 +1,40 @@
+{
+  "run_id": "4f893526-3610-403e-852e-d5676a147d08",
+  "steps": [
+    {
+      "step": 1,
+      "title": "Index the unannotated fixture",
+      "timestamp": "2026-07-15T21:20:48Z",
+      "evidence_file": "setup-index.txt",
+      "observed": "Created fixture at $TMPDIR/wc-uncovered-fixture/src/lib.rs with two pub fn items (process_payment, validate_order). Ran: wicked-estate index $TMPDIR/wc-uncovered-fixture/src --db $TMPDIR/wc-uncovered-fixture.db. Exit code: 0. Output: 'indexed ... -> 3 nodes, 2 edges, 1 files  \"contains\" = 2'. ls -la of db file: -rw-r--r--@ 1 michael.parcewski staff 172032 Jul 15 17:20 .../wc-uncovered-fixture.db (file is present and non-zero, 172032 bytes)."
+    },
+    {
+      "step": 2,
+      "title": "Verify coverage is 0.0 (optional cross-check)",
+      "timestamp": "2026-07-15T21:21:04Z",
+      "evidence_file": "coverage-cmd-stdout.txt",
+      "observed": "Ran: wicked-core coverage --db $TMPDIR/wc-uncovered-fixture.db --out $TMPDIR/coverage-check.txt. stdout+stderr captured to coverage-cmd-stdout.txt. Output line: 'coverage: 0.0000 (2 behavior-bearing, 2 unaccounted) -> /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/coverage-check.txt'. Appended exit=0. File contains '0.0000', '2 behavior-bearing', '2 unaccounted', and 'exit=0'."
+    },
+    {
+      "step": 3,
+      "title": "Attempt to build the domain graph — expect failure",
+      "timestamp": "2026-07-15T21:21:11Z",
+      "evidence_file": "domgraph-fail-output.txt",
+      "observed": "Ran: wicked-core domain-graph --db $TMPDIR/wc-uncovered-fixture.db --out $TMPDIR/requirements_graph_should_not_exist.json. stdout+stderr captured. DOMGRAPH_EXIT captured immediately after command (not through pipe). Output: 'domain-graph: front-half coverage 0.0000 — 2 behavior-bearing node(s) unaccounted; run extraction + coverage first (refusing to translate an unannotated graph). First unaccounted: [\"ts-rust . . . lib/process_payment().\", \"ts-rust . . . lib/validate_order().\"]'. Appended exit_code=1. File contains: 'exit_code=1', 'unaccounted', '2', 'domain-graph:'. File does NOT contain 'wrote'."
+    },
+    {
+      "step": 4,
+      "title": "Confirm the output file was not created",
+      "timestamp": "2026-07-15T21:21:16Z",
+      "evidence_file": "ls-output.txt",
+      "observed": "Ran: ls -la $TMPDIR/requirements_graph_should_not_exist.json 2>&1. ls exit code: 1. Output: 'ls: /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.kV5iDgtoY3/requirements_graph_should_not_exist.json: No such file or directory'. File does not exist; output contains 'No such file or directory'."
+    }
+  ],
+  "artifacts": [
+    "setup-index.txt",
+    "coverage-cmd-stdout.txt",
+    "domgraph-fail-output.txt",
+    "ls-output.txt",
+    "evidence.json"
+  ]
+}

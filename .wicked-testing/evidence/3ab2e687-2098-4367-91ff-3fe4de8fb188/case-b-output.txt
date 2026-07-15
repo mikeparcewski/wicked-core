@@ -1,0 +1,2 @@
+wicked-governance: DENY (no estate store resolvable (set --db or WICKED_ESTATE_DB) — refusing to evaluate against a default/empty store (fail-closed))
+exit_code=2

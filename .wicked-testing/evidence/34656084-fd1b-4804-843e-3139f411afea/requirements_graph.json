@@ -1,0 +1,69 @@
+{
+  "metadata": {
+    "schema_version": "1.0.0",
+    "migration_mode": "functional",
+    "source": "estate-graph"
+  },
+  "domains": {
+    "(root)": {
+      "description": "(root)",
+      "requirements": {
+        "REQ-001": {
+          "title": "process_payment",
+          "description": "process_payment",
+          "legacy_components": [
+            "lib.rs#process_payment"
+          ],
+          "data_access": [],
+          "dependencies": [],
+          "business_rules": [
+            {
+              "id": "RULE-001",
+              "statement": "process_payment charges the customer; amount must be positive",
+              "confidence": 0.95,
+              "provenance": {
+                "source": "code-graph",
+                "ref": "lib.rs#process_payment",
+                "source_kinds": [
+                  "code-body"
+                ]
+              },
+              "source_ref": "lib.rs#process_payment"
+            }
+          ],
+          "validations": [],
+          "error_paths": [],
+          "status": "review"
+        },
+        "REQ-002": {
+          "title": "validate_order",
+          "description": "validate_order",
+          "legacy_components": [
+            "lib.rs#validate_order"
+          ],
+          "data_access": [],
+          "dependencies": [],
+          "business_rules": [
+            {
+              "id": "RULE-001",
+              "statement": "validate_order returns true if and only if the order_id is positive",
+              "confidence": 0.95,
+              "provenance": {
+                "source": "code-graph",
+                "ref": "lib.rs#validate_order",
+                "source_kinds": [
+                  "code-body"
+                ]
+              },
+              "source_ref": "lib.rs#validate_order"
+            }
+          ],
+          "validations": [],
+          "error_paths": [],
+          "status": "review"
+        }
+      },
+      "entities": {}
+    }
+  }
+}
