@@ -266,8 +266,7 @@ fn bus_request_agent_verdict(
         .map_err(|e| eprintln!("wicked-core: gate eval — cannot serialize request: {e}"))
         .ok()?;
     let key = deterministic_key(&["gate-eval-req", &eval_id]);
-    let ev =
-        BusEmit::new(GATE_EVAL_REQUESTED, CORE_DOMAIN, "core.gate", payload).with_key(key);
+    let ev = BusEmit::new(GATE_EVAL_REQUESTED, CORE_DOMAIN, "core.gate", payload).with_key(key);
     db.emit(&ev)
         .map_err(|e| eprintln!("wicked-core: gate eval — cannot publish request: {e}"))
         .ok()?;
@@ -380,16 +379,18 @@ fn run_unit_and_judge_with_roster(
                     .as_deref()
                     .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
                 let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
-                Some(match crate::validator::agent_validate(
-                    &v.criterion,
-                    work_for_agent,
-                    &excluded,
-                    roster,
-                    &**runner,
-                ) {
-                    Ok(av) => (av.pass, av.reasoning),
-                    Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
-                })
+                Some(
+                    match crate::validator::agent_validate(
+                        &v.criterion,
+                        work_for_agent,
+                        &excluded,
+                        roster,
+                        &**runner,
+                    ) {
+                        Ok(av) => (av.pass, av.reasoning),
+                        Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
+                    },
+                )
             })
     } else {
         None
