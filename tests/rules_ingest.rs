@@ -214,6 +214,54 @@ fn a_policy_with_a_typoed_field_fails_loud() {
 }
 
 #[test]
+fn a_policy_with_an_invalid_regex_trigger_fails_loud() {
+    // A malformed trigger.contains regex fails CLOSED in the engine (never fires) — a silent fail-open.
+    // The write boundary must reject it so a dead Deny can't populate.
+    let base = scratch("badregex");
+    let db = base.join("estate.db");
+    let ruleset = ruleset_with_policy(
+        &base,
+        serde_json::json!({
+            "id": "pol-x", "kind": "k", "applies_to": ["build"], "effect": "deny",
+            "trigger": { "contains": "([unclosed" }, "obligations": [], "criteria": "c",
+            "severity": "high", "rule": "r"
+        }),
+    );
+    let out = ingest(db.to_str().unwrap(), &ruleset);
+    assert!(
+        !out.status.success(),
+        "an invalid regex trigger must fail loud"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not a valid regex"),
+        "the error names the dead-Deny fail-open: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_policy_with_blank_applies_to_entries_fails_loud() {
+    // `applies_to: [""]` matches no real phase — the same non-enforcing fail-open as `[]`.
+    let base = scratch("blankapply");
+    let db = base.join("estate.db");
+    let ruleset = ruleset_with_policy(
+        &base,
+        serde_json::json!({
+            "id": "pol-x", "kind": "k", "applies_to": ["  "], "effect": "deny",
+            "trigger": { "contains": "BAD" }, "obligations": [], "criteria": "c",
+            "severity": "high", "rule": "r"
+        }),
+    );
+    let out = ingest(db.to_str().unwrap(), &ruleset);
+    assert!(
+        !out.status.success(),
+        "blank applies_to entries must fail loud"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn duplicate_policy_id_fails_loud() {
     let base = scratch("dup");
     let db = base.join("estate.db");

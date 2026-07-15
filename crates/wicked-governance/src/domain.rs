@@ -95,12 +95,27 @@ impl Policy {
         if self.id.trim().is_empty() {
             anyhow::bail!("policy has an empty id");
         }
-        if self.applies_to.is_empty() {
+        // Empty applies_to (or one whose entries are all blank) is selected for NO real phase → enforces
+        // nothing. Reject both: `[]` AND `[""]`/`["  "]` are the same non-enforcing fail-open.
+        if self.applies_to.iter().all(|p| p.trim().is_empty()) {
             anyhow::bail!(
-                "policy {:?} has empty applies_to — it is selected for no phase and enforces nothing \
-                 (fail-loud: a non-enforcing policy must not silently register)",
+                "policy {:?} has no non-blank applies_to entry — it is selected for no phase and enforces \
+                 nothing (fail-loud: a non-enforcing policy must not silently register)",
                 self.id
             );
+        }
+        // A malformed `trigger.contains` regex fails CLOSED in the engine (`triggers` returns false, the
+        // policy never fires) — so an invalid regex is a SILENT fail-open: the policy registers but can
+        // never deny. Reject it at the write boundary so a bad regex can't populate a dead Deny.
+        if let Some(pattern) = &self.trigger.contains {
+            if let Err(e) = regex::Regex::new(pattern) {
+                anyhow::bail!(
+                    "policy {:?} trigger.contains {:?} is not a valid regex — it would never fire (a \
+                     silent fail-open): {e}",
+                    self.id,
+                    pattern
+                );
+            }
         }
         Ok(())
     }

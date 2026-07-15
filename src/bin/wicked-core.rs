@@ -732,16 +732,21 @@ fn coverage_cmd(args: &[String]) {
 /// (0 policies + 0 rules) errors (a silent no-op population would read as "governed" while enforcing
 /// nothing). A missing `policies/` or `rules/` subdir is tolerated (a ruleset may carry only one kind).
 fn rules_ingest_cmd(args: &[String]) {
-    // The <dir> is the first NON-FLAG token after `rules ingest` (index 3+), skipping any `--flag value`
-    // pair — so `rules ingest --db x /dir` and `rules ingest /dir --db x` both resolve the dir.
+    // The <dir> is the first NON-FLAG token after `rules ingest` (index 3+). Only the KNOWN value-taking
+    // flags (`--db`/`--dir`) consume a following value; any other `--token` is skipped alone (not blindly
+    // `i += 2`, which would swallow the dir after a bare flag). So `rules ingest --db x /dir` and
+    // `rules ingest /dir --db x` both resolve the dir.
+    const VALUE_FLAGS: &[&str] = &["--db", "--dir"];
     let positional_dir = || -> Option<String> {
         let mut i = 3;
         while i < args.len() {
             let a = &args[i];
-            if let Some(stripped) = a.strip_prefix("--") {
-                // `--db` etc. consume a following value; bare `--flag` (none here) would not.
-                let _ = stripped;
-                i += 2;
+            if a.starts_with("--") {
+                i += if VALUE_FLAGS.contains(&a.as_str()) {
+                    2
+                } else {
+                    1
+                };
             } else {
                 return Some(a.clone());
             }
@@ -838,20 +843,24 @@ fn rules_ingest_cmd(args: &[String]) {
                     return;
                 }
             };
-            // A file is either a single Policy or an array of Policies.
-            let policies: Vec<wicked_governance::Policy> =
-                match serde_json::from_str::<wicked_governance::Policy>(&text) {
-                    Ok(one) => vec![one],
-                    Err(_) => match serde_json::from_str::<Vec<wicked_governance::Policy>>(&text) {
-                        Ok(many) => many,
-                        Err(e) => {
-                            fail(&format!(
-                                "rules ingest: {p:?} is not a Policy or [Policy]: {e}"
-                            ));
-                            return;
-                        }
-                    },
-                };
+            // A file is either a single Policy object or an array of Policies. Dispatch on the JSON SHAPE
+            // (first non-whitespace char) so a malformed object surfaces the SPECIFIC Policy error (a
+            // missing/typo'd field) rather than a misleading "expected a sequence" from a fallback
+            // array-parse.
+            let is_array = text.trim_start().starts_with('[');
+            let parsed: Result<Vec<wicked_governance::Policy>, _> = if is_array {
+                serde_json::from_str::<Vec<wicked_governance::Policy>>(&text)
+            } else {
+                serde_json::from_str::<wicked_governance::Policy>(&text).map(|p| vec![p])
+            };
+            let policies = match parsed {
+                Ok(ps) => ps,
+                Err(e) => {
+                    let shape = if is_array { "[Policy]" } else { "Policy" };
+                    fail(&format!("rules ingest: {p:?} is not a valid {shape}: {e}"));
+                    return;
+                }
+            };
             for pol in &policies {
                 if !seen_policy_ids.insert(pol.id.clone()) {
                     fail(&format!(
