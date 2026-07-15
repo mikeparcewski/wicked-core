@@ -742,11 +742,11 @@ fn rules_ingest_cmd(args: &[String]) {
         while i < args.len() {
             let a = &args[i];
             if a.starts_with("--") {
-                i += if VALUE_FLAGS.contains(&a.as_str()) {
-                    2
-                } else {
-                    1
-                };
+                // A value-flag consumes the NEXT token only if it is a real value (not another flag) — so
+                // a missing value (`--db --dir /dir`) doesn't swallow the following flag.
+                let has_value = VALUE_FLAGS.contains(&a.as_str())
+                    && args.get(i + 1).is_some_and(|v| !v.starts_with("--"));
+                i += if has_value { 2 } else { 1 };
             } else {
                 return Some(a.clone());
             }
@@ -760,7 +760,18 @@ fn rules_ingest_cmd(args: &[String]) {
             return;
         }
     };
-    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+    // Guard a missing value-flag value from misdirecting the store: `--db --dir x` makes flag("--db")
+    // return "--dir", which would ingest into a stray file named "--dir" and REPORT SUCCESS while the real
+    // run's store is untouched (a populated-the-wrong-store fail-open). Reject a flag-shaped db path.
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules ingest: --db has no value (resolved to {resolved_db:?}) — refusing to ingest into a \
+             flag-shaped store path"
+        ));
+        return;
+    }
+    let mut store = match wicked_apps_core::open_store(Some(&resolved_db)) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("rules ingest: open store failed: {e}"));
