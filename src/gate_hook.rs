@@ -791,7 +791,7 @@ fn claude_output_context(raw: &str, scope: &str, phase: &str) -> serde_json::Val
 /// recall→gate wiring. Each obligation is `conform:<Severity>:<id>:<statement>` so a downstream
 /// checker/human sees the applicable ruleset (and its severity) that the output must conform to. A
 /// recall error propagates so the caller can fail closed.
-fn attach_recalled_rules(
+pub(crate) fn attach_recalled_rules(
     store: &dyn GraphRead,
     query: &RuleQuery,
     claim: &mut ConformanceClaim,
@@ -805,6 +805,8 @@ fn attach_recalled_rules(
 }
 
 /// Build the conformance-rule recall query from the optional output-facet env vars (unset ⇒ wildcard).
+/// The subprocess `output-gate-hook` uses this (the launcher scopes `WICKED_OUTPUT_*` per run); the
+/// in-process `apply_unit` recall deliberately uses a wildcard instead (see `execute::apply_unit`).
 fn output_rule_query() -> RuleQuery {
     let env = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
     RuleQuery {

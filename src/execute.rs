@@ -96,13 +96,30 @@ pub(crate) fn apply_unit(
     // 3. governance SELECT + DECIDE → a ConformanceClaim.
     let selected = select(store, &collection_scope, &phase_name, &context)?;
     let evaluated_at = EVAL_AT_BASE + unit.ord as i64;
-    let claim: ConformanceClaim = decide(
+    let mut claim: ConformanceClaim = decide(
         &selected,
         &collection_scope,
         &phase_name,
         &context,
         evaluated_at,
     );
+    // M6/M7 recall→gate wiring (DES-OUTGOV-007): surface the applicable conformance ruleset as
+    // obligations on the output claim — the same recall the standalone `output-gate-hook` does, but
+    // fired IN-PROCESS on every governed unit so a run's claims carry (and persist) the ruleset the
+    // output must conform to. In-process at the unit's real phase, so there is no separate-process
+    // decisions-file phase-match (the `fold_input_denial` fail-open trap cannot apply here); and it
+    // only APPENDS obligations — `decide`'s decision is unchanged, so deny/approve is untouched.
+    // A WILDCARD query (recall EVERY applicable rule) — NOT the env-faceted `output_rule_query()`: the
+    // in-process actor has no per-unit facet source, and reading process-global `WICKED_OUTPUT_*` here
+    // would let a stray global export silently NARROW (fail-open) a unit's surfaced ruleset. The
+    // over-broad wildcard is the fail-CLOSED direction (surface more, never fewer); facet narrowing
+    // stays in the subprocess hook where the launcher scopes it per-run. Fail-CLOSED: a recall error
+    // is a governance failure, never a silent skip.
+    crate::gate_hook::attach_recalled_rules(
+        store,
+        &wicked_governance::RuleQuery::default(),
+        &mut claim,
+    )?;
     let governance_denied = matches!(claim.decision, Decision::Deny);
     let decision_tok = decision_token(&claim.decision);
 
