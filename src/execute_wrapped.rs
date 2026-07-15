@@ -222,8 +222,14 @@ pub struct WrappedCliStepRunner {
 
 impl Default for WrappedCliStepRunner {
     fn default() -> Self {
+        // Default 2 h — agentic CLIs doing real multi-file extraction commonly exceed 15 min.
+        // Override with WICKED_UNIT_TIMEOUT_SECS (e.g. 900 for conservative environments).
+        let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(7200);
         WrappedCliStepRunner {
-            timeout: Duration::from_secs(7200),
+            timeout: Duration::from_secs(secs),
         }
     }
 }

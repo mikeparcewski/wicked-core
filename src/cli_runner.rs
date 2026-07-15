@@ -79,6 +79,37 @@ pub const TASK_DISPATCHED: &str = "wicked.crew.task.dispatched";
 /// The event the `cli-runner` publishes and the reducer consumes.
 pub const TASK_COMPLETED: &str = "wicked.crew.task.completed";
 
+/// Gate evaluation events — wicked-core publishes a request; the governed evaluator daemon responds.
+/// When `WICKED_BUS_DB` is set, `run_unit_and_judge_with_roster` publishes one of these instead of
+/// spawning a raw `claude -p` subprocess, and blocks (up to [`GATE_EVAL_TIMEOUT`]) for the response.
+/// The daemon runs under its OWN governed session (no `--dangerously-skip-permissions`).
+pub const GATE_EVAL_REQUESTED: &str = "wicked.gate.eval.requested";
+pub const GATE_EVAL_RESPONDED: &str = "wicked.gate.eval.responded";
+
+/// Wall-clock budget for the bus-mediated gate evaluator. On timeout the gate falls back to
+/// deterministic-only (no agent verdict), so `combine_verdict(det_pass, None)` decides.
+const GATE_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Payload published to the bus when the gate needs an agent verdict.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GateEvalRequest {
+    /// Deterministic per-(run, unit, attempt) key used to match the response.
+    eval_id: String,
+    criterion: String,
+    work: String,
+    run_id: String,
+    unit_ix: usize,
+    attempt: u32,
+}
+
+/// Payload the governed evaluator daemon publishes back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GateEvalResponse {
+    eval_id: String,
+    pass: bool,
+    reasoning: String,
+}
+
 /// The `wicked.task.dispatched` payload. Carries what the `cli-runner` needs to reconstruct the
 /// [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with
 /// no store handle and no duplicated execution logic. `agent_review_target` is the creator's COLD output
@@ -190,6 +221,98 @@ fn task_key(event_type: &str, run_id: &str, unit_ix: usize, attempt: u32) -> Str
     ])
 }
 
+// ── Bus-mediated gate evaluation (replaces the inline `agent_validate` subprocess) ───────────────────
+
+/// Publish `wicked.gate.eval.requested` to the bus and BLOCK until the governed evaluator daemon
+/// responds with `wicked.gate.eval.responded` — or until [`GATE_EVAL_TIMEOUT`] elapses.
+///
+/// Returns `Some(AgentVerdict)` on a successful response, `None` on timeout or bus error. A `None`
+/// result is NOT a reject — the caller interprets it as "no agent verdict" so `combine_verdict`
+/// falls through to the deterministic-only path (Approve iff deterministic passes).
+///
+/// WHY NOT A SUBPROCESS: the inline `agent_validate` spawns `claude -p --plugin-dir <garden>` whose
+/// `SessionStart` hook fires `bootstrap.py` → bubbletea TUI → "open /dev/tty: device not configured"
+/// on the first stdout line → `parse_agent_verdict` fails closed. The bus path routes evaluation to
+/// a governed daemon running under its OWN Claude Code session with normal tool approvals — no
+/// `--dangerously-skip-permissions`, no headless-TTY issues.
+fn bus_request_agent_verdict(
+    criterion: &str,
+    work: &str,
+    run_id: &str,
+    unit_ix: usize,
+    attempt: u32,
+    bus_db_path: &str,
+) -> Option<crate::validator::AgentVerdict> {
+    let db = BusDb::open(bus_db_path)
+        .map_err(|e| eprintln!("wicked-core: gate eval — cannot open bus db: {e}"))
+        .ok()?;
+
+    let eval_id = deterministic_key(&[
+        "gate-eval",
+        run_id,
+        &unit_ix.to_string(),
+        &attempt.to_string(),
+    ]);
+
+    let request = GateEvalRequest {
+        eval_id: eval_id.clone(),
+        criterion: criterion.to_string(),
+        work: work.to_string(),
+        run_id: run_id.to_string(),
+        unit_ix,
+        attempt,
+    };
+    let payload = serde_json::to_value(&request)
+        .map_err(|e| eprintln!("wicked-core: gate eval — cannot serialize request: {e}"))
+        .ok()?;
+    let key = deterministic_key(&["gate-eval-req", &eval_id]);
+    let ev = BusEmit::new(GATE_EVAL_REQUESTED, CORE_DOMAIN, "core.gate", payload).with_key(key);
+    // Capture the emitted event_id so polling starts AFTER this request — no historical rescans.
+    let floor_start = db
+        .emit(&ev)
+        .map_err(|e| eprintln!("wicked-core: gate eval — cannot publish request: {e}"))
+        .ok()?;
+
+    eprintln!("wicked-core: gate eval request published (eval_id={eval_id}, floor={floor_start}); waiting up to {GATE_EVAL_TIMEOUT:?}");
+
+    // Poll for the matching response (by eval_id) until timeout. Start from the request event_id
+    // so we never replay historical GATE_EVAL_RESPONDED events from prior runs.
+    let start = std::time::Instant::now();
+    let mut floor: i64 = floor_start;
+    while start.elapsed() < GATE_EVAL_TIMEOUT {
+        let events = match db.poll(GATE_EVAL_RESPONDED, floor, 20) {
+            Ok(evs) => evs,
+            Err(e) => {
+                eprintln!("wicked-core: gate eval poll error: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
+        };
+        for ev in &events {
+            if let Ok(resp) = serde_json::from_value::<GateEvalResponse>(ev.payload.clone()) {
+                if resp.eval_id == eval_id {
+                    eprintln!(
+                        "wicked-core: gate eval response received — pass={} reasoning={:?}",
+                        resp.pass, resp.reasoning
+                    );
+                    return Some(crate::validator::AgentVerdict {
+                        pass: resp.pass,
+                        reasoning: resp.reasoning,
+                    });
+                }
+            }
+            floor = floor.max(ev.event_id);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    eprintln!(
+        "wicked-core: gate eval timed out after {GATE_EVAL_TIMEOUT:?} (eval_id={eval_id}) — \
+         falling back to deterministic-only verdict"
+    );
+    None
+}
+
 // ── The shared execute+judge core (reused by BOTH the in-process worker AND the cli-runner) ──────────
 
 /// Run one unit's slow work via `runner` and compute the rev0.4 LAYER-2 agent verdict — the EXACT
@@ -231,7 +354,22 @@ fn run_unit_and_judge_with_roster(
             .validator
             .as_ref()
             .filter(|v| v.approved)
-            .map(|v| {
+            .and_then(|v| {
+                // BUS PATH: when `WICKED_BUS_DB` is set, publish a gate-evaluation request and wait for
+                // the governed evaluator daemon to respond (no subprocess, no dangerous flags, no TTY).
+                // `None` on timeout ⇒ deterministic-only (combine_verdict approves iff det_pass=true).
+                if let Ok(bus_path) = std::env::var("WICKED_BUS_DB") {
+                    return bus_request_agent_verdict(
+                        &v.criterion,
+                        work_for_agent,
+                        &input.run_id,
+                        input.unit_ix,
+                        input.attempt,
+                        &bus_path,
+                    )
+                    .map(|av| (av.pass, av.reasoning));
+                }
+                // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
                 // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
                 // BOTH the deterministic validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) AND the
                 // WORK's own author (the unit's `assigned_cli`, falling back to the deterministic author
@@ -244,16 +382,18 @@ fn run_unit_and_judge_with_roster(
                     .as_deref()
                     .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
                 let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
-                match crate::validator::agent_validate(
-                    &v.criterion,
-                    work_for_agent,
-                    &excluded,
-                    roster,
-                    &**runner,
-                ) {
-                    Ok(av) => (av.pass, av.reasoning),
-                    Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
-                }
+                Some(
+                    match crate::validator::agent_validate(
+                        &v.criterion,
+                        work_for_agent,
+                        &excluded,
+                        roster,
+                        &**runner,
+                    ) {
+                        Ok(av) => (av.pass, av.reasoning),
+                        Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
+                    },
+                )
             })
     } else {
         None
