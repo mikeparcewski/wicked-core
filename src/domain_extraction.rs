@@ -184,14 +184,13 @@ mod tests {
     fn every_phase_carries_a_garden_skill_ref_in_dash_form() {
         // CONTRACT-4 §3 SKILL NAMING: dash-form `wicked-<product>-<skill>`, never a colon namespace.
         let def = load_shipped_def();
-        // Retargeted to the REAL garden `modernize` surface (core#27) — the old
-        // `wicked-garden-{survey,analyze,extract,coverage-review,domain-graph}` skills no longer exist.
+        // Retargeted to the REAL garden `domain` surface (core#43) — renamed from `modernize`.
         let expected = [
-            ("survey", "wicked-garden-modernize"),
-            ("analyze", "wicked-garden-modernize"),
-            ("extract", "wicked-garden-modernize-extractor"),
-            ("coverage", "wicked-garden-modernize-antagonist"),
-            ("domain-graph", "wicked-garden-modernize-translator"),
+            ("survey", "wicked-garden-domain"),
+            ("analyze", "wicked-garden-domain"),
+            ("extract", "wicked-garden-domain-extractor"),
+            ("coverage", "wicked-garden-domain-coverage"),
+            ("domain-graph", "wicked-garden-domain-modeler"),
         ];
         for (phase_id, skill) in expected {
             let phase = def.phases.iter().find(|p| p.id == phase_id).unwrap();
@@ -230,7 +229,7 @@ mod tests {
         assert_eq!(units.len(), 5);
         assert_eq!(
             units[2].skill_ref.as_deref(),
-            Some("wicked-garden-modernize-extractor")
+            Some("wicked-garden-domain-extractor")
         );
         assert!(
             units[2].allowed_skills.is_empty(),
@@ -238,7 +237,7 @@ mod tests {
         );
         assert_eq!(
             units[3].skill_ref.as_deref(),
-            Some("wicked-garden-modernize-antagonist")
+            Some("wicked-garden-domain-coverage")
         );
         assert!(units[3].allowed_skills.is_empty());
         // The evaluator≠creator role survives onto the units.

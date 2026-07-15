@@ -5,7 +5,7 @@
 //!   wicked-core repos                             # list registered repositories
 //!   wicked-core register-repo --path <dir> [--name N]   # register a git repo to run within
 //!   wicked-core run --problem "Do X. Do Y" \      # interactive governed run (streams events)
-//!       [--repo <id>] [--confirm none|all|before:N] [--session <id>]
+//!       [--repo <id>] [--confirm none|all|before:N] [--session <id>] [--clis <csv>]
 //!   wicked-core resume --session <id>             # resume a paused/interrupted run
 //!   wicked-core cancel --session <id>             # cancel a run
 //!   wicked-core launch --problem "..."            # STUB self-test: deterministic stub output, no real CLI, no gates
@@ -212,7 +212,7 @@ fn main() {
         _ => {
             eprintln!(
                 "usage: wicked-core <status | repos | register-repo --path <dir> | \
-                 run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] | \
+                 run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
                  resume --session <id> | cancel --session <id> | \
                  launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
                  provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
@@ -466,10 +466,27 @@ fn run_interactive(core: &Core, args: &[String]) {
     };
     let repo_ref = flag(args, "--repo");
     let session_id = flag(args, "--session").unwrap_or_default();
+    // --clis <csv>: restrict distribution to a named subset of the roster (e.g. "claude").
+    // Without this flag the full registry roster is used (council convenes all seats).
+    let clis = if let Some(csv) = flag(args, "--clis") {
+        let keys: std::collections::HashSet<String> =
+            csv.split(',').map(|s| s.trim().to_string()).collect();
+        let filtered: Vec<_> = registry_roster()
+            .into_iter()
+            .filter(|c| keys.contains(&c.key))
+            .collect();
+        if filtered.is_empty() {
+            fail(&format!("--clis '{csv}' matched no roster seats"));
+            return;
+        }
+        filtered
+    } else {
+        registry_roster()
+    };
     let events = core.subscribe();
     let run_id = match core.launch_run(LaunchSpec {
         problem,
-        clis: registry_roster(),
+        clis,
         entity_mode: EntityMode::Shared,
         session_id,
         human_confirm: parse_confirm(args),
