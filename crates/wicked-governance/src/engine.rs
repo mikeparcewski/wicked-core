@@ -51,6 +51,9 @@ const GOVERNANCE_RESOLVED_BY: &str = "wicked-governance";
 /// Upsert a policy node into the shared store (begin_batch → upsert_nodes → commit_batch).
 /// Idempotent: re-registering the same id overwrites the node (estate upsert on the stable symbol).
 pub fn register_policy(store: &mut dyn GraphStore, policy: &Policy) -> anyhow::Result<()> {
+    // Fail-closed at the write boundary all persist paths route through: never register a policy that
+    // would enforce nothing (empty applies_to) — mirrors `register_rule`'s `rule.validate()?`.
+    policy.validate()?;
     let node = policy.to_node();
     store.begin_batch()?;
     store.upsert_nodes(&[node])?;
