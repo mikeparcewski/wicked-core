@@ -61,6 +61,7 @@ pub struct EvaluationOutcome {
 /// BEFORE any `work_output` is written, so a validator/evaluator deny drives the phase to `Rejected`
 /// (persisting the hard `gate_decision` veto) and leaves NO approved phase and NO stored `work_output`
 /// to leak (the ADR-0003 violation this parameter closes). `None` ⇒ governance decides alone (unchanged).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_unit(
     store: &mut dyn GraphStore,
     unit: &WorkUnit,

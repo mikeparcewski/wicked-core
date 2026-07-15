@@ -41,7 +41,7 @@ Two sub-cases are tested:
    pipe stdout/stderr through `tee` — that would capture `tee`'s exit code instead of gate-hook's):
 
    ```bash
-   echo '{"type":"bash","input":{"command":"ls"}}' \
+   echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' \
      | WICKED_DECISIONS_PATH="" wicked-core gate-hook --db "$TMPDIR/wc-hook-fixture.db" \
      > "$TMPDIR/case-a-output.txt" 2>&1
    CASE_A_EXIT=$?
@@ -55,7 +55,7 @@ Two sub-cases are tested:
 3. Invoke gate-hook with no DB and no env vars (unset both):
 
    ```bash
-   echo '{"type":"bash","input":{"command":"ls"}}' \
+   echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' \
      | env -i PATH="$PATH" wicked-core gate-hook \
      > "$TMPDIR/case-b-output.txt" 2>&1
    CASE_B_EXIT=$?

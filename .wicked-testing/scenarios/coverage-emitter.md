@@ -45,7 +45,7 @@ front-half coverage, and writes a valid `coverage-report.json`. With a fully-ann
      --db "$TMPDIR/wc-coverage-fixture.db"
    ```
 
-   Verify: output mentions "2" function nodes indexed.
+   Verify: output mentions "3 nodes" indexed (2 Function + 1 Module shell node).
 
 4. Annotate both functions so coverage reaches 1.0:
 

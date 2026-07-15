@@ -47,7 +47,7 @@ reports the unaccounted node count.
    wicked-core coverage --db "$TMPDIR/wc-uncovered-fixture.db"
    ```
 
-   Expect: `coverage: 0.0000 (2 behavior-bearing, 2 unaccounted)`.
+   Expect: `coverage: 0.0000 (2 behavior-bearing, 2 unaccounted) → <path>` (exact path varies).
 
 3. Attempt to build the domain graph, capturing stdout+stderr and exit code separately
    (do NOT pipe through `tee` — piping causes `$?` to capture `tee`'s exit code, not wicked-core's):
