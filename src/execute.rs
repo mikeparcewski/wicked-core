@@ -69,19 +69,26 @@ pub(crate) fn apply_unit(
     entity_mode: EntityMode,
     session_id: &str,
     validator_denial: Option<String>,
+    attempt: u32,
 ) -> anyhow::Result<UnitOutcome> {
     let assigned_cli = unit
         .assigned_cli
         .clone()
         .unwrap_or_else(|| "claude".to_string());
     let phase_name = crate::scope::unit_phase(unit.ord);
-    let phase_id = format!("{workflow_id}:{phase_name}");
+    // Each retry attempt uses a distinct phase_id so its state-machine events never collide with a
+    // prior attempt's events (idempotency-key dedup would return "duplicate" → false apply).
+    let phase_id = if attempt == 0 {
+        format!("{workflow_id}:{phase_name}")
+    } else {
+        format!("{workflow_id}:{phase_name}:a{attempt}")
+    };
     let collection_scope = resolve_scope(entity_mode, session_id, &unit.id);
 
     // 1. open the phase + walk it to GateRunning through the reducer.
     let phase = Phase::open(&phase_id, workflow_id, &phase_name);
     put_node(store, phase.to_node())?;
-    advance_to_gate_running(store, &phase_id)?;
+    advance_to_gate_running(store, &phase_id, attempt)?;
 
     // 2. the unit's governance context (the gate INPUT).
     let context = serde_json::json!({
@@ -129,7 +136,8 @@ pub(crate) fn apply_unit(
     //    PERSISTS the hard `gate_decision` veto — BEFORE `work_output` is written — so no approved phase
     //    or stored output can leak past a validator deny (seam finding #2 / ADR-0003).
     let validator_denied = validator_denial.is_some();
-    let gate_event_id = format!("gate-{}", unit.id);
+    // Include attempt so the gate event key is distinct from any prior attempt's key.
+    let gate_event_id = format!("gate-{}:a{}", unit.id, attempt);
     let gate_claim = if validator_denied && !governance_denied {
         ConformanceClaim {
             decision: Decision::Deny,
@@ -253,9 +261,11 @@ pub fn evaluate_unit(
 
 /// Walk a freshly-opened phase `Pending → InProgress → ReadyForGate → GateRunning`. Shared with the
 /// gate-hook drain ([`crate::gate_hook`]) so both paths walk phases identically.
+/// `attempt` is included in event IDs so each retry mints distinct idempotency keys.
 pub(crate) fn advance_to_gate_running(
     store: &mut dyn GraphStore,
     phase_id: &str,
+    attempt: u32,
 ) -> anyhow::Result<()> {
     for (step, to) in [
         PhaseStatus::InProgress,
@@ -265,7 +275,7 @@ pub(crate) fn advance_to_gate_running(
     .into_iter()
     .enumerate()
     {
-        let event_id = format!("{phase_id}:advance-{step}");
+        let event_id = format!("{phase_id}:advance-{step}:a{attempt}");
         let outcome = apply_event(store, &Event::transition(event_id, phase_id, to))?;
         if !outcome.applied {
             anyhow::bail!(
@@ -334,6 +344,7 @@ mod tests {
             EntityMode::Shared,
             "s",
             Some("agent validator rejected: diverged from criterion".into()),
+            0,
         )
         .unwrap();
         assert!(!outcome.approved, "a validator deny must NOT approve");
@@ -367,6 +378,7 @@ mod tests {
             EntityMode::Shared,
             "s",
             None,
+            0,
         )
         .unwrap();
         assert!(

@@ -468,6 +468,7 @@ pub(crate) fn apply_and_finish_unit(
         entity_mode,
         session_id,
         validator_denial,
+        attempt,
     )?;
     outcome.evaluator_claim_id = evaluator_claim_id;
 
@@ -944,6 +945,7 @@ mod resolve_tests {
             EntityMode::Shared,
             "s",
             None,
+            0,
         )
         .unwrap();
 
