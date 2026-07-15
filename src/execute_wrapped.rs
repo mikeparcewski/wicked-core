@@ -223,7 +223,7 @@ pub struct WrappedCliStepRunner {
 impl Default for WrappedCliStepRunner {
     fn default() -> Self {
         WrappedCliStepRunner {
-            timeout: Duration::from_secs(900),
+            timeout: Duration::from_secs(7200),
         }
     }
 }
