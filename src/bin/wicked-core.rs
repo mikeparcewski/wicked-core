@@ -760,6 +760,14 @@ fn rules_ingest_cmd(args: &[String]) {
             return;
         }
     };
+    // Symmetric to the --db guard below: `--dir --db x` makes flag("--dir") return "--db" (a flag-shaped
+    // dir). Reject it loudly rather than reporting a confusing "empty population" for a non-existent dir.
+    if dir.starts_with("--") {
+        fail(&format!(
+            "rules ingest: --dir has no value (resolved to {dir:?}) — refusing a flag-shaped directory"
+        ));
+        return;
+    }
     // Guard a missing value-flag value from misdirecting the store: `--db --dir x` makes flag("--db")
     // return "--dir", which would ingest into a stray file named "--dir" and REPORT SUCCESS while the real
     // run's store is untouched (a populated-the-wrong-store fail-open). Reject a flag-shaped db path.
