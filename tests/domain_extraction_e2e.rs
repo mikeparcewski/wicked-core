@@ -88,6 +88,13 @@ fn deny_policy(phase: &str, pattern: &str) -> Policy {
     }
 }
 
+fn is_terminal(s: SessionStatus) -> bool {
+    matches!(
+        s,
+        SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
+    )
+}
+
 fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
@@ -95,6 +102,10 @@ fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
             if let Some(v) = views.iter().find(|v| v.session.id == run_id) {
                 if v.session.status == want {
                     return true;
+                }
+                // Fail fast: a terminal status that isn't the one we want will never change.
+                if want != v.session.status && is_terminal(v.session.status) {
+                    return false;
                 }
             }
         }
@@ -196,22 +207,35 @@ impl StepRunner for DomainExtractionRunner {
             }
         }
         if let Some(wd) = workdir.as_ref() {
+            // Surface any subprocess failure LOUDLY (stderr + exit) so a lock / missing-binary / CLI
+            // error can't silently mask itself as a later "file missing" — never `let _ = …output()`.
+            let shell = |args: &[&str], label: &str| match Command::new(BIN).args(args).output() {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => eprintln!(
+                    "e2e runner: `{label}` exited {}: {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => eprintln!("e2e runner: `{label}` failed to spawn: {e}"),
+            };
             if ord == 4 {
                 let out = wd.join("coverage-report.json");
-                let _ = Command::new(BIN)
-                    .args(["coverage", "--db", &self.db, "--out", out.to_str().unwrap()])
-                    .output();
+                shell(
+                    &["coverage", "--db", &self.db, "--out", out.to_str().unwrap()],
+                    "coverage",
+                );
             } else if ord == 5 {
                 let out = wd.join("requirements_graph.json");
-                let _ = Command::new(BIN)
-                    .args([
+                shell(
+                    &[
                         "domain-graph",
                         "--db",
                         &self.db,
                         "--out",
                         out.to_str().unwrap(),
-                    ])
-                    .output();
+                    ],
+                    "domain-graph",
+                );
             }
         }
         StepOutput {
@@ -229,8 +253,12 @@ impl StepRunner for DomainExtractionRunner {
 
 /// Common setup: a store seeded to `accounted` coverage (1.0 when true, a hole when false) with the
 /// pinned coverage validator approved, a registered git repo, the drop-in workflow dir on the resolver
-/// path, and a spawned Core. Returns (core, repo_entry_id, db).
-fn setup(name: &str, runner: DomainExtractionRunner, accounted: bool) -> (Core, String, String) {
+/// path, and a spawned Core. Returns (core, repo_entry_id, db, repo_root).
+fn setup(
+    name: &str,
+    runner: DomainExtractionRunner,
+    accounted: bool,
+) -> (Core, String, String, std::path::PathBuf) {
     let db = runner.db.clone();
     seed(&db, accounted);
     {
@@ -238,10 +266,15 @@ fn setup(name: &str, runner: DomainExtractionRunner, accounted: bool) -> (Core, 
         provision_and_approve_coverage_validator(&mut store).unwrap();
     }
     // domain-extraction is an operator drop-in, not a built-in — point the resolver at repo/workflows.
-    std::env::set_var(
-        "WICKED_WORKFLOWS_DIR",
-        format!("{}/workflows", env!("CARGO_MANIFEST_DIR")),
-    );
+    // `set_var` is a data race under parallel test threads: set it EXACTLY ONCE (every caller sets the
+    // same value, so a single init is correct).
+    static WORKFLOWS_DIR_INIT: std::sync::Once = std::sync::Once::new();
+    WORKFLOWS_DIR_INIT.call_once(|| {
+        std::env::set_var(
+            "WICKED_WORKFLOWS_DIR",
+            format!("{}/workflows", env!("CARGO_MANIFEST_DIR")),
+        );
+    });
     let repo = make_git_repo(name);
     let core = Core::spawn_with_engine(db.clone(), Arc::new(StubDispatcher), Arc::new(runner));
     let entry = core
@@ -251,7 +284,7 @@ fn setup(name: &str, runner: DomainExtractionRunner, accounted: bool) -> (Core, 
             registered_at: 0,
         })
         .expect("register repo");
-    (core, entry.id, db)
+    (core, entry.id, db, repo)
 }
 
 fn launch(core: &Core, run_id: &str, repo_ref: &str) {
@@ -267,15 +300,10 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
     .expect("launch domain-extraction");
 }
 
-fn worktree(repo_name: &str, run_id: &str) -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join(format!(
-            "wicked-core-e2e-{repo_name}-{}",
-            std::process::id()
-        ))
-        .join(".wicked")
-        .join("worktrees")
-        .join(run_id)
+/// Derive the run's worktree from the repo root `setup` returns (not by re-deriving the temp-path
+/// scheme — so a change to the repo naming can't silently break this).
+fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
+    repo_root.join(".wicked").join("worktrees").join(run_id)
 }
 
 // --- TEST 1: the governed run produces the gated artifacts ---
@@ -283,7 +311,7 @@ fn worktree(repo_name: &str, run_id: &str) -> std::path::PathBuf {
 #[test]
 fn a_governed_run_produces_coverage_and_requirements_graph() {
     let db = db_in("happy");
-    let (core, repo_id, _db) = setup(
+    let (core, repo_id, _db, repo) = setup(
         "happy",
         DomainExtractionRunner {
             db,
@@ -298,7 +326,7 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         wait_status(&core, "run-happy", SessionStatus::AwaitingHuman),
         "the run reaches the domain-graph human-confirm gate"
     );
-    let wt = worktree("happy", "run-happy");
+    let wt = worktree(&repo, "run-happy");
     assert!(
         wt.join("coverage-report.json").is_file(),
         "the coverage phase wrote a store-recomputed coverage-report.json into the worktree"
@@ -323,7 +351,7 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
 fn a_policy_violation_denies_a_phase_and_halts_the_run() {
     let db = db_in("deny");
     // Trip a deny on the extractor phase (ord 3 → phase `unit-3`) via a token in its output.
-    let (core, repo_id, dbp) = setup(
+    let (core, repo_id, dbp, repo) = setup(
         "deny",
         DomainExtractionRunner {
             db,
@@ -350,7 +378,7 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
         UnitStatus::Rejected,
         "the extractor phase (ord 3) is the denied unit"
     );
-    let wt = worktree("deny", "run-deny");
+    let wt = worktree(&repo, "run-deny");
     assert!(
         !wt.join("requirements_graph.json").is_file(),
         "the run halted at the denied phase — no downstream requirements_graph.json"
@@ -362,7 +390,7 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
 #[test]
 fn a_conformance_rule_is_recalled_onto_the_run_claims() {
     let db = db_in("recall");
-    let (core, repo_id, dbp) = setup(
+    let (core, repo_id, dbp, _repo) = setup(
         "recall",
         DomainExtractionRunner {
             db,
@@ -433,7 +461,7 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
 #[test]
 fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
     let db = db_in("hole");
-    let (core, repo_id, _db) = setup(
+    let (core, repo_id, _db, repo) = setup(
         "hole",
         DomainExtractionRunner {
             db,
@@ -464,7 +492,13 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
         "the pinned coverage validator DENIES a sub-1.0 coverage report in a run (the gate has teeth; \
          the agent-PASS shim does not rescue a hole)"
     );
-    let wt = worktree("hole", "run-hole");
+    let wt = worktree(&repo, "run-hole");
+    // The report WAS written (< 1.0) — so the deny is the sub-1.0 coverage path, not a missing-file
+    // rejection that would pass for the wrong reason.
+    assert!(
+        wt.join("coverage-report.json").is_file(),
+        "the coverage phase produced a report; the rejection is a genuine sub-1.0 deny, not a missing file"
+    );
     assert!(
         !wt.join("requirements_graph.json").is_file(),
         "the run halted at the denied coverage phase — the domain-graph artifact was never produced"
