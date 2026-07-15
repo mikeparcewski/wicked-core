@@ -601,7 +601,8 @@ fn ensure_phase_at_gate(
     if get_phase(store, phase_id)?.is_none() {
         let phase = Phase::open(phase_id, workflow_id, phase_name);
         put_node(store, phase.to_node())?;
-        advance_to_gate_running(store, phase_id)?;
+        // gate_hook only opens a phase that doesn't yet exist → always attempt 0 here.
+        advance_to_gate_running(store, phase_id, 0)?;
     }
     Ok(())
 }
