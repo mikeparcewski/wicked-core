@@ -688,7 +688,7 @@ impl Core {
     /// (fields: id, kind, applies_to, effect, trigger, severity, criteria, rule, obligations).
     /// Validates server-side (fails closed on deny_unknown_fields + required fields). Idempotent
     /// on stable id — calling twice with the same id and payload is a no-op.
-    #[napi(ts_return_type = "Promise<void>")]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn upsert_policy(&self, policy_json: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -700,7 +700,7 @@ impl Core {
     /// Upsert a conformance rule. `rule_json` is a JSON-serialized `ConformanceRule` object
     /// (fields: id, rule_type, statement, severity, confidence, targets, provenance).
     /// Validates server-side (INV-C1/C2/C4). Idempotent on stable id.
-    #[napi(ts_return_type = "Promise<void>")]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn upsert_conformance_rule(&self, rule_json: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -711,6 +711,7 @@ impl Core {
 
     /// Recall which conformance rules apply to the given `query_json` (a JSON-serialized
     /// `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
+    /// An empty or whitespace `query_json` is treated as an all-rules query (no facet filters).
     /// Opens a read-only connection — does not block the single-writer actor. Returns a JSON
     /// array of `ConformanceRule` objects, severity-first then id.
     #[napi(ts_return_type = "Promise<string>")]
@@ -720,7 +721,11 @@ impl Core {
             use wicked_apps_core::open_store_ro;
             use wicked_governance::{recall_rules, RuleQuery};
             let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
-            let query: RuleQuery = serde_json::from_str(&query_json).map_err(err)?;
+            let query: RuleQuery = if query_json.trim().is_empty() {
+                RuleQuery::default()
+            } else {
+                serde_json::from_str(&query_json).map_err(err)?
+            };
             let rules = recall_rules(&store, &query).map_err(err)?;
             serde_json::to_string(&rules).map_err(err)
         })

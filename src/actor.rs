@@ -474,14 +474,16 @@ pub(crate) fn run(
             Command::UpsertPolicy { policy_json, reply } => {
                 let _ = reply.send((|| -> anyhow::Result<()> {
                     use wicked_governance::{register_policy, Policy};
-                    let policy: Policy = serde_json::from_str(&policy_json)?;
+                    let policy: Policy = serde_json::from_str(&policy_json)
+                        .map_err(|e| anyhow::anyhow!("invalid Policy JSON: {e}"))?;
                     register_policy(&mut store, &policy)
                 })());
             }
             Command::UpsertConformanceRule { rule_json, reply } => {
                 let _ = reply.send((|| -> anyhow::Result<()> {
                     use wicked_governance::{register_rule, ConformanceRule};
-                    let rule: ConformanceRule = serde_json::from_str(&rule_json)?;
+                    let rule: ConformanceRule = serde_json::from_str(&rule_json)
+                        .map_err(|e| anyhow::anyhow!("invalid ConformanceRule JSON: {e}"))?;
                     register_rule(&mut store, &rule)
                 })());
             }
