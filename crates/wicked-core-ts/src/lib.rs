@@ -635,8 +635,9 @@ impl Core {
             };
             let mut policies: Vec<Policy> = Vec::new();
             for node in store.find_symbols(&query).map_err(err)? {
-                if let Ok(p) = Policy::from_node(&node) {
-                    policies.push(p);
+                match Policy::from_node(&node) {
+                    Ok(p) => policies.push(p),
+                    Err(e) => eprintln!("wicked-core-ts: policy node '{}' failed to parse: {e}", node.id),
                 }
             }
             policies.sort_by(|a, b| a.id.cmp(&b.id));
@@ -672,8 +673,9 @@ impl Core {
             };
             let mut claims: Vec<ConformanceClaim> = Vec::new();
             for node in store.find_symbols(&query).map_err(err)? {
-                if let Ok(c) = claim_from_node(&node) {
-                    claims.push(c);
+                match claim_from_node(&node) {
+                    Ok(c) => claims.push(c),
+                    Err(e) => eprintln!("wicked-core-ts: claim node '{}' failed to parse: {e}", node.id),
                 }
             }
             serde_json::to_string(&claims).map_err(err)
