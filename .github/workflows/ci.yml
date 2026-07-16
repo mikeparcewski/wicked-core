@@ -74,9 +74,56 @@ jobs:
 
       # Backend-parity compile check (DES-OUTGOV-001 §5): estate's Postgres backend, wired through
       # the engine's `dyn GraphStore` seam + `AnyStore`, must keep COMPILING under `--features
-      # postgres` (it pulls sqlx + tokio). No Postgres SERVICE is needed for the compile — a
-      # CI-provisioned Postgres + real round-trip parity is a follow-on. The default gate above
-      # already asserts the OTHER half of §5: a `postgres://` spec is REJECTED (fail-closed) when the
-      # feature is OFF (the `postgres_spec_fails_closed_without_feature` test).
+      # postgres` (it pulls sqlx + tokio). No Postgres SERVICE is needed for the compile — the
+      # `postgres-parity` job below provisions a real Postgres and runs the full round-trip.
+      # The default gate above already asserts the OTHER half of §5: a `postgres://` spec is REJECTED
+      # (fail-closed) when the feature is OFF (`postgres_spec_fails_closed_without_feature` test).
       - name: cargo build --features postgres (backend compile-parity)
         run: cargo build --features postgres
+
+  postgres-parity:
+    name: postgres backend round-trip
+    runs-on: ubuntu-latest
+    needs: check
+    defaults:
+      run:
+        working-directory: wicked-core
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: wicked
+          POSTGRES_PASSWORD: wicked
+          POSTGRES_DB: estate_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout wicked-core
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: wicked-core
+      - name: Checkout wicked-estate (sibling — path deps + publish=false crates build from source)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: mikeparcewski/wicked-estate
+          ref: ${{ env.WICKED_ESTATE_REF }}
+          path: wicked-estate
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wicked-core
+          key: postgres-parity
+
+      - name: cargo test wicked-apps-core --features postgres (Postgres round-trip, core#30)
+        env:
+          TEST_POSTGRES_URL: postgres://wicked:wicked@localhost:5432/estate_test
+        run: cargo test --manifest-path crates/wicked-apps-core/Cargo.toml --features postgres

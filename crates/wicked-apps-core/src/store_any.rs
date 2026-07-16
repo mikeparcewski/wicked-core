@@ -226,6 +226,28 @@ mod tests {
         );
     }
 
+    // §5 backend-parity: AnyStore must bridge the SAME generic→dyn call styles through Postgres.
+    // Skips when TEST_POSTGRES_URL is absent (local dev without a running Postgres); the CI
+    // `postgres-parity` job always sets it so this is a hard runtime assertion there (core#30).
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_open_store_any_round_trip() {
+        let url = match std::env::var("TEST_POSTGRES_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!("TEST_POSTGRES_URL not set — skipping postgres round-trip");
+                return;
+            }
+        };
+        let mut store =
+            open_store_any(Some(&url)).expect("open postgres AnyStore via TEST_POSTGRES_URL");
+        seed_via_generic(&mut store);
+        assert!(
+            reads_back_via_dyn(&store),
+            "node written via generic S bound must read back via &dyn GraphStore on Postgres backend"
+        );
+    }
+
     // §5 backend-parity note: the DEFAULT build (no `postgres` feature) must REJECT a postgres spec
     // loudly — never silently open SQLite instead (deny-dominates). Real parity runs only under
     // `--features postgres` against a provisioned Postgres, so this asserts the rejection path.
