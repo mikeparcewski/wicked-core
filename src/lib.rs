@@ -170,14 +170,16 @@ pub struct Core {
 
 impl Core {
     /// Spawn the store actor over the estate store at `path`, with the production engine seams: the
-    /// real council dispatcher + the real wrapped-CLI step runner (runs actual agentic CLIs in the
-    /// run's worktree). The actor lives until every `Core` handle is dropped. Tests use
+    /// real council dispatcher + the ACP multi-CLI session runner. ACP is the default — each CLI
+    /// runs its wrapper binary and shares prompt-cache across governed turns. When an ACP binary is
+    /// absent, the runner emits a warning in the step output and falls back to single-shot
+    /// invocation automatically. The actor lives until every `Core` handle is dropped. Tests use
     /// [`Core::spawn_with_engine`] to inject a stub runner instead.
     pub fn spawn(path: impl Into<String>) -> Core {
         Core::spawn_with_engine(
             path,
             distribute::real_dispatcher(),
-            std::sync::Arc::new(execute_wrapped::WrappedCliStepRunner::default()),
+            std::sync::Arc::new(acp_runner::AcpStepRunner::new()),
         )
     }
 
@@ -224,38 +226,6 @@ impl Core {
             tx.clone(),
             pty.clone(),
         ));
-        let runner_actor = runner.clone();
-        std::thread::spawn(move || {
-            actor::run(
-                path,
-                rx,
-                self_tx,
-                distribute::real_dispatcher(),
-                runner_actor,
-                pty_actor,
-                None,
-            )
-        });
-        let core = Core {
-            tx: tx.clone(),
-            pty,
-            _shutdown: Arc::new(ShutdownGuard { tx }),
-        };
-        (core, runner)
-    }
-
-    /// Spawn the store actor with an [`AcpStepRunner`] as the execution seam — units use the
-    /// ACP multi-CLI session protocol, falling back to single-shot when the ACP binary is absent.
-    /// The returned handle exposes [`AcpStepRunner::drop_session`] for post-run cleanup.
-    pub fn spawn_with_acp_sessions(
-        path: impl Into<String>,
-    ) -> (Core, std::sync::Arc<AcpStepRunner>) {
-        let path = path.into();
-        let (tx, rx) = channel();
-        let self_tx = tx.clone();
-        let pty = terminal::new_map();
-        let pty_actor = pty.clone();
-        let runner = std::sync::Arc::new(acp_runner::AcpStepRunner::new());
         let runner_actor = runner.clone();
         std::thread::spawn(move || {
             actor::run(
