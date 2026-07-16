@@ -40,6 +40,36 @@ pub enum Category {
     LocalRunner,
 }
 
+/// How to parse NDJSON output and detect turn-end in a persistent PTY session.
+/// Each variant matches one CLI's `--output-format` / `--mode` output shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionAdapterKind {
+    /// Claude `--output-format stream-json --verbose`.
+    /// Sentinel: `{"type":"result"}`. Text: `content[].text` deltas.
+    #[default]
+    ClaudeNdjson,
+    /// GitHub Copilot `--output-format json`.
+    /// Sentinel: `{"type":"result"}`. Text: `assistant.message_delta.data.deltaContent`.
+    CopilotJson,
+    /// `pi --mode json`.
+    /// Sentinel: `{"type":"turn_end"}`. Text: `message_update.assistantMessageEvent.delta`.
+    PiJson,
+    /// No structured format: every line is a text delta; turn ends on process exit.
+    Passthrough,
+}
+
+impl SessionAdapterKind {
+    /// The JSON `"type"` field value that signals end-of-turn, or `None` for process-exit-only.
+    pub fn result_type(self) -> Option<&'static str> {
+        match self {
+            Self::ClaudeNdjson | Self::CopilotJson => Some("result"),
+            Self::PiJson => Some("turn_end"),
+            Self::Passthrough => None,
+        }
+    }
+}
+
 /// How the scaffold prompt is delivered to the CLI process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -172,6 +202,15 @@ pub struct AgenticCli {
     /// Whether this seat may be convened.
     #[serde(default = "default_true")]
     pub enabled_for_council: bool,
+    /// One-shot flags to strip when building a PTY session argv (e.g. `["-p", "--print"]`).
+    #[serde(default)]
+    pub session_strip_flags: Vec<String>,
+    /// Flags to inject when starting a PTY session (e.g. `["--output-format", "json"]`).
+    #[serde(default)]
+    pub session_inject_flags: Vec<String>,
+    /// NDJSON parsing strategy for persistent PTY sessions. `None` = no session support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_adapter: Option<SessionAdapterKind>,
 }
 
 fn default_true() -> bool {

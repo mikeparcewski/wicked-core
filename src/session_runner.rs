@@ -36,12 +36,43 @@ use base64::Engine as _;
 
 use crate::command::Command;
 use crate::event::CoreEvent;
+use wicked_council::SessionAdapterKind;
+
 use crate::execute_wrapped::{
-    binary_is_claude, build_argv, inject_claude_stream_flags, resolve_invocation, skill_prompt,
-    AdapterOut, ClaudeStreamJson, OutputAdapter,
+    build_argv, is_result_line_for, make_session_adapter, resolve_invocation, skill_prompt,
+    AdapterOut, OutputAdapter,
 };
 use crate::terminal;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
+
+// ── Per-CLI session configuration ─────────────────────────────────────────────
+
+/// Flags + NDJSON strategy for one CLI's PTY session mode. Built from the council registry at
+/// construction time; unknown CLIs fall back to the `Default` (claude-compatible NDJSON).
+#[derive(Clone)]
+struct SessionConfig {
+    /// One-shot flags to strip from the headless invocation (e.g. `["-p", "--print"]`).
+    strip_flags: Vec<String>,
+    /// Flags to inject for interactive session mode (e.g. `["--output-format", "stream-json"]`).
+    inject_flags: Vec<String>,
+    /// How to parse NDJSON output and detect turn completion.
+    adapter: SessionAdapterKind,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        // Fallback for CLIs not in the registry: assume claude-compatible NDJSON.
+        Self {
+            strip_flags: vec!["-p".into(), "--print".into()],
+            inject_flags: vec![
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+            ],
+            adapter: SessionAdapterKind::ClaudeNdjson,
+        }
+    }
+}
 
 // ── Session table ─────────────────────────────────────────────────────────────
 
@@ -61,6 +92,8 @@ pub struct PersistentStepRunner {
     pty: terminal::PtyMap,
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     timeout: Duration,
+    /// Per-CLI session config loaded from the council registry at construction time.
+    cli_sessions: HashMap<String, SessionConfig>,
 }
 
 impl PersistentStepRunner {
@@ -69,11 +102,34 @@ impl PersistentStepRunner {
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(7200);
+
+        // Build per-CLI session configs from the council registry (user TOML merged over builtins).
+        let registry = wicked_council::registry::load(
+            wicked_council::registry::default_user_path().as_deref(),
+        )
+        .unwrap_or_default();
+        let cli_sessions: HashMap<String, SessionConfig> = registry
+            .into_iter()
+            .filter_map(|cli| {
+                cli.session_adapter.map(|adapter| {
+                    (
+                        cli.key,
+                        SessionConfig {
+                            strip_flags: cli.session_strip_flags,
+                            inject_flags: cli.session_inject_flags,
+                            adapter,
+                        },
+                    )
+                })
+            })
+            .collect();
+
         Self {
             tx,
             pty,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs(secs),
+            cli_sessions,
         }
     }
 
@@ -139,29 +195,24 @@ impl PersistentStepRunner {
 
     // ── session argv ──────────────────────────────────────────────────────────
 
-    /// Build the argv for an **interactive** (multi-turn) CLI session. Like the wrapped-CLI argv
-    /// but without `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
-    /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
-    fn session_argv(input: &StepInput) -> Vec<String> {
+    /// Build the argv for an **interactive** (multi-turn) CLI session using per-CLI session config.
+    /// Strips one-shot flags (e.g. `-p`/`--print`) and injects session-mode flags
+    /// (e.g. `--output-format stream-json`) as declared in the CLI's registry record.
+    fn session_argv(input: &StepInput, config: &SessionConfig) -> Vec<String> {
         let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
         let invocation = input
             .unit
             .assigned_invocation
             .clone()
             .unwrap_or_else(|| resolve_invocation(cli_key));
-        // Build argv without a real prompt — the placeholder expands to an empty string and the
-        // trailing `--` + empty arg are stripped below.
+        // Build argv without a real prompt — placeholder expands to empty string.
         let mut argv = build_argv(&invocation, "", &input.unit.allowed_skills);
-        let is_claude = argv.first().map(|a| binary_is_claude(a)).unwrap_or(false);
         // Drop the end-of-options guard and the empty prompt arg emitted by the template.
         argv.retain(|a| a != "--" && !a.is_empty());
-        if is_claude {
-            // Remove one-shot flags — interactive mode doesn't use them.
-            // Only done for claude: other binaries may legitimately use -p for other purposes.
-            argv.retain(|a| a != "-p" && a != "--print");
-            // Inject stream-json (skipped when the template already carries --output-format).
-            inject_claude_stream_flags(&mut argv);
-        }
+        // Strip per-CLI one-shot flags (e.g. -p/--print for claude/pi, -p/--prompt for copilot).
+        argv.retain(|a| !config.strip_flags.iter().any(|s| s == a));
+        // Inject per-CLI session flags (e.g. --output-format stream-json --verbose for claude).
+        argv.extend(config.inject_flags.iter().cloned());
         argv
     }
 }
@@ -180,6 +231,8 @@ impl StepRunner for PersistentStepRunner {
 impl PersistentStepRunner {
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
+        let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+        let config = self.cli_sessions.get(cli_key).cloned().unwrap_or_default();
 
         // Lazily open a session for this run_id. The lock covers only the map read/write — not
         // the blocking open_terminal / wait_for_opened calls — so unrelated runs are never
@@ -196,7 +249,7 @@ impl PersistentStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let cmd = Self::session_argv(input);
+                let cmd = Self::session_argv(input, &config);
                 // Subscribe BEFORE open so we catch the TerminalOpened event.
                 let pre = self.subscribe();
                 let tid = match self.open_terminal(cwd, cmd) {
@@ -230,7 +283,14 @@ impl PersistentStepRunner {
             return failed_output(input, format!("write PTY turn: {e}"));
         }
 
-        let result = collect_turn(&events, &terminal_id, self.timeout, emit, input);
+        let result = collect_turn(
+            &events,
+            &terminal_id,
+            self.timeout,
+            emit,
+            input,
+            config.adapter,
+        );
         if result.status != StepStatus::Ok {
             // On any non-Ok outcome the terminal may be broken/hung. Drop the session so
             // the next unit for this run_id opens a fresh PTY instead of reusing a stale one.
@@ -269,8 +329,10 @@ fn collect_turn(
     timeout: Duration,
     emit: &DeltaSink,
     input: &StepInput,
+    adapter_kind: SessionAdapterKind,
 ) -> StepOutput {
-    let mut adapter = ClaudeStreamJson::default();
+    let mut adapter = make_session_adapter(adapter_kind);
+    let passthrough = adapter_kind == SessionAdapterKind::Passthrough;
     let mut line_buf = String::new();
     let mut output = String::new();
     let mut usage: Option<Usage> = None;
@@ -298,7 +360,8 @@ fn collect_turn(
                 }
                 if drain_lines(
                     &mut line_buf,
-                    &mut adapter,
+                    &mut *adapter,
+                    adapter_kind,
                     emit,
                     &mut output,
                     &mut usage,
@@ -318,14 +381,15 @@ fn collect_turn(
     // Flush any remaining complete lines (e.g. on TerminalExited without trailing newline).
     drain_lines(
         &mut line_buf,
-        &mut adapter,
+        &mut *adapter,
+        adapter_kind,
         emit,
         &mut output,
         &mut usage,
         &mut files,
         MAX_OUT,
     );
-    // Adapter finish (both current adapters are stateless, but call for completeness).
+    // Adapter finish (stateless adapters return empty, but call for completeness).
     let fin = adapter.finish();
     absorb(fin, emit, &mut output, &mut usage, &mut files, MAX_OUT);
 
@@ -335,6 +399,9 @@ fn collect_turn(
         attempt: input.attempt,
         output: output.trim_end().to_string(),
         status: if found_result {
+            StepStatus::Ok
+        } else if passthrough && !output.is_empty() {
+            // Passthrough CLIs: process exited cleanly after producing output = done.
             StepStatus::Ok
         } else if timed_out {
             StepStatus::Cancelled
@@ -351,7 +418,8 @@ fn collect_turn(
 /// line is found (turn complete). Partial trailing content stays in `buf` for the next chunk.
 fn drain_lines(
     buf: &mut String,
-    adapter: &mut ClaudeStreamJson,
+    adapter: &mut dyn OutputAdapter,
+    adapter_kind: SessionAdapterKind,
     emit: &DeltaSink,
     output: &mut String,
     usage: &mut Option<Usage>,
@@ -367,7 +435,7 @@ fn drain_lines(
             // Skip echoed input and non-JSON noise (CLI prompts, blank lines).
             continue;
         }
-        if is_result_line(line) {
+        if is_result_line_for(line, adapter_kind) {
             found = true;
         }
         let ao = adapter.on_line(line);
@@ -396,21 +464,6 @@ fn absorb(
         *usage = ao.usage;
     }
     files.extend(ao.files);
-}
-
-/// Quick sentinel check — is this line a `{"type":"result",...}` NDJSON row?
-fn is_result_line(line: &str) -> bool {
-    if !line.contains("\"result\"") {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(|t| t.as_str())
-                .map(|s| s == "result")
-        })
-        .unwrap_or(false)
 }
 
 fn failed_output(input: &StepInput, msg: String) -> StepOutput {

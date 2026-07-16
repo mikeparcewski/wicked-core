@@ -213,6 +213,129 @@ pub(crate) fn inject_claude_stream_flags(argv: &mut Vec<String>) {
     }
 }
 
+/// GitHub Copilot `--output-format json` NDJSON adapter.
+/// Text from `assistant.message_delta.data.deltaContent`.
+/// Usage synthesized minimally from the `result` line (copilot reports premiumRequests, not tokens).
+/// Sentinel: `{"type":"result",...}` — same type field as claude, so `is_result_line_for` handles both.
+#[derive(Default)]
+pub(crate) struct CopilotStreamJson;
+
+impl OutputAdapter for CopilotStreamJson {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                return AdapterOut {
+                    text: vec![line.to_string()],
+                    ..Default::default()
+                }
+            }
+        };
+        let mut out = AdapterOut::default();
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("assistant.message_delta") => {
+                if let Some(t) = v
+                    .get("data")
+                    .and_then(|d| d.get("deltaContent"))
+                    .and_then(|c| c.as_str())
+                {
+                    if !t.is_empty() {
+                        out.text.push(t.to_string());
+                    }
+                }
+            }
+            Some("result") => {
+                // Copilot reports premiumRequests not tokens; emit a zero-count Usage so the run
+                // records that a turn completed (never a fabricated dollar cost).
+                out.usage = Some(Usage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cost_usd: None,
+                });
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
+/// `pi --mode json` NDJSON adapter.
+/// Text from `message_update.assistantMessageEvent.delta` (text_delta events).
+/// Usage from `turn_end.message.usage.{input,output}` (pi reports real token counts).
+/// Sentinel: `{"type":"turn_end",...}`.
+#[derive(Default)]
+pub(crate) struct PiStreamJson;
+
+impl OutputAdapter for PiStreamJson {
+    fn on_line(&mut self, line: &str) -> AdapterOut {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                return AdapterOut {
+                    text: vec![line.to_string()],
+                    ..Default::default()
+                }
+            }
+        };
+        let mut out = AdapterOut::default();
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("message_update") => {
+                let ae = v.get("assistantMessageEvent");
+                if ae.and_then(|e| e.get("type")).and_then(|t| t.as_str()) == Some("text_delta") {
+                    if let Some(t) = ae.and_then(|e| e.get("delta")).and_then(|d| d.as_str()) {
+                        if !t.is_empty() {
+                            out.text.push(t.to_string());
+                        }
+                    }
+                }
+            }
+            Some("turn_end") => {
+                if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                    let input_tokens = usage.get("input").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let output_tokens = usage.get("output").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let cost_usd = usage
+                        .get("cost")
+                        .and_then(|c| c.get("total"))
+                        .and_then(|t| t.as_f64());
+                    out.usage = Some(Usage {
+                        input_tokens,
+                        output_tokens,
+                        cost_usd,
+                    });
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+}
+
+/// Instantiate the right [`OutputAdapter`] for a PTY session based on the CLI's declared adapter kind.
+pub(crate) fn make_session_adapter(
+    kind: wicked_council::SessionAdapterKind,
+) -> Box<dyn OutputAdapter + Send> {
+    use wicked_council::SessionAdapterKind;
+    match kind {
+        SessionAdapterKind::ClaudeNdjson => Box::new(ClaudeStreamJson::default()),
+        SessionAdapterKind::CopilotJson => Box::new(CopilotStreamJson::default()),
+        SessionAdapterKind::PiJson => Box::new(PiStreamJson::default()),
+        SessionAdapterKind::Passthrough => Box::new(Passthrough),
+    }
+}
+
+/// Check whether `line` is the end-of-turn sentinel for the given adapter kind.
+/// Returns `false` for `Passthrough` (no sentinel; turn ends on process exit).
+pub(crate) fn is_result_line_for(line: &str, kind: wicked_council::SessionAdapterKind) -> bool {
+    let sentinel = match kind.result_type() {
+        Some(s) => s,
+        None => return false,
+    };
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.get("type")?.as_str().map(|s| s == sentinel))
+        .unwrap_or(false)
+}
+
 /// The real wrapped-CLI runner. Resolves each unit's assigned CLI to its invocation template, runs it
 /// in the unit's worktree, and maps the exit code to a [`StepStatus`].
 pub struct WrappedCliStepRunner {

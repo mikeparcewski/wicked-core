@@ -823,6 +823,9 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            session_strip_flags: vec![],
+            session_inject_flags: vec![],
+            session_adapter: None,
         };
 
         let dir = std::env::temp_dir().join("wicked-core-pipeline-test");

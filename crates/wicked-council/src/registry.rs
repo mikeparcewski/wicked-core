@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::types::{AgenticCli, Category, Confidence, InputMode};
+use crate::types::{AgenticCli, Category, Confidence, InputMode, SessionAdapterKind};
 use serde::Deserialize;
 
 /// The shape of the user TOML file: `[[cli]]` array-of-tables.
@@ -43,6 +43,12 @@ struct TomlCli {
     confidence: Option<Confidence>,
     #[serde(default)]
     enabled_for_council: Option<bool>,
+    #[serde(default)]
+    session_strip_flags: Option<Vec<String>>,
+    #[serde(default)]
+    session_inject_flags: Option<Vec<String>>,
+    #[serde(default)]
+    session_adapter: Option<SessionAdapterKind>,
 }
 
 impl From<TomlCli> for AgenticCli {
@@ -60,6 +66,9 @@ impl From<TomlCli> for AgenticCli {
             // User records default to confirm-on-probe.
             confidence: t.confidence.unwrap_or(Confidence::ConfirmOnProbe),
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
+            session_strip_flags: t.session_strip_flags.unwrap_or_default(),
+            session_inject_flags: t.session_inject_flags.unwrap_or_default(),
+            session_adapter: t.session_adapter,
         }
     }
 }
@@ -81,6 +90,13 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            session_strip_flags: vec!["-p".into(), "--print".into()],
+            session_inject_flags: vec![
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+            ],
+            session_adapter: Some(SessionAdapterKind::ClaudeNdjson),
         },
         AgenticCli {
             key: "agy".into(),
@@ -94,6 +110,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // agy has no NDJSON output mode yet; PTY sessions not supported.
+            session_strip_flags: vec![],
+            session_inject_flags: vec![],
+            session_adapter: None,
         },
         AgenticCli {
             key: "codex".into(),
@@ -107,6 +127,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // codex exec is one-shot; no interactive stdin NDJSON mode found.
+            session_strip_flags: vec![],
+            session_inject_flags: vec![],
+            session_adapter: None,
         },
         AgenticCli {
             key: "pi".into(),
@@ -120,6 +144,9 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            session_strip_flags: vec!["-p".into(), "--print".into()],
+            session_inject_flags: vec!["--mode".into(), "json".into()],
+            session_adapter: Some(SessionAdapterKind::PiJson),
         },
         AgenticCli {
             key: "copilot".into(),
@@ -133,6 +160,9 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            session_strip_flags: vec!["-p".into(), "--prompt".into()],
+            session_inject_flags: vec!["--output-format".into(), "json".into()],
+            session_adapter: Some(SessionAdapterKind::CopilotJson),
         },
         AgenticCli {
             key: "opencode".into(),
@@ -146,6 +176,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // opencode run is one-shot; ACP server mode is a separate protocol.
+            session_strip_flags: vec![],
+            session_inject_flags: vec![],
+            session_adapter: None,
         },
     ]
 }
