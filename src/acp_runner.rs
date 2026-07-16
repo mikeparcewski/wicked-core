@@ -13,25 +13,22 @@
 //! | copilot  | copilot --acp     | HTTP      |
 //!
 //! When an ACP binary is unavailable or fails during the handshake, `AcpStepRunner`
-//! emits a warning in the step output and falls back to [`WrappedCliStepRunner`]
-//! (single-shot invocation). HTTP transport is not yet implemented; copilot falls back
-//! gracefully until it is.
+//! emits a warning and prepends it to `StepOutput.output` so it is visible in both
+//! streaming and persisted contexts. The run then continues with single-shot fallback.
+//! HTTP transport is not yet implemented; copilot falls back gracefully until it is.
 //!
 //! # Session lifecycle
-//! - **Open (lazy)**: on the first unit for a `run_id`, the binary is spawned and the
-//!   `initialize` + `session/new` JSON-RPC handshake completes.
+//! - **Open (lazy)**: on the first unit for a `(run_id, cli_key)` pair, the binary is
+//!   spawned and the `initialize` + `session/new` JSON-RPC handshake completes.
 //! - **Reuse**: subsequent units send `session/prompt` to the same process and stream
 //!   `session/update` text chunks until `stopReason` arrives — sharing prompt-cache
 //!   across governance turns without a per-unit cold start.
-//! - **Close**: [`AcpStepRunner::drop_session`] kills the process. Call it from the
-//!   caller after a run's last unit (mirrors [`PersistentStepRunner::drop_session`]).
+//! - **Close**: [`AcpStepRunner::drop_session`] kills all CLI processes for a `run_id`.
+//!   Call it after the last unit of a run (mirrors [`PersistentStepRunner::drop_session`]).
 //!
 //! # Protocol
-//! JSON-RPC 2.0 ndjson over stdin/stdout:
-//! - `initialize` → agent returns capabilities.
-//! - `session/new` → agent returns `sessionId`.
-//! - `session/prompt` → agent streams `session/update` notifications then responds
-//!   with `{ "result": { "stopReason": "end_turn" } }`.
+//! JSON-RPC 2.0 ndjson over stdin/stdout. Non-JSON startup banners and log lines
+//! are silently skipped during both handshake and turn execution.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -50,9 +47,9 @@ use wicked_council::types::{AcpConfig, AcpTransport};
 struct AcpProcess {
     child: Child,
     stdin: BufWriter<ChildStdin>,
-    /// Lines arriving from the ACP server's stdout, sent by the reader thread.
+    /// Lines arriving from the ACP server's stdout, fed by the reader thread.
+    /// Unbounded so the reader never blocks the child on a full pipe.
     line_rx: std::sync::mpsc::Receiver<String>,
-    /// Keeps the reader thread alive until the process is dropped.
     _reader: std::thread::JoinHandle<()>,
     session_id: String,
     next_id: u64,
@@ -68,7 +65,7 @@ impl Drop for AcpProcess {
 // ── Session startup ───────────────────────────────────────────────────────────
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake.
-/// Returns `Err` if the binary is not found, the process fails to start, or the
+/// Returns `Err` if the binary is not on PATH, the process fails to start, or the
 /// handshake does not complete within 10 s.
 fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Result<AcpProcess> {
     let mut cmd = std::process::Command::new(&config.binary);
@@ -93,9 +90,8 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
             .ok_or_else(|| anyhow::anyhow!("ACP binary '{}': no stdin", config.binary))?,
     );
 
-    // Spawn a reader thread that feeds lines to the mpsc channel so the caller can
-    // use recv_timeout without blocking the whole thread on a slow read.
-    let (tx, rx) = std::sync::mpsc::sync_channel(512);
+    // Unbounded channel — the reader thread never blocks the child on a full buffer.
+    let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines().map_while(Result::ok) {
@@ -157,8 +153,9 @@ fn rpc_send(
     Ok(())
 }
 
-/// Wait for the JSON-RPC response whose `"id"` matches `id`, skipping notifications.
-/// Returns `Err` on timeout, disconnect, or a server-side `"error"` field.
+/// Wait for the JSON-RPC response whose `"id"` matches `id`, skipping both
+/// notifications and non-JSON startup banners/logs. Returns `Err` on timeout,
+/// channel disconnect, or a server-side `"error"` field.
 fn rpc_expect(
     rx: &std::sync::mpsc::Receiver<String>,
     id: u64,
@@ -174,8 +171,12 @@ fn rpc_expect(
         }
         match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(line) => {
-                let v: Value = serde_json::from_str(&line)
-                    .map_err(|e| anyhow::anyhow!("ACP non-JSON line during handshake: {e}"))?;
+                // Skip non-JSON lines (startup banners, log output, etc.) — consistent
+                // with exec_turn_acp which also silently skips non-JSON noise.
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(err) = v.get("error") {
                         return Err(anyhow::anyhow!("ACP server error: {err}"));
@@ -245,12 +246,10 @@ fn exec_turn_acp(
             Ok(line) => {
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
-                    Err(_) => continue, // skip non-JSON noise (startup banners, etc.)
+                    Err(_) => continue,
                 };
 
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
-                    // Response to our session/prompt request — turn complete.
-                    // stopReason lives in result; non-"cancelled" values map to Ok.
                     let stop = v["result"]["stopReason"].as_str().unwrap_or("end_turn");
                     if stop == "cancelled" {
                         timed_out = true;
@@ -289,7 +288,7 @@ fn handle_update(
     emit: &DeltaSink,
     output: &mut String,
     usage: &mut Option<Usage>,
-    _files: &mut Vec<String>,
+    files: &mut Vec<String>,
     max_out: usize,
 ) {
     let update = &v["params"]["update"];
@@ -323,31 +322,63 @@ fn handle_update(
                 });
             }
         }
+        "tool_call_update" => {
+            // Collect file paths reported by the CLI (e.g. read/edit locations).
+            if let Some(locs) = update["locations"].as_array() {
+                for loc in locs {
+                    if let Some(path) = loc["path"].as_str() {
+                        files.push(path.to_string());
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
 
+// ── Fallback helpers ──────────────────────────────────────────────────────────
+
+/// Run the single-shot fallback, prepending `warning` to the output so it appears in
+/// both the streaming view and the persisted `StepOutput.output` (visible in studio).
+fn fallback_with_warning(
+    warning: String,
+    input: &StepInput,
+    emit: &DeltaSink,
+    fallback: &WrappedCliStepRunner,
+) -> StepOutput {
+    emit(&warning);
+    let mut result = fallback.run_unit_streaming(input, emit);
+    result.output = if result.output.is_empty() {
+        warning
+    } else {
+        format!("{warning}\n{}", result.output)
+    };
+    result
+}
+
 // ── AcpStepRunner ─────────────────────────────────────────────────────────────
 
-/// A [`StepRunner`] that drives ACP multi-turn sessions for multi-CLI support.
+/// A [`StepRunner`] that drives ACP multi-turn sessions for all registered CLIs.
 ///
-/// Consults the built-in CLI registry for each CLI key to find the ACP wrapper binary.
-/// Falls back to single-shot [`WrappedCliStepRunner`] when:
+/// Sessions are keyed by `(run_id, cli_key)` — each CLI in a multi-CLI run gets its own
+/// persistent ACP process so units are never mis-routed to the wrong agent.
+///
+/// Falls back to [`WrappedCliStepRunner`] (single-shot) when:
 /// - the CLI has no ACP config in the registry
 /// - the ACP binary is not on PATH
-/// - the handshake fails
-/// - the ACP session dies mid-run
+/// - the handshake fails or the session dies mid-run
 ///
-/// Each fallback emits a `[wicked-core] ACP …` warning line in the step output so
-/// callers can distinguish ACP paths from fallback paths.
+/// All fallbacks prepend a `[wicked-core] ACP …` warning to `StepOutput.output` so
+/// the degradation is visible in both streaming output and persisted logs.
 pub struct AcpStepRunner {
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<AcpProcess>>>>>,
+    /// Keyed by `(run_id, cli_key)` — one process per CLI per run.
+    sessions: Arc<Mutex<HashMap<(String, String), Arc<Mutex<AcpProcess>>>>>,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
 }
 
 impl AcpStepRunner {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -359,40 +390,46 @@ impl AcpStepRunner {
         }
     }
 
-    /// Close the ACP session for `run_id` and kill its child process. Idempotent.
+    /// Close all ACP sessions for `run_id` and kill their child processes. Idempotent.
     /// Call this after the last unit of a run completes (mirrors
     /// [`PersistentStepRunner::drop_session`]).
     pub fn drop_session(&self, run_id: &str) {
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        guard.remove(run_id);
-        // Dropping the Arc<Mutex<AcpProcess>> eventually drops AcpProcess::drop → kill.
+        guard.retain(|(rid, _), _| rid != run_id);
     }
 
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
-        let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+        let cli_key = input
+            .unit
+            .assigned_cli
+            .as_deref()
+            .unwrap_or("claude")
+            .to_string();
 
-        // Resolve the ACP config for this CLI from the built-in registry.
-        let acp_config = match acp_config_for(cli_key) {
+        let acp_config = match acp_config_for(&cli_key) {
             Some(c) => c,
             None => return self.fallback.run_unit_streaming(input, emit),
         };
 
-        // HTTP transport is not yet implemented; fall back gracefully.
         if acp_config.transport == AcpTransport::Http {
-            let msg = format!(
-                "[wicked-core] ACP HTTP transport not yet implemented for '{cli_key}'; \
-                 using single-shot fallback"
+            return fallback_with_warning(
+                format!(
+                    "[wicked-core] ACP HTTP transport not yet implemented for '{cli_key}'; \
+                     using single-shot fallback"
+                ),
+                input,
+                emit,
+                &self.fallback,
             );
-            emit(&msg);
-            return self.fallback.run_unit_streaming(input, emit);
         }
 
-        // Lazily open a session for this run. Holds the global map lock only for the
-        // short map lookup/insert — not across the blocking spawn + handshake.
+        // Lazily open a session for (run_id, cli_key). The global map lock is held only
+        // for the brief map lookup/insert — not across the blocking spawn + handshake.
+        let session_key = (run_id.clone(), cli_key.clone());
         let proc_arc: Arc<Mutex<AcpProcess>> = {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(arc) = guard.get(&run_id) {
+            if let Some(arc) = guard.get(&session_key) {
                 arc.clone()
             } else {
                 drop(guard);
@@ -404,19 +441,21 @@ impl AcpStepRunner {
                     Ok(proc) => {
                         let arc = Arc::new(Mutex::new(proc));
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                        // entry().or_insert handles concurrent openers: the first one wins.
                         guard
-                            .entry(run_id.clone())
+                            .entry(session_key.clone())
                             .or_insert_with(|| arc.clone())
                             .clone()
                     }
                     Err(e) => {
-                        let msg = format!(
-                            "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
-                             using single-shot fallback"
+                        return fallback_with_warning(
+                            format!(
+                                "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
+                                 using single-shot fallback"
+                            ),
+                            input,
+                            emit,
+                            &self.fallback,
                         );
-                        emit(&msg);
-                        return self.fallback.run_unit_streaming(input, emit);
                     }
                 }
             }
@@ -437,8 +476,10 @@ impl AcpStepRunner {
                 governed: false,
             },
             Ok(result) if result.status == StepStatus::Cancelled => {
-                // Deadline elapsed — process is still alive; don't fall back.
+                // Timeout — drop the session: the reader thread may wedge on a full pipe
+                // if we leave the ACP process running while no longer consuming its output.
                 drop(proc);
+                self.drop_session(&run_id);
                 StepOutput {
                     run_id: input.run_id.clone(),
                     unit_ix: input.unit_ix,
@@ -451,25 +492,38 @@ impl AcpStepRunner {
                 }
             }
             Ok(_) => {
-                // ACP process exited or returned Failed — drop the stale session.
                 drop(proc);
                 self.drop_session(&run_id);
-                let msg = format!(
-                    "[wicked-core] ACP session exited for '{cli_key}'; using single-shot fallback"
-                );
-                emit(&msg);
-                self.fallback.run_unit_streaming(input, emit)
+                fallback_with_warning(
+                    format!(
+                        "[wicked-core] ACP session exited for '{cli_key}'; \
+                         using single-shot fallback"
+                    ),
+                    input,
+                    emit,
+                    &self.fallback,
+                )
             }
             Err(e) => {
                 drop(proc);
                 self.drop_session(&run_id);
-                let msg = format!(
-                    "[wicked-core] ACP error for '{cli_key}' ({e}); using single-shot fallback"
-                );
-                emit(&msg);
-                self.fallback.run_unit_streaming(input, emit)
+                fallback_with_warning(
+                    format!(
+                        "[wicked-core] ACP error for '{cli_key}' ({e}); \
+                         using single-shot fallback"
+                    ),
+                    input,
+                    emit,
+                    &self.fallback,
+                )
             }
         }
+    }
+}
+
+impl Default for AcpStepRunner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -486,7 +540,6 @@ impl StepRunner for AcpStepRunner {
 
 // ── Registry helper ───────────────────────────────────────────────────────────
 
-/// Look up the ACP config for a CLI key from the built-in registry.
 fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
     wicked_council::registry::builtin()
         .into_iter()
