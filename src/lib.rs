@@ -34,6 +34,7 @@ mod plan;
 mod repo;
 mod repo_intel;
 mod scope;
+mod session_runner;
 mod sources;
 mod terminal;
 mod validator;
@@ -84,6 +85,7 @@ pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
 };
 pub use scope::{resolve_scope, EntityMode};
+pub use session_runner::PersistentStepRunner;
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
 pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
@@ -202,6 +204,42 @@ impl Core {
         bus_db_path: impl Into<String>,
     ) -> Core {
         Core::spawn_inner(path, dispatcher, runner, Some(bus_db_path.into()))
+    }
+
+    /// Spawn the store actor with a [`PersistentStepRunner`] as the execution seam — units within
+    /// the same run share a single live PTY session (no per-unit cold-start). Uses the real council
+    /// dispatcher. The returned `Core` also exposes a [`PersistentStepRunner`] handle so the caller
+    /// can call [`PersistentStepRunner::drop_session`] after each run completes.
+    pub fn spawn_with_pty_sessions(
+        path: impl Into<String>,
+    ) -> (Core, std::sync::Arc<PersistentStepRunner>) {
+        let path = path.into();
+        let (tx, rx) = channel();
+        let self_tx = tx.clone();
+        let pty = terminal::new_map();
+        let pty_actor = pty.clone();
+        let runner = std::sync::Arc::new(session_runner::PersistentStepRunner::new(
+            tx.clone(),
+            pty.clone(),
+        ));
+        let runner_actor = runner.clone();
+        std::thread::spawn(move || {
+            actor::run(
+                path,
+                rx,
+                self_tx,
+                distribute::real_dispatcher(),
+                runner_actor,
+                pty_actor,
+                None,
+            )
+        });
+        let core = Core {
+            tx: tx.clone(),
+            pty,
+            _shutdown: Arc::new(ShutdownGuard { tx }),
+        };
+        (core, runner)
     }
 
     fn spawn_inner(

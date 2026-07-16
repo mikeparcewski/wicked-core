@@ -69,7 +69,7 @@ impl OutputAdapter for Passthrough {
 /// FAIL-SAFE: any line that is not valid JSON (version drift) degrades to a single passthrough text
 /// delta, so it never panics and never blocks the run.
 #[derive(Default)]
-struct ClaudeStreamJson {
+pub(crate) struct ClaudeStreamJson {
     /// Whether any assistant text delta was emitted this run — gates the terminal `result` fallback.
     emitted_text: bool,
 }
@@ -184,7 +184,7 @@ impl OutputAdapter for ClaudeStreamJson {
 /// which `--output-format stream-json --verbose` emits the NDJSON this adapter parses; without it claude
 /// runs interactively and the adapter degrades to passthrough. (M9: a raw stdout line containing invalid
 /// UTF-8 is dropped by the `map_while(Result::ok)` line reader — a pre-existing, accepted boundary.)
-fn binary_is_claude(bin: &str) -> bool {
+pub(crate) fn binary_is_claude(bin: &str) -> bool {
     std::path::Path::new(bin)
         .file_stem()
         .map(|s| s == "claude")
@@ -195,7 +195,7 @@ fn binary_is_claude(bin: &str) -> bool {
 /// before any `--` end-of-options guard so they are parsed as flags (never demoted to positional args
 /// after the prompt). Per-binary rule — only applied when the resolved binary is `claude`; no other
 /// seat's template is touched.
-fn inject_claude_stream_flags(argv: &mut Vec<String>) {
+pub(crate) fn inject_claude_stream_flags(argv: &mut Vec<String>) {
     // (M6) Skip injection when the operator template already sets `--output-format` (e.g.
     // `--output-format json`): injecting a SECOND `--output-format stream-json` produces conflicting
     // flags that claude rejects, failing the run. Honor the template's choice as-is.
@@ -492,7 +492,7 @@ fn arm_input_governance(
 /// Resolve a CLI key to its headless invocation template. Reads the council registry (built-ins +
 /// the user's `~/.config/wicked-council/clis.toml`); if the key isn't registered, treats the key
 /// itself as the binary (`<key> {PROMPT}`) so an ad-hoc binary still runs.
-fn resolve_invocation(cli_key: &str) -> String {
+pub(crate) fn resolve_invocation(cli_key: &str) -> String {
     let user =
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/wicked-council/clis.toml"));
     if let Ok(clis) = wicked_council::registry::load(user.as_deref()) {

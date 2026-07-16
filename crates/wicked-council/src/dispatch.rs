@@ -150,6 +150,10 @@ fn run_in_isolation(
                 }
             }
         }
+        InputMode::PtySession => {
+            // The council dispatcher doesn't manage PTY sessions; skip this seat entirely.
+            return None;
+        }
     }
 
     // Append trust flags so the CLI never blocks on an interactive prompt.
