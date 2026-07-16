@@ -111,7 +111,11 @@ fn gate_hook_is_single_writer_idempotent_and_vetoes() {
         .filter(|l| !l.trim().is_empty())
         .map(str::to_string)
         .collect();
-    assert_eq!(lines.len(), 4, "one sentinel + one claim line per hook invocation");
+    assert_eq!(
+        lines.len(),
+        4,
+        "one sentinel + one claim line per hook invocation"
+    );
 
     // Parse the deny claim id from the ndjson the hook produced.
     let deny_claim_id = lines

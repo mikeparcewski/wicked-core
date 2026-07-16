@@ -1184,9 +1184,8 @@ fn apply_step_result(
         // on this path (core#35).
         if output.governed {
             let phase = crate::scope::unit_phase(ord);
-            let _ = crate::gate_hook::fold_input_denial(
-                store, &run_id, output.attempt, &phase, true,
-            );
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
         }
         return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
     }
@@ -1228,7 +1227,9 @@ fn apply_step_result(
         if !outcome.hook_denied
             && matches!(
                 unit_gate,
-                crate::workflow::GateSpec::HumanConfirmIf(crate::workflow::GateCond::VerdictNotPass)
+                crate::workflow::GateSpec::HumanConfirmIf(
+                    crate::workflow::GateCond::VerdictNotPass
+                )
             )
         {
             pause_for_human(

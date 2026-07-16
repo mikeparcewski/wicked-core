@@ -112,8 +112,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
     // lines means the hook was bypassed (hook process suppressed while tool calls still ran) → DENY.
     {
-        let sentinel_line =
-            serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
+        let sentinel_line = serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
         if let Err(e) = with_append_lock(Path::new(&decisions_path), || {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
