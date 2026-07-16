@@ -80,6 +80,18 @@ pub(crate) enum Command {
         trigger: String,
         reply: Sender<anyhow::Result<()>>,
     },
+    /// Upsert a governance policy (JSON-serialized `wicked_governance::Policy`). Validates, then
+    /// registers via `register_policy` — idempotent on stable id. Fails closed on validation.
+    UpsertPolicy {
+        policy_json: String,
+        reply: Sender<anyhow::Result<()>>,
+    },
+    /// Upsert a conformance rule (JSON-serialized `wicked_governance::ConformanceRule`). Validates,
+    /// then registers via `register_rule` — idempotent on stable id. Fails closed on validation.
+    UpsertConformanceRule {
+        rule_json: String,
+        reply: Sender<anyhow::Result<()>>,
+    },
     /// Capture an episodic memory (a learned fact/decision) at `scope` (e.g. `app:<id>`; "" = root).
     CaptureMemory {
         content: String,
