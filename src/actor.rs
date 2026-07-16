@@ -1490,15 +1490,11 @@ fn dispatch_unit(
     let prior_outputs: Vec<PriorUnitOutput> = units
         .iter()
         .filter(|u| {
-            u.ord < unit.ord
-                && u.assigned_cli
-                    .as_deref()
-                    .map(|k| k != current_cli)
-                    .unwrap_or(false)
+            u.ord < unit.ord && u.assigned_cli.as_deref().unwrap_or("claude") != current_cli
         })
         .filter_map(|u| {
             let output = crate::domain::get_work_output(store, &u.id)?;
-            let cli = u.assigned_cli.as_deref().unwrap_or("unknown");
+            let cli = u.assigned_cli.as_deref().unwrap_or("claude");
             Some(PriorUnitOutput {
                 label: format!("[{cli} — unit {}]", u.ord),
                 output,

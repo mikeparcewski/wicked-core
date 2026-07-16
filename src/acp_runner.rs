@@ -361,7 +361,7 @@ fn handle_update(
                     let remaining = max_out - used;
                     let safe = text
                         .char_indices()
-                        .take_while(|(i, _)| *i < remaining)
+                        .take_while(|(i, c)| *i + c.len_utf8() <= remaining)
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
                         .unwrap_or(0);
