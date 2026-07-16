@@ -193,9 +193,7 @@ fn main() {
                     // waiting for events that will never arrive.
                     if matches!(
                         s,
-                        SessionStatus::Completed
-                            | SessionStatus::Cancelled
-                            | SessionStatus::Failed
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
                     ) {
                         return;
                     }
