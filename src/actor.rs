@@ -1178,6 +1178,16 @@ fn apply_step_result(
             format!("Worker FAILED on unit {ord}: {snippet}")
         });
         put_node(store, unit.to_node())?;
+        // Best-effort: conform any governed Deny claims that arrived before the worker crashed.
+        // Without this the decisions log is never read for a failed unit and the deny evidence
+        // is lost — fold_input_denial only runs inside apply_and_finish_unit, which we never reach
+        // on this path (core#35).
+        if output.governed {
+            let phase = crate::scope::unit_phase(ord);
+            let _ = crate::gate_hook::fold_input_denial(
+                store, &run_id, output.attempt, &phase, true,
+            );
+        }
         return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
     }
 
@@ -1212,10 +1222,15 @@ fn apply_step_result(
     // own completed verdict (before `fail_run`) is what makes it fire. The cursor is left ON this unit,
     // so a human `confirm_gate(Approve)` re-runs it and `Reject` cancels; every OTHER gate deny-dominates.
     if !outcome.approved {
-        if matches!(
-            unit_gate,
-            crate::workflow::GateSpec::HumanConfirmIf(crate::workflow::GateCond::VerdictNotPass)
-        ) {
+        // Hook-sourced denials are hard policy vetoes — they MUST NOT be routed to human review.
+        // HumanConfirmIf is for semantic verdict escalation (evaluator disagrees, human decides);
+        // a governance hook bypass can never be "confirmed away" by an operator.
+        if !outcome.hook_denied
+            && matches!(
+                unit_gate,
+                crate::workflow::GateSpec::HumanConfirmIf(crate::workflow::GateCond::VerdictNotPass)
+            )
+        {
             pause_for_human(
                 store,
                 subscribers,

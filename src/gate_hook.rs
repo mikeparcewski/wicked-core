@@ -107,6 +107,25 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
         }
     };
 
+    // Write the hook-fired liveness sentinel for `phase` BEFORE any policy evaluation or early-returns
+    // below. This proves the hook BINARY was invoked for this phase (not just that the launcher
+    // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
+    // lines means the hook was bypassed (hook process suppressed while tool calls still ran) → DENY.
+    {
+        let sentinel_line =
+            serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
+        if let Err(e) = with_append_lock(Path::new(&decisions_path), || {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&decisions_path)?;
+            f.write_all(sentinel_line.as_bytes())
+        }) {
+            eprintln!("wicked-governance: DENY (could not write hook-fired sentinel: {e})");
+            return 2;
+        }
+    }
+
     // Read-only use of the store: select reads policies, decide is pure. NO store write here.
     // On an INFRA failure below we still exit 2 (the tool IS blocked), but we ALSO best-effort append a
     // synthetic Deny so the block leaves durable evidence — otherwise the fold would see no claim and the
@@ -321,6 +340,12 @@ fn with_append_lock<T>(
 /// un-forgeable claims over the bus/store (issue #35).
 const ARMED_MARKER_KEY: &str = "_wicked_gov_armed";
 
+/// Written by the hook process itself (not the launcher) as the first entry after `ARMED_MARKER_KEY`.
+/// Proves the hook BINARY was actually invoked and ran to the policy-evaluation point — not just that
+/// the launcher configured it. `fold_input_denial` treats its absence alongside real claim lines as a
+/// tamper signal: hook process was suppressed while tool calls still happened.
+const HOOK_FIRED_KEY: &str = "_wicked_hook_fired";
+
 /// `create_dir_all` + restrict the leaf dir to owner-only (0700) on Unix, so another local user on a
 /// shared host cannot traverse in to read a run's policy scope/phase, tool-call context, or denial
 /// reasons (council [9]). The sensitive settings/decisions files live under this dir, so blocking
@@ -394,6 +419,12 @@ fn marker_phase(v: &serde_json::Value) -> Option<&str> {
     v.get(ARMED_MARKER_KEY).and_then(|x| x.as_str())
 }
 
+/// If `v` is a hook-fired sentinel, the phase it covers; else `None`. Root-key check for the same
+/// reason as `marker_phase` — substring matching would let a crafted claim sneak past the fold.
+fn fired_phase(v: &serde_json::Value) -> Option<&str> {
+    v.get(HOOK_FIRED_KEY).and_then(|x| x.as_str())
+}
+
 /// Fold a governed unit's INPUT-hook decisions into a single deny-dominant denial, for the run engine's
 /// existing per-unit gate (DES-OUTGOV-003 §1). Reads the run's decisions log; for each claim that
 /// targets THIS unit's `phase`, `conform`s it as durable evidence (idempotent upsert by claim symbol)
@@ -442,6 +473,8 @@ pub fn fold_input_denial(
     };
     let mut denial: Option<String> = None;
     let mut saw_marker = false;
+    let mut saw_hook_fired = false;
+    let mut has_claim_lines = false; // any ConformanceClaim present for `phase`
     for line in raw.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -468,6 +501,13 @@ pub fn fold_input_denial(
             }
             continue;
         }
+        // Hook-fired sentinel (root-key check): proves the hook BINARY ran for this phase.
+        if let Some(fp) = fired_phase(&v) {
+            if fp == phase {
+                saw_hook_fired = true;
+            }
+            continue;
+        }
         let claim: ConformanceClaim = match serde_json::from_value(v) {
             Ok(c) => c,
             Err(e) => {
@@ -482,6 +522,7 @@ pub fn fold_input_denial(
         if claim.phase != phase {
             continue; // another unit's claim — folded when that unit finishes
         }
+        has_claim_lines = true;
         conform(store, &claim)?;
         if denial.is_none() && claim.decision == Decision::Deny {
             denial = Some(format!(
@@ -496,6 +537,16 @@ pub fn fold_input_denial(
         denial = Some(format!(
             "input governance denied {phase} (fail-closed): armed marker missing \
              (decisions log tampered or truncated)"
+        ));
+    }
+    // Hook-liveness check: if there are claim lines for this phase but no hook-fired sentinel, the
+    // hook process was suppressed while tool calls still executed — deny immediately. The sentinel is
+    // written BEFORE any claim evaluation in `run_gate_hook`, so its absence with claims present is
+    // impossible in normal operation and indicates hook bypass.
+    if governed && saw_marker && has_claim_lines && !saw_hook_fired && denial.is_none() {
+        denial = Some(format!(
+            "input governance denied {phase} (fail-closed): hook-fired sentinel missing with \
+             claim lines present — hook process may have been suppressed (core#34)"
         ));
     }
     Ok(denial)
@@ -552,9 +603,9 @@ pub fn apply_hook_decisions(
         let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
             anyhow::anyhow!("hook-decision drain DENY (fail-closed): corrupted claim line: {e}")
         })?;
-        // Skip an armed-marker line (root-key check) — it is a launcher sentinel, not a claim, and would
-        // otherwise fail the drain closed.
-        if marker_phase(&v).is_some() {
+        // Skip sentinel lines (root-key check) — they are metadata, not claims, and would otherwise
+        // fail the drain closed on the `ConformanceClaim` deserialisation step.
+        if marker_phase(&v).is_some() || fired_phase(&v).is_some() {
             continue;
         }
         let claim: ConformanceClaim = serde_json::from_value(v).map_err(|e| {
