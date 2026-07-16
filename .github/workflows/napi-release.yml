@@ -33,10 +33,10 @@ concurrency:
 # crates.io, so there is no version-dep fallback. The build MUST check out wicked-estate as a SIBLING
 # of wicked-core so the path deps resolve from source (the .node statically bundles the bytes). Pin the
 # estate ref here; bump on each estate release that changes what the addon bundles.
-# Pinned to the estate v0.13.1 release tag — published to crates.io, with rustls-observe (drops
+# Pinned to the estate v0.13.2 release tag — published to crates.io, with rustls-observe (drops
 # openssl-sys so aarch64-linux cross-compiles). A stable tag, not a floating SHA.
 env:
-  WICKED_ESTATE_REF: v0.13.1
+  WICKED_ESTATE_REF: v0.13.2
 
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────

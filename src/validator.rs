@@ -708,22 +708,19 @@ pub fn run_validator_reporting(
     // Inject the estate db path so scripts that invoke `wicked-core coverage` resolve the correct store.
     // This is an explicit injection (not a passthrough), so it never leaks other env secrets.
     // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
-    // Canonicalize filesystem paths to absolute before injecting: the child's cwd is the worktree,
+    // Make relative paths absolute before injecting: the child's cwd is the worktree,
     // so a relative path like "wicked-estate.db" would mis-resolve there.
+    // (No fs::canonicalize — that prepends \\?\ UNC prefix on Windows, breaking sh/bash.)
     if let Some(db) = db_path {
         if !db.is_empty() && db != ":memory:" && !db.contains("://") {
-            let abs = std::fs::canonicalize(db)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| {
-                    let p = std::path::Path::new(db);
-                    if p.is_absolute() {
-                        db.to_string()
-                    } else {
-                        std::env::current_dir()
-                            .map(|d| d.join(p).to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| db.to_string())
-                    }
-                });
+            let p = std::path::Path::new(db);
+            let abs = if p.is_absolute() {
+                db.to_string()
+            } else {
+                std::env::current_dir()
+                    .map(|d| d.join(p).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| db.to_string())
+            };
             cmd.env("WICKED_ESTATE_DB", abs);
         }
     }
