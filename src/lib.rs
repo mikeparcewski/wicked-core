@@ -68,7 +68,6 @@ pub use domain_extraction::{
 };
 pub use event::CoreEvent;
 pub use execute_wrapped::WrappedCliStepRunner;
-pub use session_runner::PersistentStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, run_gate_hook, run_output_gate_hook,
     HookDrainSummary, DECISIONS_PATH_ENV, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
@@ -86,6 +85,7 @@ pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
 };
 pub use scope::{resolve_scope, EntityMode};
+pub use session_runner::PersistentStepRunner;
 pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs, ReconDoc};
 pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
@@ -210,7 +210,9 @@ impl Core {
     /// the same run share a single live PTY session (no per-unit cold-start). Uses the real council
     /// dispatcher. The returned `Core` also exposes a [`PersistentStepRunner`] handle so the caller
     /// can call [`PersistentStepRunner::drop_session`] after each run completes.
-    pub fn spawn_with_pty_sessions(path: impl Into<String>) -> (Core, std::sync::Arc<PersistentStepRunner>) {
+    pub fn spawn_with_pty_sessions(
+        path: impl Into<String>,
+    ) -> (Core, std::sync::Arc<PersistentStepRunner>) {
         let path = path.into();
         let (tx, rx) = channel();
         let self_tx = tx.clone();

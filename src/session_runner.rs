@@ -97,11 +97,7 @@ impl PersistentStepRunner {
         r
     }
 
-    fn open_terminal(
-        &self,
-        cwd: std::path::PathBuf,
-        cmd: Vec<String>,
-    ) -> anyhow::Result<String> {
+    fn open_terminal(&self, cwd: std::path::PathBuf, cmd: Vec<String>) -> anyhow::Result<String> {
         let (reply, rx) = std::sync::mpsc::channel();
         self.tx
             .send(Command::OpenTerminal {
@@ -201,7 +197,12 @@ impl PersistentStepRunner {
                     Err(e) => return failed_output(input, format!("open PTY session: {e}")),
                 };
                 wait_for_opened(&pre, &tid);
-                guard.insert(run_id.clone(), PtySession { terminal_id: tid.clone() });
+                guard.insert(
+                    run_id.clone(),
+                    PtySession {
+                        terminal_id: tid.clone(),
+                    },
+                );
                 tid
             }
         };
@@ -270,7 +271,15 @@ fn collect_turn(
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
                     line_buf.push_str(&String::from_utf8_lossy(&bytes));
                 }
-                if drain_lines(&mut line_buf, &mut adapter, emit, &mut output, &mut usage, &mut files, MAX_OUT) {
+                if drain_lines(
+                    &mut line_buf,
+                    &mut adapter,
+                    emit,
+                    &mut output,
+                    &mut usage,
+                    &mut files,
+                    MAX_OUT,
+                ) {
                     break true;
                 }
             }
@@ -282,7 +291,15 @@ fn collect_turn(
     };
 
     // Flush any remaining complete lines (e.g. on TerminalExited without trailing newline).
-    drain_lines(&mut line_buf, &mut adapter, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+    drain_lines(
+        &mut line_buf,
+        &mut adapter,
+        emit,
+        &mut output,
+        &mut usage,
+        &mut files,
+        MAX_OUT,
+    );
     // Adapter finish (both current adapters are stateless, but call for completeness).
     let fin = adapter.finish();
     absorb(fin, emit, &mut output, &mut usage, &mut files, MAX_OUT);
@@ -361,7 +378,11 @@ fn is_result_line(line: &str) -> bool {
     }
     serde_json::from_str::<serde_json::Value>(line)
         .ok()
-        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "result"))
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s == "result")
+        })
         .unwrap_or(false)
 }
 
@@ -394,7 +415,11 @@ mod tests {
     fn unique_db() -> String {
         let seq = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("wicked-core-sess-{}-{}.db", std::process::id(), seq));
+        p.push(format!(
+            "wicked-core-sess-{}-{}.db",
+            std::process::id(),
+            seq
+        ));
         p.to_string_lossy().into_owned()
     }
 
@@ -514,7 +539,10 @@ mod tests {
                 opened_count += 1;
             }
         }
-        assert_eq!(opened_count, 1, "expected exactly 1 TerminalOpened after turn 1");
+        assert_eq!(
+            opened_count, 1,
+            "expected exactly 1 TerminalOpened after turn 1"
+        );
 
         // Turn 2 — reuses the existing session.
         let out2 = runner.run_unit(&input2);
@@ -537,7 +565,10 @@ mod tests {
                 extra_opens += 1;
             }
         }
-        assert_eq!(extra_opens, 0, "unexpected extra TerminalOpened on turn 2 (session reused)");
+        assert_eq!(
+            extra_opens, 0,
+            "unexpected extra TerminalOpened on turn 2 (session reused)"
+        );
 
         // Explicit teardown — closes the PTY cleanly.
         runner.drop_session("run-shared-session");
@@ -558,8 +589,18 @@ mod tests {
         let out_a = runner.run_unit(&input_a);
         let out_b = runner.run_unit(&input_b);
 
-        assert_eq!(out_a.status, StepStatus::Ok, "run-A failed: {:?}", out_a.output);
-        assert_eq!(out_b.status, StepStatus::Ok, "run-B failed: {:?}", out_b.output);
+        assert_eq!(
+            out_a.status,
+            StepStatus::Ok,
+            "run-A failed: {:?}",
+            out_a.output
+        );
+        assert_eq!(
+            out_b.status,
+            StepStatus::Ok,
+            "run-B failed: {:?}",
+            out_b.output
+        );
 
         // Two separate sessions opened.
         let mut opened = 0usize;
@@ -568,7 +609,10 @@ mod tests {
                 opened += 1;
             }
         }
-        assert_eq!(opened, 2, "expected 2 TerminalOpened (one per run_id); got {opened}");
+        assert_eq!(
+            opened, 2,
+            "expected 2 TerminalOpened (one per run_id); got {opened}"
+        );
 
         runner.drop_session("run-A");
         runner.drop_session("run-B");
