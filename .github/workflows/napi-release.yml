@@ -36,7 +36,7 @@ concurrency:
 # Pinned to the estate v0.13.1 release tag — published to crates.io, with rustls-observe (drops
 # openssl-sys so aarch64-linux cross-compiles). A stable tag, not a floating SHA.
 env:
-  WICKED_ESTATE_REF: v0.13.1
+  WICKED_ESTATE_REF: v0.13.2
 
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────

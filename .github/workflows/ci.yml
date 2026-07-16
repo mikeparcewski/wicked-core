@@ -25,7 +25,7 @@ concurrency:
 
 env:
   # Keep in lockstep with napi-release.yml's WICKED_ESTATE_REF.
-  WICKED_ESTATE_REF: v0.13.1
+  WICKED_ESTATE_REF: v0.13.2
   # Offline embedder — the memory engine must not download a model in CI (matches the tests' own default).
   WICKED_MEMORY_EMBEDDER: hash
   CARGO_TERM_COLOR: always
