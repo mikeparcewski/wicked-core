@@ -113,7 +113,17 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     // lines means the hook was bypassed (hook process suppressed while tool calls still ran) → DENY.
     {
         let sentinel_line = serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
-        if let Err(e) = with_append_lock(Path::new(&decisions_path), || {
+        let sentinel_path = Path::new(&decisions_path);
+        // In a launcher-managed run the dir already exists (write_armed_marker ran first); in a
+        // standalone / test invocation it may not. Create it here so the sentinel write never fails
+        // with a spurious DENY on a missing parent directory.
+        if let Some(parent) = sentinel_path.parent() {
+            if let Err(e) = create_dir_all_private(parent) {
+                eprintln!("wicked-governance: DENY (could not create governance dir: {e})");
+                return 2;
+            }
+        }
+        if let Err(e) = with_append_lock(sentinel_path, || {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)

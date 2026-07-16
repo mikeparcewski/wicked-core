@@ -451,8 +451,10 @@ pub(crate) fn apply_and_finish_unit(
         &crate::scope::unit_phase(unit.ord),
         governed,
     )?;
-    // Capture BEFORE folding — actor uses this to block HumanConfirmIf routing on hook vetoes
-    // (a hook-sourced deny must hard-fail the run, not escalate to human review).
+    // Capture whether the hook denied NOW, before `hook_denial` is moved into the deny-dominance
+    // fold below and its source identity is lost in `validator_denial`. The actor uses this flag to
+    // block HumanConfirmIf routing on hook vetoes (a hook-sourced deny must hard-fail the run, not
+    // escalate to human review).
     let hook_denied = hook_denial.is_some();
 
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
