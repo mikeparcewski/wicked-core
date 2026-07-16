@@ -188,13 +188,14 @@ fn main() {
             match core.resume_run(&sid) {
                 Ok(s) => {
                     println!("reattach {sid} → {s:?}");
-                    // resume_run returns Ok(terminal_status) for already-terminal sessions without
-                    // dispatching any work. Don't call drain_events — it would block for 1 hour
-                    // waiting for events that will never arrive.
+                    // resume_run may emit events (SessionFailed, SessionCompleted, etc.) before
+                    // returning a terminal status for a crash-recovered session. Drain whatever
+                    // is already queued non-blockingly before returning so the operator sees them.
                     if matches!(
                         s,
                         SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
                     ) {
+                        drain_non_blocking(&events);
                         return;
                     }
                 }
@@ -528,6 +529,15 @@ fn run_interactive(core: &Core, args: &[String]) {
     };
     println!("running {run_id}");
     drain_events(&events, Some((core, &run_id)));
+}
+
+/// Drain all events already queued in the channel without blocking. Used before an early-return
+/// when `resume_run` signals a terminal state — it may have dispatched events (SessionFailed,
+/// SessionCompleted, etc.) before returning, and we want the operator to see them.
+fn drain_non_blocking(events: &std::sync::mpsc::Receiver<CoreEvent>) {
+    while let Ok(ev) = events.try_recv() {
+        println!("  {ev:?}");
+    }
 }
 
 /// Print every event until the run reaches a terminal state. If `gate` is set, prompt the operator
