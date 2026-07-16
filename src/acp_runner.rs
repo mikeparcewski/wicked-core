@@ -378,6 +378,8 @@ fn fallback_with_warning(
 
 // ── AcpStepRunner ─────────────────────────────────────────────────────────────
 
+type SessionMap = Arc<Mutex<HashMap<(String, String), Arc<Mutex<AcpProcess>>>>>;
+
 /// A [`StepRunner`] that drives ACP multi-turn sessions for all registered CLIs.
 ///
 /// Sessions are keyed by `(run_id, cli_key)` — each CLI in a multi-CLI run gets its own
@@ -392,7 +394,7 @@ fn fallback_with_warning(
 /// the degradation is visible in both streaming output and persisted logs.
 pub struct AcpStepRunner {
     /// Keyed by `(run_id, cli_key)` — one process per CLI per run.
-    sessions: Arc<Mutex<HashMap<(String, String), Arc<Mutex<AcpProcess>>>>>,
+    sessions: SessionMap,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
 }
