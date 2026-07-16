@@ -33,7 +33,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use wicked_apps_core::{
-    open_store, open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
+    open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
     CONFORMANCE_CLAIM,
 };
 use wicked_governance::{conform, decide, recall_rules, select, RuleQuery};
@@ -879,6 +879,7 @@ fn output_rule_query() -> RuleQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wicked_apps_core::open_store;
 
     #[test]
     fn pretool_context_extracts_bash_command_into_work() {
