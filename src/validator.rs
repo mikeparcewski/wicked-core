@@ -133,6 +133,7 @@ pub fn author_deterministic_validator(
         // UNGOVERNED: this is the engine's OWN internal claude call (agent-judge / validator authoring).
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
+        prior_outputs: vec![],
     };
     let out = runner.run_unit(&input);
     if out.status != StepStatus::Ok {
@@ -883,6 +884,7 @@ pub fn agent_validate(
         // UNGOVERNED: this is the engine's OWN internal claude call (agent-judge / validator authoring).
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
+        prior_outputs: vec![],
     };
     let out = runner.run_unit(&input);
     if out.status != StepStatus::Ok {

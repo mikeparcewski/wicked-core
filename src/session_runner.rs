@@ -487,6 +487,7 @@ mod tests {
             entity_mode: EntityMode::Shared,
             workdir: Some(std::env::temp_dir()),
             governance: None,
+            prior_outputs: vec![],
         }
     }
 

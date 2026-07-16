@@ -22,6 +22,17 @@
 use crate::domain::WorkUnit;
 use crate::scope::EntityMode;
 
+/// Output from a prior completed unit that ran on a DIFFERENT CLI — injected into the current
+/// unit's ACP context so each agent sees what its peers produced. Actor-populated (store read on
+/// the actor thread); the worker never queries the store (single-writer invariant).
+#[derive(Debug, Clone)]
+pub struct PriorUnitOutput {
+    /// Human-readable label for the context block, e.g. `"[codex — unit 2]"`.
+    pub label: String,
+    /// The unit's produced work output.
+    pub output: String,
+}
+
 /// Everything a worker needs to do one unit's *slow* work, pre-loaded by the actor so the worker
 /// holds **no store handle** (the single-writer invariant). In P1 the slow work is the stub; P4a's
 /// real backend runs the wrapped-CLI subprocess against `workdir`.
@@ -45,6 +56,11 @@ pub struct StepInput {
     /// must never self-govern against an empty scope. `None` is the unambiguous ungoverned signal
     /// (distinct from a governed unit that merely has an empty scope).
     pub governance: Option<GovernanceContext>,
+    /// Completed outputs from units that ran on a DIFFERENT CLI earlier in the same run — shared
+    /// cross-CLI context injected as additional prompt blocks by the ACP runner. Empty for
+    /// single-CLI runs, same-CLI sequences, and non-ACP fallback paths. Actor-populated so the
+    /// worker holds no store handle (single-writer invariant).
+    pub prior_outputs: Vec<PriorUnitOutput>,
 }
 
 /// The governance context threaded to a GOVERNED wrapped-CLI unit (DES-OUTGOV-003 §4). Carries the ONE

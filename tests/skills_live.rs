@@ -40,6 +40,7 @@ fn a_skill_driven_unit_loads_the_named_skill_against_real_claude() {
         entity_mode: EntityMode::Shared,
         workdir: None,
         governance: None,
+        prior_outputs: vec![],
     };
 
     let runner = WrappedCliStepRunner::default();

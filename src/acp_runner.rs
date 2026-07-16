@@ -39,7 +39,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use crate::execute_wrapped::{skill_prompt, WrappedCliStepRunner};
-use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
+use crate::workflow::{
+    DeltaSink, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus, Usage,
+};
 use wicked_council::types::{AcpConfig, AcpTransport};
 
 // ── ACP child process ─────────────────────────────────────────────────────────
@@ -204,14 +206,32 @@ struct TurnResult {
 
 /// Send one `session/prompt` request and collect `session/update` notifications until
 /// the response arrives (or `timeout` elapses). Streams text deltas through `emit`.
+///
+/// `prior_outputs` are injected as leading ACP prompt blocks so the agent sees what peer CLIs
+/// produced before this turn. For a single-CLI run this slice is empty; the prompt stays
+/// a single text block exactly as before. For multi-CLI runs each prior block is prefixed with
+/// its label so the agent can attribute each peer's contribution.
 fn exec_turn_acp(
     proc: &mut AcpProcess,
     prompt: &str,
+    prior_outputs: &[PriorUnitOutput],
     emit: &DeltaSink,
     timeout: Duration,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
+
+    // Build the prompt block array: prior-CLI context (if any) followed by the work prompt.
+    let mut blocks: Vec<Value> = prior_outputs
+        .iter()
+        .map(|p| {
+            json!({
+                "type": "text",
+                "text": format!("{}\n{}", p.label, p.output)
+            })
+        })
+        .collect();
+    blocks.push(json!({"type": "text", "text": prompt}));
 
     rpc_send(
         &mut proc.stdin,
@@ -219,7 +239,7 @@ fn exec_turn_acp(
         "session/prompt",
         json!({
             "sessionId": proc.session_id,
-            "prompt": [{"type": "text", "text": prompt}]
+            "prompt": blocks
         }),
     )?;
 
@@ -464,7 +484,7 @@ impl AcpStepRunner {
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
         let prompt = skill_prompt(&input.unit);
 
-        match exec_turn_acp(&mut proc, &prompt, emit, self.timeout) {
+        match exec_turn_acp(&mut proc, &prompt, &input.prior_outputs, emit, self.timeout) {
             Ok(result) if result.status == StepStatus::Ok => StepOutput {
                 run_id: input.run_id.clone(),
                 unit_ix: input.unit_ix,
