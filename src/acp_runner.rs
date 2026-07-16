@@ -412,7 +412,9 @@ fn fallback_with_warning(
 
 // ── AcpStepRunner ─────────────────────────────────────────────────────────────
 
-type SessionMap = Arc<Mutex<HashMap<(String, String), Arc<Mutex<AcpProcess>>>>>;
+// `None` entries cache a failed startup so subsequent units for the same
+// `(run_id, cli_key)` fall back immediately without re-attempting spawn.
+type SessionMap = Arc<Mutex<HashMap<(String, String), Option<Arc<Mutex<AcpProcess>>>>>>;
 
 /// A [`StepRunner`] that drives ACP multi-turn sessions for all registered CLIs.
 ///
@@ -492,10 +494,17 @@ impl AcpStepRunner {
         // Lazily open a session for (run_id, cli_key). The global map lock is held only
         // for the brief map lookup/insert — not across the blocking spawn + handshake.
         let session_key = (run_id.clone(), cli_key.clone());
+        // `None` in the map means a previous startup for this key failed; fall back
+        // immediately without re-attempting spawn (avoids repeated warnings per run).
         let proc_arc: Arc<Mutex<AcpProcess>> = {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(arc) = guard.get(&session_key) {
-                arc.clone()
+            if let Some(slot) = guard.get(&session_key) {
+                match slot {
+                    Some(arc) => arc.clone(),
+                    None => {
+                        return self.fallback.run_unit_streaming(input, emit);
+                    }
+                }
             } else {
                 drop(guard);
                 let cwd = input
@@ -508,19 +517,19 @@ impl AcpStepRunner {
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                         guard
                             .entry(session_key.clone())
-                            .or_insert_with(|| arc.clone())
+                            .or_insert(Some(arc.clone()))
+                            .as_ref()
+                            .unwrap()
                             .clone()
                     }
                     Err(e) => {
-                        return fallback_with_warning(
-                            format!(
-                                "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
-                                 using single-shot fallback"
-                            ),
-                            input,
-                            emit,
-                            &self.fallback,
+                        let warning = format!(
+                            "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
+                             using single-shot fallback"
                         );
+                        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.entry(session_key.clone()).or_insert(None);
+                        return fallback_with_warning(warning, input, emit, &self.fallback);
                     }
                 }
             }
