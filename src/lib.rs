@@ -11,6 +11,7 @@
 //! execute backend (real subprocess + gate-hook), migrating the GUI onto `Core`, and deleting the
 //! `wicked-agent` crate.
 
+mod acp_runner;
 mod actor;
 mod applications;
 mod bus;
@@ -41,6 +42,7 @@ mod validator;
 mod validator_vault;
 mod workflow;
 
+pub use acp_runner::AcpStepRunner;
 pub use actor::{RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
@@ -168,14 +170,18 @@ pub struct Core {
 
 impl Core {
     /// Spawn the store actor over the estate store at `path`, with the production engine seams: the
-    /// real council dispatcher + the real wrapped-CLI step runner (runs actual agentic CLIs in the
-    /// run's worktree). The actor lives until every `Core` handle is dropped. Tests use
-    /// [`Core::spawn_with_engine`] to inject a stub runner instead.
+    /// real council dispatcher + the ACP multi-CLI session runner. ACP is the default — each CLI
+    /// runs its wrapper binary in a persistent session so turns within a run share prompt-cache.
+    /// Governed units (gate-hook injection required) always route to the single-shot wrapped runner;
+    /// ACP is not used for those. When an ACP binary is absent, the runner emits a warning in the
+    /// step output and falls back to single-shot invocation automatically. The actor lives until
+    /// every `Core` handle is dropped. Tests use [`Core::spawn_with_engine`] to inject a stub
+    /// runner instead.
     pub fn spawn(path: impl Into<String>) -> Core {
         Core::spawn_with_engine(
             path,
             distribute::real_dispatcher(),
-            std::sync::Arc::new(execute_wrapped::WrappedCliStepRunner::default()),
+            std::sync::Arc::new(acp_runner::AcpStepRunner::new()),
         )
     }
 
@@ -239,6 +245,20 @@ impl Core {
             pty,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
+        (core, runner)
+    }
+
+    /// Spawn the store actor with an [`AcpStepRunner`] as the execution seam — units within the
+    /// same run share a persistent ACP session per CLI (no per-unit cold-start). Uses the real
+    /// council dispatcher. The returned `Core` also exposes an [`AcpStepRunner`] handle so the
+    /// caller can call [`AcpStepRunner::drop_session`] after each run completes to release the
+    /// ACP child processes. See [`Core::spawn`] for the simpler version that manages the runner
+    /// internally.
+    pub fn spawn_with_acp_sessions(
+        path: impl Into<String>,
+    ) -> (Core, std::sync::Arc<AcpStepRunner>) {
+        let runner = std::sync::Arc::new(AcpStepRunner::new());
+        let core = Core::spawn_inner(path, distribute::real_dispatcher(), runner.clone(), None);
         (core, runner)
     }
 
@@ -823,6 +843,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            acp: None,
         };
 
         let dir = std::env::temp_dir().join("wicked-core-pipeline-test");

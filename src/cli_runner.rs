@@ -146,6 +146,17 @@ struct DispatchedTask {
     /// whole exec-mediation delivery mode. `None` ⇒ ungoverned (default preserves old wire compat).
     #[serde(default)]
     governance: Option<crate::workflow::GovernanceContext>,
+    /// Cross-CLI shared context (ACP multi-CLI): prior completed units that ran on a different CLI,
+    /// actor-populated before dispatch so the worker holds no store handle.
+    #[serde(default)]
+    prior_outputs: Vec<PriorOutputWire>,
+}
+
+/// Wire representation of a cross-CLI prior-unit output (Serialize/Deserialize for the event bus).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PriorOutputWire {
+    label: String,
+    output: String,
 }
 
 /// Blank the deterministic validator's SHELL SCRIPT before a unit rides the bus (seam finding #7): the
@@ -473,6 +484,14 @@ pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Opt
             cli: input.unit.assigned_cli.clone(),
             validator_pin,
             governance: input.governance.clone(),
+            prior_outputs: input
+                .prior_outputs
+                .iter()
+                .map(|p| PriorOutputWire {
+                    label: p.label.clone(),
+                    output: p.output.clone(),
+                })
+                .collect(),
         };
         let payload = match serde_json::to_value(&task) {
             Ok(v) => v,
@@ -691,6 +710,16 @@ fn run_cli_runner(
                     workdir: task.workdir.clone().map(std::path::PathBuf::from),
                     // §5: carry governance across the bus so the off-actor launcher governs identically.
                     governance: task.governance.clone(),
+                    // Cross-CLI shared context: actor-populated before dispatch so the worker holds no
+                    // store handle (single-writer invariant). Rides the DispatchedTask payload.
+                    prior_outputs: task
+                        .prior_outputs
+                        .into_iter()
+                        .map(|p| crate::workflow::PriorUnitOutput {
+                            label: p.label,
+                            output: p.output,
+                        })
+                        .collect(),
                 };
                 // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does. The
@@ -878,6 +907,7 @@ mod tests {
             entity_mode: EntityMode::Shared,
             workdir: None,
             governance: None,
+            prior_outputs: vec![],
         };
 
         // Arm the publisher on THIS thread, publish, then disarm (thread-local is per-thread).
@@ -937,6 +967,7 @@ mod tests {
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: "/abs/estate.db".into(),
             }),
+            prior_outputs: vec![],
         };
 
         assert!(arm_exec_publisher(&bus_path), "arm publisher");
@@ -974,6 +1005,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            acp: None,
         }
     }
 
@@ -1030,6 +1062,7 @@ mod tests {
             entity_mode: EntityMode::Isolated,
             workdir: Some(dir.clone()),
             governance: None,
+            prior_outputs: vec![],
         };
         let noop: &DeltaSink = &|_: &str| {};
 

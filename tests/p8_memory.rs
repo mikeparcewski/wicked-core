@@ -55,6 +55,7 @@ fn cli(key: &str) -> AgenticCli {
         alt_binaries: vec![],
         confidence: Confidence::default(),
         enabled_for_council: true,
+        acp: None,
     }
 }
 

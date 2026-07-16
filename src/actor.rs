@@ -28,7 +28,7 @@ use crate::command::Command;
 use crate::domain::{put_node, SessionStatus};
 use crate::event::CoreEvent;
 use crate::terminal::{self, PtyMap};
-use crate::workflow::{StepInput, StepRunner};
+use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, LaunchSpec};
 
 /// The actor-owned terminal registry entry (DES §4 "id → status"). Presence in the registry map IS
@@ -1479,6 +1479,30 @@ fn dispatch_unit(
     } else {
         None
     };
+    // CROSS-CLI SHARED CONTEXT (ACP multi-CLI, Tutti-inspired "@"-workspace): collect completed prior
+    // units whose assigned CLI differs from the current unit's CLI and inject their work output as
+    // context blocks. Read on the actor thread (store access) before the worker is dispatched; the
+    // worker holds no store handle (single-writer invariant). Empty for single-CLI runs.
+    // Reuses `units` already fetched above — no second store read.
+    let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
+    let prior_outputs: Vec<PriorUnitOutput> = units
+        .iter()
+        .filter(|u| {
+            u.ord < unit.ord
+                && u.assigned_cli
+                    .as_deref()
+                    .map(|k| k != current_cli)
+                    .unwrap_or(false)
+        })
+        .filter_map(|u| {
+            let output = crate::domain::get_work_output(store, &u.id)?;
+            let cli = u.assigned_cli.as_deref().unwrap_or("unknown");
+            Some(PriorUnitOutput {
+                label: format!("[{cli} — unit {}]", u.ord),
+                output,
+            })
+        })
+        .collect();
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -1490,6 +1514,7 @@ fn dispatch_unit(
         // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
         // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
         governance: in_process_governance(),
+        prior_outputs,
     };
 
     // LAW 1 EXECUTION-MEDIATION SEAM (opt-in). When exec-mediation is armed on this (actor) thread, the

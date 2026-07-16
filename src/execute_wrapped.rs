@@ -756,6 +756,7 @@ mod tests {
             entity_mode: crate::scope::EntityMode::Isolated,
             workdir: None,
             governance: Some(gov.clone()),
+            prior_outputs: vec![],
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
         let g = arm_input_governance(&input, &gov, &mut argv).unwrap();

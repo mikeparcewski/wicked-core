@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::types::{AgenticCli, Category, Confidence, InputMode};
+use crate::types::{AcpConfig, AcpTransport, AgenticCli, Category, Confidence, InputMode};
 use serde::Deserialize;
 
 /// The shape of the user TOML file: `[[cli]]` array-of-tables.
@@ -60,6 +60,8 @@ impl From<TomlCli> for AgenticCli {
             // User records default to confirm-on-probe.
             confidence: t.confidence.unwrap_or(Confidence::ConfirmOnProbe),
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
+            // User TOML records carry no ACP config; the engine falls back to single-shot.
+            acp: None,
         }
     }
 }
@@ -81,6 +83,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            acp: Some(AcpConfig {
+                binary: "claude-agent-acp".into(),
+                start_args: vec![],
+                transport: AcpTransport::Stdio,
+            }),
         },
         AgenticCli {
             key: "agy".into(),
@@ -94,6 +101,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            acp: Some(AcpConfig {
+                binary: "agy-acp".into(),
+                start_args: vec![],
+                transport: AcpTransport::Stdio,
+            }),
         },
         AgenticCli {
             key: "codex".into(),
@@ -107,6 +119,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            acp: Some(AcpConfig {
+                binary: "codex-acp".into(),
+                start_args: vec![],
+                transport: AcpTransport::Stdio,
+            }),
         },
         AgenticCli {
             key: "pi".into(),
@@ -120,6 +137,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            acp: Some(AcpConfig {
+                binary: "pi-acp".into(),
+                start_args: vec![],
+                transport: AcpTransport::Stdio,
+            }),
         },
         AgenticCli {
             key: "copilot".into(),
@@ -133,6 +155,12 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // copilot HTTP ACP on a fixed port 3000 (not dynamic; single-session only).
+            acp: Some(AcpConfig {
+                binary: "copilot".into(),
+                start_args: vec!["--acp".into(), "--port".into(), "3000".into()],
+                transport: AcpTransport::Http,
+            }),
         },
         AgenticCli {
             key: "opencode".into(),
@@ -146,6 +174,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // opencode exposes ACP via its HTTP server; pending transport implementation.
+            acp: None,
         },
     ]
 }
