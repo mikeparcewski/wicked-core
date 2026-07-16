@@ -699,6 +699,12 @@ pub fn run_validator_reporting(
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(cwd);
     apply_minimal_env(&mut cmd);
+    // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
+    // relying on PATH — essential in CI where the binary is invoked by absolute path and the sandbox
+    // strips PATH to the bare minimum. Falls back gracefully when current_exe() is unavailable.
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("WICKED_CORE_EXE", exe);
+    }
     // Inject the estate db path so scripts that invoke `wicked-core coverage` resolve the correct store.
     // This is an explicit injection (not a passthrough), so it never leaks other env secrets.
     // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
