@@ -546,7 +546,10 @@ impl Core {
     pub fn upsert_policy(&self, policy_json: impl Into<String>) -> anyhow::Result<()> {
         let (reply, rx) = channel();
         self.tx
-            .send(Command::UpsertPolicy { policy_json: policy_json.into(), reply })
+            .send(Command::UpsertPolicy {
+                policy_json: policy_json.into(),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
@@ -558,7 +561,10 @@ impl Core {
     pub fn upsert_conformance_rule(&self, rule_json: impl Into<String>) -> anyhow::Result<()> {
         let (reply, rx) = channel();
         self.tx
-            .send(Command::UpsertConformanceRule { rule_json: rule_json.into(), reply })
+            .send(Command::UpsertConformanceRule {
+                rule_json: rule_json.into(),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
