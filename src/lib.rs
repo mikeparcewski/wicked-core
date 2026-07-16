@@ -171,10 +171,12 @@ pub struct Core {
 impl Core {
     /// Spawn the store actor over the estate store at `path`, with the production engine seams: the
     /// real council dispatcher + the ACP multi-CLI session runner. ACP is the default — each CLI
-    /// runs its wrapper binary and shares prompt-cache across governed turns. When an ACP binary is
-    /// absent, the runner emits a warning in the step output and falls back to single-shot
-    /// invocation automatically. The actor lives until every `Core` handle is dropped. Tests use
-    /// [`Core::spawn_with_engine`] to inject a stub runner instead.
+    /// runs its wrapper binary in a persistent session so turns within a run share prompt-cache.
+    /// Governed units (gate-hook injection required) always route to the single-shot wrapped runner;
+    /// ACP is not used for those. When an ACP binary is absent, the runner emits a warning in the
+    /// step output and falls back to single-shot invocation automatically. The actor lives until
+    /// every `Core` handle is dropped. Tests use [`Core::spawn_with_engine`] to inject a stub
+    /// runner instead.
     pub fn spawn(path: impl Into<String>) -> Core {
         Core::spawn_with_engine(
             path,
