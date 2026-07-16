@@ -354,8 +354,18 @@ fn handle_update(
         "agent_message_chunk" => {
             if let Some(text) = update["content"]["text"].as_str() {
                 emit(text);
-                if output.len() < max_out {
-                    output.push_str(text);
+                let used = output.len();
+                if used < max_out {
+                    // Clamp to remaining capacity at a valid UTF-8 boundary so
+                    // a single large chunk never pushes output past max_out.
+                    let remaining = max_out - used;
+                    let safe = text
+                        .char_indices()
+                        .take_while(|(i, _)| *i < remaining)
+                        .last()
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    output.push_str(&text[..safe]);
                 }
             }
         }
