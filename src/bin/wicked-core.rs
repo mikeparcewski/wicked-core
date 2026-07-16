@@ -33,8 +33,8 @@ use std::io::BufRead;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
-    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, WorkflowRegistry, WrappedCliStepRunner,
-    ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
+    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
+    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -178,6 +178,34 @@ fn main() {
                 Err(e) => fail(&format!("resume failed: {e}")),
             }
         }
+        Some("reattach") => {
+            let Some(sid) = flag(&args, "--session") else {
+                fail("reattach requires --session <id>");
+                return;
+            };
+            // Subscribe BEFORE resume_run so no events are missed.
+            let events = core.subscribe();
+            match core.resume_run(&sid) {
+                Ok(s) => {
+                    println!("reattach {sid} → {s:?}");
+                    // resume_run may emit events (SessionFailed, SessionCompleted, etc.) before
+                    // returning a terminal status for a crash-recovered session. Drain whatever
+                    // is already queued non-blockingly before returning so the operator sees them.
+                    if matches!(
+                        s,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ) {
+                        drain_non_blocking(&events);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    fail(&format!("reattach failed: {e}"));
+                    return;
+                }
+            }
+            drain_events(&events, Some((&core, &sid)));
+        }
         Some("cancel") => {
             let Some(sid) = flag(&args, "--session") else {
                 fail("cancel requires --session <id>");
@@ -213,7 +241,7 @@ fn main() {
             eprintln!(
                 "usage: wicked-core <status | repos | register-repo --path <dir> | \
                  run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
-                 resume --session <id> | cancel --session <id> | \
+                 resume --session <id> | reattach --session <id> | cancel --session <id> | \
                  launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
                  provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
                  seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
@@ -503,15 +531,30 @@ fn run_interactive(core: &Core, args: &[String]) {
     drain_events(&events, Some((core, &run_id)));
 }
 
+/// Drain all events already queued in the channel without blocking. Used before an early-return
+/// when `resume_run` signals a terminal state — it may have dispatched events (SessionFailed,
+/// SessionCompleted, etc.) before returning, and we want the operator to see them.
+fn drain_non_blocking(events: &std::sync::mpsc::Receiver<CoreEvent>) {
+    while let Ok(ev) = events.try_recv() {
+        println!("  {ev:?}");
+    }
+}
+
 /// Print every event until the run reaches a terminal state. If `gate` is set, prompt the operator
 /// at each `AwaitingHuman` and resolve it via `confirm_gate`.
 fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Core, &str)>) {
+    // When `gate` carries a session id, only treat terminal events for *that* session as
+    // completion.  Events from other concurrent sessions (campaigns, terminal sessions, etc.)
+    // are printed but do not break the loop or trigger gate responses.
+    let is_mine = |s: &str| gate.map(|(_, id)| id == s).unwrap_or(true);
     loop {
         match events.recv_timeout(Duration::from_secs(3600)) {
             Ok(ev) => {
                 println!("  {ev:?}");
                 match &ev {
-                    CoreEvent::AwaitingHuman { prompt, .. } => {
+                    CoreEvent::AwaitingHuman {
+                        session, prompt, ..
+                    } if is_mine(session) => {
                         if let Some((core, run_id)) = gate {
                             let decision = prompt_decision(prompt);
                             match core.confirm_gate(run_id, decision) {
@@ -523,10 +566,18 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                             }
                         }
                     }
-                    CoreEvent::SessionCompleted { .. }
-                    | CoreEvent::RunCancelled { .. }
-                    | CoreEvent::SessionFailed { .. }
-                    | CoreEvent::Error { .. } => break,
+                    CoreEvent::SessionCompleted { session }
+                    | CoreEvent::RunCancelled { session }
+                    | CoreEvent::SessionFailed { session, .. }
+                        if is_mine(session) =>
+                    {
+                        break
+                    }
+                    CoreEvent::Error { session, .. }
+                        if session.as_deref().map(is_mine).unwrap_or(true) =>
+                    {
+                        break
+                    }
                     _ => {}
                 }
             }
