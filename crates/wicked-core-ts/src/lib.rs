@@ -743,7 +743,10 @@ impl Core {
             let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
             match recompute_front_half_coverage(&store) {
                 Ok(report) => serde_json::to_string(&report).map_err(err),
-                Err(_) => Ok("null".to_string()),
+                Err(e) => {
+                    eprintln!("wicked-core-ts: getCoverageReport failed: {e}");
+                    Ok("null".to_string())
+                }
             }
         })
     }
