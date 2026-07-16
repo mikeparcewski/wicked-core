@@ -19,6 +19,12 @@ crate-type = ["cdylib"]
 wicked-core = { path = "../.." }
 # Needed to construct AgenticCli seats + implement a stub Dispatcher for the no-LLM test engine.
 wicked-council = { path = "../wicked-council" }
+# Governance read seam (crew#40): open_store_ro + ConformanceClaim + FromNode + constants.
+wicked-apps-core = { path = "../wicked-apps-core" }
+# Policy / ConformanceRule / claim_from_node / recall_rules.
+wicked-governance = { path = "../wicked-governance" }
+# SymbolQuery — not re-exported by wicked-apps-core; needed by the governance read methods.
+wicked-estate-core = { path = "../../../wicked-estate/crates/wicked-estate-core" }
 napi = { version = "2", default-features = false, features = ["napi8"] }
 napi-derive = "2"
 serde = { version = "1", features = ["derive"] }

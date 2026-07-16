@@ -2615,8 +2615,11 @@ dependencies = [
  "napi-derive",
  "serde",
  "serde_json",
+ "wicked-apps-core",
  "wicked-core",
  "wicked-council",
+ "wicked-estate-core",
+ "wicked-governance",
 ]
 
 [[package]]
@@ -2635,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-core"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "async-trait",
  "serde",
@@ -2645,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-knowledge"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "serde",
@@ -2660,7 +2663,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-memory"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -2676,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-memory-api"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "serde",
  "wicked-estate-memory-core",
@@ -2684,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-memory-core"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -2694,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-observe"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "reqwest",
  "serde_json",
@@ -2703,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-overlay"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "rusqlite",
  "tokio",
@@ -2713,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-rank"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "petgraph",
  "serde",
@@ -2722,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-retrieve"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "model2vec-rs",
  "serde_json",
@@ -2733,7 +2736,7 @@ dependencies = [
 
 [[package]]
 name = "wicked-estate-store"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "async-trait",
  "deadpool",
