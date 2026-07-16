@@ -246,6 +246,20 @@ impl Core {
         (core, runner)
     }
 
+    /// Spawn the store actor with an [`AcpStepRunner`] as the execution seam — units within the
+    /// same run share a persistent ACP session per CLI (no per-unit cold-start). Uses the real
+    /// council dispatcher. The returned `Core` also exposes an [`AcpStepRunner`] handle so the
+    /// caller can call [`AcpStepRunner::drop_session`] after each run completes to release the
+    /// ACP child processes. See [`Core::spawn`] for the simpler version that manages the runner
+    /// internally.
+    pub fn spawn_with_acp_sessions(
+        path: impl Into<String>,
+    ) -> (Core, std::sync::Arc<AcpStepRunner>) {
+        let runner = std::sync::Arc::new(AcpStepRunner::new());
+        let core = Core::spawn_inner(path, distribute::real_dispatcher(), runner.clone(), None);
+        (core, runner)
+    }
+
     fn spawn_inner(
         path: impl Into<String>,
         dispatcher: std::sync::Arc<dyn wicked_council::types::Dispatcher + Send + Sync>,
