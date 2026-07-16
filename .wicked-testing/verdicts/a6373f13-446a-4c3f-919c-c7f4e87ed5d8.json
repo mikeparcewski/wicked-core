@@ -1,0 +1,12 @@
+{
+  "id": "a6373f13-446a-4c3f-919c-c7f4e87ed5d8",
+  "run_id": "a37e5f6e-b85f-4325-93dd-ce8fe5e23bec",
+  "verdict": "FAIL",
+  "evidence_path": ".wicked-testing/evidence/a37e5f6e-b85f-4325-93dd-ce8fe5e23bec",
+  "reviewer": "acceptance-test-reviewer",
+  "reason": "A1 FAIL: domain-graph emits the correct refusal message but exits 0 instead of non-zero; callers/CI would not detect the rejection. A2/A3/A4/A5 PASS: output file absent, stderr contains \"coverage\"/\"unaccounted\"/\"2\", no \"wrote\" present, coverage pre-condition 0.0000 confirmed.",
+  "created_at": "2026-07-15T21:09:25.883Z",
+  "updated_at": "2026-07-15T21:09:25.883Z",
+  "deleted": 0,
+  "deleted_at": null
+}

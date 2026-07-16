@@ -1,0 +1,4 @@
+=== Step 3: Domain-graph (expect fail) ===
+Wed Jul 15 21:07:20 UTC 2026
+domain-graph: front-half coverage 0.0000 — 2 behavior-bearing node(s) unaccounted; run extraction + coverage first (refusing to translate an unannotated graph). First unaccounted: ["ts-rust . . . lib/process_payment().", "ts-rust . . . lib/validate_order()."]
+exit_code=0

@@ -1,0 +1,70 @@
+{
+  "run_id": "a53a6024-0635-4543-bf43-a619e3009e26",
+  "scenario": "coverage-emitter",
+  "executed_at": "2026-07-15T16:42:00Z",
+  "steps": [
+    {
+      "id": "S0",
+      "description": "Confirm binaries exist",
+      "timestamp": "2026-07-15T16:42:00Z",
+      "exit_code": 0,
+      "output": "wicked-core: OK wicked-core (exit 0)\nwicked-estate: OK wicked-estate (exit 0)"
+    },
+    {
+      "id": "S1",
+      "description": "Create temp directory",
+      "timestamp": "2026-07-15T16:42:01Z",
+      "exit_code": 0,
+      "output": "TMPDIR_BASE=/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB\nFIXTURE_DIR=/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB/wc-coverage-fixture\nFIXTURE_DB=/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB/wc-coverage-fixture.db\nCOVERAGE_OUT=/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB/coverage-report.json\nmkdir exit: 0"
+    },
+    {
+      "id": "S2",
+      "description": "Write the Rust fixture",
+      "timestamp": "2026-07-15T16:42:02Z",
+      "exit_code": 0,
+      "output": "exit code: 0\nfile exists: YES\nline count: 7\nlib.rs created with process_payment and validate_order functions"
+    },
+    {
+      "id": "S3",
+      "description": "Index the fixture into a fresh estate DB",
+      "timestamp": "2026-07-15T16:42:03Z",
+      "exit_code": 0,
+      "output": "indexed /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB/wc-coverage-fixture/src (/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB/wc-coverage-fixture.db) \u2192 3 nodes, 2 edges, 1 files\n  \"contains\" = 2\n\nexport:\n{\"symbol\":\"file . lib.rs:\",\"kind\":\"file\",\"name\":\"lib.rs\",...}\n{\"symbol\":\"ts-rust . . . lib/process_payment().\",\"kind\":\"function\",\"name\":\"process_payment\",...}\n{\"symbol\":\"ts-rust . . . lib/validate_order().\",\"kind\":\"function\",\"name\":\"validate_order\",...}"
+    },
+    {
+      "id": "S4a",
+      "description": "Annotate process_payment with business_rule RULE-001 confidence=0.95",
+      "timestamp": "2026-07-15T16:42:04Z",
+      "exit_code": 0,
+      "output": "annotated 1 symbol(s) with [business_rule] RULE-001=process_payment charges the customer; amount must be positive"
+    },
+    {
+      "id": "S4b",
+      "description": "Annotate validate_order with business_rule RULE-002 confidence=0.95",
+      "timestamp": "2026-07-15T16:42:05Z",
+      "exit_code": 0,
+      "output": "annotated 1 symbol(s) with [business_rule] RULE-002=validate_order returns true if and only if the order_id is positive"
+    },
+    {
+      "id": "S5",
+      "description": "Run the coverage emitter (wicked-core coverage --db --out)",
+      "timestamp": "2026-07-15T16:42:06Z",
+      "exit_code": 0,
+      "output": "coverage: 1.0000 (2 behavior-bearing, 0 unaccounted) \u2192 /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/tmp.r2JuiZqobB/coverage-report.json"
+    },
+    {
+      "id": "S6",
+      "description": "Read and verify coverage-report.json",
+      "timestamp": "2026-07-15T16:42:07Z",
+      "exit_code": 0,
+      "output": "copy exit: 0\nPython field checks: ALL PASS\ncoverage=1.0, unaccounted=0, behavior_bearing=2, resolved=2, total=3, risk_flagged=0, resolve_threshold=0.75, mean_confidence=0.95, unaccounted_nodes=[], per_app[0].app=(root), per_app[0].coverage=1.0"
+    }
+  ],
+  "artifacts": [
+    "index-output.txt",
+    "annotate-1-output.txt",
+    "annotate-2-output.txt",
+    "coverage-stdout.txt",
+    "coverage-report.json"
+  ]
+}

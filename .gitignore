@@ -2,4 +2,8 @@
 *.db
 *.db-shm
 *.db-wal
+*.db.*
 .DS_Store
+coverage-report.json
+.wicked-estate/
+.wicked-testing/*.db

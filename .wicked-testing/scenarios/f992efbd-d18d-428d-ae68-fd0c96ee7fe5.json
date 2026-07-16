@@ -1,0 +1,14 @@
+{
+  "id": "f992efbd-d18d-428d-ae68-fd0c96ee7fe5",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "name": "gate-hook-fail-closed",
+  "description": "wicked-core gate-hook exits 2 (DENY) when the decisions path or estate store is missing",
+  "source_path": ".wicked-testing/scenarios/gate-hook-fail-closed.md",
+  "format_version": "1.0",
+  "tags": "[\"wicked-core\", \"gate-hook\", \"fail-closed\", \"cli\", \"deterministic\"]",
+  "status": "active",
+  "created_at": "2026-07-15T21:25:21.984894Z",
+  "updated_at": "2026-07-15T21:25:21.984894Z",
+  "deleted": 0,
+  "deleted_at": null
+}

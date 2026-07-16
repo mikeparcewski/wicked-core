@@ -1,0 +1,13 @@
+{
+  "id": "3ab2e687-2098-4367-91ff-3fe4de8fb188",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "scenario_id": "f992efbd-d18d-428d-ae68-fd0c96ee7fe5",
+  "started_at": "2026-07-15T21:25:21.984894Z",
+  "status": "passed",
+  "created_at": "2026-07-15T21:25:21.984894Z",
+  "updated_at": "2026-07-15T21:32:53.633749Z",
+  "deleted": 0,
+  "deleted_at": null,
+  "evidence_path": ".wicked-testing/evidence/3ab2e687-2098-4367-91ff-3fe4de8fb188",
+  "finished_at": "2026-07-15T21:32:53.633749Z"
+}

@@ -1,0 +1,2 @@
+domain-graph: front-half coverage 0.0000 — 2 behavior-bearing node(s) unaccounted; run extraction + coverage first (refusing to translate an unannotated graph). First unaccounted: ["ts-rust . . . lib/process_payment().", "ts-rust . . . lib/validate_order()."]
+exit_code=1

@@ -1,0 +1,73 @@
+{
+  "manifest_version": "1.1.0",
+  "run_id": "a37e5f6e-b85f-4325-93dd-ce8fe5e23bec",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "scenario_id": "97dadaa1-ccda-4985-93eb-92fda1e4dc95",
+  "scenario_name": "domain-graph-fail-closed",
+  "scenario_path": ".wicked-testing/scenarios/domain-graph-fail-closed.md",
+  "started_at": "2026-07-15T21:01:26.453Z",
+  "finished_at": "2026-07-15T21:09:25.605Z",
+  "duration_ms": 479152,
+  "status": "failed",
+  "verdict": {
+    "value": "FAIL",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "A1 FAIL: domain-graph emits the correct refusal message but exits 0 instead of non-zero; callers/CI would not detect the rejection. A2/A3/A4/A5 PASS: output file absent, stderr contains \"coverage\"/\"unaccounted\"/\"2\", no \"wrote\" present, coverage pre-condition 0.0000 confirmed.",
+    "recorded_at": "2026-07-15T21:09:25.883Z"
+  },
+  "environment": {
+    "os": "darwin 25.5.0",
+    "node": "26.0.0",
+    "wicked_testing_version": "0.9.0"
+  },
+  "artifacts": [
+    {
+      "name": "coverage-check.txt",
+      "kind": "coverage",
+      "path": "coverage-check.txt",
+      "bytes": 199,
+      "sha256": "be2b728b89d69fa206eeb04d39dd0d92251798bb9b7bb119e0f2954cc1039022",
+      "captured_at": "2026-07-15T21:07:14.968Z"
+    },
+    {
+      "name": "domgraph-fail-stdout.txt",
+      "kind": "misc",
+      "path": "domgraph-fail-stdout.txt",
+      "bytes": 346,
+      "sha256": "b73567ff8da1837bdf5fbb8c3f1195e67c498abc6090a053b5c803c6b1976e61",
+      "captured_at": "2026-07-15T21:07:20.354Z"
+    },
+    {
+      "name": "evidence.json",
+      "kind": "misc",
+      "path": "evidence.json",
+      "bytes": 4016,
+      "sha256": "78a3be327593791fc6c14530ddbc56153fed0aec5ee8176725b40b1830564ee6",
+      "captured_at": "2026-07-15T21:07:47.783Z"
+    },
+    {
+      "name": "index-output.txt",
+      "kind": "misc",
+      "path": "index-output.txt",
+      "bytes": 389,
+      "sha256": "ebbc3c91a3168ed74ef501bec8cdf1c464d5d2b5e6a5bebc3dc1516b01d61863",
+      "captured_at": "2026-07-15T21:07:09.581Z"
+    },
+    {
+      "name": "ls-output.txt",
+      "kind": "misc",
+      "path": "ls-output.txt",
+      "bytes": 204,
+      "sha256": "0f8f5a126acae3c8bffd0d3626c16edb532a3309e8fb3659c88afab196e472da",
+      "captured_at": "2026-07-15T21:07:26.128Z"
+    },
+    {
+      "name": "test-plan.md",
+      "kind": "misc",
+      "path": "test-plan.md",
+      "bytes": 10278,
+      "sha256": "2c06c67d082ec8dbba5e1299b3e53e310596723c06213bd9d2eddf80a57c1082",
+      "captured_at": "2026-07-15T21:06:26.211Z"
+    }
+  ]
+}

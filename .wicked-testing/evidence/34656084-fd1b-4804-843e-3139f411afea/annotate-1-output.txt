@@ -1,0 +1,1 @@
+annotated 1 symbol(s) with [business_rule] RULE-001=process_payment charges the customer; amount must be positive

@@ -1,0 +1,53 @@
+{
+  "run_id": "3ab2e687-2098-4367-91ff-3fe4de8fb188",
+  "scenario": "gate-hook-fail-closed",
+  "executed_at": "2026-07-15T21:29:15Z",
+  "steps": [
+    {
+      "id": 1,
+      "name": "Create estate DB fixture",
+      "status": "completed",
+      "exit_code": 0,
+      "started_at": "2026-07-15T21:29:15Z",
+      "ended_at": "2026-07-15T21:29:15Z",
+      "evidence_file": "step1-fixture.txt",
+      "notes": "wicked-estate index succeeded. Indexed 2 nodes, 1 edge, 1 file. DB created at $TMPDIR/wc-hook-fixture.db, size=172032 bytes. All preconditions (P1-P5) verified: wicked-core and wicked-estate both on PATH, TMPDIR writable, env -i available, no leaked WICKED_* env vars."
+    },
+    {
+      "id": 2,
+      "name": "Case A — gate-hook with valid DB but empty WICKED_DECISIONS_PATH",
+      "status": "completed",
+      "exit_code": 2,
+      "started_at": "2026-07-15T21:29:27Z",
+      "ended_at": "2026-07-15T21:29:28Z",
+      "evidence_file": "case-a-output.txt",
+      "notes": "Command: echo '{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"ls\"}}' | WICKED_DECISIONS_PATH=\"\" wicked-core gate-hook --db $TMPDIR/wc-hook-fixture.db. Output line 1: 'wicked-governance: DENY (WICKED_DECISIONS_PATH unset — cannot record decision)'. exit_code=2."
+    },
+    {
+      "id": 3,
+      "name": "Case B — gate-hook with no DB and no env vars",
+      "status": "completed",
+      "exit_code": 2,
+      "started_at": "2026-07-15T21:29:36Z",
+      "ended_at": "2026-07-15T21:29:37Z",
+      "evidence_file": "case-b-output.txt",
+      "notes": "Command: echo '{...}' | env -i PATH=\"$PATH\" wicked-core gate-hook. Output line 1: 'wicked-governance: DENY (no estate store resolvable (set --db or WICKED_ESTATE_DB) — refusing to evaluate against a default/empty store (fail-closed))'. exit_code=2. Contains 'no estate store resolvable', 'fail-closed'. Does not contain 'WICKED_DECISIONS_PATH'."
+    },
+    {
+      "id": 4,
+      "name": "Verify no decisions file was written (negative evidence)",
+      "status": "completed",
+      "exit_code": 0,
+      "started_at": "2026-07-15T21:29:45Z",
+      "ended_at": "2026-07-15T21:29:46Z",
+      "evidence_file": "case-a-no-decisions.txt",
+      "notes": "Lock file $TMPDIR/wc-hook-fixture.db.lock does not exist (lockfile_present=1 means ls exited 1). $TMPDIR/wicked-core-gov/ exists and contains 20 pre-existing decisions.ndjson files from prior test runs. Zero decisions.ndjson files were created newer than the test start (step1-fixture.txt timestamp). no_new_decisions_ndjson_during_test=1 confirmed. The gov_dir listing showed prior-run UUIDs only; no new subdirectory was created by the DENY-path invocations in Steps 2 and 3."
+    }
+  ],
+  "artifacts": [
+    "step1-fixture.txt",
+    "case-a-output.txt",
+    "case-b-output.txt",
+    "case-a-no-decisions.txt"
+  ]
+}

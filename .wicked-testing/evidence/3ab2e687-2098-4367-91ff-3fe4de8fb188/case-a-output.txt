@@ -1,0 +1,2 @@
+wicked-governance: DENY (WICKED_DECISIONS_PATH unset — cannot record decision)
+exit_code=2

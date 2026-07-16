@@ -1,0 +1,28 @@
+{
+  "manifest_version": "1.0.0",
+  "run_id": "3ab2e687-2098-4367-91ff-3fe4de8fb188",
+  "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
+  "scenario_id": "f992efbd-d18d-428d-ae68-fd0c96ee7fe5",
+  "scenario_name": "gate-hook-fail-closed",
+  "scenario_path": ".wicked-testing/scenarios/gate-hook-fail-closed.md",
+  "started_at": "2026-07-15T21:25:00Z",
+  "finished_at": "2026-07-15T21:33:05.584378Z",
+  "status": "passed",
+  "verdict": {
+    "value": "PASS",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "All 12 assertions confirmed by direct citation from raw evidence files. Fail-closed contract fully substantiated.",
+    "recorded_at": "2026-07-15T21:33:05.584378Z"
+  },
+  "environment": {
+    "wicked_testing_version": "unknown"
+  },
+  "artifacts": [
+    "case-a-no-decisions.txt",
+    "case-a-output.txt",
+    "case-b-output.txt",
+    "evidence.json",
+    "step1-fixture.txt",
+    "test-plan.md"
+  ]
+}

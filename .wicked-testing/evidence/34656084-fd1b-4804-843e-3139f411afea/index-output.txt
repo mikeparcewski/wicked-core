@@ -1,0 +1,2 @@
+indexed /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-domgraph-fixture/src (/var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T/wc-domgraph-fixture.db) → 3 nodes, 2 edges, 1 files
+  "contains" = 2

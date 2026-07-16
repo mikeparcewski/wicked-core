@@ -1,0 +1,12 @@
+{
+  "id": "9efcb254-9115-43b6-bf41-b83a76b22fba",
+  "run_id": "4f893526-3610-403e-852e-d5676a147d08",
+  "verdict": "PASS",
+  "evidence_path": ".wicked-testing/evidence/4f893526-3610-403e-852e-d5676a147d08",
+  "reviewer": "acceptance-test-reviewer",
+  "reason": "All 5 assertions (A1–A5) pass. wicked-core domain-graph exited with code 1, produced the expected unaccounted-node error message naming both functions (process_payment, validate_order), wrote no output file, and the prior coverage check confirmed the store was correctly populated with exactly 2 unannotated behavior-bearing nodes before the fail-closed attempt ran.",
+  "created_at": "2026-07-15T22:00:00.000Z",
+  "updated_at": "2026-07-15T22:00:00.000Z",
+  "deleted": 0,
+  "deleted_at": null
+}

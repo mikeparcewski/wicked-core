@@ -1,0 +1,12 @@
+{
+  "id": "79c34996-06fe-455c-99a4-dddc3691bf36",
+  "run_id": "3ab2e687-2098-4367-91ff-3fe4de8fb188",
+  "verdict": "PASS",
+  "evidence_path": ".wicked-testing/evidence/3ab2e687-2098-4367-91ff-3fe4de8fb188",
+  "reviewer": "acceptance-test-reviewer",
+  "reason": "All 12 assertions (A1-A10, including A2b and A5b) confirmed by direct citation from raw evidence files. Case A exits 2 with WICKED_DECISIONS_PATH unset DENY message; Case B exits 2 with no estate store resolvable fail-closed DENY message without mentioning WICKED_DECISIONS_PATH, confirming store-unavailable check fires before decisions-path check. Fixture DB created (A10); no decisions.ndjson written during DENY paths (negative evidence). Fail-closed contract fully substantiated.",
+  "created_at": "2026-07-15T21:32:53.633749Z",
+  "updated_at": "2026-07-15T21:32:53.633749Z",
+  "deleted": 0,
+  "deleted_at": null
+}

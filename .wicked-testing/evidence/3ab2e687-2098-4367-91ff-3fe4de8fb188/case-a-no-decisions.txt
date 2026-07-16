@@ -1,0 +1,23 @@
+ls: /var/folders/h9/54gktm4j4kxfd0r55wwh2phr0000gn/T//wc-hook-fixture.db.lock: No such file or directory
+lockfile_present=1
+1e39475c-af61-48ed-b710-bdfe123816f1
+268d7284-2ab3-4939-b7b3-8138dbd5cc06
+2dc5f370-4356-429d-93eb-00372296e3d8
+dc7526d2-cc2a-46a1-8b0b-2524f1ed4967
+de-run-2c68d254
+de-run-886fb1f8
+de-run-a7f3c291
+de-run-c4cc487
+de-run-outcome2
+de-run-outcome3
+de-run-outcome4
+de-run-rbboiorl
+foldtest-30440
+foldtest-30567
+foldtest-34039
+roster-test-404d9894
+
+=== Additional negative evidence: decisions.ndjson newer than test start ===
+Files newer than step1-fixture.txt in wicked-core-gov:
+no_new_decisions_ndjson_during_test=1
+pre_existing_decisions_ndjson_count=20
