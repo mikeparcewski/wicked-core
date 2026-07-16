@@ -712,18 +712,14 @@ pub fn run_validator_reporting(
     // so a relative path like "wicked-estate.db" would mis-resolve there.
     if let Some(db) = db_path {
         if !db.is_empty() && db != ":memory:" && !db.contains("://") {
-            let abs = std::fs::canonicalize(db)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| {
-                    let p = std::path::Path::new(db);
-                    if p.is_absolute() {
-                        db.to_string()
-                    } else {
-                        std::env::current_dir()
-                            .map(|d| d.join(p).to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| db.to_string())
-                    }
-                });
+            let p = std::path::Path::new(db);
+            let abs = if p.is_absolute() {
+                db.to_string()
+            } else {
+                std::env::current_dir()
+                    .map(|d| d.join(p).to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| db.to_string())
+            };
             cmd.env("WICKED_ESTATE_DB", abs);
         }
     }

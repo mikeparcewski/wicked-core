@@ -303,6 +303,9 @@ pub fn open_store_ro(path: Option<&str>) -> anyhow::Result<SqliteStore> {
             std::env::var(ESTATE_DB_ENV).unwrap_or_else(|_| ".wicked-estate/graph.db".to_string())
         }
     };
+    if resolved == ":memory:" {
+        anyhow::bail!("in-memory database is not supported for read-only connections");
+    }
     SqliteStore::open_readonly(&resolved)
         .map_err(|e| anyhow::anyhow!("open estate store read-only at {resolved:?}: {e}"))
 }
