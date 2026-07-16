@@ -1650,9 +1650,13 @@ pub(crate) fn confirm_gate(
                     conform(store, &claim)?;
                     // Persist the deny evidence then cancel the run. The run stays cancelled
                     // (the human must re-launch) — deny-dominates means Approve cannot override
-                    // a policy veto (ADR-0003).
-                    in_flight.remove(run_id);
-                    return cancel_run(store, subscribers, self_tx, run_id);
+                    // a policy veto (ADR-0003). Remove from in_flight only after cancel_run so
+                    // a write failure leaves the map consistent (run stays in_flight = retryable).
+                    let result = cancel_run(store, subscribers, self_tx, run_id);
+                    if result.is_ok() {
+                        in_flight.remove(run_id);
+                    }
+                    return result;
                 }
             }
             // Optionally inject an amendment into the unit at the cursor (the gate is steering).
