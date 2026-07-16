@@ -33,8 +33,8 @@ use std::io::BufRead;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
-    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, WorkflowRegistry, WrappedCliStepRunner,
-    ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
+    HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
+    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -186,7 +186,20 @@ fn main() {
             // Subscribe BEFORE resume_run so no events are missed.
             let events = core.subscribe();
             match core.resume_run(&sid) {
-                Ok(s) => println!("reattach {sid} → {s:?}"),
+                Ok(s) => {
+                    println!("reattach {sid} → {s:?}");
+                    // resume_run returns Ok(terminal_status) for already-terminal sessions without
+                    // dispatching any work. Don't call drain_events — it would block for 1 hour
+                    // waiting for events that will never arrive.
+                    if matches!(
+                        s,
+                        SessionStatus::Completed
+                            | SessionStatus::Cancelled
+                            | SessionStatus::Failed
+                    ) {
+                        return;
+                    }
+                }
                 Err(e) => {
                     fail(&format!("reattach failed: {e}"));
                     return;
