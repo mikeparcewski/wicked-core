@@ -100,6 +100,39 @@ export declare class Core {
   registerRepo(name: string, rootPath: string): Promise<string>
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
+  /** All registered governance policies, as a JSON array of `Policy` objects. */
+  listPolicies(): Promise<string>
+  /** All conformance rules on the store (Pattern + Policy types), as a JSON array. */
+  listConformanceRules(): Promise<string>
+  /** All conformance claims (governance decisions) on the store, as a JSON array. */
+  listConformanceClaims(): Promise<string>
+  /**
+   * Upsert a governance policy. `policy_json` is a JSON-serialized `Policy` object
+   * (fields: id, kind, applies_to, effect, trigger, severity, criteria, rule, obligations).
+   * Validates server-side (fails closed on deny_unknown_fields + required fields). Idempotent
+   * on stable id — calling twice with the same id and payload is a no-op.
+   */
+  upsertPolicy(policyJson: string): Promise<string>
+  /**
+   * Upsert a conformance rule. `rule_json` is a JSON-serialized `ConformanceRule` object
+   * (fields: id, rule_type, statement, severity, confidence, targets, provenance).
+   * Validates server-side (INV-C1/C2/C4). Idempotent on stable id.
+   */
+  upsertConformanceRule(ruleJson: string): Promise<string>
+  /**
+   * Recall which conformance rules apply to the given `query_json` (a JSON-serialized
+   * `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
+   * An empty or whitespace `query_json` is treated as an all-rules query (no facet filters).
+   * Opens a read-only connection — does not block the single-writer actor. Returns a JSON
+   * array of `ConformanceRule` objects, severity-first then id.
+   */
+  recallRulesPreview(queryJson: string): Promise<string>
+  /**
+   * Front-half coverage gate report — JSON-serialized `CoverageReport`, or the JSON literal
+   * `null` when the store has no domain-model nodes yet. Opens a read-only connection so it
+   * never blocks the single-writer actor.
+   */
+  getCoverageReport(): Promise<string>
   /**
    * Open a PTY terminal session running `cmd` (or the login shell if omitted) in `cwd`, sized
    * `cols`x`rows`. `governed=false` is a loud, opt-in UNGOVERNED operator shell that bypasses the
