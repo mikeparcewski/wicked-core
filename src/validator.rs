@@ -660,14 +660,18 @@ fn run_bounded_status(
 /// cwd, bounded timeout, + a real OS sandbox WHEN one is on PATH). Use [`run_validator_reporting`] to also
 /// learn the [`SandboxLevel`] actually applied.
 pub fn run_validator(v: &DeterministicValidator, cwd: &Path) -> anyhow::Result<bool> {
-    Ok(run_validator_reporting(v, cwd)?.0)
+    Ok(run_validator_reporting(v, cwd, None)?.0)
 }
 
 /// Like [`run_validator`], but ALSO reports the [`SandboxLevel`] the child actually ran under — the
 /// honest "was a real OS sandbox applied?" disclosure. Same fail-closed refusals (unapproved / denylist).
+///
+/// `db_path`: when `Some`, injected as `WICKED_ESTATE_DB` into the cleared child env so validator scripts
+/// that call `wicked-core coverage` (or similar store-reading commands) resolve the correct estate db.
 pub fn run_validator_reporting(
     v: &DeterministicValidator,
     cwd: &Path,
+    db_path: Option<&str>,
 ) -> anyhow::Result<(bool, SandboxLevel)> {
     if !v.approved {
         anyhow::bail!(
@@ -695,6 +699,34 @@ pub fn run_validator_reporting(
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]).current_dir(cwd);
     apply_minimal_env(&mut cmd);
+    // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
+    // relying on PATH — essential in CI where the binary is invoked by absolute path and the sandbox
+    // strips PATH to the bare minimum. Falls back gracefully when current_exe() is unavailable.
+    if let Ok(exe) = std::env::current_exe() {
+        cmd.env("WICKED_CORE_EXE", exe);
+    }
+    // Inject the estate db path so scripts that invoke `wicked-core coverage` resolve the correct store.
+    // This is an explicit injection (not a passthrough), so it never leaks other env secrets.
+    // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
+    // Canonicalize filesystem paths to absolute before injecting: the child's cwd is the worktree,
+    // so a relative path like "wicked-estate.db" would mis-resolve there.
+    if let Some(db) = db_path {
+        if !db.is_empty() && db != ":memory:" && !db.contains("://") {
+            let abs = std::fs::canonicalize(db)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| {
+                    let p = std::path::Path::new(db);
+                    if p.is_absolute() {
+                        db.to_string()
+                    } else {
+                        std::env::current_dir()
+                            .map(|d| d.join(p).to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| db.to_string())
+                    }
+                });
+            cmd.env("WICKED_ESTATE_DB", abs);
+        }
+    }
 
     let pass = match run_bounded_status(cmd, VALIDATOR_TIMEOUT) {
         Ok(Some(status)) => status.success(),
@@ -1253,7 +1285,7 @@ mod tests {
             script: "test -f marker.txt".into(),
             approved: true,
         };
-        let (pass, level) = run_validator_reporting(&benign, &dir).expect("runs");
+        let (pass, level) = run_validator_reporting(&benign, &dir, None).expect("runs");
         assert!(
             pass,
             "a read-only check must PASS under the hardening layer"
