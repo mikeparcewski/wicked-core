@@ -39,6 +39,11 @@ pub struct UnitOutcome {
     /// surfaces this as the run's "why it failed" explanation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<String>,
+    /// True when the denial originated from the input-governance hook (as opposed to a semantic
+    /// verdict or evaluator deny). Hook vetoes MUST NOT be routed to HumanConfirmIf — an adversarial
+    /// hook suppression can never escalate to human review; it hard-fails the run immediately.
+    #[serde(default)]
+    pub hook_denied: bool,
 }
 
 /// The outcome of the evaluator≠creator second-pass governance evaluation (ADR-0003 extension).
@@ -61,6 +66,7 @@ pub struct EvaluationOutcome {
 /// BEFORE any `work_output` is written, so a validator/evaluator deny drives the phase to `Rejected`
 /// (persisting the hard `gate_decision` veto) and leaves NO approved phase and NO stored `work_output`
 /// to leak (the ADR-0003 violation this parameter closes). `None` ⇒ governance decides alone (unchanged).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_unit(
     store: &mut dyn GraphStore,
     unit: &WorkUnit,
@@ -209,6 +215,7 @@ pub(crate) fn apply_unit(
         approved,
         evaluator_claim_id: None,
         denial_reason,
+        hook_denied: false, // overwritten by pipeline::apply_and_finish_unit when the hook denied
     })
 }
 
