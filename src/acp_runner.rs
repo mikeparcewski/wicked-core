@@ -81,16 +81,24 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         .spawn()
         .map_err(|e| anyhow::anyhow!("ACP binary '{}': {e}", config.binary))?;
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("ACP binary '{}': no stdout", config.binary))?;
-    let mut stdin = BufWriter::new(
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("ACP binary '{}': no stdin", config.binary))?,
-    );
+    // Take stdout/stdin before spawning the reader — kill the child if either fails so we
+    // don't leak a background process when the child started but didn't expose its pipes.
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::anyhow!("ACP binary '{}': no stdout", config.binary));
+        }
+    };
+    let mut stdin = BufWriter::new(match child.stdin.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow::anyhow!("ACP binary '{}': no stdin", config.binary));
+        }
+    });
 
     // Unbounded channel — the reader thread never blocks the child on a full buffer.
     let (tx, rx) = std::sync::mpsc::channel();
@@ -103,9 +111,19 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         }
     });
 
+    // Helper: kills the child and waits before returning a handshake error so we don't leak
+    // the background process when initialize/session-new fails or times out.
+    macro_rules! handshake_err {
+        ($child:expr, $e:expr) => {{
+            let _ = $child.kill();
+            let _ = $child.wait();
+            return Err($e);
+        }};
+    }
+
     const HANDSHAKE: Duration = Duration::from_secs(10);
 
-    rpc_send(
+    if let Err(e) = rpc_send(
         &mut stdin,
         1,
         "initialize",
@@ -114,22 +132,34 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
             "clientCapabilities": {"fs": {}, "terminal": false},
             "clientInfo": {"name": "wicked-core", "version": env!("CARGO_PKG_VERSION")}
         }),
-    )?;
-    rpc_expect(&rx, 1, HANDSHAKE)?;
+    ) {
+        handshake_err!(child, e);
+    }
+    if let Err(e) = rpc_expect(&rx, 1, HANDSHAKE) {
+        handshake_err!(child, e);
+    }
 
-    rpc_send(
+    if let Err(e) = rpc_send(
         &mut stdin,
         2,
         "session/new",
         json!({
             "cwd": cwd.to_string_lossy().as_ref()
         }),
-    )?;
-    let resp = rpc_expect(&rx, 2, HANDSHAKE)?;
-    let session_id = resp["result"]["sessionId"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("ACP session/new: missing sessionId in response"))?
-        .to_string();
+    ) {
+        handshake_err!(child, e);
+    }
+    let resp = match rpc_expect(&rx, 2, HANDSHAKE) {
+        Ok(v) => v,
+        Err(e) => handshake_err!(child, e),
+    };
+    let session_id = match resp["result"]["sessionId"].as_str() {
+        Some(s) => s.to_string(),
+        None => handshake_err!(
+            child,
+            anyhow::anyhow!("ACP session/new: missing sessionId in response")
+        ),
+    };
 
     Ok(AcpProcess {
         child,
@@ -270,6 +300,10 @@ fn exec_turn_acp(
                 };
 
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
+                    if v.get("error").is_some() {
+                        // JSON-RPC error response: treat as a failed turn (not cancelled).
+                        break;
+                    }
                     let stop = v["result"]["stopReason"].as_str().unwrap_or("end_turn");
                     if stop == "cancelled" {
                         timed_out = true;
@@ -366,7 +400,7 @@ fn fallback_with_warning(
     emit: &DeltaSink,
     fallback: &WrappedCliStepRunner,
 ) -> StepOutput {
-    emit(&warning);
+    emit(&format!("{warning}\n"));
     let mut result = fallback.run_unit_streaming(input, emit);
     result.output = if result.output.is_empty() {
         warning
@@ -428,6 +462,15 @@ impl AcpStepRunner {
             .as_deref()
             .unwrap_or("claude")
             .to_string();
+
+        // GOVERNANCE SAFETY: ACP does not (yet) implement PreToolUse gate-hook injection.
+        // A governed unit (governance: Some) MUST run through WrappedCliStepRunner so the
+        // gate-hook is armed. Delegating a governed unit to ACP would silently bypass input
+        // governance — a security regression. The single-shot fallback is used directly
+        // (no warning, no ACP session opened) — governance is not a degraded path.
+        if input.governance.is_some() {
+            return self.fallback.run_unit_streaming(input, emit);
+        }
 
         let acp_config = match acp_config_for(&cli_key) {
             Some(c) => c,

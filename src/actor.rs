@@ -1483,10 +1483,10 @@ fn dispatch_unit(
     // units whose assigned CLI differs from the current unit's CLI and inject their work output as
     // context blocks. Read on the actor thread (store access) before the worker is dispatched; the
     // worker holds no store handle (single-writer invariant). Empty for single-CLI runs.
+    // Reuses `units` already fetched above — no second store read.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
-    let prior_outputs: Vec<PriorUnitOutput> = crate::domain::session_units(store, run_id)
-        .unwrap_or_default()
-        .into_iter()
+    let prior_outputs: Vec<PriorUnitOutput> = units
+        .iter()
         .filter(|u| {
             u.ord < unit.ord
                 && u.assigned_cli

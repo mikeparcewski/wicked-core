@@ -155,7 +155,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // copilot uses its built-in HTTP ACP server on a dynamic port.
+            // copilot HTTP ACP on a fixed port 3000 (not dynamic; single-session only).
             acp: Some(AcpConfig {
                 binary: "copilot".into(),
                 start_args: vec!["--acp".into(), "--port".into(), "3000".into()],
