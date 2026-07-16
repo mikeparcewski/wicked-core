@@ -192,23 +192,23 @@ mod tests {
         Node, NodeKind, Span, SYMBOL_SCHEME,
     };
 
-    fn seed_via_generic<S: GraphRead + GraphWrite>(store: &mut S) {
-        let sym = synthetic_symbol("anystore_test", "n1");
+    fn seed_via_generic<S: GraphRead + GraphWrite>(store: &mut S, tag: &str) {
+        let sym = synthetic_symbol("anystore_test", tag);
         let node = Node::new(
             sym,
             NodeKind::Other("anystore_test".to_string()),
-            "n1".to_string(),
+            tag.to_string(),
             Language::new(SYMBOL_SCHEME),
-            Location::new("anystore_test/n1".to_string(), Span::ZERO),
+            Location::new(format!("anystore_test/{tag}"), Span::ZERO),
         );
         store.begin_batch().unwrap();
         store.upsert_nodes(&[node]).unwrap();
         store.commit_batch().unwrap();
     }
 
-    fn reads_back_via_dyn(store: &dyn GraphStore) -> bool {
+    fn reads_back_via_dyn(store: &dyn GraphStore, tag: &str) -> bool {
         store
-            .get_node(&synthetic_symbol("anystore_test", "n1"))
+            .get_node(&synthetic_symbol("anystore_test", tag))
             .unwrap()
             .is_some()
     }
@@ -219,10 +219,37 @@ mod tests {
         // GraphWrite` bound reads back through a `&dyn GraphStore` object — the two call styles the
         // engine mixes. If AnyStore's forwarding were wrong, the read would miss.
         let mut store = open_store_any(Some(":memory:")).expect("open in-memory AnyStore");
-        seed_via_generic(&mut store);
+        seed_via_generic(&mut store, "n1");
         assert!(
-            reads_back_via_dyn(&store),
+            reads_back_via_dyn(&store, "n1"),
             "node written via a generic S bound must read back via &dyn GraphStore"
+        );
+    }
+
+    // §5 backend-parity: AnyStore must bridge the SAME generic→dyn call styles through Postgres.
+    // Skips when TEST_POSTGRES_URL is absent (local dev without a running Postgres); the CI
+    // `postgres-parity` job always sets it so this is a hard runtime assertion there (core#30).
+    // Uses a per-process unique tag so re-runs on a shared Postgres never mask write failures by
+    // reading a node a prior run inserted.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn postgres_open_store_any_round_trip() {
+        let url = match std::env::var("TEST_POSTGRES_URL") {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                eprintln!(
+                    "TEST_POSTGRES_URL not set — postgres round-trip not run (counted as passed)"
+                );
+                return;
+            }
+        };
+        let tag = format!("n1-pid{}", std::process::id());
+        let mut store =
+            open_store_any(Some(&url)).expect("open postgres AnyStore via TEST_POSTGRES_URL");
+        seed_via_generic(&mut store, &tag);
+        assert!(
+            reads_back_via_dyn(&store, &tag),
+            "node written via generic S bound must read back via &dyn GraphStore on Postgres backend"
         );
     }
 
