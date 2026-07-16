@@ -382,6 +382,7 @@ pub(crate) fn run(
                     &self_tx,
                     output,
                     agent_verdict,
+                    &path,
                 ) {
                     // Run reached a TERMINAL state → drop from in_flight + remember the outcome.
                     Ok(StepApplied::Finished) => {
@@ -1078,6 +1079,7 @@ fn apply_step_result(
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
     agent_verdict: Option<(bool, String)>,
+    db_path: &str,
 ) -> anyhow::Result<StepApplied> {
     let run_id = output.run_id.clone();
     let mut session = crate::domain::get_session(store, &run_id)?
@@ -1208,6 +1210,7 @@ fn apply_step_result(
         &cli_keys,
         agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
+        Some(db_path),
     )?;
 
     // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit halts the run as `Failed` — never advancing

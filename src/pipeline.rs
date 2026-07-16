@@ -90,6 +90,7 @@ pub fn run_session(
             &cli_keys,
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
             emit,
+            None, // sync stub path has no estate db path to inject
         )?;
         let approved = outcome.approved;
         let ord = u.ord;
@@ -373,6 +374,7 @@ pub(crate) fn apply_and_finish_unit(
     cli_keys: &[String],
     agent_verdict: Option<&(bool, String)>,
     emit: &mut dyn FnMut(CoreEvent),
+    db_path: Option<&str>,
 ) -> anyhow::Result<UnitOutcome> {
     // ── PRE-RESOLVE every deny-dominant signal BEFORE the governance gate resolves the phase, so a
     //    deny drives the phase to Rejected and NO approved phase / work_output can leak past it (seam
@@ -384,7 +386,8 @@ pub(crate) fn apply_and_finish_unit(
     // FAIL — OR the ABSENCE of a worktree (fail-closed, so the agent LLM can never lone-approve a pinned
     // phase) — denies. Pure, no LLM.
     let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
-    let det_denial = pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new));
+    let det_denial =
+        pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new), db_path);
     // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before `det_denial` is
     // moved into the deny-dominance fold below, so `GateEvaluated` can carry the depth.
     let deterministic_pass = det_denial.is_none();
@@ -560,6 +563,7 @@ pub(crate) fn apply_and_finish_unit(
 fn pinned_validator_denial(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&std::path::Path>,
+    db_path: Option<&str>,
 ) -> Option<String> {
     // No pinned validator ⇒ ungated phase ⇒ no denial (unchanged pre-gate behavior).
     let v = unit.validator.as_ref()?;
@@ -574,9 +578,9 @@ fn pinned_validator_denial(
             v.criterion
         ));
     };
-    match crate::validator::run_validator(v, cwd) {
-        Ok(true) => None,
-        Ok(false) => Some(format!("pinned validator failed: {}", v.criterion)),
+    match crate::validator::run_validator_reporting(v, cwd, db_path) {
+        Ok((true, _)) => None,
+        Ok((false, _)) => Some(format!("pinned validator failed: {}", v.criterion)),
         Err(e) => Some(format!("pinned validator error: {e}")),
     }
 }
@@ -690,25 +694,25 @@ mod resolve_tests {
         let mut unit = WorkUnit::pending("s:u1", "s", 1, "d");
 
         // No validator ⇒ no denial.
-        assert!(pinned_validator_denial(&unit, Some(&dir)).is_none());
+        assert!(pinned_validator_denial(&unit, Some(&dir), None).is_none());
         // Approved + PASSES ⇒ no denial.
         unit.validator = Some(mk("test -f ok.txt", true));
-        assert!(pinned_validator_denial(&unit, Some(&dir)).is_none());
+        assert!(pinned_validator_denial(&unit, Some(&dir), None).is_none());
         // Approved + FAILS ⇒ denial (deny-dominates).
         unit.validator = Some(mk("test -f missing.txt", true));
-        assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
+        assert!(pinned_validator_denial(&unit, Some(&dir), None).is_some());
         // Pinned validator but NO worktree ⇒ FAIL-CLOSED denial (Lane D finding 1): "can't re-verify"
         // is NOT-passed, so the agent LLM can never become the sole approver of a pinned phase.
         assert!(
-            pinned_validator_denial(&unit, None).is_some(),
+            pinned_validator_denial(&unit, None, None).is_some(),
             "a pinned validator with no worktree must DENY (fail-closed), not skip"
         );
         // A unit with NO pinned validator and no worktree is simply ungated ⇒ no denial.
         let ungated = WorkUnit::pending("s:u2", "s", 2, "d");
-        assert!(pinned_validator_denial(&ungated, None).is_none());
+        assert!(pinned_validator_denial(&ungated, None, None).is_none());
         // UNAPPROVED ⇒ run_validator refuses ⇒ denial (fail-closed).
         unit.validator = Some(mk("test -f ok.txt", false));
-        assert!(pinned_validator_denial(&unit, Some(&dir)).is_some());
+        assert!(pinned_validator_denial(&unit, Some(&dir), None).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

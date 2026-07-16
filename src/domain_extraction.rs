@@ -31,23 +31,26 @@ pub const COVERAGE_CRITERION: &str =
     "resolved-or-flagged coverage == 1.0 (zero unaccounted behavior-bearing nodes)";
 
 /// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF the phase worktree's
-/// `coverage-report.json` reports FULL coverage EVERYWHERE. brain's report carries a top-level
-/// `coverage`/`unaccounted` PLUS a per-app breakdown (each app object has its OWN `coverage`/`unaccounted`),
-/// so an unanchored positive grep false-PASSes on a single fully-covered app under a sub-1.0 total. The
-/// gate is therefore: (1) at least one full-coverage marker exists (guards an empty/malformed report),
-/// AND (2) NO `coverage` value is sub-1.0 anywhere — every complete ratio starts with `1` (`1`/`1.0`/
-/// `1.0000`), every incomplete one with `0` (`0`/`0.0`/`0.83`) — AND (3) NO `unaccounted` is non-zero
-/// anywhere. Built only from `test`/`grep`/`!`/literal paths so it passes the
-/// [`looks_dangerous`](crate::validator) denylist (no redirection, command substitution, or
-/// destructive/network token; `!` negation is allowed).
-pub const COVERAGE_SCRIPT: &str = r#"test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json"#;
+/// `coverage-report.json` reports FULL coverage EVERYWHERE. If `coverage-report.json` is absent AND
+/// `WICKED_ESTATE_DB` is set (injected by the validator runner from the actor's store path), `wicked-core
+/// coverage` is invoked to generate it from the estate store — the gate both produces AND checks the report
+/// in one step. Without `WICKED_ESTATE_DB` (e.g. in standalone tests), an absent file FAILS CLOSED
+/// (the `test -n` guard keeps fail-closed semantics when no estate path is provided). brain's report
+/// carries a top-level `coverage`/`unaccounted` PLUS a per-app breakdown (each app object has its OWN
+/// `coverage`/`unaccounted`), so an unanchored positive grep false-PASSes on a single fully-covered app
+/// under a sub-1.0 total. The gate is therefore: (1) at least one full-coverage marker exists (guards an
+/// empty/malformed report), AND (2) NO `coverage` value is sub-1.0 anywhere, AND (3) NO `unaccounted`
+/// is non-zero anywhere. Built only from `test`/`grep`/`!`/`wicked-core`/`${VAR}` so it passes the
+/// [`looks_dangerous`](crate::validator) denylist (no redirection, command substitution `$(`, or
+/// destructive/network token; `${VAR}` expansion and `!`/`||` are allowed).
+pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "${WICKED_ESTATE_DB}" && wicked-core coverage)) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The APPROVED content-address pin the `coverage` phase carries in `workflows/domain-extraction.json`.
 /// Content-hash over `(COVERAGE_CRITERION, COVERAGE_SCRIPT, approved=true)` — see
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "c4cc487a030d57b7";
+pub const COVERAGE_VALIDATOR_PIN: &str = "8bcb7403b07b367c";
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
