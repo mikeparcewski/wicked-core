@@ -201,7 +201,7 @@ fn rpc_expect(
         if remaining.is_zero() {
             return Err(anyhow::anyhow!("ACP timeout waiting for response id={id}"));
         }
-        match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
+        match rx.recv_timeout(remaining) {
             Ok(line) => {
                 // Skip non-JSON lines (startup banners, log output, etc.) — consistent
                 // with exec_turn_acp which also silently skips non-JSON noise.
@@ -289,10 +289,7 @@ fn exec_turn_acp(
             timed_out = true;
             break;
         }
-        match proc
-            .line_rx
-            .recv_timeout(remaining.min(Duration::from_millis(100)))
-        {
+        match proc.line_rx.recv_timeout(remaining) {
             Ok(line) => {
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
@@ -361,7 +358,7 @@ fn handle_update(
                     let remaining = max_out - used;
                     let safe = text
                         .char_indices()
-                        .take_while(|(i, _)| *i < remaining)
+                        .take_while(|(i, c)| *i + c.len_utf8() <= remaining)
                         .last()
                         .map(|(i, c)| i + c.len_utf8())
                         .unwrap_or(0);

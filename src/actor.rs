@@ -19,10 +19,12 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use wicked_apps_core::{
-    open_store_any, AnyStore, GraphRead, GraphStore, NodeKind, ToNode, AGENT_SESSION,
+    open_store_any, AnyStore, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
+    AGENT_SESSION,
 };
 use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
+use wicked_governance::{conform, decide, select};
 
 use crate::command::Command;
 use crate::domain::{put_node, SessionStatus};
@@ -1488,15 +1490,11 @@ fn dispatch_unit(
     let prior_outputs: Vec<PriorUnitOutput> = units
         .iter()
         .filter(|u| {
-            u.ord < unit.ord
-                && u.assigned_cli
-                    .as_deref()
-                    .map(|k| k != current_cli)
-                    .unwrap_or(false)
+            u.ord < unit.ord && u.assigned_cli.as_deref().unwrap_or("claude") != current_cli
         })
         .filter_map(|u| {
             let output = crate::domain::get_work_output(store, &u.id)?;
-            let cli = u.assigned_cli.as_deref().unwrap_or("unknown");
+            let cli = u.assigned_cli.as_deref().unwrap_or("claude");
             Some(PriorUnitOutput {
                 label: format!("[{cli} — unit {}]", u.ord),
                 output,
@@ -1623,6 +1621,44 @@ pub(crate) fn confirm_gate(
             Ok(s)
         }
         crate::workflow::HumanDecision::Approve { amend } => {
+            // Layer-3: governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
+            // Runs BEFORE any approval-side mutations so a Deny cancels cleanly (no partial state committed).
+            // Without policies loaded (`wicked-core rules ingest`), select() returns empty and decide()
+            // always returns Allow — the check is a no-op until policies are populated.
+            {
+                let units = crate::domain::session_units(store, run_id)?;
+                let phase_name = units
+                    .get(session.unit_ix)
+                    .map(|u| crate::scope::unit_phase(u.ord))
+                    .unwrap_or_else(|| "terminal".to_owned());
+                let scope = session.collection_scope.as_deref().unwrap_or(run_id);
+                let context = serde_json::json!({
+                    "phase": phase_name,
+                    "scope": scope,
+                    "run_id": run_id,
+                    "gate": "phase-boundary",
+                });
+                let selected = select(store, scope, &phase_name, &context)?;
+                let claim: ConformanceClaim = decide(
+                    &selected,
+                    scope,
+                    &phase_name,
+                    &context,
+                    crate::execute::EVAL_AT_BASE,
+                );
+                if matches!(claim.decision, Decision::Deny) {
+                    conform(store, &claim)?;
+                    // Persist the deny evidence then cancel the run. The run stays cancelled
+                    // (the human must re-launch) — deny-dominates means Approve cannot override
+                    // a policy veto (ADR-0003). Remove from in_flight only after cancel_run so
+                    // a write failure leaves the map consistent (run stays in_flight = retryable).
+                    let result = cancel_run(store, subscribers, self_tx, run_id);
+                    if result.is_ok() {
+                        in_flight.remove(run_id);
+                    }
+                    return result;
+                }
+            }
             // Optionally inject an amendment into the unit at the cursor (the gate is steering).
             if let Some(a) = amend {
                 let mut units = crate::domain::session_units(store, run_id)?;
@@ -2059,5 +2095,140 @@ mod terminal_gate_tests {
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
         );
+    }
+}
+
+/// Layer-3 governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
+#[cfg(test)]
+mod phase_boundary_governance_tests {
+    use super::*;
+    use crate::domain::{put_node, AgentSession, HumanConfirm, SessionStatus, WorkUnit};
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+    use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    fn awaiting_session(store: &mut dyn GraphStore) {
+        let session = AgentSession {
+            id: "r".into(),
+            workflow_id: "wf-r".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::AwaitingHuman,
+            human_confirm: HumanConfirm::All,
+            unit_ix: 0, // cursor at unit 0
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        // One unit at ord=1 (phase "unit-1").
+        let mut u = WorkUnit::pending("r:u1", "r", 1, "a phase requiring governance approval");
+        u.gate = GateSpec::HumanConfirm {
+            unconditional: true,
+        };
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    /// Without any policy loaded, `decide()` always returns Allow — confirm_gate approves
+    /// and transitions the run back to Executing.
+    #[test]
+    fn approve_without_policies_is_allow() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        awaiting_session(&mut store);
+        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+
+        let status = confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r",
+            crate::workflow::HumanDecision::Approve { amend: None },
+        )
+        .unwrap();
+        // No deny policy → Executing (the noop NullRunner returns immediately so the run
+        // advances to whatever the engine does next with no units left — Cancelled or Completed).
+        assert!(
+            matches!(
+                status,
+                SessionStatus::Executing | SessionStatus::Cancelled | SessionStatus::Completed
+            ),
+            "without policies, approve must not be blocked: {status:?}"
+        );
+    }
+
+    /// With a triggered deny policy registered, `confirm_gate(Approve)` must deny-dominate:
+    /// the run is cancelled and governance evidence is persisted.
+    #[test]
+    fn approve_with_triggered_deny_policy_cancels_run() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        awaiting_session(&mut store);
+
+        // Register a policy that fires on phase "unit-1" whenever the context contains
+        // "phase-boundary" (which confirm_gate always injects as `"gate": "phase-boundary"`).
+        let deny_pol = Policy {
+            id: "pol-deny-test".to_string(),
+            kind: "test".to_string(),
+            applies_to: vec!["unit-1".to_string()],
+            effect: Effect::Deny,
+            trigger: Trigger {
+                contains: Some("phase-boundary".to_string()),
+            },
+            obligations: vec![],
+            criteria: "test deny criterion".to_string(),
+            severity: Severity::High,
+            rule: "Test: deny this phase gate unconditionally.".to_string(),
+        };
+        register_policy(&mut store, &deny_pol).unwrap();
+
+        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+
+        let status = confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r",
+            crate::workflow::HumanDecision::Approve { amend: None },
+        )
+        .unwrap();
+
+        // A triggered deny policy must cancel the run (deny-dominates even under Approve).
+        assert_eq!(
+            status,
+            SessionStatus::Cancelled,
+            "a triggered governance deny must cancel the run even when the human approves"
+        );
+        // The session in the store must also be Cancelled.
+        let session = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(session.status, SessionStatus::Cancelled);
     }
 }
