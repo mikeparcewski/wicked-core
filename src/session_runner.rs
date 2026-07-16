@@ -14,8 +14,8 @@
 //! - **Reuse**: subsequent units on the same `run_id` write their prompt to the open PTY's stdin
 //!   and collect output until the result sentinel arrives.
 //! - **Close (explicit)**: call [`PersistentStepRunner::drop_session`] after the last unit of a
-//!   run to cleanly kill the CLI process. The actor calls this in `apply_step_result` when it
-//!   detects the run is complete.
+//!   run to cleanly kill the CLI process. Callers are responsible for this; no auto-teardown is
+//!   wired into the actor.
 //!
 //! # Turn-completion detection
 //! PTY output arrives as raw bytes (base64-encoded [`crate::event::CoreEvent::TerminalOutput`]
@@ -152,12 +152,14 @@ impl PersistentStepRunner {
         // Build argv without a real prompt — the placeholder expands to an empty string and the
         // trailing `--` + empty arg are stripped below.
         let mut argv = build_argv(&invocation, "", &input.unit.allowed_skills);
+        let is_claude = argv.first().map(|a| binary_is_claude(a)).unwrap_or(false);
         // Drop the end-of-options guard and the empty prompt arg emitted by the template.
         argv.retain(|a| a != "--" && !a.is_empty());
-        // Remove one-shot flags — interactive mode doesn't use them.
-        argv.retain(|a| a != "-p" && a != "--print");
-        // Inject stream-json for claude (skipped when the template already carries --output-format).
-        if argv.first().map(|a| binary_is_claude(a)).unwrap_or(false) {
+        if is_claude {
+            // Remove one-shot flags — interactive mode doesn't use them.
+            // Only done for claude: other binaries may legitimately use -p for other purposes.
+            argv.retain(|a| a != "-p" && a != "--print");
+            // Inject stream-json (skipped when the template already carries --output-format).
             inject_claude_stream_flags(&mut argv);
         }
         argv
@@ -179,12 +181,17 @@ impl PersistentStepRunner {
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
 
-        // Lazily open a session for this run_id (lock released immediately after lookup/insert).
-        let terminal_id = {
-            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(s) = guard.get(&run_id) {
-                s.terminal_id.clone()
-            } else {
+        // Lazily open a session for this run_id. The lock covers only the map read/write — not
+        // the blocking open_terminal / wait_for_opened calls — so unrelated runs are never
+        // serialised by one run's slow PTY startup.
+        let existing_id = {
+            let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(&run_id).map(|s| s.terminal_id.clone())
+        };
+
+        let terminal_id = match existing_id {
+            Some(tid) => tid,
+            None => {
                 let cwd = input
                     .workdir
                     .clone()
@@ -197,13 +204,19 @@ impl PersistentStepRunner {
                     Err(e) => return failed_output(input, format!("open PTY session: {e}")),
                 };
                 wait_for_opened(&pre, &tid);
-                guard.insert(
-                    run_id.clone(),
-                    PtySession {
+                // Re-acquire to insert. Use entry to handle a concurrent opener for the same
+                // run_id: the first inserter wins; if we lose the race, close our duplicate.
+                let final_tid = {
+                    let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    let entry = guard.entry(run_id.clone()).or_insert(PtySession {
                         terminal_id: tid.clone(),
-                    },
-                );
-                tid
+                    });
+                    entry.terminal_id.clone()
+                };
+                if final_tid != tid {
+                    self.close_terminal(&tid);
+                }
+                final_tid
             }
         };
 
@@ -212,10 +225,18 @@ impl PersistentStepRunner {
 
         let prompt = format!("{}\n", skill_prompt(&input.unit));
         if let Err(e) = self.write_terminal(&terminal_id, prompt.as_bytes()) {
+            // PTY already exited — drop the stale entry so future units reopen cleanly.
+            self.drop_session(&run_id);
             return failed_output(input, format!("write PTY turn: {e}"));
         }
 
-        collect_turn(&events, &terminal_id, self.timeout, emit, input)
+        let result = collect_turn(&events, &terminal_id, self.timeout, emit, input);
+        if result.status != StepStatus::Ok {
+            // On any non-Ok outcome the terminal may be broken/hung. Drop the session so
+            // the next unit for this run_id opens a fresh PTY instead of reusing a stale one.
+            self.drop_session(&run_id);
+        }
+        result
     }
 }
 
@@ -229,7 +250,8 @@ fn wait_for_opened(rx: &std::sync::mpsc::Receiver<CoreEvent>, id: &str) {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(CoreEvent::TerminalOpened { id: i, .. }) if i == id => return,
             Ok(_) => continue,
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -257,13 +279,16 @@ fn collect_turn(
 
     let deadline = Instant::now() + timeout;
 
-    // Loop returns true when the result sentinel was found, false on timeout/disconnect.
-    let found_result: bool = loop {
+    // Loop returns (found_result, timed_out):
+    //   (true,  _)    → StepStatus::Ok
+    //   (false, true) → StepStatus::Cancelled (deadline elapsed, CLI still alive)
+    //   (false, false)→ StepStatus::Failed    (CLI crash / PTY exit / channel disconnect)
+    let (found_result, timed_out): (bool, bool) = loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
         if remaining.is_zero() {
-            break false;
+            break (false, true);
         }
         let poll = remaining.min(Duration::from_millis(100));
         match rx.recv_timeout(poll) {
@@ -280,13 +305,13 @@ fn collect_turn(
                     &mut files,
                     MAX_OUT,
                 ) {
-                    break true;
+                    break (true, false);
                 }
             }
-            Ok(CoreEvent::TerminalExited { id, .. }) if id == terminal_id => break false,
+            Ok(CoreEvent::TerminalExited { id, .. }) if id == terminal_id => break (false, false),
             Ok(_) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break false,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break (false, false),
         }
     };
 
@@ -311,8 +336,10 @@ fn collect_turn(
         output: output.trim_end().to_string(),
         status: if found_result {
             StepStatus::Ok
-        } else {
+        } else if timed_out {
             StepStatus::Cancelled
+        } else {
+            StepStatus::Failed
         },
         usage,
         files,
