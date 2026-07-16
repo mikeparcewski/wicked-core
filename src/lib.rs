@@ -11,6 +11,7 @@
 //! execute backend (real subprocess + gate-hook), migrating the GUI onto `Core`, and deleting the
 //! `wicked-agent` crate.
 
+mod acp_runner;
 mod actor;
 mod applications;
 mod bus;
@@ -41,6 +42,7 @@ mod validator;
 mod validator_vault;
 mod workflow;
 
+pub use acp_runner::AcpStepRunner;
 pub use actor::{RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
@@ -222,6 +224,38 @@ impl Core {
             tx.clone(),
             pty.clone(),
         ));
+        let runner_actor = runner.clone();
+        std::thread::spawn(move || {
+            actor::run(
+                path,
+                rx,
+                self_tx,
+                distribute::real_dispatcher(),
+                runner_actor,
+                pty_actor,
+                None,
+            )
+        });
+        let core = Core {
+            tx: tx.clone(),
+            pty,
+            _shutdown: Arc::new(ShutdownGuard { tx }),
+        };
+        (core, runner)
+    }
+
+    /// Spawn the store actor with an [`AcpStepRunner`] as the execution seam — units use the
+    /// ACP multi-CLI session protocol, falling back to single-shot when the ACP binary is absent.
+    /// The returned handle exposes [`AcpStepRunner::drop_session`] for post-run cleanup.
+    pub fn spawn_with_acp_sessions(
+        path: impl Into<String>,
+    ) -> (Core, std::sync::Arc<AcpStepRunner>) {
+        let path = path.into();
+        let (tx, rx) = channel();
+        let self_tx = tx.clone();
+        let pty = terminal::new_map();
+        let pty_actor = pty.clone();
+        let runner = std::sync::Arc::new(acp_runner::AcpStepRunner::new());
         let runner_actor = runner.clone();
         std::thread::spawn(move || {
             actor::run(
@@ -823,6 +857,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            acp: None,
         };
 
         let dir = std::env::temp_dir().join("wicked-core-pipeline-test");

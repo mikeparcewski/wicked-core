@@ -40,6 +40,37 @@ pub enum Category {
     LocalRunner,
 }
 
+/// Wire transport for an ACP (Agent Client Protocol) server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcpTransport {
+    /// JSON-RPC 2.0 ndjson over stdin/stdout — spawn the binary, pipe I/O.
+    #[default]
+    Stdio,
+    /// JSON-RPC 2.0 via HTTP POST + SSE — spawn the binary with port args, connect via HTTP.
+    Http,
+}
+
+/// ACP server configuration for a CLI seat.
+///
+/// When set on an [`AgenticCli`], the engine attempts an ACP multi-turn session
+/// before falling back to single-shot invocation. A startup failure (binary not found,
+/// handshake error) emits a warning in the step output and triggers the fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpConfig {
+    /// The binary that implements the ACP server protocol.
+    /// May differ from the CLI binary itself (e.g. `"claude-agent-acp"` for claude,
+    /// `"codex-acp"` for codex). For HTTP-mode CLIs this is the CLI binary itself.
+    pub binary: String,
+    /// Extra args passed to start the ACP server. Empty for stdio-based servers.
+    /// For HTTP-transport CLIs: e.g. `["--acp", "--port", "3001"]`.
+    #[serde(default)]
+    pub start_args: Vec<String>,
+    /// Wire transport to use when connecting to this ACP server.
+    #[serde(default)]
+    pub transport: AcpTransport,
+}
+
 /// How the scaffold prompt is delivered to the CLI process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -172,6 +203,10 @@ pub struct AgenticCli {
     /// Whether this seat may be convened.
     #[serde(default = "default_true")]
     pub enabled_for_council: bool,
+    /// ACP multi-turn session config. When present, the engine tries ACP first and falls
+    /// back to single-shot invocation if the ACP server is unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp: Option<AcpConfig>,
 }
 
 fn default_true() -> bool {

@@ -1547,6 +1547,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: Confidence::default(),
             enabled_for_council: true,
+            acp: None,
         }
     }
 

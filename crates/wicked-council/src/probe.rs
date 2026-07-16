@@ -261,6 +261,7 @@ mod tests {
             alt_binaries: vec![],
             confidence: crate::types::Confidence::Verified,
             enabled_for_council: true,
+            acp: None,
         }
     }
 
