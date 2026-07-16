@@ -150,6 +150,15 @@ fn run_in_isolation(
                 }
             }
         }
+        InputMode::PtySession => {
+            // PtySession prompts are delivered via stdin by the session runner (not this council
+            // dispatch path). The council doesn't launch PTY sessions — fall through with no-op.
+            for tok in argv.iter_mut() {
+                if tok.contains("{PROMPT}") {
+                    *tok = tok.replace("{PROMPT}", "");
+                }
+            }
+        }
     }
 
     // Append trust flags so the CLI never blocks on an interactive prompt.

@@ -53,6 +53,10 @@ pub enum InputMode {
     AtFile,
     /// Attach the prompt as a message file referenced by `{PROMPT}` (path substituted).
     MessageFile,
+    /// Keep the CLI process alive as a persistent PTY session; write each turn's prompt to stdin
+    /// and detect completion via NDJSON `{"type":"result"}` parsing. Enables prompt-cache reuse
+    /// across governance-gated turns within the same run (wicked-core#13).
+    PtySession,
 }
 
 /// How much we trust the record's `headless_invocation` before relying on it.
