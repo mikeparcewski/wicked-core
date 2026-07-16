@@ -384,6 +384,9 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
 #[napi]
 pub struct Core {
     inner: wicked_core::Core,
+    /// The estate db path — held so governance read methods can open a read-only connection
+    /// without going through the single-writer actor (crew#40).
+    db_path: String,
 }
 
 #[napi]
@@ -394,7 +397,8 @@ impl Core {
     #[napi(factory)]
     pub fn spawn(path: String) -> Core {
         Core {
-            inner: wicked_core::Core::spawn(path),
+            inner: wicked_core::Core::spawn(path.clone()),
+            db_path: path,
         }
     }
 
@@ -405,7 +409,8 @@ impl Core {
         let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
         let runner = Arc::new(StubStepRunner);
         Core {
-            inner: wicked_core::Core::spawn_with_engine(path, dispatcher, runner),
+            inner: wicked_core::Core::spawn_with_engine(path.clone(), dispatcher, runner),
+            db_path: path,
         }
     }
 
@@ -607,6 +612,71 @@ impl Core {
         task(move || {
             let repos = core.list_repos().map_err(err)?;
             serde_json::to_string(&repos).map_err(err)
+        })
+    }
+
+    // ── Governance reads (crew#40) ──────────────────────────────────────────────
+    // Each method opens a fresh READ-ONLY connection (open_store_ro) so it never
+    // races with the single-writer actor. The actor continues to hold the one writable
+    // handle; readonly connections are safe to open concurrently on SQLite WAL mode.
+
+    /// All registered governance policies, as a JSON array of `Policy` objects.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn list_policies(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::{open_store_ro, FromNode, GraphRead, NodeKind};
+            use wicked_estate_core::SymbolQuery;
+            use wicked_governance::Policy;
+            let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let query = SymbolQuery {
+                kinds: vec![NodeKind::Other("policy".to_string())],
+                ..Default::default()
+            };
+            let mut policies: Vec<Policy> = Vec::new();
+            for node in store.find_symbols(&query).map_err(err)? {
+                if let Ok(p) = Policy::from_node(&node) {
+                    policies.push(p);
+                }
+            }
+            policies.sort_by(|a, b| a.id.cmp(&b.id));
+            serde_json::to_string(&policies).map_err(err)
+        })
+    }
+
+    /// All conformance rules on the store (Pattern + Policy types), as a JSON array.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn list_conformance_rules(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            use wicked_governance::{recall_rules, RuleQuery};
+            let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let rules = recall_rules(&store, &RuleQuery::default()).map_err(err)?;
+            serde_json::to_string(&rules).map_err(err)
+        })
+    }
+
+    /// All conformance claims (governance decisions) on the store, as a JSON array.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn list_conformance_claims(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::{open_store_ro, ConformanceClaim, GraphRead, NodeKind, CONFORMANCE_CLAIM};
+            use wicked_estate_core::SymbolQuery;
+            use wicked_governance::claim_from_node;
+            let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let query = SymbolQuery {
+                kinds: vec![NodeKind::Other(CONFORMANCE_CLAIM.to_string())],
+                ..Default::default()
+            };
+            let mut claims: Vec<ConformanceClaim> = Vec::new();
+            for node in store.find_symbols(&query).map_err(err)? {
+                if let Ok(c) = claim_from_node(&node) {
+                    claims.push(c);
+                }
+            }
+            serde_json::to_string(&claims).map_err(err)
         })
     }
 
