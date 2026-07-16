@@ -8,6 +8,6 @@
   "updated_at": "2026-07-15T21:09:25.608Z",
   "deleted": 0,
   "deleted_at": null,
-  "evidence_path": "/Users/michael.parcewski/Projects/wicked/wicked-core/.wicked-testing/evidence/a37e5f6e-b85f-4325-93dd-ce8fe5e23bec",
+  "evidence_path": ".wicked-testing/evidence/a37e5f6e-b85f-4325-93dd-ce8fe5e23bec",
   "finished_at": "2026-07-15T21:09:25.605Z"
 }

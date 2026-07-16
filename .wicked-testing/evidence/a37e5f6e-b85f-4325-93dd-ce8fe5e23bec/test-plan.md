@@ -15,8 +15,8 @@ None detected. The scenario body contains only a domain-graph test description. 
 ## Implementation Notes
 
 **Sources examined**:
-- `/Users/michael.parcewski/Projects/wicked/wicked-core/src/bin/wicked-core.rs` — `domain_graph_cmd` (lines 586–700), `coverage_cmd` (lines 702–741), `fail()` helper (line 934).
-- `/Users/michael.parcewski/Projects/wicked/wicked-core/crates/wicked-governance/src/domain_model.rs` — `assert_front_half_coverage`, `build_domain_model`, `recompute_front_half_coverage`.
+- `src/bin/wicked-core.rs` — `domain_graph_cmd` (lines 586–700), `coverage_cmd` (lines 702–741), `fail()` helper (line 934).
+- `crates/wicked-governance/src/domain_model.rs` — `assert_front_half_coverage`, `build_domain_model`, `recompute_front_half_coverage`.
 
 **Verified by live test run against the actual fixture** (both binaries confirmed on PATH at `~/.local/bin/`).
 

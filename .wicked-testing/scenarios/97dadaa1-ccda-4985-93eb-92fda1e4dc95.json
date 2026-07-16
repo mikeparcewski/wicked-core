@@ -4,7 +4,7 @@
   "name": "domain-graph-fail-closed",
   "source_path": ".wicked-testing/scenarios/domain-graph-fail-closed.md",
   "format_version": "1.0",
-  "body": "wicked-core domain-graph refuses to build when coverage < 1.0 (unaccounted nodes)",
+  "description": "wicked-core domain-graph refuses to build when coverage < 1.0 (unaccounted nodes)",
   "created_at": "2026-07-15T21:01:26.204Z",
   "updated_at": "2026-07-15T21:01:26.204Z",
   "deleted": 0,

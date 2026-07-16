@@ -3,7 +3,7 @@
   "project_id": "df18ca77-745b-4c3a-ba56-b3fb0481e49f",
   "name": "coverage-emitter",
   "description": "wicked-core coverage emits a valid CoverageReport from a coverage-1.0 estate store",
-  "file_path": ".wicked-testing/scenarios/coverage-emitter.md",
+  "source_path": ".wicked-testing/scenarios/coverage-emitter.md",
   "tags": "[\"wicked-core\",\"coverage\",\"domain-graph\",\"cli\",\"deterministic\"]",
   "status": "active",
   "created_at": "2026-07-15T20:36:00.197Z",

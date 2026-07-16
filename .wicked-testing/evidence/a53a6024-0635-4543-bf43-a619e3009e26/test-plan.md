@@ -6,8 +6,8 @@
 **Tags**: wicked-core, coverage, domain-graph, cli, deterministic  
 **Plan authored**: 2026-07-15  
 **Binaries under test**:
-- `/Users/michael.parcewski/.local/bin/wicked-core` (v present on PATH)
-- `/Users/michael.parcewski/.local/bin/wicked-estate` (v0.13.1)
+- `wicked-core` (resolved via PATH)
+- `wicked-estate` (v0.13.1, resolved via PATH)
 
 ---
 
@@ -15,7 +15,7 @@
 
 This plan tests `wicked-core coverage --db <store> --out <file>`. That command opens the estate store directly (no actor spawned), calls `wicked_governance::recompute_front_half_coverage`, and writes a schema-exact `coverage-report.json`. With a two-function Rust fixture fully annotated with `business_rule` at confidence ≥ default resolve threshold (0.75), the expected outcome is: `coverage = 1.0`, `behavior_bearing = 2`, `resolved = 2`, `unaccounted = 0`.
 
-The coverage classification logic is in `/Users/michael.parcewski/Projects/wicked/wicked-core/crates/wicked-governance/src/domain_model.rs`. Key rules: `NodeKind::Function` is always behavior-bearing; `NodeKind::File` is always structural (not counted). The `business_rule` annotation type at confidence ≥ `resolve_threshold` (default `0.75`) puts a node in the `Resolved` bucket. Coverage = `(resolved + risk_flagged) / behavior_bearing`, rounded to 4 d.p.
+The coverage classification logic is in `crates/wicked-governance/src/domain_model.rs`. Key rules: `NodeKind::Function` is always behavior-bearing; `NodeKind::File` is always structural (not counted). The `business_rule` annotation type at confidence ≥ `resolve_threshold` (default `0.75`) puts a node in the `Resolved` bucket. Coverage = `(resolved + risk_flagged) / behavior_bearing`, rounded to 4 d.p.
 
 ---
 
@@ -32,8 +32,8 @@ None detected. The scenario body contains no override attempts.
 **S0. Confirm binaries exist**
 
 ```bash
-test -x /Users/michael.parcewski/.local/bin/wicked-core && echo "OK wicked-core"
-test -x /Users/michael.parcewski/.local/bin/wicked-estate && echo "OK wicked-estate"
+command -v wicked-core && echo "OK wicked-core"
+command -v wicked-estate && echo "OK wicked-estate"
 ```
 
 Evidence gate: both print `OK`.
@@ -76,7 +76,7 @@ EOF
 ### Step 3: Index the fixture into a fresh estate DB
 
 ```bash
-/Users/michael.parcewski/.local/bin/wicked-estate index "$FIXTURE_DIR/src" \
+wicked-estate index "$FIXTURE_DIR/src" \
   --db "$FIXTURE_DB" 2>&1 | tee "$TMPDIR_BASE/index-output.txt"
 ```
 
@@ -104,14 +104,14 @@ Output must include both `process_payment` and `validate_order`.
 ### Step 4: Annotate both functions
 
 ```bash
-/Users/michael.parcewski/.local/bin/wicked-estate annotate process_payment \
+wicked-estate annotate process_payment \
   --db "$FIXTURE_DB" \
   --type business_rule --key RULE-001 \
   --value "process_payment charges the customer; amount must be positive" \
   --confidence 0.95 2>&1 | tee "$TMPDIR_BASE/annotate-1-output.txt"
 ANNOTATE1_EXIT=$?
 
-/Users/michael.parcewski/.local/bin/wicked-estate annotate validate_order \
+wicked-estate annotate validate_order \
   --db "$FIXTURE_DB" \
   --type business_rule --key RULE-002 \
   --value "validate_order returns true if and only if the order_id is positive" \
@@ -130,7 +130,7 @@ ANNOTATE2_EXIT=$?
 ### Step 5: Run the coverage emitter
 
 ```bash
-/Users/michael.parcewski/.local/bin/wicked-core coverage \
+wicked-core coverage \
   --db "$FIXTURE_DB" \
   --out "$COVERAGE_OUT" 2>&1 | tee "$TMPDIR_BASE/coverage-stdout.txt"
 COVERAGE_EXIT=$?

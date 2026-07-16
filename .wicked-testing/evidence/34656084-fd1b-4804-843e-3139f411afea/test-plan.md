@@ -6,7 +6,7 @@
 |---|---|
 | Scenario ID | `domain-graph-happy-path` |
 | Title | wicked-core domain-graph emits requirements_graph.json when coverage is 1.0 |
-| Scenario path | `/Users/michael.parcewski/Projects/wicked/wicked-core/.wicked-testing/scenarios/domain-graph-happy-path.md` |
+| Scenario path | `.wicked-testing/scenarios/domain-graph-happy-path.md` |
 | Maps to | core#29, core#22 |
 | Trust level | local-dev |
 | Tags | wicked-core, domain-graph, cli, deterministic |
