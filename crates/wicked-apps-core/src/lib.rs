@@ -289,6 +289,24 @@ pub fn open_store(path: Option<&str>) -> anyhow::Result<SqliteStore> {
     Ok(store)
 }
 
+/// Open the shared estate graph **read-only** (P4b hygiene). Path resolution is identical to
+/// [`open_store`], but the underlying connection uses `SQLITE_OPEN_READONLY` — no WAL pragma or
+/// schema DDL runs, so this is safe to call from subprocesses (gate-hook, validator scripts) while
+/// the single-writer actor holds the store open.
+///
+/// `:memory:` is not supported here (there is nothing to read from an empty in-memory db and the
+/// open would fail anyway). Falls back to the `WICKED_ESTATE_DB` env var then `.wicked-estate/graph.db`.
+pub fn open_store_ro(path: Option<&str>) -> anyhow::Result<SqliteStore> {
+    let resolved: String = match path {
+        Some(p) => p.to_string(),
+        None => {
+            std::env::var(ESTATE_DB_ENV).unwrap_or_else(|_| ".wicked-estate/graph.db".to_string())
+        }
+    };
+    SqliteStore::open_readonly(&resolved)
+        .map_err(|e| anyhow::anyhow!("open estate store read-only at {resolved:?}: {e}"))
+}
+
 /// Open the shared estate graph as a backend-agnostic [`AnyStore`], dispatched on the spec. This is
 /// the opener the engine's owner (the single-writer actor) uses so the runtime is never pinned to
 /// one backend: `AnyStore` is a concrete type, so `&`/`&mut` of it coerce to every store param

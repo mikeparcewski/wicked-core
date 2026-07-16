@@ -9,15 +9,10 @@
 //!    claim, or domain data to the store** — the actor remains the sole writer of those. The hook
 //!    only *reads* policies (`select`).
 //!
-//!    HYGIENE NOTE (P4b, de-risked): `open_store` opens the SQLite file READ-WRITE and, on open, runs
-//!    the WAL pragma + `execute_batch(SCHEMA)`/`migrate_schema` DDL (a wicked-estate-store detail). The
-//!    open already sets `PRAGMA busy_timeout=5000` (estate `sqlite.rs`, since PR#47), so a hook racing
-//!    the actor's write BLOCKS up to 5s and absorbs the contention — it does NOT fail-close into a
-//!    *spurious* DENY (the earlier worry, now known false). The residual is purity, not correctness: a
-//!    subprocess that only `select`s/`decide`s/`recall`s should not run schema DDL against a store the
-//!    single-writer actor owns. The pure-reader opener (`SQLITE_OPEN_READ_ONLY`, skip DDL) is tracked as
-//!    a follow-up (estate `SqliteStore::open_readonly` + an apps-core delegate), NOT a blocker for
-//!    governance-in-run. Fails CLOSED throughout: exit 2 = deny ⇒ Claude aborts the call.
+//!    Now uses `open_store_ro` (P4b, wicked-core#36 + wicked-estate#63): the hook opens the SQLite
+//!    file with `SQLITE_OPEN_READONLY` — no WAL pragma, no `SCHEMA`/`migrate_schema` DDL — so the
+//!    hook subprocess never races the single-writer actor on schema or WAL operations. The read is
+//!    tuning-only (busy_timeout + cache). Fails CLOSED throughout: exit 2 = deny ⇒ Claude aborts.
 //!
 //!  * [`apply_hook_decisions`] is the actor-side drain. It runs ON the single store-owning actor
 //!    thread, reads the NDJSON the hook produced, and is the ONLY place those claims hit the store:
@@ -38,7 +33,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use wicked_apps_core::{
-    open_store, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
+    open_store, open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
     CONFORMANCE_CLAIM,
 };
 use wicked_governance::{conform, decide, recall_rules, select, RuleQuery};
@@ -136,10 +131,12 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     }
 
     // Read-only use of the store: select reads policies, decide is pure. NO store write here.
+    // Use open_store_ro (SQLITE_OPEN_READONLY, no DDL) so the hook subprocess never races the
+    // single-writer actor on schema or WAL operations (P4b).
     // On an INFRA failure below we still exit 2 (the tool IS blocked), but we ALSO best-effort append a
     // synthetic Deny so the block leaves durable evidence — otherwise the fold would see no claim and the
     // run could Complete despite a governance-infra block (council blocker, infra-exit-2 arm).
-    let store = match open_store(db.filter(|s| !s.is_empty())) {
+    let store = match open_store_ro(db.filter(|s| !s.is_empty())) {
         Ok(s) => s,
         Err(e) => {
             append_infra_deny(
@@ -774,7 +771,7 @@ pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
             return 2;
         }
     };
-    let store = match open_store(db.filter(|s| !s.is_empty())) {
+    let store = match open_store_ro(db.filter(|s| !s.is_empty())) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wicked-governance: DENY (open store failed: {e})");
