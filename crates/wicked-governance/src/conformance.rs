@@ -238,7 +238,7 @@ pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyh
 }
 
 /// A recall query slice. Any `None` field matches every value of that facet.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuleQuery {
     pub language: Option<String>,
     pub layer: Option<String>,

@@ -540,6 +540,30 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// Upsert a governance policy. `policy_json` is a JSON-serialized `wicked_governance::Policy`
+    /// (fields: id, kind, applies_to, effect, trigger, severity, criteria, rule, obligations).
+    /// Validates, then stores via the single-writer actor. Fails closed on validation errors.
+    pub fn upsert_policy(&self, policy_json: String) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::UpsertPolicy { policy_json, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Upsert a conformance rule. `rule_json` is a JSON-serialized `wicked_governance::ConformanceRule`
+    /// (fields: id, rule_type, statement, severity, confidence, targets, provenance).
+    /// Validates (INV-C1/C2/C4), then stores via the single-writer actor. Fails closed on validation errors.
+    pub fn upsert_conformance_rule(&self, rule_json: String) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::UpsertConformanceRule { rule_json, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// Capture an episodic memory (a learned fact/decision) into the orchestrator's memory store.
     pub fn capture_memory(&self, content: &str, scope: &str) -> anyhow::Result<()> {
         let (reply, rx) = channel();

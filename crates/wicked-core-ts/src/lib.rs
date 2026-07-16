@@ -637,7 +637,7 @@ impl Core {
             for node in store.find_symbols(&query).map_err(err)? {
                 match Policy::from_node(&node) {
                     Ok(p) => policies.push(p),
-                    Err(e) => eprintln!("wicked-core-ts: policy node '{}' failed to parse: {e}", node.id),
+                    Err(e) => eprintln!("wicked-core-ts: policy node '{}' failed to parse: {e}", node.symbol),
                 }
             }
             policies.sort_by(|a, b| a.id.cmp(&b.id));
@@ -675,10 +675,54 @@ impl Core {
             for node in store.find_symbols(&query).map_err(err)? {
                 match claim_from_node(&node) {
                     Ok(c) => claims.push(c),
-                    Err(e) => eprintln!("wicked-core-ts: claim node '{}' failed to parse: {e}", node.id),
+                    Err(e) => eprintln!("wicked-core-ts: claim node '{}' failed to parse: {e}", node.symbol),
                 }
             }
             serde_json::to_string(&claims).map_err(err)
+        })
+    }
+
+    // ── Governance writes (crew#42) ─────────────────────────────────────────────
+
+    /// Upsert a governance policy. `policy_json` is a JSON-serialized `Policy` object
+    /// (fields: id, kind, applies_to, effect, trigger, severity, criteria, rule, obligations).
+    /// Validates server-side (fails closed on deny_unknown_fields + required fields). Idempotent
+    /// on stable id — calling twice with the same id and payload is a no-op.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn upsert_policy(&self, policy_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.upsert_policy(policy_json).map_err(err)?;
+            Ok(String::new())
+        })
+    }
+
+    /// Upsert a conformance rule. `rule_json` is a JSON-serialized `ConformanceRule` object
+    /// (fields: id, rule_type, statement, severity, confidence, targets, provenance).
+    /// Validates server-side (INV-C1/C2/C4). Idempotent on stable id.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn upsert_conformance_rule(&self, rule_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.upsert_conformance_rule(rule_json).map_err(err)?;
+            Ok(String::new())
+        })
+    }
+
+    /// Recall which conformance rules apply to the given `query_json` (a JSON-serialized
+    /// `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
+    /// Opens a read-only connection — does not block the single-writer actor. Returns a JSON
+    /// array of `ConformanceRule` objects, severity-first then id.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn recall_rules_preview(&self, query_json: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            use wicked_governance::{recall_rules, RuleQuery};
+            let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let query: RuleQuery = serde_json::from_str(&query_json).map_err(err)?;
+            let rules = recall_rules(&store, &query).map_err(err)?;
+            serde_json::to_string(&rules).map_err(err)
         })
     }
 
