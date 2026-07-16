@@ -708,8 +708,9 @@ pub fn run_validator_reporting(
     // Inject the estate db path so scripts that invoke `wicked-core coverage` resolve the correct store.
     // This is an explicit injection (not a passthrough), so it never leaks other env secrets.
     // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
-    // Canonicalize filesystem paths to absolute before injecting: the child's cwd is the worktree,
+    // Make relative paths absolute before injecting: the child's cwd is the worktree,
     // so a relative path like "wicked-estate.db" would mis-resolve there.
+    // (No fs::canonicalize — that prepends \\?\ UNC prefix on Windows, breaking sh/bash.)
     if let Some(db) = db_path {
         if !db.is_empty() && db != ":memory:" && !db.contains("://") {
             let p = std::path::Path::new(db);

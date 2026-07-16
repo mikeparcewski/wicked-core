@@ -294,8 +294,9 @@ pub fn open_store(path: Option<&str>) -> anyhow::Result<SqliteStore> {
 /// schema DDL runs, so this is safe to call from subprocesses (gate-hook, validator scripts) while
 /// the single-writer actor holds the store open.
 ///
-/// `:memory:` is not supported here (there is nothing to read from an empty in-memory db and the
-/// open would fail anyway). Falls back to the `WICKED_ESTATE_DB` env var then `.wicked-estate/graph.db`.
+/// Unlike [`open_store`] this does **not** create the database or migrate its schema — the store
+/// must already exist on disk or the call fails. `:memory:` is rejected explicitly (nothing to
+/// read). Falls back to the `WICKED_ESTATE_DB` env var then `.wicked-estate/graph.db`.
 pub fn open_store_ro(path: Option<&str>) -> anyhow::Result<SqliteStore> {
     let resolved: String = match path {
         Some(p) => p.to_string(),
