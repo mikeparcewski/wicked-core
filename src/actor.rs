@@ -1626,7 +1626,7 @@ pub(crate) fn confirm_gate(
         }
         crate::workflow::HumanDecision::Approve { amend } => {
             // Layer-3: governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
-            // Runs BEFORE any state mutation so a Deny leaves the run in AwaitingHuman (recoverable).
+            // Runs BEFORE any approval-side mutations so a Deny cancels cleanly (no partial state committed).
             // Without policies loaded (`wicked-core rules ingest`), select() returns empty and decide()
             // always returns Allow — the check is a no-op until policies are populated.
             {
@@ -1634,7 +1634,7 @@ pub(crate) fn confirm_gate(
                 let phase_name = units
                     .get(session.unit_ix)
                     .map(|u| crate::scope::unit_phase(u.ord))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "terminal".to_owned());
                 let scope = session.collection_scope.as_deref().unwrap_or(run_id);
                 let context = serde_json::json!({
                     "phase": phase_name,
