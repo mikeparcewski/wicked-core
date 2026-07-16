@@ -23,8 +23,8 @@ use wicked_apps_core::{
     AGENT_SESSION,
 };
 use wicked_council::types::Dispatcher;
-use wicked_governance::{conform, decide, select};
 use wicked_estate_core::SymbolQuery;
+use wicked_governance::{conform, decide, select};
 
 use crate::command::Command;
 use crate::domain::{put_node, SessionStatus};
@@ -1635,10 +1635,7 @@ pub(crate) fn confirm_gate(
                     .get(session.unit_ix)
                     .map(|u| crate::scope::unit_phase(u.ord))
                     .unwrap_or_default();
-                let scope = session
-                    .collection_scope
-                    .as_deref()
-                    .unwrap_or(run_id);
+                let scope = session.collection_scope.as_deref().unwrap_or(run_id);
                 let context = serde_json::json!({
                     "phase": phase_name,
                     "scope": scope,
@@ -2146,7 +2143,9 @@ mod phase_boundary_governance_tests {
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
         let mut u = WorkUnit::pending("r:u1", "r", 1, "a phase requiring governance approval");
-        u.gate = GateSpec::HumanConfirm { unconditional: true };
+        u.gate = GateSpec::HumanConfirm {
+            unconditional: true,
+        };
         put_node(store, u.to_node()).unwrap();
     }
 
