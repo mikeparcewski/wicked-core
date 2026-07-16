@@ -178,6 +178,22 @@ fn main() {
                 Err(e) => fail(&format!("resume failed: {e}")),
             }
         }
+        Some("reattach") => {
+            let Some(sid) = flag(&args, "--session") else {
+                fail("reattach requires --session <id>");
+                return;
+            };
+            // Subscribe BEFORE resume_run so no events are missed.
+            let events = core.subscribe();
+            match core.resume_run(&sid) {
+                Ok(s) => println!("reattach {sid} → {s:?}"),
+                Err(e) => {
+                    fail(&format!("reattach failed: {e}"));
+                    return;
+                }
+            }
+            drain_events(&events, Some((&core, &sid)));
+        }
         Some("cancel") => {
             let Some(sid) = flag(&args, "--session") else {
                 fail("cancel requires --session <id>");
@@ -213,7 +229,7 @@ fn main() {
             eprintln!(
                 "usage: wicked-core <status | repos | register-repo --path <dir> | \
                  run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
-                 resume --session <id> | cancel --session <id> | \
+                 resume --session <id> | reattach --session <id> | cancel --session <id> | \
                  launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
                  provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
                  seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
