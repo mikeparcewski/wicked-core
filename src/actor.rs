@@ -914,6 +914,7 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
 /// `registry`: the actor-owned workflow registry (built-ins + runtime-registered defs + file
 /// overlay already loaded). Passed to `plan_and_distribute` so `LaunchRun` picks up workflows
 /// registered via `Command::RegisterWorkflow` without a process restart.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_run_inner(
     store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,

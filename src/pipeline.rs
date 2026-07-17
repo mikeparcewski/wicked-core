@@ -164,10 +164,10 @@ fn resolve_workflow_def(
     // any runtime-registered workflows. Only the legacy run_session path omits it and falls back to
     // the per-call built-ins + overlay-dir path below.
     if let Some(reg) = extra {
-        match reg.get(id) {
-            Some(def) => return Ok(Some(def.clone())),
-            None => {} // not in the actor registry — fall through to built-ins + overlay dir
+        if let Some(def) = reg.get(id) {
+            return Ok(Some(def.clone()));
         }
+        // not in the actor registry — fall through to built-ins + overlay dir
     }
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
