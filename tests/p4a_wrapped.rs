@@ -47,6 +47,7 @@ fn echo_cli() -> AgenticCli {
         confidence: Confidence::default(),
         enabled_for_council: true,
         acp: None,
+        capabilities: None,
     }
 }
 
