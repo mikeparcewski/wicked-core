@@ -243,6 +243,19 @@ pub enum PhaseRole {
     Evaluator,
 }
 
+/// How a phase executes: via a council-routed CLI agent, or a direct tool command.
+/// `Agent` is the default (preserves all existing behaviour); `Tool` bypasses the council
+/// and runs `cmd` as a subprocess with the session's `workdir` as the working directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PhaseExecutor {
+    #[default]
+    Agent,
+    Tool {
+        cmd: Vec<String>,
+    },
+}
+
 /// One ordered phase of a workflow — pure DATA the reducer dispatches on.
 /// `deny_unknown_fields`: a misspelled key in a drop-in JSON is a loud parse error (naming the
 /// file), never a silently-dropped default — matching the workflows/README.md contract.
@@ -295,6 +308,11 @@ pub struct PhaseDef {
     /// `None` (the default) ⇒ the phase runs ungated by a pinned validator (the pre-gate behavior).
     #[serde(default)]
     pub validator_pin: Option<String>,
+    /// How this phase executes. `Agent` (default) = council routes to a CLI; `Tool` = run `cmd`
+    /// directly in the session workdir, no council. `#[serde(default)]` for back-compat with
+    /// existing workflow JSON files that omit this field.
+    #[serde(default)]
+    pub executor: PhaseExecutor,
 }
 
 impl PhaseDef {
@@ -313,6 +331,7 @@ impl PhaseDef {
             skill_ref: None,
             allowed_skills: Vec::new(),
             validator_pin: None,
+            executor: PhaseExecutor::default(),
         }
     }
     fn gate(mut self, gt: GateType, spec: GateSpec) -> Self {
@@ -340,6 +359,10 @@ impl PhaseDef {
     fn skill(mut self, skill_ref: &str, allowed: &[&str]) -> Self {
         self.skill_ref = Some(skill_ref.to_string());
         self.allowed_skills = allowed.iter().map(|s| s.to_string()).collect();
+        self
+    }
+    pub(crate) fn executor(mut self, executor: PhaseExecutor) -> Self {
+        self.executor = executor;
         self
     }
 }
@@ -447,7 +470,7 @@ impl WorkflowRegistry {
     /// The built-in workflows (feature/bug/migration), each validated at construction.
     pub fn with_defaults() -> Self {
         let mut r = WorkflowRegistry::default();
-        for def in [feature_def(), bug_def(), migration_def()] {
+        for def in [feature_def(), bug_def(), migration_def(), onboarding_def()] {
             r.register(def).expect("built-in workflow defs are valid");
         }
         r
@@ -635,14 +658,46 @@ pub fn migration_def() -> WorkflowDef {
     }
 }
 
+/// `onboarding` — estate indexing pipeline for a registered repo (3 deterministic tool phases).
+/// Phases run in the session's `workdir` (the repo root); no council is convened.
+/// index → annotate → domain (sequential, each after the previous).
+pub fn onboarding_def() -> WorkflowDef {
+    WorkflowDef {
+        id: "onboarding".to_string(),
+        phases: vec![
+            PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
+                cmd: vec!["wicked-estate".to_string(), "index".to_string()],
+            }),
+            PhaseDef::new("annotate", StageKind::Recon)
+                .executor(PhaseExecutor::Tool {
+                    cmd: vec![
+                        "wicked-estate".to_string(),
+                        "clusters".to_string(),
+                        "--annotate".to_string(),
+                    ],
+                })
+                .after("index"),
+            PhaseDef::new("domain", StageKind::Recon)
+                .executor(PhaseExecutor::Tool {
+                    cmd: vec![
+                        "wicked-estate".to_string(),
+                        "nodes".to_string(),
+                        "--json".to_string(),
+                    ],
+                })
+                .after("annotate"),
+        ],
+    }
+}
+
 #[cfg(test)]
 mod workflow_def_tests {
     use super::*;
 
     #[test]
-    fn registry_seeds_the_three_builtin_workflows() {
+    fn registry_seeds_the_four_builtin_workflows() {
         let r = WorkflowRegistry::with_defaults();
-        assert_eq!(r.ids(), vec!["bug", "feature", "migration"]);
+        assert_eq!(r.ids(), vec!["bug", "feature", "migration", "onboarding"]);
     }
 
     #[test]

@@ -98,6 +98,7 @@ fn cli(key: &str) -> AgenticCli {
         confidence: Confidence::default(),
         enabled_for_council: true,
         acp: None,
+        capabilities: None,
     }
 }
 

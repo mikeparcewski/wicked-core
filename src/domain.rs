@@ -187,6 +187,10 @@ pub struct WorkUnit {
     /// behavior). `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub validator: Option<crate::validator::DeterministicValidator>,
+    /// The exact command this unit runs when `PhaseExecutor::Tool` (carried from the phase def).
+    /// `None` for Agent-executor units. `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_cmd: Option<Vec<String>>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -282,6 +286,9 @@ pub enum RoutingInfo {
     /// A review/test unit was REASSIGNED off the council's pick to enforce evaluator ≠ creator (the
     /// critic must differ from the CLI that produced the work it checks). `was` is the council's pick.
     EvaluatorDistinct { winner: String, was: String },
+    /// No council convened — this unit is a deterministic tool execution. The `assigned_cli` is
+    /// the literal command name (first element of `tool_cmd`).
+    Tool,
 }
 
 impl WorkUnit {
@@ -313,6 +320,7 @@ impl WorkUnit {
             gate: crate::workflow::GateSpec::default(),
             role: crate::workflow::PhaseRole::default(),
             validator: None,
+            tool_cmd: None,
             status: UnitStatus::Pending,
         }
     }

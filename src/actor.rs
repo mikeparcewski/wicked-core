@@ -1531,6 +1531,41 @@ fn dispatch_unit(
         prior_outputs,
     };
 
+    // TOOL EXECUTOR: if the unit carries a tool_cmd, bypass the CLI runner entirely.
+    // Spawn the command off-thread (same actor-safety rule as the agent path), capture
+    // stdout+stderr as the transcript, post ApplyStepResult when done.
+    if let Some(cmd) = unit.tool_cmd.clone() {
+        let tx = self_tx.clone();
+        let run_id2 = run_id.to_string();
+        let ord = unit.ord;
+        let unit_ix2 = unit_ix;
+        let attempt = session.attempt;
+        let workdir = session.workdir.clone();
+        std::thread::spawn(move || {
+            let (output_str, status) = run_tool_cmd(&cmd, workdir.as_deref());
+            // Stream the whole output as one delta so the transcript panel shows something.
+            let _ = tx.send(crate::command::Command::CliOutputDelta {
+                run_id: run_id2.clone(),
+                ord,
+                chunk: output_str.clone(),
+            });
+            let _ = tx.send(crate::command::Command::ApplyStepResult {
+                output: crate::workflow::StepOutput {
+                    run_id: run_id2,
+                    unit_ix: unit_ix2,
+                    attempt,
+                    output: output_str,
+                    status,
+                    usage: None,
+                    files: Vec::new(),
+                    governed: false,
+                },
+                agent_verdict: None,
+            });
+        });
+        return Ok(true);
+    }
+
     // LAW 1 EXECUTION-MEDIATION SEAM (opt-in). When exec-mediation is armed on this (actor) thread, the
     // reducer does NOT call execution directly: it PUBLISHES `wicked.task.dispatched` and returns. The
     // off-actor `cli-runner` subscriber runs the unit (via the SAME runner) and publishes
@@ -1584,6 +1619,48 @@ fn dispatch_unit(
         });
     });
     Ok(true)
+}
+
+/// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
+/// `(output, StepStatus)`. Exit 0 → `StepStatus::Ok`; anything else → `StepStatus::Failed`.
+/// Called off the actor thread (blocking subprocess).
+fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workflow::StepStatus) {
+    use std::process::Command;
+    let Some(bin) = cmd.first() else {
+        return (
+            "tool phase has empty cmd".to_string(),
+            crate::workflow::StepStatus::Failed,
+        );
+    };
+    let mut proc = Command::new(bin);
+    proc.args(&cmd[1..]);
+    if let Some(wd) = workdir {
+        proc.current_dir(wd);
+    }
+    match proc.output() {
+        Ok(out) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.is_empty() {
+                if !combined.is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr);
+            }
+            let status = if out.status.success() {
+                crate::workflow::StepStatus::Ok
+            } else {
+                let code = out.status.code().unwrap_or(-1);
+                combined.push_str(&format!("\n[exit {}]", code));
+                crate::workflow::StepStatus::Failed
+            };
+            (combined, status)
+        }
+        Err(e) => (
+            format!("failed to spawn {:?}: {e}", bin),
+            crate::workflow::StepStatus::Failed,
+        ),
+    }
 }
 
 /// Mark a run `Completed` and emit `SessionCompleted`. Propagates a store-write failure so a failed
