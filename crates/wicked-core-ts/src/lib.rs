@@ -731,6 +731,26 @@ impl Core {
         })
     }
 
+    /// Front-half coverage gate report — JSON-serialized `CoverageReport`, or the JSON literal
+    /// `null` when the store has no domain-model nodes yet. Opens a read-only connection so it
+    /// never blocks the single-writer actor.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn get_coverage_report(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            use wicked_governance::recompute_front_half_coverage;
+            let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            match recompute_front_half_coverage(&store) {
+                Ok(report) => serde_json::to_string(&report).map_err(err),
+                Err(e) => {
+                    eprintln!("wicked-core-ts: getCoverageReport failed: {e}");
+                    Ok("null".to_string())
+                }
+            }
+        })
+    }
+
     // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────
     // Each method runs its (potentially blocking) Core call on a libuv worker thread via the SAME
     // `CoreTask`/`AsyncTask` pattern as every other method — the Node event loop is never blocked on
