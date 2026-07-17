@@ -196,6 +196,20 @@ pub(crate) fn run(
     // The actor-owned PTY terminal registry (id → status + seq). Byte-I/O lives off-actor in
     // `pty_map`; this small map is the single-writer state the actor owns (DES §4).
     let mut terminals: HashMap<String, TermReg> = HashMap::new();
+    // Actor-owned workflow registry: built-ins seeded at startup, runtime defs added via
+    // `Command::RegisterWorkflow`. The file overlay dir (`$WICKED_WORKFLOWS_DIR` /
+    // `~/.config/wicked-core/workflows`) is loaded ONCE here so every subsequent `LaunchRun` on
+    // this actor instance sees both the file-overlay and any runtime-registered defs without
+    // re-reading the directory per call.
+    let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
+    if let Some(dir) = pipeline::workflow_overlay_dir() {
+        if let Err(e) = registry.load_dir(&dir) {
+            eprintln!(
+                "wicked-core: workflow overlay {} failed to load ({e}); using built-ins only",
+                dir.display()
+            );
+        }
+    }
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
     // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC
     // (which unwinds past the loop; the old end-of-`run` drain ran only on a NORMAL exit, so a panic
@@ -358,6 +372,7 @@ pub(crate) fn run(
                     &self_tx,
                     &mut in_flight,
                     spec,
+                    &registry,
                 );
                 let _ = reply.send(res);
             }
@@ -649,7 +664,7 @@ pub(crate) fn run(
             }
             // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
             Command::LaunchCampaign { def, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
                 let res = crate::campaign::launch(
                     &mut store,
                     &mut subscribers,
@@ -660,7 +675,7 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::ResumeCampaign { id, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
                 let res = crate::campaign::resume(
                     &mut store,
                     &mut subscribers,
@@ -671,7 +686,7 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelCampaign { id, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
                 let res = crate::campaign::cancel(
                     &mut store,
                     &mut subscribers,
@@ -691,7 +706,7 @@ pub(crate) fn run(
                 decision,
                 reply,
             } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
                 let res = crate::campaign::confirm_gate(
                     &mut store,
                     &mut subscribers,
@@ -714,7 +729,7 @@ pub(crate) fn run(
             Command::CampaignRunFinished { run_id, outcome } => {
                 // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
                 // points). No-op if the run isn't campaign-owned.
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
                 if let Err(e) = crate::campaign::on_run_finished(
                     &mut store,
                     &mut subscribers,
@@ -728,7 +743,7 @@ pub(crate) fn run(
             }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
                 if let Err(e) = crate::campaign::on_node_awaiting(
                     &mut store,
                     &mut subscribers,
@@ -739,6 +754,15 @@ pub(crate) fn run(
                 ) {
                     emit_run_error(&mut subscribers, &run_id, e);
                 }
+            }
+            Command::RegisterWorkflow { json, reply } => {
+                let result = serde_json::from_str::<crate::workflow::WorkflowDef>(&json)
+                    .map_err(|e| anyhow::anyhow!("invalid workflow JSON: {e}"))
+                    .and_then(|def| {
+                        let id = def.id.clone();
+                        registry.register(def).map(|_| id).map_err(|e| anyhow::anyhow!("{e}"))
+                    });
+                let _ = reply.send(result);
             }
             Command::Shutdown => {
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
@@ -836,11 +860,13 @@ fn campaign_seams<'a>(
     dispatcher: &'a Arc<dyn Dispatcher + Send + Sync>,
     runner: &'a Arc<dyn StepRunner>,
     self_tx: &'a Sender<Command>,
+    registry: &'a crate::workflow::WorkflowRegistry,
 ) -> crate::campaign::Seams<'a> {
     crate::campaign::Seams {
         dispatcher,
         runner,
         self_tx,
+        registry,
     }
 }
 
@@ -881,6 +907,10 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
 /// The body of `Command::LaunchRun` (also the campaign driver's node launcher, DES §4). Plans +
 /// distributes synchronously, then advances unit 0 off-thread (or pauses at a gate). Idempotent by
 /// run id: refuses to re-plan over a live run (resume it instead). Returns the run id.
+///
+/// `registry`: the actor-owned workflow registry (built-ins + runtime-registered defs + file
+/// overlay already loaded). Passed to `plan_and_distribute` so `LaunchRun` picks up workflows
+/// registered via `Command::RegisterWorkflow` without a process restart.
 pub(crate) fn launch_run_inner(
     store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
@@ -889,6 +919,7 @@ pub(crate) fn launch_run_inner(
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
     spec: LaunchSpec,
+    registry: &crate::workflow::WorkflowRegistry,
 ) -> anyhow::Result<String> {
     let run_id = spec.session_id.clone();
     validate_session_id(&run_id)?;
@@ -922,6 +953,7 @@ pub(crate) fn launch_run_inner(
         spec.workflow.as_deref(),
         dispatcher,
         &mut |ev| emit(subscribers, ev),
+        Some(registry),
     )?;
     match advance_or_pause(store, subscribers, runner, self_tx, &run_id, 0) {
         Ok(Progress::Dispatched) => {

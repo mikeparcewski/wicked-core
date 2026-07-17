@@ -603,6 +603,9 @@ pub(crate) struct Seams<'a> {
     pub dispatcher: &'a Arc<dyn Dispatcher + Send + Sync>,
     pub runner: &'a Arc<dyn StepRunner>,
     pub self_tx: &'a Sender<Command>,
+    /// The actor-owned workflow registry (built-ins + file overlay + runtime-registered defs).
+    /// Passed to `launch_run_inner` so campaign nodes can use defs registered at runtime.
+    pub registry: &'a crate::workflow::WorkflowRegistry,
 }
 
 /// Fan an event out to every live subscriber (mirrors the actor's single-emit-point helper).
@@ -745,6 +748,7 @@ fn dispatch(
             seams.self_tx,
             in_flight,
             ls,
+            seams.registry,
         )
         .map(|_| ())
     } else {
@@ -1190,6 +1194,7 @@ pub(crate) fn resume(
                         seams.self_tx,
                         in_flight,
                         spec.to_launch_spec(run_id.clone()),
+                        seams.registry,
                     )
                     .map(|_| ()),
                     None => Err(anyhow::anyhow!("resume: unknown node {node}")),

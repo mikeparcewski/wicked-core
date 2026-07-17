@@ -713,6 +713,25 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// Register (or replace) a workflow definition in the actor's runtime registry. `json` is a
+    /// JSON-serialised [`WorkflowDef`]; validates before inserting and rejects invalid JSON or a
+    /// def that fails its own structural validation. Idempotent on id — calling twice with the same
+    /// id replaces the first registration. Returns the registered workflow id.
+    ///
+    /// Registered defs are visible immediately: the next `launch_run` call with a matching `workflow`
+    /// id will plan from this def without a process restart.
+    pub fn register_workflow(&self, json: impl Into<String>) -> anyhow::Result<String> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RegisterWorkflow {
+                json: json.into(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     // ── PTY terminal sessions (DES-TERMINAL-001) ─────────────────────────────────────────────────
 
     /// Open a PTY terminal session running `cmd` (or the login shell if `None`) in `cwd`, sized

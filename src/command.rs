@@ -218,6 +218,12 @@ pub(crate) enum Command {
     /// Internal: a HITL gate opened inside a campaign node's Run — free its slot, surface the prompt,
     /// and dispatch independent work into the freed slot.
     CampaignNodeAwaiting { run_id: String, prompt: String },
+    /// Register (or replace) a workflow def in the actor's registry. Validates before inserting.
+    /// `json` is a serialized `WorkflowDef`. Replies `Err` if validation fails.
+    RegisterWorkflow {
+        json: String,
+        reply: std::sync::mpsc::Sender<anyhow::Result<String>>, // returns the workflow id
+    },
     /// Stop the actor loop and release the store. Sent automatically when the LAST external `Core`
     /// handle drops (the actor holds its own `self_tx` for worker write-back, so channel-close alone
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but

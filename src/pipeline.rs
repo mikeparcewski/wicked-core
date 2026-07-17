@@ -67,6 +67,7 @@ pub fn run_session(
         workflow,
         &dispatcher,
         emit,
+        None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -144,17 +145,30 @@ pub(crate) struct Planned {
     pub cli_keys: Vec<String>,
 }
 
-/// Resolve a selected workflow id to its validated [`WorkflowDef`]. Seeds the built-ins and overlays
-/// operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else `$HOME/.config/wicked-core/workflows`,
-/// best-effort). `None` (no selection) ⇒ `Ok(None)` and the caller uses the free-text planner; a
-/// requested-but-**unknown** id ⇒ `Err` (never a silent fallback).
+/// Resolve a selected workflow id to its validated [`WorkflowDef`]. When `extra` is provided it is
+/// consulted first (runtime-registered workflows take priority over built-ins and the file overlay);
+/// otherwise seeds the built-ins and overlays operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else
+/// `$HOME/.config/wicked-core/workflows`, best-effort). `None` (no selection) ⇒ `Ok(None)` and the
+/// caller uses the free-text planner; a requested-but-**unknown** id ⇒ `Err` (never a silent
+/// fallback).
 fn resolve_workflow_def(
     workflow: Option<&str>,
+    extra: Option<&crate::workflow::WorkflowRegistry>,
 ) -> anyhow::Result<Option<crate::workflow::WorkflowDef>> {
     // No selection ⇒ the caller uses the free-text planner. Only THIS falls through.
     let Some(id) = workflow else {
         return Ok(None);
     };
+    // When the caller provides an actor-owned registry (the interactive LaunchRun path), use it
+    // directly: it already contains the built-ins (seeded at actor startup via `with_defaults()`) plus
+    // any runtime-registered workflows. Only the legacy run_session path omits it and falls back to
+    // the per-call built-ins + overlay-dir path below.
+    if let Some(reg) = extra {
+        match reg.get(id) {
+            Some(def) => return Ok(Some(def.clone())),
+            None => {} // not in the actor registry — fall through to built-ins + overlay dir
+        }
+    }
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
         // Best-effort dir read: a broken *overlay dir* must never wedge a built-in run (load_dir
@@ -223,7 +237,7 @@ fn attach_pinned_validators(
     Ok(())
 }
 
-fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {
         return Some(std::path::PathBuf::from(d));
     }
@@ -235,6 +249,9 @@ fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
 /// units, register the workflow's ordered phase list, and let the council assign a CLI per unit.
 /// Emits `SessionStarted` / `UnitPlanned×n` / `UnitDistributed×n` and leaves the session at
 /// `Executing`. Store-writing, so it runs on the actor (single-writer) thread.
+///
+/// `workflow_registry`: when `Some`, the actor-owned runtime registry is consulted first for
+/// workflow resolution (enables defs registered via `RegisterWorkflow` without a restart).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_and_distribute(
     store: &mut dyn wicked_apps_core::GraphStore,
@@ -248,6 +265,7 @@ pub(crate) fn plan_and_distribute(
     workflow: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
+    workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
 ) -> anyhow::Result<Planned> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -258,7 +276,7 @@ pub(crate) fn plan_and_distribute(
     // The def is validated (the registry only hands out validated defs), so plan_from_def's unit-id
     // uniqueness precondition holds. The DENY_PHASE_SPAN governed-limit check below applies to BOTH
     // paths — a def with too many phases is rejected exactly like an over-long prose problem.
-    let selected_def = resolve_workflow_def(workflow)?;
+    let selected_def = resolve_workflow_def(workflow, workflow_registry)?;
     let mut units = match &selected_def {
         Some(def) => plan::plan_from_def(def, problem, session_id),
         None => plan::plan_units(problem, session_id),
@@ -662,14 +680,14 @@ mod resolve_tests {
     #[test]
     fn workflow_selection_resolves_none_known_and_rejects_unknown() {
         // No selection ⇒ None (the caller uses the free-text planner).
-        assert!(resolve_workflow_def(None).unwrap().is_none());
+        assert!(resolve_workflow_def(None, None).unwrap().is_none());
         // A known built-in resolves to its def.
         assert_eq!(
-            resolve_workflow_def(Some("feature")).unwrap().unwrap().id,
+            resolve_workflow_def(Some("feature"), None).unwrap().unwrap().id,
             "feature"
         );
         // A requested-but-unknown id is a LOUD error (never a silent fall-through to prose planning).
-        let err = resolve_workflow_def(Some("feaure-typo-xyz"))
+        let err = resolve_workflow_def(Some("feaure-typo-xyz"), None)
             .unwrap_err()
             .to_string();
         assert!(
