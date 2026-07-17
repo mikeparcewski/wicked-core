@@ -35,13 +35,21 @@ pub(crate) enum Command {
         ndjson_path: PathBuf,
         reply: Sender<anyhow::Result<HookDrainSummary>>,
     },
-    /// Launch an INTERACTIVE, resumable run: plan + distribute on the actor (fast store writes), then
-    /// execute each unit OFF-THREAD on the worker pool (so the actor stays responsive). Reply carries
-    /// the run id, or a busy error if a run with that id is already in flight. (Contrast `Launch`,
-    /// the legacy straight-through path that blocks the actor.)
+    /// Launch an INTERACTIVE, resumable run. The actor immediately validates the run id, creates a
+    /// Planning stub on the store, emits `SessionStarted`, and replies with the run id so the caller
+    /// is unblocked in < 1 ms. The slow planning + council distribution work is deferred to a
+    /// self-sent `ContinueLaunch` that the actor processes in the next loop iteration.
     LaunchRun {
         spec: crate::LaunchSpec,
         reply: Sender<anyhow::Result<String>>,
+    },
+    /// Internal: the deferred second half of `LaunchRun`. Carries the validated spec and the resolved
+    /// repo workdir (already written to disk by `LaunchRun`). Errors here surface as `CoreEvent::Error`
+    /// — no reply channel. The actor marks the run Failed on error so it never wedges in Planning.
+    ContinueLaunch {
+        spec: crate::LaunchSpec,
+        repo_ref: Option<String>,
+        workdir: Option<String>,
     },
     /// Resume an interactive run from its persisted cursor (after a pause, crash, or fresh process).
     /// Re-dispatches the next not-yet-done unit. Busy error if the run is already in flight.

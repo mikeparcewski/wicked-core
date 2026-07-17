@@ -27,11 +27,11 @@ use wicked_estate_core::SymbolQuery;
 use wicked_governance::{conform, decide, select};
 
 use crate::command::Command;
-use crate::domain::{put_node, SessionStatus};
+use crate::domain::{put_node, AgentSession, SessionStatus};
 use crate::event::CoreEvent;
 use crate::terminal::{self, PtyMap};
 use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
-use crate::{pipeline, LaunchSpec};
+use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 
 /// The actor-owned terminal registry entry (DES §4 "id → status"). Presence in the registry map IS
 /// the "open" status; removal (on exit/close) is the terminal state — this is the single-emit guard
@@ -364,17 +364,147 @@ pub(crate) fn run(
                 ));
             }
             Command::LaunchRun { spec, reply } => {
-                let res = launch_run_inner(
-                    &mut store,
-                    &mut subscribers,
-                    &dispatcher,
-                    &runner,
-                    &self_tx,
-                    &mut in_flight,
-                    spec,
-                    &registry,
-                );
+                // Fast path: validate + create Planning stub + emit SessionStarted + reply < 1 ms.
+                // The slow planning + council distribution is deferred to ContinueLaunch.
+                let run_id = spec.session_id.clone();
+                let res: anyhow::Result<String> = (|| {
+                    validate_session_id(&run_id)?;
+                    if in_flight.contains(&run_id) {
+                        return Err(RunBusy(run_id.clone()).into());
+                    }
+                    if let Ok(Some(existing)) = crate::domain::get_session(&store, &run_id) {
+                        if !matches!(
+                            existing.status,
+                            SessionStatus::Completed
+                                | SessionStatus::Cancelled
+                                | SessionStatus::Failed
+                        ) {
+                            return Err(RunExists(
+                                run_id.clone(),
+                                format!("{:?}", existing.status),
+                            )
+                            .into());
+                        }
+                    }
+                    let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+                    let (repo_ref, workdir) = resolve_workdir(&store, &spec.repo_ref, &run_id)?;
+                    // Governed unit limit check (fast, no LLM): reject over-limit runs BEFORE
+                    // creating the stub so callers receive a synchronous Err, preserving the
+                    // contract that an error at launch means no session was persisted.
+                    let selected_def =
+                        pipeline::resolve_workflow_def(spec.workflow.as_deref(), Some(&registry))?;
+                    let n_units = match &selected_def {
+                        Some(def) => crate::plan::plan_from_def(def, &spec.problem, &run_id).len(),
+                        None => crate::plan::plan_units(&spec.problem, &run_id).len(),
+                    };
+                    if n_units as u32 > DENY_PHASE_SPAN {
+                        anyhow::bail!(
+                            "run has {n_units} units, exceeding the {DENY_PHASE_SPAN}-unit governed limit; \
+                             split the problem into smaller runs"
+                        );
+                    }
+                    // Write a Planning stub so GET /runs shows the session immediately.
+                    let cli_keys: Vec<String> = spec.clis.iter().map(|c| c.key.clone()).collect();
+                    let collection_scope = match spec.entity_mode {
+                        EntityMode::Shared => {
+                            Some(resolve_scope(spec.entity_mode, &run_id, "shared"))
+                        }
+                        EntityMode::Isolated => None,
+                    };
+                    let stub = AgentSession {
+                        id: run_id.clone(),
+                        workflow_id: format!("wf-{run_id}"),
+                        problem: spec.problem.clone(),
+                        entity_mode: spec.entity_mode,
+                        collection_scope,
+                        clis: cli_keys,
+                        status: SessionStatus::Planning,
+                        human_confirm: spec.human_confirm,
+                        unit_ix: 0,
+                        attempt: 0,
+                        workdir: workdir.clone(),
+                        repo_ref: repo_ref.clone(),
+                    };
+                    put_node(&mut store, stub.to_node())?;
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::SessionStarted {
+                            session: run_id.clone(),
+                            problem: spec.problem.clone(),
+                        },
+                    );
+                    in_flight.insert(run_id.clone());
+                    let _ = self_tx.send(Command::ContinueLaunch {
+                        spec,
+                        repo_ref,
+                        workdir,
+                    });
+                    Ok(run_id.clone())
+                })();
                 let _ = reply.send(res);
+            }
+            Command::ContinueLaunch {
+                spec,
+                repo_ref,
+                workdir,
+            } => {
+                // Deferred second half: plan units + council distribution + dispatch unit 0.
+                // SessionStarted was already emitted; skip_stub=true so plan_and_distribute
+                // does not double-emit it.
+                let run_id = spec.session_id.clone();
+                let plan_res = pipeline::plan_and_distribute(
+                    &mut store,
+                    &spec.clis,
+                    &spec.problem,
+                    spec.entity_mode,
+                    &run_id,
+                    spec.human_confirm,
+                    repo_ref,
+                    workdir,
+                    spec.workflow.as_deref(),
+                    &dispatcher,
+                    &mut |ev| emit(&mut subscribers, ev),
+                    Some(&registry),
+                    true, // session stub already created + SessionStarted already emitted
+                );
+                match plan_res {
+                    Err(e) => {
+                        in_flight.remove(&run_id);
+                        // Mark the Planning stub as Failed so GET /runs shows a terminal state.
+                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                            s.status = SessionStatus::Failed;
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                        emit_run_error(&mut subscribers, &run_id, e);
+                    }
+                    Ok(_) => {
+                        match advance_or_pause(
+                            &mut store,
+                            &mut subscribers,
+                            &runner,
+                            &self_tx,
+                            &run_id,
+                            0,
+                        ) {
+                            Ok(Progress::Dispatched) => { /* in_flight already set in LaunchRun */ }
+                            Ok(Progress::Paused) => {
+                                in_flight.remove(&run_id);
+                            }
+                            Ok(Progress::Done) => {
+                                in_flight.remove(&run_id);
+                                if let Err(e) =
+                                    finalize_run(&mut store, &mut subscribers, &self_tx, &run_id)
+                                {
+                                    emit_run_error(&mut subscribers, &run_id, e);
+                                }
+                            }
+                            Err(e) => {
+                                in_flight.remove(&run_id);
+                                emit_run_error(&mut subscribers, &run_id, e);
+                            }
+                        }
+                    }
+                }
             }
             Command::ResumeRun { run_id, reply } => {
                 let res = resume_run_inner(
@@ -958,6 +1088,7 @@ pub(crate) fn launch_run_inner(
         dispatcher,
         &mut |ev| emit(subscribers, ev),
         Some(registry),
+        false, // stub not yet created — this path is campaign-driven, needs full setup
     )?;
     match advance_or_pause(store, subscribers, runner, self_tx, &run_id, 0) {
         Ok(Progress::Dispatched) => {
