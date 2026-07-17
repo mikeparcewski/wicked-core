@@ -251,7 +251,9 @@ pub enum PhaseRole {
 pub enum PhaseExecutor {
     #[default]
     Agent,
-    Tool { cmd: Vec<String> },
+    Tool {
+        cmd: Vec<String>,
+    },
 }
 
 /// One ordered phase of a workflow — pure DATA the reducer dispatches on.
@@ -663,13 +665,9 @@ pub fn onboarding_def() -> WorkflowDef {
     WorkflowDef {
         id: "onboarding".to_string(),
         phases: vec![
-            PhaseDef::new("index", StageKind::Recon)
-                .executor(PhaseExecutor::Tool {
-                    cmd: vec![
-                        "wicked-estate".to_string(),
-                        "index".to_string(),
-                    ],
-                }),
+            PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
+                cmd: vec!["wicked-estate".to_string(), "index".to_string()],
+            }),
             PhaseDef::new("annotate", StageKind::Recon)
                 .executor(PhaseExecutor::Tool {
                     cmd: vec![

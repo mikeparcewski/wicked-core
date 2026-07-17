@@ -683,7 +683,10 @@ mod resolve_tests {
         assert!(resolve_workflow_def(None, None).unwrap().is_none());
         // A known built-in resolves to its def.
         assert_eq!(
-            resolve_workflow_def(Some("feature"), None).unwrap().unwrap().id,
+            resolve_workflow_def(Some("feature"), None)
+                .unwrap()
+                .unwrap()
+                .id,
             "feature"
         );
         // A requested-but-unknown id is a LOUD error (never a silent fall-through to prose planning).

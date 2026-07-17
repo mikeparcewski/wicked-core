@@ -760,7 +760,10 @@ pub(crate) fn run(
                     .map_err(|e| anyhow::anyhow!("invalid workflow JSON: {e}"))
                     .and_then(|def| {
                         let id = def.id.clone();
-                        registry.register(def).map(|_| id).map_err(|e| anyhow::anyhow!("{e}"))
+                        registry
+                            .register(def)
+                            .map(|_| id)
+                            .map_err(|e| anyhow::anyhow!("{e}"))
                     });
                 let _ = reply.send(result);
             }
