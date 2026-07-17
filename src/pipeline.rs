@@ -160,14 +160,12 @@ fn resolve_workflow_def(
         return Ok(None);
     };
     // When the caller provides an actor-owned registry (the interactive LaunchRun path), use it
-    // directly: it already contains the built-ins (seeded at actor startup via `with_defaults()`) plus
-    // any runtime-registered workflows. Only the legacy run_session path omits it and falls back to
-    // the per-call built-ins + overlay-dir path below.
+    // as the sole authoritative source: it already contains built-ins (seeded at actor startup
+    // via `with_defaults()`), the overlay directory (loaded at startup), and any runtime-registered
+    // workflows. Falling through to a disk re-scan when `extra` is present would be redundant I/O
+    // and could surface stale/inconsistent overlay files added after startup.
     if let Some(reg) = extra {
-        if let Some(def) = reg.get(id) {
-            return Ok(Some(def.clone()));
-        }
-        // not in the actor registry — fall through to built-ins + overlay dir
+        return Ok(reg.get(id).cloned());
     }
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
