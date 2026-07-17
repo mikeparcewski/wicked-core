@@ -709,6 +709,18 @@ impl Core {
         })
     }
 
+    /// Register (or replace) a workflow definition in the actor's runtime registry. `json` is a
+    /// JSON-serialised `WorkflowDef` object (fields: id, description, phases — see the wicked-core
+    /// workflow schema). Validates server-side (id + ≥1 phase required); rejects invalid JSON or a
+    /// structurally invalid def. Returns the registered workflow id. Idempotent on id — calling
+    /// twice replaces the first registration. The def is immediately visible to the next `launchRun`
+    /// call; no process restart required.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn register_workflow(&self, json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || core.register_workflow(json).map_err(err))
+    }
+
     /// Recall which conformance rules apply to the given `query_json` (a JSON-serialized
     /// `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
     /// An empty or whitespace `query_json` is treated as an all-rules query (no facet filters).
