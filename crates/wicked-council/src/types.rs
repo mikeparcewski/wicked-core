@@ -207,6 +207,11 @@ pub struct AgenticCli {
     /// back to single-shot invocation if the ACP server is unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp: Option<AcpConfig>,
+    /// Human-readable capability profile for this seat — what kinds of tasks it excels at.
+    /// Used by the council as the option label voters see; CLI names are never exposed.
+    /// Example: "broad reasoning, TypeScript/React, refactoring, API design"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<String>,
 }
 
 fn default_true() -> bool {

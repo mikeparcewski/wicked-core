@@ -874,6 +874,7 @@ mod tests {
             confidence: Confidence::default(),
             enabled_for_council: true,
             acp: None,
+            capabilities: None,
         };
 
         let dir = std::env::temp_dir().join("wicked-core-pipeline-test");

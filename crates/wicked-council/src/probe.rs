@@ -262,6 +262,7 @@ mod tests {
             confidence: crate::types::Confidence::Verified,
             enabled_for_council: true,
             acp: None,
+            capabilities: None,
         }
     }
 
