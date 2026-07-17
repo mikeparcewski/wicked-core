@@ -43,6 +43,8 @@ struct TomlCli {
     confidence: Option<Confidence>,
     #[serde(default)]
     enabled_for_council: Option<bool>,
+    #[serde(default)]
+    capabilities: Option<String>,
 }
 
 impl From<TomlCli> for AgenticCli {
@@ -62,6 +64,7 @@ impl From<TomlCli> for AgenticCli {
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
             // User TOML records carry no ACP config; the engine falls back to single-shot.
             acp: None,
+            capabilities: t.capabilities,
         }
     }
 }
@@ -88,6 +91,11 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
             }),
+            capabilities: Some(
+                "broad reasoning, architecture design, TypeScript/React/web, \
+                 refactoring, API design, technical writing, multi-file edits"
+                    .into(),
+            ),
         },
         AgenticCli {
             key: "agy".into(),
@@ -106,6 +114,11 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
             }),
+            capabilities: Some(
+                "fast iteration, multi-language code generation, open-source models, \
+                 structured output, scripting"
+                    .into(),
+            ),
         },
         AgenticCli {
             key: "codex".into(),
@@ -124,6 +137,11 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
             }),
+            capabilities: Some(
+                "algorithm implementation, Python/JavaScript code generation, \
+                 code completion, OpenAI model family"
+                    .into(),
+            ),
         },
         AgenticCli {
             key: "pi".into(),
@@ -142,6 +160,11 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
             }),
+            capabilities: Some(
+                "conversational reasoning, nuanced analysis, cross-language tasks, \
+                 explanation and documentation"
+                    .into(),
+            ),
         },
         AgenticCli {
             key: "copilot".into(),
@@ -161,6 +184,11 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec!["--acp".into(), "--port".into(), "3000".into()],
                 transport: AcpTransport::Http,
             }),
+            capabilities: Some(
+                "GitHub context, pull request review, commit-level changes, \
+                 popular library patterns, IDE-native suggestions"
+                    .into(),
+            ),
         },
         AgenticCli {
             key: "opencode".into(),
@@ -176,6 +204,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             enabled_for_council: true,
             // opencode exposes ACP via its HTTP server; pending transport implementation.
             acp: None,
+            capabilities: Some(
+                "open-source models, local/private code, broad language support, \
+                 configurable backends"
+                    .into(),
+            ),
         },
     ]
 }

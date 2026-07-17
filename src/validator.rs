@@ -1550,6 +1550,7 @@ mod tests {
             confidence: Confidence::default(),
             enabled_for_council: true,
             acp: None,
+            capabilities: None,
         }
     }
 

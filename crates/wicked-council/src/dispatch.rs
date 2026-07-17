@@ -17,8 +17,8 @@ use crate::types::{AgenticCli, Category, CouncilTask, Dispatcher, InputMode, Vot
 
 /// The fixed 4-question scaffold, rendered onto the task.
 ///
-/// The CLI is instructed to answer with four `KEY: value` lines so the output is
-/// machine-parseable across heterogeneous CLIs.
+/// Options are numbered capability profiles — CLI identities are never shown to voters.
+/// Voters respond with the option NUMBER, preventing self-selection bias.
 pub fn render_scaffold(task: &CouncilTask) -> String {
     let options = task
         .options
@@ -29,14 +29,19 @@ pub fn render_scaffold(task: &CouncilTask) -> String {
         .join("\n");
     let criteria = task.criteria.join(", ");
     format!(
-        "You are one independent member of a council. Topic: {topic}\n\
-         Options:\n{options}\n\
+        "You are one independent evaluator on a routing council. You do NOT know which \
+         other evaluators exist or which system you are. Your only job is to pick the \
+         best-fit capability profile for the task described below.\n\n\
+         Task: {topic}\n\n\
+         Capability profiles:\n{options}\n\n\
          Evaluation criteria: {criteria}\n\n\
-         Answer with EXACTLY these four lines, each prefixed with the key:\n\
-         RECOMMENDATION: <which option, and the trade-offs>\n\
-         TOP_RISK: <the single biggest risk in your recommendation>\n\
-         CHANGE_MY_MIND: <the evidence or condition that would reverse it>\n\
-         DISQUALIFIER: <any option that is fundamentally unviable, or 'None'>",
+         Answer with EXACTLY these four lines. For RECOMMENDATION, give the option NUMBER \
+         only (e.g. \"2\"), followed by a brief rationale — do NOT name any tool, CLI, or \
+         AI system:\n\
+         RECOMMENDATION: <option number and rationale>\n\
+         TOP_RISK: <the single biggest risk with that profile for this task>\n\
+         CHANGE_MY_MIND: <evidence or condition that would reverse your pick>\n\
+         DISQUALIFIER: <option number of any profile fundamentally unviable for this task, or 'None'>",
         topic = task.topic,
     )
 }
