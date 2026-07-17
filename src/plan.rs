@@ -83,6 +83,10 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Carry the evaluator≠creator role (§4) so the gate can do real artifact-passing (an
             // Evaluator unit reviews the prior Creator's cold output).
             unit.role = phase.role;
+            // Carry the tool command for Tool-executor phases so the actor can run it directly.
+            if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
+                unit.tool_cmd = Some(cmd.clone());
+            }
             unit
         })
         .collect()

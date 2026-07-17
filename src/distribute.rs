@@ -59,7 +59,23 @@ pub fn distribute_units_on(
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     let mut dists: Vec<Distribution> = units
         .iter()
-        .map(|unit| distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher))
+        .map(|unit| {
+            if unit.tool_cmd.is_some() {
+                Ok(Distribution {
+                    assigned_cli: unit
+                        .tool_cmd
+                        .as_ref()
+                        .and_then(|c| c.first())
+                        .cloned()
+                        .unwrap_or_else(|| "__tool__".to_string()),
+                    assigned_invocation: None,
+                    council_task_ref: None,
+                    routing: RoutingInfo::Tool,
+                })
+            } else {
+                distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
+            }
+        })
         .collect::<anyhow::Result<_>>()?;
     enforce_evaluator_distinct(units, &mut dists, &roster_keys, clis);
     Ok(dists)
@@ -85,6 +101,9 @@ fn enforce_evaluator_distinct(
         return; // can't distinguish with one seat / nothing built
     }
     for (u, d) in units.iter().zip(dists.iter_mut()) {
+        if u.tool_cmd.is_some() {
+            continue; // Tool phases have no CLI to distinct
+        }
         if matches!(u.stage, StageKind::Review | StageKind::Test)
             && builder_clis.contains(&d.assigned_cli)
         {

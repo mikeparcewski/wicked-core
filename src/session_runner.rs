@@ -473,6 +473,7 @@ mod tests {
             gate: GateSpec::default(),
             role: PhaseRole::default(),
             validator: None,
+            tool_cmd: None,
             status: UnitStatus::Pending,
         }
     }
