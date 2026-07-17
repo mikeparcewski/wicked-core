@@ -135,19 +135,37 @@ fn distribute_one(
         work_kind,
     );
 
+    // Build numbered capability profiles — CLI names are NEVER exposed to voters.
+    // Each voter sees only the capability description and picks a number, preventing
+    // self-selection bias (a CLI knowing its own name will recommend itself).
+    let cap_map: Vec<(String, String)> = clis
+        .iter()
+        .map(|c| {
+            let label = c
+                .capabilities
+                .as_deref()
+                .unwrap_or(&c.display_name)
+                .to_string();
+            (label, c.key.clone())
+        })
+        .collect();
+    let option_labels: Vec<String> = cap_map.iter().map(|(label, _)| label.clone()).collect();
+
     let task = CouncilTask {
         id: ids::new_task_id(),
         topic: format!(
-            "which CLI should own work unit {}: {}",
-            unit.id, unit.description
+            "A software task needs an agent to execute it.\n\
+             Task description: {}\n\
+             Which numbered capability profile is the best fit?",
+            unit.description
         ),
-        options: roster_keys.to_vec(),
+        options: option_labels,
         criteria,
         session_id: session_id.to_string(),
     };
     let task_id = worker.queue_blocking(task);
     let status: Option<PollStatus> = worker.poll(&task_id);
-    let (assigned_cli, routing) = route_from_status(status.as_ref(), roster_keys);
+    let (assigned_cli, routing) = route_from_status(status.as_ref(), roster_keys, &cap_map);
 
     Ok(Distribution {
         assigned_invocation: invocation_of(clis, &assigned_cli),
@@ -162,9 +180,17 @@ fn pct(x: f32) -> u8 {
     (x.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
-/// Resolve the assigned CLI from the council's poll status AND the routing provenance: the verdict
-/// winner if it names a roster seat, else gracefully degrade to the first seat (with the reason).
-fn route_from_status(status: Option<&PollStatus>, roster_keys: &[String]) -> (String, RoutingInfo) {
+/// Resolve the assigned CLI from the council's poll status AND the routing provenance.
+///
+/// Voters respond with a **capability-profile number** (e.g. "2"), never a CLI name.
+/// We parse the leading integer from the winning recommendation, use it as a 1-based
+/// index into `cap_map` (ordered `(capability_label, cli_key)`), and fall back
+/// gracefully to the first seat if the number is missing or out of range.
+fn route_from_status(
+    status: Option<&PollStatus>,
+    roster_keys: &[String],
+    cap_map: &[(String, String)],
+) -> (String, RoutingInfo) {
     let fallback = || {
         roster_keys
             .first()
@@ -193,23 +219,36 @@ fn route_from_status(status: Option<&PollStatus>, roster_keys: &[String]) -> (St
         return degrade("verdict named no winner");
     };
 
-    let winner_norm = winner.to_lowercase();
-    if let Some(seat) = roster_keys
-        .iter()
-        .find(|k| winner_norm == k.to_lowercase() || winner_norm.contains(&k.to_lowercase()))
-    {
-        (
-            seat.clone(),
-            RoutingInfo::Council {
-                winner: seat.clone(),
-                agreement_pct: pct(verdict.agreement_ratio),
-                returned: status.returned,
-                dissent: verdict.dissent.len() as u32,
-            },
-        )
-    } else {
-        degrade(&format!("winner '{winner}' is not a roster seat"))
+    // Parse the leading integer from the recommendation text (voters are told to lead with
+    // the option number). "2 — broad reasoning..." → 2 → index 1.
+    let idx_opt = winner
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|tok| tok.parse::<usize>().ok())
+        .filter(|&n| n >= 1 && n <= cap_map.len())
+        .map(|n| n - 1); // convert to 0-based
+
+    if let Some(idx) = idx_opt {
+        let seat = cap_map[idx].1.clone();
+        // Confirm the seat exists in the roster (cap_map may be a superset if a CLI was
+        // added after roster construction — degrade rather than assign an unknown key).
+        if roster_keys.iter().any(|k| k == &seat) {
+            return (
+                seat.clone(),
+                RoutingInfo::Council {
+                    winner: seat,
+                    agreement_pct: pct(verdict.agreement_ratio),
+                    returned: status.returned,
+                    dissent: verdict.dissent.len() as u32,
+                },
+            );
+        }
     }
+
+    degrade(&format!(
+        "recommendation '{winner}' did not resolve to a roster seat"
+    ))
 }
 
 #[cfg(test)]
@@ -235,30 +274,69 @@ mod tests {
         }
     }
 
+    fn cap_map(keys: &[&str]) -> Vec<(String, String)> {
+        keys.iter()
+            .map(|k| (format!("{k}-capabilities"), k.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn winner_matching_a_seat_is_assigned_with_council_provenance() {
+    fn option_number_selects_correct_seat() {
         let roster = vec!["fake-a".to_string(), "fake-b".to_string()];
-        let st = status_with_winner(Some("fake-b"), TaskState::Voted);
-        let (cli, routing) = route_from_status(Some(&st), &roster);
+        let map = cap_map(&["fake-a", "fake-b"]);
+        // "2 — rationale" → index 1 → fake-b
+        let st = status_with_winner(Some("2 — best fit for this task"), TaskState::Voted);
+        let (cli, routing) = route_from_status(Some(&st), &roster, &map);
         assert_eq!(cli, "fake-b");
         assert!(
-            matches!(&routing, RoutingInfo::Council { winner, agreement_pct, .. } if winner.as_str() == "fake-b" && *agreement_pct == 100),
-            "a matched winner records Council provenance, got {routing:?}"
+            matches!(&routing, RoutingInfo::Council { winner, agreement_pct, .. }
+                if winner.as_str() == "fake-b" && *agreement_pct == 100),
+            "option-2 winner maps to fake-b with Council provenance, got {routing:?}"
         );
     }
 
     #[test]
-    fn no_match_degrades_to_first_seat_with_reason() {
+    fn bare_number_also_resolves() {
         let roster = vec!["fake-a".to_string(), "fake-b".to_string()];
-        let (cli, routing) = route_from_status(None, &roster);
+        let map = cap_map(&["fake-a", "fake-b"]);
+        let st = status_with_winner(Some("1"), TaskState::Voted);
+        let (cli, _) = route_from_status(Some(&st), &roster, &map);
+        assert_eq!(cli, "fake-a");
+    }
+
+    #[test]
+    fn no_status_degrades_to_first_seat() {
+        let roster = vec!["fake-a".to_string(), "fake-b".to_string()];
+        let map = cap_map(&["fake-a", "fake-b"]);
+        let (cli, routing) = route_from_status(None, &roster, &map);
         assert_eq!(cli, "fake-a");
         assert!(matches!(routing, RoutingInfo::Degraded { .. }));
+    }
+
+    #[test]
+    fn out_of_range_number_degrades() {
+        let roster = vec!["fake-a".to_string(), "fake-b".to_string()];
+        let map = cap_map(&["fake-a", "fake-b"]);
+        // 99 is out of range for a 2-option map
+        let st = status_with_winner(Some("99 — some rationale"), TaskState::Voted);
+        let (cli, routing) = route_from_status(Some(&st), &roster, &map);
+        assert_eq!(cli, "fake-a");
+        assert!(
+            matches!(&routing, RoutingInfo::Degraded { reason } if reason.contains("99")),
+            "out-of-range option degrades with the recommendation in the reason, got {routing:?}"
+        );
+    }
+
+    #[test]
+    fn non_numeric_recommendation_degrades() {
+        let roster = vec!["fake-a".to_string(), "fake-b".to_string()];
+        let map = cap_map(&["fake-a", "fake-b"]);
         let st = status_with_winner(Some("Option Z"), TaskState::Voted);
-        let (cli, routing) = route_from_status(Some(&st), &roster);
+        let (cli, routing) = route_from_status(Some(&st), &roster, &map);
         assert_eq!(cli, "fake-a");
         assert!(
             matches!(&routing, RoutingInfo::Degraded { reason } if reason.contains("Option Z")),
-            "a non-roster winner degrades with a reason naming the winner, got {routing:?}"
+            "non-numeric winner degrades with a reason naming the recommendation, got {routing:?}"
         );
     }
 }
