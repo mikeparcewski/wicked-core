@@ -68,6 +68,7 @@ pub fn run_session(
         &dispatcher,
         emit,
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
+        false, // stub not yet created
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -151,7 +152,7 @@ pub(crate) struct Planned {
 /// `$HOME/.config/wicked-core/workflows`, best-effort). `None` (no selection) ⇒ `Ok(None)` and the
 /// caller uses the free-text planner; a requested-but-**unknown** id ⇒ `Err` (never a silent
 /// fallback).
-fn resolve_workflow_def(
+pub(crate) fn resolve_workflow_def(
     workflow: Option<&str>,
     extra: Option<&crate::workflow::WorkflowRegistry>,
 ) -> anyhow::Result<Option<crate::workflow::WorkflowDef>> {
@@ -251,6 +252,9 @@ pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
 /// `workflow_registry`: when `Some`, the actor-owned runtime registry is consulted first for
 /// workflow resolution (enables defs registered via `RegisterWorkflow` without a restart).
 #[allow(clippy::too_many_arguments)]
+/// When `session_already_started` is `true` the caller already wrote a Planning stub to the store
+/// and emitted `SessionStarted` (the non-blocking `LaunchRun` fast path). In that case we skip
+/// the duplicate stub write + event to avoid emitting `SessionStarted` twice.
 pub(crate) fn plan_and_distribute(
     store: &mut dyn wicked_apps_core::GraphStore,
     clis: &[AgenticCli],
@@ -264,6 +268,7 @@ pub(crate) fn plan_and_distribute(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
+    session_already_started: bool,
 ) -> anyhow::Result<Planned> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -317,11 +322,13 @@ pub(crate) fn plan_and_distribute(
         workdir,
         repo_ref,
     };
-    put_node(store, session.to_node())?;
-    emit(CoreEvent::SessionStarted {
-        session: session_id.to_string(),
-        problem: problem.to_string(),
-    });
+    if !session_already_started {
+        put_node(store, session.to_node())?;
+        emit(CoreEvent::SessionStarted {
+            session: session_id.to_string(),
+            problem: problem.to_string(),
+        });
+    }
 
     for u in &units {
         put_node(store, u.to_node())?;
