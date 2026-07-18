@@ -755,7 +755,7 @@ fn domain_graph_cmd(args: &[String]) {
 /// the cwd so the shipped grep validator (which reads that path from the phase worktree) finds it
 /// (DES-OUTGOV-005 decision #4). Opens the store directly for a brief read; never spawns the actor.
 fn coverage_cmd(args: &[String]) {
-    let out_path = flag(args, "--out").unwrap_or_else(|| "coverage-report.json".to_string());
+    let json_stdout = args.iter().any(|a| a == "--json");
     let store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
         Err(e) => {
@@ -770,6 +770,13 @@ fn coverage_cmd(args: &[String]) {
             return;
         }
     };
+    let json = serde_json::to_string_pretty(&report).expect("CoverageReport serializes to JSON");
+    if json_stdout {
+        // --json: emit to stdout so callers (e.g. wicked-crew) don't need a temp file.
+        println!("{json}");
+        return;
+    }
+    let out_path = flag(args, "--out").unwrap_or_else(|| "coverage-report.json".to_string());
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -781,7 +788,6 @@ fn coverage_cmd(args: &[String]) {
             }
         }
     }
-    let json = serde_json::to_string_pretty(&report).expect("CoverageReport serializes to JSON");
     match std::fs::write(&out_path, json) {
         Ok(()) => println!(
             "coverage: {:.4} ({} behavior-bearing, {} unaccounted) → {out_path}",
