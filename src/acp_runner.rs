@@ -40,7 +40,8 @@ use serde_json::{json, Value};
 
 use crate::execute_wrapped::{skill_prompt, WrappedCliStepRunner};
 use crate::workflow::{
-    DeltaSink, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus, Usage,
+    DeltaSink, GovernanceContext, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus,
+    Usage,
 };
 use wicked_council::types::{AcpConfig, AcpTransport};
 
@@ -69,8 +70,27 @@ impl Drop for AcpProcess {
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake.
 /// Returns `Err` if the binary is not on PATH, the process fails to start, or the
 /// handshake does not complete within 10 s.
-fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Result<AcpProcess> {
+///
+/// When `gov` is `Some`, `--settings <path>` is prepended to the binary's argv (before
+/// `config.start_args`) so Claude's PreToolUse gate-hook fires on every tool call, and the
+/// governance env vars are set on the child process so the hook subprocess can locate the
+/// decisions log, store, scope, and phase. This is the ACP equivalent of what
+/// `execute_wrapped::arm_input_governance` does for the single-shot wrapped-CLI path.
+fn start_acp_process(
+    config: &AcpConfig,
+    cwd: &std::path::Path,
+    gov: Option<&AcpGovArmed>,
+) -> anyhow::Result<AcpProcess> {
     let mut cmd = std::process::Command::new(&config.binary);
+    // --settings must precede all other start_args so it is parsed as a flag, not a positional
+    // argument. This mirrors how arm_input_governance inserts it at position 1 in the argv vec.
+    if let Some(g) = gov {
+        cmd.arg("--settings").arg(&g.settings_path);
+        cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
+        cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
+        cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
+        cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
+    }
     cmd.args(&config.start_args);
     cmd.current_dir(cwd);
     cmd.stdin(Stdio::piped());
@@ -417,6 +437,110 @@ fn fallback_with_warning(
     result
 }
 
+// ── ACP input governance ──────────────────────────────────────────────────────
+
+/// Quote the current-exe path for the platform's shell so `$`/backtick/space in the install
+/// path can't be expanded or split. Mirrors `execute_wrapped`'s private `quote_exe_command`.
+fn quote_exe_for_hook(exe: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!("'{}' gate-hook", exe.replace('\'', "'\\''"))
+    }
+    #[cfg(not(unix))]
+    {
+        format!("\"{exe}\" gate-hook")
+    }
+}
+
+/// Everything the ACP launcher needs to propagate input governance into the ACP subprocess.
+/// Returned by [`arm_acp_governance`]; the settings file and armed marker have already been
+/// written to disk when this is returned.
+struct AcpGovArmed {
+    /// Absolute path to the per-(unit, attempt) `--settings` JSON file.
+    settings_path: std::path::PathBuf,
+    /// Absolute path to the append-only decisions NDJSON (set as `WICKED_DECISIONS_PATH`).
+    decisions_path: std::path::PathBuf,
+    /// The estate SQLite store path (set as `WICKED_ESTATE_DB` on the ACP child process).
+    db_path: String,
+    /// The unit's collection scope, e.g. `wicked-agent/<run>/unit/<id>` (set as
+    /// `WICKED_GATE_SCOPE`).
+    scope: String,
+    /// The unit's orchestration phase, e.g. `unit-3` (set as `WICKED_GATE_PHASE`).
+    phase: String,
+}
+
+/// Arm input governance for a governed ACP session. Produces and writes the per-(unit, attempt)
+/// `--settings` JSON file declaring the `PreToolUse` gate-hook, writes the ARMED marker to the
+/// decisions log, and returns the [`AcpGovArmed`] the caller uses to configure the ACP process.
+///
+/// Mirrors `execute_wrapped::arm_input_governance` (for the wrapped-CLI path) exactly:
+/// - same settings JSON structure (hook command, matcher, type)
+/// - same decisions-log path derivation ([`gate_hook::decisions_path_for`])
+/// - same O_EXCL + unlink-on-clash file write (closes TOCTOU)
+/// - same armed-marker write (evidence-integrity)
+///
+/// SECURITY: only the trusted `current_exe()` is interpolated into the hook command string.
+/// Scope/phase (which embed the caller-controlled `session_id`/`unit.id`) travel via ENV, not
+/// the command string, so no attacker-controlled data ever reaches the shell-executed hook.
+fn arm_acp_governance(
+    input: &StepInput,
+    gov: &GovernanceContext,
+) -> std::io::Result<AcpGovArmed> {
+    let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
+    let phase = crate::scope::unit_phase(input.unit.ord);
+    let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "wicked-core".to_string());
+    let command = quote_exe_for_hook(&exe);
+    let settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
+            ]
+        }
+    });
+    let dir = decisions_path
+        .parent()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
+    crate::gate_hook::create_dir_all_private(&dir)?;
+    // Per-unit settings file written with O_EXCL; clash → unlink the existing entry (a symlink
+    // is unlinked itself, never followed) then re-create — same TOCTOU mitigation as the
+    // wrapped-CLI path (execute_wrapped::arm_input_governance).
+    let settings_path = dir.join(format!("settings-{phase}.json"));
+    let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&settings_path)
+            .or_else(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    let _ = std::fs::remove_file(&settings_path);
+                    std::fs::OpenOptions::new()
+                        .create_new(true)
+                        .write(true)
+                        .open(&settings_path)
+                } else {
+                    Err(e)
+                }
+            })?;
+        f.write_all(&bytes)?;
+    }
+    // Write the ARMED marker BEFORE the ACP process starts: its presence proves governance was
+    // armed + the log is intact (evidence-integrity, same invariant as the wrapped-CLI path).
+    crate::gate_hook::write_armed_marker(&decisions_path, &phase)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(AcpGovArmed {
+        settings_path,
+        decisions_path,
+        db_path: gov.db_path.clone(),
+        scope,
+        phase,
+    })
+}
+
 // ── AcpStepRunner ─────────────────────────────────────────────────────────────
 
 // `None` entries cache a failed startup so subsequent units for the same
@@ -472,15 +596,119 @@ impl AcpStepRunner {
             .unwrap_or("claude")
             .to_string();
 
-        // GOVERNANCE SAFETY: ACP does not (yet) implement PreToolUse gate-hook injection.
-        // A governed unit (governance: Some) MUST run through WrappedCliStepRunner so the
-        // gate-hook is armed. Delegating a governed unit to ACP would silently bypass input
-        // governance — a security regression. The single-shot fallback is used directly
-        // (no warning, no ACP session opened) — governance is not a degraded path.
-        if input.governance.is_some() {
-            return self.fallback.run_unit_streaming(input, emit);
+        // GOVERNED ACP PATH: arm input governance and open a FRESH session per unit (not cached).
+        //
+        // A fresh session is required because the gate-hook subprocess inherits env vars from the
+        // ACP process, and `WICKED_GATE_SCOPE`/`WICKED_GATE_PHASE` are fixed at process-start
+        // time. Each unit has its own phase; reusing a cached session would leave every subsequent
+        // unit governed under the FIRST unit's phase — a silent mis-routing of evidence.
+        //
+        // The `--settings` injection happens at `initialize` time (the binary's argv), which is
+        // the only point in the ACP lifecycle where a new flag can be introduced. Per-prompt
+        // injection is not possible — the `session/prompt` RPC has no settings field.
+        if let Some(gov) = &input.governance {
+            let acp_config = match acp_config_for(&cli_key) {
+                // Only stdio-mode ACP can receive --settings at process-start time; we spawn and
+                // control the process directly. HTTP-mode ACP connects to a server we don't
+                // spawn, so --settings cannot be injected → fall back to the wrapped-CLI path,
+                // which handles governance independently via arm_input_governance.
+                Some(c) if c.transport == AcpTransport::Stdio => c,
+                _ => return self.fallback.run_unit_streaming(input, emit),
+            };
+
+            let gov_armed = match arm_acp_governance(input, gov) {
+                Ok(g) => g,
+                // A governed unit whose governance cannot be armed MUST NOT run ungoverned — fail
+                // it outright, mirroring the wrapped-CLI path's fail-closed contract.
+                Err(e) => {
+                    return StepOutput {
+                        run_id: input.run_id.clone(),
+                        unit_ix: input.unit_ix,
+                        attempt: input.attempt,
+                        output: format!("(could not arm ACP input governance: {e})"),
+                        status: StepStatus::Failed,
+                        usage: None,
+                        files: Vec::new(),
+                        governed: false, // arming failed → not governed (unit fails anyway)
+                    };
+                }
+            };
+
+            let cwd = input
+                .workdir
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+            // Session startup failure after governance is armed: fall back to the wrapped-CLI
+            // path. WrappedCliStepRunner sees governance: Some and re-arms independently via
+            // arm_input_governance — the unit is still governed, not silently unguarded.
+            let mut proc = match start_acp_process(&acp_config, &cwd, Some(&gov_armed)) {
+                Ok(p) => p,
+                Err(e) => {
+                    return fallback_with_warning(
+                        format!(
+                            "[wicked-core] ACP governance session unavailable for '{cli_key}' \
+                             ({e}); using single-shot fallback"
+                        ),
+                        input,
+                        emit,
+                        &self.fallback,
+                    );
+                }
+            };
+
+            let prompt = skill_prompt(&input.unit);
+            return match exec_turn_acp(
+                &mut proc,
+                &prompt,
+                &input.prior_outputs,
+                emit,
+                self.timeout,
+            ) {
+                Ok(result) if result.status == StepStatus::Ok => StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::Ok,
+                    usage: result.usage,
+                    files: result.files,
+                    governed: true,
+                },
+                Ok(result) if result.status == StepStatus::Cancelled => StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::Cancelled,
+                    usage: result.usage,
+                    files: result.files,
+                    governed: true,
+                },
+                // Turn failed or session exited: fall back to wrapped-CLI, which re-arms
+                // governance on its own — unit is still governed via the fallback path.
+                Ok(_) => fallback_with_warning(
+                    format!(
+                        "[wicked-core] ACP governance session exited for '{cli_key}'; \
+                         using single-shot fallback"
+                    ),
+                    input,
+                    emit,
+                    &self.fallback,
+                ),
+                Err(e) => fallback_with_warning(
+                    format!(
+                        "[wicked-core] ACP governance error for '{cli_key}' ({e}); \
+                         using single-shot fallback"
+                    ),
+                    input,
+                    emit,
+                    &self.fallback,
+                ),
+            };
         }
 
+        // UNGOVERNED ACP PATH — unchanged from before.
         let acp_config = match acp_config_for(&cli_key) {
             Some(c) => c,
             None => return self.fallback.run_unit_streaming(input, emit),
@@ -518,7 +746,7 @@ impl AcpStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                match start_acp_process(&acp_config, &cwd) {
+                match start_acp_process(&acp_config, &cwd, None) {
                     Ok(proc) => {
                         let arc = Arc::new(Mutex::new(proc));
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
