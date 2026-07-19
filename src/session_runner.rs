@@ -177,8 +177,26 @@ impl StepRunner for PersistentStepRunner {
     }
 
     /// Close the PTY session for `run_id` so the CLI process exits cleanly after the run ends.
+    ///
+    /// Runs cleanup on a background thread — `on_run_complete` is called from the actor thread
+    /// (via `finalize_run`/`fail_run`/`cancel_run`). Sending `Command::CloseTerminal` and then
+    /// blocking on the reply channel while still ON the actor thread would deadlock because the
+    /// actor cannot process its own inbox while blocked in `rx.recv()`.
     fn on_run_complete(&self, run_id: &str) {
-        self.drop_session(run_id);
+        let tx = self.tx.clone();
+        let sessions = self.sessions.clone();
+        let run_id = run_id.to_string();
+        std::thread::spawn(move || {
+            let tid = {
+                let mut guard = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                guard.remove(&run_id).map(|s| s.terminal_id)
+            };
+            if let Some(id) = tid {
+                let (reply, rx) = std::sync::mpsc::channel();
+                let _ = tx.send(Command::CloseTerminal { id, reply });
+                let _ = rx.recv();
+            }
+        });
     }
 }
 

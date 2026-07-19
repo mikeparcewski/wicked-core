@@ -482,11 +482,7 @@ pub(crate) fn run(
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
                             match crate::distribute::distribute_units_on(
-                                &pre.units,
-                                &pre.clis,
-                                &sid,
-                                None,
-                                &disp,
+                                &pre.units, &pre.clis, &sid, None, &disp,
                             ) {
                                 Ok(distributions) => {
                                     let _ = tx.send(Command::PlanReady {
@@ -1477,7 +1473,14 @@ fn apply_step_result(
             let _ =
                 crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
         }
-        return Ok(fail_run(store, subscribers, runner, self_tx, &mut session, ord));
+        return Ok(fail_run(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &mut session,
+            ord,
+        ));
     }
 
     let cli_keys = session.clis.clone();
@@ -1535,7 +1538,14 @@ fn apply_step_result(
             )?;
             return Ok(StepApplied::Paused);
         }
-        return Ok(fail_run(store, subscribers, runner, self_tx, &mut session, ord));
+        return Ok(fail_run(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &mut session,
+            ord,
+        ));
     }
 
     // Approved → advance the resume cursor past the unit we just applied.
