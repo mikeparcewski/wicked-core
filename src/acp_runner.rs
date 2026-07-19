@@ -482,10 +482,7 @@ struct AcpGovArmed {
 /// SECURITY: only the trusted `current_exe()` is interpolated into the hook command string.
 /// Scope/phase (which embed the caller-controlled `session_id`/`unit.id`) travel via ENV, not
 /// the command string, so no attacker-controlled data ever reaches the shell-executed hook.
-fn arm_acp_governance(
-    input: &StepInput,
-    gov: &GovernanceContext,
-) -> std::io::Result<AcpGovArmed> {
+fn arm_acp_governance(input: &StepInput, gov: &GovernanceContext) -> std::io::Result<AcpGovArmed> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
     let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
@@ -612,7 +609,12 @@ impl AcpStepRunner {
                 // control the process directly. HTTP-mode ACP connects to a server we don't
                 // spawn, so --settings cannot be injected → fall back to the wrapped-CLI path,
                 // which handles governance independently via arm_input_governance.
-                Some(c) if c.transport == AcpTransport::Stdio => c,
+                Some(c)
+                    if c.transport == AcpTransport::Stdio
+                        && crate::execute_wrapped::binary_is_claude(&cli_key) =>
+                {
+                    c
+                }
                 _ => return self.fallback.run_unit_streaming(input, emit),
             };
 
@@ -658,13 +660,8 @@ impl AcpStepRunner {
             };
 
             let prompt = skill_prompt(&input.unit);
-            return match exec_turn_acp(
-                &mut proc,
-                &prompt,
-                &input.prior_outputs,
-                emit,
-                self.timeout,
-            ) {
+            return match exec_turn_acp(&mut proc, &prompt, &input.prior_outputs, emit, self.timeout)
+            {
                 Ok(result) if result.status == StepStatus::Ok => StepOutput {
                     run_id: input.run_id.clone(),
                     unit_ix: input.unit_ix,
@@ -687,24 +684,30 @@ impl AcpStepRunner {
                 },
                 // Turn failed or session exited: fall back to wrapped-CLI, which re-arms
                 // governance on its own — unit is still governed via the fallback path.
-                Ok(_) => fallback_with_warning(
-                    format!(
-                        "[wicked-core] ACP governance session exited for '{cli_key}'; \
-                         using single-shot fallback"
-                    ),
-                    input,
-                    emit,
-                    &self.fallback,
-                ),
-                Err(e) => fallback_with_warning(
-                    format!(
-                        "[wicked-core] ACP governance error for '{cli_key}' ({e}); \
-                         using single-shot fallback"
-                    ),
-                    input,
-                    emit,
-                    &self.fallback,
-                ),
+                Ok(_) => {
+                    drop(proc);
+                    fallback_with_warning(
+                        format!(
+                            "[wicked-core] ACP governance session exited for '{cli_key}'; \
+                             using single-shot fallback"
+                        ),
+                        input,
+                        emit,
+                        &self.fallback,
+                    )
+                }
+                Err(e) => {
+                    drop(proc);
+                    fallback_with_warning(
+                        format!(
+                            "[wicked-core] ACP governance error for '{cli_key}' ({e}); \
+                             using single-shot fallback"
+                        ),
+                        input,
+                        emit,
+                        &self.fallback,
+                    )
+                }
             };
         }
 
