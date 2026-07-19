@@ -511,46 +511,76 @@ pub(crate) fn run(
                 mut pre,
                 distributions,
             } => {
-                // Council finished — write assignments to the store, advance the session to
-                // Executing, then dispatch unit 0 (or pause at a gate).
-                match pipeline::apply_distributions(
-                    &mut store,
-                    &mut pre,
-                    distributions,
-                    &mut |ev| emit(&mut subscribers, ev),
-                ) {
-                    Err(e) => {
-                        in_flight.remove(&run_id);
-                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                            s.status = SessionStatus::Failed;
-                            let _ = put_node(&mut store, s.to_node());
-                        }
-                        emit_run_error(&mut subscribers, &run_id, e);
-                    }
-                    Ok(()) => {
-                        match advance_or_pause(
-                            &mut store,
-                            &mut subscribers,
-                            &runner,
-                            &self_tx,
-                            &run_id,
-                            0,
-                        ) {
-                            Ok(Progress::Dispatched) => { /* in_flight set in LaunchRun */ }
-                            Ok(Progress::Paused) => {
-                                in_flight.remove(&run_id);
+                // Guard: the run may have been cancelled while the council thread was running.
+                // If it is already terminal, discard the result — do not resurrect the run.
+                let already_terminal = crate::domain::get_session(&store, &run_id)
+                    .ok()
+                    .flatten()
+                    .map(|s| {
+                        matches!(
+                            s.status,
+                            SessionStatus::Completed
+                                | SessionStatus::Cancelled
+                                | SessionStatus::Failed
+                        )
+                    })
+                    .unwrap_or(true); // unknown run → treat as terminal
+                if already_terminal {
+                    in_flight.remove(&run_id);
+                } else {
+                    // Write assignments to the store, advance the session to Executing, then
+                    // dispatch unit 0 (or pause at a gate).
+                    match pipeline::apply_distributions(
+                        &mut store,
+                        &mut pre,
+                        distributions,
+                        &mut |ev| emit(&mut subscribers, ev),
+                    ) {
+                        Err(e) => {
+                            in_flight.remove(&run_id);
+                            if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                                s.status = SessionStatus::Failed;
+                                let _ = put_node(&mut store, s.to_node());
                             }
-                            Ok(Progress::Done) => {
-                                in_flight.remove(&run_id);
-                                if let Err(e) =
-                                    finalize_run(&mut store, &mut subscribers, &self_tx, &run_id)
-                                {
+                            emit_run_error(&mut subscribers, &run_id, e);
+                        }
+                        Ok(()) => {
+                            match advance_or_pause(
+                                &mut store,
+                                &mut subscribers,
+                                &runner,
+                                &self_tx,
+                                &run_id,
+                                0,
+                            ) {
+                                Ok(Progress::Dispatched) => { /* in_flight set in LaunchRun */ }
+                                Ok(Progress::Paused) => {
+                                    in_flight.remove(&run_id);
+                                }
+                                Ok(Progress::Done) => {
+                                    in_flight.remove(&run_id);
+                                    if let Err(e) = finalize_run(
+                                        &mut store,
+                                        &mut subscribers,
+                                        &self_tx,
+                                        &run_id,
+                                    ) {
+                                        emit_run_error(&mut subscribers, &run_id, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    // Wedge-prevention: advance_or_pause failed after the session
+                                    // was already written to Executing — mark it Failed so the UI
+                                    // shows a terminal state, not a permanently-stuck Executing.
+                                    in_flight.remove(&run_id);
+                                    if let Ok(Some(mut s)) =
+                                        crate::domain::get_session(&store, &run_id)
+                                    {
+                                        s.status = SessionStatus::Failed;
+                                        let _ = put_node(&mut store, s.to_node());
+                                    }
                                     emit_run_error(&mut subscribers, &run_id, e);
                                 }
-                            }
-                            Err(e) => {
-                                in_flight.remove(&run_id);
-                                emit_run_error(&mut subscribers, &run_id, e);
                             }
                         }
                     }
@@ -558,15 +588,24 @@ pub(crate) fn run(
             }
             Command::PlanFailed { run_id, error } => {
                 in_flight.remove(&run_id);
+                // Guard: do not clobber Cancelled with Failed if the run was cancelled while the
+                // council thread was running.
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                    s.status = SessionStatus::Failed;
-                    let _ = put_node(&mut store, s.to_node());
+                    if !matches!(
+                        s.status,
+                        SessionStatus::Completed
+                            | SessionStatus::Cancelled
+                            | SessionStatus::Failed
+                    ) {
+                        s.status = SessionStatus::Failed;
+                        let _ = put_node(&mut store, s.to_node());
+                        emit_run_error(
+                            &mut subscribers,
+                            &run_id,
+                            anyhow::anyhow!("council distribution failed: {error}"),
+                        );
+                    }
                 }
-                emit_run_error(
-                    &mut subscribers,
-                    &run_id,
-                    anyhow::anyhow!("council distribution failed: {error}"),
-                );
             }
             Command::ResumeRun { run_id, reply } => {
                 let res = resume_run_inner(
