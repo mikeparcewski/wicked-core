@@ -146,6 +146,18 @@ pub(crate) struct Planned {
     pub cli_keys: Vec<String>,
 }
 
+/// The result of [`pre_distribute`] — planning complete, units persisted at `Distributing`, ready
+/// for the blocking council call. All fields are owned so this can be moved across a thread boundary.
+pub(crate) struct PreDistributed {
+    pub session_id: String,
+    pub session: AgentSession,
+    pub units: Vec<crate::domain::WorkUnit>,
+    /// The launch roster — needed by `distribute_units_on` to convene the council.
+    pub clis: Vec<AgenticCli>,
+    pub workflow_id: String,
+    pub cli_keys: Vec<String>,
+}
+
 /// Resolve a selected workflow id to its validated [`WorkflowDef`]. When `extra` is provided it is
 /// consulted first (runtime-registered workflows take priority over built-ins and the file overlay);
 /// otherwise seeds the built-ins and overlays operator drop-in files (`$WICKED_WORKFLOWS_DIR`, else
@@ -244,18 +256,16 @@ pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
         .map(|h| std::path::PathBuf::from(h).join(".config/wicked-core/workflows"))
 }
 
-/// PLAN + DISTRIBUTE (shared by both drivers): persist the session, decompose the problem into
-/// units, register the workflow's ordered phase list, and let the council assign a CLI per unit.
-/// Emits `SessionStarted` / `UnitPlanned×n` / `UnitDistributed×n` and leaves the session at
-/// `Executing`. Store-writing, so it runs on the actor (single-writer) thread.
+/// Plan a session and persist units to the store, stopping SHORT of the blocking council call.
+/// Returns a [`PreDistributed`] that carries everything the distribute thread needs (all owned).
+/// Emits `SessionStarted` (when `!session_already_started`) + `UnitPlanned×n`. Leaves the session
+/// at `Distributing`. Store-writing — runs on the actor (single-writer) thread.
 ///
-/// `workflow_registry`: when `Some`, the actor-owned runtime registry is consulted first for
-/// workflow resolution (enables defs registered via `RegisterWorkflow` without a restart).
+/// The caller spawns a thread, calls `distribute::distribute_units_on(&pre.units, &pre.clis, ...)`
+/// there, then posts `Command::PlanReady` (or `PlanFailed`) back to the actor. The actor arm calls
+/// [`apply_distributions`] to finish the setup and dispatch unit 0.
 #[allow(clippy::too_many_arguments)]
-/// When `session_already_started` is `true` the caller already wrote a Planning stub to the store
-/// and emitted `SessionStarted` (the non-blocking `LaunchRun` fast path). In that case we skip
-/// the duplicate stub write + event to avoid emitting `SessionStarted` twice.
-pub(crate) fn plan_and_distribute(
+pub(crate) fn pre_distribute(
     store: &mut dyn wicked_apps_core::GraphStore,
     clis: &[AgenticCli],
     problem: &str,
@@ -265,20 +275,13 @@ pub(crate) fn plan_and_distribute(
     repo_ref: Option<String>,
     workdir: Option<String>,
     workflow: Option<&str>,
-    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
-) -> anyhow::Result<Planned> {
+) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
 
-    // DATA-DRIVEN planning when a workflow is selected (Law 2): units come from the def's phases, each
-    // unit's stage from the phase's declared `kind`. No selection ⇒ the legacy free-text planner; a
-    // requested-but-unknown id already errored in resolve_workflow_def above.
-    // The def is validated (the registry only hands out validated defs), so plan_from_def's unit-id
-    // uniqueness precondition holds. The DENY_PHASE_SPAN governed-limit check below applies to BOTH
-    // paths — a def with too many phases is rejected exactly like an over-long prose problem.
     let selected_def = resolve_workflow_def(workflow, workflow_registry)?;
     let mut units = match &selected_def {
         Some(def) => plan::plan_from_def(def, problem, session_id),
@@ -292,13 +295,6 @@ pub(crate) fn plan_and_distribute(
         );
     }
 
-    // ENGAGE THE DUAL-VALIDATOR GATE (the producer side of the rev0.4 pin+vault): for a def-driven run,
-    // any phase that declares a `validator_pin` gets its ALREADY-APPROVED validator LOADED from the vault
-    // and attached to the phase's unit. Units are 1:1 with `def.phases` in declaration order (plan_from_def
-    // zips them), so we zip here too. Loading is a PURE store read — no LLM authoring — so it is actor-safe
-    // on the single-writer thread; authoring/approval happened out of band. Once attached, the gate reads
-    // `unit.validator`: `pinned_validator_denial` re-verifies it deterministically and the off-thread
-    // agent judge renders its semantic verdict — the layers that were INERT with nothing pinning the unit.
     if let Some(def) = &selected_def {
         attach_pinned_validators(store, &mut units, def)?;
     }
@@ -341,7 +337,6 @@ pub(crate) fn plan_and_distribute(
     session.status = SessionStatus::Distributing;
     put_node(store, session.to_node())?;
 
-    // Register the workflow (ordered phase list + cursor) after planning.
     let phase_specs: Vec<(String, String)> = units
         .iter()
         .map(|u| {
@@ -353,9 +348,26 @@ pub(crate) fn plan_and_distribute(
         .collect();
     wicked_orchestration::register_workflow(store, &workflow_id, problem, &phase_specs)?;
 
-    let distributions =
-        distribute::distribute_units_on(&units, clis, session_id, None, dispatcher)?;
-    for (u, dist) in units.iter_mut().zip(distributions.iter()) {
+    Ok(PreDistributed {
+        session_id: session_id.to_string(),
+        session,
+        units,
+        clis: clis.to_vec(),
+        workflow_id,
+        cli_keys,
+    })
+}
+
+/// Apply council distributions to the pre-distributed units, persist assignments to the store, and
+/// advance the session to `Executing`. Emits `UnitDistributed×n`. Store-writing — runs on the actor
+/// thread (called from the `PlanReady` command arm).
+pub(crate) fn apply_distributions(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    pre: &mut PreDistributed,
+    distributions: Vec<crate::distribute::Distribution>,
+    emit: &mut dyn FnMut(CoreEvent),
+) -> anyhow::Result<()> {
+    for (u, dist) in pre.units.iter_mut().zip(distributions.iter()) {
         u.assigned_cli = Some(dist.assigned_cli.clone());
         u.assigned_invocation = dist.assigned_invocation.clone();
         u.council_task_ref = dist.council_task_ref.clone();
@@ -363,20 +375,63 @@ pub(crate) fn plan_and_distribute(
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
         emit(CoreEvent::UnitDistributed {
-            session: session_id.to_string(),
+            session: pre.session_id.clone(),
             ord: u.ord,
             cli: dist.assigned_cli.clone(),
         });
     }
+    pre.session.status = SessionStatus::Executing;
+    put_node(store, pre.session.to_node())?;
+    Ok(())
+}
 
-    session.status = SessionStatus::Executing;
-    put_node(store, session.to_node())?;
-
+/// PLAN + DISTRIBUTE (used by the sync operator CLI + tests): the full sequential path — plan,
+/// persist, distribute (blocking council), apply assignments. For the interactive actor engine the
+/// call is split: [`pre_distribute`] on the actor thread + `distribute_units_on` off-thread +
+/// [`apply_distributions`] back on the actor thread via `Command::PlanReady`.
+///
+/// `workflow_registry`: when `Some`, the actor-owned runtime registry is consulted first for
+/// workflow resolution (enables defs registered via `RegisterWorkflow` without a restart).
+/// When `session_already_started` is `true` the caller already wrote a Planning stub + emitted
+/// `SessionStarted`; we skip the duplicate writes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_and_distribute(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    clis: &[AgenticCli],
+    problem: &str,
+    entity_mode: EntityMode,
+    session_id: &str,
+    human_confirm: crate::domain::HumanConfirm,
+    repo_ref: Option<String>,
+    workdir: Option<String>,
+    workflow: Option<&str>,
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    emit: &mut dyn FnMut(CoreEvent),
+    workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
+    session_already_started: bool,
+) -> anyhow::Result<Planned> {
+    let mut pre = pre_distribute(
+        store,
+        clis,
+        problem,
+        entity_mode,
+        session_id,
+        human_confirm,
+        repo_ref,
+        workdir,
+        workflow,
+        emit,
+        workflow_registry,
+        session_already_started,
+    )?;
+    let distributions =
+        distribute::distribute_units_on(&pre.units, clis, session_id, None, dispatcher)?;
+    apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {
-        session,
-        units,
-        workflow_id,
-        cli_keys,
+        session: pre.session,
+        units: pre.units,
+        workflow_id: pre.workflow_id,
+        cli_keys: pre.cli_keys,
     })
 }
 

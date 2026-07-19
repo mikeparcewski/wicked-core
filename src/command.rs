@@ -232,6 +232,20 @@ pub(crate) enum Command {
         json: String,
         reply: std::sync::mpsc::Sender<anyhow::Result<String>>, // returns the workflow id
     },
+    /// Council distribution complete — the distribute worker thread finished `distribute_units_on`
+    /// successfully. The actor arm calls `pipeline::apply_distributions` to write assignments to the
+    /// store and dispatch unit 0. Sent by the off-actor distribute thread; processed on actor thread.
+    PlanReady {
+        run_id: String,
+        pre: crate::pipeline::PreDistributed,
+        distributions: Vec<crate::distribute::Distribution>,
+    },
+    /// Distribution failed (council error or pre-distribute error). The actor arm marks the session
+    /// `Failed` and emits a `SessionFailed` event. Sent by the off-actor distribute thread.
+    PlanFailed {
+        run_id: String,
+        error: String,
+    },
     /// Stop the actor loop and release the store. Sent automatically when the LAST external `Core`
     /// handle drops (the actor holds its own `self_tx` for worker write-back, so channel-close alone
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but
