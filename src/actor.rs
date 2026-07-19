@@ -448,11 +448,10 @@ pub(crate) fn run(
                 repo_ref,
                 workdir,
             } => {
-                // Deferred second half: plan units + council distribution + dispatch unit 0.
-                // SessionStarted was already emitted; skip_stub=true so plan_and_distribute
-                // does not double-emit it.
+                // Fast half (actor thread): plan + store writes only, no blocking council call.
+                // SessionStarted was already emitted; session_already_started=true skips the dupe.
                 let run_id = spec.session_id.clone();
-                let plan_res = pipeline::plan_and_distribute(
+                match pipeline::pre_distribute(
                     &mut store,
                     &spec.clis,
                     &spec.problem,
@@ -462,22 +461,73 @@ pub(crate) fn run(
                     repo_ref,
                     workdir,
                     spec.workflow.as_deref(),
-                    &dispatcher,
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
                     true, // session stub already created + SessionStarted already emitted
-                );
-                match plan_res {
+                ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
-                        // Mark the Planning stub as Failed so GET /runs shows a terminal state.
                         if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                             s.status = SessionStatus::Failed;
                             let _ = put_node(&mut store, s.to_node());
                         }
                         emit_run_error(&mut subscribers, &run_id, e);
                     }
-                    Ok(_) => {
+                    Ok(pre) => {
+                        // Blocking half (worker thread): convene the council off the actor thread
+                        // so the actor stays responsive (serves reads, handles gates) while the
+                        // council votes. Posts PlanReady or PlanFailed back when done.
+                        let tx = self_tx.clone();
+                        let disp = dispatcher.clone();
+                        std::thread::spawn(move || {
+                            let sid = pre.session_id.clone();
+                            match crate::distribute::distribute_units_on(
+                                &pre.units,
+                                &pre.clis,
+                                &sid,
+                                None,
+                                &disp,
+                            ) {
+                                Ok(distributions) => {
+                                    let _ = tx.send(Command::PlanReady {
+                                        run_id: sid,
+                                        pre,
+                                        distributions,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: sid,
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            Command::PlanReady {
+                run_id,
+                mut pre,
+                distributions,
+            } => {
+                // Council finished — write assignments to the store, advance the session to
+                // Executing, then dispatch unit 0 (or pause at a gate).
+                match pipeline::apply_distributions(
+                    &mut store,
+                    &mut pre,
+                    distributions,
+                    &mut |ev| emit(&mut subscribers, ev),
+                ) {
+                    Err(e) => {
+                        in_flight.remove(&run_id);
+                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                            s.status = SessionStatus::Failed;
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                        emit_run_error(&mut subscribers, &run_id, e);
+                    }
+                    Ok(()) => {
                         match advance_or_pause(
                             &mut store,
                             &mut subscribers,
@@ -486,7 +536,7 @@ pub(crate) fn run(
                             &run_id,
                             0,
                         ) {
-                            Ok(Progress::Dispatched) => { /* in_flight already set in LaunchRun */ }
+                            Ok(Progress::Dispatched) => { /* in_flight set in LaunchRun */ }
                             Ok(Progress::Paused) => {
                                 in_flight.remove(&run_id);
                             }
@@ -505,6 +555,18 @@ pub(crate) fn run(
                         }
                     }
                 }
+            }
+            Command::PlanFailed { run_id, error } => {
+                in_flight.remove(&run_id);
+                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                    s.status = SessionStatus::Failed;
+                    let _ = put_node(&mut store, s.to_node());
+                }
+                emit_run_error(
+                    &mut subscribers,
+                    &run_id,
+                    anyhow::anyhow!("council distribution failed: {error}"),
+                );
             }
             Command::ResumeRun { run_id, reply } => {
                 let res = resume_run_inner(
