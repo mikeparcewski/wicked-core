@@ -562,6 +562,7 @@ pub(crate) fn run(
                                     if let Err(e) = finalize_run(
                                         &mut store,
                                         &mut subscribers,
+                                        &runner,
                                         &self_tx,
                                         &run_id,
                                     ) {
@@ -664,6 +665,7 @@ pub(crate) fn run(
                                 let _ = fail_run(
                                     &mut store,
                                     &mut subscribers,
+                                    &runner,
                                     &self_tx,
                                     &mut session,
                                     ord,
@@ -691,7 +693,7 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelRun { run_id, reply } => {
-                let res = cancel_run(&mut store, &mut subscribers, &self_tx, &run_id);
+                let res = cancel_run(&mut store, &mut subscribers, &runner, &self_tx, &run_id);
                 in_flight.remove(&run_id);
                 let _ = reply.send(res);
             }
@@ -1197,7 +1199,7 @@ pub(crate) fn launch_run_inner(
         }
         Ok(Progress::Paused) => {} // paused at a gate — not in flight
         Ok(Progress::Done) => {
-            if let Err(e) = finalize_run(store, subscribers, self_tx, &run_id) {
+            if let Err(e) = finalize_run(store, subscribers, runner, self_tx, &run_id) {
                 emit_run_error(subscribers, &run_id, e);
             }
         }
@@ -1285,7 +1287,7 @@ pub(crate) fn resume_run_inner(
         }
         Progress::Paused => Ok(SessionStatus::AwaitingHuman),
         Progress::Done => {
-            finalize_run(store, subscribers, self_tx, run_id)?;
+            finalize_run(store, subscribers, runner, self_tx, run_id)?;
             Ok(SessionStatus::Completed)
         }
     }
@@ -1342,7 +1344,7 @@ fn redrive_executing_sessions(
             }
             // No unit at the cursor (every remaining unit is Done) → the run is actually complete.
             Ok(false) => {
-                if let Err(e) = finalize_run(store, subscribers, self_tx, &run_id) {
+                if let Err(e) = finalize_run(store, subscribers, runner, self_tx, &run_id) {
                     emit_run_error(subscribers, &run_id, e);
                 }
             }
@@ -1475,7 +1477,7 @@ fn apply_step_result(
             let _ =
                 crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
         }
-        return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
+        return Ok(fail_run(store, subscribers, runner, self_tx, &mut session, ord));
     }
 
     let cli_keys = session.clis.clone();
@@ -1533,7 +1535,7 @@ fn apply_step_result(
             )?;
             return Ok(StepApplied::Paused);
         }
-        return Ok(fail_run(store, subscribers, self_tx, &mut session, ord));
+        return Ok(fail_run(store, subscribers, runner, self_tx, &mut session, ord));
     }
 
     // Approved → advance the resume cursor past the unit we just applied.
@@ -1553,7 +1555,7 @@ fn apply_step_result(
         Progress::Dispatched => Ok(StepApplied::Continuing),
         Progress::Paused => Ok(StepApplied::Paused),
         Progress::Done => {
-            finalize_run(store, subscribers, self_tx, &run_id)?;
+            finalize_run(store, subscribers, runner, self_tx, &run_id)?;
             Ok(StepApplied::Finished)
         }
     }
@@ -1564,6 +1566,7 @@ fn apply_step_result(
 fn fail_run(
     store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
+    runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
     ord: u32,
@@ -1578,6 +1581,7 @@ fn fail_run(
         },
     );
     notify_campaign(self_tx, &session.id, crate::campaign::NodeOutcome::Failed);
+    runner.on_run_complete(&session.id);
     StepApplied::Finished
 }
 
@@ -1936,6 +1940,7 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
 fn finalize_run(
     store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
+    runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
 ) -> anyhow::Result<()> {
@@ -1950,6 +1955,7 @@ fn finalize_run(
         },
     );
     notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Completed);
+    runner.on_run_complete(run_id);
     Ok(())
 }
 
@@ -1977,7 +1983,7 @@ pub(crate) fn confirm_gate(
 
     match decision {
         crate::workflow::HumanDecision::Reject => {
-            let s = cancel_run(store, subscribers, self_tx, run_id)?;
+            let s = cancel_run(store, subscribers, runner, self_tx, run_id)?;
             in_flight.remove(run_id);
             Ok(s)
         }
@@ -2013,7 +2019,7 @@ pub(crate) fn confirm_gate(
                     // (the human must re-launch) — deny-dominates means Approve cannot override
                     // a policy veto (ADR-0003). Remove from in_flight only after cancel_run so
                     // a write failure leaves the map consistent (run stays in_flight = retryable).
-                    let result = cancel_run(store, subscribers, self_tx, run_id);
+                    let result = cancel_run(store, subscribers, runner, self_tx, run_id);
                     if result.is_ok() {
                         in_flight.remove(run_id);
                     }
@@ -2076,7 +2082,7 @@ pub(crate) fn confirm_gate(
                 Ok(true) => Ok(SessionStatus::Executing),
                 Ok(false) => {
                     in_flight.remove(run_id);
-                    finalize_run(store, subscribers, self_tx, run_id)?;
+                    finalize_run(store, subscribers, runner, self_tx, run_id)?;
                     Ok(SessionStatus::Completed)
                 }
                 Err(e) => {
@@ -2094,6 +2100,7 @@ pub(crate) fn confirm_gate(
 pub(crate) fn cancel_run(
     store: &mut dyn GraphStore,
     subscribers: &mut Vec<Sender<CoreEvent>>,
+    runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
 ) -> anyhow::Result<SessionStatus> {
@@ -2122,6 +2129,7 @@ pub(crate) fn cancel_run(
         },
     );
     notify_campaign(self_tx, run_id, crate::campaign::NodeOutcome::Cancelled);
+    runner.on_run_complete(run_id);
     Ok(SessionStatus::Cancelled)
 }
 

@@ -175,6 +175,11 @@ impl StepRunner for PersistentStepRunner {
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec_turn(input, emit)
     }
+
+    /// Close the PTY session for `run_id` so the CLI process exits cleanly after the run ends.
+    fn on_run_complete(&self, run_id: &str) {
+        self.drop_session(run_id);
+    }
 }
 
 impl PersistentStepRunner {

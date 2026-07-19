@@ -617,6 +617,11 @@ impl StepRunner for AcpStepRunner {
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec_turn(input, emit)
     }
+
+    /// Close all ACP sessions for `run_id` so Claude processes don't leak after a run ends.
+    fn on_run_complete(&self, run_id: &str) {
+        self.drop_session(run_id);
+    }
 }
 
 // ── Registry helper ───────────────────────────────────────────────────────────
