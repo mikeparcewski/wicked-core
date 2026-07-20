@@ -11,6 +11,7 @@ pub enum CoreEvent {
     /// Liveness tick (also the P1 proof that subscribe→emit works end to end).
     Heartbeat,
     /// A session was created and planning began.
+    #[non_exhaustive]
     SessionStarted {
         session: String,
         problem: String,
@@ -20,6 +21,7 @@ pub enum CoreEvent {
         entity_mode: String,
     },
     /// A work unit was planned (one per decomposed piece).
+    #[non_exhaustive]
     UnitPlanned {
         session: String,
         ord: u32,
@@ -32,6 +34,7 @@ pub enum CoreEvent {
         executor_type: String,
     },
     /// The council assigned a CLI to a unit.
+    #[non_exhaustive]
     UnitDistributed {
         session: String,
         ord: u32,

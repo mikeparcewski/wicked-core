@@ -552,6 +552,27 @@ pub(crate) fn run(
                 // the resolved workdir, then proceed with pre_distribute + council distribution
                 // (same logic as ContinueLaunch — SessionStarted already emitted).
                 let run_id = spec.session_id.clone();
+                // Guard: the run may have been cancelled while the worktree thread was running.
+                // If it is already terminal, discard the result — do not resurrect the run.
+                let already_terminal = crate::domain::get_session(&store, &run_id)
+                    .ok()
+                    .flatten()
+                    .map(|s| {
+                        matches!(
+                            s.status,
+                            SessionStatus::Completed
+                                | SessionStatus::Cancelled
+                                | SessionStatus::Failed
+                        )
+                    })
+                    .unwrap_or(true); // unknown run → treat as terminal
+                if already_terminal {
+                    in_flight.remove(&run_id);
+                    if let Some(ref path) = workdir {
+                        let _ = std::fs::remove_dir_all(path);
+                    }
+                    return;
+                }
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     s.workdir = workdir.clone();
                     let _ = put_node(&mut store, s.to_node());
@@ -564,7 +585,7 @@ pub(crate) fn run(
                     &run_id,
                     spec.human_confirm,
                     repo_ref,
-                    workdir,
+                    workdir.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
@@ -572,6 +593,9 @@ pub(crate) fn run(
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
+                        if let Some(ref path) = workdir {
+                            let _ = std::fs::remove_dir_all(path);
+                        }
                         if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                             s.status = SessionStatus::Failed;
                             let _ = put_node(&mut store, s.to_node());
@@ -607,12 +631,19 @@ pub(crate) fn run(
             Command::WorktreeFailed { run_id, error } => {
                 // The off-thread worktree creation failed. Mark the session Failed and surface
                 // the error as a CoreEvent::Error so the UI / bus bridge learns about it.
+                // Guard: only update if the session is not already in a terminal state (e.g.
+                // it may have been cancelled while the worktree thread was running).
                 in_flight.remove(&run_id);
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                    s.status = SessionStatus::Failed;
-                    let _ = put_node(&mut store, s.to_node());
+                    if !matches!(
+                        s.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ) {
+                        s.status = SessionStatus::Failed;
+                        let _ = put_node(&mut store, s.to_node());
+                        emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{error}"));
+                    }
                 }
-                emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{error}"));
             }
             Command::PlanReady {
                 run_id,
