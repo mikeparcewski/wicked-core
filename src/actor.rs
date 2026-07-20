@@ -506,8 +506,8 @@ pub(crate) fn run(
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
-                    true,  // session stub already created + SessionStarted already emitted
-                    false, // session_already_started=true skips the emit block that uses `governed`
+                    true, // session stub already created + SessionStarted already emitted
+                    in_process_governance().is_some(), // keep governed accurate even when unused today
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -636,8 +636,8 @@ pub(crate) fn run(
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
-                    true,  // session stub already created + SessionStarted already emitted
-                    false, // session_already_started=true skips the emit block that uses `governed`
+                    true, // session stub already created + SessionStarted already emitted
+                    in_process_governance().is_some(), // keep governed accurate even when unused today
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
