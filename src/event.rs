@@ -284,6 +284,41 @@ pub enum CoreEvent {
         path: String,
         db_path: String,
     },
+    /// (EVT-001) A structured workflow def was selected for this session — the authoritative
+    /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
+    /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
+    /// `unit_count` is the number of phases the def decomposed into.
+    WorkflowSelected {
+        session: String,
+        workflow_id: String,
+        unit_count: u32,
+    },
+    /// (EVT-012) A human approved a gate AND supplied an amendment text that was injected into
+    /// the unit's description before re-dispatch. Fires after the amendment is persisted to the
+    /// store, before `Resumed`. Only emitted when the amendment text is non-empty. This is the
+    /// authoritative record for the human-in-the-loop paper trail: `Resumed` alone carries no
+    /// amendment text.
+    UnitReworkAmended {
+        session: String,
+        ord: u32,
+        /// The raw amendment text supplied by the operator.
+        amendment: String,
+        /// The unit's description after the amendment was injected.
+        updated_description: String,
+    },
+    /// (EVT-013) A worker's `ApplyStepResult` arrived and the output is ready to be gated. Fires
+    /// after all terminal/idempotency/attempt guards pass, before the gate runs. `output_bytes` is
+    /// the byte length of the worker's output — lets an operator immediately distinguish "0 bytes"
+    /// from "8 MB that was truncated by MAX_OUT". `step_status` is `"ok"`, `"failed"`, or
+    /// `"cancelled"`. `governed` reflects whether the runner armed input governance for this unit.
+    UnitOutputCaptured {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        output_bytes: usize,
+        step_status: String,
+        governed: bool,
+    },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {
         session: Option<String>,
