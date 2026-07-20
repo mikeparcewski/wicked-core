@@ -568,10 +568,16 @@ pub(crate) fn run(
                     .unwrap_or(true); // unknown run → treat as terminal
                 if already_terminal {
                     in_flight.remove(&run_id);
-                    if let Some(ref path) = workdir {
+                    // Use remove_worktree (git worktree remove --force) to clean up both
+                    // the directory and the git worktree metadata entry.
+                    if let Some(ref ref_id) = repo_ref {
+                        if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                            crate::repo::remove_worktree(&repo.root_path, &run_id);
+                        }
+                    } else if let Some(ref path) = workdir {
                         let _ = std::fs::remove_dir_all(path);
                     }
-                    return;
+                    continue; // Stay in the actor loop — do NOT return/kill the actor.
                 }
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     s.workdir = workdir.clone();
@@ -584,7 +590,7 @@ pub(crate) fn run(
                     spec.entity_mode,
                     &run_id,
                     spec.human_confirm,
-                    repo_ref,
+                    repo_ref.clone(),
                     workdir.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
@@ -593,7 +599,11 @@ pub(crate) fn run(
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
-                        if let Some(ref path) = workdir {
+                        if let Some(ref ref_id) = repo_ref {
+                            if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                                crate::repo::remove_worktree(&repo.root_path, &run_id);
+                            }
+                        } else if let Some(ref path) = workdir {
                             let _ = std::fs::remove_dir_all(path);
                         }
                         if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
@@ -635,6 +645,13 @@ pub(crate) fn run(
                 // it may have been cancelled while the worktree thread was running).
                 in_flight.remove(&run_id);
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                    // Best-effort: prune any stale git worktree metadata left by a partial
+                    // `git worktree add` (git usually self-cleans on failure, but prune anyway).
+                    if let Some(ref ref_id) = s.repo_ref {
+                        if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                            crate::repo::remove_worktree(&repo.root_path, &run_id);
+                        }
+                    }
                     if !matches!(
                         s.status,
                         SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
