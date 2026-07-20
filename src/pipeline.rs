@@ -12,10 +12,11 @@ use wicked_apps_core::ToNode;
 use wicked_council::types::Dispatcher;
 use wicked_council::AgenticCli;
 
-use crate::domain::{put_node, AgentSession, SessionStatus, UnitStatus};
+use crate::domain::{put_node, AgentSession, RoutingInfo, SessionStatus, UnitStatus};
 use crate::event::CoreEvent;
 use crate::execute::{self, UnitOutcome};
 use crate::scope::{resolve_scope, EntityMode};
+use crate::workflow::{GateSpec, PhaseRole};
 use crate::{distribute, plan};
 
 /// The result of a completed session run.
@@ -323,6 +324,13 @@ pub(crate) fn pre_distribute(
         emit(CoreEvent::SessionStarted {
             session: session_id.to_string(),
             problem: problem.to_string(),
+            workflow_id: selected_def.as_ref().map(|d| d.id.clone()),
+            cli_count: clis.len() as u32,
+            governed: crate::actor::in_process_governance().is_some(),
+            entity_mode: match entity_mode {
+                EntityMode::Shared => "shared".to_string(),
+                EntityMode::Isolated => "isolated".to_string(),
+            },
         });
     }
 
@@ -332,6 +340,27 @@ pub(crate) fn pre_distribute(
             session: session_id.to_string(),
             ord: u.ord,
             description: u.description.clone(),
+            stage: u.stage.label().to_string(),
+            role: match u.role {
+                PhaseRole::Neutral => "neutral",
+                PhaseRole::Creator => "creator",
+                PhaseRole::Evaluator => "evaluator",
+            }
+            .to_string(),
+            gate: match &u.gate {
+                GateSpec::Auto => "auto",
+                GateSpec::HumanConfirm { .. } => "human_confirm",
+                GateSpec::HumanConfirmIf(_) => "human_confirm_if",
+            }
+            .to_string(),
+            skill_ref: u.skill_ref.clone(),
+            has_validator_pin: u.validator.is_some(),
+            executor_type: if u.tool_cmd.is_some() {
+                "tool"
+            } else {
+                "agent"
+            }
+            .to_string(),
         });
     }
     session.status = SessionStatus::Distributing;
@@ -374,10 +403,41 @@ pub(crate) fn apply_distributions(
         u.routing = Some(dist.routing.clone());
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
+        let (routing_method, agreement_pct, returned, dissent, degraded_reason) =
+            match &dist.routing {
+                RoutingInfo::Council {
+                    agreement_pct,
+                    returned,
+                    dissent,
+                    ..
+                } => (
+                    "council".to_string(),
+                    Some(*agreement_pct),
+                    Some(*returned),
+                    Some(*dissent),
+                    None,
+                ),
+                RoutingInfo::Degraded { reason } => (
+                    "degraded".to_string(),
+                    None,
+                    None,
+                    None,
+                    Some(reason.clone()),
+                ),
+                RoutingInfo::EvaluatorDistinct { .. } => {
+                    ("evaluator_distinct".to_string(), None, None, None, None)
+                }
+                RoutingInfo::Tool => ("tool".to_string(), None, None, None, None),
+            };
         emit(CoreEvent::UnitDistributed {
             session: pre.session_id.clone(),
             ord: u.ord,
             cli: dist.assigned_cli.clone(),
+            routing_method,
+            agreement_pct,
+            returned,
+            dissent,
+            degraded_reason,
         });
     }
     pre.session.status = SessionStatus::Executing;

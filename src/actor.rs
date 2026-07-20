@@ -99,7 +99,7 @@ thread_local! {
 /// runs with cwd = the worktree, so a relative `.wicked-estate/graph.db` would open the wrong/empty
 /// store (finding #6). A non-file store surfaces a LOUD one-time operator notice (council [3]/[13]) so a
 /// silently-ungoverned run is not mistaken for a governed one.
-fn in_process_governance() -> Option<crate::workflow::GovernanceContext> {
+pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceContext> {
     let path = GOV_DB_PATH.with(|c| c.borrow().clone())?;
     if path == ":memory:" || path.contains("://") {
         GOV_OFF_WARNED.with(|w| {
@@ -431,6 +431,13 @@ pub(crate) fn run(
                         CoreEvent::SessionStarted {
                             session: run_id.clone(),
                             problem: spec.problem.clone(),
+                            workflow_id: selected_def.as_ref().map(|d| d.id.clone()),
+                            cli_count: spec.clis.len() as u32,
+                            governed: in_process_governance().is_some(),
+                            entity_mode: match spec.entity_mode {
+                                EntityMode::Shared => "shared".to_string(),
+                                EntityMode::Isolated => "isolated".to_string(),
+                            },
                         },
                     );
                     in_flight.insert(run_id.clone());
