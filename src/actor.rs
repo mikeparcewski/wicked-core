@@ -387,7 +387,16 @@ pub(crate) fn run(
                         }
                     }
                     let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
-                    let (repo_ref, workdir) = resolve_workdir(&store, &spec.repo_ref, &run_id)?;
+                    // Read the repo from the store (fast, no git subprocess) so the worker thread
+                    // can create the worktree with its root_path without holding a store handle.
+                    // `create_worktree` (git worktree add) is moved off the actor thread below.
+                    let (repo_ref, repo_root) = if let Some(ref repo_id) = spec.repo_ref {
+                        let repo = crate::repo::get_repo(&store, repo_id)?
+                            .ok_or_else(|| anyhow::anyhow!("repo not registered: {repo_id}"))?;
+                        (Some(repo_id.clone()), Some(repo.root_path.clone()))
+                    } else {
+                        (None, None)
+                    };
                     // Governed unit limit check (fast, no LLM): reject over-limit runs BEFORE
                     // creating the stub so callers receive a synchronous Err, preserving the
                     // contract that an error at launch means no session was persisted.
@@ -404,6 +413,8 @@ pub(crate) fn run(
                         );
                     }
                     // Write a Planning stub so GET /runs shows the session immediately.
+                    // workdir is not yet known (worktree creation happens off-thread below);
+                    // it will be set to the resolved path in the WorktreeReady handler.
                     let cli_keys: Vec<String> = spec.clis.iter().map(|c| c.key.clone()).collect();
                     let collection_scope = match spec.entity_mode {
                         EntityMode::Shared => {
@@ -422,7 +433,7 @@ pub(crate) fn run(
                         human_confirm: spec.human_confirm,
                         unit_ix: 0,
                         attempt: 0,
-                        workdir: workdir.clone(),
+                        workdir: None, // resolved off-thread; updated in WorktreeReady
                         repo_ref: repo_ref.clone(),
                     };
                     put_node(&mut store, stub.to_node())?;
@@ -441,10 +452,33 @@ pub(crate) fn run(
                         },
                     );
                     in_flight.insert(run_id.clone());
-                    let _ = self_tx.send(Command::ContinueLaunch {
-                        spec,
-                        repo_ref,
-                        workdir,
+                    // Spawn a worker to create the worktree off-thread (`git worktree add` can take
+                    // seconds on large repos). The actor remains fully responsive during this time.
+                    // The worker posts WorktreeReady or WorktreeFailed back over self_tx.
+                    let tx = self_tx.clone();
+                    let rid = run_id.clone();
+                    std::thread::spawn(move || {
+                        let cmd = match (repo_root, repo_ref) {
+                            (Some(root), Some(ref_id)) => {
+                                match crate::repo::create_worktree(&root, &rid) {
+                                    Ok(wt) => Command::WorktreeReady {
+                                        spec,
+                                        repo_ref: Some(ref_id),
+                                        workdir: Some(wt.to_string_lossy().to_string()),
+                                    },
+                                    Err(e) => Command::WorktreeFailed {
+                                        run_id: rid,
+                                        error: e.to_string(),
+                                    },
+                                }
+                            }
+                            _ => Command::WorktreeReady {
+                                spec,
+                                repo_ref: None,
+                                workdir: None,
+                            },
+                        };
+                        let _ = tx.send(cmd);
                     });
                     Ok(run_id.clone())
                 })();
@@ -506,6 +540,172 @@ pub(crate) fn run(
                                 }
                             }
                         });
+                    }
+                }
+            }
+            Command::WorktreeReady {
+                spec,
+                repo_ref,
+                workdir,
+            } => {
+                // The worktree-creation worker finished successfully. Update the Planning stub with
+                // the resolved workdir, then proceed with pre_distribute + council distribution
+                // (same logic as ContinueLaunch — SessionStarted already emitted).
+                let run_id = spec.session_id.clone();
+                // Guard: the run may have been cancelled while the worktree thread was running.
+                // If it is already terminal, discard the result — do not resurrect the run.
+                let session_check = crate::domain::get_session(&store, &run_id);
+                let already_terminal = match &session_check {
+                    Ok(Some(s)) => matches!(
+                        s.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ),
+                    Ok(None) => true, // session purged — treat as terminal
+                    Err(e) => {
+                        // Store read failure: cannot determine terminal state safely.
+                        // Clean up the worktree and emit an error so the UI learns about it.
+                        in_flight.remove(&run_id);
+                        if let Some(ref path) = workdir {
+                            let _ = std::fs::remove_dir_all(path);
+                        }
+                        emit_run_error(
+                            &mut subscribers,
+                            &run_id,
+                            anyhow::anyhow!("store error in WorktreeReady guard: {e}"),
+                        );
+                        continue;
+                    }
+                };
+                if already_terminal {
+                    in_flight.remove(&run_id);
+                    // Spawn cleanup off the actor thread — git worktree remove can be slow
+                    // and must not stall NAPI calls waiting on the actor.
+                    if let Some(ref ref_id) = repo_ref {
+                        if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                            let root = repo.root_path.clone();
+                            let rid = run_id.clone();
+                            std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
+                        }
+                    } else if let Some(path) = workdir {
+                        std::thread::spawn(move || {
+                            let _ = std::fs::remove_dir_all(path);
+                        });
+                    }
+                    continue; // Stay in the actor loop — do NOT return/kill the actor.
+                }
+                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                    s.workdir = workdir.clone();
+                    if let Err(e) = put_node(&mut store, s.to_node()) {
+                        // Store write failure — cannot persist workdir; fail the session rather
+                        // than proceeding with an inconsistent store state.
+                        in_flight.remove(&run_id);
+                        if let Some(ref ref_id) = repo_ref {
+                            if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                                let root = repo.root_path.clone();
+                                let rid = run_id.clone();
+                                std::thread::spawn(move || {
+                                    crate::repo::remove_worktree(&root, &rid)
+                                });
+                            }
+                        } else if let Some(ref path) = workdir {
+                            let p = path.clone();
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_dir_all(p);
+                            });
+                        }
+                        emit_run_error(
+                            &mut subscribers,
+                            &run_id,
+                            anyhow::anyhow!("failed to persist workdir: {e}"),
+                        );
+                        continue;
+                    }
+                }
+                match pipeline::pre_distribute(
+                    &mut store,
+                    &spec.clis,
+                    &spec.problem,
+                    spec.entity_mode,
+                    &run_id,
+                    spec.human_confirm,
+                    repo_ref.clone(),
+                    workdir.clone(),
+                    spec.workflow.as_deref(),
+                    &mut |ev| emit(&mut subscribers, ev),
+                    Some(&registry),
+                    true, // session stub already created + SessionStarted already emitted
+                ) {
+                    Err(e) => {
+                        in_flight.remove(&run_id);
+                        if let Some(ref ref_id) = repo_ref {
+                            if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                                let root = repo.root_path.clone();
+                                let rid = run_id.clone();
+                                std::thread::spawn(move || {
+                                    crate::repo::remove_worktree(&root, &rid)
+                                });
+                            }
+                        } else if let Some(ref path) = workdir {
+                            let p = path.clone();
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_dir_all(p);
+                            });
+                        }
+                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                            s.status = SessionStatus::Failed;
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                        emit_run_error(&mut subscribers, &run_id, e);
+                    }
+                    Ok(pre) => {
+                        let tx = self_tx.clone();
+                        let disp = dispatcher.clone();
+                        std::thread::spawn(move || {
+                            let sid = pre.session_id.clone();
+                            match crate::distribute::distribute_units_on(
+                                &pre.units, &pre.clis, &sid, None, &disp,
+                            ) {
+                                Ok(distributions) => {
+                                    let _ = tx.send(Command::PlanReady {
+                                        run_id: sid,
+                                        pre,
+                                        distributions,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: sid,
+                                        error: e.to_string(),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            Command::WorktreeFailed { run_id, error } => {
+                // The off-thread worktree creation failed. Mark the session Failed and surface
+                // the error as a CoreEvent::Error so the UI / bus bridge learns about it.
+                // Guard: only update if the session is not already in a terminal state (e.g.
+                // it may have been cancelled while the worktree thread was running).
+                in_flight.remove(&run_id);
+                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                    // Best-effort: prune any stale git worktree metadata left by a partial
+                    // `git worktree add`. Spawned off the actor thread — git can be slow.
+                    if let Some(ref ref_id) = s.repo_ref {
+                        if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                            let root = repo.root_path.clone();
+                            let rid = run_id.clone();
+                            std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
+                        }
+                    }
+                    if !matches!(
+                        s.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ) {
+                        s.status = SessionStatus::Failed;
+                        let _ = put_node(&mut store, s.to_node());
+                        emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{error}"));
                     }
                 }
             }

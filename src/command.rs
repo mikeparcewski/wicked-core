@@ -43,14 +43,28 @@ pub(crate) enum Command {
         spec: crate::LaunchSpec,
         reply: Sender<anyhow::Result<String>>,
     },
-    /// Internal: the deferred second half of `LaunchRun`. Carries the validated spec and the resolved
-    /// repo workdir (already written to disk by `LaunchRun`). Errors here surface as `CoreEvent::Error`
-    /// — no reply channel. The actor marks the run Failed on error so it never wedges in Planning.
+    /// Internal: the deferred second half of `LaunchRun`. Carries the validated spec; `workdir` is
+    /// `None` when this path is taken (the worktree is created off-thread and arrives via
+    /// `WorktreeReady` instead). Errors here surface as `CoreEvent::Error` — no reply channel.
+    /// The actor marks the run Failed on error so it never wedges in Planning.
+    /// NOTE: superseded by `WorktreeReady` for the normal `LaunchRun` path; the handler is retained
+    /// for external callers (e.g. tests) that bypass `LaunchRun`.
+    #[allow(dead_code)]
     ContinueLaunch {
         spec: crate::LaunchSpec,
         repo_ref: Option<String>,
         workdir: Option<String>,
     },
+    /// Internal: worktree created off-thread; actor thread now writes units + distributes.
+    /// Posted by the worktree-creation worker spawned by `LaunchRun` on success.
+    WorktreeReady {
+        spec: crate::LaunchSpec,
+        repo_ref: Option<String>,
+        workdir: Option<String>,
+    },
+    /// Internal: worktree creation failed off-thread; actor marks the run Failed.
+    /// Posted by the worktree-creation worker spawned by `LaunchRun` on error.
+    WorktreeFailed { run_id: String, error: String },
     /// Resume an interactive run from its persisted cursor (after a pause, crash, or fresh process).
     /// Re-dispatches the next not-yet-done unit. Busy error if the run is already in flight.
     ResumeRun {
