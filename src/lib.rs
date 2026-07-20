@@ -68,7 +68,7 @@ pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
     COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID,
 };
-pub use event::CoreEvent;
+pub use event::{CoreEvent, StepFailureKind};
 pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, run_gate_hook, run_output_gate_hook,
