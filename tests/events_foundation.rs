@@ -794,14 +794,10 @@ fn step_failed_event_fires_before_session_failed() {
         |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "fail-sess"),
     );
 
-    assert!(
-        step_failed_pos.is_some(),
-        "StepFailed must be emitted when runner returns Failed"
-    );
-    assert!(
-        session_failed_pos.is_some(),
-        "SessionFailed must follow a worker failure"
-    );
+    let step_failed_pos =
+        step_failed_pos.expect("StepFailed must be emitted when runner returns Failed");
+    let session_failed_pos =
+        session_failed_pos.expect("SessionFailed must follow a worker failure");
     assert!(
         step_failed_pos < session_failed_pos,
         "StepFailed must precede SessionFailed"
@@ -812,7 +808,7 @@ fn step_failed_event_fires_before_session_failed() {
         detail,
         failure_kind,
         ..
-    }) = collected.get(step_failed_pos.unwrap())
+    }) = collected.get(step_failed_pos)
     else {
         panic!("expected StepFailed event at step_failed_pos but got something else");
     };

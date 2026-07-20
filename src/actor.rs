@@ -1539,23 +1539,21 @@ fn redrive_executing_sessions(
             emit_run_error(subscribers, &run_id, e);
             continue;
         }
+        // Emit CrashRecoveryRedrive before dispatch so the UI sees it before UnitDispatched
+        // (which dispatch_unit emits internally). Guard: only emit when a unit exists at the
+        // cursor — if not, the run is completing normally and no redrive badge should appear.
+        if let Some(unit) = units.get(sess.unit_ix) {
+            emit(
+                subscribers,
+                CoreEvent::CrashRecoveryRedrive {
+                    session: run_id.clone(),
+                    ord: unit.ord,
+                    attempt: sess.attempt,
+                },
+            );
+        }
         match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
             Ok(true) => {
-                // Emit the redrive event only when a unit is actually being re-dispatched
-                // (dispatch returns true). When it returns false there is no unit at the cursor
-                // (all remaining units are Done) — emitting a CrashRecoveryRedrive with a
-                // fabricated ord=0 would mislead the UI into showing a redrive badge on a run
-                // that is actually completing normally. See Copilot finding on PR-1.
-                if let Some(unit) = units.get(sess.unit_ix) {
-                    emit(
-                        subscribers,
-                        CoreEvent::CrashRecoveryRedrive {
-                            session: run_id.clone(),
-                            ord: unit.ord,
-                            attempt: sess.attempt,
-                        },
-                    );
-                }
                 in_flight.insert(run_id);
             }
             // No unit at the cursor (every remaining unit is Done) → the run is actually complete.
