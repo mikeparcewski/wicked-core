@@ -157,6 +157,13 @@ pub enum CoreEvent {
     RepoRegistered { repo_ref: String },
     /// The session reached a terminal/awaiting state.
     SessionCompleted { session: String },
+    /// A PTY worker session opened for a run unit (the CLI process is now alive and accepting
+    /// prompts). `terminal_id` matches the `TerminalOpened` id on the terminal event stream.
+    WorkerSessionStarted {
+        session: String,
+        terminal_id: String,
+        cli_key: String,
+    },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {
         session: Option<String>,

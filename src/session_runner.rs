@@ -239,6 +239,18 @@ impl PersistentStepRunner {
                 if final_tid != tid {
                     self.close_terminal(&tid);
                 }
+                let cli_key = input
+                    .unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string());
+                let _ = self
+                    .tx
+                    .send(Command::EmitEvent(CoreEvent::WorkerSessionStarted {
+                        session: run_id.clone(),
+                        terminal_id: final_tid.clone(),
+                        cli_key,
+                    }));
                 final_tid
             }
         };
