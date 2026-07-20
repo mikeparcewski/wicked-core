@@ -242,10 +242,7 @@ pub(crate) enum Command {
     },
     /// Distribution failed (council error or pre-distribute error). The actor arm marks the session
     /// `Failed` and emits a `SessionFailed` event. Sent by the off-actor distribute thread.
-    PlanFailed {
-        run_id: String,
-        error: String,
-    },
+    PlanFailed { run_id: String, error: String },
     /// Stop the actor loop and release the store. Sent automatically when the LAST external `Core`
     /// handle drops (the actor holds its own `self_tx` for worker write-back, so channel-close alone
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but
