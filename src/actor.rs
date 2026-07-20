@@ -590,9 +590,7 @@ pub(crate) fn run(
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     if !matches!(
                         s.status,
-                        SessionStatus::Completed
-                            | SessionStatus::Cancelled
-                            | SessionStatus::Failed
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
                     ) {
                         s.status = SessionStatus::Failed;
                         let _ = put_node(&mut store, s.to_node());
