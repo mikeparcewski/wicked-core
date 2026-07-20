@@ -1764,6 +1764,22 @@ fn apply_step_result(
                 )
             )
         {
+            // (EVT-010) GateEscalated — the verdict was not-pass AND the gate spec says escalate
+            // to human review (not auto-deny). Fires just before AwaitingHuman so the studio can
+            // distinguish a pre-unit gate (HumanConfirm, fires before the unit runs) from a
+            // verdict escalation (HumanConfirmIf, fires after the unit ran and failed the gate).
+            emit(
+                subscribers,
+                CoreEvent::GateEscalated {
+                    session: run_id.clone(),
+                    ord,
+                    condition: "verdict_not_pass".to_string(),
+                    verdict_summary: outcome
+                        .denial_reason
+                        .clone()
+                        .unwrap_or_else(|| "verdict not pass".to_string()),
+                },
+            );
             pause_for_human(
                 store,
                 subscribers,
@@ -2080,6 +2096,18 @@ fn dispatch_unit(
     // Spawn the command off-thread (same actor-safety rule as the agent path), capture
     // stdout+stderr as the transcript, post ApplyStepResult when done.
     if let Some(cmd) = unit.tool_cmd.clone() {
+        // (EVT-011) ToolExecutorDispatched — fires just before the tool command spawns so the
+        // studio can distinguish a tool-path unit from an agent-path unit in the event stream
+        // (both emit UnitExecuting, but only this event carries the actual command).
+        emit(
+            subscribers,
+            CoreEvent::ToolExecutorDispatched {
+                session: run_id.to_string(),
+                ord: unit.ord,
+                cmd: cmd.clone(),
+                workdir: session.workdir.clone(),
+            },
+        );
         let tx = self_tx.clone();
         let run_id2 = run_id.to_string();
         let ord = unit.ord;

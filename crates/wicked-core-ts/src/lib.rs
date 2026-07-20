@@ -414,6 +414,73 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
                 "outputBytes": c.output_bytes,
             })).collect::<Vec<_>>(),
         }),
+        // ── P2 governance-deep wave (EVT-008, EVT-009, EVT-010, EVT-011, EVT-016) ──────────
+        CoreEvent::GovernanceHookFired {
+            session,
+            ord,
+            attempt,
+            tool_name,
+            decision,
+            denying_policy,
+        } => json!({
+            "type": "governanceHookFired",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+            "toolName": tool_name,
+            "decision": decision,
+            "denyingPolicy": denying_policy,
+        }),
+        CoreEvent::ValidationPinAttached {
+            session,
+            ord,
+            pin,
+            criterion,
+        } => json!({
+            "type": "validationPinAttached",
+            "session": session,
+            "ord": ord,
+            "pin": pin,
+            "criterion": criterion,
+        }),
+        CoreEvent::GateEscalated {
+            session,
+            ord,
+            condition,
+            verdict_summary,
+        } => json!({
+            "type": "gateEscalated",
+            "session": session,
+            "ord": ord,
+            "condition": condition,
+            "verdictSummary": verdict_summary,
+        }),
+        CoreEvent::ToolExecutorDispatched {
+            session,
+            ord,
+            cmd,
+            workdir,
+        } => json!({
+            "type": "toolExecutorDispatched",
+            "session": session,
+            "ord": ord,
+            "cmd": cmd,
+            "workdir": workdir,
+        }),
+        CoreEvent::GovernanceContextArmed {
+            session,
+            ord,
+            attempt,
+            path,
+            db_path,
+        } => json!({
+            "type": "governanceContextArmed",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+            "path": path,
+            "dbPath": db_path,
+        }),
         // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
         // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
         // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
@@ -1368,6 +1435,60 @@ mod tests {
             },
             "unitContextInjected",
             &["type", "session", "ord", "recipientCli", "priorUnits"],
+        );
+        // P2 governance-deep wave (EVT-008, EVT-009, EVT-010, EVT-011, EVT-016).
+        check(
+            CoreEvent::GovernanceHookFired {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                tool_name: s(),
+                decision: "allow".to_string(),
+                denying_policy: None,
+            },
+            "governanceHookFired",
+            &["type", "session", "ord", "attempt", "toolName", "decision", "denyingPolicy"],
+        );
+        check(
+            CoreEvent::ValidationPinAttached {
+                session: s(),
+                ord: 1,
+                pin: s(),
+                criterion: s(),
+            },
+            "validationPinAttached",
+            &["type", "session", "ord", "pin", "criterion"],
+        );
+        check(
+            CoreEvent::GateEscalated {
+                session: s(),
+                ord: 1,
+                condition: "verdict_not_pass".to_string(),
+                verdict_summary: s(),
+            },
+            "gateEscalated",
+            &["type", "session", "ord", "condition", "verdictSummary"],
+        );
+        check(
+            CoreEvent::ToolExecutorDispatched {
+                session: s(),
+                ord: 1,
+                cmd: vec!["echo".to_string(), "hello".to_string()],
+                workdir: None,
+            },
+            "toolExecutorDispatched",
+            &["type", "session", "ord", "cmd", "workdir"],
+        );
+        check(
+            CoreEvent::GovernanceContextArmed {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                path: "wrapped_cli".to_string(),
+                db_path: s(),
+            },
+            "governanceContextArmed",
+            &["type", "session", "ord", "attempt", "path", "dbPath"],
         );
     }
 }

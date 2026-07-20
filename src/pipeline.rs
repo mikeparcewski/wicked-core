@@ -304,6 +304,20 @@ pub(crate) fn pre_distribute(
 
     if let Some(def) = &selected_def {
         attach_pinned_validators(store, &mut units, def)?;
+        // (EVT-009) ValidationPinAttached — emit for every unit that received a pinned validator
+        // so the operator can confirm at plan time that the gate is actually armed with the
+        // correct pin and criterion. Emitted AFTER attach succeeds (fail-closed: we never reach
+        // this if the pin is missing from the vault or unapproved).
+        for u in &units {
+            if let Some(v) = &u.validator {
+                emit(CoreEvent::ValidationPinAttached {
+                    session: session_id.to_string(),
+                    ord: u.ord,
+                    pin: crate::validator_vault::pin(v),
+                    criterion: v.criterion.clone(),
+                });
+            }
+        }
     }
 
     let collection_scope = match entity_mode {
@@ -609,6 +623,24 @@ pub(crate) fn apply_and_finish_unit(
     // block HumanConfirmIf routing on hook vetoes (a hook-sourced deny must hard-fail the run, not
     // escalate to human review).
     let hook_denied = hook_denial.is_some();
+
+    // (EVT-008) GovernanceHookFired — replay per-tool-call decisions from the NDJSON log as events.
+    // Only runs for governed units (ungoverned units have no log). Reads the log once more (cheap;
+    // tiny NDJSON files) so fold_input_denial's signature is unchanged. Emits one event per claim
+    // entry for this unit's phase, in log order.
+    if governed {
+        let phase = crate::scope::unit_phase(unit.ord);
+        for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+            emit(CoreEvent::GovernanceHookFired {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                tool_name: rec.tool_name,
+                decision: rec.decision,
+                denying_policy: rec.denying_policy,
+            });
+        }
+    }
 
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
     let validator_denial = det_denial

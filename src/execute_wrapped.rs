@@ -218,6 +218,10 @@ pub(crate) fn inject_claude_stream_flags(argv: &mut Vec<String>) {
 pub struct WrappedCliStepRunner {
     /// Per-unit wall-clock bound. A CLI exceeding it is killed and the step reports `Cancelled`.
     timeout: Duration,
+    /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`). `None` for
+    /// the `Default` path (no-tx contexts such as standalone tests); `Some` when constructed via
+    /// [`WrappedCliStepRunner::with_tx`] (the actor path, seeded from `AcpStepRunner::new`).
+    tx: Option<std::sync::mpsc::Sender<crate::command::Command>>,
 }
 
 impl Default for WrappedCliStepRunner {
@@ -230,6 +234,29 @@ impl Default for WrappedCliStepRunner {
             .unwrap_or(7200);
         WrappedCliStepRunner {
             timeout: Duration::from_secs(secs),
+            tx: None,
+        }
+    }
+}
+
+impl WrappedCliStepRunner {
+    /// Construct with a back-channel to the actor so the runner can relay events via
+    /// `Command::EmitEvent`. Used by `AcpStepRunner::new` to give the fallback runner a tx.
+    pub(crate) fn with_tx(tx: std::sync::mpsc::Sender<crate::command::Command>) -> Self {
+        let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(7200);
+        WrappedCliStepRunner {
+            timeout: Duration::from_secs(secs),
+            tx: Some(tx),
+        }
+    }
+
+    /// Relay a [`CoreEvent`] through the actor's single emit point. No-op when no tx was set.
+    fn emit_event(&self, ev: crate::event::CoreEvent) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(crate::command::Command::EmitEvent(ev));
         }
     }
 }
@@ -282,7 +309,19 @@ impl WrappedCliStepRunner {
         // Non-claude CLIs + ungoverned internal calls (`governance: None`) are untouched.
         let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
             (Some(gov), true) => match arm_input_governance(input, gov, &mut argv) {
-                Ok(env) => Some(env),
+                Ok(env) => {
+                    // (EVT-016) GovernanceContextArmed — wrapped-CLI path successfully armed
+                    // governance. Fires before the subprocess starts so the operator can confirm
+                    // governance is ON for this unit (distinct from GateEvaluated's signals).
+                    self.emit_event(crate::event::CoreEvent::GovernanceContextArmed {
+                        session: input.run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        path: "wrapped_cli".to_string(),
+                        db_path: gov.db_path.clone(),
+                    });
+                    Some(env)
+                }
                 // A governed unit whose governance cannot be armed must NOT run ungoverned — fail it.
                 Err(e) => {
                     return StepOutput {
