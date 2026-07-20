@@ -111,7 +111,8 @@ fn drain_until_terminal(
                     break;
                 }
             }
-            Err(_) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
         }
     }
     collected

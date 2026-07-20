@@ -104,16 +104,67 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
     use serde_json::json;
     match ev {
         CoreEvent::Heartbeat => json!({ "type": "heartbeat" }),
-        CoreEvent::SessionStarted { session, problem } => {
-            json!({ "type": "sessionStarted", "session": session, "problem": problem })
+        CoreEvent::SessionStarted {
+            session,
+            problem,
+            workflow_id,
+            cli_count,
+            governed,
+            entity_mode,
+        } => {
+            json!({
+                "type": "sessionStarted",
+                "session": session,
+                "problem": problem,
+                "workflowId": workflow_id,
+                "cliCount": cli_count,
+                "governed": governed,
+                "entityMode": entity_mode,
+            })
         }
         CoreEvent::UnitPlanned {
             session,
             ord,
             description,
-        } => json!({ "type": "unitPlanned", "session": session, "ord": ord, "description": description }),
-        CoreEvent::UnitDistributed { session, ord, cli } => {
-            json!({ "type": "unitDistributed", "session": session, "ord": ord, "cli": cli })
+            stage,
+            role,
+            gate,
+            skill_ref,
+            has_validator_pin,
+            executor_type,
+        } => json!({
+            "type": "unitPlanned",
+            "session": session,
+            "ord": ord,
+            "description": description,
+            "stage": stage,
+            "role": role,
+            "gate": gate,
+            "skillRef": skill_ref,
+            "hasValidatorPin": has_validator_pin,
+            "executorType": executor_type,
+        }),
+        CoreEvent::UnitDistributed {
+            session,
+            ord,
+            cli,
+            routing_method,
+            agreement_pct,
+            returned,
+            dissent,
+            degraded_reason,
+        } => {
+            json!({
+                "type": "unitDistributed",
+                "session": session,
+                "ord": ord,
+                "cli": cli,
+                "routingMethod": routing_method,
+                "agreementPct": agreement_pct,
+                "returned": returned,
+                "dissent": dissent,
+                "degradedReason": degraded_reason,
+            })
         }
         CoreEvent::UnitExecuting { session, ord } => {
             json!({ "type": "unitExecuting", "session": session, "ord": ord })
@@ -909,19 +960,45 @@ mod tests {
         let s = || "s".to_string();
         check(CoreEvent::Heartbeat, "heartbeat", &["type"]);
         check(
-            CoreEvent::SessionStarted { session: s(), problem: s() },
+            CoreEvent::SessionStarted {
+                session: s(),
+                problem: s(),
+                workflow_id: None,
+                cli_count: 1,
+                governed: false,
+                entity_mode: s(),
+            },
             "sessionStarted",
-            &["type", "session", "problem"],
+            &["type", "session", "problem", "workflowId", "cliCount", "governed", "entityMode"],
         );
         check(
-            CoreEvent::UnitPlanned { session: s(), ord: 1, description: s() },
+            CoreEvent::UnitPlanned {
+                session: s(),
+                ord: 1,
+                description: s(),
+                stage: s(),
+                role: s(),
+                gate: s(),
+                skill_ref: None,
+                has_validator_pin: false,
+                executor_type: s(),
+            },
             "unitPlanned",
-            &["type", "session", "ord", "description"],
+            &["type", "session", "ord", "description", "stage", "role", "gate", "skillRef", "hasValidatorPin", "executorType"],
         );
         check(
-            CoreEvent::UnitDistributed { session: s(), ord: 1, cli: s() },
+            CoreEvent::UnitDistributed {
+                session: s(),
+                ord: 1,
+                cli: s(),
+                routing_method: s(),
+                agreement_pct: None,
+                returned: None,
+                dissent: None,
+                degraded_reason: None,
+            },
             "unitDistributed",
-            &["type", "session", "ord", "cli"],
+            &["type", "session", "ord", "cli", "routingMethod", "agreementPct", "returned", "dissent", "degradedReason"],
         );
         check(
             CoreEvent::UnitExecuting { session: s(), ord: 1 },
