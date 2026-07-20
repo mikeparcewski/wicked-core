@@ -578,14 +578,18 @@ pub(crate) fn run(
                 };
                 if already_terminal {
                     in_flight.remove(&run_id);
-                    // Use remove_worktree (git worktree remove --force) to clean up both
-                    // the directory and the git worktree metadata entry.
+                    // Spawn cleanup off the actor thread — git worktree remove can be slow
+                    // and must not stall NAPI calls waiting on the actor.
                     if let Some(ref ref_id) = repo_ref {
                         if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
-                            crate::repo::remove_worktree(&repo.root_path, &run_id);
+                            let root = repo.root_path.clone();
+                            let rid = run_id.clone();
+                            std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
                         }
-                    } else if let Some(ref path) = workdir {
-                        let _ = std::fs::remove_dir_all(path);
+                    } else if let Some(path) = workdir {
+                        std::thread::spawn(move || {
+                            let _ = std::fs::remove_dir_all(path);
+                        });
                     }
                     continue; // Stay in the actor loop — do NOT return/kill the actor.
                 }
@@ -597,10 +601,17 @@ pub(crate) fn run(
                         in_flight.remove(&run_id);
                         if let Some(ref ref_id) = repo_ref {
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
-                                crate::repo::remove_worktree(&repo.root_path, &run_id);
+                                let root = repo.root_path.clone();
+                                let rid = run_id.clone();
+                                std::thread::spawn(move || {
+                                    crate::repo::remove_worktree(&root, &rid)
+                                });
                             }
                         } else if let Some(ref path) = workdir {
-                            let _ = std::fs::remove_dir_all(path);
+                            let p = path.clone();
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_dir_all(p);
+                            });
                         }
                         emit_run_error(
                             &mut subscribers,
@@ -628,10 +639,17 @@ pub(crate) fn run(
                         in_flight.remove(&run_id);
                         if let Some(ref ref_id) = repo_ref {
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
-                                crate::repo::remove_worktree(&repo.root_path, &run_id);
+                                let root = repo.root_path.clone();
+                                let rid = run_id.clone();
+                                std::thread::spawn(move || {
+                                    crate::repo::remove_worktree(&root, &rid)
+                                });
                             }
                         } else if let Some(ref path) = workdir {
-                            let _ = std::fs::remove_dir_all(path);
+                            let p = path.clone();
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_dir_all(p);
+                            });
                         }
                         if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                             s.status = SessionStatus::Failed;
@@ -673,10 +691,12 @@ pub(crate) fn run(
                 in_flight.remove(&run_id);
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     // Best-effort: prune any stale git worktree metadata left by a partial
-                    // `git worktree add` (git usually self-cleans on failure, but prune anyway).
+                    // `git worktree add`. Spawned off the actor thread — git can be slow.
                     if let Some(ref ref_id) = s.repo_ref {
                         if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
-                            crate::repo::remove_worktree(&repo.root_path, &run_id);
+                            let root = repo.root_path.clone();
+                            let rid = run_id.clone();
+                            std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
                         }
                     }
                     if !matches!(
