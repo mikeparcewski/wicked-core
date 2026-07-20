@@ -38,6 +38,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::command::Command;
+use crate::event::CoreEvent;
 use crate::execute_wrapped::{skill_prompt, WrappedCliStepRunner};
 use crate::workflow::{
     DeltaSink, GovernanceContext, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus,
@@ -556,7 +558,17 @@ type SessionMap = Arc<Mutex<HashMap<(String, String), Option<Arc<Mutex<AcpProces
 ///
 /// All fallbacks prepend a `[wicked-core] ACP …` warning to `StepOutput.output` so
 /// the degradation is visible in both streaming output and persisted logs.
+/// Stable `fallback_kind` slugs carried on [`CoreEvent::AcpFallback`] for UI dispatch.
+pub(crate) mod fallback_kind {
+    pub const BINARY_UNAVAILABLE: &str = "binary_unavailable";
+    pub const HANDSHAKE_FAILED: &str = "handshake_failed";
+    pub const SESSION_DIED: &str = "session_died";
+    pub const HTTP_UNIMPLEMENTED: &str = "http_unimplemented";
+}
+
 pub struct AcpStepRunner {
+    /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`).
+    tx: std::sync::mpsc::Sender<Command>,
     /// Keyed by `(run_id, cli_key)` — one process per CLI per run.
     sessions: SessionMap,
     fallback: WrappedCliStepRunner,
@@ -564,16 +576,21 @@ pub struct AcpStepRunner {
 }
 
 impl AcpStepRunner {
-    pub fn new() -> Self {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<Command>) -> Self {
         let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(7200);
         Self {
+            tx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             fallback: WrappedCliStepRunner::default(),
             timeout: Duration::from_secs(secs),
         }
+    }
+
+    fn emit_event(&self, ev: CoreEvent) {
+        let _ = self.tx.send(Command::EmitEvent(ev));
     }
 
     /// Close all ACP sessions for `run_id` and kill their child processes. Idempotent.
@@ -647,15 +664,17 @@ impl AcpStepRunner {
             let mut proc = match start_acp_process(&acp_config, &cwd, Some(&gov_armed)) {
                 Ok(p) => p,
                 Err(e) => {
-                    return fallback_with_warning(
-                        format!(
-                            "[wicked-core] ACP governance session unavailable for '{cli_key}' \
-                             ({e}); using single-shot fallback"
-                        ),
-                        input,
-                        emit,
-                        &self.fallback,
+                    let reason = format!(
+                        "[wicked-core] ACP governance session unavailable for '{cli_key}' \
+                         ({e}); using single-shot fallback"
                     );
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::HANDSHAKE_FAILED.to_string(),
+                    });
+                    return fallback_with_warning(reason, input, emit, &self.fallback);
                 }
             };
 
@@ -686,27 +705,31 @@ impl AcpStepRunner {
                 // governance on its own — unit is still governed via the fallback path.
                 Ok(_) => {
                     drop(proc);
-                    fallback_with_warning(
-                        format!(
-                            "[wicked-core] ACP governance session exited for '{cli_key}'; \
-                             using single-shot fallback"
-                        ),
-                        input,
-                        emit,
-                        &self.fallback,
-                    )
+                    let reason = format!(
+                        "[wicked-core] ACP governance session exited for '{cli_key}'; \
+                         using single-shot fallback"
+                    );
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::SESSION_DIED.to_string(),
+                    });
+                    fallback_with_warning(reason, input, emit, &self.fallback)
                 }
                 Err(e) => {
                     drop(proc);
-                    fallback_with_warning(
-                        format!(
-                            "[wicked-core] ACP governance error for '{cli_key}' ({e}); \
-                             using single-shot fallback"
-                        ),
-                        input,
-                        emit,
-                        &self.fallback,
-                    )
+                    let reason = format!(
+                        "[wicked-core] ACP governance error for '{cli_key}' ({e}); \
+                         using single-shot fallback"
+                    );
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::SESSION_DIED.to_string(),
+                    });
+                    fallback_with_warning(reason, input, emit, &self.fallback)
                 }
             };
         }
@@ -718,15 +741,17 @@ impl AcpStepRunner {
         };
 
         if acp_config.transport == AcpTransport::Http {
-            return fallback_with_warning(
-                format!(
-                    "[wicked-core] ACP HTTP transport not yet implemented for '{cli_key}'; \
-                     using single-shot fallback"
-                ),
-                input,
-                emit,
-                &self.fallback,
+            let reason = format!(
+                "[wicked-core] ACP HTTP transport not yet implemented for '{cli_key}'; \
+                 using single-shot fallback"
             );
+            self.emit_event(CoreEvent::AcpFallback {
+                session: run_id.clone(),
+                cli_key: cli_key.clone(),
+                reason: reason.clone(),
+                fallback_kind: fallback_kind::HTTP_UNIMPLEMENTED.to_string(),
+            });
+            return fallback_with_warning(reason, input, emit, &self.fallback);
         }
 
         // Lazily open a session for (run_id, cli_key). The global map lock is held only
@@ -740,6 +765,7 @@ impl AcpStepRunner {
                 match slot {
                     Some(arc) => arc.clone(),
                     None => {
+                        drop(guard); // release sessions lock before the blocking fallback call
                         return self.fallback.run_unit_streaming(input, emit);
                     }
                 }
@@ -751,23 +777,43 @@ impl AcpStepRunner {
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 match start_acp_process(&acp_config, &cwd, None) {
                     Ok(proc) => {
+                        let acp_session_id = proc.session_id.clone();
                         let arc = Arc::new(Mutex::new(proc));
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                        guard
-                            .entry(session_key.clone())
-                            .or_insert(Some(arc.clone()))
-                            .as_ref()
-                            .unwrap()
-                            .clone()
+                        use std::collections::hash_map::Entry;
+                        let (result, did_insert) = match guard.entry(session_key.clone()) {
+                            Entry::Vacant(v) => {
+                                let slot = v.insert(Some(arc.clone()));
+                                (slot.as_ref().unwrap().clone(), true)
+                            }
+                            Entry::Occupied(o) => (o.into_mut().as_ref().unwrap().clone(), false),
+                        };
+                        drop(guard);
+                        if did_insert {
+                            self.emit_event(CoreEvent::AcpSessionStarted {
+                                session: run_id.clone(),
+                                cli_key: cli_key.clone(),
+                                acp_session_id,
+                            });
+                        }
+                        result
                     }
                     Err(e) => {
-                        let warning = format!(
+                        let reason = format!(
                             "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
                              using single-shot fallback"
                         );
-                        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                        guard.entry(session_key.clone()).or_insert(None);
-                        return fallback_with_warning(warning, input, emit, &self.fallback);
+                        {
+                            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                            guard.entry(session_key.clone()).or_insert(None);
+                        } // release sessions lock before the blocking fallback call
+                        self.emit_event(CoreEvent::AcpFallback {
+                            session: run_id.clone(),
+                            cli_key: cli_key.clone(),
+                            reason: reason.clone(),
+                            fallback_kind: fallback_kind::BINARY_UNAVAILABLE.to_string(),
+                        });
+                        return fallback_with_warning(reason, input, emit, &self.fallback);
                     }
                 }
             }
@@ -806,28 +852,32 @@ impl AcpStepRunner {
             Ok(_) => {
                 drop(proc);
                 self.drop_session(&run_id);
-                fallback_with_warning(
-                    format!(
-                        "[wicked-core] ACP session exited for '{cli_key}'; \
-                         using single-shot fallback"
-                    ),
-                    input,
-                    emit,
-                    &self.fallback,
-                )
+                let reason = format!(
+                    "[wicked-core] ACP session exited for '{cli_key}'; \
+                     using single-shot fallback"
+                );
+                self.emit_event(CoreEvent::AcpFallback {
+                    session: run_id.clone(),
+                    cli_key: cli_key.clone(),
+                    reason: reason.clone(),
+                    fallback_kind: fallback_kind::SESSION_DIED.to_string(),
+                });
+                fallback_with_warning(reason, input, emit, &self.fallback)
             }
             Err(e) => {
                 drop(proc);
                 self.drop_session(&run_id);
-                fallback_with_warning(
-                    format!(
-                        "[wicked-core] ACP error for '{cli_key}' ({e}); \
-                         using single-shot fallback"
-                    ),
-                    input,
-                    emit,
-                    &self.fallback,
-                )
+                let reason = format!(
+                    "[wicked-core] ACP error for '{cli_key}' ({e}); \
+                     using single-shot fallback"
+                );
+                self.emit_event(CoreEvent::AcpFallback {
+                    session: run_id.clone(),
+                    cli_key: cli_key.clone(),
+                    reason: reason.clone(),
+                    fallback_kind: fallback_kind::SESSION_DIED.to_string(),
+                });
+                fallback_with_warning(reason, input, emit, &self.fallback)
             }
         }
     }
@@ -835,7 +885,8 @@ impl AcpStepRunner {
 
 impl Default for AcpStepRunner {
     fn default() -> Self {
-        Self::new()
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Self::new(tx)
     }
 }
 

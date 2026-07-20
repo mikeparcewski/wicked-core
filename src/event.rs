@@ -165,6 +165,22 @@ pub enum CoreEvent {
         terminal_id: String,
         cli_key: String,
     },
+    /// An ACP (Agent Client Protocol) persistent session opened for a `(run_id, cli_key)` pair.
+    /// `acp_session_id` is the session identifier the ACP binary assigned during the handshake.
+    AcpSessionStarted {
+        session: String,
+        cli_key: String,
+        acp_session_id: String,
+    },
+    /// The ACP runner fell back to single-shot wrapped-CLI execution for this unit.
+    /// `reason` is the human-readable warning already prepended to step output; `fallback_kind`
+    /// is a stable slug for UI dispatch (see acp_runner constants).
+    AcpFallback {
+        session: String,
+        cli_key: String,
+        reason: String,
+        fallback_kind: String,
+    },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {
         session: Option<String>,
