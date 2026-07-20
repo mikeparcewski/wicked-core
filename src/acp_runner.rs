@@ -799,8 +799,7 @@ impl AcpStepRunner {
                              using single-shot fallback"
                         );
                         {
-                            let mut guard =
-                                self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                             guard.entry(session_key.clone()).or_insert(None);
                         } // release sessions lock before the blocking fallback call
                         self.emit_event(CoreEvent::AcpFallback {
