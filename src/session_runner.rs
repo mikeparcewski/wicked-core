@@ -237,7 +237,23 @@ impl PersistentStepRunner {
                     entry.terminal_id.clone()
                 };
                 if final_tid != tid {
+                    // Lost the race — another thread already inserted for this run_id.
+                    // Close our duplicate and don't emit: the winner already emitted or will.
                     self.close_terminal(&tid);
+                } else {
+                    let cli_key = input
+                        .unit
+                        .assigned_cli
+                        .as_deref()
+                        .unwrap_or("claude")
+                        .to_string();
+                    let _ = self
+                        .tx
+                        .send(Command::EmitEvent(CoreEvent::WorkerSessionStarted {
+                            session: run_id.clone(),
+                            terminal_id: tid, // final_tid == tid; move instead of clone
+                            cli_key,
+                        }));
                 }
                 final_tid
             }

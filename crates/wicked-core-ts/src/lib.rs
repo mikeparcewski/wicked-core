@@ -345,6 +345,16 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "ord": ord,
             "attempt": attempt,
         }),
+        CoreEvent::WorkerSessionStarted {
+            session,
+            terminal_id,
+            cli_key,
+        } => json!({
+            "type": "workerSessionStarted",
+            "session": session,
+            "terminalId": terminal_id,
+            "cliKey": cli_key,
+        }),
         // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
         // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
         // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
@@ -1238,6 +1248,15 @@ mod tests {
             CoreEvent::CrashRecoveryRedrive { session: s(), ord: 1, attempt: 1 },
             "crashRecoveryRedrive",
             &["type", "session", "ord", "attempt"],
+        );
+        check(
+            CoreEvent::WorkerSessionStarted {
+                session: s(),
+                terminal_id: s(),
+                cli_key: s(),
+            },
+            "workerSessionStarted",
+            &["type", "session", "terminalId", "cliKey"],
         );
     }
 }

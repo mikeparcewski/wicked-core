@@ -947,6 +947,9 @@ pub(crate) fn run(
                     },
                 );
             }
+            Command::EmitEvent(ev) => {
+                emit(&mut subscribers, ev);
+            }
             Command::CaptureMemory {
                 content,
                 scope,
