@@ -1539,6 +1539,15 @@ fn redrive_executing_sessions(
             emit_run_error(subscribers, &run_id, e);
             continue;
         }
+        let redrive_ord = units.get(sess.unit_ix).map(|u| u.ord).unwrap_or(0);
+        emit(
+            subscribers,
+            CoreEvent::CrashRecoveryRedrive {
+                session: run_id.clone(),
+                ord: redrive_ord,
+                attempt: sess.attempt,
+            },
+        );
         match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
             Ok(true) => {
                 in_flight.insert(run_id);
@@ -1669,6 +1678,16 @@ fn apply_step_result(
             format!("Worker FAILED on unit {ord}: {snippet}")
         });
         put_node(store, unit.to_node())?;
+        emit(
+            subscribers,
+            CoreEvent::StepFailed {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                detail: unit.denial_reason.clone().unwrap_or_default(),
+                failure_kind: crate::event::StepFailureKind::WorkerError,
+            },
+        );
         // Best-effort: conform any governed Deny claims that arrived before the worker crashed.
         // Without this the decisions log is never read for a failed unit and the deny evidence
         // is lost — fold_input_denial only runs inside apply_and_finish_unit, which we never reach
