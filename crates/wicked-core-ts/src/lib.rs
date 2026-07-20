@@ -52,8 +52,8 @@ const EVENT_QUEUE_BOUND: usize = 1024;
 use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
 use wicked_core::{
-    CoreEvent, EntityMode, HumanConfirm, HumanDecision, InjectedContext, LaunchSpec, RepoSpec,
-    SessionStatus, StepFailureKind, StubStepRunner,
+    CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus,
+    StepFailureKind, StubStepRunner,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────

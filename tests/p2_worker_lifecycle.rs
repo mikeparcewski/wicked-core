@@ -22,7 +22,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("wicked-core-p2wl-{}-{}", std::process::id(), seq));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("estate.db").to_str().unwrap().to_string()
+        dir.join("estate.db").to_string_lossy().into_owned()
     }
 
     /// Fake interactive CLI script: reads one line per turn, emits the minimum NDJSON that
@@ -278,10 +278,14 @@ mod tests {
             out1.output
         );
 
-        // Give the one-shot CLI process time to fully exit so the PTY slave is closed.
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait for the TerminalExited event: this tells us the one-shot CLI's PTY process has
+        // fully exited and the slave side is closed, so the next write will deterministically
+        // fail with EIO rather than relying on a fixed sleep.
+        wait_for(&events, "TerminalExited after one-shot CLI", |e| {
+            matches!(e, CoreEvent::TerminalExited { .. })
+        });
 
-        // Clear buffered events from turn 1 (e.g. WorkerSessionStarted, TerminalOutput).
+        // Clear any remaining buffered events from turn 1.
         let _ = drain_buffered(&events);
 
         // Turn 2 — PTY write fails because the CLI has exited.
