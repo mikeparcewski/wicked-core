@@ -244,13 +244,14 @@ impl PersistentStepRunner {
                     let cli_key = input
                         .unit
                         .assigned_cli
-                        .clone()
-                        .unwrap_or_else(|| "claude".to_string());
+                        .as_deref()
+                        .unwrap_or("claude")
+                        .to_string();
                     let _ = self
                         .tx
                         .send(Command::EmitEvent(CoreEvent::WorkerSessionStarted {
                             session: run_id.clone(),
-                            terminal_id: final_tid.clone(),
+                            terminal_id: tid, // final_tid == tid; move instead of clone
                             cli_key,
                         }));
                 }
