@@ -178,11 +178,8 @@ impl Core {
     /// every `Core` handle is dropped. Tests use [`Core::spawn_with_engine`] to inject a stub
     /// runner instead.
     pub fn spawn(path: impl Into<String>) -> Core {
-        Core::spawn_with_engine(
-            path,
-            distribute::real_dispatcher(),
-            std::sync::Arc::new(acp_runner::AcpStepRunner::new()),
-        )
+        let (core, _runner) = Core::spawn_with_acp_sessions(path);
+        core
     }
 
     /// Spawn the store actor with INJECTED engine seams — the council `dispatcher` (vote collection)
@@ -257,8 +254,29 @@ impl Core {
     pub fn spawn_with_acp_sessions(
         path: impl Into<String>,
     ) -> (Core, std::sync::Arc<AcpStepRunner>) {
-        let runner = std::sync::Arc::new(AcpStepRunner::new());
-        let core = Core::spawn_inner(path, distribute::real_dispatcher(), runner.clone(), None);
+        let (tx, rx) = channel();
+        let path = path.into();
+        let self_tx = tx.clone();
+        let pty = terminal::new_map();
+        let pty_actor = pty.clone();
+        let runner = std::sync::Arc::new(AcpStepRunner::new(tx.clone()));
+        let runner_actor = runner.clone();
+        std::thread::spawn(move || {
+            actor::run(
+                path,
+                rx,
+                self_tx,
+                distribute::real_dispatcher(),
+                runner_actor,
+                pty_actor,
+                None,
+            )
+        });
+        let core = Core {
+            tx: tx.clone(),
+            pty,
+            _shutdown: Arc::new(ShutdownGuard { tx }),
+        };
         (core, runner)
     }
 
