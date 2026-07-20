@@ -52,8 +52,8 @@ const EVENT_QUEUE_BOUND: usize = 1024;
 use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
 use wicked_core::{
-    CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus,
-    StepFailureKind, StubStepRunner,
+    CoreEvent, EntityMode, HumanConfirm, HumanDecision, InjectedContext, LaunchSpec, RepoSpec,
+    SessionStatus, StepFailureKind, StubStepRunner,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -376,6 +376,43 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "cliKey": cli_key,
             "reason": reason,
             "fallbackKind": fallback_kind,
+        }),
+        // P2 observability events — worker-lifecycle wave (EVT-003, EVT-004, EVT-007).
+        CoreEvent::WorkerSessionReused {
+            session,
+            terminal_id,
+            ord,
+        } => json!({
+            "type": "workerSessionReused",
+            "session": session,
+            "terminalId": terminal_id,
+            "ord": ord,
+        }),
+        CoreEvent::WorkerSessionClosed {
+            session,
+            terminal_id,
+            reason,
+        } => json!({
+            "type": "workerSessionClosed",
+            "session": session,
+            "terminalId": terminal_id,
+            "reason": reason,
+        }),
+        CoreEvent::UnitContextInjected {
+            session,
+            ord,
+            recipient_cli,
+            prior_units,
+        } => json!({
+            "type": "unitContextInjected",
+            "session": session,
+            "ord": ord,
+            "recipientCli": recipient_cli,
+            "priorUnits": prior_units.iter().map(|c| json!({
+                "ord": c.ord,
+                "label": c.label,
+                "outputBytes": c.output_bytes,
+            })).collect::<Vec<_>>(),
         }),
         // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
         // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
@@ -1298,6 +1335,39 @@ mod tests {
             },
             "acpFallback",
             &["type", "session", "cliKey", "reason", "fallbackKind"],
+        );
+        // P2 observability events — worker-lifecycle wave (EVT-003, EVT-004, EVT-007).
+        check(
+            CoreEvent::WorkerSessionReused {
+                session: s(),
+                terminal_id: s(),
+                ord: 2,
+            },
+            "workerSessionReused",
+            &["type", "session", "terminalId", "ord"],
+        );
+        check(
+            CoreEvent::WorkerSessionClosed {
+                session: s(),
+                terminal_id: s(),
+                reason: s(),
+            },
+            "workerSessionClosed",
+            &["type", "session", "terminalId", "reason"],
+        );
+        check(
+            CoreEvent::UnitContextInjected {
+                session: s(),
+                ord: 2,
+                recipient_cli: s(),
+                prior_units: vec![wicked_core::InjectedContext {
+                    ord: 1,
+                    label: s(),
+                    output_bytes: 42,
+                }],
+            },
+            "unitContextInjected",
+            &["type", "session", "ord", "recipientCli", "priorUnits"],
         );
     }
 }

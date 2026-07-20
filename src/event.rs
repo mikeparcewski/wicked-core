@@ -10,6 +10,18 @@ pub enum StepFailureKind {
     WorkerError,
 }
 
+/// One prior unit whose output was injected into a receiving unit's ACP context (EVT-007).
+/// Content is intentionally absent — only identity and size are carried to avoid doubling volume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InjectedContext {
+    /// The prior unit's ord.
+    pub ord: u32,
+    /// The CLI label used in the prompt block (e.g. `"[codex — unit 2]"`).
+    pub label: String,
+    /// Byte length of the injected output (for size debugging; not the content itself).
+    pub output_bytes: usize,
+}
+
 /// An event emitted by the core runtime as work progresses. Cheap to clone (fanned out to every
 /// subscriber). The taxonomy mirrors the plan → distribute → execute → evidence pipeline; P1 emits
 /// only `Heartbeat` (the rest land when the pipeline is lifted in P2).
@@ -180,6 +192,40 @@ pub enum CoreEvent {
         cli_key: String,
         reason: String,
         fallback_kind: String,
+    },
+    /// (EVT-003) A PTY-based persistent worker session is being REUSED for a subsequent unit
+    /// in the same run — the session was already open and the prompt will be written into it.
+    /// Fires before the prompt write. Confirms the prompt-cache sharing invariant; absence for a
+    /// multi-unit run means every unit paid cold-start cost.
+    WorkerSessionReused {
+        session: String,
+        /// The existing PTY terminal id being reused.
+        terminal_id: String,
+        /// The unit ord this prompt is being submitted for.
+        ord: u32,
+    },
+    /// (EVT-004) A PTY-based persistent worker session was explicitly closed. `reason` is
+    /// `"run_complete"` (normal end-of-run teardown via `on_run_complete`) or `"error"` (the PTY
+    /// write failed and the stale session is being dropped). Paired with `WorkerSessionStarted`
+    /// and `WorkerSessionReused` to form the full session lifecycle.
+    WorkerSessionClosed {
+        session: String,
+        /// The PTY terminal id that was closed.
+        terminal_id: String,
+        /// Why the session was closed: `"run_complete"` or `"error"`.
+        reason: String,
+    },
+    /// (EVT-007) One or more cross-CLI prior unit outputs were injected into the current unit's
+    /// ACP context before dispatch (the multi-CLI Tutti-inspired context sharing path). Only fires
+    /// when `prior_units` is non-empty. Fires before `UnitExecuting` for the receiving unit.
+    UnitContextInjected {
+        session: String,
+        /// The unit receiving the injected context.
+        ord: u32,
+        /// The CLI key of the receiving unit.
+        recipient_cli: String,
+        /// The prior units whose outputs were injected (by ord + label + byte size).
+        prior_units: Vec<InjectedContext>,
     },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {

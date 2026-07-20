@@ -2023,7 +2023,9 @@ fn dispatch_unit(
     // worker holds no store handle (single-writer invariant). Empty for single-CLI runs.
     // Reuses `units` already fetched above — no second store read.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
-    let prior_outputs: Vec<PriorUnitOutput> = units
+    // Collect (PriorUnitOutput, ord, output_bytes) so EVT-007 can be emitted without a second
+    // store read — the event carries identity + size but not the raw content.
+    let prior_with_meta: Vec<(PriorUnitOutput, u32, usize)> = units
         .iter()
         .filter(|u| {
             u.ord < unit.ord && u.assigned_cli.as_deref().unwrap_or("claude") != current_cli
@@ -2031,12 +2033,34 @@ fn dispatch_unit(
         .filter_map(|u| {
             let output = crate::domain::get_work_output(store, &u.id)?;
             let cli = u.assigned_cli.as_deref().unwrap_or("claude");
-            Some(PriorUnitOutput {
-                label: format!("[{cli} — unit {}]", u.ord),
-                output,
-            })
+            let label = format!("[{cli} — unit {}]", u.ord);
+            let output_bytes = output.len();
+            Some((PriorUnitOutput { label, output }, u.ord, output_bytes))
         })
         .collect();
+    // (EVT-007) Emit UnitContextInjected when prior cross-CLI outputs are being injected.
+    // Only fires for multi-CLI runs where earlier units on a different CLI have completed.
+    if !prior_with_meta.is_empty() {
+        let prior_units = prior_with_meta
+            .iter()
+            .map(|(pu, ord, bytes)| crate::event::InjectedContext {
+                ord: *ord,
+                label: pu.label.clone(),
+                output_bytes: *bytes,
+            })
+            .collect();
+        emit(
+            subscribers,
+            CoreEvent::UnitContextInjected {
+                session: run_id.to_string(),
+                ord: unit.ord,
+                recipient_cli: current_cli.to_string(),
+                prior_units,
+            },
+        );
+    }
+    let prior_outputs: Vec<PriorUnitOutput> =
+        prior_with_meta.into_iter().map(|(pu, _, _)| pu).collect();
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
