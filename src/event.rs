@@ -31,7 +31,7 @@ pub enum CoreEvent {
         has_validator_pin: bool,
         executor_type: String,
     },
-    /// The council assigned a CLI to a unit.
+    /// A CLI was assigned to a unit (council, degraded fallback, or tool executor).
     UnitDistributed {
         session: String,
         ord: u32,
