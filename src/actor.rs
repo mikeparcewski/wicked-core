@@ -591,7 +591,24 @@ pub(crate) fn run(
                 }
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     s.workdir = workdir.clone();
-                    let _ = put_node(&mut store, s.to_node());
+                    if let Err(e) = put_node(&mut store, s.to_node()) {
+                        // Store write failure — cannot persist workdir; fail the session rather
+                        // than proceeding with an inconsistent store state.
+                        in_flight.remove(&run_id);
+                        if let Some(ref ref_id) = repo_ref {
+                            if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
+                                crate::repo::remove_worktree(&repo.root_path, &run_id);
+                            }
+                        } else if let Some(ref path) = workdir {
+                            let _ = std::fs::remove_dir_all(path);
+                        }
+                        emit_run_error(
+                            &mut subscribers,
+                            &run_id,
+                            anyhow::anyhow!("failed to persist workdir: {e}"),
+                        );
+                        continue;
+                    }
                 }
                 match pipeline::pre_distribute(
                     &mut store,
