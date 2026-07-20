@@ -11,18 +11,36 @@ pub enum CoreEvent {
     /// Liveness tick (also the P1 proof that subscribe→emit works end to end).
     Heartbeat,
     /// A session was created and planning began.
-    SessionStarted { session: String, problem: String },
+    SessionStarted {
+        session: String,
+        problem: String,
+        workflow_id: Option<String>,
+        cli_count: u32,
+        governed: bool,
+        entity_mode: String,
+    },
     /// A work unit was planned (one per decomposed piece).
     UnitPlanned {
         session: String,
         ord: u32,
         description: String,
+        stage: String,
+        role: String,
+        gate: String,
+        skill_ref: Option<String>,
+        has_validator_pin: bool,
+        executor_type: String,
     },
     /// The council assigned a CLI to a unit.
     UnitDistributed {
         session: String,
         ord: u32,
         cli: String,
+        routing_method: String,
+        agreement_pct: Option<u8>,
+        returned: Option<u32>,
+        dissent: Option<u32>,
+        degraded_reason: Option<String>,
     },
     /// A unit's execution started.
     UnitExecuting { session: String, ord: u32 },
