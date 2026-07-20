@@ -70,6 +70,7 @@ pub fn run_session(
         emit,
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
         false, // stub not yet created
+        crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -279,6 +280,11 @@ pub(crate) fn pre_distribute(
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
+    // Whether input governance is active for this run. Must be supplied by the caller
+    // (evaluated on the actor thread where the GOV_DB_PATH thread-local is set) so that
+    // callers on non-actor threads (e.g. the sync operator/test path) propagate the correct
+    // value rather than silently reading an unset thread-local on their thread.
+    governed: bool,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -326,7 +332,7 @@ pub(crate) fn pre_distribute(
             problem: problem.to_string(),
             workflow_id: selected_def.as_ref().map(|d| d.id.clone()),
             cli_count: clis.len() as u32,
-            governed: crate::actor::in_process_governance().is_some(),
+            governed,
             entity_mode: match entity_mode {
                 EntityMode::Shared => "shared".to_string(),
                 EntityMode::Isolated => "isolated".to_string(),
@@ -469,6 +475,10 @@ pub(crate) fn plan_and_distribute(
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
+    // See pre_distribute's `governed` parameter — must be resolved by the caller on the thread
+    // that has GOV_DB_PATH set (the actor thread) and passed explicitly here so the sync/test
+    // path does not silently read an unset thread-local.
+    governed: bool,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -483,6 +493,7 @@ pub(crate) fn plan_and_distribute(
         emit,
         workflow_registry,
         session_already_started,
+        governed,
     )?;
     let distributions =
         distribute::distribute_units_on(&pre.units, clis, session_id, None, dispatcher)?;
