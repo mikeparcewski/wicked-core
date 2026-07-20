@@ -208,7 +208,10 @@ fn session_started_carries_governance_flag() {
     let collected_mem = drain_until_terminal(&ev_mem, "mem-sess");
     let mem_events = session_started_for(&collected_mem, "mem-sess");
     assert_eq!(mem_events.len(), 1, "exactly one SessionStarted");
-    assert!(!mem_events[0].governed, "governed=false when using :memory: store");
+    assert!(
+        !mem_events[0].governed,
+        "governed=false when using :memory: store"
+    );
 }
 
 /// cli_count in the event equals the number of CLIs in the launch spec.
@@ -234,8 +237,7 @@ fn session_started_cli_count_matches_spec() {
     let started = session_started_for(&collected, "clicount-sess");
     assert_eq!(started.len(), 1);
     assert_eq!(
-        started[0].cli_count,
-        3,
+        started[0].cli_count, 3,
         "cli_count == number of CLIs in the spec"
     );
 }
