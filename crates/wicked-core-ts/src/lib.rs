@@ -481,6 +481,45 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "path": path,
             "dbPath": db_path,
         }),
+        // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
+        CoreEvent::WorkflowSelected {
+            session,
+            workflow_id,
+            unit_count,
+        } => json!({
+            "type": "workflowSelected",
+            "session": session,
+            "workflowId": workflow_id,
+            "unitCount": unit_count,
+        }),
+        CoreEvent::UnitReworkAmended {
+            session,
+            ord,
+            amendment,
+            updated_description,
+        } => json!({
+            "type": "unitReworkAmended",
+            "session": session,
+            "ord": ord,
+            "amendment": amendment,
+            "updatedDescription": updated_description,
+        }),
+        CoreEvent::UnitOutputCaptured {
+            session,
+            ord,
+            attempt,
+            output_bytes,
+            step_status,
+            governed,
+        } => json!({
+            "type": "unitOutputCaptured",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+            "outputBytes": output_bytes,
+            "stepStatus": step_status,
+            "governed": governed,
+        }),
         // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
         // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
         // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
@@ -1489,6 +1528,38 @@ mod tests {
             },
             "governanceContextArmed",
             &["type", "session", "ord", "attempt", "path", "dbPath"],
+        );
+        // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
+        check(
+            CoreEvent::WorkflowSelected {
+                session: s(),
+                workflow_id: "feature".to_string(),
+                unit_count: 2,
+            },
+            "workflowSelected",
+            &["type", "session", "workflowId", "unitCount"],
+        );
+        check(
+            CoreEvent::UnitReworkAmended {
+                session: s(),
+                ord: 1,
+                amendment: "add error handling".to_string(),
+                updated_description: s(),
+            },
+            "unitReworkAmended",
+            &["type", "session", "ord", "amendment", "updatedDescription"],
+        );
+        check(
+            CoreEvent::UnitOutputCaptured {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                output_bytes: 512,
+                step_status: "ok".to_string(),
+                governed: false,
+            },
+            "unitOutputCaptured",
+            &["type", "session", "ord", "attempt", "outputBytes", "stepStatus", "governed"],
         );
     }
 }

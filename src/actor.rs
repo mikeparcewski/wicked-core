@@ -1663,6 +1663,28 @@ fn apply_step_result(
         );
     }
 
+    // (EVT-013) UnitOutputCaptured — fires here, after all guards pass and usage/data events land,
+    // before the three status branches (Cancelled / Failed / Ok-gate). This is the earliest point
+    // where the output is known to belong to the current live unit at the correct attempt.
+    // `step_status` mirrors the three observable outcomes so consumers can distinguish them without
+    // pattern-matching the downstream events; `output_bytes` surfaces truncation at a glance.
+    emit(
+        subscribers,
+        CoreEvent::UnitOutputCaptured {
+            session: run_id.clone(),
+            ord,
+            attempt: output.attempt,
+            output_bytes: output.output.len(),
+            step_status: match output.status {
+                crate::workflow::StepStatus::Cancelled => "cancelled",
+                crate::workflow::StepStatus::Failed => "failed",
+                crate::workflow::StepStatus::Ok => "ok",
+            }
+            .to_string(),
+            governed: output.governed,
+        },
+    );
+
     // A worker that CANCELLED the live unit (e.g. P4a subprocess kill) terminates the run as
     // Cancelled — and clears in_flight via `Finished` (NOT `Stale`, which would wedge the run).
     if output.status == crate::workflow::StepStatus::Cancelled {
@@ -2329,10 +2351,25 @@ pub(crate) fn confirm_gate(
             }
             // Optionally inject an amendment into the unit at the cursor (the gate is steering).
             if let Some(a) = amend {
-                let mut units = crate::domain::session_units(store, run_id)?;
-                if let Some(u) = units.get_mut(session.unit_ix) {
-                    u.description = format!("{} (operator amendment: {a})", u.description);
-                    put_node(store, u.to_node())?;
+                if !a.is_empty() {
+                    let mut units = crate::domain::session_units(store, run_id)?;
+                    if let Some(u) = units.get_mut(session.unit_ix) {
+                        u.description = format!("{} (operator amendment: {a})", u.description);
+                        put_node(store, u.to_node())?;
+                        // (EVT-012) UnitReworkAmended — the authoritative amendment paper trail.
+                        // Fires here (after persist, before Resumed) so the amendment text is
+                        // durable before any subscriber sees the run resume. Resumed alone carries
+                        // no amendment text; this event is the canonical record.
+                        emit(
+                            subscribers,
+                            CoreEvent::UnitReworkAmended {
+                                session: run_id.to_string(),
+                                ord: u.ord,
+                                amendment: a.clone(),
+                                updated_description: u.description.clone(),
+                            },
+                        );
+                    }
                 }
             }
             // Clear the pause → Executing, then dispatch the cursor unit directly (bypass should_pause
