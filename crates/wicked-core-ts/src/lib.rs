@@ -355,6 +355,28 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "terminalId": terminal_id,
             "cliKey": cli_key,
         }),
+        CoreEvent::AcpSessionStarted {
+            session,
+            cli_key,
+            acp_session_id,
+        } => json!({
+            "type": "acpSessionStarted",
+            "session": session,
+            "cliKey": cli_key,
+            "acpSessionId": acp_session_id,
+        }),
+        CoreEvent::AcpFallback {
+            session,
+            cli_key,
+            reason,
+            fallback_kind,
+        } => json!({
+            "type": "acpFallback",
+            "session": session,
+            "cliKey": cli_key,
+            "reason": reason,
+            "fallbackKind": fallback_kind,
+        }),
         // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
         // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
         // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
@@ -1257,6 +1279,25 @@ mod tests {
             },
             "workerSessionStarted",
             &["type", "session", "terminalId", "cliKey"],
+        );
+        check(
+            CoreEvent::AcpSessionStarted {
+                session: s(),
+                cli_key: s(),
+                acp_session_id: s(),
+            },
+            "acpSessionStarted",
+            &["type", "session", "cliKey", "acpSessionId"],
+        );
+        check(
+            CoreEvent::AcpFallback {
+                session: s(),
+                cli_key: s(),
+                reason: s(),
+                fallback_kind: s(),
+            },
+            "acpFallback",
+            &["type", "session", "cliKey", "reason", "fallbackKind"],
         );
     }
 }
