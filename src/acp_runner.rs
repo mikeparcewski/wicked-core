@@ -780,17 +780,22 @@ impl AcpStepRunner {
                         let acp_session_id = proc.session_id.clone();
                         let arc = Arc::new(Mutex::new(proc));
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                        let result = guard
-                            .entry(session_key.clone())
-                            .or_insert(Some(arc.clone()))
-                            .as_ref()
-                            .unwrap()
-                            .clone();
-                        self.emit_event(CoreEvent::AcpSessionStarted {
-                            session: run_id.clone(),
-                            cli_key: cli_key.clone(),
-                            acp_session_id,
-                        });
+                        use std::collections::hash_map::Entry;
+                        let (result, did_insert) = match guard.entry(session_key.clone()) {
+                            Entry::Vacant(v) => {
+                                let slot = v.insert(Some(arc.clone()));
+                                (slot.as_ref().unwrap().clone(), true)
+                            }
+                            Entry::Occupied(o) => (o.into_mut().as_ref().unwrap().clone(), false),
+                        };
+                        drop(guard);
+                        if did_insert {
+                            self.emit_event(CoreEvent::AcpSessionStarted {
+                                session: run_id.clone(),
+                                cli_key: cli_key.clone(),
+                                acp_session_id,
+                            });
+                        }
                         result
                     }
                     Err(e) => {
