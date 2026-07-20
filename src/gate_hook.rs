@@ -651,6 +651,12 @@ pub fn fold_input_denial(
             }
             continue;
         }
+        // Tool-call annotation written by `run_gate_hook` immediately before each claim so that
+        // `collect_hook_decisions` can recover the tool name. NOT a `ConformanceClaim` — skip it
+        // here with the same root-key check used for the other sentinel types.
+        if tool_call_entry(&v).is_some() {
+            continue;
+        }
         let claim: ConformanceClaim = match serde_json::from_value(v) {
             Ok(c) => c,
             Err(e) => {
@@ -746,9 +752,10 @@ pub fn apply_hook_decisions(
         let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
             anyhow::anyhow!("hook-decision drain DENY (fail-closed): corrupted claim line: {e}")
         })?;
-        // Skip sentinel lines (root-key check) — they are metadata, not claims, and would otherwise
-        // fail the drain closed on the `ConformanceClaim` deserialisation step.
-        if marker_phase(&v).is_some() || fired_phase(&v).is_some() {
+        // Skip sentinel and annotation lines (root-key check) — they are metadata, not claims, and
+        // would otherwise fail the drain closed on the `ConformanceClaim` deserialisation step.
+        if marker_phase(&v).is_some() || fired_phase(&v).is_some() || tool_call_entry(&v).is_some()
+        {
             continue;
         }
         let claim: ConformanceClaim = serde_json::from_value(v).map_err(|e| {
