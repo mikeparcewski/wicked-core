@@ -1431,7 +1431,7 @@ mod tests {
             let ann = serde_json::json!({ TOOL_CALL_KEY: "Bash", TOOL_CALL_PHASE_KEY: "unit-1" })
                 .to_string()
                 + "\n";
-            let mut claim = allow_claim("a1", "unit-1");
+            let claim = allow_claim("a1", "unit-1");
             let claim_line = serde_json::to_string(&claim).unwrap() + "\n";
             let combined = ann + &claim_line;
             let mut f = std::fs::OpenOptions::new()
