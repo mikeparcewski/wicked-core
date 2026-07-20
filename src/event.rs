@@ -3,7 +3,7 @@
 //! the store on a timer.
 
 /// Why a unit step failed (worker-reported failure kind; extensible for future tool / govauth errors).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StepFailureKind {
     /// The CLI worker process itself failed (non-zero exit, crash, or no output).

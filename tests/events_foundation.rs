@@ -808,20 +808,21 @@ fn step_failed_event_fires_before_session_failed() {
     );
 
     // Verify the event payload: detail = raw excerpt, failure_kind = WorkerError.
-    if let Some(CoreEvent::StepFailed {
+    let Some(CoreEvent::StepFailed {
         detail,
         failure_kind,
         ..
     }) = collected.get(step_failed_pos.unwrap())
-    {
-        assert_eq!(
-            detail, "subprocess exited with code 1",
-            "detail must be the raw runner output without framing"
-        );
-        assert_eq!(
-            *failure_kind,
-            wicked_core::StepFailureKind::WorkerError,
-            "failure_kind must be WorkerError for a runner-reported failure"
-        );
-    }
+    else {
+        panic!("expected StepFailed event at step_failed_pos but got something else");
+    };
+    assert_eq!(
+        detail, "subprocess exited with code 1",
+        "detail must be the raw runner output without framing"
+    );
+    assert_eq!(
+        *failure_kind,
+        wicked_core::StepFailureKind::WorkerError,
+        "failure_kind must be WorkerError for a runner-reported failure"
+    );
 }
