@@ -582,9 +582,11 @@ impl AcpStepRunner {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(7200);
         Self {
+            // Give the fallback runner the same tx so it can relay GovernanceContextArmed
+            // events (EVT-016 "wrapped_cli" path) when ACP falls back to the wrapped-CLI runner.
+            fallback: WrappedCliStepRunner::with_tx(tx.clone()),
             tx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            fallback: WrappedCliStepRunner::default(),
             timeout: Duration::from_secs(secs),
         }
     }
@@ -636,7 +638,19 @@ impl AcpStepRunner {
             };
 
             let gov_armed = match arm_acp_governance(input, gov) {
-                Ok(g) => g,
+                Ok(g) => {
+                    // (EVT-016) GovernanceContextArmed — ACP path successfully armed governance.
+                    // Fires before the ACP process starts so the operator can confirm governance
+                    // is ON for this unit (distinct from GateEvaluated's after-the-fact signals).
+                    self.emit_event(CoreEvent::GovernanceContextArmed {
+                        session: input.run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        path: "acp".to_string(),
+                        db_path: g.db_path.clone(),
+                    });
+                    g
+                }
                 // A governed unit whose governance cannot be armed MUST NOT run ungoverned — fail
                 // it outright, mirroring the wrapped-CLI path's fail-closed contract.
                 Err(e) => {

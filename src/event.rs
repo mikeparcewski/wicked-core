@@ -227,6 +227,63 @@ pub enum CoreEvent {
         /// The prior units whose outputs were injected (by ord + label + byte size).
         prior_units: Vec<InjectedContext>,
     },
+    /// (EVT-008) One governance hook decision replayed from the NDJSON decisions log, collected
+    /// by `gate_hook::collect_hook_decisions` and emitted from `pipeline::apply_and_finish_unit`
+    /// after `fold_input_denial` returns. One event per tool-call decision entry in the log.
+    /// Fires at gate time (post-fold), not in real-time during execution. `tool_name` is the
+    /// tool the hook intercepted (e.g. `"Bash"`, `"Edit"`); `decision` is `"allow"`,
+    /// `"allow_with_conditions"`, or `"deny"`; `denying_policy` is the first policy id that
+    /// denied, when `decision == "deny"`.
+    GovernanceHookFired {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        tool_name: String,
+        decision: String,
+        denying_policy: Option<String>,
+    },
+    /// (EVT-009) A pinned, approved deterministic validator was successfully loaded from the vault
+    /// and attached to a unit during `attach_pinned_validators`. Fires at plan time (before the
+    /// unit runs). `pin` is the content-hash pin; `criterion` is the validator's human-readable
+    /// acceptance criterion.
+    ValidationPinAttached {
+        session: String,
+        ord: u32,
+        pin: String,
+        criterion: String,
+    },
+    /// (EVT-010) A `HumanConfirmIf(VerdictNotPass)` gate fired — the unit's verdict was not-pass
+    /// and the run was escalated to human review instead of being auto-denied. Fires alongside
+    /// `AwaitingHuman` to identify the escalation type. `condition` is currently always
+    /// `"verdict_not_pass"`; `verdict_summary` is the denial reason that triggered escalation.
+    GateEscalated {
+        session: String,
+        ord: u32,
+        condition: String,
+        verdict_summary: String,
+    },
+    /// (EVT-011) A unit's work was dispatched via the `PhaseExecutor::Tool` path (a direct
+    /// subprocess command, bypassing the council and CLI runner entirely). Fires just before
+    /// the tool command spawns. `cmd` is the full command including the binary; `workdir` is
+    /// the working directory (the session workdir, or `None` if unset).
+    ToolExecutorDispatched {
+        session: String,
+        ord: u32,
+        cmd: Vec<String>,
+        workdir: Option<String>,
+    },
+    /// (EVT-016) Input governance was successfully armed for a unit — the gate-hook settings file
+    /// was written, the ARMED marker was written to the decisions log, and the governed CLI
+    /// invocation is about to start. `path` is `"wrapped_cli"` (the `--settings`-injection path)
+    /// or `"acp"` (the ACP stdio-mode governed session path). `db_path` is the estate store the
+    /// gate-hook subprocess will open read-only to evaluate tool calls.
+    GovernanceContextArmed {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        path: String,
+        db_path: String,
+    },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {
         session: Option<String>,

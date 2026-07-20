@@ -304,6 +304,7 @@ pub(crate) fn pre_distribute(
 
     if let Some(def) = &selected_def {
         attach_pinned_validators(store, &mut units, def)?;
+        // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
     }
 
     let collection_scope = match entity_mode {
@@ -369,6 +370,22 @@ pub(crate) fn pre_distribute(
             .to_string(),
         });
     }
+    // (EVT-009) ValidationPinAttached — emitted here, AFTER SessionStarted + UnitPlanned×n, so
+    // that consumers initialising per-session state on SessionStarted see events in the natural
+    // "session open → units planned → pins attached" order (Copilot).  Emitting before
+    // SessionStarted (the original position) created an ordering edge-case where the session was
+    // not yet "started" when the first pin event arrived.
+    for u in &units {
+        if let Some(v) = &u.validator {
+            emit(CoreEvent::ValidationPinAttached {
+                session: session_id.to_string(),
+                ord: u.ord,
+                pin: crate::validator_vault::pin(v),
+                criterion: v.criterion.clone(),
+            });
+        }
+    }
+
     session.status = SessionStatus::Distributing;
     put_node(store, session.to_node())?;
 
@@ -609,6 +626,24 @@ pub(crate) fn apply_and_finish_unit(
     // block HumanConfirmIf routing on hook vetoes (a hook-sourced deny must hard-fail the run, not
     // escalate to human review).
     let hook_denied = hook_denial.is_some();
+
+    // (EVT-008) GovernanceHookFired — replay per-tool-call decisions from the NDJSON log as events.
+    // Only runs for governed units (ungoverned units have no log). Reads the log once more (cheap;
+    // tiny NDJSON files) so fold_input_denial's signature is unchanged. Emits one event per claim
+    // entry for this unit's phase, in log order.
+    if governed {
+        let phase = crate::scope::unit_phase(unit.ord);
+        for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+            emit(CoreEvent::GovernanceHookFired {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                tool_name: rec.tool_name,
+                decision: rec.decision,
+                denying_policy: rec.denying_policy,
+            });
+        }
+    }
 
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
     let validator_denial = det_denial

@@ -164,11 +164,40 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     };
     let claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
 
-    // The ONLY side effect of the hook: append the claim to the run's decisions log.
-    if let Err(e) = append_decision(Path::new(&decisions_path), &claim) {
-        // A failure to record is a governance failure — fail closed rather than allow unrecorded.
-        eprintln!("wicked-governance: DENY (could not append decision: {e})");
-        return 2;
+    // Write the tool-call annotation AND the claim as a SINGLE buffer under the advisory lock.
+    // Using one buffer means that even if `with_append_lock` degrades to running without the lock
+    // (e.g., the lockfile cannot be created), a single `write_all` of a small buffer is still
+    // atomic on both POSIX (`O_APPEND`) and Windows (`FILE_APPEND_DATA`) — no concurrent hook
+    // subprocess can interleave between the annotation and the claim (Copilot).
+    {
+        let annotation_json = serde_json::json!({
+            TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool.as_str() },
+            TOOL_CALL_PHASE_KEY: phase,
+        })
+        .to_string()
+            + "\n";
+        let claim_line = match serde_json::to_string(&claim) {
+            Ok(mut s) => {
+                s.push('\n');
+                s
+            }
+            Err(e) => {
+                eprintln!("wicked-governance: DENY (could not serialise claim: {e})");
+                return 2;
+            }
+        };
+        // Concatenate into one buffer so the single `write_all` is atomic even in degraded mode.
+        let combined = annotation_json + &claim_line;
+        if let Err(e) = with_append_lock(Path::new(&decisions_path), || {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&decisions_path)?;
+            f.write_all(combined.as_bytes())
+        }) {
+            eprintln!("wicked-governance: DENY (could not append decision: {e})");
+            return 2;
+        }
     }
 
     match claim.decision {
@@ -352,6 +381,15 @@ const ARMED_MARKER_KEY: &str = "_wicked_gov_armed";
 /// tamper signal: hook process was suppressed while tool calls still happened.
 const HOOK_FIRED_KEY: &str = "_wicked_hook_fired";
 
+/// Key of the tool-call annotation line the hook writes BEFORE each conformance claim. Carries the
+/// tool name (e.g. `"Bash"`, `"Edit"`) and the phase so `collect_hook_decisions` can surface the
+/// tool name in `GovernanceHookFired` events without re-running the evaluation. Written in the same
+/// single buffer as the claim (both under the advisory lock) — a write failure returns exit 2 (fail
+/// closed) and no decision is appended.
+const TOOL_CALL_KEY: &str = "_wicked_tool_call";
+/// Companion phase key on the tool-call annotation (pairs with `TOOL_CALL_KEY`).
+const TOOL_CALL_PHASE_KEY: &str = "_wicked_tool_phase";
+
 /// `create_dir_all` + restrict the leaf dir to owner-only (0700) on Unix, so another local user on a
 /// shared host cannot traverse in to read a run's policy scope/phase, tool-call context, or denial
 /// reasons (council [9]). The sensitive settings/decisions files live under this dir, so blocking
@@ -429,6 +467,108 @@ fn marker_phase(v: &serde_json::Value) -> Option<&str> {
 /// reason as `marker_phase` — substring matching would let a crafted claim sneak past the fold.
 fn fired_phase(v: &serde_json::Value) -> Option<&str> {
     v.get(HOOK_FIRED_KEY).and_then(|x| x.as_str())
+}
+
+/// If `v` is a tool-call annotation (written by the hook before each claim), return `(tool_name,
+/// phase)`; else `None`. Root-key check — the same security rationale as `marker_phase`.
+fn tool_call_entry(v: &serde_json::Value) -> Option<(&str, &str)> {
+    let tool = v.get(TOOL_CALL_KEY).and_then(|x| x.as_str())?;
+    let phase = v.get(TOOL_CALL_PHASE_KEY).and_then(|x| x.as_str())?;
+    Some((tool, phase))
+}
+
+/// One hook decision record for `GovernanceHookFired` — the structured view of a single tool-call
+/// intercepted by the governance hook subprocess and recorded in the decisions NDJSON.
+#[derive(Debug, Clone)]
+pub struct HookDecisionRecord {
+    /// The tool the hook intercepted (e.g. `"Bash"`, `"Edit"`). `"(unknown)"` when the
+    /// tool-call annotation was not present in the log (older hook versions, or write failure).
+    pub tool_name: String,
+    /// The hook's decision for this tool call: `"allow"`, `"allow_with_conditions"`, or `"deny"`.
+    pub decision: String,
+    /// The first policy id that denied, when `decision == "deny"`. `None` when allowed (or when
+    /// the deny came from an infra/corruption path with no policy ids).
+    pub denying_policy: Option<String>,
+}
+
+/// Collect the per-tool-call hook decisions for `(run_id, attempt, phase)` from the decisions
+/// log, for emitting [`crate::event::CoreEvent::GovernanceHookFired`] events. Returns an empty
+/// `Vec` when the log is absent (ungoverned unit or log not yet written). Does NOT fail closed —
+/// this is observability-only; governance enforcement is `fold_input_denial`'s job.
+///
+/// Correlates each tool-call annotation (`TOOL_CALL_KEY`) with the immediately-following claim
+/// for the same phase, so the tool name rides the event even though `ConformanceClaim` does not
+/// store it. Logs written before the annotation was added gracefully degrade to `"(unknown)"` for
+/// the tool name.
+pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<HookDecisionRecord> {
+    let path = decisions_path_for(run_id, attempt);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(), // log absent or unreadable — no events to emit
+    };
+    let mut records: Vec<HookDecisionRecord> = Vec::new();
+    let mut pending_tool: Option<String> = None; // tool name from the last annotation
+    for line in raw.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => {
+                pending_tool = None;
+                continue;
+            }
+        };
+        // Skip armed-marker and hook-fired sentinel lines.
+        if marker_phase(&v).is_some() || fired_phase(&v).is_some() {
+            continue;
+        }
+        // Tool-call annotation — note the tool name for the next claim on this phase.
+        // Clear `pending_tool` when the annotation is for a DIFFERENT phase so a stale tool
+        // name from another phase is never incorrectly attached to a later claim (Copilot).
+        if let Some((tool, ann_phase)) = tool_call_entry(&v) {
+            if ann_phase == phase {
+                pending_tool = Some(tool.to_string());
+            } else {
+                pending_tool = None;
+            }
+            continue;
+        }
+        // Try to deserialize as a ConformanceClaim.
+        let claim: wicked_apps_core::ConformanceClaim = match serde_json::from_value(v) {
+            Ok(c) => c,
+            Err(_) => {
+                pending_tool = None;
+                continue;
+            }
+        };
+        if claim.phase != phase {
+            pending_tool = None;
+            continue;
+        }
+        // Map each Decision variant explicitly so consumers of `GovernanceHookFired` see full
+        // fidelity — collapsing AllowWithConditions into "allow" loses the conditional signal
+        // and can mislead operators inspecting hook decisions (Copilot).
+        let decision_str = match claim.decision {
+            wicked_apps_core::Decision::Deny => "deny",
+            wicked_apps_core::Decision::AllowWithConditions => "allow_with_conditions",
+            _ => "allow",
+        };
+        let denying_policy = if claim.decision == wicked_apps_core::Decision::Deny {
+            claim.policy_ids.into_iter().next()
+        } else {
+            None
+        };
+        records.push(HookDecisionRecord {
+            tool_name: pending_tool
+                .take()
+                .unwrap_or_else(|| "(unknown)".to_string()),
+            decision: decision_str.to_string(),
+            denying_policy,
+        });
+    }
+    records
 }
 
 /// Fold a governed unit's INPUT-hook decisions into a single deny-dominant denial, for the run engine's
@@ -512,6 +652,12 @@ pub fn fold_input_denial(
             if fp == phase {
                 saw_hook_fired = true;
             }
+            continue;
+        }
+        // Tool-call annotation written by `run_gate_hook` immediately before each claim so that
+        // `collect_hook_decisions` can recover the tool name. NOT a `ConformanceClaim` — skip it
+        // here with the same root-key check used for the other sentinel types.
+        if tool_call_entry(&v).is_some() {
             continue;
         }
         let claim: ConformanceClaim = match serde_json::from_value(v) {
@@ -609,9 +755,10 @@ pub fn apply_hook_decisions(
         let v: serde_json::Value = serde_json::from_str(line).map_err(|e| {
             anyhow::anyhow!("hook-decision drain DENY (fail-closed): corrupted claim line: {e}")
         })?;
-        // Skip sentinel lines (root-key check) — they are metadata, not claims, and would otherwise
-        // fail the drain closed on the `ConformanceClaim` deserialisation step.
-        if marker_phase(&v).is_some() || fired_phase(&v).is_some() {
+        // Skip sentinel and annotation lines (root-key check) — they are metadata, not claims, and
+        // would otherwise fail the drain closed on the `ConformanceClaim` deserialisation step.
+        if marker_phase(&v).is_some() || fired_phase(&v).is_some() || tool_call_entry(&v).is_some()
+        {
             continue;
         }
         let claim: ConformanceClaim = serde_json::from_value(v).map_err(|e| {
@@ -1251,6 +1398,93 @@ mod tests {
             "a corrupted `{{` line fails the drain CLOSED (never a silent skip→allow)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify `collect_hook_decisions` correlation logic: annotation→claim pairing, graceful
+    /// degradation when an annotation is absent, and phase-isolation of stale annotations.
+    #[test]
+    fn collect_hook_decisions_correlates_tool_names_and_handles_edge_cases() {
+        let run_id = format!("chd-test-{}", std::process::id());
+        let path = decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_file(&path);
+
+        // Write an armed marker, a hook-fired sentinel, then three claim groups:
+        //   A) annotation(Bash, unit-1) + claim(Allow, unit-1) → tool name "Bash"
+        //   B) claim(Deny, unit-1) with NO annotation → tool name "(unknown)"
+        //   C) annotation(Write, unit-2) + claim(Allow, unit-2) → different phase, must NOT
+        //      leak into unit-1 results; a subsequent Allow on unit-1 also gets "(unknown)"
+        write_armed_marker(&path, "unit-1").unwrap();
+
+        // Sentinel (group A)
+        let sentinel = serde_json::json!({ HOOK_FIRED_KEY: "unit-1" }).to_string() + "\n";
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(sentinel.as_bytes()).unwrap();
+        }
+
+        // Group A: annotation + allow claim for unit-1
+        {
+            let ann = serde_json::json!({ TOOL_CALL_KEY: "Bash", TOOL_CALL_PHASE_KEY: "unit-1" })
+                .to_string()
+                + "\n";
+            let claim = allow_claim("a1", "unit-1");
+            let claim_line = serde_json::to_string(&claim).unwrap() + "\n";
+            let combined = ann + &claim_line;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(combined.as_bytes()).unwrap();
+        }
+
+        // Group B: deny claim for unit-1 with NO annotation — tool must degrade to "(unknown)"
+        {
+            let mut deny = allow_claim("d1", "unit-1");
+            deny.decision = Decision::Deny;
+            append_decision(&path, &deny).unwrap();
+        }
+
+        // Group C: annotation for unit-2 then allow for unit-1 — annotation MUST NOT leak
+        {
+            let ann = serde_json::json!({ TOOL_CALL_KEY: "Write", TOOL_CALL_PHASE_KEY: "unit-2" })
+                .to_string()
+                + "\n";
+            let claim = allow_claim("a2", "unit-1");
+            let claim_line = serde_json::to_string(&claim).unwrap() + "\n";
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(ann.as_bytes()).unwrap();
+            f.write_all(claim_line.as_bytes()).unwrap();
+        }
+
+        let records = collect_hook_decisions(&run_id, 0, "unit-1");
+        // A) annotation + allow → "Bash"
+        assert_eq!(records.len(), 3, "three claims for unit-1");
+        assert_eq!(
+            records[0].tool_name, "Bash",
+            "annotated claim gets tool name"
+        );
+        assert_eq!(records[0].decision, "allow");
+        assert!(records[0].denying_policy.is_none());
+        // B) deny without annotation → "(unknown)"
+        assert_eq!(
+            records[1].tool_name, "(unknown)",
+            "unannotated claim degrades to (unknown)"
+        );
+        assert_eq!(records[1].decision, "deny");
+        // C) annotation for unit-2 must not leak into the unit-1 claim that follows
+        assert_eq!(
+            records[2].tool_name, "(unknown)",
+            "annotation for a different phase must not attach to a unit-1 claim"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
     /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.

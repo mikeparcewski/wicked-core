@@ -104,7 +104,11 @@ fn gate_hook_is_single_writer_idempotent_and_vetoes() {
         "a denied tool-call exits 2 (claude aborts the call)"
     );
 
-    // The hook appended two lines per invocation: a hook-fired sentinel + a claim (core#34).
+    // The hook appended three lines per invocation:
+    //   1. a hook-fired sentinel (core#34),
+    //   2. a tool-call annotation (_wicked_tool_call) — written together with the claim
+    //      under a single lock so they stay adjacent,
+    //   3. the conformance claim.
     let lines: Vec<String> = std::fs::read_to_string(&decisions)
         .expect("decisions log written by the hook")
         .lines()
@@ -113,8 +117,8 @@ fn gate_hook_is_single_writer_idempotent_and_vetoes() {
         .collect();
     assert_eq!(
         lines.len(),
-        4,
-        "one sentinel + one claim line per hook invocation"
+        6,
+        "one sentinel + one annotation + one claim line per hook invocation"
     );
 
     // Parse the deny claim id from the ndjson the hook produced.
