@@ -797,8 +797,11 @@ impl AcpStepRunner {
                             "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
                              using single-shot fallback"
                         );
-                        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                        guard.entry(session_key.clone()).or_insert(None);
+                        {
+                            let mut guard =
+                                self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                            guard.entry(session_key.clone()).or_insert(None);
+                        } // release sessions lock before the blocking fallback call
                         self.emit_event(CoreEvent::AcpFallback {
                             session: run_id.clone(),
                             cli_key: cli_key.clone(),
