@@ -164,30 +164,38 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     };
     let claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
 
-    // Best-effort: write a tool-call annotation before the claim so `collect_hook_decisions` can
-    // surface the tool name in `GovernanceHookFired` events. A write failure is not fatal — the
-    // claim is still written and governance is still enforced; the event just loses the tool name.
+    // Write the tool-call annotation AND the claim under a SINGLE advisory lock so they stay
+    // adjacent in the NDJSON file. Two separate locks would allow a concurrent hook subprocess
+    // to interleave between the annotation and the claim, breaking the invariant that
+    // `collect_hook_decisions` relies on when correlating tool names to decisions (Copilot).
     {
-        let annotation = serde_json::json!({
+        let annotation_json = serde_json::json!({
             TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool.as_str() },
             TOOL_CALL_PHASE_KEY: phase,
         })
         .to_string()
             + "\n";
-        let _ = with_append_lock(Path::new(&decisions_path), || {
+        let claim_line = match serde_json::to_string(&claim) {
+            Ok(mut s) => {
+                s.push('\n');
+                s
+            }
+            Err(e) => {
+                eprintln!("wicked-governance: DENY (could not serialise claim: {e})");
+                return 2;
+            }
+        };
+        if let Err(e) = with_append_lock(Path::new(&decisions_path), || {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&decisions_path)?;
-            f.write_all(annotation.as_bytes())
-        });
-    }
-
-    // The ONLY side effect of the hook: append the claim to the run's decisions log.
-    if let Err(e) = append_decision(Path::new(&decisions_path), &claim) {
-        // A failure to record is a governance failure — fail closed rather than allow unrecorded.
-        eprintln!("wicked-governance: DENY (could not append decision: {e})");
-        return 2;
+            f.write_all(annotation_json.as_bytes())?;
+            f.write_all(claim_line.as_bytes())
+        }) {
+            eprintln!("wicked-governance: DENY (could not append decision: {e})");
+            return 2;
+        }
     }
 
     match claim.decision {
@@ -473,7 +481,7 @@ pub struct HookDecisionRecord {
     /// The tool the hook intercepted (e.g. `"Bash"`, `"Edit"`). `"(unknown)"` when the
     /// tool-call annotation was not present in the log (older hook versions, or write failure).
     pub tool_name: String,
-    /// The hook's decision for this tool call: `"allow"` or `"deny"`.
+    /// The hook's decision for this tool call: `"allow"`, `"allow_with_conditions"`, or `"deny"`.
     pub decision: String,
     /// The first policy id that denied, when `decision == "deny"`. `None` when allowed (or when
     /// the deny came from an infra/corruption path with no policy ids).
@@ -514,9 +522,13 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
             continue;
         }
         // Tool-call annotation — note the tool name for the next claim on this phase.
+        // Clear `pending_tool` when the annotation is for a DIFFERENT phase so a stale tool
+        // name from another phase is never incorrectly attached to a later claim (Copilot).
         if let Some((tool, ann_phase)) = tool_call_entry(&v) {
             if ann_phase == phase {
                 pending_tool = Some(tool.to_string());
+            } else {
+                pending_tool = None;
             }
             continue;
         }
@@ -532,8 +544,12 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
             pending_tool = None;
             continue;
         }
+        // Map each Decision variant explicitly so consumers of `GovernanceHookFired` see full
+        // fidelity — collapsing AllowWithConditions into "allow" loses the conditional signal
+        // and can mislead operators inspecting hook decisions (Copilot).
         let decision_str = match claim.decision {
             wicked_apps_core::Decision::Deny => "deny",
+            wicked_apps_core::Decision::AllowWithConditions => "allow_with_conditions",
             _ => "allow",
         };
         let denying_policy = if claim.decision == wicked_apps_core::Decision::Deny {

@@ -224,16 +224,21 @@ pub struct WrappedCliStepRunner {
     tx: Option<std::sync::mpsc::Sender<crate::command::Command>>,
 }
 
+/// Per-unit wall-clock timeout. Default 2 h — agentic CLIs doing real multi-file extraction
+/// commonly exceed 15 min. Override with `WICKED_UNIT_TIMEOUT_SECS` (e.g. 900 for conservative
+/// environments). Extracted into a helper so both `Default` and `with_tx` stay DRY (Gemini).
+fn unit_timeout() -> Duration {
+    let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(7200);
+    Duration::from_secs(secs)
+}
+
 impl Default for WrappedCliStepRunner {
     fn default() -> Self {
-        // Default 2 h — agentic CLIs doing real multi-file extraction commonly exceed 15 min.
-        // Override with WICKED_UNIT_TIMEOUT_SECS (e.g. 900 for conservative environments).
-        let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(7200);
         WrappedCliStepRunner {
-            timeout: Duration::from_secs(secs),
+            timeout: unit_timeout(),
             tx: None,
         }
     }
@@ -243,12 +248,8 @@ impl WrappedCliStepRunner {
     /// Construct with a back-channel to the actor so the runner can relay events via
     /// `Command::EmitEvent`. Used by `AcpStepRunner::new` to give the fallback runner a tx.
     pub(crate) fn with_tx(tx: std::sync::mpsc::Sender<crate::command::Command>) -> Self {
-        let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(7200);
         WrappedCliStepRunner {
-            timeout: Duration::from_secs(secs),
+            timeout: unit_timeout(),
             tx: Some(tx),
         }
     }
