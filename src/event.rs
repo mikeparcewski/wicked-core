@@ -2,6 +2,13 @@
 //! stream that consumers actually subscribe to — so the UI watches work happen instead of polling
 //! the store on a timer.
 
+/// Why a unit step failed (worker-reported failure kind; extensible for future tool / govauth errors).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StepFailureKind {
+    /// The CLI worker process itself failed (non-zero exit, crash, or no output).
+    WorkerError,
+}
+
 /// An event emitted by the core runtime as work progresses. Cheap to clone (fanned out to every
 /// subscriber). The taxonomy mirrors the plan → distribute → execute → evidence pipeline; P1 emits
 /// only `Heartbeat` (the rest land when the pipeline is lifted in P2).
@@ -115,6 +122,22 @@ pub enum CoreEvent {
     UnitDone { session: String, ord: u32 },
     /// A unit was denied (gate veto — never reaches approved).
     UnitDenied { session: String, ord: u32 },
+    /// A worker failure halted this unit (run is transitioning to Failed). `detail` is a bounded
+    /// excerpt of the worker's output; `failure_kind` names the category for UI dispatch.
+    StepFailed {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        detail: String,
+        failure_kind: StepFailureKind,
+    },
+    /// The engine restarted while a unit was in-flight and is re-dispatching it. `attempt` is the
+    /// NEW (post-bump) attempt number so the UI can show ⚠×N crash-redrive badges.
+    CrashRecoveryRedrive {
+        session: String,
+        ord: u32,
+        attempt: u32,
+    },
     /// The run paused at a human-confirm gate BEFORE the unit with this `ord`. The operator must
     /// `confirm_gate` (approve / reject / cancel) to proceed. `prompt` is the gate question.
     AwaitingHuman {
