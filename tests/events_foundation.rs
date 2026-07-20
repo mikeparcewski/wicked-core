@@ -64,6 +64,23 @@ impl Dispatcher for NullDispatcher {
     }
 }
 
+/// Fails every unit immediately (simulates a CLI worker crash/error).
+struct FailRunner;
+impl StepRunner for FailRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "subprocess exited with code 1".into(),
+            status: StepStatus::Failed,
+            usage: None,
+            files: vec![],
+            governed: false,
+        }
+    }
+}
+
 /// Completes every unit immediately with Ok status.
 struct OkRunner;
 impl StepRunner for OkRunner {
@@ -751,4 +768,57 @@ fn unit_distributed_degraded_routing_carries_reason() {
             "degraded routing must carry a degraded_reason"
         );
     }
+}
+
+// ── StepFailed tests ─────────────────────────────────────────────────────────────────────────────
+
+/// When a step runner returns StepStatus::Failed, a `StepFailed` event fires before `SessionFailed`.
+/// The event carries the raw bounded excerpt (not the framing text) and WorkerError kind.
+#[test]
+fn step_failed_event_fires_before_session_failed() {
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        Arc::new(FailRunner),
+    );
+    let ev = core.subscribe();
+    core.launch_run(spec("fail-sess", vec![cli("a")]))
+        .expect("launch");
+
+    let collected = drain_until_terminal(&ev, "fail-sess");
+
+    let step_failed_pos = collected
+        .iter()
+        .position(|e| matches!(e, CoreEvent::StepFailed { session, .. } if session == "fail-sess"));
+    let session_failed_pos = collected.iter().position(
+        |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "fail-sess"),
+    );
+
+    let step_failed_pos =
+        step_failed_pos.expect("StepFailed must be emitted when runner returns Failed");
+    let session_failed_pos =
+        session_failed_pos.expect("SessionFailed must follow a worker failure");
+    assert!(
+        step_failed_pos < session_failed_pos,
+        "StepFailed must precede SessionFailed"
+    );
+
+    // Verify the event payload: detail = raw excerpt, failure_kind = WorkerError.
+    let Some(CoreEvent::StepFailed {
+        detail,
+        failure_kind,
+        ..
+    }) = collected.get(step_failed_pos)
+    else {
+        panic!("expected StepFailed event at step_failed_pos but got something else");
+    };
+    assert_eq!(
+        detail, "subprocess exited with code 1",
+        "detail must be the raw runner output without framing"
+    );
+    assert_eq!(
+        *failure_kind,
+        wicked_core::StepFailureKind::WorkerError,
+        "failure_kind must be WorkerError for a runner-reported failure"
+    );
 }

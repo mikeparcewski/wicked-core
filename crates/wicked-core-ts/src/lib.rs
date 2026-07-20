@@ -53,7 +53,7 @@ use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
 use wicked_core::{
     CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus,
-    StubStepRunner,
+    StepFailureKind, StubStepRunner,
 };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -317,6 +317,34 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::CampaignCancelled { campaign } => {
             json!({ "type": "campaignCancelled", "campaign": campaign })
         }
+        // P1 observability events — worker failure + crash recovery.
+        CoreEvent::StepFailed {
+            session,
+            ord,
+            attempt,
+            detail,
+            failure_kind,
+        } => json!({
+            "type": "stepFailed",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+            "detail": detail,
+            "failureKind": match failure_kind {
+                StepFailureKind::WorkerError => "workerError",
+                _ => "unknown",
+            },
+        }),
+        CoreEvent::CrashRecoveryRedrive {
+            session,
+            ord,
+            attempt,
+        } => json!({
+            "type": "crashRecoveryRedrive",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+        }),
         // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
         // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
         // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
@@ -1194,6 +1222,22 @@ mod tests {
             CoreEvent::CampaignCancelled { campaign: s() },
             "campaignCancelled",
             &["type", "campaign"],
+        );
+        check(
+            CoreEvent::StepFailed {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                detail: s(),
+                failure_kind: StepFailureKind::WorkerError,
+            },
+            "stepFailed",
+            &["type", "session", "ord", "attempt", "detail", "failureKind"],
+        );
+        check(
+            CoreEvent::CrashRecoveryRedrive { session: s(), ord: 1, attempt: 1 },
+            "crashRecoveryRedrive",
+            &["type", "session", "ord", "attempt"],
         );
     }
 }

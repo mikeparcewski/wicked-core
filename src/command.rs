@@ -43,10 +43,11 @@ pub(crate) enum Command {
         spec: crate::LaunchSpec,
         reply: Sender<anyhow::Result<String>>,
     },
-    /// Internal: the deferred second half of `LaunchRun`. Carries the validated spec; `workdir` is
-    /// `None` when this path is taken (the worktree is created off-thread and arrives via
-    /// `WorktreeReady` instead). Errors here surface as `CoreEvent::Error` — no reply channel.
-    /// The actor marks the run Failed on error so it never wedges in Planning.
+    /// Internal: the deferred second half of `LaunchRun`. On the normal `LaunchRun` path, `workdir`
+    /// is `None` because the worktree is created off-thread and arrives via `WorktreeReady` instead.
+    /// External callers (e.g. tests) that bypass `LaunchRun` may pass `workdir: Some(_)` directly.
+    /// Errors here surface as `CoreEvent::Error` — no reply channel. The actor marks the run Failed
+    /// on error so it never wedges in Planning.
     /// NOTE: superseded by `WorktreeReady` for the normal `LaunchRun` path; the handler is retained
     /// for external callers (e.g. tests) that bypass `LaunchRun`.
     #[allow(dead_code)]

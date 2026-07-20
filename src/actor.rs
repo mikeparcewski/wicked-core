@@ -1539,6 +1539,19 @@ fn redrive_executing_sessions(
             emit_run_error(subscribers, &run_id, e);
             continue;
         }
+        // Emit CrashRecoveryRedrive before dispatch so the UI sees it before UnitDispatched
+        // (which dispatch_unit emits internally). Guard: only emit when a unit exists at the
+        // cursor — if not, the run is completing normally and no redrive badge should appear.
+        if let Some(unit) = units.get(sess.unit_ix) {
+            emit(
+                subscribers,
+                CoreEvent::CrashRecoveryRedrive {
+                    session: run_id.clone(),
+                    ord: unit.ord,
+                    attempt: sess.attempt,
+                },
+            );
+        }
         match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
             Ok(true) => {
                 in_flight.insert(run_id);
@@ -1661,14 +1674,26 @@ fn apply_step_result(
     if output.status == crate::workflow::StepStatus::Failed {
         unit.status = crate::domain::UnitStatus::Rejected;
         // Capture WHY for the UI: the worker's failure output (bounded).
-        let detail = output.output.trim();
-        unit.denial_reason = Some(if detail.is_empty() {
+        let raw = output.output.trim();
+        let raw_snippet: String = raw.chars().take(400).collect();
+        unit.denial_reason = Some(if raw.is_empty() {
             format!("Worker FAILED on unit {ord} (no output)")
         } else {
-            let snippet: String = detail.chars().take(400).collect();
-            format!("Worker FAILED on unit {ord}: {snippet}")
+            format!("Worker FAILED on unit {ord}: {raw_snippet}")
         });
         put_node(store, unit.to_node())?;
+        // `detail` is the raw bounded excerpt — no framing text — so event consumers get
+        // the worker's own output without needing to parse the denial_reason framing.
+        emit(
+            subscribers,
+            CoreEvent::StepFailed {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                detail: raw_snippet,
+                failure_kind: crate::event::StepFailureKind::WorkerError,
+            },
+        );
         // Best-effort: conform any governed Deny claims that arrived before the worker crashed.
         // Without this the decisions log is never read for a failed unit and the deny evidence
         // is lost — fold_input_denial only runs inside apply_and_finish_unit, which we never reach
