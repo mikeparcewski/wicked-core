@@ -452,34 +452,36 @@ pub(crate) fn run(
                         },
                     );
                     in_flight.insert(run_id.clone());
-                    // Spawn a worker to create the worktree off-thread (`git worktree add` can take
-                    // seconds on large repos). The actor remains fully responsive during this time.
-                    // The worker posts WorktreeReady or WorktreeFailed back over self_tx.
-                    let tx = self_tx.clone();
-                    let rid = run_id.clone();
-                    std::thread::spawn(move || {
-                        let cmd = match (repo_root, repo_ref) {
-                            (Some(root), Some(ref_id)) => {
-                                match crate::repo::create_worktree(&root, &rid) {
-                                    Ok(wt) => Command::WorktreeReady {
-                                        spec,
-                                        repo_ref: Some(ref_id),
-                                        workdir: Some(wt.to_string_lossy().to_string()),
-                                    },
-                                    Err(e) => Command::WorktreeFailed {
-                                        run_id: rid,
-                                        error: e.to_string(),
-                                    },
-                                }
-                            }
-                            _ => Command::WorktreeReady {
-                                spec,
-                                repo_ref: None,
-                                workdir: None,
-                            },
-                        };
-                        let _ = tx.send(cmd);
-                    });
+                    // For repo-present runs, spawn a worker so `git worktree add` (which can take
+                    // seconds on large repos) does not block the actor. For repo-less runs there is
+                    // no git I/O; enqueue WorktreeReady directly on the actor thread to avoid an
+                    // unnecessary thread spawn for the common case.
+                    if let (Some(root), Some(ref_id)) = (repo_root, repo_ref) {
+                        let tx = self_tx.clone();
+                        let rid = run_id.clone();
+                        std::thread::spawn(move || {
+                            let cmd = match crate::repo::create_worktree(&root, &rid) {
+                                Ok(wt) => Command::WorktreeReady {
+                                    spec,
+                                    repo_ref: Some(ref_id),
+                                    workdir: Some(wt.to_string_lossy().to_string()),
+                                },
+                                Err(e) => Command::WorktreeFailed {
+                                    run_id: rid,
+                                    error: e.to_string(),
+                                },
+                            };
+                            let _ = tx.send(cmd);
+                        });
+                    } else {
+                        // No worktree needed; post WorktreeReady directly so WorktreeReady's handler
+                        // runs on the next actor iteration without an extra thread lifecycle.
+                        let _ = self_tx.send(Command::WorktreeReady {
+                            spec,
+                            repo_ref: None,
+                            workdir: None,
+                        });
+                    }
                     Ok(run_id.clone())
                 })();
                 let _ = reply.send(res);
