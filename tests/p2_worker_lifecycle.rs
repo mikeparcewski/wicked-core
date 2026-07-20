@@ -46,6 +46,30 @@ mod tests {
         format!("sh {p}")
     }
 
+    /// One-shot fake CLI: handles a single turn then exits. Used to simulate a CLI crash that
+    /// makes the PTY write fail on the next unit (triggering EVT-004 with reason="error").
+    fn one_shot_cli_invocation() -> String {
+        use std::os::unix::fs::PermissionsExt;
+        static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let p = PATH.get_or_init(|| {
+            let mut path = std::env::temp_dir();
+            path.push(format!(
+                "wicked-core-p2wl-oneshot-cli-{}.sh",
+                std::process::id()
+            ));
+            // Read exactly one line, respond, then exit — the PTY slave closes, so the next
+            // write to the PTY master returns EIO.
+            let script = "#!/bin/sh\n\
+                IFS= read -r line\n\
+                printf '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"WKRTURN:%s\"}]}}\\n' \"$line\"\n\
+                printf '{\"type\":\"result\",\"result\":\"ok\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\\n' \"$line\"\n";
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        });
+        format!("sh {p}")
+    }
+
     fn make_unit(ord: u32, description: &str, invocation: &str) -> WorkUnit {
         WorkUnit {
             id: format!("u-test-{ord}"),
@@ -87,15 +111,22 @@ mod tests {
         }
     }
 
-    /// Drain events until `pred` matches or the deadline expires.
-    fn wait_for(rx: &std::sync::mpsc::Receiver<CoreEvent>, pred: impl Fn(&CoreEvent) -> bool) {
+    /// Block until an event matches `pred` or fail the test after 5 s.
+    fn wait_for(
+        rx: &std::sync::mpsc::Receiver<CoreEvent>,
+        label: &str,
+        pred: impl Fn(&CoreEvent) -> bool,
+    ) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(50)) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(ev) if pred(&ev) => return,
-                Ok(_) | Err(_) => continue,
+                Ok(_) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
             }
         }
+        panic!("timed out waiting for: {label}");
     }
 
     /// Drain all buffered events without blocking.
@@ -177,7 +208,9 @@ mod tests {
 
         // Explicit teardown.
         runner.drop_session("run-p2wl-reuse");
-        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+        wait_for(&events, "TerminalExited after drop_session", |e| {
+            matches!(e, CoreEvent::TerminalExited { .. })
+        });
     }
 
     /// `WorkerSessionClosed` with `reason="run_complete"` fires when `on_run_complete` is called.
@@ -207,15 +240,66 @@ mod tests {
         runner.on_run_complete("run-p2wl-close");
 
         // WorkerSessionClosed with reason="run_complete" must arrive.
-        wait_for(&events, |e| {
-            matches!(
-                e,
-                CoreEvent::WorkerSessionClosed { reason, .. } if reason == "run_complete"
-            )
-        });
+        wait_for(
+            &events,
+            "WorkerSessionClosed(reason=run_complete)",
+            |e| matches!(e, CoreEvent::WorkerSessionClosed { reason, .. } if reason == "run_complete"),
+        );
 
         // Also verify the terminal eventually exits.
-        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+        wait_for(&events, "TerminalExited after run_complete", |e| {
+            matches!(e, CoreEvent::TerminalExited { .. })
+        });
+    }
+
+    /// `WorkerSessionClosed` with `reason="error"` fires when the PTY write fails.
+    ///
+    /// A one-shot CLI exits after the first turn. When the second unit tries to write to the
+    /// PTY, the slave side is already closed, so the write returns `EIO`. The runner emits
+    /// EVT-004 with `reason="error"` before dropping the stale session entry.
+    #[test]
+    fn worker_session_closed_fires_on_write_error() {
+        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let (core, runner) = Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+
+        let inv = one_shot_cli_invocation();
+        let unit1 = make_unit(1, "first unit (succeeds)", &inv);
+        let unit2 = make_unit(2, "second unit (write fails)", &inv);
+        let input1 = make_input("run-p2wl-wrerr", 0, unit1);
+        let input2 = make_input("run-p2wl-wrerr", 1, unit2);
+
+        // Turn 1 — opens the session; CLI exits after responding.
+        let out1 = runner.run_unit(&input1);
+        assert_eq!(
+            out1.status,
+            StepStatus::Ok,
+            "turn 1 must succeed; got: {:?}",
+            out1.output
+        );
+
+        // Give the one-shot CLI process time to fully exit so the PTY slave is closed.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Clear buffered events from turn 1 (e.g. WorkerSessionStarted, TerminalOutput).
+        let _ = drain_buffered(&events);
+
+        // Turn 2 — PTY write fails because the CLI has exited.
+        let out2 = runner.run_unit(&input2);
+        assert_ne!(
+            out2.status,
+            StepStatus::Ok,
+            "turn 2 must fail (write error); got status {:?} output: {:?}",
+            out2.status,
+            out2.output
+        );
+
+        // EVT-004 with reason="error" must arrive.
+        wait_for(
+            &events,
+            "WorkerSessionClosed(reason=error)",
+            |e| matches!(e, CoreEvent::WorkerSessionClosed { reason, .. } if reason == "error"),
+        );
     }
 
     // ── StepRunner adapter for the PersistentStepRunner (needed to satisfy the StepRunner bound) ──
