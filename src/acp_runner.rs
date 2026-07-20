@@ -765,6 +765,7 @@ impl AcpStepRunner {
                 match slot {
                     Some(arc) => arc.clone(),
                     None => {
+                        drop(guard); // release sessions lock before the blocking fallback call
                         return self.fallback.run_unit_streaming(input, emit);
                     }
                 }
