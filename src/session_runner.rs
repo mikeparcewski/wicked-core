@@ -192,6 +192,13 @@ impl StepRunner for PersistentStepRunner {
                 guard.remove(&run_id).map(|s| s.terminal_id)
             };
             if let Some(id) = tid {
+                // (EVT-004) Normal end-of-run session close. Emit before CloseTerminal so
+                // observers see the closed event in the stream before the PTY child exits.
+                let _ = tx.send(Command::EmitEvent(CoreEvent::WorkerSessionClosed {
+                    session: run_id.clone(),
+                    terminal_id: id.clone(),
+                    reason: "run_complete".to_string(),
+                }));
                 let (reply, rx) = std::sync::mpsc::channel();
                 let _ = tx.send(Command::CloseTerminal { id, reply });
                 let _ = rx.recv();
@@ -213,7 +220,18 @@ impl PersistentStepRunner {
         };
 
         let terminal_id = match existing_id {
-            Some(tid) => tid,
+            Some(tid) => {
+                // (EVT-003) Session already open — reusing it for this unit. Fires before the
+                // prompt write so callers can observe the reuse before any output arrives.
+                let _ = self
+                    .tx
+                    .send(Command::EmitEvent(CoreEvent::WorkerSessionReused {
+                        session: run_id.clone(),
+                        terminal_id: tid.clone(),
+                        ord: input.unit.ord,
+                    }));
+                tid
+            }
             None => {
                 let cwd = input
                     .workdir
@@ -264,6 +282,15 @@ impl PersistentStepRunner {
 
         let prompt = format!("{}\n", skill_prompt(&input.unit));
         if let Err(e) = self.write_terminal(&terminal_id, prompt.as_bytes()) {
+            // (EVT-004) The PTY write failed — emit the closed event before dropping the session
+            // so observers see the full lifecycle (opened → reused? → closed:error).
+            let _ = self
+                .tx
+                .send(Command::EmitEvent(CoreEvent::WorkerSessionClosed {
+                    session: run_id.clone(),
+                    terminal_id: terminal_id.clone(),
+                    reason: "error".to_string(),
+                }));
             // PTY already exited — drop the stale entry so future units reopen cleanly.
             self.drop_session(&run_id);
             return failed_output(input, format!("write PTY turn: {e}"));

@@ -2023,20 +2023,45 @@ fn dispatch_unit(
     // worker holds no store handle (single-writer invariant). Empty for single-CLI runs.
     // Reuses `units` already fetched above — no second store read.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
-    let prior_outputs: Vec<PriorUnitOutput> = units
-        .iter()
-        .filter(|u| {
-            u.ord < unit.ord && u.assigned_cli.as_deref().unwrap_or("claude") != current_cli
-        })
-        .filter_map(|u| {
-            let output = crate::domain::get_work_output(store, &u.id)?;
-            let cli = u.assigned_cli.as_deref().unwrap_or("claude");
-            Some(PriorUnitOutput {
-                label: format!("[{cli} — unit {}]", u.ord),
-                output,
+    // Single-pass: build both the worker's prior-output list and the EVT-007 context items
+    // simultaneously via `unzip` — no intermediate Vec and no second store read.
+    let (prior_outputs, context_items): (Vec<PriorUnitOutput>, Vec<crate::event::InjectedContext>) =
+        units
+            .iter()
+            .filter(|u| {
+                u.ord < unit.ord && u.assigned_cli.as_deref().unwrap_or("claude") != current_cli
             })
-        })
-        .collect();
+            .filter_map(|u| {
+                let output = crate::domain::get_work_output(store, &u.id)?;
+                let cli = u.assigned_cli.as_deref().unwrap_or("claude");
+                let label = format!("[{cli} — unit {}]", u.ord);
+                let output_bytes = output.len();
+                Some((
+                    PriorUnitOutput {
+                        label: label.clone(),
+                        output,
+                    },
+                    crate::event::InjectedContext {
+                        ord: u.ord,
+                        label,
+                        output_bytes,
+                    },
+                ))
+            })
+            .unzip();
+    // (EVT-007) Emit UnitContextInjected when prior cross-CLI outputs are being injected.
+    // Only fires for multi-CLI runs where earlier units on a different CLI have completed.
+    if !context_items.is_empty() {
+        emit(
+            subscribers,
+            CoreEvent::UnitContextInjected {
+                session: run_id.to_string(),
+                ord: unit.ord,
+                recipient_cli: current_cli.to_string(),
+                prior_units: context_items,
+            },
+        );
+    }
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
