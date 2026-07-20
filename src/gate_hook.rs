@@ -164,10 +164,11 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
     };
     let claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
 
-    // Write the tool-call annotation AND the claim under a SINGLE advisory lock so they stay
-    // adjacent in the NDJSON file. Two separate locks would allow a concurrent hook subprocess
-    // to interleave between the annotation and the claim, breaking the invariant that
-    // `collect_hook_decisions` relies on when correlating tool names to decisions (Copilot).
+    // Write the tool-call annotation AND the claim as a SINGLE buffer under the advisory lock.
+    // Using one buffer means that even if `with_append_lock` degrades to running without the lock
+    // (e.g., the lockfile cannot be created), a single `write_all` of a small buffer is still
+    // atomic on both POSIX (`O_APPEND`) and Windows (`FILE_APPEND_DATA`) — no concurrent hook
+    // subprocess can interleave between the annotation and the claim (Copilot).
     {
         let annotation_json = serde_json::json!({
             TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool.as_str() },
@@ -185,13 +186,14 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
                 return 2;
             }
         };
+        // Concatenate into one buffer so the single `write_all` is atomic even in degraded mode.
+        let combined = annotation_json + &claim_line;
         if let Err(e) = with_append_lock(Path::new(&decisions_path), || {
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&decisions_path)?;
-            f.write_all(annotation_json.as_bytes())?;
-            f.write_all(claim_line.as_bytes())
+            f.write_all(combined.as_bytes())
         }) {
             eprintln!("wicked-governance: DENY (could not append decision: {e})");
             return 2;
@@ -381,8 +383,9 @@ const HOOK_FIRED_KEY: &str = "_wicked_hook_fired";
 
 /// Key of the tool-call annotation line the hook writes BEFORE each conformance claim. Carries the
 /// tool name (e.g. `"Bash"`, `"Edit"`) and the phase so `collect_hook_decisions` can surface the
-/// tool name in `GovernanceHookFired` events without re-running the evaluation. Best-effort: a
-/// write failure does NOT abort the hook (the claim is still written and governance is still enforced).
+/// tool name in `GovernanceHookFired` events without re-running the evaluation. Written in the same
+/// single buffer as the claim (both under the advisory lock) — a write failure returns exit 2 (fail
+/// closed) and no decision is appended.
 const TOOL_CALL_KEY: &str = "_wicked_tool_call";
 /// Companion phase key on the tool-call annotation (pairs with `TOOL_CALL_KEY`).
 const TOOL_CALL_PHASE_KEY: &str = "_wicked_tool_phase";
