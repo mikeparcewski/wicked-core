@@ -280,10 +280,10 @@ pub(crate) fn pre_distribute(
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
-    // Whether input governance is active for this run. Must be supplied by the caller
-    // (evaluated on the actor thread where the GOV_DB_PATH thread-local is set) so that
-    // callers on non-actor threads (e.g. the sync operator/test path) propagate the correct
-    // value rather than silently reading an unset thread-local on their thread.
+    // Whether input governance is active for this run. The call site is responsible for
+    // evaluating in_process_governance().is_some() and passing the result here; pre_distribute
+    // must never read the GOV_DB_PATH thread-local directly, because thread-locals do not
+    // propagate to spawned threads (including the sync/test path where it is unset).
     governed: bool,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
@@ -475,9 +475,10 @@ pub(crate) fn plan_and_distribute(
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
-    // See pre_distribute's `governed` parameter — must be resolved by the caller on the thread
-    // that has GOV_DB_PATH set (the actor thread) and passed explicitly here so the sync/test
-    // path does not silently read an unset thread-local.
+    // Whether input governance is active. See pre_distribute's `governed` parameter — the call
+    // site supplies this value so neither pre_distribute nor plan_and_distribute read the
+    // GOV_DB_PATH thread-local internally. Pass in_process_governance().is_some() from the
+    // calling thread; the sync/test path correctly gets false when GOV_DB_PATH is not set.
     governed: bool,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
