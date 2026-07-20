@@ -554,18 +554,28 @@ pub(crate) fn run(
                 let run_id = spec.session_id.clone();
                 // Guard: the run may have been cancelled while the worktree thread was running.
                 // If it is already terminal, discard the result — do not resurrect the run.
-                let already_terminal = crate::domain::get_session(&store, &run_id)
-                    .ok()
-                    .flatten()
-                    .map(|s| {
-                        matches!(
-                            s.status,
-                            SessionStatus::Completed
-                                | SessionStatus::Cancelled
-                                | SessionStatus::Failed
-                        )
-                    })
-                    .unwrap_or(true); // unknown run → treat as terminal
+                let session_check = crate::domain::get_session(&store, &run_id);
+                let already_terminal = match &session_check {
+                    Ok(Some(s)) => matches!(
+                        s.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ),
+                    Ok(None) => true, // session purged — treat as terminal
+                    Err(e) => {
+                        // Store read failure: cannot determine terminal state safely.
+                        // Clean up the worktree and emit an error so the UI learns about it.
+                        in_flight.remove(&run_id);
+                        if let Some(ref path) = workdir {
+                            let _ = std::fs::remove_dir_all(path);
+                        }
+                        emit_run_error(
+                            &mut subscribers,
+                            &run_id,
+                            anyhow::anyhow!("store error in WorktreeReady guard: {e}"),
+                        );
+                        continue;
+                    }
+                };
                 if already_terminal {
                     in_flight.remove(&run_id);
                     // Use remove_worktree (git worktree remove --force) to clean up both
