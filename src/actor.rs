@@ -1539,17 +1539,23 @@ fn redrive_executing_sessions(
             emit_run_error(subscribers, &run_id, e);
             continue;
         }
-        let redrive_ord = units.get(sess.unit_ix).map(|u| u.ord).unwrap_or(0);
-        emit(
-            subscribers,
-            CoreEvent::CrashRecoveryRedrive {
-                session: run_id.clone(),
-                ord: redrive_ord,
-                attempt: sess.attempt,
-            },
-        );
         match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
             Ok(true) => {
+                // Emit the redrive event only when a unit is actually being re-dispatched
+                // (dispatch returns true). When it returns false there is no unit at the cursor
+                // (all remaining units are Done) — emitting a CrashRecoveryRedrive with a
+                // fabricated ord=0 would mislead the UI into showing a redrive badge on a run
+                // that is actually completing normally. See Copilot finding on PR-1.
+                if let Some(unit) = units.get(sess.unit_ix) {
+                    emit(
+                        subscribers,
+                        CoreEvent::CrashRecoveryRedrive {
+                            session: run_id.clone(),
+                            ord: unit.ord,
+                            attempt: sess.attempt,
+                        },
+                    );
+                }
                 in_flight.insert(run_id);
             }
             // No unit at the cursor (every remaining unit is Done) → the run is actually complete.
@@ -1670,21 +1676,23 @@ fn apply_step_result(
     if output.status == crate::workflow::StepStatus::Failed {
         unit.status = crate::domain::UnitStatus::Rejected;
         // Capture WHY for the UI: the worker's failure output (bounded).
-        let detail = output.output.trim();
-        unit.denial_reason = Some(if detail.is_empty() {
+        let raw = output.output.trim();
+        let raw_snippet: String = raw.chars().take(400).collect();
+        unit.denial_reason = Some(if raw.is_empty() {
             format!("Worker FAILED on unit {ord} (no output)")
         } else {
-            let snippet: String = detail.chars().take(400).collect();
-            format!("Worker FAILED on unit {ord}: {snippet}")
+            format!("Worker FAILED on unit {ord}: {raw_snippet}")
         });
         put_node(store, unit.to_node())?;
+        // `detail` is the raw bounded excerpt — no framing text — so event consumers get
+        // the worker's own output without needing to parse the denial_reason framing.
         emit(
             subscribers,
             CoreEvent::StepFailed {
                 session: run_id.clone(),
                 ord,
                 attempt: output.attempt,
-                detail: unit.denial_reason.clone().unwrap_or_default(),
+                detail: raw_snippet,
                 failure_kind: crate::event::StepFailureKind::WorkerError,
             },
         );
