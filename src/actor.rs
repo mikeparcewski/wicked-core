@@ -482,7 +482,7 @@ pub(crate) fn run(
                             workdir: None,
                         });
                     }
-                    Ok(run_id.clone())
+                    Ok(run_id)
                 })();
                 let _ = reply.send(res);
             }
