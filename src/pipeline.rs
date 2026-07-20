@@ -70,6 +70,7 @@ pub fn run_session(
         emit,
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
         false, // stub not yet created
+        crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -279,6 +280,11 @@ pub(crate) fn pre_distribute(
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
+    // Whether input governance is active for this run. The call site is responsible for
+    // evaluating in_process_governance().is_some() and passing the result here; pre_distribute
+    // must never read the GOV_DB_PATH thread-local directly, because thread-locals do not
+    // propagate to spawned threads (including the sync/test path where it is unset).
+    governed: bool,
 ) -> anyhow::Result<PreDistributed> {
     let workflow_id = format!("wf-{session_id}");
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
@@ -326,7 +332,7 @@ pub(crate) fn pre_distribute(
             problem: problem.to_string(),
             workflow_id: selected_def.as_ref().map(|d| d.id.clone()),
             cli_count: clis.len() as u32,
-            governed: crate::actor::in_process_governance().is_some(),
+            governed,
             entity_mode: match entity_mode {
                 EntityMode::Shared => "shared".to_string(),
                 EntityMode::Isolated => "isolated".to_string(),
@@ -469,6 +475,11 @@ pub(crate) fn plan_and_distribute(
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
     session_already_started: bool,
+    // Whether input governance is active. See pre_distribute's `governed` parameter — the call
+    // site supplies this value so neither pre_distribute nor plan_and_distribute read the
+    // GOV_DB_PATH thread-local internally. Pass in_process_governance().is_some() from the
+    // calling thread; the sync/test path correctly gets false when GOV_DB_PATH is not set.
+    governed: bool,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -483,6 +494,7 @@ pub(crate) fn plan_and_distribute(
         emit,
         workflow_registry,
         session_already_started,
+        governed,
     )?;
     let distributions =
         distribute::distribute_units_on(&pre.units, clis, session_id, None, dispatcher)?;

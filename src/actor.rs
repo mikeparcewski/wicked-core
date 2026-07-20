@@ -507,6 +507,7 @@ pub(crate) fn run(
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
                     true, // session stub already created + SessionStarted already emitted
+                    in_process_governance().is_some(), // keep governed accurate even when unused today
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -636,6 +637,7 @@ pub(crate) fn run(
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
                     true, // session stub already created + SessionStarted already emitted
+                    in_process_governance().is_some(), // keep governed accurate even when unused today
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
@@ -1398,6 +1400,7 @@ pub(crate) fn launch_run_inner(
         &mut |ev| emit(subscribers, ev),
         Some(registry),
         false, // stub not yet created — this path is campaign-driven, needs full setup
+        in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
     )?;
     match advance_or_pause(store, subscribers, runner, self_tx, &run_id, 0) {
         Ok(Progress::Dispatched) => {
