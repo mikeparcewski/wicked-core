@@ -168,6 +168,10 @@ pub(crate) enum Command {
         ord: u32,
         chunk: String,
     },
+    /// Internal: relay an arbitrary event from an off-actor thread through the single emit point.
+    /// Workers send this when they need to emit a structured event without holding a subscriber list
+    /// reference. The actor fans the event out to all subscribers on receipt.
+    EmitEvent(CoreEvent),
     // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────────────────────
     /// Open a PTY session running `cmd` (or the login shell if `None`) in `cwd`, sized `cols`x`rows`.
     /// The actor registers the session (id → status + `seq`) — single writer — and spawns the
