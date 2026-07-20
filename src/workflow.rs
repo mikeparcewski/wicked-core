@@ -149,6 +149,13 @@ pub trait StepRunner: Send + Sync {
     fn run_unit_streaming(&self, input: &StepInput, _emit: &DeltaSink) -> StepOutput {
         self.run_unit(input)
     }
+
+    /// Called by the actor when a run reaches a terminal state (Completed / Failed / Cancelled).
+    /// Runners that keep persistent sessions (ACP, PTY) close/kill them here so the CLI process
+    /// exits cleanly and does not leak. The default is a no-op — stateless runners need no change.
+    /// Fire-and-forget: implementations must not block the actor thread. Swallow channel-closed
+    /// errors silently — the run is already gone; a send failure is expected and harmless.
+    fn on_run_complete(&self, _run_id: &str) {}
 }
 
 /// The deterministic stub step — today's composition behavior (output = `stub-output for <desc>`),

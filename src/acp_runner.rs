@@ -848,6 +848,21 @@ impl StepRunner for AcpStepRunner {
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec_turn(input, emit)
     }
+
+    /// Close all ACP sessions for `run_id` so Claude processes don't leak after a run ends.
+    ///
+    /// Runs cleanup on a background thread — `on_run_complete` is called from the actor thread
+    /// (via `finalize_run`/`fail_run`/`cancel_run`). Dropping `AcpProcess` calls `kill()` +
+    /// `wait()` on the child process, which blocks. Doing that on the actor thread would stall
+    /// the entire actor while waiting for the subprocess to exit.
+    fn on_run_complete(&self, run_id: &str) {
+        let sessions = self.sessions.clone();
+        let run_id = run_id.to_string();
+        std::thread::spawn(move || {
+            let mut guard = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            guard.retain(|(rid, _), _| *rid != run_id);
+        });
+    }
 }
 
 // ── Registry helper ───────────────────────────────────────────────────────────

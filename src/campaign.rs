@@ -1099,7 +1099,7 @@ pub(crate) fn cancel(
     }
     persist(store, &mut campaign)?;
     for rid in &live {
-        let _ = crate::actor::cancel_run(store, subscribers, seams.self_tx, rid);
+        let _ = crate::actor::cancel_run(store, subscribers, seams.runner, seams.self_tx, rid);
         in_flight.remove(rid);
     }
     emit(
@@ -1380,7 +1380,7 @@ fn fail_fast(
     }
     persist(store, campaign)?;
     for rid in &live {
-        let _ = crate::actor::cancel_run(store, subscribers, seams.self_tx, rid);
+        let _ = crate::actor::cancel_run(store, subscribers, seams.runner, seams.self_tx, rid);
         in_flight.remove(rid);
     }
     Ok(())
