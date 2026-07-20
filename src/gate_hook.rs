@@ -1400,6 +1400,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Verify `collect_hook_decisions` correlation logic: annotation→claim pairing, graceful
+    /// degradation when an annotation is absent, and phase-isolation of stale annotations.
+    #[test]
+    fn collect_hook_decisions_correlates_tool_names_and_handles_edge_cases() {
+        let run_id = format!("chd-test-{}", std::process::id());
+        let path = decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_file(&path);
+
+        // Write an armed marker, a hook-fired sentinel, then three claim groups:
+        //   A) annotation(Bash, unit-1) + claim(Allow, unit-1) → tool name "Bash"
+        //   B) claim(Deny, unit-1) with NO annotation → tool name "(unknown)"
+        //   C) annotation(Write, unit-2) + claim(Allow, unit-2) → different phase, must NOT
+        //      leak into unit-1 results; a subsequent Allow on unit-1 also gets "(unknown)"
+        write_armed_marker(&path, "unit-1").unwrap();
+
+        // Sentinel (group A)
+        let sentinel = serde_json::json!({ HOOK_FIRED_KEY: "unit-1" }).to_string() + "\n";
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(sentinel.as_bytes()).unwrap();
+        }
+
+        // Group A: annotation + allow claim for unit-1
+        {
+            let ann = serde_json::json!({ TOOL_CALL_KEY: "Bash", TOOL_CALL_PHASE_KEY: "unit-1" })
+                .to_string()
+                + "\n";
+            let mut claim = allow_claim("a1", "unit-1");
+            let claim_line = serde_json::to_string(&claim).unwrap() + "\n";
+            let combined = ann + &claim_line;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(combined.as_bytes()).unwrap();
+        }
+
+        // Group B: deny claim for unit-1 with NO annotation — tool must degrade to "(unknown)"
+        {
+            let mut deny = allow_claim("d1", "unit-1");
+            deny.decision = Decision::Deny;
+            append_decision(&path, &deny).unwrap();
+        }
+
+        // Group C: annotation for unit-2 then allow for unit-1 — annotation MUST NOT leak
+        {
+            let ann = serde_json::json!({ TOOL_CALL_KEY: "Write", TOOL_CALL_PHASE_KEY: "unit-2" })
+                .to_string()
+                + "\n";
+            let claim = allow_claim("a2", "unit-1");
+            let claim_line = serde_json::to_string(&claim).unwrap() + "\n";
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(ann.as_bytes()).unwrap();
+            f.write_all(claim_line.as_bytes()).unwrap();
+        }
+
+        let records = collect_hook_decisions(&run_id, 0, "unit-1");
+        // A) annotation + allow → "Bash"
+        assert_eq!(records.len(), 3, "three claims for unit-1");
+        assert_eq!(
+            records[0].tool_name, "Bash",
+            "annotated claim gets tool name"
+        );
+        assert_eq!(records[0].decision, "allow");
+        assert!(records[0].denying_policy.is_none());
+        // B) deny without annotation → "(unknown)"
+        assert_eq!(
+            records[1].tool_name, "(unknown)",
+            "unannotated claim degrades to (unknown)"
+        );
+        assert_eq!(records[1].decision, "deny");
+        // C) annotation for unit-2 must not leak into the unit-1 claim that follows
+        assert_eq!(
+            records[2].tool_name, "(unknown)",
+            "annotation for a different phase must not attach to a unit-1 claim"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
     /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.
     fn allow_claim(id: &str, phase: &str) -> ConformanceClaim {
         ConformanceClaim {

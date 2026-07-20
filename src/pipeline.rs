@@ -304,20 +304,7 @@ pub(crate) fn pre_distribute(
 
     if let Some(def) = &selected_def {
         attach_pinned_validators(store, &mut units, def)?;
-        // (EVT-009) ValidationPinAttached — emit for every unit that received a pinned validator
-        // so the operator can confirm at plan time that the gate is actually armed with the
-        // correct pin and criterion. Emitted AFTER attach succeeds (fail-closed: we never reach
-        // this if the pin is missing from the vault or unapproved).
-        for u in &units {
-            if let Some(v) = &u.validator {
-                emit(CoreEvent::ValidationPinAttached {
-                    session: session_id.to_string(),
-                    ord: u.ord,
-                    pin: crate::validator_vault::pin(v),
-                    criterion: v.criterion.clone(),
-                });
-            }
-        }
+        // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
     }
 
     let collection_scope = match entity_mode {
@@ -383,6 +370,22 @@ pub(crate) fn pre_distribute(
             .to_string(),
         });
     }
+    // (EVT-009) ValidationPinAttached — emitted here, AFTER SessionStarted + UnitPlanned×n, so
+    // that consumers initialising per-session state on SessionStarted see events in the natural
+    // "session open → units planned → pins attached" order (Copilot).  Emitting before
+    // SessionStarted (the original position) created an ordering edge-case where the session was
+    // not yet "started" when the first pin event arrived.
+    for u in &units {
+        if let Some(v) = &u.validator {
+            emit(CoreEvent::ValidationPinAttached {
+                session: session_id.to_string(),
+                ord: u.ord,
+                pin: crate::validator_vault::pin(v),
+                criterion: v.criterion.clone(),
+            });
+        }
+    }
+
     session.status = SessionStatus::Distributing;
     put_node(store, session.to_node())?;
 
