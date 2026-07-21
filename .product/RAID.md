@@ -34,15 +34,15 @@ author: michael.parcewski@accenture.com
 
 | ID | Issue | Severity | Status |
 |---|---|---|---|
-| ISS-001 | Actor thread never terminates (`self_tx` held) — leaked thread + writable store handle per spawn | CRITICAL | Open — fix not yet merged |
-| ISS-002 | `apply_step_result` no idempotency/cursor guard — stale result double-applies a finished unit | HIGH | Open — fix not yet merged |
-| ISS-003 | Gate-hook opens SQLite READ-WRITE with no busy_timeout — spurious Deny under contention | HIGH | Open — fix not yet merged |
-| ISS-004 | Deny-mid-run leaves session Completed unconditionally | MEDIUM | Open — deferred, acceptable if documented |
-| ISS-005 | No cross-actor execution lease — two actors on same db can double-dispatch | MEDIUM | Blocked on ISS-001 |
-| ISS-006 | Distribution runs on actor thread — design claim "actor not frozen" is false for distribute window | HIGH | Open — fix or doc |
-| ISS-007 | P0 SQLITE_BUSY test is theater: never creates writer-writer contention; passes even without the fix | MEDIUM | Open — test needs strengthening |
-| ISS-008 | Resume test under-specifies from-cursor proof — correctness is incidental, not asserted | MEDIUM | Open — add `FastRunner` recording |
-| ISS-009 | Dual-cursor drift between `workflow.current_index` and `session.unit_ix` on denial — latent, will materialize in P4a | MEDIUM | Open — pull cursor unification forward |
+| ISS-001 | Actor thread never terminates (`self_tx` held) — leaked thread + writable store handle per spawn | CRITICAL | **RESOLVED** — `ShutdownGuard` (sends `Command::Shutdown` on last `Core` drop) + `Command::Shutdown` break in actor loop. Test: `actor_shuts_down_when_last_core_drops` in `tests/p1_reentrant.rs`. |
+| ISS-002 | `apply_step_result` no idempotency/cursor guard — stale result double-applies a finished unit | HIGH | **RESOLVED** — four guards in `apply_step_result` (`actor.rs:1997-2023`): terminal-status check → cursor mismatch → attempt guard (`output.attempt < session.attempt`) → unit-status Done check. Stale path returns `StepApplied::Stale` with no store write. |
+| ISS-003 | Gate-hook opens SQLite READ-WRITE with no busy_timeout — spurious Deny under contention | HIGH | **RESOLVED** — `gate_hook.rs` now uses `open_store_ro` (P4b, wicked-core#36 + wicked-estate#63): hook opens with `SQLITE_OPEN_READONLY`, no WAL/DDL, actor is sole writer. |
+| ISS-004 | Deny-mid-run leaves session Completed unconditionally | MEDIUM | **RESOLVED** — deny path drives `fail_run` (→ `SessionStatus::Failed`), never `finalize_run`. Proven by `sync_launch_halts_as_failed_on_a_governance_deny` in `tests/seam_findings.rs`. |
+| ISS-005 | No cross-actor execution lease — two actors on same db can double-dispatch | MEDIUM | **Mitigated** — ISS-001 is resolved (no leaked actors), so the two-actor scenario requires explicit misuse. OS-level file lock or per-session lease remains a recommended hardening; deferred. |
+| ISS-006 | Distribution runs on actor thread — design claim "actor not frozen" is false for distribute window | HIGH | **RESOLVED** — `distribute_units_on` called via `std::thread::spawn` in `ContinueLaunch`, `WorktreeReady`, and `ReassignUnit` handlers; actor thread is not blocked. |
+| ISS-007 | P0 SQLITE_BUSY test is theater: never creates writer-writer contention; passes even without the fix | MEDIUM | Open — test needs strengthening (writer-writer contention fixture). Deferred. |
+| ISS-008 | Resume test under-specifies from-cursor proof — correctness is incidental, not asserted | MEDIUM | **RESOLVED** — `tests/p1_reentrant.rs::engine_is_off_thread_guards_inflight_and_resumes_from_cursor` uses `FastRunner` (records dispatched `unit_ix` in a mutex vec) and asserts `*ran == vec![1]` at line 259-263: the resume dispatched only the remaining unit, not from 0. |
+| ISS-009 | Dual-cursor drift between `workflow.current_index` and `session.unit_ix` on denial — latent, will materialize in P4a | MEDIUM | Open — pull cursor unification forward. Deferred to P4a. |
 | ISS-010 | crates.io publication blocked by path dependency on `wicked-estate-store` and four `publish = false` vendored crates | LOW | Will resolve when estate is published |
 
 ## Decisions
