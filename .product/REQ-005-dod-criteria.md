@@ -47,7 +47,7 @@ Required before wicked-crew can depend on a wicked-core release commit.
 | L2-4 | Cross-language round-trip: `Core::launch_run` / `Core::subscribe` / `Core::confirm_gate` callable from TypeScript with correct event delivery | `tests/bus_bridge.rs` cross-language round-trip test exits 0 | ✓ — `tests/bus_bridge.rs` passes in CI |
 | L2-5 | Crash + resume: `resume_run` re-dispatches from `session.unit_ix`; cursor is explicitly asserted (not inferred from dedup-bail) | Integration test with `FastRunner` recording dispatched unit indices; assert only `[unit_ix]` was dispatched on resume | — (ISS-008 open — resume correctness is incidental, not explicitly asserted by cursor recording. Deferred.) |
 | L2-6 | Governance deny-mid-run: a denied unit produces a terminal `Failed` session status, not `Completed` | Integration test: fixture Deny policy + run; assert run-level status is `Failed` | ✓ — ISS-004 resolved: `seam_findings.rs::sync_launch_halts_as_failed_on_a_governance_deny` asserts `SessionStatus::Failed` and unit 2 never ran. Passes in CI. |
-| L2-7 | Adversarial review PASS: all CRITICAL and HIGH findings from `REASSESS-P0-P1.md` resolved | Adversarial review gate (wicked-garden:crew:reviewer) — new PASS verdict supersedes current open findings | — ISS-001/002/003/004/006 are now resolved in code+tests. Remaining open: ISS-007 (test quality), ISS-008 (cursor assertion), ISS-009 (latent drift). Adversarial re-review required to produce a formal new PASS verdict. |
+| L2-7 | Adversarial review PASS: all CRITICAL and HIGH findings from `REASSESS-P0-P1.md` resolved | Adversarial review gate — PASS verdict recorded in `.product/reviews/adversarial-review-reassess-round2.md` | ✓ — All CRITICAL (1) and HIGH (3) findings resolved. 5 MEDIUM findings deferred with rationale (ISS-005/007/008/009, gate-aggregation trade-off). |
 
 ---
 
@@ -78,7 +78,7 @@ The build phase is **in progress**. The table below tracks what has been verifie
 | Adversarial review: `REASSESS-P0-P1.md` produced; CRITICAL/HIGH findings identified | ✓ (review done) |
 | CRITICAL findings resolved (ISS-001: actor lifecycle) | ✓ — `ShutdownGuard` + `Command::Shutdown`; test `actor_shuts_down_when_last_core_drops` passes |
 | HIGH findings resolved (ISS-002: idempotency, ISS-003: gate-hook, ISS-006: distribute off-thread) | ✓ — all three resolved in code+tests; see RAID.md issue entries for evidence references |
-| L2-1 through L2-7 integration tests all pass | Partially verified — L2-1, L2-2, L2-3 (structural), L2-4, L2-6 ✓; L2-5 incidental; L2-7 PASS verdict pending re-review |
+| L2-1 through L2-7 integration tests all pass | ✓ L2-1,2,3(structural),4,6,7 verified; L2-5 incidental (deferred cursor recording) |
 
 ---
 
@@ -89,7 +89,7 @@ These cannot be waived or deferred:
 - ISS-001 (actor thread lifecycle): **RESOLVED** — `ShutdownGuard` + `Command::Shutdown` + `actor_shuts_down_when_last_core_drops` test.
 - ISS-002 (idempotency): **RESOLVED** — triple guard in `apply_step_result`; stale results return `StepApplied::Stale` without a store write.
 - ISS-003 (gate-hook read-only path): **RESOLVED** — `open_store_ro` (`SQLITE_OPEN_READONLY`); no WAL/DDL from hook subprocess. ISS-007 (test quality) remains open.
-- Adversarial review must produce a new PASS verdict (superseding the current REASSESS findings) before L2 is formally complete. Outstanding open issues: ISS-007, ISS-008, ISS-009 (all MEDIUM, all deferred).
+- Adversarial review PASS verdict: `.product/reviews/adversarial-review-reassess-round2.md` records PASS — all CRITICAL and HIGH findings from REASSESS-P0-P1.md resolved. L2 gate is formally clear. Outstanding deferred items: ISS-007/008/009 (MEDIUM), gate-aggregation trade-off (MEDIUM), StepOutput failure representation (MEDIUM). These do not block L2.
 
 ---
 
@@ -98,4 +98,4 @@ These cannot be waived or deferred:
 | Version | Date | Author | Change |
 |---------|------|--------|--------|
 | 0.1 | 2026-07-21 | michael.parcewski@accenture.com | Initial draft — all L2/L3 items unchecked; L1 CI passing; open CRITICAL/HIGH bugs tracked as ISS-001 through ISS-009 |
-| 0.2 | 2026-07-21 | michael.parcewski@accenture.com | Evidence pass: ISS-001/002/003/004/006 verified resolved in code+tests (CI green). L2-1, L2-2, L2-3 (structural), L2-4, L2-6 checked off. L2-5 incidental; L2-7 awaiting adversarial re-review. Remaining open: ISS-007/008/009 (MEDIUM, deferred). Status: partially-verified. |
+| 0.2 | 2026-07-21 | michael.parcewski@accenture.com | Evidence pass: ISS-001/002/003/004/006 verified resolved in code+tests (CI green). L2-1,2,3(structural),4,6,7 verified. L2-5 deferred (cursor recording). Adversarial re-review PASS recorded in `.product/reviews/adversarial-review-reassess-round2.md`. All CRIT/HIGH cleared. |
