@@ -2365,7 +2365,9 @@ pub(crate) fn confirm_gate(
                             CoreEvent::UnitReworkAmended {
                                 session: run_id.to_string(),
                                 ord: u.ord,
-                                amendment: a.clone(),
+                                // Move `a` — it is not used after this emit, avoiding an
+                                // unnecessary heap allocation (Gemini code review).
+                                amendment: a,
                                 updated_description: u.description.clone(),
                             },
                         );
