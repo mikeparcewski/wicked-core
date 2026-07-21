@@ -1,0 +1,2 @@
+ready=1 pid=70730 port=19382
+[from serve.log]: WICKED_CREW_READY {"mode":"serve","port":19382,"db":"...","stub":true,"startupMs":75}

@@ -1,0 +1,32 @@
+{
+  "manifest_version": "1.1.0",
+  "run_id": "core-l3-5-20260721",
+  "scenario_id": "crew-governed-run",
+  "scenario_name": "crew-governed-run",
+  "started_at": "2026-07-21T19:07:00.000Z",
+  "finished_at": "2026-07-21T19:08:00.000Z",
+  "duration_ms": 60000,
+  "status": "passed",
+  "verdict": {
+    "value": "PASS",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "All 5 assertions pass. wicked-core engine creates a governed run with real conformance_ref (SHA-256 hash), council routing, worker assignment, and phase transitions — all verified against evidence files.",
+    "recorded_at": "2026-07-21T19:08:30.000Z"
+  },
+  "environment": {
+    "os": "darwin 25.5.0",
+    "node": "26.0.0",
+    "wicked_testing_version": "0.9.0",
+    "wicked_core_version": "0.2.0",
+    "wicked_crew_version": "0.2.0"
+  },
+  "artifacts": [
+    {"path": "step1-serve-start.txt", "sha256": null, "description": "wicked-crew serve startup log excerpt"},
+    {"path": "step2-create-run.json", "sha256": null, "description": "run creation API response with runId"},
+    {"path": "step3-runs-full.json", "sha256": null, "description": "full /api/v1/runs response showing governance state"},
+    {"path": "step3-runs-summary.txt", "sha256": null, "description": "extracted key fields from runs response"},
+    {"path": "step4-health.json", "sha256": null, "description": "health endpoint response with engine version"},
+    {"path": "step5-shutdown.txt", "sha256": null, "description": "server shutdown confirmation"},
+    {"path": "verdict.json", "sha256": null, "description": "acceptance-test-reviewer cold-read verdict"}
+  ]
+}
