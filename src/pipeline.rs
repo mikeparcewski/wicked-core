@@ -180,7 +180,14 @@ pub(crate) fn resolve_workflow_def(
     // workflows. Falling through to a disk re-scan when `extra` is present would be redundant I/O
     // and could surface stale/inconsistent overlay files added after startup.
     if let Some(reg) = extra {
-        return Ok(reg.get(id).cloned());
+        // A requested-but-unknown id is a loud error here too — never a silent Ok(None) fallback.
+        // The actor-owned registry already contains built-ins + overlay workflows, so a miss is a
+        // real typo/invalid id, not a "not-yet-loaded" race.
+        return reg
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("workflow '{id}' not found in registry"))
+            .map(Some);
     }
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
