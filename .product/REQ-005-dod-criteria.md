@@ -26,7 +26,7 @@ Required on every PR and merge to main.
 |---|---|---|---|
 | L1-1 | `cargo fmt --all --check` exits 0 | CI `ci.yml` `cargo fmt --all --check` step | ✓ 2026-07-21 — `cargo fmt --all --check` exits 0 locally and in CI `check` job on every merged PR. |
 | L1-2 | `cargo clippy --workspace --all-targets -- -D warnings` exits 0 | CI `ci.yml` `cargo clippy` step | ✓ 2026-07-21 — `cargo clippy --workspace --all-targets -- -D warnings` exits 0 locally and in CI. |
-| L1-3 | `cargo build --workspace` exits 0 | CI `ci.yml` `cargo build --workspace` step | ✓ 2026-07-21 — `cargo build --workspace` exits 0 locally (Finished dev profile in 57.73s). CI passes on every merged PR. |
+| L1-3 | `cargo build --workspace` exits 0 | CI `ci.yml` `cargo build --workspace` step | ✓ 2026-07-21 — `cargo build --workspace` exits 0 locally and in CI `check` job on every merged PR. |
 | L1-4 | `cargo test --workspace` exits 0 on ubuntu-latest | CI `ci.yml` `cargo test --workspace` step | ✓ 2026-07-21 — CI `check` job passes on every merged PR. All L2 integration tests verified. |
 | L1-5 | `cargo build --features postgres` exits 0 (backend compile-parity) | CI `ci.yml` backend compile step | ✓ 2026-07-21 — CI `check` job includes `cargo build --features postgres` step; passes on every merged PR. |
 | L1-6 | napi bindings build: `napi-release.yml` runs `npx napi build --platform --release` for 5 targets (macOS x64/arm64, Linux x64/arm64, Windows x64) | CI `napi-release.yml` build matrix (triggered on version tags) | ✓ 2026-07-21 — `napi-release.yml` build matrix present for all 5 targets; runs on version tags. v0.1.0 bindings shipped via this workflow. |
