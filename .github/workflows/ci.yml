@@ -32,8 +32,12 @@ env:
 
 jobs:
   check:
-    name: fmt · clippy · build · test
-    runs-on: ubuntu-latest
+    name: fmt · clippy · build · test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     defaults:
       run:
         working-directory: wicked-core
