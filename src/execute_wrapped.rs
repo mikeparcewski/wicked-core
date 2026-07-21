@@ -463,25 +463,55 @@ fn resolve_wicked_core_exe() -> String {
         }
     }
     // 3. PATH lookup.
-    if let Ok(found) = which_wicked_core() {
+    if let Ok(found) = which_binary("wicked-core") {
         return found;
     }
     // 4. Bare name — will work if wicked-core is on PATH at hook time.
     "wicked-core".to_string()
 }
 
-/// Locate `wicked-core` on PATH using the same search the shell would do.
-fn which_wicked_core() -> Result<String, ()> {
+/// Locate `wicked-estate-mcp` binary for injecting estate tools into governed workers.
+/// Priority: sibling of wicked-core binary → user-local install → cargo → PATH.
+fn resolve_estate_mcp_exe() -> String {
+    // 1. Sibling of the wicked-core binary (monorepo dev: target/release/).
+    if let Ok(path) = std::env::current_exe() {
+        let is_node = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "node" || n == "node.exe")
+            .unwrap_or(false);
+        if !is_node {
+            if let Some(parent) = path.parent() {
+                let sibling = parent.join(if cfg!(windows) {
+                    "wicked-estate-mcp.exe"
+                } else {
+                    "wicked-estate-mcp"
+                });
+                if sibling.exists() {
+                    return sibling.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    // 2. User-local install / cargo / PATH.
+    if let Ok(found) = which_binary("wicked-estate-mcp") {
+        return found;
+    }
+    "wicked-estate-mcp".to_string()
+}
+
+/// Locate a binary on PATH using the same search the shell would do.
+fn which_binary(name: &str) -> Result<String, ()> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     let exe_name = if cfg!(windows) {
-        "wicked-core.exe"
+        format!("{name}.exe")
     } else {
-        "wicked-core"
+        name.to_string()
     };
     for dir in path_var.split(if cfg!(windows) { ';' } else { ':' }) {
-        let candidate = std::path::Path::new(dir).join(exe_name);
+        let candidate = std::path::Path::new(dir).join(&exe_name);
         if candidate.is_file() {
-            if let Ok(s) = candidate.to_str().map(|s| s.to_string()).ok_or(()) {
+            if let Some(s) = candidate.to_str().map(|s| s.to_string()) {
                 return Ok(s);
             }
         }
@@ -534,11 +564,22 @@ fn arm_input_governance(
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
+    // Include the wicked-estate MCP server so governed workers have access to the 23 estate tools
+    // (graph-view, code-graph, memory recall, etc.). The db_path comes from GovernanceContext —
+    // the same store the gate-hook uses — so no separate lookup is needed. Using the resolved exe
+    // directory to find wicked-estate-mcp avoids hardcoding a PATH dependency.
+    let estate_mcp_exe = resolve_estate_mcp_exe();
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
                 { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
             ]
+        },
+        "mcpServers": {
+            "wicked-estate": {
+                "command": estate_mcp_exe,
+                "args": ["--db", &gov.db_path]
+            }
         }
     });
     let dir = decisions_path
