@@ -1,6 +1,6 @@
 [package]
 name = "wicked-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "In-process composition runtime for the wicked-estate core services: a single-writer store actor + command API + live event stream that the agent, UI, and MCP servers compose through, instead of each re-opening and racing on the shared SQLite file."
