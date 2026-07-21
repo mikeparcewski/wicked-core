@@ -58,7 +58,7 @@ Required for crates.io publication and a stable semver version tag.
 | # | Criterion | How Verified | Verified |
 |---|---|---|---|
 | L3-1 | Path dependencies resolved: `wicked-estate-store` published to crates.io; vendored `publish = false` crates removed or published | `cargo publish --dry-run` exits 0 | — (blocked on estate publication) |
-| L3-2 | Multi-platform CI: `cargo test` passes on ubuntu-latest + macos-latest + windows-latest | CI matrix extended to include macOS/Windows | ✓ (pending CI run) 2026-07-21 — `.github/workflows/ci.yml` `check` job extended to matrix `[ubuntu-latest, macos-latest, windows-latest]`. Unix-gated tests (`p2_worker_lifecycle.rs`, `operator_api.rs`) carry `#[cfg(unix)]` so they skip cleanly on Windows. Criterion fully ✓ once macOS + Windows legs confirm green on this PR. |
+| L3-2 | Multi-platform CI: `cargo test` passes on ubuntu-latest + macos-latest + windows-latest | CI matrix extended to include macOS/Windows | ✓ 2026-07-21 — `.github/workflows/ci.yml` `check` job extended to matrix `[ubuntu-latest, macos-latest, windows-latest]`. All 3 legs passed on PR #103 (ubuntu SUCCESS, macOS SUCCESS, windows SUCCESS). Unix-gated tests (`p2_worker_lifecycle.rs`, `operator_api.rs`) carry `#[cfg(unix)]` so they skip cleanly on Windows. |
 | L3-3 | Semver: `Cargo.toml` version ≥ 0.2.0; all open ISS-* items resolved or explicitly deferred with documented rationale | Manual gate + CHANGELOG.md entry | — |
 | L3-4 | `CHANGELOG.md` entry exists for the release version | File inspection | — |
 | L3-5 | wicked-testing acceptance pipeline: PASS verdict against a real governed wicked-crew run driven by this version of wicked-core | `.wicked-testing/evidence/` with `verdict: PASS` | — |
