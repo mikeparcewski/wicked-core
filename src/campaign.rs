@@ -55,6 +55,11 @@ pub struct RunSpec {
     /// The registered repo the node's Run targets, if any (creates an isolated worktree).
     #[serde(default)]
     pub repo_ref: Option<String>,
+    /// The registered `WorkflowDef` id this node's Run follows (e.g. `"feature"` / `"bug"`). When
+    /// set, planning is DATA-DRIVEN (phases from the def); `None` falls back to the free-text planner.
+    /// `#[serde(default)]` so existing serialised `CampaignDef`s without the field deserialise as `None`.
+    #[serde(default)]
+    pub workflow_id: Option<String>,
 }
 
 impl RunSpec {
@@ -67,7 +72,7 @@ impl RunSpec {
             session_id: run_id,
             human_confirm: self.human_confirm,
             repo_ref: self.repo_ref.clone(),
-            workflow: None, // campaign nodes plan free-text today; a per-node WorkflowDef is future work
+            workflow: self.workflow_id.clone(),
         }
     }
 }
@@ -1501,6 +1506,7 @@ mod tests {
                 entity_mode: EntityMode::Shared,
                 human_confirm: HumanConfirm::None,
                 repo_ref: None,
+                workflow_id: None,
             },
         }
     }
@@ -1774,6 +1780,40 @@ mod tests {
         ));
         assert_eq!(back.def.nodes.len(), 2);
         assert_eq!(back.def.max_concurrency, 2);
+    }
+
+    // ── SC-C10 — workflow_id passthrough: RunSpec with workflow_id → LaunchSpec.workflow set ──
+    #[test]
+    fn run_spec_to_launch_spec_passes_workflow_id_through() {
+        let spec_with = RunSpec {
+            problem: "implement feature X".into(),
+            clis: vec![],
+            entity_mode: EntityMode::Shared,
+            human_confirm: HumanConfirm::None,
+            repo_ref: None,
+            workflow_id: Some("feature".into()),
+        };
+        let ls = spec_with.to_launch_spec("run-abc".into());
+        assert_eq!(
+            ls.workflow,
+            Some("feature".into()),
+            "workflow_id should be propagated to LaunchSpec.workflow"
+        );
+        assert_eq!(ls.session_id, "run-abc");
+
+        let spec_without = RunSpec {
+            problem: "do something".into(),
+            clis: vec![],
+            entity_mode: EntityMode::Shared,
+            human_confirm: HumanConfirm::None,
+            repo_ref: None,
+            workflow_id: None,
+        };
+        let ls_none = spec_without.to_launch_spec("run-xyz".into());
+        assert_eq!(
+            ls_none.workflow, None,
+            "absent workflow_id should yield LaunchSpec.workflow = None"
+        );
     }
 
     #[test]
