@@ -183,11 +183,12 @@ pub(crate) fn resolve_workflow_def(
         // A requested-but-unknown id is a loud error here too — never a silent Ok(None) fallback.
         // The actor-owned registry already contains built-ins + overlay workflows, so a miss is a
         // real typo/invalid id, not a "not-yet-loaded" race.
-        return reg
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("workflow '{id}' not found in registry"))
-            .map(Some);
+        return reg.get(id).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown workflow `{id}` — known workflows: {}",
+                reg.ids().join(", ")
+            )
+        }).map(Some);
     }
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
@@ -881,6 +882,36 @@ mod resolve_tests {
         assert!(
             err.contains("unknown workflow") && err.contains("feaure-typo-xyz"),
             "error must name the bad id: {err}"
+        );
+    }
+
+    #[test]
+    fn workflow_selection_with_actor_registry() {
+        use crate::workflow::WorkflowRegistry;
+        let reg = WorkflowRegistry::with_defaults();
+
+        // Known id in actor registry resolves to def.
+        assert_eq!(
+            resolve_workflow_def(Some("feature"), Some(&reg))
+                .unwrap()
+                .unwrap()
+                .id,
+            "feature"
+        );
+        // No selection (None) with actor registry still returns None.
+        assert!(resolve_workflow_def(None, Some(&reg)).unwrap().is_none());
+        // Unknown id with actor registry returns Err (not silent Ok(None)).
+        let err = resolve_workflow_def(Some("feaure-typo"), Some(&reg))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown workflow") && err.contains("feaure-typo"),
+            "error must name the bad id and say 'unknown workflow': {err}"
+        );
+        // Error message lists known workflow ids.
+        assert!(
+            err.contains("feature"),
+            "error must list known workflows: {err}"
         );
     }
 
