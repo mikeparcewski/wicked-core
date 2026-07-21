@@ -31,7 +31,7 @@ All CRITICAL and HIGH findings from REASSESS-P0-P1.md are resolved in the curren
 
 **Status: RESOLVED**
 
-`actor.rs:1997-2023` — three stale-result guards before any store write:
+`actor.rs:1997-2023` — four stale-result guards before any store write:
 1. Terminal status check: `if matches!(session.status, Completed | Cancelled | Failed) → StepApplied::Stale`
 2. Cursor mismatch: `if output.unit_ix != session.unit_ix → StepApplied::Stale`
 3. Attempt guard: `if output.attempt < session.attempt → StepApplied::Stale`
@@ -103,9 +103,9 @@ The drift is latent — `resume_run` reads `session.unit_ix` (not `workflow.curr
 
 ### [MEDIUM] Resume test under-specifies cursor proof
 
-**Status: Open (ISS-008)**
+**Status: RESOLVED (ISS-008)**
 
-`tests/p1_reentrant.rs` proves resume correctness only incidentally (dedup-bail would catch a from-0 re-run via an error path, not a direct assertion). Fix: instrument `FastRunner` to record dispatched `unit_ix` values, then assert exactly `[1]` on resume. Deferred.
+`tests/p1_reentrant.rs::engine_is_off_thread_guards_inflight_and_resumes_from_cursor` uses `FastRunner` (records dispatched `unit_ix` in a mutex vec, lines 67-76) and asserts `*ran.lock().unwrap() == vec![1]` at lines 259-263. The resume dispatched only the remaining unit — not a from-0 re-run. This is an explicit cursor proof, not an incidental dedup-bail. CI passes.
 
 ---
 
@@ -133,7 +133,7 @@ The drift is latent — `resume_run` reads `session.unit_ix` (not `workflow.curr
 |----------|-------|----------|---------------|
 | CRITICAL | 1 | 1 ✓ | 0 |
 | HIGH | 3 | 3 ✓ | 0 |
-| MEDIUM | 8 | 3 ✓ | 5 (all deferred with rationale) |
+| MEDIUM | 8 | 4 ✓ | 4 (all deferred with rationale) |
 | LOW | 2 | N/A | Verified safe or no change required |
 
-**L2-7 gate: PASS** — all CRITICAL and HIGH findings resolved. Remaining MEDIUM findings are tracked as ISS-007/008/009 (deferred), ISS-005 (mitigated), and two acknowledged design trade-offs with no active incorrect behavior today.
+**L2-7 gate: PASS** — all CRITICAL and HIGH findings resolved; ISS-008 (resume cursor proof) also resolved. Remaining MEDIUM findings are tracked as ISS-007/009 (deferred), ISS-005 (mitigated), and two acknowledged design trade-offs with no active incorrect behavior today.
