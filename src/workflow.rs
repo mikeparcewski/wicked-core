@@ -1027,7 +1027,12 @@ mod workflow_def_tests {
     #[test]
     fn shipped_onboarding_drop_in_workflows_load_and_validate() {
         let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        for name in ["survey-repo", "repo-graph", "domain-graph-slice", "memories"] {
+        for name in [
+            "survey-repo",
+            "repo-graph",
+            "domain-graph-slice",
+            "memories",
+        ] {
             let path = workflows_dir.join(format!("{name}.json"));
             let def = WorkflowRegistry::def_from_file(&path)
                 .unwrap_or_else(|e| panic!("{name}.json must parse + validate: {e}"));
