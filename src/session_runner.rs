@@ -205,6 +205,16 @@ impl StepRunner for PersistentStepRunner {
             }
         });
     }
+
+    /// Purge the per-run session cache entry on reassignment so a subsequent dispatch to the same
+    /// `run_id` opens a fresh PTY instead of reusing the now-closed one.
+    ///
+    /// The terminal is already closed by the actor via `finish_terminal` before this is called,
+    /// so we only remove the stale cache entry — no `CloseTerminal` command is sent here.
+    fn close_cli_session(&self, run_id: &str, _cli_key: &str) {
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(run_id);
+    }
 }
 
 impl PersistentStepRunner {

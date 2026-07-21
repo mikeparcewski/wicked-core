@@ -1381,7 +1381,7 @@ pub(crate) fn run(
                     .clone()
                     .unwrap_or_else(|| "claude".to_string());
                 // ── close the PTY session (if any) ──────────────────────────────────────────
-                if let Some(session_entries) = run_sessions.get(&run_id).cloned() {
+                if let Some(session_entries) = run_sessions.remove(&run_id) {
                     for (cli_key, terminal_id) in &session_entries {
                         emit(
                             &mut subscribers,
@@ -1398,27 +1398,18 @@ pub(crate) fn run(
                             terminal_id,
                             true,
                         );
-                        // Remove from our index (finish_terminal emits TerminalExited which
-                        // would try to clean up too, but the entry is already removed here).
-                        if let Some(v) = run_sessions.get_mut(&run_id) {
-                            v.retain(|(_, tid)| tid != terminal_id);
-                        }
                         eprintln!(
                             "[wicked-core] reassign: closed PTY session {terminal_id} \
                              ({cli_key}) for run {run_id}"
                         );
                     }
-                    run_sessions.remove(&run_id);
                 }
-                // ── close ACP session on a background thread (may block on process exit) ────
-                {
-                    let runner_clone = runner.clone();
-                    let run_id_clone = run_id.clone();
-                    let prev_cli_clone = previous_cli.clone();
-                    std::thread::spawn(move || {
-                        runner_clone.close_cli_session(&run_id_clone, &prev_cli_clone);
-                    });
-                }
+                // ── drop the runner-internal session cache entry ─────────────────────────────
+                // `AcpStepRunner::close_cli_session` already spawns its own background thread
+                // (blocking kill+wait is safe there); calling directly here avoids an extra hop.
+                // `PersistentStepRunner::close_cli_session` just removes from its sessions map
+                // (non-blocking — the terminal was already killed by `finish_terminal` above).
+                runner.close_cli_session(&run_id, &previous_cli);
                 // ── bump attempt ────────────────────────────────────────────────────────────
                 let new_attempt = session.attempt.saturating_add(1);
                 {
@@ -1432,10 +1423,13 @@ pub(crate) fn run(
                 // ── when new_cli: None, re-run the council asynchronously ─────────────────
                 match new_cli {
                     Some(cli) => {
-                        // Update the unit's assigned_cli in the store.
+                        // Update the unit's assigned_cli in the store and clear
+                        // assigned_invocation so the runner re-resolves from the registry —
+                        // the new CLI's invocation template may differ from the previous one.
                         let mut updated_units = units.clone();
                         if let Some(u) = updated_units.get_mut(session.unit_ix) {
                             u.assigned_cli = Some(cli.clone());
+                            u.assigned_invocation = None;
                             if let Err(e) = crate::domain::put_node(&mut store, u.to_node()) {
                                 let _ = reply.send(Err(e));
                                 continue;
@@ -1575,6 +1569,9 @@ pub(crate) fn run(
                 if let Some(u) = units.get_mut(session.unit_ix) {
                     if u.ord == ord {
                         u.assigned_cli = Some(new_cli);
+                        // Clear assigned_invocation so the runner re-resolves the invocation
+                        // template from the registry for the newly assigned CLI.
+                        u.assigned_invocation = None;
                         if let Err(e) = crate::domain::put_node(&mut store, u.to_node()) {
                             let _ = reply.send(Err(e));
                             continue;
