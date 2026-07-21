@@ -68,6 +68,10 @@ Record: the full JSON response (must contain `runId`).
 
 ### Step 3 — List runs and verify governance state
 
+> **Note:** Step 1 removes the DB file (`rm -f "$DB"`) before starting the server, so
+> the run list always contains exactly the one run created in Step 2. The script reads
+> `runs[0]` safely because no prior state can leak in.
+
 ```bash
 PORT=19382
 RUNS=$(curl -s "http://localhost:$PORT/api/v1/runs")
@@ -120,7 +124,7 @@ Record: `shutdown=ok`.
 
 - **A1** (Step 1): `ready=1` — wicked-crew serve started successfully with wicked-core engine.
 - **A2** (Step 2): Response contains `runId` with a non-empty UUID — the engine created a run entry.
-- **A3** (Step 3): `run_count >= 1`, `status` is one of `{executing, planning, distributing, completed}`, `conformance_ref_len >= 32` — the engine applied conformance governance (non-zero ref = governance hash recorded).
+- **A3** (Step 3): `run_count >= 1`, `status` is one of `{executing, planning, distributing, completed}`, `conformance_ref_len >= 64` — the engine applied conformance governance (SHA-256 hex digest = 64 chars; anything shorter would indicate a placeholder or truncated value).
 - **A4** (Step 3): `assigned_cli` is non-empty (e.g. `claude`, `agy`) — the engine assigned a worker to the run.
 - **A5** (Step 4): `version` is `0.2.0` — confirming this is the expected wicked-core engine version.
 
