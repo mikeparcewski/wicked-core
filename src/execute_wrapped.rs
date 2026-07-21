@@ -433,6 +433,94 @@ fn quote_exe_command(exe: &str) -> String {
     }
 }
 
+/// Resolve the absolute path to the `wicked-core` binary for the gate-hook command.
+///
+/// When wicked-core is loaded as a napi-rs native addon inside Node.js (the wicked-crew TS
+/// layer), `std::env::current_exe()` returns the Node.js binary path. Using that would produce
+/// a hook command like `'/opt/homebrew/bin/node' gate-hook` that Node.js would try to
+/// `require('gate-hook')` — always failing. Resolution order:
+///
+/// 1. `$WICKED_CORE_EXE` — explicit daemon override (the daemon sets this to its own path).
+/// 2. `current_exe()` if its filename is not `node` or `node.exe` (native non-addon launch).
+/// 3. PATH lookup of `wicked-core` — fallback for installs that put the binary on PATH.
+/// 4. Bare `"wicked-core"` string — last resort; will fail at hook time if not on PATH.
+fn resolve_wicked_core_exe() -> String {
+    // 1. Operator override — trim so trailing whitespace/newlines don't break the hook command.
+    if let Ok(v) = std::env::var("WICKED_CORE_EXE") {
+        let trimmed = v.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+    // 2. current_exe() — valid unless it is the Node.js interpreter.
+    if let Ok(path) = std::env::current_exe() {
+        let is_node = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            // Case-insensitive: Windows may report Node.exe / NODE.EXE.
+            .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
+            .unwrap_or(false);
+        if !is_node {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    // 3. PATH lookup.
+    if let Ok(found) = which_binary("wicked-core") {
+        return found;
+    }
+    // 4. Bare name — last resort; works if wicked-core is on PATH at hook-execution time.
+    "wicked-core".to_string()
+}
+
+/// Locate `wicked-estate-mcp` binary for injecting estate tools into governed workers.
+/// Priority: sibling of wicked-core binary → user-local install → cargo → PATH.
+fn resolve_estate_mcp_exe() -> String {
+    // 1. Sibling of the wicked-core binary (monorepo dev: target/release/).
+    if let Ok(path) = std::env::current_exe() {
+        let is_node = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
+            .unwrap_or(false);
+        if !is_node {
+            if let Some(parent) = path.parent() {
+                let sibling = parent.join(if cfg!(windows) {
+                    "wicked-estate-mcp.exe"
+                } else {
+                    "wicked-estate-mcp"
+                });
+                if sibling.exists() {
+                    return sibling.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    // 2. User-local install / cargo / PATH.
+    if let Ok(found) = which_binary("wicked-estate-mcp") {
+        return found;
+    }
+    "wicked-estate-mcp".to_string()
+}
+
+/// Locate a binary on PATH using the same search the shell would do.
+fn which_binary(name: &str) -> Result<String, ()> {
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let exe_name = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&exe_name);
+        if candidate.is_file() {
+            if let Some(s) = candidate.to_str().map(|s| s.to_string()) {
+                return Ok(s);
+            }
+        }
+    }
+    Err(())
+}
+
 /// What the launcher sets on the wrapped CLI's `Command` to arm INPUT governance. Scope/phase are set as
 /// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
 /// metacharacters.
@@ -463,19 +551,38 @@ fn arm_input_governance(
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
     let decisions_path = crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "wicked-core".to_string());
+    // Resolve the wicked-core binary path for the gate-hook command.
+    //
+    // When wicked-core runs as a napi-rs addon loaded by Node.js (the wicked-crew TS layer),
+    // `std::env::current_exe()` returns the Node.js binary — which would produce a hook command
+    // like `'/opt/homebrew/bin/node' gate-hook` that Node then tries to require() as a module.
+    // Resolution order:
+    //   1. $WICKED_CORE_EXE — explicit override from the daemon's process environment
+    //   2. current_exe() — if it does not end with "node"/"node.exe" (i.e., not the napi addon path)
+    //   3. PATH lookup of "wicked-core" — covers cargo-install and wicked-crew npm-install scenarios
+    //   4. Bare "wicked-core" — last resort; works if the binary is on PATH at hook-execution time
+    let exe = resolve_wicked_core_exe();
     // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the exe is
     // interpolated (scope/phase go via env). Quote it per-platform so a `$`/backtick in the install path
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
+    // Include the wicked-estate MCP server so governed workers have access to the 23 estate tools
+    // (graph-view, code-graph, memory recall, etc.). The db_path comes from GovernanceContext —
+    // the same store the gate-hook uses — so no separate lookup is needed. Using the resolved exe
+    // directory to find wicked-estate-mcp avoids hardcoding a PATH dependency.
+    let estate_mcp_exe = resolve_estate_mcp_exe();
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
                 { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
             ]
+        },
+        "mcpServers": {
+            "wicked-estate": {
+                "command": estate_mcp_exe,
+                "args": ["--db", &gov.db_path]
+            }
         }
     });
     let dir = decisions_path
