@@ -1250,11 +1250,18 @@ pub(crate) fn run(
                 use std::io::Write;
                 let sessions = run_sessions.get(&run_id).cloned().unwrap_or_default();
                 if sessions.is_empty() {
-                    eprintln!(
-                        "[wicked-core] inject: run {run_id} has no active PTY sessions \
-                         (ACP-only or not yet started); skipping"
-                    );
-                    let _ = reply.send(Ok(()));
+                    if matches!(&target, InjectTarget::Cli(_)) {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "run {run_id} has no active PTY sessions; \
+                             targeted inject requires at least one open PTY"
+                        )));
+                    } else {
+                        eprintln!(
+                            "[wicked-core] inject: run {run_id} has no active PTY sessions \
+                             (ACP-only or not yet started); skipping"
+                        );
+                        let _ = reply.send(Ok(()));
+                    }
                     continue;
                 }
                 let target_str = match &target {
@@ -1264,7 +1271,7 @@ pub(crate) fn run(
                 let msg_bytes = format!("{message}\n");
                 let mut emitted = false;
                 for (cli_key, terminal_id) in &sessions {
-                    let matches = matches!(target, InjectTarget::All)
+                    let matches = matches!(&target, InjectTarget::All)
                         || matches!(&target, InjectTarget::Cli(k) if k == cli_key);
                     if !matches {
                         continue;
@@ -1305,6 +1312,12 @@ pub(crate) fn run(
                     }
                 }
                 if !emitted {
+                    if matches!(&target, InjectTarget::Cli(_)) {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "no active PTY session matching cli '{target_str}' for run {run_id}"
+                        )));
+                        continue;
+                    }
                     eprintln!(
                         "[wicked-core] inject: no matching PTY session found for run {run_id} \
                          target {target_str}"
@@ -1452,6 +1465,15 @@ pub(crate) fn run(
                                 let _ = reply.send(Ok(()));
                             }
                             Err(e) => {
+                                // Wedge prevention: dispatch failed, so no worker will ever
+                                // post ApplyStepResult. Mark the run Failed and surface the error.
+                                in_flight.remove(&run_id);
+                                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id)
+                                {
+                                    s.status = SessionStatus::Failed;
+                                    let _ = put_node(&mut store, s.to_node());
+                                }
+                                emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{e}"));
                                 let _ = reply.send(Err(e));
                             }
                         }
@@ -1515,10 +1537,14 @@ pub(crate) fn run(
                                     });
                                 }
                                 Err(e) => {
-                                    eprintln!(
-                                        "[wicked-core] reassign council for run {run_id_c} \
-                                         ord={ord_c} failed: {e}"
-                                    );
+                                    // Post PlanFailed so the actor thread marks the run Failed
+                                    // and emits the error event — prevents a permanent wedge.
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: run_id_c,
+                                        error: format!(
+                                            "reassign council re-run failed for ord={ord_c}: {e}"
+                                        ),
+                                    });
                                 }
                             }
                         });
@@ -1567,6 +1593,13 @@ pub(crate) fn run(
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
+                        // Wedge prevention: no worker will post ApplyStepResult on failure.
+                        in_flight.remove(&run_id);
+                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                            s.status = SessionStatus::Failed;
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                        emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{e}"));
                         let _ = reply.send(Err(e));
                     }
                 }
