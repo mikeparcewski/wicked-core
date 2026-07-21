@@ -183,12 +183,16 @@ pub(crate) fn resolve_workflow_def(
         // A requested-but-unknown id is a loud error here too — never a silent Ok(None) fallback.
         // The actor-owned registry already contains built-ins + overlay workflows, so a miss is a
         // real typo/invalid id, not a "not-yet-loaded" race.
-        return reg.get(id).cloned().ok_or_else(|| {
-            anyhow::anyhow!(
-                "unknown workflow `{id}` — known workflows: {}",
-                reg.ids().join(", ")
-            )
-        }).map(Some);
+        return reg
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown workflow `{id}` — known workflows: {}",
+                    reg.ids().join(", ")
+                )
+            })
+            .map(Some);
     }
     let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
     if let Some(dir) = workflow_overlay_dir() {
