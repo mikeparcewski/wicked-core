@@ -16,7 +16,7 @@ wicked-core is the **in-process composition runtime** for the wicked-* ecosystem
 things:
 
 1. **Single-writer `StoreActor`** — one thread owns the SQLite write lock, eliminating in-process
-   `SQLITE_BUSY` races. All write consumers hold a clonable `Core` handle that issues typed
+   `SQLITE_BUSY` races. All write consumers hold a cloneable `Core` handle that issues typed
    `Command`s with oneshot replies.
 2. **Live event stream** — `Core::subscribe()` fans out `CoreEvent`s to any number of subscribers.
    No polling.
@@ -38,7 +38,7 @@ unpublished `wicked-estate-store` 0.13, plus four vendored engine crates marked 
 
 ---
 
-## Core user flows
+## Core user flows (4)
 
 ### Flow 1 — Start a governed run
 1. The wicked-crew daemon calls `core.launch_run(RunSpec)` via the napi bindings.
@@ -55,14 +55,13 @@ unpublished `wicked-estate-store` 0.13, plus four vendored engine crates marked 
    `CoreEvent::GateDenied`, halting further dispatch for that unit.
 3. The gate-hook subprocess (invoked by the CLI tool during a wrapped run) writes claims to an
    append-only `decisions.ndjson`; the actor drains and applies them via `Command::ApplyHookDecisions`.
-   The hook never opens the SQLite file directly.
+   The hook is designed to never open the SQLite file directly (ISS-003: current implementation opens it read-write — this is an open bug tracked in RAID.md).
 
 ### Flow 3 — Crash recovery + resume
 1. The wicked-crew daemon detects a missing session and calls `core.resume_run(run_id)`.
 2. The actor reads the persisted cursor (`session.unit_ix`, `exec_phase`) from the estate store and
    re-dispatches from the last safe point.
-3. Idempotency is enforced by attempt-scoped event IDs — duplicate `StepResult` messages for an
-   already-applied unit are detected and discarded.
+3. Idempotency via attempt-scoped event IDs is the target design — duplicate `StepResult` messages for an already-applied unit should be detected and discarded (ISS-002: the guard is not yet implemented in `apply_step_result` — tracked in RAID.md).
 
 ### Flow 4 — HITL gate (human-in-the-loop)
 1. The actor sets `run.status = AwaitingHuman` and emits `CoreEvent::AwaitingHuman { run, stage_ix, prompt }`.

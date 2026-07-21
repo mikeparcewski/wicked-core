@@ -71,7 +71,7 @@ cargo test
 
 **Trigger:** Pull requests + pushes to `main`
 
-**Steps:** `cargo fmt --check` → `cargo clippy -D warnings` → `cargo build` → `cargo test`
+**Steps:** `cargo fmt --all --check` → `cargo clippy --workspace --all-targets -- -D warnings` → `cargo build --workspace` → `cargo test --workspace` → `cargo build --features postgres` (backend compile-parity); plus a separate `postgres-parity` job that provisions a real Postgres and runs the store round-trip
 
 **Platform:** `ubuntu-latest` (single platform; no macOS/Windows matrix today)
 
