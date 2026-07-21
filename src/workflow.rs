@@ -1028,6 +1028,7 @@ mod workflow_def_tests {
     fn shipped_onboarding_drop_in_workflows_load_and_validate() {
         let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
         for name in [
+            "chat",
             "survey-repo",
             "repo-graph",
             "domain-graph-slice",
