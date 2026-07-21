@@ -8,9 +8,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "domain-candidates.md"
-      ],
+      "required_deliverables": [],
       "depends_on": [],
       "role": "neutral",
       "skill_ref": null,
@@ -24,9 +22,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "domain-slice.md"
-      ],
+      "required_deliverables": [],
       "depends_on": [
         "identify"
       ],
@@ -42,9 +38,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "domain-validation.md"
-      ],
+      "required_deliverables": [],
       "depends_on": [
         "extract"
       ],

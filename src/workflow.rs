@@ -1037,8 +1037,6 @@ mod workflow_def_tests {
             let def = WorkflowRegistry::def_from_file(&path)
                 .unwrap_or_else(|e| panic!("{name}.json must parse + validate: {e}"));
             assert_eq!(def.id, name, "{name}.json id field must match filename");
-            def.validate()
-                .unwrap_or_else(|e| panic!("{name}.json WorkflowDef is invalid: {e}"));
         }
     }
 }

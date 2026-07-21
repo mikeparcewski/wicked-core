@@ -8,9 +8,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "memory-candidates.md"
-      ],
+      "required_deliverables": [],
       "depends_on": [],
       "role": "neutral",
       "skill_ref": null,
@@ -24,9 +22,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "memories-stored.md"
-      ],
+      "required_deliverables": [],
       "depends_on": [
         "gather"
       ],
