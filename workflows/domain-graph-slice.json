@@ -1,0 +1,51 @@
+{
+  "id": "domain-graph-slice",
+  "phases": [
+    {
+      "id": "identify",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "extract",
+      "kind": "build",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "identify"
+      ],
+      "role": "creator",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "validate",
+      "kind": "review",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "extract"
+      ],
+      "role": "evaluator",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    }
+  ]
+}
