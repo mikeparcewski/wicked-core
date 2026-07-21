@@ -204,15 +204,18 @@ pub enum CoreEvent {
         /// The unit ord this prompt is being submitted for.
         ord: u32,
     },
-    /// (EVT-004) A PTY-based persistent worker session was explicitly closed. `reason` is
-    /// `"run_complete"` (normal end-of-run teardown via `on_run_complete`) or `"error"` (the PTY
-    /// write failed and the stale session is being dropped). Paired with `WorkerSessionStarted`
-    /// and `WorkerSessionReused` to form the full session lifecycle.
+    /// (EVT-004) A PTY-based persistent worker session was explicitly closed. `reason` is one of:
+    /// - `"run_complete"` — normal end-of-run teardown via `on_run_complete`
+    /// - `"error"` — the PTY write failed and the stale session is being dropped
+    /// - `"reassigned"` — the unit was reassigned to a different CLI; the old session is closed
+    ///   before the new one is opened for the re-dispatched unit
+    ///
+    /// Paired with `WorkerSessionStarted` and `WorkerSessionReused` to form the full session lifecycle.
     WorkerSessionClosed {
         session: String,
         /// The PTY terminal id that was closed.
         terminal_id: String,
-        /// Why the session was closed: `"run_complete"` or `"error"`.
+        /// Why the session was closed: `"run_complete"`, `"error"`, or `"reassigned"`.
         reason: String,
     },
     /// (EVT-007) One or more cross-CLI prior unit outputs were injected into the current unit's
@@ -318,6 +321,23 @@ pub enum CoreEvent {
         output_bytes: usize,
         step_status: String,
         governed: bool,
+    },
+    /// An operator message was injected into one or all active PTY workers for a run.
+    /// ACP-backed sessions have no PTY and are skipped with a warning (no event).
+    WorkerMessageInjected {
+        session: String,
+        message: String,
+        /// `"all"` or the cli_key that was targeted.
+        target: String,
+    },
+    /// A unit was stopped and re-dispatched to a different CLI (or re-routed via council).
+    UnitReassigned {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        previous_cli: String,
+        /// `None` means the council was re-convened and its choice is the new assignment.
+        new_cli: Option<String>,
     },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {

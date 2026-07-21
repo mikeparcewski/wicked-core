@@ -196,6 +196,10 @@ pub(crate) fn run(
     // The actor-owned PTY terminal registry (id → status + seq). Byte-I/O lives off-actor in
     // `pty_map`; this small map is the single-writer state the actor owns (DES §4).
     let mut terminals: HashMap<String, TermReg> = HashMap::new();
+    // Actor-maintained PTY session index: run_id → [(cli_key, terminal_id)].
+    // Populated on WorkerSessionStarted, pruned on WorkerSessionClosed / TerminalExited.
+    // Used by InjectWorkerMessage + ReassignUnit without touching the runner or store.
+    let mut run_sessions: HashMap<String, Vec<(String, String)>> = HashMap::new();
     // Actor-owned workflow registry: built-ins seeded at startup, runtime defs added via
     // `Command::RegisterWorkflow`. The file overlay dir (`$WICKED_WORKFLOWS_DIR` /
     // `~/.config/wicked-core/workflows`) is loaded ONCE here so every subsequent `LaunchRun` on
@@ -952,6 +956,40 @@ pub(crate) fn run(
                 );
             }
             Command::EmitEvent(ev) => {
+                // Maintain the run → [(cli_key, terminal_id)] index used by InjectWorkerMessage
+                // and ReassignUnit. Only PTY-backed sessions appear here; ACP sessions emit no
+                // WorkerSessionStarted events (they have no terminal_id).
+                //
+                // KNOWN ISSUE: entries are pruned on WorkerSessionClosed but NOT on TerminalExited
+                // (natural EOF without an explicit close). A PTY that exits unexpectedly will leave
+                // a stale entry until the next WorkerSessionClosed for that terminal_id — inject and
+                // reassign may try to write to a terminal already gone. A TerminalExited arm is the
+                // correct fix but is intentionally deferred (low frequency + the write fails cleanly).
+                match &ev {
+                    CoreEvent::WorkerSessionStarted {
+                        session,
+                        terminal_id,
+                        cli_key,
+                    } => {
+                        run_sessions
+                            .entry(session.clone())
+                            .or_default()
+                            .push((cli_key.clone(), terminal_id.clone()));
+                    }
+                    CoreEvent::WorkerSessionClosed {
+                        session,
+                        terminal_id,
+                        ..
+                    } => {
+                        if let Some(v) = run_sessions.get_mut(session) {
+                            v.retain(|(_, tid)| tid != terminal_id);
+                            if v.is_empty() {
+                                run_sessions.remove(session);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
                 emit(&mut subscribers, ev);
             }
             Command::CaptureMemory {
@@ -1207,6 +1245,367 @@ pub(crate) fn run(
                             .map_err(|e| anyhow::anyhow!("{e}"))
                     });
                 let _ = reply.send(result);
+            }
+            Command::InjectWorkerMessage {
+                run_id,
+                message,
+                target,
+                reply,
+            } => {
+                use crate::command::InjectTarget;
+                use std::io::Write;
+                let sessions = run_sessions.get(&run_id).cloned().unwrap_or_default();
+                if sessions.is_empty() {
+                    if matches!(&target, InjectTarget::Cli(_)) {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "run {run_id} has no active PTY sessions; \
+                             targeted inject requires at least one open PTY"
+                        )));
+                    } else {
+                        eprintln!(
+                            "[wicked-core] inject: run {run_id} has no active PTY sessions \
+                             (ACP-only or not yet started); skipping"
+                        );
+                        let _ = reply.send(Ok(()));
+                    }
+                    continue;
+                }
+                let target_str = match &target {
+                    InjectTarget::All => "all".to_string(),
+                    InjectTarget::Cli(k) => k.clone(),
+                };
+                let msg_bytes = format!("{message}\n");
+                let mut emitted = false;
+                for (cli_key, terminal_id) in &sessions {
+                    let matches = matches!(&target, InjectTarget::All)
+                        || matches!(&target, InjectTarget::Cli(k) if k == cli_key);
+                    if !matches {
+                        continue;
+                    }
+                    // Acquire the per-terminal writer Arc from the off-actor pty_map.
+                    let writer = {
+                        let map = terminal::lock(&pty_map);
+                        map.get(terminal_id).map(|s| s.writer.clone())
+                    };
+                    match writer {
+                        None => {
+                            eprintln!(
+                                "[wicked-core] inject: terminal {terminal_id} ({cli_key}) \
+                                 not in pty_map — already closed?"
+                            );
+                        }
+                        Some(w) => {
+                            let mut w = w.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Err(e) =
+                                w.write_all(msg_bytes.as_bytes()).and_then(|_| w.flush())
+                            {
+                                eprintln!(
+                                    "[wicked-core] inject write to {terminal_id} ({cli_key}) \
+                                     failed: {e}"
+                                );
+                            } else {
+                                emit(
+                                    &mut subscribers,
+                                    CoreEvent::WorkerMessageInjected {
+                                        session: run_id.clone(),
+                                        message: message.clone(),
+                                        target: target_str.clone(),
+                                    },
+                                );
+                                emitted = true;
+                            }
+                        }
+                    }
+                }
+                if !emitted {
+                    if matches!(&target, InjectTarget::Cli(_)) {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "no active PTY session matching cli '{target_str}' for run {run_id}"
+                        )));
+                        continue;
+                    }
+                    eprintln!(
+                        "[wicked-core] inject: no matching PTY session found for run {run_id} \
+                         target {target_str}"
+                    );
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Command::ReassignUnit {
+                run_id,
+                ord,
+                new_cli,
+                reply,
+            } => {
+                // ── validation ──────────────────────────────────────────────────────────────
+                let session = match crate::domain::get_session(&store, &run_id) {
+                    Ok(Some(s)) => s,
+                    Ok(None) => {
+                        let _ = reply.send(Err(anyhow::anyhow!("run not found: {run_id}")));
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                };
+                if session.status != crate::domain::SessionStatus::Executing {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "run {run_id} is not Executing (status: {:?}); \
+                         can only reassign a unit that is currently running",
+                        session.status
+                    )));
+                    continue;
+                }
+                let units = match crate::domain::session_units(&store, &run_id) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                };
+                let cursor_unit = match units.get(session.unit_ix) {
+                    Some(u) => u,
+                    None => {
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "run {run_id} cursor unit_ix {} out of range",
+                            session.unit_ix
+                        )));
+                        continue;
+                    }
+                };
+                if cursor_unit.ord != ord {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "run {run_id} cursor unit is ord={} not ord={ord}; \
+                         can only reassign the currently-executing unit",
+                        cursor_unit.ord
+                    )));
+                    continue;
+                }
+                let previous_cli = cursor_unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string());
+                // ── close the PTY session (if any) ──────────────────────────────────────────
+                if let Some(session_entries) = run_sessions.remove(&run_id) {
+                    for (cli_key, terminal_id) in &session_entries {
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::WorkerSessionClosed {
+                                session: run_id.clone(),
+                                terminal_id: terminal_id.clone(),
+                                reason: "reassigned".to_string(),
+                            },
+                        );
+                        finish_terminal(
+                            &mut terminals,
+                            &pty_map,
+                            &mut subscribers,
+                            terminal_id,
+                            true,
+                        );
+                        eprintln!(
+                            "[wicked-core] reassign: closed PTY session {terminal_id} \
+                             ({cli_key}) for run {run_id}"
+                        );
+                    }
+                }
+                // ── drop the runner-internal session cache entry ─────────────────────────────
+                // `AcpStepRunner::close_cli_session` already spawns its own background thread
+                // (blocking kill+wait is safe there); calling directly here avoids an extra hop.
+                // `PersistentStepRunner::close_cli_session` just removes from its sessions map
+                // (non-blocking — the terminal was already killed by `finish_terminal` above).
+                runner.close_cli_session(&run_id, &previous_cli);
+                // ── bump attempt ────────────────────────────────────────────────────────────
+                let new_attempt = session.attempt.saturating_add(1);
+                {
+                    let mut s = session.clone();
+                    s.attempt = new_attempt;
+                    if let Err(e) = crate::domain::put_node(&mut store, s.to_node()) {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                }
+                // ── when new_cli: None, re-run the council asynchronously ─────────────────
+                match new_cli {
+                    Some(cli) => {
+                        // Update the unit's assigned_cli in the store and clear
+                        // assigned_invocation so the runner re-resolves from the registry —
+                        // the new CLI's invocation template may differ from the previous one.
+                        let mut updated_units = units.clone();
+                        if let Some(u) = updated_units.get_mut(session.unit_ix) {
+                            u.assigned_cli = Some(cli.clone());
+                            u.assigned_invocation = None;
+                            if let Err(e) = crate::domain::put_node(&mut store, u.to_node()) {
+                                let _ = reply.send(Err(e));
+                                continue;
+                            }
+                        }
+                        // Emit UnitReassigned before dispatching.
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::UnitReassigned {
+                                session: run_id.clone(),
+                                ord,
+                                attempt: new_attempt,
+                                previous_cli: previous_cli.clone(),
+                                new_cli: Some(cli.clone()),
+                            },
+                        );
+                        // Re-dispatch the cursor unit.
+                        match dispatch_unit(
+                            &store,
+                            &mut subscribers,
+                            &runner,
+                            &self_tx,
+                            &run_id,
+                            session.unit_ix,
+                        ) {
+                            Ok(_) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                // Wedge prevention: dispatch failed, so no worker will ever
+                                // post ApplyStepResult. Mark the run Failed and surface the error.
+                                in_flight.remove(&run_id);
+                                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id)
+                                {
+                                    s.status = SessionStatus::Failed;
+                                    let _ = put_node(&mut store, s.to_node());
+                                }
+                                emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{e}"));
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    None => {
+                        // Re-run the council off the actor thread; post back ReassignReady.
+                        let tx = self_tx.clone();
+                        let disp = dispatcher.clone();
+                        let run_id_c = run_id.clone();
+                        let prev_cli_c = previous_cli.clone();
+                        let units_for_council = units.clone();
+                        let clis_keys = session.clis.clone();
+                        let ord_c = ord;
+                        // Emit UnitReassigned now (new_cli=None indicates council re-run).
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::UnitReassigned {
+                                session: run_id.clone(),
+                                ord,
+                                attempt: new_attempt,
+                                previous_cli: previous_cli.clone(),
+                                new_cli: None,
+                            },
+                        );
+                        let _ = reply.send(Ok(()));
+                        std::thread::spawn(move || {
+                            // Resolve the session's cli keys to full AgenticCli objects.
+                            let all_clis = crate::registry_roster();
+                            let clis: Vec<_> = all_clis
+                                .into_iter()
+                                .filter(|c| clis_keys.contains(&c.key))
+                                .collect();
+                            // Re-run the council for just this one unit.
+                            let unit_slice: Vec<_> = units_for_council
+                                .into_iter()
+                                .filter(|u| u.ord == ord_c)
+                                .collect();
+                            match crate::distribute::distribute_units_on(
+                                &unit_slice,
+                                &clis,
+                                &run_id_c,
+                                None,
+                                &disp,
+                            ) {
+                                Ok(dists) => {
+                                    let new_cli_key = dists
+                                        .into_iter()
+                                        .next()
+                                        .map(|d| d.assigned_cli)
+                                        .unwrap_or_else(|| prev_cli_c.clone());
+                                    let _ = tx.send(Command::ReassignReady {
+                                        run_id: run_id_c,
+                                        ord: ord_c,
+                                        new_cli: new_cli_key,
+                                        reply: {
+                                            // Use a dummy channel — the original reply was
+                                            // already sent above.
+                                            let (s, _) = std::sync::mpsc::channel();
+                                            s
+                                        },
+                                    });
+                                }
+                                Err(e) => {
+                                    // Post PlanFailed so the actor thread marks the run Failed
+                                    // and emits the error event — prevents a permanent wedge.
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: run_id_c,
+                                        error: format!(
+                                            "reassign council re-run failed for ord={ord_c}: {e}"
+                                        ),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            Command::ReassignReady {
+                run_id,
+                ord,
+                new_cli,
+                reply,
+            } => {
+                // Apply the council's new assignment and re-dispatch the cursor unit.
+                let session = match crate::domain::get_session(&store, &run_id) {
+                    Ok(Some(s)) => s,
+                    _ => {
+                        let _ = reply.send(Err(anyhow::anyhow!("run {run_id} not found")));
+                        continue;
+                    }
+                };
+                let mut units = match crate::domain::session_units(&store, &run_id) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                        continue;
+                    }
+                };
+                if let Some(u) = units.get_mut(session.unit_ix) {
+                    if u.ord == ord {
+                        u.assigned_cli = Some(new_cli);
+                        // Clear assigned_invocation so the runner re-resolves the invocation
+                        // template from the registry for the newly assigned CLI.
+                        u.assigned_invocation = None;
+                        if let Err(e) = crate::domain::put_node(&mut store, u.to_node()) {
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
+                    }
+                }
+                match dispatch_unit(
+                    &store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &run_id,
+                    session.unit_ix,
+                ) {
+                    Ok(_) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        // Wedge prevention: no worker will post ApplyStepResult on failure.
+                        in_flight.remove(&run_id);
+                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                            s.status = SessionStatus::Failed;
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                        emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{e}"));
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             Command::Shutdown => {
                 // Reap every live PTY: kill children + join reader threads so no process/thread is

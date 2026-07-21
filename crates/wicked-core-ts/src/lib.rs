@@ -261,6 +261,30 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::SessionCompleted { session } => {
             json!({ "type": "sessionCompleted", "session": session })
         }
+        CoreEvent::WorkerMessageInjected {
+            session,
+            message,
+            target,
+        } => json!({
+            "type": "workerMessageInjected",
+            "session": session,
+            "message": message,
+            "target": target,
+        }),
+        CoreEvent::UnitReassigned {
+            session,
+            ord,
+            attempt,
+            previous_cli,
+            new_cli,
+        } => json!({
+            "type": "unitReassigned",
+            "session": session,
+            "ord": ord,
+            "attempt": attempt,
+            "previousCli": previous_cli,
+            "newCli": new_cli,
+        }),
         CoreEvent::Error { session, message } => {
             json!({ "type": "error", "session": session, "message": message })
         }
@@ -1080,6 +1104,50 @@ impl Core {
             Ok("ok".to_string())
         })
     }
+
+    /// Inject an operator message into one or all active PTY workers for a run.
+    ///
+    /// `target` is either `"all"` (write to every PTY session for the run) or a CLI key string
+    /// (write only to that CLI's session). ACP-backed sessions have no PTY and are skipped with a
+    /// warning. Fires [`CoreEvent::WorkerMessageInjected`] for each successful write.
+    #[napi]
+    pub fn inject_worker_message(
+        &self,
+        run_id: String,
+        message: String,
+        target: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let t = if target == "all" {
+                wicked_core::InjectTarget::All
+            } else {
+                wicked_core::InjectTarget::Cli(target)
+            };
+            core.inject_worker_message(&run_id, &message, t)
+                .map_err(err)?;
+            Ok("ok".to_string())
+        })
+    }
+
+    /// Stop the current worker for `ord` in run `run_id` and re-dispatch it.
+    ///
+    /// `newCli` is either a CLI key string (re-dispatch immediately to that CLI) or `null` (re-run
+    /// the council and let it pick). Returns `"ok"` when the command has been queued; the
+    /// [`CoreEvent::UnitReassigned`] event confirms the reassignment.
+    #[napi]
+    pub fn reassign_unit(
+        &self,
+        run_id: String,
+        ord: u32,
+        new_cli: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.reassign_unit(&run_id, ord, new_cli).map_err(err)?;
+            Ok("ok".to_string())
+        })
+    }
 }
 
 // ── the live-event subscription handle ─────────────────────────────────────────
@@ -1317,6 +1385,26 @@ mod tests {
             CoreEvent::SessionCompleted { session: s() },
             "sessionCompleted",
             &["type", "session"],
+        );
+        check(
+            CoreEvent::WorkerMessageInjected {
+                session: s(),
+                message: s(),
+                target: s(),
+            },
+            "workerMessageInjected",
+            &["type", "session", "message", "target"],
+        );
+        check(
+            CoreEvent::UnitReassigned {
+                session: s(),
+                ord: 1,
+                attempt: 1,
+                previous_cli: s(),
+                new_cli: Some(s()),
+            },
+            "unitReassigned",
+            &["type", "session", "ord", "attempt", "previousCli", "newCli"],
         );
         check(
             CoreEvent::Error { session: Some(s()), message: s() },

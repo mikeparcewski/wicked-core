@@ -59,6 +59,7 @@ pub use campaign::{
 };
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
 pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
+pub use command::InjectTarget;
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
     all_sessions, get_session, get_work_output, put_node, session_units, AgentSession,
@@ -841,6 +842,61 @@ impl Core {
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?;
         Ok(())
+    }
+
+    /// Inject an operator message into active PTY worker(s) for `run_id`.
+    ///
+    /// The message is written verbatim to stdin (with a trailing `\n`) of every PTY session whose
+    /// CLI key matches `target`. ACP-backed sessions have no PTY and are skipped silently (with a
+    /// warning logged to stderr). A [`CoreEvent::WorkerMessageInjected`] is emitted for each
+    /// successful write.
+    ///
+    /// Fire-and-forget in spirit — the actor returns `Ok(())` even when no sessions were found;
+    /// failures reach the caller only if the actor channel is dead.
+    pub fn inject_worker_message(
+        &self,
+        run_id: &str,
+        message: &str,
+        target: InjectTarget,
+    ) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::InjectWorkerMessage {
+                run_id: run_id.to_string(),
+                message: message.to_string(),
+                target,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Stop the current worker for `ord` inside run `run_id` and re-dispatch it.
+    ///
+    /// * `new_cli = Some(key)` — re-dispatch immediately to that CLI (no council re-run).
+    /// * `new_cli = None` — re-convene the council and let it pick; the re-dispatch happens once
+    ///   the council vote returns (the method returns `Ok(())` before that happens — the result
+    ///   appears as a [`CoreEvent::UnitReassigned`] followed by the normal unit-lifecycle events).
+    ///
+    /// Returns an error if the run is not currently `Executing`, or if `ord` is not the cursor unit.
+    pub fn reassign_unit(
+        &self,
+        run_id: &str,
+        ord: u32,
+        new_cli: Option<String>,
+    ) -> anyhow::Result<()> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ReassignUnit {
+                run_id: run_id.to_string(),
+                ord,
+                new_cli,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 }
 
