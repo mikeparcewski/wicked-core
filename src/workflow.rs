@@ -158,8 +158,14 @@ pub trait StepRunner: Send + Sync {
     fn on_run_complete(&self, _run_id: &str) {}
 
     /// Close the session for a specific CLI within a run (called by `ReassignUnit` before
-    /// re-dispatching). ACP runners drop the `(run_id, cli_key)` process; PTY runners are
-    /// handled directly by the actor (which calls `finish_terminal` via the registry it owns).
+    /// re-dispatching to a different CLI). Callers:
+    /// - `AcpStepRunner`: drops the `(run_id, cli_key)` ACP child process (spawns a background
+    ///   thread because kill+wait may block).
+    /// - `PersistentStepRunner`: removes the stale `run_id → terminal_id` cache entry so the
+    ///   next dispatch opens a fresh PTY rather than reusing the now-closed terminal id. The
+    ///   terminal itself is already killed by the actor via `finish_terminal` before this is called.
+    ///
+    /// The default no-op is correct for stateless runners (e.g. `WrappedCliStepRunner`).
     /// Must be fire-and-forget — never block the actor thread.
     fn close_cli_session(&self, _run_id: &str, _cli_key: &str) {}
 }

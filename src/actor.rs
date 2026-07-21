@@ -959,6 +959,12 @@ pub(crate) fn run(
                 // Maintain the run → [(cli_key, terminal_id)] index used by InjectWorkerMessage
                 // and ReassignUnit. Only PTY-backed sessions appear here; ACP sessions emit no
                 // WorkerSessionStarted events (they have no terminal_id).
+                //
+                // KNOWN ISSUE: entries are pruned on WorkerSessionClosed but NOT on TerminalExited
+                // (natural EOF without an explicit close). A PTY that exits unexpectedly will leave
+                // a stale entry until the next WorkerSessionClosed for that terminal_id — inject and
+                // reassign may try to write to a terminal already gone. A TerminalExited arm is the
+                // correct fix but is intentionally deferred (low frequency + the write fails cleanly).
                 match &ev {
                     CoreEvent::WorkerSessionStarted {
                         session,
