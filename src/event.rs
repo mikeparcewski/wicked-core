@@ -319,6 +319,23 @@ pub enum CoreEvent {
         step_status: String,
         governed: bool,
     },
+    /// An operator message was injected into one or all active PTY workers for a run.
+    /// ACP-backed sessions have no PTY and are skipped with a warning (no event).
+    WorkerMessageInjected {
+        session: String,
+        message: String,
+        /// `"all"` or the cli_key that was targeted.
+        target: String,
+    },
+    /// A unit was stopped and re-dispatched to a different CLI (or re-routed via council).
+    UnitReassigned {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        previous_cli: String,
+        /// `None` means the council was re-convened and its choice is the new assignment.
+        new_cli: Option<String>,
+    },
     /// Something went wrong (surfaced to the operator rather than swallowed).
     Error {
         session: Option<String>,

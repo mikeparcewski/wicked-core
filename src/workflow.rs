@@ -156,6 +156,12 @@ pub trait StepRunner: Send + Sync {
     /// Fire-and-forget: implementations must not block the actor thread. Swallow channel-closed
     /// errors silently — the run is already gone; a send failure is expected and harmless.
     fn on_run_complete(&self, _run_id: &str) {}
+
+    /// Close the session for a specific CLI within a run (called by `ReassignUnit` before
+    /// re-dispatching). ACP runners drop the `(run_id, cli_key)` process; PTY runners are
+    /// handled directly by the actor (which calls `finish_terminal` via the registry it owns).
+    /// Must be fire-and-forget — never block the actor thread.
+    fn close_cli_session(&self, _run_id: &str, _cli_key: &str) {}
 }
 
 /// The deterministic stub step — today's composition behavior (output = `stub-output for <desc>`),

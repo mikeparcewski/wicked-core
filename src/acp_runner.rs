@@ -928,6 +928,18 @@ impl StepRunner for AcpStepRunner {
             guard.retain(|(rid, _), _| *rid != run_id);
         });
     }
+
+    /// Close a single ACP session for `(run_id, cli_key)` — called by `ReassignUnit` before
+    /// re-dispatching to a different CLI. Runs on a background thread (drop may block on kill/wait).
+    fn close_cli_session(&self, run_id: &str, cli_key: &str) {
+        let sessions = self.sessions.clone();
+        let run_id = run_id.to_string();
+        let cli_key = cli_key.to_string();
+        std::thread::spawn(move || {
+            let mut guard = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            guard.remove(&(run_id, cli_key));
+        });
+    }
 }
 
 // ── Registry helper ───────────────────────────────────────────────────────────

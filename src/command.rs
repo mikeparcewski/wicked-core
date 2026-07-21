@@ -262,9 +262,43 @@ pub(crate) enum Command {
     /// Distribution failed (council error or pre-distribute error). The actor arm marks the session
     /// `Failed` and emits a `SessionFailed` event. Sent by the off-actor distribute thread.
     PlanFailed { run_id: String, error: String },
+    /// Inject an operator message into one or all active PTY workers for a run.
+    /// ACP-backed sessions (no PTY) are skipped with a warning logged to stderr.
+    InjectWorkerMessage {
+        run_id: String,
+        message: String,
+        target: InjectTarget,
+        reply: Sender<anyhow::Result<()>>,
+    },
+    /// Stop the current worker for an executing unit and re-dispatch it to a different CLI
+    /// (or re-run the council when `new_cli` is `None`). Returns an error if the run is not
+    /// currently `Executing`, or if the `ord` does not match the cursor unit.
+    ReassignUnit {
+        run_id: String,
+        ord: u32,
+        new_cli: Option<String>,
+        reply: Sender<anyhow::Result<()>>,
+    },
+    /// Internal — posted back from the async re-council thread when `ReassignUnit { new_cli: None }`
+    /// finishes. The actor applies the new assignment and re-dispatches.
+    ReassignReady {
+        run_id: String,
+        ord: u32,
+        new_cli: String,
+        reply: Sender<anyhow::Result<()>>,
+    },
     /// Stop the actor loop and release the store. Sent automatically when the LAST external `Core`
     /// handle drops (the actor holds its own `self_tx` for worker write-back, so channel-close alone
     /// can never terminate it — this is the real exit). In-flight workers' results are abandoned but
     /// the cursor is persisted, so a later `ResumeRun` continues the run.
     Shutdown,
+}
+
+/// Where to direct an injected worker message.
+#[derive(Debug, Clone)]
+pub enum InjectTarget {
+    /// Write to every active PTY session for the run.
+    All,
+    /// Write only to the session whose CLI key matches.
+    Cli(String),
 }
