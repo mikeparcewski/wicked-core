@@ -434,11 +434,23 @@ pub(crate) fn run(
                         },
                     );
                     in_flight.insert(run_id.clone());
-                    let _ = self_tx.send(Command::ContinueLaunch {
-                        spec,
-                        repo_ref,
-                        workdir,
-                    });
+                    if self_tx
+                        .send(Command::ContinueLaunch {
+                            spec,
+                            repo_ref,
+                            workdir,
+                        })
+                        .is_err()
+                    {
+                        // Channel closed (actor shutting down) — stub exists in the store but
+                        // deferred planning will never run. Mark Failed so the UI shows a terminal
+                        // state instead of a permanent Planning spinner.
+                        in_flight.remove(&run_id);
+                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                            s.status = SessionStatus::Failed;
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                    }
                     Ok(run_id.clone())
                 })();
                 let _ = reply.send(res);
