@@ -1,0 +1,39 @@
+{
+  "id": "memories",
+  "phases": [
+    {
+      "id": "gather",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "memory-candidates.md"
+      ],
+      "depends_on": [],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "store",
+      "kind": "build",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "memories-stored.md"
+      ],
+      "depends_on": [
+        "gather"
+      ],
+      "role": "creator",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    }
+  ]
+}

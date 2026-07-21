@@ -1,0 +1,57 @@
+{
+  "id": "survey-repo",
+  "phases": [
+    {
+      "id": "structure",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "repo-structure.md"
+      ],
+      "depends_on": [],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "stack",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "tech-stack.md"
+      ],
+      "depends_on": [
+        "structure"
+      ],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "conventions",
+      "kind": "recon",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [
+        "conventions.md"
+      ],
+      "depends_on": [
+        "stack"
+      ],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    }
+  ]
+}
