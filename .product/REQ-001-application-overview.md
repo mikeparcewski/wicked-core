@@ -52,7 +52,7 @@ unpublished `wicked-estate-store` 0.13, plus four vendored engine crates marked 
 1. Per unit, the actor opens a governance phase, runs `select(select_key)` + `decide(context)` via
    the embedded governance engine (rules from `.product/evidence/` policies).
 2. The actor applies the gate claim via `apply_gate`; a deny is sticky and emits
-   `CoreEvent::GateDenied`, halting further dispatch for that unit.
+   `CoreEvent::GateDecided { allow: false }` (and `UnitDenied`), halting further dispatch for that unit.
 3. The gate-hook subprocess (invoked by the CLI tool during a wrapped run) writes claims to an
    append-only `decisions.ndjson`; the actor drains and applies them via `Command::ApplyHookDecisions`.
    The hook is designed to never open the SQLite file directly (ISS-003: current implementation opens it read-write — this is an open bug tracked in RAID.md).
@@ -64,7 +64,7 @@ unpublished `wicked-estate-store` 0.13, plus four vendored engine crates marked 
 3. Idempotency via attempt-scoped event IDs is the target design — duplicate `StepResult` messages for an already-applied unit should be detected and discarded (ISS-002: the guard is not yet implemented in `apply_step_result` — tracked in RAID.md).
 
 ### Flow 4 — HITL gate (human-in-the-loop)
-1. The actor sets `run.status = AwaitingHuman` and emits `CoreEvent::AwaitingHuman { run, stage_ix, prompt }`.
+1. The actor sets `session.status = SessionStatus::AwaitingHuman` and emits `CoreEvent::AwaitingHuman { session, ord, prompt }`.
 2. The wicked-crew daemon surfaces the prompt to the operator (terminal CLI or wicked-studio panel).
 3. The operator calls `Core::confirm_gate(run_id, decision)` which applies the human decision and
    re-enters the run from the cursor.

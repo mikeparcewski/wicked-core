@@ -35,6 +35,8 @@ cargo test
 
 ### What the tests cover
 
+The table below covers the key test files. Refer to `tests/` for the complete suite.
+
 | File | What is tested |
 |---|---|
 | `p0_single_writer.rs` | Single-writer actor: no SQLITE_BUSY under concurrent reads while actor writes; gate-hook idempotency (hook writes ndjson, not store); governance veto on Deny claim |
