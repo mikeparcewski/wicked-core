@@ -19,7 +19,7 @@
     "A3": {
       "verdict": "PASS",
       "evidence": "run_count=1, status=completed, conformance_ref_len=64 | full JSON conformance_ref: a3740e23230b08d6a8c9abf14bc14e92bbe549bde9db11fab08f446d1e350026",
-      "notes": "All three sub-conditions met: run_count=1>=1; status=completed is in {executing,planning,distributing,completed}; conformance_ref is a 64-hex SHA-256 digest (>=32). Real governance hash, not a placeholder."
+      "notes": "All three sub-conditions met: run_count=1>=1; status=completed is in {executing,planning,distributing,completed}; conformance_ref is a 64-hex SHA-256 digest (len=64>=64). Real governance hash, not a placeholder."
     },
     "A4": {
       "verdict": "PASS",

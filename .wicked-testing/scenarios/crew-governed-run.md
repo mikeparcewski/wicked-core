@@ -21,6 +21,7 @@ verdict against a real governed wicked-crew run driven by this version of wicked
 - `wicked-crew` is on PATH (globally installed via npm).
 - `wicked-core` is the engine embedded in the installed wicked-crew package.
 - A temp directory is writable for the DB.
+- `$TMPDIR` is set to a writable path (macOS/Linux: set by the OS to `/var/folders/…` or `/tmp`; Windows Git Bash: set by the shell). Steps use `$TMPDIR` for log files and PID tracking.
 
 > **Note on Step 1 command path:** the step uses `which wicked-crew | xargs dirname` to locate the
 > CLI entry point. This avoids coupling to a specific npm prefix or global install layout. On
