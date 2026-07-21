@@ -59,8 +59,8 @@ Required for crates.io publication and a stable semver version tag.
 |---|---|---|---|
 | L3-1 | Path dependencies resolved: `wicked-estate-store` published to crates.io; vendored `publish = false` crates removed or published | `cargo publish --dry-run` exits 0 | — (blocked on estate publication) |
 | L3-2 | Multi-platform CI: `cargo test` passes on ubuntu-latest + macos-latest + windows-latest | CI matrix extended to include macOS/Windows | ✓ 2026-07-21 — `.github/workflows/ci.yml` `check` job extended to matrix `[ubuntu-latest, macos-latest, windows-latest]`. All 3 legs passed on PR #103 (ubuntu SUCCESS, macOS SUCCESS, windows SUCCESS). Unix-gated tests (`p2_worker_lifecycle.rs`, `operator_api.rs`) carry `#[cfg(unix)]` so they skip cleanly on Windows. |
-| L3-3 | Semver: `Cargo.toml` version ≥ 0.2.0; all open ISS-* items resolved or explicitly deferred with documented rationale | Manual gate + CHANGELOG.md entry | — |
-| L3-4 | `CHANGELOG.md` entry exists for the release version | File inspection | — |
+| L3-3 | Semver: `Cargo.toml` version ≥ 0.2.0; all open ISS-* items resolved or explicitly deferred with documented rationale | Manual gate + CHANGELOG.md entry | ✓ 2026-07-21 — `Cargo.toml` bumped to `0.2.0`. Open ISS items: ISS-007 (MEDIUM, deferred — test quality), ISS-009 (MEDIUM, deferred to P4a — cursor drift), ISS-010 (LOW, blocked on estate crates.io publication). All deferred with documented rationale in `.product/RAID.md`. |
+| L3-4 | `CHANGELOG.md` entry exists for the release version | File inspection | ✓ 2026-07-21 — `CHANGELOG.md` created with `[0.2.0]` section covering P0→P4a features, ISS-001/002/003/004/008 fixes (ISS-005 mitigated — not a full fix; ISS-006 resolved; ISS-007 deferred), napi bindings, multi-platform CI, and deferred items. |
 | L3-5 | wicked-testing acceptance pipeline: PASS verdict against a real governed wicked-crew run driven by this version of wicked-core | `.wicked-testing/evidence/` with `verdict: PASS` | — |
 
 ---
@@ -100,3 +100,4 @@ These cannot be waived or deferred:
 | 0.1 | 2026-07-21 | michael.parcewski@accenture.com | Initial draft — all L2/L3 items unchecked; L1 CI passing; open CRITICAL/HIGH bugs tracked as ISS-001 through ISS-009 |
 | 0.2 | 2026-07-21 | michael.parcewski@accenture.com | Evidence pass: ISS-001/002/003/004/006/008 verified resolved in code+tests (CI green). L2-1,2,3(structural),4,5,6,7 verified. L2-5: FastRunner cursor assertion in `engine_is_off_thread_guards_inflight_and_resumes_from_cursor`. Adversarial re-review PASS recorded in `.product/reviews/adversarial-review-reassess-round2.md`. All CRIT/HIGH cleared. Remaining open: ISS-007/009 (MEDIUM, deferred). |
 | 0.3 | 2026-07-21 | michael.parcewski@accenture.com | L1-1 through L1-6 formally checked off (were effectively ✓; now explicit with evidence). CI matrix extended to ubuntu + macOS + windows (L3-2). |
+| 0.4 | 2026-07-21 | michael.parcewski@accenture.com | L3-3 and L3-4 checked off: `Cargo.toml` bumped to 0.2.0; `CHANGELOG.md` created with full [0.2.0] entry. |
