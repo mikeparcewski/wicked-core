@@ -186,6 +186,7 @@ fn cnode(id: &str, hc: HumanConfirm) -> CampaignNode {
             entity_mode: EntityMode::Shared,
             human_confirm: hc,
             repo_ref: None,
+            workflow_id: None,
         },
     }
 }
