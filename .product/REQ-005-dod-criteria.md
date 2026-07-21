@@ -1,7 +1,7 @@
 ---
 name: REQ-005-dod-criteria
 title: wicked-core — Definition of Done Criteria
-status: in-progress
+status: partially-verified
 version: 0.1
 date: 2026-07-21
 author: michael.parcewski@accenture.com
@@ -41,13 +41,13 @@ Required before wicked-crew can depend on a wicked-core release commit.
 
 | # | Criterion | How Verified | Verified |
 |---|---|---|---|
-| L2-1 | Actor lifecycle: actor thread terminates when all `Core` handles are dropped | Integration test: drop all handles, assert actor thread joins within timeout | — (ISS-001 open) |
-| L2-2 | `apply_step_result` is idempotent: a duplicate `StepOutput` for an already-applied unit is discarded with no store change | Integration test: send same `StepOutput` twice, assert unit state unchanged | — (ISS-002 open) |
-| L2-3 | Gate-hook path is genuinely read-only: hook subprocess does not acquire SQLite write lock | Integration test: concurrent actor write + hook invocation; assert no SQLITE_BUSY and actor write succeeds | — (ISS-003 open) |
+| L2-1 | Actor lifecycle: actor thread terminates when all `Core` handles are dropped | Integration test: drop all handles, assert actor thread joins within timeout | ✓ — `tests/p1_reentrant.rs::actor_shuts_down_when_last_core_drops` passes in CI. ISS-001 resolved via `ShutdownGuard` + `Command::Shutdown`. |
+| L2-2 | `apply_step_result` is idempotent: a duplicate `StepOutput` for an already-applied unit is discarded with no store change | Integration test: send same `StepOutput` twice, assert unit state unchanged | ✓ — ISS-002 resolved: triple guard (terminal status + cursor + attempt) in `apply_step_result`; stale result returns `StepApplied::Stale`. CI passes. |
+| L2-3 | Gate-hook path is genuinely read-only: hook subprocess does not acquire SQLite write lock | Integration test: concurrent actor write + hook invocation; assert no SQLITE_BUSY and actor write succeeds | ✓ (structural) — ISS-003 resolved: `gate_hook.rs` uses `open_store_ro` (`SQLITE_OPEN_READONLY`, no WAL/DDL). ISS-007 notes the existing P0 test does not create writer-writer contention; full contention test deferred. |
 | L2-4 | Cross-language round-trip: `Core::launch_run` / `Core::subscribe` / `Core::confirm_gate` callable from TypeScript with correct event delivery | `tests/bus_bridge.rs` cross-language round-trip test exits 0 | ✓ — `tests/bus_bridge.rs` passes in CI |
-| L2-5 | Crash + resume: `resume_run` re-dispatches from `session.unit_ix`; cursor is explicitly asserted (not inferred from dedup-bail) | Integration test with `FastRunner` recording dispatched unit indices; assert only `[unit_ix]` was dispatched on resume | — (ISS-008 open; proof is currently incidental) |
-| L2-6 | Governance deny-mid-run: a denied unit produces a terminal `Failed` (or `CompletedWithRejections`) session status, not `Completed` | Integration test: fixture Deny policy + run; assert run-level status is not `Completed` | — (ISS-004 open) |
-| L2-7 | Adversarial review PASS: all CRITICAL and HIGH findings from `REASSESS-P0-P1.md` resolved | Adversarial review gate (wicked-garden:crew:reviewer) — new PASS verdict supersedes current open findings | — (ISS-001/002/003/006 open) |
+| L2-5 | Crash + resume: `resume_run` re-dispatches from `session.unit_ix`; cursor is explicitly asserted (not inferred from dedup-bail) | Integration test with `FastRunner` recording dispatched unit indices; assert only `[unit_ix]` was dispatched on resume | — (ISS-008 open — resume correctness is incidental, not explicitly asserted by cursor recording. Deferred.) |
+| L2-6 | Governance deny-mid-run: a denied unit produces a terminal `Failed` session status, not `Completed` | Integration test: fixture Deny policy + run; assert run-level status is `Failed` | ✓ — ISS-004 resolved: `seam_findings.rs::sync_launch_halts_as_failed_on_a_governance_deny` asserts `SessionStatus::Failed` and unit 2 never ran. Passes in CI. |
+| L2-7 | Adversarial review PASS: all CRITICAL and HIGH findings from `REASSESS-P0-P1.md` resolved | Adversarial review gate (wicked-garden:crew:reviewer) — new PASS verdict supersedes current open findings | — ISS-001/002/003/004/006 are now resolved in code+tests. Remaining open: ISS-007 (test quality), ISS-008 (cursor assertion), ISS-009 (latent drift). Adversarial re-review required to produce a formal new PASS verdict. |
 
 ---
 
@@ -76,9 +76,9 @@ The build phase is **in progress**. The table below tracks what has been verifie
 | `WorkflowDef` JSON data-driven execution (P0/P1/P1.5/P2/output-governance) built and tested | ✓ |
 | napi bindings ship: `launchRun`/`subscribe`/`confirmGate` (TypeScript surface) | ✓ |
 | Adversarial review: `REASSESS-P0-P1.md` produced; CRITICAL/HIGH findings identified | ✓ (review done) |
-| CRITICAL findings resolved (ISS-001: actor lifecycle) | — open |
-| HIGH findings resolved (ISS-002: idempotency, ISS-003: gate-hook, ISS-006: distribute off-thread) | — open |
-| L2-1 through L2-7 integration tests all pass | — open (requires ISS-* fixes) |
+| CRITICAL findings resolved (ISS-001: actor lifecycle) | ✓ — `ShutdownGuard` + `Command::Shutdown`; test `actor_shuts_down_when_last_core_drops` passes |
+| HIGH findings resolved (ISS-002: idempotency, ISS-003: gate-hook, ISS-006: distribute off-thread) | ✓ — all three resolved in code+tests; see RAID.md issue entries for evidence references |
+| L2-1 through L2-7 integration tests all pass | Partially verified — L2-1, L2-2, L2-3 (structural), L2-4, L2-6 ✓; L2-5 incidental; L2-7 PASS verdict pending re-review |
 
 ---
 
@@ -86,10 +86,10 @@ The build phase is **in progress**. The table below tracks what has been verifie
 
 These cannot be waived or deferred:
 
-- ISS-001 (actor thread lifecycle) must be fixed before the L2 gate can pass. A leaked actor + writable store handle is a data-corruption risk.
-- ISS-002 (idempotency) must be fixed. Silent double-apply of a finished unit is a store corruption vector.
-- ISS-003 (gate-hook read-only path) must be fixed before wicked-crew depends on a release. Spurious Deny from SQLITE_BUSY is a governance correctness failure.
-- Adversarial review must produce a new PASS verdict (superseding the current REASSESS findings) before L2 is complete.
+- ISS-001 (actor thread lifecycle): **RESOLVED** — `ShutdownGuard` + `Command::Shutdown` + `actor_shuts_down_when_last_core_drops` test.
+- ISS-002 (idempotency): **RESOLVED** — triple guard in `apply_step_result`; stale results return `StepApplied::Stale` without a store write.
+- ISS-003 (gate-hook read-only path): **RESOLVED** — `open_store_ro` (`SQLITE_OPEN_READONLY`); no WAL/DDL from hook subprocess. ISS-007 (test quality) remains open.
+- Adversarial review must produce a new PASS verdict (superseding the current REASSESS findings) before L2 is formally complete. Outstanding open issues: ISS-007, ISS-008, ISS-009 (all MEDIUM, all deferred).
 
 ---
 
@@ -98,3 +98,4 @@ These cannot be waived or deferred:
 | Version | Date | Author | Change |
 |---------|------|--------|--------|
 | 0.1 | 2026-07-21 | michael.parcewski@accenture.com | Initial draft — all L2/L3 items unchecked; L1 CI passing; open CRITICAL/HIGH bugs tracked as ISS-001 through ISS-009 |
+| 0.2 | 2026-07-21 | michael.parcewski@accenture.com | Evidence pass: ISS-001/002/003/004/006 verified resolved in code+tests (CI green). L2-1, L2-2, L2-3 (structural), L2-4, L2-6 checked off. L2-5 incidental; L2-7 awaiting adversarial re-review. Remaining open: ISS-007/008/009 (MEDIUM, deferred). Status: partially-verified. |
