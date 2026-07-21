@@ -1,0 +1,6 @@
+run_count=1
+run_id=cd177e3c-991b-4a1e-af55-f51072737bd9
+status=completed
+problem_prefix=L3-5 acceptance test: verify wicked-core engine go
+conformance_ref_len=64
+assigned_cli=claude

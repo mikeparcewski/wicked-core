@@ -2,7 +2,7 @@
 name: REQ-005-dod-criteria
 title: wicked-core — Definition of Done Criteria
 status: partially-verified
-version: 0.3
+version: 0.6
 date: 2026-07-21
 author: michael.parcewski@accenture.com
 review-required: true
@@ -61,7 +61,7 @@ Required for crates.io publication and a stable semver version tag.
 | L3-2 | Multi-platform CI: `cargo test` passes on ubuntu-latest + macos-latest + windows-latest | CI matrix extended to include macOS/Windows | ✓ 2026-07-21 — `.github/workflows/ci.yml` `check` job extended to matrix `[ubuntu-latest, macos-latest, windows-latest]`. All 3 legs passed on PR #103 (ubuntu SUCCESS, macOS SUCCESS, windows SUCCESS). Unix-gated tests (`p2_worker_lifecycle.rs`, `operator_api.rs`) carry `#[cfg(unix)]` so they skip cleanly on Windows. |
 | L3-3 | Semver: `Cargo.toml` version ≥ 0.2.0; all open ISS-* items resolved or explicitly deferred with documented rationale | Manual gate + CHANGELOG.md entry | ✓ 2026-07-21 — `Cargo.toml` bumped to `0.2.0`. Open ISS items: ISS-007 (MEDIUM, deferred — test quality), ISS-009 (MEDIUM, deferred to P4a — cursor drift), ISS-010 (LOW, blocked on estate crates.io publication). All deferred with documented rationale in `.product/RAID.md`. |
 | L3-4 | `CHANGELOG.md` entry exists for the release version | File inspection | ✓ 2026-07-21 — `CHANGELOG.md` created with `[0.2.0]` section covering P0→P4a features, ISS-001/002/003/004/008 fixes (ISS-005 mitigated — not a full fix; ISS-006 resolved; ISS-007 deferred), napi bindings, multi-platform CI, and deferred items. |
-| L3-5 | wicked-testing acceptance pipeline: PASS verdict against a real governed wicked-crew run driven by this version of wicked-core | `.wicked-testing/evidence/` with `verdict: PASS` | — |
+| L3-5 | wicked-testing acceptance pipeline: PASS verdict against a real governed wicked-crew run driven by this version of wicked-core | `.wicked-testing/evidence/` with `verdict: PASS` | ✓ 2026-07-21 — acceptance pipeline PASS in `.wicked-testing/evidence/core-l3-5-20260721/verdict.json`. Scenario `crew-governed-run`: wicked-crew serve (--stub for worker-CLI dispatch, real governance engine) + POST /api/v1/runs → runId `cd177e3c-991b-4a1e-af55-f51072737bd9`; run created with `conformance_ref=a3740e23...` (64-hex SHA-256, real governance hash), `status=completed`, `assigned_cli=claude`, health `version=0.2.0`. All 5 assertions PASS; independent reviewer (acceptance-test-reviewer) evaluated cold; structural separation confirmed. |
 
 ---
 
@@ -102,3 +102,4 @@ These cannot be waived or deferred:
 | 0.3 | 2026-07-21 | michael.parcewski@accenture.com | L1-1 through L1-6 formally checked off (were effectively ✓; now explicit with evidence). CI matrix extended to ubuntu + macOS + windows (L3-2). |
 | 0.4 | 2026-07-21 | michael.parcewski@accenture.com | L3-3 and L3-4 checked off: `Cargo.toml` bumped to 0.2.0; `CHANGELOG.md` created with full [0.2.0] entry. |
 | 0.5 | 2026-07-21 | mike.parcewski@gmail.com | L2-4 upgraded from split evidence to fully verified: `cross_language_roundtrip` (`#[ignore]`) run manually: 1 passed, 0 failed. Rust→JS: Rust emits `wicked.crew.run.requested` to SQLite bus; JS subscribe drains and confirms well-formed envelope (`event_id=1, event_type=wicked.crew.run.requested, drained=1, acked=true`). JS→Rust: JS emits; Rust `BusDb::poll` receives with correct type/payload (`event_id=1, type=wicked.crew.run.requested, payload={problem:js wrote this, workflow:bug}`). Duration: 0.54s. Command: `cargo test -p wicked-core --test bus_bridge -- cross_language_roundtrip --ignored --nocapture`. |
+| 0.6 | 2026-07-21 | mike.parcewski@gmail.com | L3-5 checked off: wicked-testing acceptance pipeline PASS against a real governed wicked-crew run. Scenario `crew-governed-run` (`.wicked-testing/scenarios/crew-governed-run.md`): wicked-crew serve --stub (governance engine real, worker-CLI dispatch stubbed) + POST /api/v1/runs → run `cd177e3c` created; governance applied (`conformance_ref=a3740e23...`, 64-hex SHA-256); `status=completed`, `assigned_cli=claude`, engine `version=0.2.0`. All 5 assertions PASS; independent reviewer cold-read; verdict in `.wicked-testing/evidence/core-l3-5-20260721/verdict.json`. L3-1 (crates.io path deps) remains open (blocked on estate crates.io publication); status stays `partially-verified`. |

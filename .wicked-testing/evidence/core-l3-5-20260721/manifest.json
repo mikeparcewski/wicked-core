@@ -1,0 +1,82 @@
+{
+  "manifest_version": "1.1.0",
+  "run_id": "core-l3-5-20260721",
+  "scenario_id": "crew-governed-run",
+  "scenario_name": "crew-governed-run",
+  "scenario_path": ".wicked-testing/scenarios/crew-governed-run.md",
+  "started_at": "2026-07-21T19:07:00.000Z",
+  "finished_at": "2026-07-21T19:08:00.000Z",
+  "duration_ms": 60000,
+  "status": "passed",
+  "verdict": {
+    "value": "PASS",
+    "reviewer": "acceptance-test-reviewer",
+    "reason": "All 5 assertions pass. wicked-core engine creates a governed run with real conformance_ref (SHA-256 hash), council routing, worker assignment, and phase transitions — all verified against evidence files.",
+    "recorded_at": "2026-07-21T19:08:30.000Z"
+  },
+  "environment": {
+    "os": "darwin 25.5.0",
+    "node": "26.0.0",
+    "wicked_testing_version": "0.9.0",
+    "wicked_core_version": "0.2.0",
+    "wicked_crew_version": "0.2.0"
+  },
+  "artifacts": [
+    {
+      "name": "step1-serve-start.txt",
+      "kind": "misc",
+      "path": "step1-serve-start.txt",
+      "bytes": 133,
+      "sha256": "e99209b48d8161e26c994a62223c6224656261402f6d8bb6191650ee6959cdc3",
+      "captured_at": "2026-07-21T19:07:15.000Z"
+    },
+    {
+      "name": "step2-create-run.json",
+      "kind": "misc",
+      "path": "step2-create-run.json",
+      "bytes": 49,
+      "sha256": "ec3346fdc93f1e790fd9105a6e8afd3ee015a2742684a57b3e72e5f0d2387f91",
+      "captured_at": "2026-07-21T19:07:20.000Z"
+    },
+    {
+      "name": "step3-runs-full.json",
+      "kind": "misc",
+      "path": "step3-runs-full.json",
+      "bytes": 1233,
+      "sha256": "2bab73a419c6554659f69345249e1ccef7f4a50f5b62dc3096d7d96df40dc428",
+      "captured_at": "2026-07-21T19:07:25.000Z"
+    },
+    {
+      "name": "step3-runs-summary.txt",
+      "kind": "misc",
+      "path": "step3-runs-summary.txt",
+      "bytes": 182,
+      "sha256": "718bba45a1a92c0374abdb6eec31277b5261e566d0dd82f4ff5e45f77400908d",
+      "captured_at": "2026-07-21T19:07:25.000Z"
+    },
+    {
+      "name": "step4-health.json",
+      "kind": "misc",
+      "path": "step4-health.json",
+      "bytes": 46,
+      "sha256": "d96e107d05f1ad61ea7b36d989a95539e9fdb4aa6c8e0d19259bebd113132c4f",
+      "captured_at": "2026-07-21T19:07:30.000Z"
+    },
+    {
+      "name": "step5-shutdown.txt",
+      "kind": "misc",
+      "path": "step5-shutdown.txt",
+      "bytes": 12,
+      "sha256": "9e770e15dedc8c1068497749db1114eef644ae913944bb930d436b96932ecb80",
+      "captured_at": "2026-07-21T19:08:00.000Z"
+    },
+    {
+      "name": "verdict.json",
+      "kind": "misc",
+      "path": "verdict.json",
+      "bytes": 2745,
+      "sha256": "415ee119ef1d2ae020461547e0761e7d8af410eb05bb71613f0d65e1084d0992",
+      "captured_at": "2026-07-21T19:08:30.000Z"
+    }
+  ]
+}
