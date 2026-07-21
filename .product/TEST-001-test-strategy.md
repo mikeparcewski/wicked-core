@@ -47,7 +47,7 @@ cargo test
 | `bus_bridge.rs` | Cross-language napi round-trip: `run.requested` → launch → `run.launched`; verifies wicked-bus bridge wiring |
 | `exec_seam.rs` | Execution seam: CLI runner dispatches off actor thread via wicked-bus opt-in path |
 | `events_foundation.rs` | Foundation event stream: session lifecycle events |
-| `coverage.rs` / `coverage_cli.rs` / `coverage_schema.rs` | Coverage emitter: store-recomputed report, schema validation, CLI surface |
+| `coverage_cli.rs` / `coverage_schema.rs` | Coverage emitter: CLI surface and schema validation (no standalone `coverage.rs`) |
 | `domain_extraction_e2e.rs` | Domain extraction end-to-end |
 | `p10_methodology.rs` through `p14_gate_phase.rs` | Methodology pipeline stages (recon, adversarial review, functional test, gate phases) |
 | `operator_api.rs` | Operator API (provision-validator, approve-validator) |
