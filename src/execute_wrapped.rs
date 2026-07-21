@@ -445,10 +445,11 @@ fn quote_exe_command(exe: &str) -> String {
 /// 3. PATH lookup of `wicked-core` — fallback for installs that put the binary on PATH.
 /// 4. Bare `"wicked-core"` string — last resort; will fail at hook time if not on PATH.
 fn resolve_wicked_core_exe() -> String {
-    // 1. Operator override.
+    // 1. Operator override — trim so trailing whitespace/newlines don't break the hook command.
     if let Ok(v) = std::env::var("WICKED_CORE_EXE") {
-        if !v.trim().is_empty() {
-            return v;
+        let trimmed = v.trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
         }
     }
     // 2. current_exe() — valid unless it is the Node.js interpreter.
@@ -456,7 +457,8 @@ fn resolve_wicked_core_exe() -> String {
         let is_node = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n == "node" || n == "node.exe")
+            // Case-insensitive: Windows may report Node.exe / NODE.EXE.
+            .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
             .unwrap_or(false);
         if !is_node {
             return path.to_string_lossy().into_owned();
@@ -466,7 +468,7 @@ fn resolve_wicked_core_exe() -> String {
     if let Ok(found) = which_binary("wicked-core") {
         return found;
     }
-    // 4. Bare name — will work if wicked-core is on PATH at hook time.
+    // 4. Bare name — last resort; works if wicked-core is on PATH at hook-execution time.
     "wicked-core".to_string()
 }
 
@@ -478,7 +480,7 @@ fn resolve_estate_mcp_exe() -> String {
         let is_node = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n == "node" || n == "node.exe")
+            .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
             .unwrap_or(false);
         if !is_node {
             if let Some(parent) = path.parent() {
@@ -502,14 +504,14 @@ fn resolve_estate_mcp_exe() -> String {
 
 /// Locate a binary on PATH using the same search the shell would do.
 fn which_binary(name: &str) -> Result<String, ()> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
     let exe_name = if cfg!(windows) {
         format!("{name}.exe")
     } else {
         name.to_string()
     };
-    for dir in path_var.split(if cfg!(windows) { ';' } else { ':' }) {
-        let candidate = std::path::Path::new(dir).join(&exe_name);
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&exe_name);
         if candidate.is_file() {
             if let Some(s) = candidate.to_str().map(|s| s.to_string()) {
                 return Ok(s);
@@ -556,8 +558,9 @@ fn arm_input_governance(
     // like `'/opt/homebrew/bin/node' gate-hook` that Node then tries to require() as a module.
     // Resolution order:
     //   1. $WICKED_CORE_EXE — explicit override from the daemon's process environment
-    //   2. current_exe() — if it does not end with "node" or "node.exe" (i.e., not the addon path)
-    //   3. PATH lookup of "wicked-core" — daemon installed wicked-core-mcp binary has a sibling
+    //   2. current_exe() — if it does not end with "node"/"node.exe" (i.e., not the napi addon path)
+    //   3. PATH lookup of "wicked-core" — covers cargo-install and wicked-crew npm-install scenarios
+    //   4. Bare "wicked-core" — last resort; works if the binary is on PATH at hook-execution time
     let exe = resolve_wicked_core_exe();
     // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the exe is
     // interpolated (scope/phase go via env). Quote it per-platform so a `$`/backtick in the install path
