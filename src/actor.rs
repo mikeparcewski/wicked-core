@@ -499,7 +499,15 @@ pub(crate) fn run(
                                 }
                             }
                             Err(e) => {
+                                // Wedge prevention: advance_or_pause failed after plan_and_distribute
+                                // wrote the session to Executing — no worker will ever post a result,
+                                // so mark Failed to prevent the UI permanently showing Executing.
                                 in_flight.remove(&run_id);
+                                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id)
+                                {
+                                    s.status = SessionStatus::Failed;
+                                    let _ = put_node(&mut store, s.to_node());
+                                }
                                 emit_run_error(&mut subscribers, &run_id, e);
                             }
                         }
