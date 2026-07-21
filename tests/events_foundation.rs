@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, StepInput, StepOutput,
+    StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -1005,4 +1005,143 @@ fn unit_output_captured_fires_before_gate_decided_for_ok_unit() {
             "UnitOutputCaptured must precede GateDecided for ord={ord}"
         );
     }
+}
+
+/// UnitReworkAmended fires only when the amendment text is non-empty, appears between the amendment
+/// being persisted and Resumed, and carries the correct amendment text + updated_description.
+/// An empty amend string must NOT emit the event. (Copilot coverage request.)
+#[test]
+fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
+    // Single-unit run with human_confirm:All so the gate fires before the first unit.
+    let core = Core::spawn_with_engine(
+        db_path("ura"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev = core.subscribe();
+    core.launch_run(LaunchSpec {
+        problem: "Do the work.".into(),
+        clis: vec![cli("a")],
+        entity_mode: EntityMode::Shared,
+        session_id: "ura-sess".into(),
+        human_confirm: HumanConfirm::All, // pauses before unit 1
+        repo_ref: None,
+        workflow: None,
+    })
+    .expect("launch");
+
+    // Drain until the gate pause.
+    let mut collected = drain_until_terminal(&ev, "ura-sess");
+    let pause_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == "ura-sess"),
+        )
+        .expect("AwaitingHuman must fire with human_confirm:All");
+
+    // Approve with a non-empty amendment. The run then completes (OkRunner, single unit).
+    core.confirm_gate(
+        "ura-sess",
+        HumanDecision::Approve {
+            amend: Some("use structured logging throughout".to_string()),
+        },
+    )
+    .expect("confirm with amendment");
+
+    // Drain until terminal (SessionCompleted or SessionFailed).
+    let more = drain_until_terminal(&ev, "ura-sess");
+    collected.extend(more);
+
+    // UnitReworkAmended must fire.
+    let amended: Vec<_> = collected
+        .iter()
+        .filter_map(|e| {
+            if let CoreEvent::UnitReworkAmended {
+                session,
+                amendment,
+                updated_description,
+                ..
+            } = e
+            {
+                if session == "ura-sess" {
+                    return Some((amendment.as_str(), updated_description.as_str()));
+                }
+            }
+            None
+        })
+        .collect();
+
+    assert_eq!(
+        amended.len(),
+        1,
+        "exactly one UnitReworkAmended for a non-empty amendment"
+    );
+    let (amendment, updated) = amended[0];
+    assert_eq!(
+        amendment, "use structured logging throughout",
+        "amendment text must match what was passed to confirm_gate"
+    );
+    assert!(
+        updated.contains("operator amendment: use structured logging throughout"),
+        "updated_description must contain the injected amendment text, got: {updated}"
+    );
+
+    // Ordering: UnitReworkAmended must appear after AwaitingHuman and before Resumed.
+    let ura_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::UnitReworkAmended { session, .. } if session == "ura-sess"),
+        )
+        .expect("UnitReworkAmended must be in collected events");
+    let resumed_pos = collected
+        .iter()
+        .position(|e| matches!(e, CoreEvent::Resumed { session, .. } if session == "ura-sess"))
+        .expect("Resumed must fire after confirm_gate(Approve)");
+    assert!(
+        pause_pos < ura_pos,
+        "UnitReworkAmended must appear after AwaitingHuman"
+    );
+    assert!(
+        ura_pos < resumed_pos,
+        "UnitReworkAmended must precede Resumed"
+    );
+
+    // Empty amendment must NOT emit UnitReworkAmended.
+    let core2 = Core::spawn_with_engine(
+        db_path("ura-empty"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev2 = core2.subscribe();
+    core2
+        .launch_run(LaunchSpec {
+            problem: "Do the work.".into(),
+            clis: vec![cli("a")],
+            entity_mode: EntityMode::Shared,
+            session_id: "ura-empty-sess".into(),
+            human_confirm: HumanConfirm::All,
+            repo_ref: None,
+            workflow: None,
+        })
+        .expect("launch empty amend run");
+    let mut collected2 = drain_until_terminal(&ev2, "ura-empty-sess");
+    // Confirm with an empty string — must not emit UnitReworkAmended.
+    core2
+        .confirm_gate(
+            "ura-empty-sess",
+            HumanDecision::Approve {
+                amend: Some(String::new()),
+            },
+        )
+        .expect("confirm with empty amendment");
+    let more2 = drain_until_terminal(&ev2, "ura-empty-sess");
+    collected2.extend(more2);
+    let empty_amended: Vec<_> = collected2
+        .iter()
+        .filter(|e| matches!(e, CoreEvent::UnitReworkAmended { .. }))
+        .collect();
+    assert!(
+        empty_amended.is_empty(),
+        "UnitReworkAmended must NOT fire for an empty amendment string"
+    );
 }

@@ -348,7 +348,7 @@ pub(crate) fn pre_distribute(
         emit(CoreEvent::WorkflowSelected {
             session: session_id.to_string(),
             workflow_id: def.id.clone(),
-            unit_count: units.len() as u32,
+            unit_count: u32::try_from(units.len()).unwrap_or(u32::MAX),
         });
     }
 
