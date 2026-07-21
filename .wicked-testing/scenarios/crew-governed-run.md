@@ -22,6 +22,11 @@ verdict against a real governed wicked-crew run driven by this version of wicked
 - `wicked-core` is the engine embedded in the installed wicked-crew package.
 - A temp directory is writable for the DB.
 
+> **Note on Step 1 command path:** the step uses `which wicked-crew | xargs dirname` to locate the
+> CLI entry point. This avoids coupling to a specific npm prefix or global install layout. On
+> machines where `wicked-crew` is not on PATH, adjust to use the explicit entry point path from
+> `npm root -g`.
+
 ## Steps
 
 ### Step 1 — Start wicked-crew serve (stub mode)
