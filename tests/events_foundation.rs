@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, StepInput, StepOutput, StepRunner,
-    StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, StepInput, StepOutput,
+    StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -820,5 +820,328 @@ fn step_failed_event_fires_before_session_failed() {
         *failure_kind,
         wicked_core::StepFailureKind::WorkerError,
         "failure_kind must be WorkerError for a runner-reported failure"
+    );
+}
+
+// ── P2 decisions-full wave tests (EVT-001, EVT-013) ─────────────────────────────────────────────
+
+/// WorkflowSelected fires between SessionStarted and the first UnitPlanned for a structured-workflow
+/// run, carrying the resolved workflow id and unit count. It must NOT fire for free-text runs.
+#[test]
+fn workflow_selected_fires_for_structured_run_only() {
+    // ── Structured run: WorkflowSelected must fire ──
+    let core = Core::spawn_with_engine(
+        db_path("wfsel"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let def_json = r#"{
+        "id": "test-wfsel",
+        "phases": [
+            {"id": "build", "kind": "build", "gate": "auto"},
+            {"id": "review", "kind": "review", "gate": "auto", "depends_on": ["build"]}
+        ]
+    }"#;
+    core.register_workflow(def_json).expect("register workflow");
+
+    let ev = core.subscribe();
+    core.launch_run(LaunchSpec {
+        problem: "Build then review it.".into(),
+        clis: vec![cli("a")],
+        entity_mode: EntityMode::Shared,
+        session_id: "wfsel-sess".into(),
+        human_confirm: HumanConfirm::None,
+        repo_ref: None,
+        workflow: Some("test-wfsel".into()),
+    })
+    .expect("launch structured");
+    let collected = drain_until_terminal(&ev, "wfsel-sess");
+
+    let selected: Vec<_> = collected
+        .iter()
+        .filter_map(|e| {
+            if let CoreEvent::WorkflowSelected {
+                session,
+                workflow_id,
+                unit_count,
+            } = e
+            {
+                if session == "wfsel-sess" {
+                    return Some((workflow_id.as_str(), *unit_count));
+                }
+            }
+            None
+        })
+        .collect();
+
+    assert_eq!(
+        selected.len(),
+        1,
+        "exactly one WorkflowSelected for a structured run"
+    );
+    assert_eq!(
+        selected[0].0, "test-wfsel",
+        "workflow_id matches the registered def"
+    );
+    assert_eq!(selected[0].1, 2, "unit_count matches the number of phases");
+
+    // Verify ordering: WorkflowSelected must appear after SessionStarted and before the first UnitPlanned.
+    let ss_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::SessionStarted { session, .. } if session == "wfsel-sess"),
+        )
+        .expect("SessionStarted must fire");
+    let ws_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::WorkflowSelected { session, .. } if session == "wfsel-sess"),
+        )
+        .expect("WorkflowSelected must fire");
+    let up_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::UnitPlanned { session, .. } if session == "wfsel-sess"),
+        )
+        .expect("at least one UnitPlanned must fire");
+    assert!(
+        ss_pos < ws_pos,
+        "WorkflowSelected must come after SessionStarted"
+    );
+    assert!(
+        ws_pos < up_pos,
+        "WorkflowSelected must come before the first UnitPlanned"
+    );
+
+    // ── Free-text run: WorkflowSelected must NOT fire ──
+    let core2 = Core::spawn_with_engine(
+        db_path("wfsel-free"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev2 = core2.subscribe();
+    core2
+        .launch_run(spec("wfsel-free-sess", vec![cli("a")]))
+        .expect("launch free-text");
+    let collected2 = drain_until_terminal(&ev2, "wfsel-free-sess");
+    let free_selected: Vec<_> = collected2
+        .iter()
+        .filter(|e| matches!(e, CoreEvent::WorkflowSelected { .. }))
+        .collect();
+    assert!(
+        free_selected.is_empty(),
+        "WorkflowSelected must NOT fire for a free-text run, got: {free_selected:?}"
+    );
+}
+
+/// UnitOutputCaptured fires before GateDecided for a normal (Ok) unit, carrying output_bytes,
+/// step_status="ok", and governed=false (the OkRunner does not arm governance).
+#[test]
+fn unit_output_captured_fires_before_gate_decided_for_ok_unit() {
+    let core = Core::spawn_with_engine(
+        db_path("uoc"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev = core.subscribe();
+    core.launch_run(spec("uoc-sess", vec![cli("a")]))
+        .expect("launch");
+    let collected = drain_until_terminal(&ev, "uoc-sess");
+
+    // UnitOutputCaptured must fire for every unit (OkRunner, so all are Ok).
+    let captured: Vec<_> = collected
+        .iter()
+        .filter_map(|e| {
+            if let CoreEvent::UnitOutputCaptured {
+                session,
+                ord,
+                attempt,
+                output_bytes,
+                step_status,
+                governed,
+            } = e
+            {
+                if session == "uoc-sess" {
+                    return Some((
+                        *ord,
+                        *attempt,
+                        *output_bytes,
+                        step_status.as_str(),
+                        *governed,
+                    ));
+                }
+            }
+            None
+        })
+        .collect();
+
+    assert!(
+        !captured.is_empty(),
+        "UnitOutputCaptured must fire for at least one unit"
+    );
+    for &(ord, attempt, _bytes, status, gov) in &captured {
+        assert_eq!(
+            status, "ok",
+            "OkRunner produces step_status=ok for ord={ord}"
+        );
+        assert_eq!(attempt, 0, "first dispatch is attempt=0 for ord={ord}");
+        assert!(!gov, "OkRunner does not arm governance for ord={ord}");
+    }
+
+    // Verify ordering: for each ord, UnitOutputCaptured must precede GateDecided.
+    for &(ord, ..) in &captured {
+        let uoc_pos = collected.iter().position(|e| {
+            matches!(e, CoreEvent::UnitOutputCaptured { session, ord: o, .. }
+                if session == "uoc-sess" && *o == ord)
+        });
+        let gd_pos = collected.iter().position(|e| {
+            matches!(e, CoreEvent::GateDecided { session, ord: o, .. }
+                if session == "uoc-sess" && *o == ord)
+        });
+        let uoc_pos = uoc_pos.expect("UnitOutputCaptured must fire");
+        let gd_pos = gd_pos.expect("GateDecided must fire");
+        assert!(
+            uoc_pos < gd_pos,
+            "UnitOutputCaptured must precede GateDecided for ord={ord}"
+        );
+    }
+}
+
+/// UnitReworkAmended fires only when the amendment text is non-empty, appears between the amendment
+/// being persisted and Resumed, and carries the correct amendment text + updated_description.
+/// An empty amend string must NOT emit the event. (Copilot coverage request.)
+#[test]
+fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
+    // Single-unit run with human_confirm:All so the gate fires before the first unit.
+    let core = Core::spawn_with_engine(
+        db_path("ura"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev = core.subscribe();
+    core.launch_run(LaunchSpec {
+        problem: "Do the work.".into(),
+        clis: vec![cli("a")],
+        entity_mode: EntityMode::Shared,
+        session_id: "ura-sess".into(),
+        human_confirm: HumanConfirm::All, // pauses before unit 1
+        repo_ref: None,
+        workflow: None,
+    })
+    .expect("launch");
+
+    // Drain until the gate pause.
+    let mut collected = drain_until_terminal(&ev, "ura-sess");
+    let pause_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::AwaitingHuman { session, .. } if session == "ura-sess"),
+        )
+        .expect("AwaitingHuman must fire with human_confirm:All");
+
+    // Approve with a non-empty amendment. The run then completes (OkRunner, single unit).
+    core.confirm_gate(
+        "ura-sess",
+        HumanDecision::Approve {
+            amend: Some("use structured logging throughout".to_string()),
+        },
+    )
+    .expect("confirm with amendment");
+
+    // Drain until terminal (SessionCompleted or SessionFailed).
+    let more = drain_until_terminal(&ev, "ura-sess");
+    collected.extend(more);
+
+    // UnitReworkAmended must fire.
+    let amended: Vec<_> = collected
+        .iter()
+        .filter_map(|e| {
+            if let CoreEvent::UnitReworkAmended {
+                session,
+                amendment,
+                updated_description,
+                ..
+            } = e
+            {
+                if session == "ura-sess" {
+                    return Some((amendment.as_str(), updated_description.as_str()));
+                }
+            }
+            None
+        })
+        .collect();
+
+    assert_eq!(
+        amended.len(),
+        1,
+        "exactly one UnitReworkAmended for a non-empty amendment"
+    );
+    let (amendment, updated) = amended[0];
+    assert_eq!(
+        amendment, "use structured logging throughout",
+        "amendment text must match what was passed to confirm_gate"
+    );
+    assert!(
+        updated.contains("operator amendment: use structured logging throughout"),
+        "updated_description must contain the injected amendment text, got: {updated}"
+    );
+
+    // Ordering: UnitReworkAmended must appear after AwaitingHuman and before Resumed.
+    let ura_pos = collected
+        .iter()
+        .position(
+            |e| matches!(e, CoreEvent::UnitReworkAmended { session, .. } if session == "ura-sess"),
+        )
+        .expect("UnitReworkAmended must be in collected events");
+    let resumed_pos = collected
+        .iter()
+        .position(|e| matches!(e, CoreEvent::Resumed { session, .. } if session == "ura-sess"))
+        .expect("Resumed must fire after confirm_gate(Approve)");
+    assert!(
+        pause_pos < ura_pos,
+        "UnitReworkAmended must appear after AwaitingHuman"
+    );
+    assert!(
+        ura_pos < resumed_pos,
+        "UnitReworkAmended must precede Resumed"
+    );
+
+    // Empty amendment must NOT emit UnitReworkAmended.
+    let core2 = Core::spawn_with_engine(
+        db_path("ura-empty"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    let ev2 = core2.subscribe();
+    core2
+        .launch_run(LaunchSpec {
+            problem: "Do the work.".into(),
+            clis: vec![cli("a")],
+            entity_mode: EntityMode::Shared,
+            session_id: "ura-empty-sess".into(),
+            human_confirm: HumanConfirm::All,
+            repo_ref: None,
+            workflow: None,
+        })
+        .expect("launch empty amend run");
+    let mut collected2 = drain_until_terminal(&ev2, "ura-empty-sess");
+    // Confirm with an empty string — must not emit UnitReworkAmended.
+    core2
+        .confirm_gate(
+            "ura-empty-sess",
+            HumanDecision::Approve {
+                amend: Some(String::new()),
+            },
+        )
+        .expect("confirm with empty amendment");
+    let more2 = drain_until_terminal(&ev2, "ura-empty-sess");
+    collected2.extend(more2);
+    let empty_amended: Vec<_> = collected2
+        .iter()
+        .filter(|e| matches!(e, CoreEvent::UnitReworkAmended { .. }))
+        .collect();
+    assert!(
+        empty_amended.is_empty(),
+        "UnitReworkAmended must NOT fire for an empty amendment string"
     );
 }

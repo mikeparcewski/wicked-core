@@ -341,6 +341,17 @@ pub(crate) fn pre_distribute(
         });
     }
 
+    // (EVT-001) WorkflowSelected — the authoritative decomposition signal for structured runs.
+    // Fires once per session, after SessionStarted and before the first UnitPlanned, so consumers
+    // that initialise per-session state on SessionStarted see it before any unit events arrive.
+    if let Some(def) = &selected_def {
+        emit(CoreEvent::WorkflowSelected {
+            session: session_id.to_string(),
+            workflow_id: def.id.clone(),
+            unit_count: u32::try_from(units.len()).unwrap_or(u32::MAX),
+        });
+    }
+
     for u in &units {
         put_node(store, u.to_node())?;
         emit(CoreEvent::UnitPlanned {
