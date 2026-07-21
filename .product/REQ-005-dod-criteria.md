@@ -29,7 +29,7 @@ Required on every PR and merge to main.
 | L1-3 | `cargo build --workspace` exits 0 | CI `ci.yml` `cargo build --workspace` step | — |
 | L1-4 | `cargo test --workspace` exits 0 on ubuntu-latest | CI `ci.yml` `cargo test --workspace` step | — |
 | L1-5 | `cargo build --features postgres` exits 0 (backend compile-parity) | CI `ci.yml` backend compile step | — |
-| L1-6 | napi bindings build: `napi-release.yml` `cargo build --release` exits 0 for x86_64/aarch64 | CI `napi-release.yml` build matrix | — |
+| L1-6 | napi bindings build: `napi-release.yml` runs `npx napi build --platform --release` for 5 targets (macOS x64/arm64, Linux x64/arm64, Windows x64) | CI `napi-release.yml` build matrix (triggered on version tags) | — |
 
 **Current status:** L1-1 through L1-5 pass in CI on every merged PR (`check` job in `ci.yml`). L1-6 passes on version tags via `napi-release.yml`. All L1 criteria are effectively ✓ as of main HEAD, but open CRITICAL bugs (ISS-001, ISS-002, ISS-003) mean correctness is not fully established even when tests pass.
 
