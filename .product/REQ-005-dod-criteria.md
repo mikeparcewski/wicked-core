@@ -1,7 +1,7 @@
 ---
 name: REQ-005-dod-criteria
 title: wicked-core — Definition of Done Criteria
-status: not-started
+status: in-progress
 version: 0.1
 date: 2026-07-21
 author: michael.parcewski@accenture.com
