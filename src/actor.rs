@@ -529,13 +529,12 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            let result = std::panic::catch_unwind(
-                                std::panic::AssertUnwindSafe(|| {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on(
                                         &pre.units, &pre.clis, &sid, None, &disp,
                                     )
-                                }),
-                            );
+                                }));
                             match result {
                                 Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
@@ -557,13 +556,17 @@ pub(crate) fn run(
                                             let payload = _panic;
                                             payload
                                                 .downcast_ref::<&str>()
-                                                .map(|s| format!("distribution thread panicked: {s}"))
-                                                .or_else(|| {
-                                                    payload
-                                                        .downcast_ref::<String>()
-                                                        .map(|s| format!("distribution thread panicked: {s}"))
+                                                .map(|s| {
+                                                    format!("distribution thread panicked: {s}")
                                                 })
-                                                .unwrap_or_else(|| "distribution thread panicked".to_string())
+                                                .or_else(|| {
+                                                    payload.downcast_ref::<String>().map(|s| {
+                                                        format!("distribution thread panicked: {s}")
+                                                    })
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "distribution thread panicked".to_string()
+                                                })
                                         },
                                     });
                                 }
@@ -692,13 +695,12 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            let result = std::panic::catch_unwind(
-                                std::panic::AssertUnwindSafe(|| {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on(
                                         &pre.units, &pre.clis, &sid, None, &disp,
                                     )
-                                }),
-                            );
+                                }));
                             match result {
                                 Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
@@ -720,13 +722,17 @@ pub(crate) fn run(
                                             let payload = _panic;
                                             payload
                                                 .downcast_ref::<&str>()
-                                                .map(|s| format!("distribution thread panicked: {s}"))
-                                                .or_else(|| {
-                                                    payload
-                                                        .downcast_ref::<String>()
-                                                        .map(|s| format!("distribution thread panicked: {s}"))
+                                                .map(|s| {
+                                                    format!("distribution thread panicked: {s}")
                                                 })
-                                                .unwrap_or_else(|| "distribution thread panicked".to_string())
+                                                .or_else(|| {
+                                                    payload.downcast_ref::<String>().map(|s| {
+                                                        format!("distribution thread panicked: {s}")
+                                                    })
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "distribution thread panicked".to_string()
+                                                })
                                         },
                                     });
                                 }
@@ -1555,8 +1561,8 @@ pub(crate) fn run(
                                 .into_iter()
                                 .filter(|u| u.ord == ord_c)
                                 .collect();
-                            let result = std::panic::catch_unwind(
-                                std::panic::AssertUnwindSafe(|| {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on(
                                         &unit_slice,
                                         &clis,
@@ -1564,8 +1570,7 @@ pub(crate) fn run(
                                         None,
                                         &disp,
                                     )
-                                }),
-                            );
+                                }));
                             match result {
                                 Ok(Ok(dists)) => {
                                     let new_cli_key = dists
