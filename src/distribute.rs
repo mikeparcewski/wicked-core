@@ -57,26 +57,38 @@ pub fn distribute_units_on(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
 ) -> anyhow::Result<Vec<Distribution>> {
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
-    let mut dists: Vec<Distribution> = units
-        .iter()
-        .map(|unit| {
-            if unit.tool_cmd.is_some() {
-                Ok(Distribution {
-                    assigned_cli: unit
-                        .tool_cmd
-                        .as_ref()
-                        .and_then(|c| c.first())
-                        .cloned()
-                        .unwrap_or_else(|| "__tool__".to_string()),
-                    assigned_invocation: None,
-                    council_task_ref: None,
-                    routing: RoutingInfo::Tool,
+    let mut dists: Vec<Distribution> = std::thread::scope(|s| {
+        let handles: Vec<_> = units
+            .iter()
+            .map(|unit| {
+                s.spawn(|| {
+                    if unit.tool_cmd.is_some() {
+                        Ok(Distribution {
+                            assigned_cli: unit
+                                .tool_cmd
+                                .as_ref()
+                                .and_then(|c| c.first())
+                                .cloned()
+                                .unwrap_or_else(|| "__tool__".to_string()),
+                            assigned_invocation: None,
+                            council_task_ref: None,
+                            routing: RoutingInfo::Tool,
+                        })
+                    } else {
+                        distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
+                    }
                 })
-            } else {
-                distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
-            }
-        })
-        .collect::<anyhow::Result<_>>()?;
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .map_err(|_| anyhow::anyhow!("council thread panicked"))
+                    .and_then(|r| r)
+            })
+            .collect::<anyhow::Result<_>>()
+    })?;
     enforce_evaluator_distinct(units, &mut dists, &roster_keys, clis);
     Ok(dists)
 }

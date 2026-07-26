@@ -529,20 +529,31 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            match crate::distribute::distribute_units_on(
-                                &pre.units, &pre.clis, &sid, None, &disp,
-                            ) {
-                                Ok(distributions) => {
+                            let result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    crate::distribute::distribute_units_on(
+                                        &pre.units, &pre.clis, &sid, None, &disp,
+                                    )
+                                }),
+                            );
+                            match result {
+                                Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
                                         run_id: sid,
                                         pre,
                                         distributions,
                                     });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
                                         error: e.to_string(),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: sid,
+                                        error: "distribution thread panicked".to_string(),
                                     });
                                 }
                             }
@@ -670,20 +681,31 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            match crate::distribute::distribute_units_on(
-                                &pre.units, &pre.clis, &sid, None, &disp,
-                            ) {
-                                Ok(distributions) => {
+                            let result = std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| {
+                                    crate::distribute::distribute_units_on(
+                                        &pre.units, &pre.clis, &sid, None, &disp,
+                                    )
+                                }),
+                            );
+                            match result {
+                                Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
                                         run_id: sid,
                                         pre,
                                         distributions,
                                     });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
                                         error: e.to_string(),
+                                    });
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: sid,
+                                        error: "distribution thread panicked".to_string(),
                                     });
                                 }
                             }
