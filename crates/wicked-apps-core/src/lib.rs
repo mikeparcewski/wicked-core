@@ -146,6 +146,8 @@ pub const EV_PHASE_REJECTED: &str = "wicked.crew.phase.rejected";
 // wicked.crew.* — council subsystem (producer: wicked-council)
 pub const EV_COUNCIL_REQUESTED: &str = "wicked.crew.council.requested";
 pub const EV_COUNCIL_VOTED: &str = "wicked.crew.council.voted";
+/// A deliberation ballot completed BELOW the approval threshold — another round follows.
+pub const EV_COUNCIL_DELIBERATED: &str = "wicked.crew.council.deliberated";
 pub const EV_CLI_RANKED: &str = "wicked.crew.cli.ranked";
 
 // wicked.crew.* — agent subsystem (producer: wicked-crew). Agent-qualified nouns keep them under
@@ -172,6 +174,7 @@ pub const EVENT_CATALOG: &[&str] = &[
     EV_PHASE_REJECTED,
     EV_COUNCIL_REQUESTED,
     EV_COUNCIL_VOTED,
+    EV_COUNCIL_DELIBERATED,
     EV_CLI_RANKED,
     EV_AGENT_SESSION_STARTED,
     EV_AGENT_PLAN_CREATED,

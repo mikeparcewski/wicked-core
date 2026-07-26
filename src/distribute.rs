@@ -14,6 +14,7 @@ use wicked_council::{
 };
 
 use crate::domain::{RoutingInfo, WorkUnit};
+use crate::event::CoreEvent;
 
 /// The production dispatcher — spawns real CLI subprocesses to collect council votes. Injected so
 /// tests can substitute a deterministic stub (no subprocess, no flaky dispatch).
@@ -22,6 +23,71 @@ pub fn real_dispatcher() -> Arc<dyn Dispatcher + Send + Sync> {
         timeout: Duration::from_secs(30),
         local_runner_timeout: Duration::from_secs(30),
     })
+}
+
+/// Fans council lifecycle events back to the actor's single emit point (via
+/// `Command::EmitEvent`), making deliberation visible to subscribers while a vote is
+/// still in flight. `None` keeps the historical silent behaviour (tests, straight-line
+/// pipeline callers).
+pub type EventRelay = Arc<dyn Fn(CoreEvent) + Send + Sync>;
+
+/// Adapts the council's string-keyed `EventSink` to run-scoped [`CoreEvent`]s. The council
+/// worker emits `EV_COUNCIL_REQUESTED` when voters are polled, `EV_COUNCIL_DELIBERATED`
+/// after each below-bar runoff ballot, and `EV_COUNCIL_VOTED` when the verdict lands; all
+/// three are translated with the owning (session, ord) attached so the UI can pin them to
+/// the unit being distributed. Rank bookkeeping (`EV_CLI_RANKED`) and any future council
+/// event types are intentionally dropped — they are not run-scoped.
+struct RelaySink {
+    relay: EventRelay,
+    session: String,
+    ord: u32,
+}
+
+impl wicked_council::EventSink for RelaySink {
+    fn emit(&self, event: &str, payload: &serde_json::Value) {
+        let ev = match event {
+            wicked_apps_core::EV_COUNCIL_REQUESTED => CoreEvent::CouncilConvened {
+                session: self.session.clone(),
+                ord: self.ord,
+                clis: payload["clis"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            wicked_apps_core::EV_COUNCIL_DELIBERATED => CoreEvent::CouncilDeliberated {
+                session: self.session.clone(),
+                ord: self.ord,
+                round: payload["round"].as_u64().unwrap_or(0) as u32,
+                agreement_pct: (payload["agreement_ratio"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0)
+                    * 100.0)
+                    .round() as u8,
+                needed_pct: (payload["threshold"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 100.0)
+                    .round() as u8,
+                votes: payload["votes"].as_u64().unwrap_or(0) as u32,
+            },
+            wicked_apps_core::EV_COUNCIL_VOTED => CoreEvent::CouncilVoted {
+                session: self.session.clone(),
+                ord: self.ord,
+                consensus: payload["consensus"].as_bool().unwrap_or(false),
+                agreement_pct: (payload["agreement_ratio"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0)
+                    * 100.0)
+                    .round() as u8,
+                votes: payload["votes"].as_u64().unwrap_or(0) as u32,
+            },
+            _ => return,
+        };
+        (self.relay)(ev);
+    }
 }
 
 /// The distribution decision for one unit (positionally aligned with the input units).
@@ -58,12 +124,14 @@ pub fn distribute_units_on(
     session_id: &str,
     db_path: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    relay: Option<EventRelay>,
 ) -> anyhow::Result<Vec<Distribution>> {
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     let mut dists: Vec<Distribution> = std::thread::scope(|s| {
         // Spawn all units concurrently. Scoped-thread closures borrow from the enclosing
         // scope — `std::thread::scope` guarantees all threads finish before it returns,
         // making the borrows sound without requiring `move`.
+        let relay = &relay;
         let handles: Vec<_> = units
             .iter()
             .map(|unit| {
@@ -81,7 +149,15 @@ pub fn distribute_units_on(
                             routing: RoutingInfo::Tool,
                         })
                     } else {
-                        distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
+                        distribute_one(
+                            unit,
+                            clis,
+                            &roster_keys,
+                            session_id,
+                            db_path,
+                            dispatcher,
+                            relay.clone(),
+                        )
                     }
                 })
             })
@@ -154,6 +230,7 @@ fn distribute_one(
     session_id: &str,
     db_path: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    relay: Option<EventRelay>,
 ) -> anyhow::Result<Distribution> {
     let estate = match db_path {
         Some(path) => EstateHandle::new(
@@ -165,6 +242,16 @@ fn distribute_one(
     };
     let ledger = Ledger::new(estate.clone());
     let rank_store = Arc::new(EstateRankStore::new(estate));
+    // Council lifecycle events flow to the actor's emit point when a relay is armed;
+    // otherwise deliberation stays silent (the pre-relay behaviour).
+    let events: Arc<dyn wicked_council::EventSink + Send + Sync> = match relay {
+        Some(relay) => Arc::new(RelaySink {
+            relay,
+            session: session_id.to_string(),
+            ord: unit.ord,
+        }),
+        None => Arc::new(NoopEventSink),
+    };
 
     // NOTE: a historical-ranking fast path once lived here, but distribution always runs with an
     // IN-MEMORY council estate — the single-writer actor owns the only shared-store handle, so we
@@ -177,7 +264,7 @@ fn distribute_one(
         ledger,
         dispatcher.clone(),
         rank_store,
-        Arc::new(NoopEventSink),
+        events,
         clis.to_vec(),
         work_kind,
     );
@@ -384,6 +471,90 @@ mod tests {
         assert!(
             matches!(&routing, RoutingInfo::Degraded { reason } if reason.contains("Option Z")),
             "non-numeric winner degrades with a reason naming the recommendation, got {routing:?}"
+        );
+    }
+
+    /// RelaySink translates the council's string-keyed events into run-scoped CoreEvents
+    /// with the owning (session, ord) attached, and drops non-run-scoped event types.
+    #[test]
+    fn relay_sink_translates_council_events_and_drops_the_rest() {
+        use wicked_council::EventSink;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let relay: EventRelay = Arc::new(move |ev| sink_seen.lock().unwrap().push(ev));
+        let sink = RelaySink {
+            relay,
+            session: "s1".to_string(),
+            ord: 3,
+        };
+
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_REQUESTED,
+            &serde_json::json!({"clis": ["a", "b"], "task_id": "t", "session_id": "s1"}),
+        );
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_VOTED,
+            &serde_json::json!({"consensus": true, "agreement_ratio": 0.5, "votes": 4}),
+        );
+        // Not run-scoped — must be dropped, not translated.
+        sink.emit(wicked_apps_core::EV_CLI_RANKED, &serde_json::json!({}));
+
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 2, "ranked event dropped: {events:?}");
+        assert!(
+            matches!(&events[0], CoreEvent::CouncilConvened { session, ord, clis }
+                if session == "s1" && *ord == 3 && clis == &["a".to_string(), "b".to_string()]),
+            "requested → CouncilConvened with run scope, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], CoreEvent::CouncilVoted { session, ord, consensus: true, agreement_pct: 50, votes: 4 }
+                if session == "s1" && *ord == 3),
+            "voted → CouncilVoted with ratio as percent, got {:?}",
+            events[1]
+        );
+    }
+
+    /// Malformed payloads (missing/mistyped fields) degrade to defaults instead of panicking.
+    #[test]
+    fn relay_sink_survives_malformed_payloads() {
+        use wicked_council::EventSink;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let relay: EventRelay = Arc::new(move |ev| sink_seen.lock().unwrap().push(ev));
+        let sink = RelaySink {
+            relay,
+            session: "s1".to_string(),
+            ord: 1,
+        };
+
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_REQUESTED,
+            &serde_json::json!({}),
+        );
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_VOTED,
+            &serde_json::json!({"agreement_ratio": "not a number"}),
+        );
+
+        let events = seen.lock().unwrap();
+        assert!(
+            matches!(&events[0], CoreEvent::CouncilConvened { clis, .. } if clis.is_empty()),
+            "missing clis → empty list, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(
+                &events[1],
+                CoreEvent::CouncilVoted {
+                    consensus: false,
+                    agreement_pct: 0,
+                    votes: 0,
+                    ..
+                }
+            ),
+            "mistyped fields → zero defaults, got {:?}",
+            events[1]
         );
     }
 }

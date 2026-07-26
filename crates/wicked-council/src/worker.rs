@@ -23,8 +23,17 @@ use std::time::Instant;
 use crate::store::{Ledger, TaskRecord};
 use crate::synthesis;
 use crate::types::{
-    AgenticCli, CouncilTask, Dispatcher, EventSink, RankSignal, RankStore, TaskState, Verdict,
+    AgenticCli, BallotContext, CouncilTask, Dispatcher, EventSink, RankSignal, RankStore,
+    TaskState, Verdict, SEATS,
 };
+
+/// The share of seats that must converge on one option before the council stops
+/// deliberating — the approval bar every voter is told about in its ballot prompt.
+pub const APPROVAL_THRESHOLD: f32 = 0.75;
+
+/// Hard cap on ballots (first vote + runoffs) so deliberation always terminates.
+/// Below-threshold after the final ballot degrades to plurality, exactly as before.
+pub const MAX_BALLOTS: u32 = 3;
 
 /// The detached worker. Holds the shared ledger plus the injected seams (dispatcher, rank
 /// store, event sink) so the same engine wiring serves both the real CLI and the
@@ -172,39 +181,93 @@ fn run_council(
         return;
     }
 
-    // Dispatch each CLI in isolation, recording per-CLI latency for ranking. (Sequential
-    // here; the isolation guarantees independence and the contract is "the agent isn't
-    // resident", not "maximally parallel" — parallelism is a straightforward follow-up
-    // since each dispatch is independent.)
-    let mut votes = Vec::new();
-    let mut latencies = Vec::new();
-    for cli in roster {
-        let started = Instant::now();
-        let vote = dispatcher.dispatch(cli, task);
-        let latency_ms = started.elapsed().as_millis() as u64;
-        latencies.push((cli.key.clone(), vote.is_some(), latency_ms));
-        if let Some(v) = vote {
-            votes.push(v);
+    // DELIBERATION LOOP — governance as a conversation, not a one-shot poll. Each ballot
+    // dispatches every seat with its unique lens (SEATS rotation) and the approval bar;
+    // if the ballot lands below APPROVAL_THRESHOLD, a runoff shares the tally + dissent
+    // arguments with every seat so the council can converge like a real deliberating
+    // body. MAX_BALLOTS caps the loop; the final ballot's plurality stands regardless.
+    let mut ballot: u32 = 1;
+    let mut prior_tally: Vec<(String, u32)> = Vec::new();
+    let mut dissent_arguments: Vec<String> = Vec::new();
+    // Per-CLI ranking signal accumulated ACROSS ballots: total latency summed over every
+    // dispatch (a 3-ballot deliberation costs 3 dispatches and is reported as such), and
+    // success from the seat's final ballot (the one the verdict is synthesized from).
+    let mut signal_acc: std::collections::BTreeMap<String, (bool, u64)> =
+        std::collections::BTreeMap::new();
+    let (votes, verdict) = loop {
+        // Dispatch each CLI in isolation, recording per-CLI latency for ranking.
+        // (Sequential; isolation guarantees independence — parallelism is a follow-up.)
+        let mut votes = Vec::new();
+        for (i, cli) in roster.iter().enumerate() {
+            let ctx = BallotContext {
+                seat: Some(SEATS[i % SEATS.len()].clone()),
+                ballot,
+                approval_threshold: APPROVAL_THRESHOLD,
+                prior_tally: prior_tally.clone(),
+                dissent_arguments: dissent_arguments.clone(),
+            };
+            let started = Instant::now();
+            let vote = dispatcher.dispatch_ballot(cli, task, &ctx);
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
+            entry.0 = vote.is_some();
+            entry.1 += latency_ms;
+            if let Some(v) = vote {
+                votes.push(v);
+            }
         }
-    }
 
-    // Persist collected votes.
-    let collected = votes.clone();
-    ledger.update(&task.id, |rec| rec.votes = collected);
+        // Persist this ballot's votes (the record always reflects the latest ballot).
+        let collected = votes.clone();
+        ledger.update(&task.id, |rec| rec.votes = collected);
 
-    // No votes at all (every seat timed out / errored) → timed_out.
-    if votes.is_empty() {
-        ledger.update(&task.id, |rec| rec.state = TaskState::TimedOut);
-        return;
-    }
+        // No votes at all (every seat timed out / errored) → timed_out.
+        if votes.is_empty() {
+            ledger.update(&task.id, |rec| rec.state = TaskState::TimedOut);
+            return;
+        }
 
-    // Synthesize the verdict (layer c).
-    let verdict = synthesis::synthesize(&task.id, &votes);
+        // Synthesize the verdict (layer c) for this ballot.
+        let verdict = synthesis::synthesize(&task.id, &votes);
+
+        if verdict.agreement_ratio >= APPROVAL_THRESHOLD || ballot >= MAX_BALLOTS {
+            break (votes, verdict);
+        }
+
+        // Below the bar with ballots remaining: surface the round, then deliberate again
+        // with the tally + anonymized dissent arguments in every seat's next prompt.
+        events.emit(
+            wicked_apps_core::EV_COUNCIL_DELIBERATED,
+            &serde_json::json!({
+                "task_id": task.id,
+                "round": ballot,
+                "agreement_ratio": verdict.agreement_ratio,
+                "votes": votes.len(),
+                "threshold": APPROVAL_THRESHOLD,
+            }),
+        );
+
+        let matrix = synthesis::build_matrix(&votes);
+        prior_tally = matrix.recommendation_counts;
+        let winning_norm = verdict
+            .winning_recommendation
+            .as_deref()
+            .map(normalize)
+            .unwrap_or_default();
+        dissent_arguments = votes
+            .iter()
+            .filter(|v| normalize(&v.recommendation) != winning_norm)
+            .filter(|v| !v.top_risk.trim().is_empty())
+            .take(3)
+            .map(|v| v.top_risk.clone())
+            .collect();
+        ballot += 1;
+    };
     let winning = verdict.winning_recommendation.clone();
 
-    // Record per-CLI ranking signals: did the seat succeed, and did it agree with the
-    // eventual consensus winner?
-    for (cli_key, success, latency_ms) in &latencies {
+    // Record per-CLI ranking signals: did the seat succeed on the deciding ballot, did it
+    // agree with the eventual consensus winner, and what did the whole deliberation cost?
+    for (cli_key, (success, total_latency_ms)) in &signal_acc {
         let agreement = match (&winning, votes.iter().find(|v| &v.cli == cli_key)) {
             (Some(win), Some(v)) => normalize(&v.recommendation) == normalize(win),
             _ => false,
@@ -215,7 +278,7 @@ fn run_council(
             &RankSignal {
                 success: *success,
                 agreement_with_consensus: agreement,
-                latency_ms: *latency_ms,
+                latency_ms: *total_latency_ms,
             },
         );
     }
@@ -243,7 +306,7 @@ fn run_council(
         &serde_json::json!({
             "task_id": task.id,
             "work_kind": work_kind,
-            "updated": latencies.iter().map(|(k, _, _)| k).collect::<Vec<_>>(),
+            "updated": signal_acc.keys().collect::<Vec<_>>(),
         }),
     );
 }
@@ -255,4 +318,210 @@ fn normalize(s: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Ledger;
+    use crate::types::{Confidence, EventSink, NoopEventSink, RankStore, Ranking, Vote};
+    use crate::EstateHandle;
+    use std::sync::Mutex;
+
+    fn cli(key: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.to_string(),
+            display_name: key.to_string(),
+            binary: key.to_string(),
+            headless_invocation: format!("{key} {{PROMPT}}"),
+            category: crate::types::Category::AgenticCoder,
+            input_mode: crate::types::InputMode::PromptArg,
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: crate::types::Confidence::Verified,
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+        }
+    }
+
+    fn vote(cli_key: &str, rec: &str) -> Vote {
+        Vote {
+            cli: cli_key.to_string(),
+            recommendation: rec.to_string(),
+            top_risk: format!("{cli_key} risk"),
+            change_my_mind: String::new(),
+            disqualifier: None,
+            confidence: Confidence::default(),
+            provenance: String::new(),
+        }
+    }
+
+    struct NoopRank;
+    impl RankStore for NoopRank {
+        fn record(&self, _cli: &str, _work_kind: &str, _signal: &RankSignal) {}
+        fn best_for(&self, _work_kind: &str, _top: usize) -> Vec<Ranking> {
+            Vec::new()
+        }
+    }
+
+    /// Scripted deliberation: ballot 1 splits 2/1/1 (50% < 75%); on ballot 2 every seat
+    /// sees the tally (ctx.ballot == 2, non-empty prior_tally) and converges on "1".
+    struct ConvergingDispatcher {
+        calls: Mutex<Vec<(String, u32, usize)>>, // (cli, ballot, tally_len)
+    }
+    impl Dispatcher for ConvergingDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot");
+        }
+        fn dispatch_ballot(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> Option<Vote> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((cli.key.clone(), ctx.ballot, ctx.prior_tally.len()));
+            assert!(ctx.seat.is_some(), "every ballot dispatch carries a seat");
+            assert!(
+                (ctx.approval_threshold - APPROVAL_THRESHOLD).abs() < f32::EPSILON,
+                "voters are told the approval bar"
+            );
+            let rec = if ctx.ballot == 1 {
+                match cli.key.as_str() {
+                    "a" | "b" => "1 — fits",
+                    "c" => "2 — other",
+                    _ => "3 — third",
+                }
+            } else {
+                "1 — fits"
+            };
+            Some(vote(&cli.key, rec))
+        }
+    }
+
+    fn worker_with(dispatcher: Arc<dyn Dispatcher + Send + Sync>, keys: &[&str]) -> Worker {
+        let estate = EstateHandle::in_memory().expect("estate");
+        Worker::new(
+            Ledger::new(estate),
+            dispatcher,
+            Arc::new(NoopRank),
+            Arc::new(NoopEventSink),
+            keys.iter().map(|k| cli(k)).collect(),
+            "general",
+        )
+    }
+
+    fn task() -> CouncilTask {
+        CouncilTask {
+            id: "t-deliberate".into(),
+            topic: "pick a profile".into(),
+            options: vec!["one".into(), "two".into(), "three".into()],
+            criteria: vec!["general".into()],
+            session_id: "s".into(),
+        }
+    }
+
+    #[test]
+    fn fragmented_first_ballot_converges_on_runoff() {
+        let dispatcher = Arc::new(ConvergingDispatcher {
+            calls: Mutex::new(Vec::new()),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+
+        assert_eq!(status.state, TaskState::Voted);
+        let verdict = status.verdict.expect("verdict");
+        assert!(
+            verdict.agreement_ratio >= APPROVAL_THRESHOLD,
+            "runoff converged: {}",
+            verdict.agreement_ratio
+        );
+
+        let calls = dispatcher.calls.lock().unwrap();
+        // 4 seats × 2 ballots — the runoff re-polled everyone.
+        assert_eq!(calls.len(), 8, "two full ballots dispatched: {calls:?}");
+        // Ballot-1 calls carry no tally; ballot-2 calls carry the prior tally.
+        assert!(calls
+            .iter()
+            .all(|(_, b, tally)| if *b == 1 { *tally == 0 } else { *tally > 0 }));
+    }
+
+    /// A unanimous (or above-bar) first ballot never triggers a runoff.
+    struct UnanimousDispatcher;
+    impl Dispatcher for UnanimousDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot");
+        }
+        fn dispatch_ballot(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> Option<Vote> {
+            assert_eq!(ctx.ballot, 1, "no runoff should run above the bar");
+            Some(vote(&cli.key, "2 — best"))
+        }
+    }
+
+    #[test]
+    fn above_bar_first_ballot_needs_no_runoff() {
+        let worker = worker_with(Arc::new(UnanimousDispatcher), &["a", "b", "c"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert!(status.verdict.expect("verdict").agreement_ratio >= APPROVAL_THRESHOLD);
+    }
+
+    /// Deliberation terminates at MAX_BALLOTS even when the council never converges,
+    /// and the final plurality verdict stands.
+    struct NeverConvergesDispatcher {
+        ballots_seen: Mutex<u32>,
+    }
+    impl Dispatcher for NeverConvergesDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot");
+        }
+        fn dispatch_ballot(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> Option<Vote> {
+            let mut seen = self.ballots_seen.lock().unwrap();
+            *seen = (*seen).max(ctx.ballot);
+            // Everyone votes for themselves forever — permanent 25% fragmentation.
+            let rec = match cli.key.as_str() {
+                "a" => "1 — mine",
+                "b" => "2 — mine",
+                "c" => "3 — mine",
+                _ => "4 — mine",
+            };
+            Some(vote(&cli.key, rec))
+        }
+    }
+
+    #[test]
+    fn never_converging_council_stops_at_max_ballots_with_plurality() {
+        let dispatcher = Arc::new(NeverConvergesDispatcher {
+            ballots_seen: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+
+        assert_eq!(status.state, TaskState::Voted, "plurality still resolves");
+        let verdict = status.verdict.expect("verdict");
+        assert!(verdict.agreement_ratio < APPROVAL_THRESHOLD);
+        assert!(verdict.winning_recommendation.is_some());
+        assert_eq!(
+            *dispatcher.ballots_seen.lock().unwrap(),
+            MAX_BALLOTS,
+            "deliberation capped at MAX_BALLOTS"
+        );
+    }
 }

@@ -529,10 +529,16 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
+                            let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on(
-                                        &pre.units, &pre.clis, &sid, None, &disp,
+                                        &pre.units,
+                                        &pre.clis,
+                                        &sid,
+                                        None,
+                                        &disp,
+                                        Some(relay),
                                     )
                                 }));
                             match result {
@@ -695,10 +701,16 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
+                            let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on(
-                                        &pre.units, &pre.clis, &sid, None, &disp,
+                                        &pre.units,
+                                        &pre.clis,
+                                        &sid,
+                                        None,
+                                        &disp,
+                                        Some(relay),
                                     )
                                 }));
                             match result {
@@ -1561,6 +1573,7 @@ pub(crate) fn run(
                                 .into_iter()
                                 .filter(|u| u.ord == ord_c)
                                 .collect();
+                            let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     crate::distribute::distribute_units_on(
@@ -1569,6 +1582,7 @@ pub(crate) fn run(
                                         &run_id_c,
                                         None,
                                         &disp,
+                                        Some(relay),
                                     )
                                 }));
                             match result {
@@ -1794,6 +1808,20 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
         run_id: run_id.to_string(),
         outcome,
     });
+}
+
+/// Build an [`crate::distribute::EventRelay`] that posts council lifecycle events
+/// (convened / deliberated / voted) back to the actor's single emit point via
+/// `Command::EmitEvent`, so the UI can watch deliberation live. The `Mutex` makes the
+/// captured `Sender` shareable from the relay's `Fn + Sync` closure — the same pattern
+/// as the CliOutputDelta back-channel.
+fn council_event_relay(tx: Sender<Command>) -> crate::distribute::EventRelay {
+    let tx = std::sync::Mutex::new(tx);
+    std::sync::Arc::new(move |ev| {
+        if let Ok(g) = tx.lock() {
+            let _ = g.send(Command::EmitEvent(ev));
+        }
+    })
 }
 
 /// Reject a session id carrying shell-hostile or control characters. Governance now passes scope/phase
