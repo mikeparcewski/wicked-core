@@ -161,12 +161,15 @@ fn start_acp_process(
         handshake_err!(child, e);
     }
 
+    // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp)
+    // reject session/new with -32602 when it is absent; bridges ignore it.
     if let Err(e) = rpc_send(
         &mut stdin,
         2,
         "session/new",
         json!({
-            "cwd": cwd.to_string_lossy().as_ref()
+            "cwd": cwd.to_string_lossy().as_ref(),
+            "mcpServers": []
         }),
     ) {
         handshake_err!(child, e);
@@ -950,7 +953,10 @@ impl StepRunner for AcpStepRunner {
 // ── Registry helper ───────────────────────────────────────────────────────────
 
 fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
-    wicked_council::registry::builtin()
+    // The MERGED registry (built-ins + user overlay), not builtin(): a user record
+    // replaces its built-in wholesale, so its [cli.acp] table (or its absence) must
+    // decide the transport here exactly as it does everywhere else.
+    crate::registry_roster()
         .into_iter()
         .find(|c| c.key == cli_key)
         .and_then(|c| c.acp)

@@ -45,6 +45,8 @@ struct TomlCli {
     enabled_for_council: Option<bool>,
     #[serde(default)]
     capabilities: Option<String>,
+    #[serde(default)]
+    acp: Option<AcpConfig>,
 }
 
 impl From<TomlCli> for AgenticCli {
@@ -62,8 +64,10 @@ impl From<TomlCli> for AgenticCli {
             // User records default to confirm-on-probe.
             confidence: t.confidence.unwrap_or(Confidence::ConfirmOnProbe),
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
-            // User TOML records carry no ACP config; the engine falls back to single-shot.
-            acp: None,
+            // A user record without [cli.acp] falls back to single-shot; note that an
+            // overlay REPLACES its built-in wholesale, so overriding a CLI that has a
+            // built-in ACP config requires restating [cli.acp] in the TOML.
+            acp: t.acp,
             capabilities: t.capabilities,
         }
     }
@@ -101,7 +105,9 @@ pub fn builtin() -> Vec<AgenticCli> {
             key: "agy".into(),
             display_name: "Antigravity".into(),
             binary: "agy".into(),
-            headless_invocation: "agy run \"{PROMPT}\"".into(),
+            // `agy -p` is the documented non-interactive mode; `agy run` spawns the
+            // bubbletea TUI and dies headless ("could not open TTY").
+            headless_invocation: "agy -p \"{PROMPT}\"".into(),
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["agy".into(), "--version".into()],
@@ -178,11 +184,12 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // copilot HTTP ACP on a fixed port 3000 (not dynamic; single-session only).
+            // copilot speaks native ACP over stdio (`copilot --acp`): verified initialize /
+            // session/new / session/prompt with agent_message_chunk streaming (v1.0.75).
             acp: Some(AcpConfig {
                 binary: "copilot".into(),
-                start_args: vec!["--acp".into(), "--port".into(), "3000".into()],
-                transport: AcpTransport::Http,
+                start_args: vec!["--acp".into()],
+                transport: AcpTransport::Stdio,
             }),
             capabilities: Some(
                 "GitHub context, pull request review, commit-level changes, \
@@ -202,8 +209,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // opencode exposes ACP via its HTTP server; pending transport implementation.
-            acp: None,
+            acp: Some(AcpConfig {
+                binary: "opencode-acp".into(),
+                start_args: vec![],
+                transport: AcpTransport::Stdio,
+            }),
             capabilities: Some(
                 "open-source models, local/private code, broad language support, \
                  configurable backends"
