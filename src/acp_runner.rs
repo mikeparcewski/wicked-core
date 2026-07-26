@@ -83,25 +83,47 @@ fn start_acp_process(
     cwd: &std::path::Path,
     gov: Option<&AcpGovArmed>,
 ) -> anyhow::Result<AcpProcess> {
-    let mut cmd = std::process::Command::new(&config.binary);
-    // --settings must precede all other start_args so it is parsed as a flag, not a positional
-    // argument. This mirrors how arm_input_governance inserts it at position 1 in the argv vec.
-    if let Some(g) = gov {
-        cmd.arg("--settings").arg(&g.settings_path);
-        cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
-        cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
-        cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
-        cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
-    }
-    cmd.args(&config.start_args);
-    cmd.current_dir(cwd);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::null());
+    let build_cmd = |binary: &str| {
+        let mut cmd = std::process::Command::new(binary);
+        // --settings must precede all other start_args so it is parsed as a flag, not a
+        // positional argument. Mirrors arm_input_governance's position-1 insertion.
+        if let Some(g) = gov {
+            cmd.arg("--settings").arg(&g.settings_path);
+            cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
+            cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
+            cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
+            cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
+        }
+        cmd.args(&config.start_args);
+        cmd.current_dir(cwd);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null());
+        cmd
+    };
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("ACP binary '{}': {e}", config.binary))?;
+    let mut child = match build_cmd(&config.binary).spawn() {
+        Ok(c) => c,
+        // Windows: npm installs launcher shims as `<name>.cmd`, which CreateProcess
+        // does not resolve for a bare name — retry with the extension explicit
+        // (std special-cases explicit .cmd/.bat since the BatBadBut hardening).
+        // Only when the configured binary has no extension of its own: appending
+        // to `foo.exe` would produce a nonsensical `foo.exe.cmd`.
+        Err(e)
+            if cfg!(windows)
+                && e.kind() == std::io::ErrorKind::NotFound
+                && std::path::Path::new(&config.binary).extension().is_none() =>
+        {
+            let cmd_name = format!("{}.cmd", config.binary);
+            build_cmd(&cmd_name).spawn().map_err(|e2| {
+                anyhow::anyhow!(
+                    "ACP binary '{}': {e} (also tried '{cmd_name}': {e2})",
+                    config.binary
+                )
+            })?
+        }
+        Err(e) => return Err(anyhow::anyhow!("ACP binary '{}': {e}", config.binary)),
+    };
 
     // Take stdout/stdin before spawning the reader — kill the child if either fails so we
     // don't leak a background process when the child started but didn't expose its pipes.
