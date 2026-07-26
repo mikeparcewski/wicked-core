@@ -166,6 +166,26 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
                 "degradedReason": degraded_reason,
             })
         }
+        CoreEvent::CouncilConvened { session, ord, clis } => json!({
+            "type": "councilConvened",
+            "session": session,
+            "ord": ord,
+            "clis": clis,
+        }),
+        CoreEvent::CouncilVoted {
+            session,
+            ord,
+            consensus,
+            agreement_pct,
+            votes,
+        } => json!({
+            "type": "councilVoted",
+            "session": session,
+            "ord": ord,
+            "consensus": consensus,
+            "agreementPct": agreement_pct,
+            "votes": votes,
+        }),
         CoreEvent::UnitExecuting { session, ord } => {
             json!({ "type": "unitExecuting", "session": session, "ord": ord })
         }

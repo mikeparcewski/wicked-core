@@ -537,7 +537,7 @@ pub(crate) fn plan_and_distribute(
         governed,
     )?;
     let distributions =
-        distribute::distribute_units_on(&pre.units, clis, session_id, None, dispatcher)?;
+        distribute::distribute_units_on(&pre.units, clis, session_id, None, dispatcher, None)?;
     apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {
         session: pre.session,

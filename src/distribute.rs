@@ -14,6 +14,7 @@ use wicked_council::{
 };
 
 use crate::domain::{RoutingInfo, WorkUnit};
+use crate::event::CoreEvent;
 
 /// The production dispatcher — spawns real CLI subprocesses to collect council votes. Injected so
 /// tests can substitute a deterministic stub (no subprocess, no flaky dispatch).
@@ -22,6 +23,56 @@ pub fn real_dispatcher() -> Arc<dyn Dispatcher + Send + Sync> {
         timeout: Duration::from_secs(30),
         local_runner_timeout: Duration::from_secs(30),
     })
+}
+
+/// Fans council lifecycle events back to the actor's single emit point (via
+/// `Command::EmitEvent`), making deliberation visible to subscribers while a vote is
+/// still in flight. `None` keeps the historical silent behaviour (tests, straight-line
+/// pipeline callers).
+pub type EventRelay = Arc<dyn Fn(CoreEvent) + Send + Sync>;
+
+/// Adapts the council's string-keyed `EventSink` to run-scoped [`CoreEvent`]s. The council
+/// worker emits `EV_COUNCIL_REQUESTED` when voters are polled and `EV_COUNCIL_VOTED` when
+/// the verdict lands; both are translated with the owning (session, ord) attached so the
+/// UI can pin them to the unit being distributed. Rank bookkeeping (`EV_CLI_RANKED`) and
+/// any future council event types are intentionally dropped — they are not run-scoped.
+struct RelaySink {
+    relay: EventRelay,
+    session: String,
+    ord: u32,
+}
+
+impl wicked_council::EventSink for RelaySink {
+    fn emit(&self, event: &str, payload: &serde_json::Value) {
+        let ev = match event {
+            wicked_apps_core::EV_COUNCIL_REQUESTED => CoreEvent::CouncilConvened {
+                session: self.session.clone(),
+                ord: self.ord,
+                clis: payload["clis"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            wicked_apps_core::EV_COUNCIL_VOTED => CoreEvent::CouncilVoted {
+                session: self.session.clone(),
+                ord: self.ord,
+                consensus: payload["consensus"].as_bool().unwrap_or(false),
+                agreement_pct: (payload["agreement_ratio"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0)
+                    * 100.0)
+                    .round() as u8,
+                votes: payload["votes"].as_u64().unwrap_or(0) as u32,
+            },
+            _ => return,
+        };
+        (self.relay)(ev);
+    }
 }
 
 /// The distribution decision for one unit (positionally aligned with the input units).
@@ -58,12 +109,14 @@ pub fn distribute_units_on(
     session_id: &str,
     db_path: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    relay: Option<EventRelay>,
 ) -> anyhow::Result<Vec<Distribution>> {
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     let mut dists: Vec<Distribution> = std::thread::scope(|s| {
         // Spawn all units concurrently. Scoped-thread closures borrow from the enclosing
         // scope — `std::thread::scope` guarantees all threads finish before it returns,
         // making the borrows sound without requiring `move`.
+        let relay = &relay;
         let handles: Vec<_> = units
             .iter()
             .map(|unit| {
@@ -81,7 +134,15 @@ pub fn distribute_units_on(
                             routing: RoutingInfo::Tool,
                         })
                     } else {
-                        distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
+                        distribute_one(
+                            unit,
+                            clis,
+                            &roster_keys,
+                            session_id,
+                            db_path,
+                            dispatcher,
+                            relay.clone(),
+                        )
                     }
                 })
             })
@@ -154,6 +215,7 @@ fn distribute_one(
     session_id: &str,
     db_path: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    relay: Option<EventRelay>,
 ) -> anyhow::Result<Distribution> {
     let estate = match db_path {
         Some(path) => EstateHandle::new(
@@ -165,6 +227,16 @@ fn distribute_one(
     };
     let ledger = Ledger::new(estate.clone());
     let rank_store = Arc::new(EstateRankStore::new(estate));
+    // Council lifecycle events flow to the actor's emit point when a relay is armed;
+    // otherwise deliberation stays silent (the pre-relay behaviour).
+    let events: Arc<dyn wicked_council::EventSink + Send + Sync> = match relay {
+        Some(relay) => Arc::new(RelaySink {
+            relay,
+            session: session_id.to_string(),
+            ord: unit.ord,
+        }),
+        None => Arc::new(NoopEventSink),
+    };
 
     // NOTE: a historical-ranking fast path once lived here, but distribution always runs with an
     // IN-MEMORY council estate — the single-writer actor owns the only shared-store handle, so we
@@ -177,7 +249,7 @@ fn distribute_one(
         ledger,
         dispatcher.clone(),
         rank_store,
-        Arc::new(NoopEventSink),
+        events,
         clis.to_vec(),
         work_kind,
     );

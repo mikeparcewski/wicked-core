@@ -62,6 +62,21 @@ pub enum CoreEvent {
         dissent: Option<u32>,
         degraded_reason: Option<String>,
     },
+    /// The council was convened to pick a CLI for a unit (distribution vote started).
+    CouncilConvened {
+        session: String,
+        ord: u32,
+        /// Roster keys polled for this vote.
+        clis: Vec<String>,
+    },
+    /// The council reached a verdict for a unit's assignment vote.
+    CouncilVoted {
+        session: String,
+        ord: u32,
+        consensus: bool,
+        agreement_pct: u8,
+        votes: u32,
+    },
     /// A unit's execution started.
     UnitExecuting { session: String, ord: u32 },
     /// A live chunk of a unit's CLI output, streamed AS the subprocess produces it (P8 live output).
