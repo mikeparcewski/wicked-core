@@ -1,8 +1,9 @@
 //! ACP (Agent Client Protocol) session runner — multi-CLI extension of wicked-core#13.
 //!
 //! Drives persistent multi-turn sessions using the standardised JSON-RPC 2.0 ndjson
-//! (stdin/stdout) ACP protocol. Each CLI runs its own ACP wrapper binary; wicked-core
-//! is the ACP client. The registry maps CLI keys to their ACP binary:
+//! (stdin/stdout) ACP protocol. Each CLI runs its own ACP server — a wrapper binary
+//! or the CLI's native ACP mode; wicked-core is the ACP client. The registry maps CLI
+//! keys to their ACP invocation:
 //!
 //! | CLI      | ACP binary / invocation                              | Transport |
 //! |----------|------------------------------------------------------|-----------|
