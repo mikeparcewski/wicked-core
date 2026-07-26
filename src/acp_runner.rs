@@ -630,8 +630,11 @@ impl AcpStepRunner {
         // output-side gates still apply — and fall through to the shared ACP session
         // path below so they KEEP multi-turn ACP instead of silently degrading to
         // single-shot on every governed run.
-        if input.governance.is_some() && crate::execute_wrapped::binary_is_claude(&cli_key) {
-            let gov = input.governance.as_ref().unwrap();
+        if let Some(gov) = input
+            .governance
+            .as_ref()
+            .filter(|_| crate::execute_wrapped::binary_is_claude(&cli_key))
+        {
             let acp_config = match acp_config_for(&cli_key) {
                 // Only stdio-mode ACP can receive --settings at process-start time; we spawn and
                 // control the process directly. HTTP-mode ACP connects to a server we don't
@@ -957,8 +960,13 @@ impl StepRunner for AcpStepRunner {
 fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
     // The MERGED registry (built-ins + user overlay), not builtin(): a user record
     // replaces its built-in wholesale, so its [cli.acp] table (or its absence) must
-    // decide the transport here exactly as it does everywhere else.
-    crate::registry_roster()
+    // decide the transport here exactly as it does everywhere else. Deliberately NOT
+    // `registry_roster()`: that filters to `enabled_for_council` seats (a seat disabled
+    // for voting can still execute units over ACP) and swallows load errors. A
+    // malformed overlay falls back to built-ins instead of stripping every ACP config.
+    let user = wicked_council::registry::default_user_path();
+    wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin())
         .into_iter()
         .find(|c| c.key == cli_key)
         .and_then(|c| c.acp)

@@ -340,4 +340,53 @@ enabled_for_council = false
         let merged = load(Some(Path::new("/nonexistent/path/clis.toml"))).unwrap();
         assert_eq!(merged.len(), builtin().len());
     }
+
+    /// A user record can carry a `[cli.acp]` table, and an override WITHOUT one strips
+    /// the built-in's ACP config (wholesale replacement — the documented semantic).
+    #[test]
+    fn load_merges_user_toml_acp_config() {
+        let dir = std::env::temp_dir().join(format!("wc-registry-acp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(
+            br#"
+[[cli]]
+key = "claude"
+display_name = "Claude (overridden)"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "my-claude-acp"
+start_args = ["--flag"]
+transport = "stdio"
+
+[[cli]]
+key = "codex"
+display_name = "Codex (overridden, no acp)"
+binary = "codex"
+headless_invocation = "codex exec \"{PROMPT}\""
+"#,
+        )
+        .unwrap();
+
+        let merged = load(Some(&path)).expect("load must succeed");
+
+        // The [cli.acp] table parses and rides the override.
+        let claude = merged.iter().find(|c| c.key == "claude").unwrap();
+        let acp = claude.acp.as_ref().expect("overlay acp must survive merge");
+        assert_eq!(acp.binary, "my-claude-acp");
+        assert_eq!(acp.start_args, vec!["--flag".to_string()]);
+        assert_eq!(acp.transport, AcpTransport::Stdio);
+
+        // An override without [cli.acp] replaces the built-in wholesale — ACP stripped.
+        let codex = merged.iter().find(|c| c.key == "codex").unwrap();
+        assert!(
+            codex.acp.is_none(),
+            "override without [cli.acp] strips the built-in ACP config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
