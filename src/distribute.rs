@@ -57,6 +57,20 @@ impl wicked_council::EventSink for RelaySink {
                     })
                     .unwrap_or_default(),
             },
+            wicked_apps_core::EV_COUNCIL_DELIBERATED => CoreEvent::CouncilDeliberated {
+                session: self.session.clone(),
+                ord: self.ord,
+                round: payload["round"].as_u64().unwrap_or(0) as u32,
+                agreement_pct: (payload["agreement_ratio"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .clamp(0.0, 1.0)
+                    * 100.0)
+                    .round() as u8,
+                needed_pct: (payload["threshold"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0) * 100.0)
+                    .round() as u8,
+                votes: payload["votes"].as_u64().unwrap_or(0) as u32,
+            },
             wicked_apps_core::EV_COUNCIL_VOTED => CoreEvent::CouncilVoted {
                 session: self.session.clone(),
                 ord: self.ord,
@@ -456,6 +470,87 @@ mod tests {
         assert!(
             matches!(&routing, RoutingInfo::Degraded { reason } if reason.contains("Option Z")),
             "non-numeric winner degrades with a reason naming the recommendation, got {routing:?}"
+        );
+    }
+
+    /// RelaySink translates the council's string-keyed events into run-scoped CoreEvents
+    /// with the owning (session, ord) attached, and drops non-run-scoped event types.
+    #[test]
+    fn relay_sink_translates_council_events_and_drops_the_rest() {
+        use wicked_council::EventSink;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let relay: EventRelay = Arc::new(move |ev| sink_seen.lock().unwrap().push(ev));
+        let sink = RelaySink {
+            relay,
+            session: "s1".to_string(),
+            ord: 3,
+        };
+
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_REQUESTED,
+            &serde_json::json!({"clis": ["a", "b"], "task_id": "t", "session_id": "s1"}),
+        );
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_VOTED,
+            &serde_json::json!({"consensus": true, "agreement_ratio": 0.5, "votes": 4}),
+        );
+        // Not run-scoped — must be dropped, not translated.
+        sink.emit(wicked_apps_core::EV_CLI_RANKED, &serde_json::json!({}));
+
+        let events = seen.lock().unwrap();
+        assert_eq!(events.len(), 2, "ranked event dropped: {events:?}");
+        assert!(
+            matches!(&events[0], CoreEvent::CouncilConvened { session, ord, clis }
+                if session == "s1" && *ord == 3 && clis == &["a".to_string(), "b".to_string()]),
+            "requested → CouncilConvened with run scope, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(&events[1], CoreEvent::CouncilVoted { session, ord, consensus: true, agreement_pct: 50, votes: 4 }
+                if session == "s1" && *ord == 3),
+            "voted → CouncilVoted with ratio as percent, got {:?}",
+            events[1]
+        );
+    }
+
+    /// Malformed payloads (missing/mistyped fields) degrade to defaults instead of panicking.
+    #[test]
+    fn relay_sink_survives_malformed_payloads() {
+        use wicked_council::EventSink;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let relay: EventRelay = Arc::new(move |ev| sink_seen.lock().unwrap().push(ev));
+        let sink = RelaySink {
+            relay,
+            session: "s1".to_string(),
+            ord: 1,
+        };
+
+        sink.emit(wicked_apps_core::EV_COUNCIL_REQUESTED, &serde_json::json!({}));
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_VOTED,
+            &serde_json::json!({"agreement_ratio": "not a number"}),
+        );
+
+        let events = seen.lock().unwrap();
+        assert!(
+            matches!(&events[0], CoreEvent::CouncilConvened { clis, .. } if clis.is_empty()),
+            "missing clis → empty list, got {:?}",
+            events[0]
+        );
+        assert!(
+            matches!(
+                &events[1],
+                CoreEvent::CouncilVoted {
+                    consensus: false,
+                    agreement_pct: 0,
+                    votes: 0,
+                    ..
+                }
+            ),
+            "mistyped fields → zero defaults, got {:?}",
+            events[1]
         );
     }
 }
