@@ -189,11 +189,15 @@ fn run_council(
     let mut ballot: u32 = 1;
     let mut prior_tally: Vec<(String, u32)> = Vec::new();
     let mut dissent_arguments: Vec<String> = Vec::new();
-    let (votes, latencies, verdict) = loop {
+    // Per-CLI ranking signal accumulated ACROSS ballots: total latency summed over every
+    // dispatch (a 3-ballot deliberation costs 3 dispatches and is reported as such), and
+    // success from the seat's final ballot (the one the verdict is synthesized from).
+    let mut signal_acc: std::collections::BTreeMap<String, (bool, u64)> =
+        std::collections::BTreeMap::new();
+    let (votes, verdict) = loop {
         // Dispatch each CLI in isolation, recording per-CLI latency for ranking.
         // (Sequential; isolation guarantees independence — parallelism is a follow-up.)
         let mut votes = Vec::new();
-        let mut latencies = Vec::new();
         for (i, cli) in roster.iter().enumerate() {
             let ctx = BallotContext {
                 seat: Some(SEATS[i % SEATS.len()].clone()),
@@ -205,7 +209,9 @@ fn run_council(
             let started = Instant::now();
             let vote = dispatcher.dispatch_ballot(cli, task, &ctx);
             let latency_ms = started.elapsed().as_millis() as u64;
-            latencies.push((cli.key.clone(), vote.is_some(), latency_ms));
+            let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
+            entry.0 = vote.is_some();
+            entry.1 += latency_ms;
             if let Some(v) = vote {
                 votes.push(v);
             }
@@ -225,7 +231,7 @@ fn run_council(
         let verdict = synthesis::synthesize(&task.id, &votes);
 
         if verdict.agreement_ratio >= APPROVAL_THRESHOLD || ballot >= MAX_BALLOTS {
-            break (votes, latencies, verdict);
+            break (votes, verdict);
         }
 
         // Below the bar with ballots remaining: surface the round, then deliberate again
@@ -259,9 +265,9 @@ fn run_council(
     };
     let winning = verdict.winning_recommendation.clone();
 
-    // Record per-CLI ranking signals: did the seat succeed, and did it agree with the
-    // eventual consensus winner?
-    for (cli_key, success, latency_ms) in &latencies {
+    // Record per-CLI ranking signals: did the seat succeed on the deciding ballot, did it
+    // agree with the eventual consensus winner, and what did the whole deliberation cost?
+    for (cli_key, (success, total_latency_ms)) in &signal_acc {
         let agreement = match (&winning, votes.iter().find(|v| &v.cli == cli_key)) {
             (Some(win), Some(v)) => normalize(&v.recommendation) == normalize(win),
             _ => false,
@@ -272,7 +278,7 @@ fn run_council(
             &RankSignal {
                 success: *success,
                 agreement_with_consensus: agreement,
-                latency_ms: *latency_ms,
+                latency_ms: *total_latency_ms,
             },
         );
     }
@@ -300,7 +306,7 @@ fn run_council(
         &serde_json::json!({
             "task_id": task.id,
             "work_kind": work_kind,
-            "updated": latencies.iter().map(|(k, _, _)| k).collect::<Vec<_>>(),
+            "updated": signal_acc.keys().collect::<Vec<_>>(),
         }),
     );
 }

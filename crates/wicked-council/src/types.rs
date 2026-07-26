@@ -339,7 +339,9 @@ pub trait Prober {
 /// A council seat's deliberation identity — the unique lens a voter evaluates through,
 /// like a named chair on a real review board. Assigned deterministically per convened
 /// CLI so re-runs are reproducible; the voter is told its seat, never its CLI identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Prompt-rendering input only — never persisted or serialized (hence no serde derives;
+/// `&'static str` fields cannot meaningfully round-trip through deserialization).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seat {
     /// Short seat name shown in the prompt (e.g. "Capability Fit").
     pub name: &'static str,
@@ -371,18 +373,33 @@ pub const SEATS: &[Seat] = &[
 /// Context for one deliberation ballot: which seat the voter holds, which ballot round
 /// this is, the approval bar, and — on runoff rounds — the prior tally + dissent so the
 /// council can converge like a real deliberating body instead of re-rolling blind.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BallotContext {
     /// The seat this voter holds (None = unassigned / legacy single-shot path).
     pub seat: Option<Seat>,
     /// 1-based ballot number (1 = first ballot, >1 = runoff).
     pub ballot: u32,
     /// The approval share the council must reach in `[0.0, 1.0]` (e.g. `0.75`).
+    /// `0.0` means no bar is stated in the prompt (legacy scaffold).
     pub approval_threshold: f32,
     /// Runoff only: the prior ballot's tally lines, most-voted first (display, count).
     pub prior_tally: Vec<(String, u32)>,
     /// Runoff only: anonymized dissent arguments (top risks cited by non-winning votes).
     pub dissent_arguments: Vec<String>,
+}
+
+/// The legacy plain-scaffold context: no seat, first ballot, no approval bar. `ballot`
+/// is 1 (the field is documented 1-based; a derived `Default` would set the invalid 0).
+impl Default for BallotContext {
+    fn default() -> Self {
+        BallotContext {
+            seat: None,
+            ballot: 1,
+            approval_threshold: 0.0,
+            prior_tally: Vec::new(),
+            dissent_arguments: Vec::new(),
+        }
+    }
 }
 
 /// Isolated, timeboxed dispatch of the 4-question scaffold to one CLI.

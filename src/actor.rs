@@ -1811,9 +1811,10 @@ fn notify_campaign(self_tx: &Sender<Command>, run_id: &str, outcome: crate::camp
 }
 
 /// Build an [`crate::distribute::EventRelay`] that posts council lifecycle events
-/// (convened / voted) back to the actor's single emit point via `Command::EmitEvent`,
-/// so the UI can watch deliberation live. `Sender` is `!Sync`, so it rides behind a
-/// `Mutex` — the same pattern as the CliOutputDelta back-channel.
+/// (convened / deliberated / voted) back to the actor's single emit point via
+/// `Command::EmitEvent`, so the UI can watch deliberation live. The `Mutex` makes the
+/// captured `Sender` shareable from the relay's `Fn + Sync` closure — the same pattern
+/// as the CliOutputDelta back-channel.
 fn council_event_relay(tx: Sender<Command>) -> crate::distribute::EventRelay {
     let tx = std::sync::Mutex::new(tx);
     std::sync::Arc::new(move |ev| {

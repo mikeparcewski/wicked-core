@@ -32,10 +32,11 @@ pub fn real_dispatcher() -> Arc<dyn Dispatcher + Send + Sync> {
 pub type EventRelay = Arc<dyn Fn(CoreEvent) + Send + Sync>;
 
 /// Adapts the council's string-keyed `EventSink` to run-scoped [`CoreEvent`]s. The council
-/// worker emits `EV_COUNCIL_REQUESTED` when voters are polled and `EV_COUNCIL_VOTED` when
-/// the verdict lands; both are translated with the owning (session, ord) attached so the
-/// UI can pin them to the unit being distributed. Rank bookkeeping (`EV_CLI_RANKED`) and
-/// any future council event types are intentionally dropped — they are not run-scoped.
+/// worker emits `EV_COUNCIL_REQUESTED` when voters are polled, `EV_COUNCIL_DELIBERATED`
+/// after each below-bar runoff ballot, and `EV_COUNCIL_VOTED` when the verdict lands; all
+/// three are translated with the owning (session, ord) attached so the UI can pin them to
+/// the unit being distributed. Rank bookkeeping (`EV_CLI_RANKED`) and any future council
+/// event types are intentionally dropped — they are not run-scoped.
 struct RelaySink {
     relay: EventRelay,
     session: String,
