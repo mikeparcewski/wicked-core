@@ -107,7 +107,13 @@ fn start_acp_process(
         // Windows: npm installs launcher shims as `<name>.cmd`, which CreateProcess
         // does not resolve for a bare name — retry with the extension explicit
         // (std special-cases explicit .cmd/.bat since the BatBadBut hardening).
-        Err(e) if cfg!(windows) && e.kind() == std::io::ErrorKind::NotFound => {
+        // Only when the configured binary has no extension of its own: appending
+        // to `foo.exe` would produce a nonsensical `foo.exe.cmd`.
+        Err(e)
+            if cfg!(windows)
+                && e.kind() == std::io::ErrorKind::NotFound
+                && std::path::Path::new(&config.binary).extension().is_none() =>
+        {
             let cmd_name = format!("{}.cmd", config.binary);
             build_cmd(&cmd_name).spawn().map_err(|e2| {
                 anyhow::anyhow!(
