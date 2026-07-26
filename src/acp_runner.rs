@@ -625,18 +625,19 @@ impl AcpStepRunner {
         // The `--settings` injection happens at `initialize` time (the binary's argv), which is
         // the only point in the ACP lifecycle where a new flag can be introduced. Per-prompt
         // injection is not possible — the `session/prompt` RPC has no settings field.
-        if let Some(gov) = &input.governance {
+        // Input governance at ACP process start (`--settings` PreToolUse hooks) is
+        // Claude-specific. Non-claude CLIs mirror the wrapped path — no input arming,
+        // output-side gates still apply — and fall through to the shared ACP session
+        // path below so they KEEP multi-turn ACP instead of silently degrading to
+        // single-shot on every governed run.
+        if input.governance.is_some() && crate::execute_wrapped::binary_is_claude(&cli_key) {
+            let gov = input.governance.as_ref().unwrap();
             let acp_config = match acp_config_for(&cli_key) {
                 // Only stdio-mode ACP can receive --settings at process-start time; we spawn and
                 // control the process directly. HTTP-mode ACP connects to a server we don't
                 // spawn, so --settings cannot be injected → fall back to the wrapped-CLI path,
                 // which handles governance independently via arm_input_governance.
-                Some(c)
-                    if c.transport == AcpTransport::Stdio
-                        && crate::execute_wrapped::binary_is_claude(&cli_key) =>
-                {
-                    c
-                }
+                Some(c) if c.transport == AcpTransport::Stdio => c,
                 _ => return self.fallback.run_unit_streaming(input, emit),
             };
 
@@ -751,7 +752,8 @@ impl AcpStepRunner {
             };
         }
 
-        // UNGOVERNED ACP PATH — unchanged from before.
+        // SHARED ACP SESSION PATH — ungoverned units of every CLI, plus governed units of
+        // non-claude CLIs (input arming is claude-only; their output-side gates still run).
         let acp_config = match acp_config_for(&cli_key) {
             Some(c) => c,
             None => return self.fallback.run_unit_streaming(input, emit),
