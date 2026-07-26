@@ -172,6 +172,22 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "ord": ord,
             "clis": clis,
         }),
+        CoreEvent::CouncilDeliberated {
+            session,
+            ord,
+            round,
+            agreement_pct,
+            needed_pct,
+            votes,
+        } => json!({
+            "type": "councilDeliberated",
+            "session": session,
+            "ord": ord,
+            "round": round,
+            "agreementPct": agreement_pct,
+            "neededPct": needed_pct,
+            "votes": votes,
+        }),
         CoreEvent::CouncilVoted {
             session,
             ord,

@@ -527,7 +527,10 @@ mod tests {
             ord: 1,
         };
 
-        sink.emit(wicked_apps_core::EV_COUNCIL_REQUESTED, &serde_json::json!({}));
+        sink.emit(
+            wicked_apps_core::EV_COUNCIL_REQUESTED,
+            &serde_json::json!({}),
+        );
         sink.emit(
             wicked_apps_core::EV_COUNCIL_VOTED,
             &serde_json::json!({"agreement_ratio": "not a number"}),

@@ -336,10 +336,72 @@ pub trait Prober {
     fn probe(&self, cli: &AgenticCli) -> ProbeOutcome;
 }
 
+/// A council seat's deliberation identity — the unique lens a voter evaluates through,
+/// like a named chair on a real review board. Assigned deterministically per convened
+/// CLI so re-runs are reproducible; the voter is told its seat, never its CLI identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Seat {
+    /// Short seat name shown in the prompt (e.g. "Capability Fit").
+    pub name: &'static str,
+    /// The evaluation lens the seat is asked to prioritize.
+    pub lens: &'static str,
+}
+
+/// The built-in seat rotation. Extra convened CLIs wrap around (two "Capability Fit"
+/// seats on a 5+-seat council is fine — perspectives bias, they don't partition).
+pub const SEATS: &[Seat] = &[
+    Seat {
+        name: "Capability Fit",
+        lens: "Does the profile's core strength actually match the primary work in this task? Weigh demonstrated fit over generality.",
+    },
+    Seat {
+        name: "Risk & Failure Modes",
+        lens: "Which profile is least likely to fail, stall, or produce something unusable on this task? Weigh downside over upside.",
+    },
+    Seat {
+        name: "Efficiency",
+        lens: "Which profile completes this task with the least wasted time and cost? Weigh directness and turnaround.",
+    },
+    Seat {
+        name: "Output Quality",
+        lens: "Which profile produces the most correct, reviewable, and complete artifact for this task? Weigh craft over speed.",
+    },
+];
+
+/// Context for one deliberation ballot: which seat the voter holds, which ballot round
+/// this is, the approval bar, and — on runoff rounds — the prior tally + dissent so the
+/// council can converge like a real deliberating body instead of re-rolling blind.
+#[derive(Debug, Clone, Default)]
+pub struct BallotContext {
+    /// The seat this voter holds (None = unassigned / legacy single-shot path).
+    pub seat: Option<Seat>,
+    /// 1-based ballot number (1 = first ballot, >1 = runoff).
+    pub ballot: u32,
+    /// The approval share the council must reach in `[0.0, 1.0]` (e.g. `0.75`).
+    pub approval_threshold: f32,
+    /// Runoff only: the prior ballot's tally lines, most-voted first (display, count).
+    pub prior_tally: Vec<(String, u32)>,
+    /// Runoff only: anonymized dissent arguments (top risks cited by non-winning votes).
+    pub dissent_arguments: Vec<String>,
+}
+
 /// Isolated, timeboxed dispatch of the 4-question scaffold to one CLI.
 pub trait Dispatcher {
     /// Dispatch the scaffold to one CLI and collect its vote (`None` on failure/timeout).
     fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote>;
+
+    /// Dispatch one deliberation ballot with seat + round context. The default ignores
+    /// the context and delegates to [`Dispatcher::dispatch`], so existing implementations
+    /// (test stubs, fakes) keep working unchanged; the real dispatcher overrides this to
+    /// render the seat lens, approval bar, and runoff tally into the prompt.
+    fn dispatch_ballot(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        _ctx: &BallotContext,
+    ) -> Option<Vote> {
+        self.dispatch(cli, task)
+    }
 }
 
 /// Per-`(cli × work-kind)` ranking memory.

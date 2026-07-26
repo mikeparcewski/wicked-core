@@ -69,6 +69,18 @@ pub enum CoreEvent {
         /// Roster keys polled for this vote.
         clis: Vec<String>,
     },
+    /// A deliberation ballot landed BELOW the approval bar — the council is running a
+    /// runoff round where every seat sees the tally + dissent (governance as conversation).
+    CouncilDeliberated {
+        session: String,
+        ord: u32,
+        /// The completed ballot number (1-based).
+        round: u32,
+        agreement_pct: u8,
+        /// The approval bar the council must reach, as a percent.
+        needed_pct: u8,
+        votes: u32,
+    },
     /// The council reached a verdict for a unit's assignment vote.
     CouncilVoted {
         session: String,

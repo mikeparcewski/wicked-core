@@ -13,13 +13,21 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::types::{AgenticCli, Category, CouncilTask, Dispatcher, InputMode, Vote};
+use crate::types::{AgenticCli, BallotContext, Category, CouncilTask, Dispatcher, InputMode, Vote};
 
 /// The fixed 4-question scaffold, rendered onto the task.
 ///
 /// Options are numbered capability profiles — CLI identities are never shown to voters.
 /// Voters respond with the option NUMBER, preventing self-selection bias.
 pub fn render_scaffold(task: &CouncilTask) -> String {
+    render_ballot(task, &BallotContext::default())
+}
+
+/// The deliberative scaffold: the base 4-question form plus the voter's seat lens, the
+/// council's approval bar, and — on runoff ballots — the prior tally and dissent
+/// arguments, so the council converges through visible deliberation instead of
+/// re-rolling blind. `BallotContext::default()` renders the plain legacy scaffold.
+pub fn render_ballot(task: &CouncilTask, ctx: &BallotContext) -> String {
     let options = task
         .options
         .iter()
@@ -28,10 +36,63 @@ pub fn render_scaffold(task: &CouncilTask) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let criteria = task.criteria.join(", ");
+
+    let seat_block = match &ctx.seat {
+        Some(seat) => format!(
+            "You hold the **{name}** seat on the council. Evaluate primarily through this \
+             lens: {lens}\n\n",
+            name = seat.name,
+            lens = seat.lens,
+        ),
+        None => String::new(),
+    };
+
+    let threshold_block = if ctx.approval_threshold > 0.0 {
+        format!(
+            "The council needs at least {pct}% of seats to converge on one option. If a \
+             ballot fragments, a runoff round shares the tally and dissent with every seat.\n\n",
+            pct = (ctx.approval_threshold * 100.0).round() as u32,
+        )
+    } else {
+        String::new()
+    };
+
+    let runoff_block = if ctx.ballot > 1 {
+        let tally = ctx
+            .prior_tally
+            .iter()
+            .map(|(rec, n)| format!("  {n} vote(s): {rec}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let dissent = if ctx.dissent_arguments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Dissenting seats argued:\n{}\n",
+                ctx.dissent_arguments
+                    .iter()
+                    .map(|d| format!("  - {d}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+        format!(
+            "This is ballot {ballot} — the previous ballot did not reach the approval bar.\n\
+             Prior tally:\n{tally}\n{dissent}\
+             Reconsider from your seat's lens: hold your vote if your reasoning stands, or \
+             converge on the strongest option if the dissent persuades you. Never converge \
+             on an option you consider fundamentally unviable.\n\n",
+            ballot = ctx.ballot,
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         "You are one independent evaluator on a routing council. You do NOT know which \
          other evaluators exist or which system you are. Your only job is to pick the \
          best-fit capability profile for the task described below.\n\n\
+         {seat_block}{threshold_block}{runoff_block}\
          Task: {topic}\n\n\
          Capability profiles:\n{options}\n\n\
          Evaluation criteria: {criteria}\n\n\
@@ -73,15 +134,14 @@ impl RealDispatcher {
     }
 }
 
-impl Dispatcher for RealDispatcher {
-    fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
-        let prompt = render_scaffold(task);
-
+impl RealDispatcher {
+    /// Shared dispatch body: render the given prompt, run isolated, parse the vote.
+    fn dispatch_prompt(&self, cli: &AgenticCli, task: &CouncilTask, prompt: &str) -> Option<Vote> {
         // Isolation: a per-dispatch tempdir under the system temp root.
         let workdir = make_tempdir(&cli.key, &task.id)?;
 
         let timeout = self.timeout_for(cli);
-        let result = run_in_isolation(cli, &prompt, &workdir, timeout);
+        let result = run_in_isolation(cli, prompt, &workdir, timeout);
 
         // Best-effort cleanup; never fail the dispatch on a cleanup error.
         let _ = std::fs::remove_dir_all(&workdir);
@@ -91,6 +151,21 @@ impl Dispatcher for RealDispatcher {
             return None;
         }
         Some(parse_vote(cli, &stdout))
+    }
+}
+
+impl Dispatcher for RealDispatcher {
+    fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
+        self.dispatch_prompt(cli, task, &render_scaffold(task))
+    }
+
+    fn dispatch_ballot(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &BallotContext,
+    ) -> Option<Vote> {
+        self.dispatch_prompt(cli, task, &render_ballot(task, ctx))
     }
 }
 
@@ -298,5 +373,63 @@ fn strip_key(line: &str, key: &str) -> Option<String> {
         Some(line[needle.len()..].trim().to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SEATS;
+
+    fn task() -> CouncilTask {
+        CouncilTask {
+            id: "t".into(),
+            topic: "route this".into(),
+            options: vec!["profile one".into(), "profile two".into()],
+            criteria: vec!["general".into()],
+            session_id: "s".into(),
+        }
+    }
+
+    #[test]
+    fn plain_scaffold_has_no_seat_threshold_or_runoff_blocks() {
+        let p = render_scaffold(&task());
+        assert!(!p.contains("seat on the council"));
+        assert!(!p.contains("approval"));
+        assert!(!p.contains("Prior tally"));
+    }
+
+    #[test]
+    fn first_ballot_renders_seat_and_threshold() {
+        let ctx = BallotContext {
+            seat: Some(SEATS[1].clone()),
+            ballot: 1,
+            approval_threshold: 0.75,
+            prior_tally: vec![],
+            dissent_arguments: vec![],
+        };
+        let p = render_ballot(&task(), &ctx);
+        assert!(p.contains("Risk & Failure Modes"), "seat name rendered");
+        assert!(p.contains("75%"), "approval bar stated");
+        assert!(!p.contains("Prior tally"), "no runoff block on ballot 1");
+    }
+
+    #[test]
+    fn runoff_ballot_renders_tally_and_dissent() {
+        let ctx = BallotContext {
+            seat: Some(SEATS[0].clone()),
+            ballot: 2,
+            approval_threshold: 0.75,
+            prior_tally: vec![("1 — fits".into(), 3), ("2 — other".into(), 1)],
+            dissent_arguments: vec!["profile two lacks repo context".into()],
+        };
+        let p = render_ballot(&task(), &ctx);
+        assert!(p.contains("ballot 2"));
+        assert!(p.contains("3 vote(s): 1 — fits"));
+        assert!(p.contains("profile two lacks repo context"));
+        assert!(
+            p.contains("Never converge"),
+            "anti-groupthink guard present"
+        );
     }
 }
