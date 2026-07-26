@@ -633,7 +633,7 @@ impl AcpStepRunner {
         if let Some(gov) = input
             .governance
             .as_ref()
-            .filter(|_| crate::execute_wrapped::binary_is_claude(&cli_key))
+            .filter(|_| cli_runs_claude(&cli_key))
         {
             let acp_config = match acp_config_for(&cli_key) {
                 // Only stdio-mode ACP can receive --settings at process-start time; we spawn and
@@ -957,17 +957,32 @@ impl StepRunner for AcpStepRunner {
 
 // ── Registry helper ───────────────────────────────────────────────────────────
 
-fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
-    // The MERGED registry (built-ins + user overlay), not builtin(): a user record
-    // replaces its built-in wholesale, so its [cli.acp] table (or its absence) must
-    // decide the transport here exactly as it does everywhere else. Deliberately NOT
-    // `registry_roster()`: that filters to `enabled_for_council` seats (a seat disabled
-    // for voting can still execute units over ACP) and swallows load errors. A
-    // malformed overlay falls back to built-ins instead of stripping every ACP config.
+/// The merged-registry record for `cli_key` (built-ins + user overlay). Deliberately
+/// NOT `registry_roster()`: that filters to `enabled_for_council` seats (a seat disabled
+/// for voting can still execute units over ACP) and swallows load errors. A malformed
+/// overlay falls back to built-ins instead of stripping every ACP config.
+fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
     let user = wicked_council::registry::default_user_path();
     wicked_council::registry::load(user.as_deref())
         .unwrap_or_else(|_| wicked_council::registry::builtin())
         .into_iter()
         .find(|c| c.key == cli_key)
-        .and_then(|c| c.acp)
+}
+
+fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
+    // The MERGED registry, not builtin(): a user record replaces its built-in wholesale,
+    // so its [cli.acp] table (or its absence) must decide the transport here exactly as
+    // it does everywhere else.
+    registry_record(cli_key).and_then(|c| c.acp)
+}
+
+/// Whether this seat runs Claude Code — classified by the REGISTERED BINARY, not the
+/// key: `binary_is_claude` is a path-stem classifier and registry keys can diverge from
+/// binary names (e.g. a "claude-eval" seat whose binary is `claude`). Ad-hoc CLIs not
+/// in the registry fall back to classifying the key itself (the historical behaviour).
+fn cli_runs_claude(cli_key: &str) -> bool {
+    match registry_record(cli_key) {
+        Some(c) => crate::execute_wrapped::binary_is_claude(&c.binary),
+        None => crate::execute_wrapped::binary_is_claude(cli_key),
+    }
 }
