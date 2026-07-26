@@ -115,6 +115,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // wicked-crew's own bridge (packages/agent-acp-bridges) — no ecosystem
+            // adapter exists for Antigravity yet.
             acp: Some(AcpConfig {
                 binary: "agy-acp".into(),
                 start_args: vec![],
@@ -138,6 +140,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // Official ACP-org adapter (@agentclientprotocol/codex-acp, Rust).
             acp: Some(AcpConfig {
                 binary: "codex-acp".into(),
                 start_args: vec![],
@@ -161,6 +164,7 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // Community adapter (npm `pi-acp`) — sessions + resumption.
             acp: Some(AcpConfig {
                 binary: "pi-acp".into(),
                 start_args: vec![],
@@ -209,9 +213,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
+            // opencode speaks NATIVE ACP over stdio (`opencode acp`) — no bridge needed.
             acp: Some(AcpConfig {
-                binary: "opencode-acp".into(),
-                start_args: vec![],
+                binary: "opencode".into(),
+                start_args: vec!["acp".into()],
                 transport: AcpTransport::Stdio,
             }),
             capabilities: Some(

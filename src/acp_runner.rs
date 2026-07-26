@@ -4,18 +4,19 @@
 //! (stdin/stdout) ACP protocol. Each CLI runs its own ACP wrapper binary; wicked-core
 //! is the ACP client. The registry maps CLI keys to their ACP binary:
 //!
-//! | CLI      | ACP binary        | Transport |
-//! |----------|-------------------|-----------|
-//! | claude   | claude-agent-acp  | stdio     |
-//! | agy      | agy-acp           | stdio     |
-//! | codex    | codex-acp         | stdio     |
-//! | pi       | pi-acp            | stdio     |
-//! | copilot  | copilot --acp     | HTTP      |
+//! | CLI      | ACP binary / invocation                              | Transport |
+//! |----------|------------------------------------------------------|-----------|
+//! | claude   | claude-agent-acp (@agentclientprotocol, Agent SDK)   | stdio     |
+//! | codex    | codex-acp (@agentclientprotocol, Rust)               | stdio     |
+//! | pi       | pi-acp (community adapter)                           | stdio     |
+//! | agy      | agy-acp (wicked-crew packages/agent-acp-bridges)     | stdio     |
+//! | copilot  | copilot --acp (native)                               | stdio     |
+//! | opencode | opencode acp (native)                                | stdio     |
 //!
 //! When an ACP binary is unavailable or fails during the handshake, `AcpStepRunner`
 //! emits a warning and prepends it to `StepOutput.output` so it is visible in both
 //! streaming and persisted contexts. The run then continues with single-shot fallback.
-//! HTTP transport is not yet implemented; copilot falls back gracefully until it is.
+//! HTTP transport is not yet implemented (no registry entry uses it today).
 //!
 //! # Session lifecycle
 //! - **Open (lazy)**: on the first unit for a `(run_id, cli_key)` pair, the binary is
