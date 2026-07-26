@@ -529,20 +529,45 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            match crate::distribute::distribute_units_on(
-                                &pre.units, &pre.clis, &sid, None, &disp,
-                            ) {
-                                Ok(distributions) => {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::distribute::distribute_units_on(
+                                        &pre.units, &pre.clis, &sid, None, &disp,
+                                    )
+                                }));
+                            match result {
+                                Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
                                         run_id: sid,
                                         pre,
                                         distributions,
                                     });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
                                         error: e.to_string(),
+                                    });
+                                }
+                                Err(_panic) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: sid,
+                                        error: {
+                                            let payload = _panic;
+                                            payload
+                                                .downcast_ref::<&str>()
+                                                .map(|s| {
+                                                    format!("distribution thread panicked: {s}")
+                                                })
+                                                .or_else(|| {
+                                                    payload.downcast_ref::<String>().map(|s| {
+                                                        format!("distribution thread panicked: {s}")
+                                                    })
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "distribution thread panicked".to_string()
+                                                })
+                                        },
                                     });
                                 }
                             }
@@ -670,20 +695,45 @@ pub(crate) fn run(
                         let disp = dispatcher.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
-                            match crate::distribute::distribute_units_on(
-                                &pre.units, &pre.clis, &sid, None, &disp,
-                            ) {
-                                Ok(distributions) => {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::distribute::distribute_units_on(
+                                        &pre.units, &pre.clis, &sid, None, &disp,
+                                    )
+                                }));
+                            match result {
+                                Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
                                         run_id: sid,
                                         pre,
                                         distributions,
                                     });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     let _ = tx.send(Command::PlanFailed {
                                         run_id: sid,
                                         error: e.to_string(),
+                                    });
+                                }
+                                Err(_panic) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: sid,
+                                        error: {
+                                            let payload = _panic;
+                                            payload
+                                                .downcast_ref::<&str>()
+                                                .map(|s| {
+                                                    format!("distribution thread panicked: {s}")
+                                                })
+                                                .or_else(|| {
+                                                    payload.downcast_ref::<String>().map(|s| {
+                                                        format!("distribution thread panicked: {s}")
+                                                    })
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    "distribution thread panicked".to_string()
+                                                })
+                                        },
                                     });
                                 }
                             }
@@ -1511,14 +1561,18 @@ pub(crate) fn run(
                                 .into_iter()
                                 .filter(|u| u.ord == ord_c)
                                 .collect();
-                            match crate::distribute::distribute_units_on(
-                                &unit_slice,
-                                &clis,
-                                &run_id_c,
-                                None,
-                                &disp,
-                            ) {
-                                Ok(dists) => {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    crate::distribute::distribute_units_on(
+                                        &unit_slice,
+                                        &clis,
+                                        &run_id_c,
+                                        None,
+                                        &disp,
+                                    )
+                                }));
+                            match result {
+                                Ok(Ok(dists)) => {
                                     let new_cli_key = dists
                                         .into_iter()
                                         .next()
@@ -1536,7 +1590,7 @@ pub(crate) fn run(
                                         },
                                     });
                                 }
-                                Err(e) => {
+                                Ok(Err(e)) => {
                                     // Post PlanFailed so the actor thread marks the run Failed
                                     // and emits the error event — prevents a permanent wedge.
                                     let _ = tx.send(Command::PlanFailed {
@@ -1544,6 +1598,24 @@ pub(crate) fn run(
                                         error: format!(
                                             "reassign council re-run failed for ord={ord_c}: {e}"
                                         ),
+                                    });
+                                }
+                                Err(_panic) => {
+                                    let _ = tx.send(Command::PlanFailed {
+                                        run_id: run_id_c,
+                                        error: {
+                                            let payload = _panic;
+                                            let msg = payload
+                                                .downcast_ref::<&str>()
+                                                .map(|s| format!("reassign council thread panicked for ord={ord_c}: {s}"))
+                                                .or_else(|| {
+                                                    payload
+                                                        .downcast_ref::<String>()
+                                                        .map(|s| format!("reassign council thread panicked for ord={ord_c}: {s}"))
+                                                })
+                                                .unwrap_or_else(|| format!("reassign council thread panicked for ord={ord_c}"));
+                                            msg
+                                        },
                                     });
                                 }
                             }

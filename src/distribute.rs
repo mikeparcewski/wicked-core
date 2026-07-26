@@ -47,8 +47,11 @@ fn invocation_of(clis: &[AgenticCli], key: &str) -> Option<String> {
 const DISTRIBUTE_CRITERIA: &[&str] = &["general"];
 
 /// Convene the council (in-process) for every unit, persisting its task/verdict on the SHARED store
-/// at `db_path` so council nodes land on the same file as the rest (R6). Sequential — each
-/// `queue_blocking` joins its worker before the next, so the council never writes concurrently.
+/// at `db_path` so council nodes land on the same file as the rest (R6). Units are dispatched in
+/// parallel via `std::thread::scope`; each spawns its own in-memory council estate, so there is no
+/// shared SQLite state and no concurrent-write hazard. (If `db_path` is `Some`, multiple threads
+/// would open the same file — currently `db_path` is always `None` from the actor; callers passing
+/// a file path should be aware of the SQLite single-writer constraint.)
 pub fn distribute_units_on(
     units: &[WorkUnit],
     clis: &[AgenticCli],
@@ -57,26 +60,51 @@ pub fn distribute_units_on(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
 ) -> anyhow::Result<Vec<Distribution>> {
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
-    let mut dists: Vec<Distribution> = units
-        .iter()
-        .map(|unit| {
-            if unit.tool_cmd.is_some() {
-                Ok(Distribution {
-                    assigned_cli: unit
-                        .tool_cmd
-                        .as_ref()
-                        .and_then(|c| c.first())
-                        .cloned()
-                        .unwrap_or_else(|| "__tool__".to_string()),
-                    assigned_invocation: None,
-                    council_task_ref: None,
-                    routing: RoutingInfo::Tool,
+    let mut dists: Vec<Distribution> = std::thread::scope(|s| {
+        // Spawn all units concurrently. Scoped-thread closures borrow from the enclosing
+        // scope — `std::thread::scope` guarantees all threads finish before it returns,
+        // making the borrows sound without requiring `move`.
+        let handles: Vec<_> = units
+            .iter()
+            .map(|unit| {
+                s.spawn(|| {
+                    if unit.tool_cmd.is_some() {
+                        Ok(Distribution {
+                            assigned_cli: unit
+                                .tool_cmd
+                                .as_ref()
+                                .and_then(|c| c.first())
+                                .cloned()
+                                .unwrap_or_else(|| "__tool__".to_string()),
+                            assigned_invocation: None,
+                            council_task_ref: None,
+                            routing: RoutingInfo::Tool,
+                        })
+                    } else {
+                        distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
+                    }
                 })
-            } else {
-                distribute_one(unit, clis, &roster_keys, session_id, db_path, dispatcher)
-            }
-        })
-        .collect::<anyhow::Result<_>>()?;
+            })
+            .collect();
+        // Join ALL handles before inspecting results. Early-returning on the first join error
+        // would drop remaining handles, letting the scope re-propagate their panics and
+        // bypass the intended `anyhow::Error` mapping.
+        let results: Vec<_> = handles.into_iter().map(|h| h.join()).collect();
+        results
+            .into_iter()
+            .map(|r| {
+                r.map_err(|e| {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "council thread panicked".to_string());
+                    anyhow::anyhow!(msg)
+                })
+                .and_then(|r| r)
+            })
+            .collect::<anyhow::Result<_>>()
+    })?;
     enforce_evaluator_distinct(units, &mut dists, &roster_keys, clis);
     Ok(dists)
 }
