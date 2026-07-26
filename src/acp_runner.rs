@@ -161,12 +161,15 @@ fn start_acp_process(
         handshake_err!(child, e);
     }
 
+    // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp)
+    // reject session/new with -32602 when it is absent; bridges ignore it.
     if let Err(e) = rpc_send(
         &mut stdin,
         2,
         "session/new",
         json!({
-            "cwd": cwd.to_string_lossy().as_ref()
+            "cwd": cwd.to_string_lossy().as_ref(),
+            "mcpServers": []
         }),
     ) {
         handshake_err!(child, e);
@@ -622,18 +625,22 @@ impl AcpStepRunner {
         // The `--settings` injection happens at `initialize` time (the binary's argv), which is
         // the only point in the ACP lifecycle where a new flag can be introduced. Per-prompt
         // injection is not possible — the `session/prompt` RPC has no settings field.
-        if let Some(gov) = &input.governance {
+        // Input governance at ACP process start (`--settings` PreToolUse hooks) is
+        // Claude-specific. Non-claude CLIs mirror the wrapped path — no input arming,
+        // output-side gates still apply — and fall through to the shared ACP session
+        // path below so they KEEP multi-turn ACP instead of silently degrading to
+        // single-shot on every governed run.
+        if let Some(gov) = input
+            .governance
+            .as_ref()
+            .filter(|_| cli_runs_claude(&cli_key))
+        {
             let acp_config = match acp_config_for(&cli_key) {
                 // Only stdio-mode ACP can receive --settings at process-start time; we spawn and
                 // control the process directly. HTTP-mode ACP connects to a server we don't
                 // spawn, so --settings cannot be injected → fall back to the wrapped-CLI path,
                 // which handles governance independently via arm_input_governance.
-                Some(c)
-                    if c.transport == AcpTransport::Stdio
-                        && crate::execute_wrapped::binary_is_claude(&cli_key) =>
-                {
-                    c
-                }
+                Some(c) if c.transport == AcpTransport::Stdio => c,
                 _ => return self.fallback.run_unit_streaming(input, emit),
             };
 
@@ -748,7 +755,8 @@ impl AcpStepRunner {
             };
         }
 
-        // UNGOVERNED ACP PATH — unchanged from before.
+        // SHARED ACP SESSION PATH — ungoverned units of every CLI, plus governed units of
+        // non-claude CLIs (input arming is claude-only; their output-side gates still run).
         let acp_config = match acp_config_for(&cli_key) {
             Some(c) => c,
             None => return self.fallback.run_unit_streaming(input, emit),
@@ -949,9 +957,32 @@ impl StepRunner for AcpStepRunner {
 
 // ── Registry helper ───────────────────────────────────────────────────────────
 
-fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
-    wicked_council::registry::builtin()
+/// The merged-registry record for `cli_key` (built-ins + user overlay). Deliberately
+/// NOT `registry_roster()`: that filters to `enabled_for_council` seats (a seat disabled
+/// for voting can still execute units over ACP) and swallows load errors. A malformed
+/// overlay falls back to built-ins instead of stripping every ACP config.
+fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
+    let user = wicked_council::registry::default_user_path();
+    wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin())
         .into_iter()
         .find(|c| c.key == cli_key)
-        .and_then(|c| c.acp)
+}
+
+fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
+    // The MERGED registry, not builtin(): a user record replaces its built-in wholesale,
+    // so its [cli.acp] table (or its absence) must decide the transport here exactly as
+    // it does everywhere else.
+    registry_record(cli_key).and_then(|c| c.acp)
+}
+
+/// Whether this seat runs Claude Code — classified by the REGISTERED BINARY, not the
+/// key: `binary_is_claude` is a path-stem classifier and registry keys can diverge from
+/// binary names (e.g. a "claude-eval" seat whose binary is `claude`). Ad-hoc CLIs not
+/// in the registry fall back to classifying the key itself (the historical behaviour).
+fn cli_runs_claude(cli_key: &str) -> bool {
+    match registry_record(cli_key) {
+        Some(c) => crate::execute_wrapped::binary_is_claude(&c.binary),
+        None => crate::execute_wrapped::binary_is_claude(cli_key),
+    }
 }

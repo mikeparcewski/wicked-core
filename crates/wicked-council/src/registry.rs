@@ -45,6 +45,8 @@ struct TomlCli {
     enabled_for_council: Option<bool>,
     #[serde(default)]
     capabilities: Option<String>,
+    #[serde(default)]
+    acp: Option<AcpConfig>,
 }
 
 impl From<TomlCli> for AgenticCli {
@@ -62,8 +64,10 @@ impl From<TomlCli> for AgenticCli {
             // User records default to confirm-on-probe.
             confidence: t.confidence.unwrap_or(Confidence::ConfirmOnProbe),
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
-            // User TOML records carry no ACP config; the engine falls back to single-shot.
-            acp: None,
+            // A user record without [cli.acp] falls back to single-shot; note that an
+            // overlay REPLACES its built-in wholesale, so overriding a CLI that has a
+            // built-in ACP config requires restating [cli.acp] in the TOML.
+            acp: t.acp,
             capabilities: t.capabilities,
         }
     }
@@ -101,7 +105,9 @@ pub fn builtin() -> Vec<AgenticCli> {
             key: "agy".into(),
             display_name: "Antigravity".into(),
             binary: "agy".into(),
-            headless_invocation: "agy run \"{PROMPT}\"".into(),
+            // `agy -p` is the documented non-interactive mode; `agy run` spawns the
+            // bubbletea TUI and dies headless ("could not open TTY").
+            headless_invocation: "agy -p \"{PROMPT}\"".into(),
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["agy".into(), "--version".into()],
@@ -178,11 +184,12 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // copilot HTTP ACP on a fixed port 3000 (not dynamic; single-session only).
+            // copilot speaks native ACP over stdio (`copilot --acp`): verified initialize /
+            // session/new / session/prompt with agent_message_chunk streaming (v1.0.75).
             acp: Some(AcpConfig {
                 binary: "copilot".into(),
-                start_args: vec!["--acp".into(), "--port".into(), "3000".into()],
-                transport: AcpTransport::Http,
+                start_args: vec!["--acp".into()],
+                transport: AcpTransport::Stdio,
             }),
             capabilities: Some(
                 "GitHub context, pull request review, commit-level changes, \
@@ -202,8 +209,11 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // opencode exposes ACP via its HTTP server; pending transport implementation.
-            acp: None,
+            acp: Some(AcpConfig {
+                binary: "opencode-acp".into(),
+                start_args: vec![],
+                transport: AcpTransport::Stdio,
+            }),
             capabilities: Some(
                 "open-source models, local/private code, broad language support, \
                  configurable backends"
@@ -329,5 +339,54 @@ enabled_for_council = false
     fn missing_file_returns_builtins() {
         let merged = load(Some(Path::new("/nonexistent/path/clis.toml"))).unwrap();
         assert_eq!(merged.len(), builtin().len());
+    }
+
+    /// A user record can carry a `[cli.acp]` table, and an override WITHOUT one strips
+    /// the built-in's ACP config (wholesale replacement — the documented semantic).
+    #[test]
+    fn load_merges_user_toml_acp_config() {
+        let dir = std::env::temp_dir().join(format!("wc-registry-acp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(
+            br#"
+[[cli]]
+key = "claude"
+display_name = "Claude (overridden)"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "my-claude-acp"
+start_args = ["--flag"]
+transport = "stdio"
+
+[[cli]]
+key = "codex"
+display_name = "Codex (overridden, no acp)"
+binary = "codex"
+headless_invocation = "codex exec \"{PROMPT}\""
+"#,
+        )
+        .unwrap();
+
+        let merged = load(Some(&path)).expect("load must succeed");
+
+        // The [cli.acp] table parses and rides the override.
+        let claude = merged.iter().find(|c| c.key == "claude").unwrap();
+        let acp = claude.acp.as_ref().expect("overlay acp must survive merge");
+        assert_eq!(acp.binary, "my-claude-acp");
+        assert_eq!(acp.start_args, vec!["--flag".to_string()]);
+        assert_eq!(acp.transport, AcpTransport::Stdio);
+
+        // An override without [cli.acp] replaces the built-in wholesale — ACP stripped.
+        let codex = merged.iter().find(|c| c.key == "codex").unwrap();
+        assert!(
+            codex.acp.is_none(),
+            "override without [cli.acp] strips the built-in ACP config"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
