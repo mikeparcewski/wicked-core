@@ -356,6 +356,19 @@ fn exec_turn_acp(
                     } else {
                         found = true;
                     }
+                    // The ecosystem adapters (official claude/codex, pi-acp, native
+                    // opencode) report authoritative usage ON THE PROMPT RESULT, not as
+                    // inputTokens/outputTokens usage_update notifications — without this
+                    // no CliUsage event fires and the studio's Burn panel stays empty.
+                    // Prefer it over notification-derived usage; keep any notification
+                    // cost (the result shape carries no cost field).
+                    if let Some(result_usage) = parse_result_usage(&v["result"]["usage"]) {
+                        let cost = usage.as_ref().and_then(|u| u.cost_usd);
+                        usage = Some(Usage {
+                            cost_usd: cost.or(result_usage.cost_usd),
+                            ..result_usage
+                        });
+                    }
                     break;
                 }
 
@@ -424,11 +437,25 @@ fn handle_update(
                 .as_u64()
                 .or_else(|| update["output_tokens"].as_u64())
                 .unwrap_or(0);
+            // The official claude adapter's usage_update is `{used, size, cost:{amount}}`
+            // — no per-direction tokens (those arrive on the prompt result), but cost is
+            // ONLY reported here, so lift it even when the token fields are absent.
+            let cost = update["cost"]["amount"].as_f64();
             if input > 0 || out > 0 {
                 *usage = Some(Usage {
                     input_tokens: input,
                     output_tokens: out,
-                    cost_usd: None,
+                    cost_usd: cost.or_else(|| usage.as_ref().and_then(|u| u.cost_usd)),
+                });
+            } else if let Some(c) = cost {
+                let (i, o) = usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((0, 0));
+                *usage = Some(Usage {
+                    input_tokens: i,
+                    output_tokens: o,
+                    cost_usd: Some(c),
                 });
             }
         }
@@ -444,6 +471,31 @@ fn handle_update(
         }
         _ => {}
     }
+}
+
+/// Parse the authoritative usage object from a `session/prompt` RESULT. All ecosystem
+/// adapters report here (camelCase): official claude/codex, pi-acp, native opencode.
+/// Input counts cached reads/writes alongside fresh input, mirroring the historical
+/// bridge semantics (total context presented to the model). `None` when absent/empty.
+fn parse_result_usage(u: &Value) -> Option<Usage> {
+    if !u.is_object() {
+        return None;
+    }
+    let field = |k: &str| u[k].as_u64().unwrap_or(0);
+    // Saturating: token counters come from an external process — a malformed or
+    // hostile frame must clamp, never wrap into a tiny bogus total.
+    let input = field("inputTokens")
+        .saturating_add(field("cachedReadTokens"))
+        .saturating_add(field("cachedWriteTokens"));
+    let output = field("outputTokens");
+    if input == 0 && output == 0 {
+        return None;
+    }
+    Some(Usage {
+        input_tokens: input,
+        output_tokens: output,
+        cost_usd: None,
+    })
 }
 
 // ── Fallback helpers ──────────────────────────────────────────────────────────
@@ -1148,6 +1200,62 @@ mod tests {
 
         // Everything consumed; nothing left for anyone.
         assert!(r.drain_operator_messages("run1", "claude").is_empty());
+    }
+
+    #[test]
+    fn result_usage_parses_ecosystem_adapter_shape() {
+        // Official claude adapter result: input + cached reads/writes sum into input.
+        let v = serde_json::json!({
+            "inputTokens": 2, "outputTokens": 4,
+            "cachedReadTokens": 15273, "cachedWriteTokens": 18195, "totalTokens": 33474
+        });
+        let u = parse_result_usage(&v).expect("usage");
+        assert_eq!(u.input_tokens, 2 + 15273 + 18195);
+        assert_eq!(u.output_tokens, 4);
+        assert_eq!(u.cost_usd, None);
+
+        // Absent / empty / zeroed → None (no fabricated usage).
+        assert!(parse_result_usage(&serde_json::Value::Null).is_none());
+        assert!(parse_result_usage(&serde_json::json!({})).is_none());
+        assert!(
+            parse_result_usage(&serde_json::json!({"inputTokens": 0, "outputTokens": 0})).is_none()
+        );
+    }
+
+    #[test]
+    fn usage_update_lifts_cost_only_frames() {
+        // Official claude adapter usage_update: {used, size, cost:{amount}} — no token
+        // fields. The cost must be lifted and must survive a later result-usage merge.
+        let emit_fn = |_: &str| {};
+        let emit: &DeltaSink = &emit_fn;
+        let mut output = String::new();
+        let mut usage: Option<Usage> = None;
+        let mut files = Vec::new();
+        let v = serde_json::json!({
+            "params": {"update": {
+                "sessionUpdate": "usage_update",
+                "used": 33474, "size": 1000000,
+                "cost": {"amount": 0.19, "currency": "USD"}
+            }}
+        });
+        handle_update(&v, emit, &mut output, &mut usage, &mut files, 1024);
+        let u = usage.expect("cost-only frame lifts usage");
+        assert_eq!(u.cost_usd, Some(0.19));
+        assert_eq!(u.input_tokens, 0);
+
+        // Merge semantics from the turn loop: result usage wins tokens, keeps cost.
+        let result_usage = parse_result_usage(&serde_json::json!({
+            "inputTokens": 10, "outputTokens": 5
+        }))
+        .unwrap();
+        let cost = u.cost_usd;
+        let merged = Usage {
+            cost_usd: cost.or(result_usage.cost_usd),
+            ..result_usage
+        };
+        assert_eq!(merged.input_tokens, 10);
+        assert_eq!(merged.output_tokens, 5);
+        assert_eq!(merged.cost_usd, Some(0.19));
     }
 
     #[test]
