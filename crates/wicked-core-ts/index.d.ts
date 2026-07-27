@@ -120,6 +120,15 @@ export declare class Core {
    */
   upsertConformanceRule(ruleJson: string): Promise<string>
   /**
+   * Register (or replace) a workflow definition in the actor's runtime registry. `json` is a
+   * JSON-serialised `WorkflowDef` object (fields: id, description, phases — see the wicked-core
+   * workflow schema). Validates server-side (id + ≥1 phase required); rejects invalid JSON or a
+   * structurally invalid def. Returns the registered workflow id. Idempotent on id — calling
+   * twice replaces the first registration. The def is immediately visible to the next `launchRun`
+   * call; no process restart required.
+   */
+  registerWorkflow(json: string): Promise<string>
+  /**
    * Recall which conformance rules apply to the given `query_json` (a JSON-serialized
    * `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
    * An empty or whitespace `query_json` is treated as an all-rules query (no facet filters).
@@ -158,6 +167,22 @@ export declare class Core {
    * `terminalExited` event is emitted. Rejects on an unknown id.
    */
   closeTerminal(id: string): Promise<string>
+  /**
+   * Inject an operator message into one or all active PTY workers for a run.
+   *
+   * `target` is either `"all"` (write to every PTY session for the run) or a CLI key string
+   * (write only to that CLI's session). ACP-backed sessions have no PTY and are skipped with a
+   * warning. Fires [`CoreEvent::WorkerMessageInjected`] for each successful write.
+   */
+  injectWorkerMessage(runId: string, message: string, target: string): Promise<unknown>
+  /**
+   * Stop the current worker for `ord` in run `run_id` and re-dispatch it.
+   *
+   * `newCli` is either a CLI key string (re-dispatch immediately to that CLI) or `null` (re-run
+   * the council and let it pick). Returns `"ok"` when the command has been queued; the
+   * [`CoreEvent::UnitReassigned`] event confirms the reassignment.
+   */
+  reassignUnit(runId: string, ord: number, newCli?: string | undefined | null): Promise<unknown>
 }
 /**
  * A live event subscription returned by [`Core::subscribe`]. Owns the FIFO pump thread + its
