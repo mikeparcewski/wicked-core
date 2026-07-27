@@ -402,6 +402,7 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "detail": detail,
             "failureKind": match failure_kind {
                 StepFailureKind::WorkerError => "workerError",
+                StepFailureKind::EnvironmentRefused => "environmentRefused",
                 _ => "unknown",
             },
         }),

@@ -132,7 +132,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             key: "codex".into(),
             display_name: "Codex".into(),
             binary: "codex".into(),
-            headless_invocation: "codex exec \"{PROMPT}\"".into(),
+            // --skip-git-repo-check: unit sandboxes/worktrees are often not git repos;
+            // without it codex refuses with "Not inside a trusted directory" (headless
+            // has no prompt to answer). Approvals/sandboxing are NOT touched here.
+            headless_invocation: "codex exec --skip-git-repo-check \"{PROMPT}\"".into(),
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["codex".into(), "--version".into()],
