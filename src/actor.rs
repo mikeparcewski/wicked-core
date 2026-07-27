@@ -2289,7 +2289,10 @@ fn apply_step_result(
     if output.status == crate::workflow::StepStatus::Failed {
         if output.attempt == 0 {
             if let Some(refusal) = environment_refusal(&output.output) {
-                let cli = unit.assigned_cli.clone().unwrap_or_default();
+                let cli = unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string());
                 let effective_invocation = unit.assigned_invocation.clone().or_else(|| {
                     crate::registry_roster()
                         .into_iter()
@@ -2329,11 +2332,19 @@ fn apply_step_result(
                 }
                 // Bubble up: the operator decides. Approve retries the unit (their
                 // amendment rides the prompt); Reject fails the run; the reassign
-                // surface remains available for "use another CLI".
+                // surface remains available for "use another CLI". The worker's own
+                // words ride both the prompt and denial_reason so the operator sees
+                // WHAT the CLI said, not only our classification.
+                let raw_excerpt: String = output.output.trim().chars().take(300).collect();
+                unit.denial_reason = Some(format!(
+                    "environment refused ({}): {raw_excerpt}",
+                    refusal.reason
+                ));
+                put_node(store, unit.to_node())?;
                 let prompt = format!(
-                    "Unit {ord} ({cli}) refused its environment: {}. Approve to retry \
-                     (optionally amend), reject to fail the run, or reassign the unit \
-                     to a different CLI first.",
+                    "Unit {ord} ({cli}) refused its environment: {} — \"{raw_excerpt}\". \
+                     Approve to retry (optionally amend), reject to fail the run, or \
+                     reassign the unit to a different CLI first.",
                     refusal.reason
                 );
                 pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
