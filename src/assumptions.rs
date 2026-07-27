@@ -101,7 +101,7 @@ pub fn parse(output: &str) -> Vec<ExternalTransform> {
                     clip(&transform)
                 },
                 known: false,
-                detail: clip(&format!("malformed marker, review the source line: {rest}")),
+                detail: clip(&format!("malformed marker, review the source line: {line}")),
             }
         };
         found.push(entry);

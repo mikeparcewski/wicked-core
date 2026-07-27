@@ -1473,6 +1473,19 @@ mod tests {
             &["type", "session", "message", "target"],
         );
         check(
+            CoreEvent::AssumptionRecorded {
+                session: s(),
+                ord: 1,
+                kind: s(),
+                library: s(),
+                transform: s(),
+                known: true,
+                detail: s(),
+            },
+            "assumptionRecorded",
+            &["type", "session", "ord", "kind", "library", "transform", "known", "detail"],
+        );
+        check(
             CoreEvent::WorkerMessageQueued {
                 session: s(),
                 message: s(),

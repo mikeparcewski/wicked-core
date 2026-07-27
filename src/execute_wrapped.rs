@@ -798,6 +798,9 @@ fn tokenize(s: &str) -> Vec<String> {
 /// The runtime skill allowlist (`unit.allowed_skills`, §4.2) rides the invocation template via a
 /// `{SKILLS}` placeholder — see [`build_argv`]. The template author picks the per-CLI flag (e.g.
 /// `claude … --allowedTools {SKILLS}`), so the engine never hard-codes one CLI's semantics.
+/// Real work units additionally carry the structured-assumptions conventions appendix
+/// ([`crate::assumptions::PROMPT_CONVENTION`]); engine-internal `validator`/`triage`
+/// sessions return the authored prompt byte-exact.
 pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
     let base = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => format!("/{skill} {}", unit.description),
