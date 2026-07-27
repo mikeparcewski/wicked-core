@@ -168,6 +168,8 @@ pub(crate) enum Command {
         unit_ix: usize,
         attempt: u32,
         decision: crate::validator::TriageDecision,
+        /// The judge's bounded reasoning (propagated for every decision variant).
+        analysis: String,
         /// Bounded excerpt of the original failure output (for prompts + denial reasons).
         failure_excerpt: String,
     },

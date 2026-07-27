@@ -919,7 +919,8 @@ pub fn triage_failure(
     invocation: &str,
     roster: &[AgenticCli],
     runner: &dyn StepRunner,
-) -> anyhow::Result<TriageDecision> {
+    triage_ctx: &str,
+) -> anyhow::Result<(TriageDecision, String)> {
     let prompt = format!(
         "You are an execution-failure triage judge for a CLI-agent orchestrator. A worker \
          CLI failed; decide the remedy. The FIRST line of your reply MUST be exactly one \
@@ -955,8 +956,11 @@ pub fn triage_failure(
             unit.assigned_invocation = Some(invocation);
         }
     }
+    // Unique per (run, unit, attempt): session-based runners key long-lived CLI
+    // processes by run_id — a constant here would cross-contaminate their caches.
+    let triage_run_id = format!("triage-{triage_ctx}");
     let input = StepInput {
-        run_id: "triage".to_string(),
+        run_id: triage_run_id.clone(),
         unit_ix: 0,
         attempt: 0,
         unit,
@@ -968,6 +972,8 @@ pub fn triage_failure(
         prior_outputs: vec![],
     };
     let out = runner.run_unit(&input);
+    // Drop any session the judge's runner opened under the triage run id.
+    runner.on_run_complete(&triage_run_id);
     if out.status != StepStatus::Ok {
         anyhow::bail!("triage judge failed ({:?}): {}", out.status, out.output);
     }
@@ -978,7 +984,9 @@ pub fn triage_failure(
 /// malformed. `RETRY_WITH_FLAG` additionally requires the flag to be a single sane token
 /// (`-`/`--` prefix, [A-Za-z0-9=_-] body) — anything else escalates rather than letting a
 /// model smuggle arbitrary argv into an invocation.
-fn parse_triage_decision(raw: &str) -> TriageDecision {
+/// Returns `(decision, analysis)` — analysis is the judge's bounded reasoning from the
+/// lines AFTER the contract line, propagated for every variant (observability contract).
+fn parse_triage_decision(raw: &str) -> (TriageDecision, String) {
     let first_line = raw
         .lines()
         .map(str::trim)
@@ -994,12 +1002,18 @@ fn parse_triage_decision(raw: &str) -> TriageDecision {
         .chars()
         .take(400)
         .collect();
+    let malformed = |line: &str| {
+        (
+            TriageDecision::Escalate(format!("malformed triage verdict: {line}")),
+            String::new(),
+        )
+    };
     let rest = match first_line.strip_prefix("DECISION:") {
         Some(r) => r.trim(),
-        None => return TriageDecision::Escalate(format!("malformed triage verdict: {first_line}")),
+        None => return malformed(first_line),
     };
     let mut parts = rest.split_whitespace();
-    match parts.next() {
+    let decision = match parts.next() {
         Some("RETRY_WITH_FLAG") => {
             let flag = parts.next().unwrap_or("");
             let sane = flag.starts_with('-')
@@ -1011,16 +1025,20 @@ fn parse_triage_decision(raw: &str) -> TriageDecision {
             if sane {
                 TriageDecision::RetryWithFlag(flag.to_string())
             } else {
-                TriageDecision::Escalate(format!(
-                    "triage proposed a non-sane flag ({flag:?}); {analysis}"
-                ))
+                return (
+                    TriageDecision::Escalate(format!("triage proposed a non-sane flag ({flag:?})")),
+                    analysis,
+                );
             }
         }
-        Some("RETRY") => TriageDecision::Retry,
-        Some("ESCALATE") => TriageDecision::Escalate(analysis),
-        Some("FAIL") => TriageDecision::Fail(analysis),
-        _ => TriageDecision::Escalate(format!("malformed triage verdict: {first_line}")),
-    }
+        // STRICT: the contract line carries the keyword ALONE — trailing prose on the
+        // decision line is a malformed verdict (analysis belongs on the next lines).
+        Some("RETRY") if parts.next().is_none() => TriageDecision::Retry,
+        Some("ESCALATE") if parts.next().is_none() => TriageDecision::Escalate(analysis.clone()),
+        Some("FAIL") if parts.next().is_none() => TriageDecision::Fail(analysis.clone()),
+        _ => return malformed(first_line),
+    };
+    (decision, analysis)
 }
 
 /// Parse the reviewer's verdict FAIL-CLOSED. Reads ONLY the first non-empty line (a compliant reviewer
@@ -1868,31 +1886,49 @@ mod triage_parse_tests {
 
     #[test]
     fn contract_lines_parse() {
+        let (d, a) = parse_triage_decision(
+            "DECISION: RETRY_WITH_FLAG --skip-git-repo-check\nsandbox refusal",
+        );
         assert_eq!(
-            parse_triage_decision(
-                "DECISION: RETRY_WITH_FLAG --skip-git-repo-check\nsandbox refusal"
-            ),
+            d,
             TriageDecision::RetryWithFlag("--skip-git-repo-check".to_string())
         );
-        assert_eq!(
-            parse_triage_decision("DECISION: RETRY\nrate limited"),
-            TriageDecision::Retry
+        assert!(a.contains("sandbox refusal"), "analysis propagates: {a}");
+
+        let (d, a) = parse_triage_decision("DECISION: RETRY\nrate limited");
+        assert_eq!(d, TriageDecision::Retry);
+        assert!(
+            a.contains("rate limited"),
+            "analysis propagates for RETRY: {a}"
         );
-        assert!(matches!(
-            parse_triage_decision("DECISION: ESCALATE\nneeds operator trust grant"),
-            TriageDecision::Escalate(a) if a.contains("trust grant")
-        ));
-        assert!(matches!(
-            parse_triage_decision("DECISION: FAIL\ntests genuinely failed"),
-            TriageDecision::Fail(r) if r.contains("genuinely")
-        ));
+
+        let (d, _) = parse_triage_decision("DECISION: ESCALATE\nneeds operator trust grant");
+        assert!(matches!(d, TriageDecision::Escalate(a) if a.contains("trust grant")));
+
+        let (d, _) = parse_triage_decision("DECISION: FAIL\ntests genuinely failed");
+        assert!(matches!(d, TriageDecision::Fail(r) if r.contains("genuinely")));
+    }
+
+    #[test]
+    fn trailing_prose_on_the_decision_line_is_malformed() {
+        for bad in [
+            "DECISION: FAIL because tests failed",
+            "DECISION: RETRY now",
+            "DECISION: ESCALATE to operator",
+        ] {
+            let (d, _) = parse_triage_decision(bad);
+            assert!(
+                matches!(d, TriageDecision::Escalate(a) if a.contains("malformed")),
+                "{bad} must be malformed-escalate"
+            );
+        }
     }
 
     #[test]
     fn malformed_and_unsafe_resolve_to_escalate() {
         // No contract line at all.
         assert!(matches!(
-            parse_triage_decision("I think you should retry with sudo"),
+            parse_triage_decision("I think you should retry with sudo").0,
             TriageDecision::Escalate(_)
         ));
         // Multi-token / quoted / non-flag payloads never become argv.
@@ -1903,13 +1939,13 @@ mod triage_parse_tests {
             "DECISION: RETRY_WITH_FLAG",
         ] {
             assert!(
-                matches!(parse_triage_decision(bad), TriageDecision::Escalate(_)),
+                matches!(parse_triage_decision(bad).0, TriageDecision::Escalate(_)),
                 "{bad} must escalate"
             );
         }
         // Unknown decision word.
         assert!(matches!(
-            parse_triage_decision("DECISION: MAYBE\nunsure"),
+            parse_triage_decision("DECISION: MAYBE\nunsure").0,
             TriageDecision::Escalate(_)
         ));
     }
