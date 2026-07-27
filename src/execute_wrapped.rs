@@ -799,10 +799,16 @@ fn tokenize(s: &str) -> Vec<String> {
 /// `{SKILLS}` placeholder — see [`build_argv`]. The template author picks the per-CLI flag (e.g.
 /// `claude … --allowedTools {SKILLS}`), so the engine never hard-codes one CLI's semantics.
 pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
-    match unit.skill_ref.as_deref() {
+    let base = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => format!("/{skill} {}", unit.description),
         _ => unit.description.clone(),
+    };
+    // Engine-internal judge/triage prompts are fully authored — no conventions appendix
+    // (their verdict contracts must stay byte-exact).
+    if matches!(unit.session_id.as_str(), "validator" | "triage") {
+        return base;
     }
+    format!("{base}{}", crate::assumptions::PROMPT_CONVENTION)
 }
 
 /// Build the argv from an invocation template, substituting `{PROMPT}` (the skill-led prompt, guarded
@@ -968,18 +974,24 @@ mod tests {
 
     #[test]
     fn skill_prompt_leads_with_the_headless_slash_form() {
+        let appendix = crate::assumptions::PROMPT_CONVENTION;
         let mut u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
-        // authored path: no skill → bare description.
-        assert_eq!(skill_prompt(&u), "add SSO login");
+        // authored path: no skill → bare description + the conventions appendix.
+        assert_eq!(skill_prompt(&u), format!("add SSO login{appendix}"));
         // skill-driven: leads with /<skill> so the harness expands the named skill deterministically.
         u.skill_ref = Some("wicked-testing-semantic-reviewer".to_string());
         assert_eq!(
             skill_prompt(&u),
-            "/wicked-testing-semantic-reviewer add SSO login"
+            format!("/wicked-testing-semantic-reviewer add SSO login{appendix}")
         );
         // an empty skill_ref is treated as no skill (authored path), never a bare "/ ...".
         u.skill_ref = Some(String::new());
-        assert_eq!(skill_prompt(&u), "add SSO login");
+        assert_eq!(skill_prompt(&u), format!("add SSO login{appendix}"));
+        // Engine-internal judge/triage prompts stay byte-exact — no appendix.
+        let judge = WorkUnit::pending("validator-agent", "validator", 1, "judge this");
+        assert_eq!(skill_prompt(&judge), "judge this");
+        let triage = WorkUnit::pending("triage-agent", "triage", 1, "triage this");
+        assert_eq!(skill_prompt(&triage), "triage this");
     }
 
     #[test]
@@ -987,14 +999,16 @@ mod tests {
         let mut u = WorkUnit::pending("s:build", "s", 1, "do it");
         u.skill_ref = Some("wicked-testing-plan".to_string());
         let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u), &[]);
-        assert_eq!(
-            argv,
-            vec![
-                "claude".to_string(),
-                "-p".to_string(),
-                "/wicked-testing-plan do it".to_string(),
-            ],
+        assert_eq!(argv.len(), 3, "one guarded prompt arg");
+        assert_eq!(argv[0], "claude");
+        assert_eq!(argv[1], "-p");
+        assert!(
+            argv[2].starts_with("/wicked-testing-plan do it"),
             "the skill-led prompt binds as -p's value, one argv element (no shell, no flag smuggling)"
+        );
+        assert!(
+            argv[2].contains("ASSUMPTION[external-transform]"),
+            "the conventions appendix rides the same single arg"
         );
     }
 

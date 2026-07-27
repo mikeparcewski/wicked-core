@@ -163,6 +163,18 @@ pub enum CoreEvent {
         ord: u32,
         files: Vec<String>,
     },
+    /// A structured assumption parsed from a completed unit's output — currently the
+    /// external-transform convention: a third-party library/service transforms a payload.
+    /// `known=false` marks a needs-research placeholder a human should review.
+    AssumptionRecorded {
+        session: String,
+        ord: u32,
+        kind: String,
+        library: String,
+        transform: String,
+        known: bool,
+        detail: String,
+    },
     /// A unit finished (approved + output captured).
     UnitDone { session: String, ord: u32 },
     /// A unit was denied (gate veto — never reaches approved).
