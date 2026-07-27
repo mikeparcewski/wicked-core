@@ -157,6 +157,19 @@ pub trait StepRunner: Send + Sync {
     /// errors silently — the run is already gone; a send failure is expected and harmless.
     fn on_run_complete(&self, _run_id: &str) {}
 
+    /// Queue an operator message for delivery on the run's NEXT matching unit prompt (the
+    /// inject path for runs with no live PTY to write into — i.e. every ACP-backed run).
+    /// Returns `true` when the runner accepted the message; the default declines, so
+    /// stateless/stub runners keep the historical skip-with-warning behaviour.
+    fn queue_operator_message(
+        &self,
+        _run_id: &str,
+        _target: &crate::command::InjectTarget,
+        _message: &str,
+    ) -> bool {
+        false
+    }
+
     /// Close the session for a specific CLI within a run (called by `ReassignUnit` before
     /// re-dispatching to a different CLI). Callers:
     /// - `AcpStepRunner`: drops the `(run_id, cli_key)` ACP child process (spawns a background

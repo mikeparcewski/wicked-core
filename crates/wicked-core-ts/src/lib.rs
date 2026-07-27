@@ -297,6 +297,16 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         CoreEvent::SessionCompleted { session } => {
             json!({ "type": "sessionCompleted", "session": session })
         }
+        CoreEvent::WorkerMessageQueued {
+            session,
+            message,
+            target,
+        } => json!({
+            "type": "workerMessageQueued",
+            "session": session,
+            "message": message,
+            "target": target,
+        }),
         CoreEvent::WorkerMessageInjected {
             session,
             message,

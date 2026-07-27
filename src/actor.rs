@@ -1318,18 +1318,32 @@ pub(crate) fn run(
                 use std::io::Write;
                 let sessions = run_sessions.get(&run_id).cloned().unwrap_or_default();
                 if sessions.is_empty() {
-                    if matches!(&target, InjectTarget::Cli(_)) {
-                        let _ = reply.send(Err(anyhow::anyhow!(
-                            "run {run_id} has no active PTY sessions; \
-                             targeted inject requires at least one open PTY"
-                        )));
+                    // No live PTY (ACP-backed run, or workers not yet started): hand the
+                    // message to the RUNNER, which delivers it on the next matching unit's
+                    // prompt as an operator context block. Previously this was a silent
+                    // no-op (broadcast) or an error (targeted), which made the studio's
+                    // inject bar a lie for every ACP run.
+                    let target_str = match &target {
+                        InjectTarget::All => "all".to_string(),
+                        InjectTarget::Cli(k) => k.clone(),
+                    };
+                    if runner.queue_operator_message(&run_id, &target, &message) {
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::WorkerMessageQueued {
+                                session: run_id.clone(),
+                                message,
+                                target: target_str,
+                            },
+                        );
                     } else {
+                        // Runner without queueing support (stub/test) — the historical no-op.
                         eprintln!(
                             "[wicked-core] inject: run {run_id} has no active PTY sessions \
-                             (ACP-only or not yet started); skipping"
+                             and the runner cannot queue; skipping"
                         );
-                        let _ = reply.send(Ok(()));
                     }
+                    let _ = reply.send(Ok(()));
                     continue;
                 }
                 let target_str = match &target {

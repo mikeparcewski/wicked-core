@@ -350,8 +350,15 @@ pub enum CoreEvent {
         governed: bool,
     },
     /// An operator message was injected into one or all active PTY workers for a run.
-    /// ACP-backed sessions have no PTY and are skipped with a warning (no event).
     WorkerMessageInjected {
+        session: String,
+        message: String,
+        /// `"all"` or the cli_key that was targeted.
+        target: String,
+    },
+    /// An operator message had no live PTY to write to (ACP-backed run) and was QUEUED —
+    /// it rides the next matching unit's prompt as an operator context block.
+    WorkerMessageQueued {
         session: String,
         message: String,
         /// `"all"` or the cli_key that was targeted.
