@@ -8,6 +8,10 @@
 pub enum StepFailureKind {
     /// The CLI worker process itself failed (non-zero exit, crash, or no output).
     WorkerError,
+    /// The CLI refused its ENVIRONMENT (untrusted directory, missing TTY, folder-trust
+    /// prompt) rather than failing the work itself — recoverable by reassigning the unit
+    /// to a different CLI. Emitted alongside the automatic reassignment when one fires.
+    EnvironmentRefused,
 }
 
 /// One prior unit whose output was injected into a receiving unit's ACP context (EVT-007).

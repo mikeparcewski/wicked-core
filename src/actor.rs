@@ -2096,6 +2096,62 @@ fn redrive_executing_sessions(
     }
 }
 
+/// A mechanical trust-grant: insert `flag` into the invocation right after `anchor`.
+/// `None` when the anchor is missing or the flag is already present (nothing to heal —
+/// the refusal then bubbles up to the operator instead of retrying in a loop).
+struct InvocationFix {
+    anchor: &'static str,
+    flag: &'static str,
+}
+
+impl InvocationFix {
+    fn apply(&self, invocation: &str) -> Option<String> {
+        if invocation.contains(self.flag) || !invocation.contains(self.anchor) {
+            return None;
+        }
+        Some(invocation.replacen(self.anchor, &format!("{} {}", self.anchor, self.flag), 1))
+    }
+}
+
+/// A classified environment refusal: why the CLI rejected where it ran, and the known
+/// mechanical fix when one exists (the automated "answer yes").
+struct EnvironmentRefusal {
+    reason: &'static str,
+    fix: Option<InvocationFix>,
+}
+
+/// Classify a failed worker's output as an ENVIRONMENT refusal — the CLI rejecting where
+/// it ran (trust prompt, untrusted directory, no TTY) rather than failing the work. Tight,
+/// per-CLI signatures only: a broad match here would misroute real work failures into
+/// retry loops.
+fn environment_refusal(output: &str) -> Option<EnvironmentRefusal> {
+    // codex exec outside a git repo: the headless "answer yes" is the skip flag.
+    if output.contains("Not inside a trusted directory") {
+        return Some(EnvironmentRefusal {
+            reason: "codex refused untrusted directory",
+            fix: Some(InvocationFix {
+                anchor: "codex exec",
+                flag: "--skip-git-repo-check",
+            }),
+        });
+    }
+    // bubbletea-based TUIs spawned without a TTY — no headless grant exists.
+    if output.contains("could not open TTY") {
+        return Some(EnvironmentRefusal {
+            reason: "CLI requires a TTY",
+            fix: None,
+        });
+    }
+    // claude's interactive folder-trust prompt — granting trust is an operator call.
+    if output.contains("Do you trust the files in this folder") {
+        return Some(EnvironmentRefusal {
+            reason: "claude folder-trust prompt",
+            fix: None,
+        });
+    }
+    None
+}
+
 /// Apply one worker step's output on the single-writer thread: gate the unit, advance the cursor,
 /// and either dispatch the next unit or finalize the run.
 ///
@@ -2220,9 +2276,70 @@ fn apply_step_result(
         notify_campaign(self_tx, &run_id, crate::campaign::NodeOutcome::Cancelled);
         return Ok(StepApplied::Finished);
     }
-    // A worker FAILURE halts the run as `Failed` (the run-level contract: never complete past a
-    // failure). Operator recovery is relaunch/resume; there is no automatic retry (see ORCHESTRATOR).
+    // A worker FAILURE halts the run as `Failed` (the run-level contract: never complete
+    // past a failure) — EXCEPT environment refusals (untrusted dir, missing TTY,
+    // folder-trust prompt), which say nothing about the work. Escalation ladder:
+    //   1. the refusal carries a KNOWN mechanical fix (a trust flag) → apply it and
+    //      retry the SAME CLI — the automated "answer yes / grant access";
+    //   2. no safe auto-fix → PAUSE for the operator (awaiting-human) with the error
+    //      and the options, instead of failing; reassignment stays an operator choice
+    //      via the existing reassign surface;
+    //   3. anything unclassified → fail as before.
+    // Attempt 0 only, so a repeat refusal after the fix falls through to a real failure.
     if output.status == crate::workflow::StepStatus::Failed {
+        if output.attempt == 0 {
+            if let Some(refusal) = environment_refusal(&output.output) {
+                let cli = unit.assigned_cli.clone().unwrap_or_default();
+                let effective_invocation = unit.assigned_invocation.clone().or_else(|| {
+                    crate::registry_roster()
+                        .into_iter()
+                        .find(|c| c.key == cli)
+                        .map(|c| c.headless_invocation)
+                });
+                let fixed = refusal
+                    .fix
+                    .and_then(|f| effective_invocation.as_deref().and_then(|inv| f.apply(inv)));
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: match &fixed {
+                            Some(_) => {
+                                format!("{} — auto-granting and retrying {cli}", refusal.reason)
+                            }
+                            None => {
+                                format!("{} — pausing for operator decision", refusal.reason)
+                            }
+                        },
+                        failure_kind: crate::event::StepFailureKind::EnvironmentRefused,
+                    },
+                );
+                if let Some(new_invocation) = fixed {
+                    // Self-heal: retry the same CLI with the trust grant applied.
+                    unit.assigned_invocation = Some(new_invocation);
+                    put_node(store, unit.to_node())?;
+                    // Rework semantics: bump the attempt so the stale-result guard
+                    // drops any late output from the refused worker.
+                    session.attempt = session.attempt.saturating_add(1);
+                    put_node(store, session.to_node())?;
+                    dispatch_unit(store, subscribers, runner, self_tx, &run_id, output.unit_ix)?;
+                    return Ok(StepApplied::Continuing);
+                }
+                // Bubble up: the operator decides. Approve retries the unit (their
+                // amendment rides the prompt); Reject fails the run; the reassign
+                // surface remains available for "use another CLI".
+                let prompt = format!(
+                    "Unit {ord} ({cli}) refused its environment: {}. Approve to retry \
+                     (optionally amend), reject to fail the run, or reassign the unit \
+                     to a different CLI first.",
+                    refusal.reason
+                );
+                pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
+                return Ok(StepApplied::Paused);
+            }
+        }
         unit.status = crate::domain::UnitStatus::Rejected;
         // Capture WHY for the UI: the worker's failure output (bounded).
         let raw = output.output.trim();
@@ -3460,5 +3577,48 @@ mod phase_boundary_governance_tests {
         // The session in the store must also be Cancelled.
         let session = crate::domain::get_session(&store, "r").unwrap().unwrap();
         assert_eq!(session.status, SessionStatus::Cancelled);
+    }
+}
+
+#[cfg(test)]
+mod environment_refusal_tests {
+    use super::environment_refusal;
+
+    #[test]
+    fn codex_refusal_classifies_with_an_applicable_fix() {
+        let r = environment_refusal(
+            "Reading additional input from stdin...\nNot inside a trusted directory and --skip-git-repo-check was not specified."
+        )
+        .expect("classified");
+        assert_eq!(r.reason, "codex refused untrusted directory");
+        let fix = r.fix.expect("codex has a mechanical grant");
+        assert_eq!(
+            fix.apply("codex exec \"{PROMPT}\"").as_deref(),
+            Some("codex exec --skip-git-repo-check \"{PROMPT}\"")
+        );
+        // Already-fixed invocation → nothing to heal (bubbles up instead of looping).
+        assert!(fix
+            .apply("codex exec --skip-git-repo-check \"{PROMPT}\"")
+            .is_none());
+        // Foreign invocation without the anchor → no blind edits.
+        assert!(fix.apply("claude -p \"{PROMPT}\"").is_none());
+    }
+
+    #[test]
+    fn no_fix_signatures_classify_for_operator_escalation() {
+        let tty = environment_refusal("bubbletea: error opening TTY: could not open TTY").unwrap();
+        assert_eq!(tty.reason, "CLI requires a TTY");
+        assert!(tty.fix.is_none());
+        let trust =
+            environment_refusal("Do you trust the files in this folder?\n/private/tmp/x").unwrap();
+        assert_eq!(trust.reason, "claude folder-trust prompt");
+        assert!(trust.fix.is_none());
+    }
+
+    #[test]
+    fn real_work_failures_do_not_classify() {
+        assert!(environment_refusal("error: test suite failed: 3 assertions").is_none());
+        assert!(environment_refusal("panicked at src/lib.rs:42").is_none());
+        assert!(environment_refusal("").is_none());
     }
 }
