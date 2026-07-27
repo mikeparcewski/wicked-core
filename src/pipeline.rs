@@ -228,7 +228,7 @@ fn attach_pinned_validators(
     units: &mut [crate::domain::WorkUnit],
     def: &crate::workflow::WorkflowDef,
 ) -> anyhow::Result<()> {
-    // NOTE (docs wave): the shipped feature/bug/migration defs all carry `validator_pin = null`, so
+    // NOTE (docs wave): the shipped built-in defs all carry `validator_pin = null`, so
     // this loop is a no-op for them and the dual-validator gate stays INERT until an operator provisions
     // + pins a validator. The author→approve→vault→pin path is exposed as `wicked-core
     // provision-validator --criterion "..."` then `wicked-core approve-validator --pin <pin>`; the

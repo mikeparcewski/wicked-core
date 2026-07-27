@@ -182,9 +182,16 @@ impl RunMemory {
 /// Model2Vec but the model can't load now, we FAIL LOUD (the actor then runs without recall) rather
 /// than silently switch to Hash and return empty results forever.
 fn choose_embedder(engine: MemoryEngine, mem_path: &str) -> anyhow::Result<MemoryEngine> {
-    let marker = format!("{mem_path}.embedder");
-    let recorded = std::fs::read_to_string(&marker)
-        .ok()
+    // In-memory stores get no marker FILE (it would be a literal `:memory:.embedder` in
+    // the CWD); the embedder is chosen fresh each open, which is fine — nothing persists.
+    let marker = if mem_path == ":memory:" {
+        None
+    } else {
+        Some(format!("{mem_path}.embedder"))
+    };
+    let recorded = marker
+        .as_deref()
+        .and_then(|m| std::fs::read_to_string(m).ok())
         .map(|s| s.trim().to_string());
     let forced_hash = std::env::var("WICKED_MEMORY_EMBEDDER").as_deref() == Ok("hash");
 
@@ -199,7 +206,9 @@ fn choose_embedder(engine: MemoryEngine, mem_path: &str) -> anyhow::Result<Memor
     if want_semantic {
         match wicked_estate_retrieve::Model2VecEmbedder::new() {
             Ok(e) => {
-                let _ = std::fs::write(&marker, "model2vec");
+                if let Some(m) = &marker {
+                    let _ = std::fs::write(m, "model2vec");
+                }
                 return Ok(engine.with_embedder(Box::new(e)));
             }
             Err(err) if recorded.as_deref() == Some("model2vec") => {
@@ -219,12 +228,19 @@ fn choose_embedder(engine: MemoryEngine, mem_path: &str) -> anyhow::Result<Memor
         }
     }
     // Lexical path (fresh store + forced/fallback hash, or a store recorded as hash).
-    let _ = std::fs::write(&marker, "hash");
+    if let Some(m) = &marker {
+        let _ = std::fs::write(m, "hash");
+    }
     Ok(engine) // already on the default HashEmbedder
 }
 
 /// The memory db path derived from the estate db path.
 fn mem_path_for(estate_path: &str) -> String {
+    // An in-memory estate gets an in-memory sidecar — appending a suffix would
+    // otherwise create a literal `:memory:.mem` FILE in the process CWD.
+    if estate_path == ":memory:" {
+        return ":memory:".to_string();
+    }
     format!("{estate_path}.mem")
 }
 

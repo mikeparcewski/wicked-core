@@ -7,3 +7,6 @@
 coverage-report.json
 .wicked-estate/
 .wicked-testing/*.db
+
+# SQLite sidecar litter from pre-fix `:memory:` estate runs (invalid on Windows)
+:memory:*

@@ -406,6 +406,18 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
                 _ => "unknown",
             },
         }),
+        CoreEvent::WorkerStalled {
+            session,
+            ord,
+            terminal_id,
+            stalled_secs,
+        } => json!({
+            "type": "workerStalled",
+            "session": session,
+            "ord": ord,
+            "terminalId": terminal_id,
+            "stalledSecs": stalled_secs,
+        }),
         CoreEvent::AssumptionRecorded {
             session,
             ord,
