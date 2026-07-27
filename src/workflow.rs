@@ -208,7 +208,8 @@ impl StepRunner for StubStepRunner {
 // needs to drive a phase (its gate policy, whether it runs code, whether it needs verified evidence,
 // its role for the evaluator≠creator split, its dependencies) is DATA on the phase. The reducer
 // branches on these fields — never on the workflow `id` and never on a closed `match` over a phase
-// name. Adding feature/bug/migration (below) or a new workflow is a data value, not a core change.
+// name. Adding a built-in (feature/bug/migration/onboarding/collab, below) or a new workflow is a
+// data value, not a core change.
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
 use crate::domain::StageKind;
