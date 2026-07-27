@@ -491,7 +491,8 @@ impl WorkflowDef {
     }
 }
 
-/// The registry of known workflows — id → def. `with_defaults()` seeds feature/bug/migration.
+/// The registry of known workflows — id → def. `with_defaults()` seeds the built-ins
+/// (feature/bug/migration/onboarding/collab).
 /// Registering a new workflow is a data insert (Law 2); the reducer only ever `get`s a def.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowRegistry {
@@ -499,7 +500,8 @@ pub struct WorkflowRegistry {
 }
 
 impl WorkflowRegistry {
-    /// The built-in workflows (feature/bug/migration), each validated at construction.
+    /// The built-in workflows (feature/bug/migration/onboarding/collab), each validated at
+    /// construction.
     pub fn with_defaults() -> Self {
         let mut r = WorkflowRegistry::default();
         for def in [

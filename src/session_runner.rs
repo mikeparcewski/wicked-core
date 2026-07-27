@@ -387,6 +387,20 @@ fn collect_turn(
         if remaining.is_zero() {
             break (false, true);
         }
+        // Checked every iteration (not just on recv timeout): a busy bus — other
+        // terminals/runs producing events — keeps recv returning Ok, so a timeout-arm-only
+        // check could starve forever while THIS terminal is silent.
+        if !stall_emitted && last_activity.elapsed() >= stall_after {
+            stall_emitted = true;
+            if let Some(tx) = stall_tx {
+                let _ = tx.send(Command::EmitEvent(CoreEvent::WorkerStalled {
+                    session: input.run_id.clone(),
+                    ord: input.unit.ord,
+                    terminal_id: terminal_id.to_string(),
+                    stalled_secs: last_activity.elapsed().as_secs(),
+                }));
+            }
+        }
         let poll = remaining.min(Duration::from_millis(100));
         match rx.recv_timeout(poll) {
             Ok(CoreEvent::TerminalOutput { id, bytes_b64, .. }) if id == terminal_id => {
@@ -408,20 +422,7 @@ fn collect_turn(
             }
             Ok(CoreEvent::TerminalExited { id, .. }) if id == terminal_id => break (false, false),
             Ok(_) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if !stall_emitted && last_activity.elapsed() >= stall_after {
-                    stall_emitted = true;
-                    if let Some(tx) = stall_tx {
-                        let _ = tx.send(Command::EmitEvent(CoreEvent::WorkerStalled {
-                            session: input.run_id.clone(),
-                            ord: input.unit.ord,
-                            terminal_id: terminal_id.to_string(),
-                            stalled_secs: last_activity.elapsed().as_secs(),
-                        }));
-                    }
-                }
-                continue;
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break (false, false),
         }
     };
