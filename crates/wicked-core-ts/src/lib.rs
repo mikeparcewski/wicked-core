@@ -406,6 +406,18 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
                 _ => "unknown",
             },
         }),
+        CoreEvent::FailureTriaged {
+            session,
+            ord,
+            decision,
+            analysis,
+        } => json!({
+            "type": "failureTriaged",
+            "session": session,
+            "ord": ord,
+            "decision": decision,
+            "analysis": analysis,
+        }),
         CoreEvent::CrashRecoveryRedrive {
             session,
             ord,

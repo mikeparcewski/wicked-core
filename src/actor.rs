@@ -1715,6 +1715,222 @@ pub(crate) fn run(
                     }
                 }
             }
+            Command::FailureTriageReady {
+                run_id,
+                unit_ix,
+                attempt,
+                decision,
+                analysis: judge_analysis,
+                failure_excerpt,
+            } => {
+                use crate::validator::TriageDecision;
+                // Stale guards mirror apply_step_result: only the live cursor attempt of
+                // an Executing run may apply a triage decision.
+                let mut session = match crate::domain::get_session(&store, &run_id) {
+                    Ok(Some(s)) if s.status == SessionStatus::Executing => s,
+                    _ => continue,
+                };
+                if session.unit_ix != unit_ix || session.attempt != attempt {
+                    continue;
+                }
+                let mut units = match crate::domain::session_units(&store, &run_id) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        emit_run_error(&mut subscribers, &run_id, e);
+                        continue;
+                    }
+                };
+                let Some(unit) = units.get_mut(unit_ix) else {
+                    continue;
+                };
+                let ord = unit.ord;
+                // DENY-DOMINATES policy filter: a judge may PROPOSE any flag, but flags
+                // smelling of privilege bypass are never auto-applied — they escalate
+                // with the proposal attached so the operator makes that call.
+                const DANGER: &[&str] = &["dangerous", "bypass", "allow-all", "skip-permissions"];
+                let decision = match decision {
+                    TriageDecision::RetryWithFlag(flag)
+                        if DANGER.iter().any(|d| flag.to_lowercase().contains(d)) =>
+                    {
+                        TriageDecision::Escalate(format!(
+                            "triage proposed privileged flag {flag} — operator approval required"
+                        ))
+                    }
+                    other => other,
+                };
+                // The event's `analysis` is the JUDGE'S reasoning for every variant; the
+                // flag (when any) is appended so the record shows what will be applied.
+                let decision_str = match &decision {
+                    TriageDecision::RetryWithFlag(_) => "retry_with_flag",
+                    TriageDecision::Retry => "retry",
+                    TriageDecision::Escalate(_) => "escalate",
+                    TriageDecision::Fail(_) => "fail",
+                };
+                let event_analysis = match &decision {
+                    TriageDecision::RetryWithFlag(f) => {
+                        format!("{judge_analysis} (flag: {f})")
+                    }
+                    TriageDecision::Escalate(a) if judge_analysis.is_empty() => a.clone(),
+                    TriageDecision::Fail(r) if judge_analysis.is_empty() => r.clone(),
+                    _ => judge_analysis.clone(),
+                };
+                emit(
+                    &mut subscribers,
+                    CoreEvent::FailureTriaged {
+                        session: run_id.clone(),
+                        ord,
+                        decision: decision_str.to_string(),
+                        analysis: event_analysis,
+                    },
+                );
+                match decision {
+                    TriageDecision::RetryWithFlag(flag) => {
+                        let cli = unit
+                            .assigned_cli
+                            .clone()
+                            .unwrap_or_else(|| "claude".to_string());
+                        let base = unit.assigned_invocation.clone().or_else(|| {
+                            crate::registry_roster()
+                                .into_iter()
+                                .find(|c| c.key == cli)
+                                .map(|c| c.headless_invocation)
+                        });
+                        // Insert the flag ahead of the prompt placeholder (quoted or bare).
+                        let already_present =
+                            base.as_deref().is_some_and(|inv| inv.contains(&flag));
+                        let fixed = base.filter(|_| !already_present).and_then(|inv| {
+                            if inv.contains("\"{PROMPT}\"") {
+                                Some(inv.replacen(
+                                    "\"{PROMPT}\"",
+                                    &format!("{flag} \"{{PROMPT}}\""),
+                                    1,
+                                ))
+                            } else if inv.contains("{PROMPT}") {
+                                Some(inv.replacen("{PROMPT}", &format!("{flag} {{PROMPT}}"), 1))
+                            } else {
+                                None
+                            }
+                        });
+                        match fixed {
+                            Some(new_invocation) => {
+                                unit.assigned_invocation = Some(new_invocation);
+                                if let Err(e) = put_node(&mut store, unit.to_node()) {
+                                    emit_run_error(&mut subscribers, &run_id, e);
+                                    continue;
+                                }
+                                session.attempt = session.attempt.saturating_add(1);
+                                if let Err(e) = put_node(&mut store, session.to_node()) {
+                                    emit_run_error(&mut subscribers, &run_id, e);
+                                    continue;
+                                }
+                                if let Err(e) = dispatch_unit(
+                                    &store,
+                                    &mut subscribers,
+                                    &runner,
+                                    &self_tx,
+                                    &run_id,
+                                    unit_ix,
+                                ) {
+                                    emit_run_error(&mut subscribers, &run_id, e);
+                                }
+                            }
+                            None => {
+                                // Un-insertable OR already present → operator decides,
+                                // with wording matching which case it actually is.
+                                let why = if already_present {
+                                    format!(
+                                        "triage proposed flag {flag}, but it is already \
+                                         present and the CLI still refused"
+                                    )
+                                } else {
+                                    format!(
+                                        "triage proposed flag {flag} but it could not be \
+                                         applied to the invocation"
+                                    )
+                                };
+                                let prompt = format!(
+                                    "Unit {ord} failed; {why}. Approve to retry unchanged, \
+                                     reject to stop the run. Failure: {failure_excerpt}"
+                                );
+                                if let Err(e) = pause_for_human(
+                                    &mut store,
+                                    &mut subscribers,
+                                    &self_tx,
+                                    &mut session,
+                                    ord,
+                                    prompt,
+                                ) {
+                                    emit_run_error(&mut subscribers, &run_id, e);
+                                }
+                            }
+                        }
+                    }
+                    TriageDecision::Retry => {
+                        session.attempt = session.attempt.saturating_add(1);
+                        if let Err(e) = put_node(&mut store, session.to_node()) {
+                            emit_run_error(&mut subscribers, &run_id, e);
+                            continue;
+                        }
+                        if let Err(e) = dispatch_unit(
+                            &store,
+                            &mut subscribers,
+                            &runner,
+                            &self_tx,
+                            &run_id,
+                            unit_ix,
+                        ) {
+                            emit_run_error(&mut subscribers, &run_id, e);
+                        }
+                    }
+                    TriageDecision::Escalate(analysis) => {
+                        unit.denial_reason =
+                            Some(format!("triage escalation: {analysis} — {failure_excerpt}"));
+                        let _ = put_node(&mut store, unit.to_node());
+                        let prompt = format!(
+                            "Unit {ord} failed and triage escalated: {analysis}. Failure output: \
+                             \"{failure_excerpt}\". Approve to retry (optionally amend), reject \
+                             to fail the run, or reassign the unit to a different CLI first."
+                        );
+                        if let Err(e) = pause_for_human(
+                            &mut store,
+                            &mut subscribers,
+                            &self_tx,
+                            &mut session,
+                            ord,
+                            prompt,
+                        ) {
+                            emit_run_error(&mut subscribers, &run_id, e);
+                        }
+                    }
+                    TriageDecision::Fail(reason) => {
+                        unit.status = crate::domain::UnitStatus::Rejected;
+                        let excerpt: String = failure_excerpt.chars().take(400).collect();
+                        unit.denial_reason = Some(format!(
+                            "Worker FAILED on unit {ord} (triage: {reason}): {excerpt}"
+                        ));
+                        let _ = put_node(&mut store, unit.to_node());
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::StepFailed {
+                                session: run_id.clone(),
+                                ord,
+                                attempt,
+                                detail: excerpt,
+                                failure_kind: crate::event::StepFailureKind::WorkerError,
+                            },
+                        );
+                        let _ = fail_run(
+                            &mut store,
+                            &mut subscribers,
+                            &runner,
+                            &self_tx,
+                            &mut session,
+                            ord,
+                        );
+                        in_flight.remove(&run_id);
+                    }
+                }
+            }
             Command::Shutdown => {
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
@@ -2287,6 +2503,10 @@ fn apply_step_result(
     //   3. anything unclassified → fail as before.
     // Attempt 0 only, so a repeat refusal after the fix falls through to a real failure.
     if output.status == crate::workflow::StepStatus::Failed {
+        // Escalation requires a human in the loop. Autonomous sessions
+        // (HumanConfirm::None — the campaign/fail-fast contract) keep mechanical
+        // self-heal only; unknown failures fail exactly as they always did.
+        let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
         if output.attempt == 0 {
             if let Some(refusal) = environment_refusal(&output.output) {
                 let cli = unit
@@ -2308,12 +2528,15 @@ fn apply_step_result(
                         session: run_id.clone(),
                         ord,
                         attempt: output.attempt,
-                        detail: match &fixed {
-                            Some(_) => {
+                        detail: match (&fixed, human_present) {
+                            (Some(_), _) => {
                                 format!("{} — auto-granting and retrying {cli}", refusal.reason)
                             }
-                            None => {
+                            (None, true) => {
                                 format!("{} — pausing for operator decision", refusal.reason)
+                            }
+                            (None, false) => {
+                                format!("{} — no operator in the loop; failing", refusal.reason)
                             }
                         },
                         failure_kind: crate::event::StepFailureKind::EnvironmentRefused,
@@ -2331,24 +2554,102 @@ fn apply_step_result(
                     return Ok(StepApplied::Continuing);
                 }
                 // Bubble up: the operator decides. Approve retries the unit (their
-                // amendment rides the prompt); Reject fails the run; the reassign
+                // amendment rides the prompt); Reject stops the run; the reassign
                 // surface remains available for "use another CLI". The worker's own
                 // words ride both the prompt and denial_reason so the operator sees
                 // WHAT the CLI said, not only our classification.
-                let raw_excerpt: String = output.output.trim().chars().take(300).collect();
-                unit.denial_reason = Some(format!(
-                    "environment refused ({}): {raw_excerpt}",
-                    refusal.reason
-                ));
-                put_node(store, unit.to_node())?;
-                let prompt = format!(
-                    "Unit {ord} ({cli}) refused its environment: {} — \"{raw_excerpt}\". \
-                     Approve to retry (optionally amend), reject to fail the run, or \
+                if !human_present {
+                    // No operator to ask — fall through to the standard fail contract.
+                } else {
+                    let raw_excerpt: String = output.output.trim().chars().take(300).collect();
+                    unit.denial_reason = Some(format!(
+                        "environment refused ({}): {raw_excerpt}",
+                        refusal.reason
+                    ));
+                    put_node(store, unit.to_node())?;
+                    let prompt = format!(
+                        "Unit {ord} ({cli}) refused its environment: {} — \"{raw_excerpt}\". \
+                     Approve to retry (optionally amend), reject to stop the run, or \
                      reassign the unit to a different CLI first.",
-                    refusal.reason
+                        refusal.reason
+                    );
+                    pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
+                    return Ok(StepApplied::Paused);
+                }
+            } else if human_present {
+                // UNRECOGNIZED failure → agent triage (the generalization of the signature
+                // table): a distinct judge seat reads the error and decides the remedy.
+                // Blocking CLI work — runs off-thread; the decision returns as
+                // `FailureTriageReady` and the run stays Executing meanwhile.
+                // StepFailed fires IMMEDIATELY — it signals the worker failure, not the
+                // run's fate (which triage now decides), preserving the event contract.
+                let failure_excerpt: String = output.output.trim().chars().take(1200).collect();
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: failure_excerpt.chars().take(400).collect(),
+                        failure_kind: crate::event::StepFailureKind::WorkerError,
+                    },
                 );
-                pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
-                return Ok(StepApplied::Paused);
+                let cli = unit
+                    .assigned_cli
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string());
+                let invocation = unit.assigned_invocation.clone().or_else(|| {
+                    crate::registry_roster()
+                        .into_iter()
+                        .find(|c| c.key == cli)
+                        .map(|c| c.headless_invocation)
+                });
+                let tx = self_tx.clone();
+                let runner2 = runner.clone();
+                let run_id2 = run_id.clone();
+                let unit_ix2 = output.unit_ix;
+                let attempt2 = output.attempt;
+                let desc = unit.description.clone();
+                std::thread::spawn(move || {
+                    let ctx = format!("{run_id2}-u{unit_ix2}-a{attempt2}");
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::validator::triage_failure(
+                            &failure_excerpt,
+                            &desc,
+                            &cli,
+                            invocation.as_deref().unwrap_or("(unknown)"),
+                            &crate::registry_roster(),
+                            &*runner2,
+                            &ctx,
+                        )
+                    }));
+                    let (decision, analysis) = match result {
+                        Ok(Ok(pair)) => pair,
+                        // Judge errored or panicked → the operator decides (fail-closed to
+                        // escalation, never to silent run death).
+                        Ok(Err(e)) => (
+                            crate::validator::TriageDecision::Escalate(format!(
+                                "triage judge errored: {e}"
+                            )),
+                            String::new(),
+                        ),
+                        Err(_) => (
+                            crate::validator::TriageDecision::Escalate(
+                                "triage judge panicked".to_string(),
+                            ),
+                            String::new(),
+                        ),
+                    };
+                    let _ = tx.send(Command::FailureTriageReady {
+                        run_id: run_id2,
+                        unit_ix: unit_ix2,
+                        attempt: attempt2,
+                        decision,
+                        analysis,
+                        failure_excerpt,
+                    });
+                });
+                return Ok(StepApplied::Continuing);
             }
         }
         unit.status = crate::domain::UnitStatus::Rejected;
