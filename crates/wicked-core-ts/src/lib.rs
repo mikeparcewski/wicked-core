@@ -1442,6 +1442,15 @@ mod tests {
             &["type", "session", "message", "target"],
         );
         check(
+            CoreEvent::WorkerMessageQueued {
+                session: s(),
+                message: s(),
+                target: s(),
+            },
+            "workerMessageQueued",
+            &["type", "session", "message", "target"],
+        );
+        check(
             CoreEvent::UnitReassigned {
                 session: s(),
                 ord: 1,

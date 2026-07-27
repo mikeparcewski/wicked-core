@@ -349,7 +349,8 @@ pub enum CoreEvent {
         step_status: String,
         governed: bool,
     },
-    /// An operator message was injected into one or all active PTY workers for a run.
+    /// An operator message was delivered — written into a live PTY worker, or (ACP runs)
+    /// appended to a unit's prompt at dispatch after having been queued.
     WorkerMessageInjected {
         session: String,
         message: String,

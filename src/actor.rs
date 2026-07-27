@@ -1336,14 +1336,22 @@ pub(crate) fn run(
                                 target: target_str,
                             },
                         );
+                        let _ = reply.send(Ok(()));
+                    } else if matches!(&target, InjectTarget::Cli(_)) {
+                        // Runner without queueing support: preserve the historical contract —
+                        // a targeted inject with nowhere to deliver is an error.
+                        let _ = reply.send(Err(anyhow::anyhow!(
+                            "run {run_id} has no active PTY sessions and the runner cannot \
+                             queue; targeted inject undeliverable"
+                        )));
                     } else {
-                        // Runner without queueing support (stub/test) — the historical no-op.
+                        // Broadcast with nowhere to deliver — the historical skip-with-warning.
                         eprintln!(
                             "[wicked-core] inject: run {run_id} has no active PTY sessions \
                              and the runner cannot queue; skipping"
                         );
+                        let _ = reply.send(Ok(()));
                     }
-                    let _ = reply.send(Ok(()));
                     continue;
                 }
                 let target_str = match &target {

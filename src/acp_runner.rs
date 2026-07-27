@@ -593,6 +593,9 @@ pub(crate) mod fallback_kind {
     pub const HTTP_UNIMPLEMENTED: &str = "http_unimplemented";
 }
 
+/// Operator messages queued per run for next-turn delivery: `(original target, message)`.
+type InjectQueue = Arc<Mutex<HashMap<String, Vec<(crate::command::InjectTarget, String)>>>>;
+
 pub struct AcpStepRunner {
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`).
     tx: std::sync::mpsc::Sender<Command>,
@@ -601,7 +604,7 @@ pub struct AcpStepRunner {
     /// Operator messages queued for delivery on the run's next matching unit prompt
     /// (the ACP inject path — there is no PTY to write into mid-turn). Keyed by run_id;
     /// drained in [`AcpStepRunner::exec_turn`], pruned with the run's sessions.
-    pending_injects: Arc<Mutex<HashMap<String, Vec<(crate::command::InjectTarget, String)>>>>,
+    pending_injects: InjectQueue,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
 }
@@ -641,9 +644,15 @@ impl AcpStepRunner {
     }
 
     /// Drain queued operator messages matching `(run_id, cli_key)` — `All`-targeted and
-    /// exact-CLI-targeted entries deliver; entries for other CLIs stay queued. Returned as
-    /// prompt-ready [`PriorUnitOutput`] blocks so the agent sees them as operator context.
-    fn drain_operator_messages(&self, run_id: &str, cli_key: &str) -> Vec<PriorUnitOutput> {
+    /// exact-CLI-targeted entries deliver; entries for other CLIs stay queued. Each entry
+    /// is returned as `(original target string, prompt-ready block)` so the delivery event
+    /// carries the INJECTION target ("all" or the cli_key the operator named), matching
+    /// the PTY path's event contract.
+    fn drain_operator_messages(
+        &self,
+        run_id: &str,
+        cli_key: &str,
+    ) -> Vec<(String, PriorUnitOutput)> {
         use crate::command::InjectTarget;
         let mut guard = self
             .pending_injects
@@ -654,15 +663,18 @@ impl AcpStepRunner {
         };
         let mut delivered = Vec::new();
         queue.retain(|(target, message)| {
-            let matches = match target {
-                InjectTarget::All => true,
-                InjectTarget::Cli(k) => k == cli_key,
+            let (matches, target_str) = match target {
+                InjectTarget::All => (true, "all".to_string()),
+                InjectTarget::Cli(k) => (k == cli_key, k.clone()),
             };
             if matches {
-                delivered.push(PriorUnitOutput {
-                    label: "[operator message]".to_string(),
-                    output: message.clone(),
-                });
+                delivered.push((
+                    target_str,
+                    PriorUnitOutput {
+                        label: "[operator message]".to_string(),
+                        output: message.clone(),
+                    },
+                ));
             }
             !matches
         });
@@ -686,11 +698,11 @@ impl AcpStepRunner {
         // guidance. Consumed here even if the turn later falls back to the wrapped path —
         // the same at-most-once posture as the cross-CLI context those paths also drop.
         let operator_msgs = self.drain_operator_messages(&run_id, &cli_key);
-        for m in &operator_msgs {
+        for (orig_target, block) in &operator_msgs {
             self.emit_event(CoreEvent::WorkerMessageInjected {
                 session: run_id.clone(),
-                message: m.output.clone(),
-                target: cli_key.clone(),
+                message: block.output.clone(),
+                target: orig_target.clone(),
             });
         }
         let prior_with_operator: Vec<PriorUnitOutput>;
@@ -701,7 +713,7 @@ impl AcpStepRunner {
                 .prior_outputs
                 .iter()
                 .cloned()
-                .chain(operator_msgs)
+                .chain(operator_msgs.into_iter().map(|(_, block)| block))
                 .collect();
             &prior_with_operator
         };
@@ -1115,21 +1127,24 @@ mod tests {
         assert!(r.queue_operator_message("run1", &InjectTarget::Cli("codex".into()), "codex only"));
         assert!(r.queue_operator_message("run1", &InjectTarget::Cli("agy".into()), "agy only"));
 
-        // claude drains the broadcast but not the CLI-targeted entries.
+        // claude drains the broadcast but not the CLI-targeted entries; the delivery
+        // record carries the ORIGINAL injection target, not the receiving CLI.
         let claude = r.drain_operator_messages("run1", "claude");
         assert_eq!(claude.len(), 1);
-        assert_eq!(claude[0].output, "for everyone");
-        assert_eq!(claude[0].label, "[operator message]");
+        assert_eq!(claude[0].0, "all");
+        assert_eq!(claude[0].1.output, "for everyone");
+        assert_eq!(claude[0].1.label, "[operator message]");
 
         // codex drains only its own targeted entry (broadcast already consumed).
         let codex = r.drain_operator_messages("run1", "codex");
         assert_eq!(codex.len(), 1);
-        assert_eq!(codex[0].output, "codex only");
+        assert_eq!(codex[0].0, "codex");
+        assert_eq!(codex[0].1.output, "codex only");
 
         // agy's entry survived both prior drains.
         let agy = r.drain_operator_messages("run1", "agy");
         assert_eq!(agy.len(), 1);
-        assert_eq!(agy[0].output, "agy only");
+        assert_eq!(agy[0].1.output, "agy only");
 
         // Everything consumed; nothing left for anyone.
         assert!(r.drain_operator_messages("run1", "claude").is_empty());
