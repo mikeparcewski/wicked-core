@@ -406,6 +406,24 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
                 _ => "unknown",
             },
         }),
+        CoreEvent::AssumptionRecorded {
+            session,
+            ord,
+            kind,
+            library,
+            transform,
+            known,
+            detail,
+        } => json!({
+            "type": "assumptionRecorded",
+            "session": session,
+            "ord": ord,
+            "kind": kind,
+            "library": library,
+            "transform": transform,
+            "known": known,
+            "detail": detail,
+        }),
         CoreEvent::FailureTriaged {
             session,
             ord,
@@ -1453,6 +1471,19 @@ mod tests {
             },
             "workerMessageInjected",
             &["type", "session", "message", "target"],
+        );
+        check(
+            CoreEvent::AssumptionRecorded {
+                session: s(),
+                ord: 1,
+                kind: s(),
+                library: s(),
+                transform: s(),
+                known: true,
+                detail: s(),
+            },
+            "assumptionRecorded",
+            &["type", "session", "ord", "kind", "library", "transform", "known", "detail"],
         );
         check(
             CoreEvent::WorkerMessageQueued {

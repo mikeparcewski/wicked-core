@@ -14,6 +14,7 @@
 mod acp_runner;
 mod actor;
 mod applications;
+pub mod assumptions;
 mod bus;
 mod campaign;
 mod cli_runner;

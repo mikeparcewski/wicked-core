@@ -2478,6 +2478,26 @@ fn apply_step_result(
         },
     );
 
+    // Structured assumptions (external-transform convention): parse markers from OK
+    // output and surface each as an event — needs-research entries are the human-review
+    // placeholders ("uses X for Y; semantics unverified"). Parse is bounded (≤16).
+    if output.status == crate::workflow::StepStatus::Ok {
+        for a in crate::assumptions::parse(&output.output) {
+            emit(
+                subscribers,
+                CoreEvent::AssumptionRecorded {
+                    session: run_id.clone(),
+                    ord,
+                    kind: "external-transform".to_string(),
+                    library: a.library,
+                    transform: a.transform,
+                    known: a.known,
+                    detail: a.detail,
+                },
+            );
+        }
+    }
+
     // A worker that CANCELLED the live unit (e.g. P4a subprocess kill) terminates the run as
     // Cancelled — and clears in_flight via `Finished` (NOT `Stale`, which would wedge the run).
     if output.status == crate::workflow::StepStatus::Cancelled {
