@@ -24,7 +24,13 @@ pub struct RunKnowledge {
 impl RunKnowledge {
     /// Open the knowledge store as a sibling of the estate db (`<estate>.knowledge`).
     pub fn open(estate_path: &str) -> anyhow::Result<Self> {
-        let path = format!("{estate_path}.knowledge");
+        // An in-memory estate gets an in-memory sidecar — a suffix on ":memory:" would
+        // create a literal `:memory:.knowledge` FILE in the process CWD.
+        let path = if estate_path == ":memory:" {
+            ":memory:".to_string()
+        } else {
+            format!("{estate_path}.knowledge")
+        };
         let engine = KnowledgeEngine::open(&path)
             .map_err(|e| anyhow::anyhow!("open knowledge store at {path}: {e}"))?;
         Ok(Self { engine })

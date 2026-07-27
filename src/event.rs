@@ -163,6 +163,16 @@ pub enum CoreEvent {
         ord: u32,
         files: Vec<String>,
     },
+    /// A live PTY worker has produced NO output for `stalled_secs` while its turn is
+    /// still open — it may be sitting at an interactive prompt the sentinel parser
+    /// cannot answer. Emitted once per turn; the operator can inspect via the terminal
+    /// surface or inject a response.
+    WorkerStalled {
+        session: String,
+        ord: u32,
+        terminal_id: String,
+        stalled_secs: u64,
+    },
     /// A structured assumption parsed from a completed unit's output — currently the
     /// external-transform convention: a third-party library/service transforms a payload.
     /// `known=false` marks a needs-research placeholder a human should review.

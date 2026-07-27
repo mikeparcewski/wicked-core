@@ -502,7 +502,13 @@ impl WorkflowRegistry {
     /// The built-in workflows (feature/bug/migration), each validated at construction.
     pub fn with_defaults() -> Self {
         let mut r = WorkflowRegistry::default();
-        for def in [feature_def(), bug_def(), migration_def(), onboarding_def()] {
+        for def in [
+            feature_def(),
+            bug_def(),
+            migration_def(),
+            onboarding_def(),
+            collab_def(),
+        ] {
             r.register(def).expect("built-in workflow defs are valid");
         }
         r
@@ -583,6 +589,39 @@ impl WorkflowRegistry {
 
 /// `feature` — clarify(value) → design(strategy) → build(execution) → adversarial-review → test → review.
 /// Gates: HumanConfirm after clarify + after adversarial-review; HumanConfirmIf(¬PASS) on test.
+/// The collaborative-discussion workflow: two (or more) seats argue a design to an
+/// outcome. Roles alternate creator/evaluator so evaluator-distinct FORCES the critic
+/// onto a different CLI, and cross-CLI context injection carries each side's actual
+/// words to the other. Verified to produce genuine dialogue (grounded critique,
+/// point-by-point revision, honest verdicts).
+pub fn collab_def() -> WorkflowDef {
+    WorkflowDef {
+        id: "collab".to_string(),
+        phases: vec![
+            PhaseDef::new("propose", StageKind::Recon)
+                .gate(GateType::Value, GateSpec::Auto)
+                .role(PhaseRole::Creator),
+            PhaseDef::new("critique", StageKind::Review)
+                .gate(GateType::Value, GateSpec::Auto)
+                .role(PhaseRole::Evaluator)
+                .after("propose"),
+            PhaseDef::new("revise", StageKind::Recon)
+                .gate(GateType::Strategy, GateSpec::Auto)
+                .role(PhaseRole::Creator)
+                .after("critique"),
+            PhaseDef::new("verdict", StageKind::Review)
+                .gate(
+                    GateType::Value,
+                    GateSpec::HumanConfirm {
+                        unconditional: false,
+                    },
+                )
+                .role(PhaseRole::Evaluator)
+                .after("revise"),
+        ],
+    }
+}
+
 pub fn feature_def() -> WorkflowDef {
     WorkflowDef {
         id: "feature".to_string(),
@@ -727,9 +766,28 @@ mod workflow_def_tests {
     use super::*;
 
     #[test]
-    fn registry_seeds_the_four_builtin_workflows() {
+    fn registry_seeds_the_builtin_workflows() {
         let r = WorkflowRegistry::with_defaults();
-        assert_eq!(r.ids(), vec!["bug", "feature", "migration", "onboarding"]);
+        assert_eq!(
+            r.ids(),
+            vec!["bug", "collab", "feature", "migration", "onboarding"]
+        );
+    }
+
+    #[test]
+    fn collab_alternates_creator_and_evaluator_roles() {
+        let def = collab_def();
+        let roles: Vec<_> = def.phases.iter().map(|p| p.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                PhaseRole::Creator,
+                PhaseRole::Evaluator,
+                PhaseRole::Creator,
+                PhaseRole::Evaluator
+            ],
+            "evaluator-distinct must force the critic/verdict onto a different CLI"
+        );
     }
 
     #[test]

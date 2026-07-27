@@ -306,7 +306,14 @@ impl PersistentStepRunner {
             return failed_output(input, format!("write PTY turn: {e}"));
         }
 
-        let result = collect_turn(&events, &terminal_id, self.timeout, emit, input);
+        let result = collect_turn(
+            &events,
+            &terminal_id,
+            self.timeout,
+            emit,
+            input,
+            Some(&self.tx),
+        );
         if result.status != StepStatus::Ok {
             // On any non-Ok outcome the terminal may be broken/hung. Drop the session so
             // the next unit for this run_id opens a fresh PTY instead of reusing a stale one.
@@ -345,6 +352,7 @@ fn collect_turn(
     timeout: Duration,
     emit: &DeltaSink,
     input: &StepInput,
+    stall_tx: Option<&std::sync::mpsc::Sender<Command>>,
 ) -> StepOutput {
     let mut adapter = ClaudeStreamJson::default();
     let mut line_buf = String::new();
@@ -354,6 +362,19 @@ fn collect_turn(
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
     let deadline = Instant::now() + timeout;
+    // STALL DETECTION: a live PTY that stops producing bytes mid-turn may be sitting at
+    // an interactive prompt the stream parser can never answer. After WICKED_STALL_SECS
+    // (default 120) of silence we emit WorkerStalled ONCE so the operator can inspect
+    // the terminal or inject a response — the turn keeps waiting (the overall timeout
+    // still bounds it).
+    let stall_after = Duration::from_secs(
+        std::env::var("WICKED_STALL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120),
+    );
+    let mut last_activity = Instant::now();
+    let mut stall_emitted = false;
 
     // Loop returns (found_result, timed_out):
     //   (true,  _)    → StepStatus::Ok
@@ -369,6 +390,7 @@ fn collect_turn(
         let poll = remaining.min(Duration::from_millis(100));
         match rx.recv_timeout(poll) {
             Ok(CoreEvent::TerminalOutput { id, bytes_b64, .. }) if id == terminal_id => {
+                last_activity = Instant::now();
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
                     line_buf.push_str(&String::from_utf8_lossy(&bytes));
                 }
@@ -386,7 +408,20 @@ fn collect_turn(
             }
             Ok(CoreEvent::TerminalExited { id, .. }) if id == terminal_id => break (false, false),
             Ok(_) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if !stall_emitted && last_activity.elapsed() >= stall_after {
+                    stall_emitted = true;
+                    if let Some(tx) = stall_tx {
+                        let _ = tx.send(Command::EmitEvent(CoreEvent::WorkerStalled {
+                            session: input.run_id.clone(),
+                            ord: input.unit.ord,
+                            terminal_id: terminal_id.to_string(),
+                            stalled_secs: last_activity.elapsed().as_secs(),
+                        }));
+                    }
+                }
+                continue;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break (false, false),
         }
     };
