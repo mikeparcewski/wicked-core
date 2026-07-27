@@ -176,6 +176,16 @@ pub enum CoreEvent {
         detail: String,
         failure_kind: StepFailureKind,
     },
+    /// The agent triage judge decided the remedy for an UNRECOGNIZED worker failure
+    /// (the generalization of the static environment-refusal table): `decision` is one of
+    /// `retry_with_flag` / `retry` / `escalate` / `fail`; `analysis` is the judge's
+    /// bounded reasoning.
+    FailureTriaged {
+        session: String,
+        ord: u32,
+        decision: String,
+        analysis: String,
+    },
     /// The engine restarted while a unit was in-flight and is re-dispatching it. `attempt` is the
     /// NEW (post-bump) attempt number so the UI can show ⚠×N crash-redrive badges.
     CrashRecoveryRedrive {

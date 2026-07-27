@@ -161,6 +161,16 @@ pub(crate) enum Command {
         output: StepOutput,
         agent_verdict: Option<(bool, String)>,
     },
+    /// Internal: the off-actor triage thread posts the agent judge's decision for an
+    /// unrecognized worker failure; the actor applies it (retry / escalate / fail).
+    FailureTriageReady {
+        run_id: String,
+        unit_ix: usize,
+        attempt: u32,
+        decision: crate::validator::TriageDecision,
+        /// Bounded excerpt of the original failure output (for prompts + denial reasons).
+        failure_excerpt: String,
+    },
     /// Internal: a worker streams a live output chunk; the actor (the single emit point) fans it out
     /// as a [`CoreEvent::CliOutputDelta`]. Keeps the single-emit-point invariant while streaming.
     CliOutputDelta {
