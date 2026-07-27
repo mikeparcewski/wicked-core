@@ -482,7 +482,11 @@ fn parse_result_usage(u: &Value) -> Option<Usage> {
         return None;
     }
     let field = |k: &str| u[k].as_u64().unwrap_or(0);
-    let input = field("inputTokens") + field("cachedReadTokens") + field("cachedWriteTokens");
+    // Saturating: token counters come from an external process — a malformed or
+    // hostile frame must clamp, never wrap into a tiny bogus total.
+    let input = field("inputTokens")
+        .saturating_add(field("cachedReadTokens"))
+        .saturating_add(field("cachedWriteTokens"));
     let output = field("outputTokens");
     if input == 0 && output == 0 {
         return None;
