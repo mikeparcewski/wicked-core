@@ -302,6 +302,11 @@ pub(crate) fn pre_distribute(
     let cli_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
 
     let selected_def = resolve_workflow_def(workflow, workflow_registry)?;
+    // core#120: a Tool-executor phase with an unresolvable binary must refuse the launch here —
+    // before anything is planned or persisted — never degrade to agent improvisation.
+    if let Some(def) = &selected_def {
+        crate::workflow::preflight_tool_phases(def)?;
+    }
     let mut units = match &selected_def {
         Some(def) => plan::plan_from_def(def, problem, session_id),
         None => plan::plan_units(problem, session_id),
