@@ -1041,14 +1041,15 @@ fn parse_triage_decision(raw: &str) -> (TriageDecision, String) {
     (decision, analysis)
 }
 
-/// Parse the reviewer's verdict FAIL-CLOSED via CONTRACT LINES (core#128). Line 1 keeps the rich
-/// rule: its first whitespace token must EQUAL `PASS` or `REJECT` (after trimming edge punctuation
-/// + uppercasing), reasoning may follow on the same line, and naming the OTHER verdict word there
-/// ambiguates. LATER lines are decisive only when the line is the keyword ALONE — a CLI-prepended
-/// warning banner followed by a bare `PASS` parses, while keyword-led prose deeper in the output
-/// (`PASS if criteria were met`) can never fail open. Anything else — `PASSABLE`, `PASSING criteria: not met`, `PASS or REJECT: REJECT`, a
-/// missing verdict — resolves to REJECT. This is what stops the old loose `starts_with`-per-line
-/// fail-OPEN (FINDING 3/14): a model can never sneak a pass past an ambiguous or malformed first line.
+/// Parse the reviewer's verdict FAIL-CLOSED (core#128). Keyword-FREE lines (CLI warning banners,
+/// blank noise) are skipped; the FIRST line naming a verdict keyword is the single decision point.
+/// At that line: line 1 keeps the rich rule (first token equals `PASS`/`REJECT` after trimming edge
+/// punctuation, reasoning may follow); a later line decides only when it is the keyword ALONE.
+/// Anything imperfect at the decision point — both verdicts named (`PASS or REJECT: REJECT`),
+/// keyword-led prose (`PASS if criteria were met`), `PASSABLE` — REJECTS immediately; later lines
+/// can never rescue it. No keyword anywhere also rejects. Preserves FINDING 3/14's guarantee: a
+/// model can never sneak a pass past ambiguous or malformed output, while a banner above a bare
+/// `PASS` no longer poisons a factually-correct verdict.
 fn parse_agent_verdict(raw: &str) -> AgentVerdict {
     // Normalize a token: drop leading/trailing non-alphanumerics (so `PASS.`/`REJECT:` normalize) then
     // uppercase.
@@ -1072,10 +1073,15 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
         let first = tokens.first().map(String::as_str).unwrap_or("");
         let mentions_pass = tokens.iter().any(|t| t == "PASS");
         let mentions_reject = tokens.iter().any(|t| t == "REJECT");
-        // Line 1 keeps the rich rule (verdict token leads, reasoning may follow). LATER lines
-        // match only when the line IS the keyword alone — so a banner followed by a bare
-        // `PASS` verdict line parses, but keyword-led prose deeper in the output
-        // ("PASS if criteria were met") can never fail open.
+        // Keyword-free lines are noise (CLI banners) — skip. The FIRST keyword-bearing line is
+        // the ONE decision point: line 1 keeps the rich rule (verdict token leads, reasoning may
+        // follow); a later line decides only when it IS the keyword alone. Anything imperfect at
+        // the decision point (both verdicts named, keyword-led prose, `PASSABLE`) REJECTS
+        // immediately — a later lone `PASS` can never rescue an ambiguous line (review finding:
+        // skipping ambiguity would weaken the original fail-closed guarantee).
+        if !mentions_pass && !mentions_reject {
+            continue;
+        }
         let keyword_alone = tokens.len() == 1;
         let decisive = ix == 0 || keyword_alone;
         match first {
@@ -1091,7 +1097,14 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
                     reasoning: line.to_string(),
                 }
             }
-            _ => continue,
+            _ => {
+                return AgentVerdict {
+                    pass: false,
+                    reasoning: format!(
+                        "ambiguous or malformed verdict at the decision line (fail-closed): {line}"
+                    ),
+                }
+            }
         }
     }
     // No contract line anywhere — never a lone-model approve on ambiguous/malformed output.
@@ -1225,6 +1238,16 @@ mod tests {
         assert!(
             !parse_agent_verdict("banner\nrambling\nno verdict anywhere").pass,
             "no contract line anywhere still fails closed"
+        );
+        // Review finding: an AMBIGUOUS decision line must terminate the parse — a later lone
+        // PASS can never rescue it (preserves the original fail-closed guarantee).
+        assert!(
+            !parse_agent_verdict("PASS or REJECT: REJECT\nPASS").pass,
+            "ambiguous first keyword line terminates fail-closed; later lone PASS cannot rescue"
+        );
+        assert!(
+            !parse_agent_verdict("banner noise\nPASS criteria: not met\nPASS").pass,
+            "keyword-led prose at the decision line terminates fail-closed; later lone PASS cannot rescue"
         );
     }
 
