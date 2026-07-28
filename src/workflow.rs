@@ -792,11 +792,11 @@ pub fn onboarding_def() -> WorkflowDef {
                 .after("index"),
             PhaseDef::new("domain", StageKind::Recon)
                 .executor(PhaseExecutor::Tool {
-                    cmd: vec![
-                        "wicked-estate".to_string(),
-                        "nodes".to_string(),
-                        "--json".to_string(),
-                    ],
+                    // The REAL domain front-end: translates the annotated estate graph into
+                    // requirements_graph.json (fail-closed with an actionable message when the
+                    // domain-extraction front-half hasn't annotated the graph yet). The previous
+                    // `wicked-estate nodes --json` dumped raw nodes and produced no artifact.
+                    cmd: vec!["wicked-core".to_string(), "domain-graph".to_string()],
                 })
                 .after("annotate"),
         ],
