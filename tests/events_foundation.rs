@@ -1183,3 +1183,48 @@ fn launch_refuses_synchronously_when_a_tool_phase_binary_is_missing() {
         "a refused launch must not persist a session, found it in: {sessions:?}"
     );
 }
+
+// ── core#126: an "Unknown command:" no-op reply must take the failure path, not fold as Ok ───────
+
+/// Replies Ok whose entire output is a CLI slash-command refusal — the silent-no-op shape that
+/// previously counted as a completed skill unit.
+struct UnknownCommandRunner;
+impl StepRunner for UnknownCommandRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "Unknown command: /wicked-garden-domain-extractor".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: vec![],
+            governed: false,
+        }
+    }
+}
+
+#[test]
+fn an_unknown_command_noop_reply_fails_the_unit_despite_ok_status() {
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        Arc::new(UnknownCommandRunner),
+    );
+    let ev = core.subscribe();
+    core.launch_run(spec("noop-sess", vec![cli("a")]))
+        .expect("launch");
+    let collected = drain_until_terminal(&ev, "noop-sess");
+    assert!(
+        collected
+            .iter()
+            .any(|e| matches!(e, CoreEvent::StepFailed { session, .. } if session == "noop-sess")),
+        "an Unknown-command no-op must surface as StepFailed, never fold as completed work"
+    );
+    assert!(
+        collected.iter().any(
+            |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "noop-sess")
+        ),
+        "the run must not complete on no-op output"
+    );
+}

@@ -803,7 +803,9 @@ fn tokenize(s: &str) -> Vec<String> {
 /// sessions return the authored prompt byte-exact.
 pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
     let base = match unit.skill_ref.as_deref() {
-        Some(skill) if !skill.is_empty() => format!("/{skill} {}", unit.description),
+        Some(skill) if !skill.is_empty() => {
+            format!("/{} {}", plugin_skill_invocation(skill), unit.description)
+        }
         _ => unit.description.clone(),
     };
     // Engine-internal judge/triage prompts are fully authored — no conventions appendix
@@ -812,6 +814,22 @@ pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
         return base;
     }
     format!("{base}{}", crate::assumptions::PROMPT_CONVENTION)
+}
+
+/// Map a dash-form `skill_ref` onto the CLI's invocable name. Claude Code invokes PLUGIN skills
+/// as `/plugin:skill` — a dash-form ref like `wicked-garden-domain-extractor` is literally
+/// "Unknown command" to it (core#126: three no-op units, caught only by the coverage validator).
+/// Refs under a known wicked plugin family are rewritten `wicked-<plugin>-<skill>` →
+/// `wicked-<plugin>:<skill>`; anything else passes through untouched.
+pub(crate) fn plugin_skill_invocation(skill_ref: &str) -> String {
+    for plugin in ["wicked-garden", "wicked-testing", "wicked-brain"] {
+        if let Some(rest) = skill_ref.strip_prefix(&format!("{plugin}-")) {
+            if !rest.is_empty() {
+                return format!("{plugin}:{rest}");
+            }
+        }
+    }
+    skill_ref.to_string()
 }
 
 /// Build the argv from an invocation template, substituting `{PROMPT}` (the skill-led prompt, guarded
@@ -985,7 +1003,7 @@ mod tests {
         u.skill_ref = Some("wicked-testing-semantic-reviewer".to_string());
         assert_eq!(
             skill_prompt(&u),
-            format!("/wicked-testing-semantic-reviewer add SSO login{appendix}")
+            format!("/wicked-testing:semantic-reviewer add SSO login{appendix}")
         );
         // an empty skill_ref is treated as no skill (authored path), never a bare "/ ...".
         u.skill_ref = Some(String::new());
@@ -1006,7 +1024,7 @@ mod tests {
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "-p");
         assert!(
-            argv[2].starts_with("/wicked-testing-plan do it"),
+            argv[2].starts_with("/wicked-testing:plan do it"),
             "the skill-led prompt binds as -p's value, one argv element (no shell, no flag smuggling)"
         );
         assert!(

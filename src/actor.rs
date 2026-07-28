@@ -2415,6 +2415,17 @@ fn apply_step_result(
     if output.attempt < session.attempt {
         return Ok(StepApplied::Stale);
     }
+    // NO-OP TRIPWIRE (core#126): a skill-led unit whose entire output is the CLI refusing the
+    // slash command is NOT completed work — it is a silent no-op that must take the failure
+    // path (ladder/triage/gate), never fold as Ok. Without this, three "done" units of
+    // "Unknown command: /…" reached the coverage gate looking like finished phases.
+    let mut output = output;
+    if matches!(output.status, crate::workflow::StepStatus::Ok) {
+        let t = output.output.trim();
+        if t.starts_with("Unknown command:") && t.len() < 200 {
+            output.status = crate::workflow::StepStatus::Failed;
+        }
+    }
     let mut units = crate::domain::session_units(store, &run_id)?;
     let unit = units
         .get_mut(output.unit_ix)
