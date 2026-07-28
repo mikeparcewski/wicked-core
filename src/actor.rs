@@ -406,6 +406,13 @@ pub(crate) fn run(
                     // contract that an error at launch means no session was persisted.
                     let selected_def =
                         pipeline::resolve_workflow_def(spec.workflow.as_deref(), Some(&registry))?;
+                    // Tool-dependency preflight (core#120) belongs HERE, in the sync fast path:
+                    // pre_distribute's check fires during deferred ContinueLaunch, AFTER the caller
+                    // already got a run id — a refused run must instead be a synchronous Err with
+                    // no session persisted ("the process never started").
+                    if let Some(def) = &selected_def {
+                        crate::workflow::preflight_tool_phases(def)?;
+                    }
                     let n_units = match &selected_def {
                         Some(def) => crate::plan::plan_from_def(def, &spec.problem, &run_id).len(),
                         None => crate::plan::plan_units(&spec.problem, &run_id).len(),
