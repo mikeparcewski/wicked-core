@@ -1195,7 +1195,7 @@ impl StepRunner for UnknownCommandRunner {
             run_id: i.run_id.clone(),
             unit_ix: i.unit_ix,
             attempt: i.attempt,
-            output: "Unknown command: /wicked-garden-domain-extractor".into(),
+            output: "Unknown command: /wicked-garden:domain-extractor".into(),
             status: StepStatus::Ok,
             usage: None,
             files: vec![],
@@ -1211,9 +1211,17 @@ fn an_unknown_command_noop_reply_fails_the_unit_despite_ok_status() {
         Arc::new(NumericDispatcher),
         Arc::new(UnknownCommandRunner),
     );
+    // The tripwire is scoped to SKILL-DRIVEN units — launch through a workflow whose
+    // phase carries a skill_ref (free-text units are exempt by design).
+    core.register_workflow(
+        r#"{"id":"skilled-noop","phases":[{"id":"survey","skill_ref":"wicked-garden-domain"}]}"#
+            .to_string(),
+    )
+    .expect("register workflow");
     let ev = core.subscribe();
-    core.launch_run(spec("noop-sess", vec![cli("a")]))
-        .expect("launch");
+    let mut s = spec("noop-sess", vec![cli("a")]);
+    s.workflow = Some("skilled-noop".into());
+    core.launch_run(s).expect("launch");
     let collected = drain_until_terminal(&ev, "noop-sess");
     assert!(
         collected
