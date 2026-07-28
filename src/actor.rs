@@ -2415,10 +2415,23 @@ fn apply_step_result(
     if output.attempt < session.attempt {
         return Ok(StepApplied::Stale);
     }
+    let mut output = output;
     let mut units = crate::domain::session_units(store, &run_id)?;
     let unit = units
         .get_mut(output.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("unit ix {} out of range for {run_id}", output.unit_ix))?;
+    // NO-OP TRIPWIRE (core#126), scoped to SKILL-DRIVEN units: an Ok step whose entire output
+    // is the CLI refusing the invocation ("Unknown command: …") is not completed work — it is a
+    // silent no-op that must take the failure path (ladder/triage/gate), never fold as Ok.
+    // Without this, three "done" units of refusal one-liners reached the coverage gate looking
+    // like finished phases. Non-skill units are exempt: free-text work could legitimately quote
+    // such a line.
+    if unit.skill_ref.is_some() && matches!(output.status, crate::workflow::StepStatus::Ok) {
+        let t = output.output.trim();
+        if t.starts_with("Unknown command:") && t.len() < 200 {
+            output.status = crate::workflow::StepStatus::Failed;
+        }
+    }
     if unit.status == crate::domain::UnitStatus::Done {
         return Ok(StepApplied::Stale);
     }
