@@ -311,7 +311,7 @@ pub fn preflight_tool_phases(def: &WorkflowDef) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "workflow '{}' cannot start — unresolved tool dependencies: {}.              Install the missing tool(s) or fix PATH, then relaunch.",
+            "workflow '{}' cannot start — unresolved tool dependencies: {}. Install the missing tool(s) or fix PATH, then relaunch.",
             def.id,
             missing.join("; ")
         )
@@ -319,28 +319,13 @@ pub fn preflight_tool_phases(def: &WorkflowDef) -> anyhow::Result<()> {
 }
 
 /// Resolve a tool binary the way `Command::new` will: an explicit path must exist as a file; a
-/// bare name must be found in some `PATH` entry (with the usual executable extensions on Windows).
+/// bare name must resolve on `PATH` via the shared PATHEXT-aware [`crate::validator::find_on_path`].
 fn tool_binary_resolves(bin: &str) -> bool {
     let p = std::path::Path::new(bin);
     if p.components().count() > 1 || p.is_absolute() {
         return p.is_file();
     }
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let exts: &[&str] = if cfg!(windows) {
-        &["", ".exe", ".cmd", ".bat"]
-    } else {
-        &[""]
-    };
-    for dir in std::env::split_paths(&paths) {
-        for ext in exts {
-            if dir.join(format!("{bin}{ext}")).is_file() {
-                return true;
-            }
-        }
-    }
-    false
+    crate::validator::find_on_path(bin).is_some()
 }
 
 /// One ordered phase of a workflow — pure DATA the reducer dispatches on.
