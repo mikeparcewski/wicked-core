@@ -1171,7 +1171,15 @@ fn launch_refuses_synchronously_when_a_tool_phase_binary_is_missing() {
     let msg = err.to_string();
     assert!(
         msg.contains("unresolved tool dependencies")
-            && msg.contains("definitely-not-a-real-binary-xyzzy"),
-        "refusal must be loud and name the tool, got: {msg}"
+            && msg.contains("definitely-not-a-real-binary-xyzzy")
+            && msg.contains("tooly-preflight")
+            && msg.contains("index"),
+        "refusal must name the workflow, phase, and tool, got: {msg}"
+    );
+    // "Never started": the refused run must not be persisted as a session.
+    let sessions = core.sessions().expect("list sessions");
+    assert!(
+        !sessions.iter().any(|id| id == "preflight-refusal-run"),
+        "a refused launch must not persist a session, found it in: {sessions:?}"
     );
 }
