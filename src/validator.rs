@@ -1041,46 +1041,79 @@ fn parse_triage_decision(raw: &str) -> (TriageDecision, String) {
     (decision, analysis)
 }
 
-/// Parse the reviewer's verdict FAIL-CLOSED. Reads ONLY the first non-empty line (a compliant reviewer
-/// puts the one-word verdict there) and requires its first whitespace token to EQUAL `PASS` or `REJECT`
-/// (after trimming edge punctuation + uppercasing) AND that the line does not also name the OTHER
-/// verdict word. Anything else — `PASSABLE`, `PASSING criteria: not met`, `PASS or REJECT: REJECT`, a
-/// missing verdict — resolves to REJECT. This is what stops the old loose `starts_with`-per-line
-/// fail-OPEN (FINDING 3/14): a model can never sneak a pass past an ambiguous or malformed first line.
+/// Parse the reviewer's verdict FAIL-CLOSED (core#128). Keyword-FREE lines (CLI warning banners,
+/// blank noise) are skipped; the FIRST line naming a verdict keyword is the single decision point.
+/// At that line: line 1 keeps the rich rule (first token equals `PASS`/`REJECT` after trimming edge
+/// punctuation, reasoning may follow); a later line decides only when it is the keyword ALONE.
+/// Anything imperfect at the decision point — both verdicts named (`PASS or REJECT: REJECT`),
+/// keyword-led prose (`PASS if criteria were met`), `PASSABLE` — REJECTS immediately; later lines
+/// can never rescue it. No keyword anywhere also rejects. Preserves FINDING 3/14's guarantee: a
+/// model can never sneak a pass past ambiguous or malformed output, while a banner above a bare
+/// `PASS` no longer poisons a factually-correct verdict.
 fn parse_agent_verdict(raw: &str) -> AgentVerdict {
-    let first_line = raw
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("");
     // Normalize a token: drop leading/trailing non-alphanumerics (so `PASS.`/`REJECT:` normalize) then
     // uppercase.
     let norm = |t: &str| {
         t.trim_matches(|c: char| !c.is_alphanumeric())
             .to_uppercase()
     };
-    let tokens: Vec<String> = first_line.split_whitespace().map(norm).collect();
-    let first = tokens.first().map(String::as_str).unwrap_or("");
-    let mentions_pass = tokens.iter().any(|t| t == "PASS");
-    let mentions_reject = tokens.iter().any(|t| t == "REJECT");
-    match first {
-        // First token IS the verdict AND the line does not also name the opposite word ⇒ decisive.
-        "PASS" if !mentions_reject => AgentVerdict {
-            pass: true,
-            reasoning: first_line.to_string(),
-        },
-        "REJECT" if !mentions_pass => AgentVerdict {
-            pass: false,
-            reasoning: first_line.to_string(),
-        },
-        // Everything else fails closed — never a lone-model approve on an ambiguous/malformed line.
-        _ => AgentVerdict {
-            pass: false,
-            reasoning: format!(
-                "no unambiguous PASS/REJECT on the first line (fail-closed): {}",
-                raw.trim()
-            ),
-        },
+    // CONTRACT LINE SCAN (core#128): the verdict is the FIRST line whose FIRST token is the
+    // keyword (and that does not also name the opposite keyword). CLIs prepend warning banners
+    // the prompt cannot suppress ("Warning: Skill descriptions were shortened …"), and a literal
+    // first-line read rejected a factually-correct PASS behind such a banner. Scanning stays
+    // fail-closed: prose lines whose first token isn't the keyword never match, and an output
+    // with NO contract line anywhere still fails closed exactly as before.
+    for (ix, line) in raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .enumerate()
+    {
+        let tokens: Vec<String> = line.split_whitespace().map(norm).collect();
+        let first = tokens.first().map(String::as_str).unwrap_or("");
+        let mentions_pass = tokens.iter().any(|t| t == "PASS");
+        let mentions_reject = tokens.iter().any(|t| t == "REJECT");
+        // Keyword-free lines are noise (CLI banners) — skip. The FIRST keyword-bearing line is
+        // the ONE decision point: line 1 keeps the rich rule (verdict token leads, reasoning may
+        // follow); a later line decides only when it IS the keyword alone. Anything imperfect at
+        // the decision point (both verdicts named, keyword-led prose, `PASSABLE`) REJECTS
+        // immediately — a later lone `PASS` can never rescue an ambiguous line (review finding:
+        // skipping ambiguity would weaken the original fail-closed guarantee).
+        if !mentions_pass && !mentions_reject {
+            continue;
+        }
+        let keyword_alone = tokens.len() == 1;
+        let decisive = ix == 0 || keyword_alone;
+        match first {
+            "PASS" if decisive && !mentions_reject => {
+                return AgentVerdict {
+                    pass: true,
+                    reasoning: line.to_string(),
+                }
+            }
+            "REJECT" if decisive && !mentions_pass => {
+                return AgentVerdict {
+                    pass: false,
+                    reasoning: line.to_string(),
+                }
+            }
+            _ => {
+                return AgentVerdict {
+                    pass: false,
+                    reasoning: format!(
+                        "ambiguous or malformed verdict at the decision line (fail-closed): {line}"
+                    ),
+                }
+            }
+        }
+    }
+    // No contract line anywhere — never a lone-model approve on ambiguous/malformed output.
+    AgentVerdict {
+        pass: false,
+        reasoning: format!(
+            "no unambiguous PASS/REJECT contract line (fail-closed): {}",
+            raw.trim()
+        ),
     }
 }
 
@@ -1184,10 +1217,37 @@ mod tests {
             !parse_agent_verdict("PASS or REJECT: REJECT").pass,
             "first line names BOTH verdicts ⇒ ambiguous ⇒ fail-closed"
         );
-        // Only the FIRST line decides — a later PASS after a non-verdict first line does not count.
+        // core#128: a KEYWORD-ALONE contract line after CLI noise decides — the live incident
+        // shape (warning banner, blank line, bare PASS, rationale) must parse as PASS.
         assert!(
-            !parse_agent_verdict("Thinking about it...\nPASS").pass,
-            "verdict must be on the first non-empty line"
+            parse_agent_verdict(
+                "Warning: Skill descriptions were shortened to fit the context budget.\n\nPASS\nThe work reports coverage 1.0."
+            )
+            .pass,
+            "a bare PASS contract line after a CLI banner is decisive"
+        );
+        assert!(
+            parse_agent_verdict("Thinking about it...\nPASS").pass,
+            "a deliberate keyword-alone PASS line decides even after prose"
+        );
+        // But keyword-LED PROSE beyond line 1 can never fail open — only line 1 gets the rich rule.
+        assert!(
+            !parse_agent_verdict("Some preamble.\nPASS if the criteria were met").pass,
+            "later keyword-led prose is not a contract line (fail-closed)"
+        );
+        assert!(
+            !parse_agent_verdict("banner\nrambling\nno verdict anywhere").pass,
+            "no contract line anywhere still fails closed"
+        );
+        // Review finding: an AMBIGUOUS decision line must terminate the parse — a later lone
+        // PASS can never rescue it (preserves the original fail-closed guarantee).
+        assert!(
+            !parse_agent_verdict("PASS or REJECT: REJECT\nPASS").pass,
+            "ambiguous first keyword line terminates fail-closed; later lone PASS cannot rescue"
+        );
+        assert!(
+            !parse_agent_verdict("banner noise\nPASS criteria: not met\nPASS").pass,
+            "keyword-led prose at the decision line terminates fail-closed; later lone PASS cannot rescue"
         );
     }
 
