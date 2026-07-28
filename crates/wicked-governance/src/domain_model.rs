@@ -534,12 +534,17 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
             .take(20)
             .map(|n| n.symbol_id.as_str())
             .collect();
+        // FATAL-LAST: the diagnostic sample precedes the summary+action line, because downstream
+        // consumers (unit denial_reason, logs) keep the TAIL of long output — the line a human
+        // must read has to be the last one, not buried above a 20-item symbol list.
         anyhow::bail!(
-            "front-half coverage {:.4} — {} behavior-bearing node(s) unaccounted; run extraction + \
-             coverage first (refusing to translate an unannotated graph). First unaccounted: {:?}",
+            "first unaccounted (sample of {}): {:?}\nfront-half coverage {:.4} — {} behavior-bearing \
+             node(s) unaccounted; run extraction + coverage first (refusing to translate an \
+             unannotated graph).",
+            shown.len(),
+            shown,
             report.coverage,
-            report.unaccounted,
-            shown
+            report.unaccounted
         );
     }
     Ok(())
