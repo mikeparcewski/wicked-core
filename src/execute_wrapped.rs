@@ -804,7 +804,15 @@ fn tokenize(s: &str) -> Vec<String> {
 pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
     let base = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => {
-            format!("/{} {}", plugin_skill_invocation(skill), unit.description)
+            // NOT a slash line: plugin SKILLS are not slash commands — a "/name" prompt hits the
+            // CLI's command parser and dies as "Unknown command" in ANY name form (core#126,
+            // probed live both ways). The grounded mechanic is the Skill tool: instruct the
+            // session to invoke the named skill and do the unit's work under it.
+            format!(
+                "Invoke your skill \"{}\" (via the Skill tool) and complete this task under its instructions: {}",
+                plugin_skill_invocation(skill),
+                unit.description
+            )
         }
         _ => unit.description.clone(),
     };
@@ -1003,7 +1011,7 @@ mod tests {
         u.skill_ref = Some("wicked-testing-semantic-reviewer".to_string());
         assert_eq!(
             skill_prompt(&u),
-            format!("/wicked-testing:semantic-reviewer add SSO login{appendix}")
+            format!("Invoke your skill \"wicked-testing:semantic-reviewer\" (via the Skill tool) and complete this task under its instructions: add SSO login{appendix}")
         );
         // an empty skill_ref is treated as no skill (authored path), never a bare "/ ...".
         u.skill_ref = Some(String::new());
@@ -1024,7 +1032,7 @@ mod tests {
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "-p");
         assert!(
-            argv[2].starts_with("/wicked-testing:plan do it"),
+            argv[2].starts_with("Invoke your skill \"wicked-testing:plan\""),
             "the skill-led prompt binds as -p's value, one argv element (no shell, no flag smuggling)"
         );
         assert!(
