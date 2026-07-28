@@ -1,6 +1,6 @@
 [package]
 name = "wicked-core-ts"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 description = "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-process composition/orchestration runtime (launch runs, resolve gates, live event stream) from JS/TS."
