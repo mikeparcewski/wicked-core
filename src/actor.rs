@@ -2680,9 +2680,18 @@ fn apply_step_result(
             }
         }
         unit.status = crate::domain::UnitStatus::Rejected;
-        // Capture WHY for the UI: the worker's failure output (bounded).
+        // Capture WHY for the UI: the worker's failure output (bounded). Head+TAIL, not head
+        // only — fatal lines come LAST by convention (a tool that prints N warnings then the
+        // refusal would otherwise surface as 400 chars of warnings with the actual reason cut).
         let raw = output.output.trim();
-        let raw_snippet: String = raw.chars().take(400).collect();
+        let n = raw.chars().count();
+        let raw_snippet: String = if n <= 800 {
+            raw.to_string()
+        } else {
+            let head: String = raw.chars().take(300).collect();
+            let tail: String = raw.chars().skip(n - 500).collect();
+            format!("{head}\n[… {} chars elided …]\n{tail}", n - 800)
+        };
         unit.denial_reason = Some(if raw.is_empty() {
             format!("Worker FAILED on unit {ord} (no output)")
         } else {
