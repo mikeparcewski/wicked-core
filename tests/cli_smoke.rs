@@ -78,3 +78,26 @@ fn usage_labels_launch_as_a_stub_self_test() {
     );
     let _ = std::fs::remove_file(&db);
 }
+
+/// `domain-graph --help` must DOCUMENT, never execute — it previously wrote
+/// `.wicked-estate/requirements/requirements_graph.json` into the cwd on --help.
+#[test]
+fn domain_graph_help_documents_and_writes_nothing() {
+    let dir = std::env::temp_dir().join(format!("wc-dg-help-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_wicked-core"))
+        .args(["domain-graph", "--help"])
+        .current_dir(&dir)
+        .output()
+        .expect("run wicked-core domain-graph --help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("domain-graph") && stdout.contains("--out"),
+        "help must document the subcommand, got: {stdout}"
+    );
+    assert!(
+        !dir.join(".wicked-estate").exists(),
+        "--help must not write any artifact"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

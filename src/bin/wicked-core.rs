@@ -635,6 +635,16 @@ fn print_status(core: &Core) {
 /// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
 /// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
+    // `--help` must document, never execute — this subcommand writes a file.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "wicked-core domain-graph [--db <path>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
+             Translate the ANNOTATED estate graph into requirements_graph.json (default out: \
+             .wicked-estate/requirements/requirements_graph.json, cwd-relative). Fails closed when \
+             the domain-extraction front-half has not annotated the graph."
+        );
+        return;
+    }
     let out_path = flag(args, "--out")
         .unwrap_or_else(|| ".wicked-estate/requirements/requirements_graph.json".to_string());
     // The schema pins metadata.schema_version to const "1.0.0" — a consumer rejects a version it has
