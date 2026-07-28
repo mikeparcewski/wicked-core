@@ -1145,3 +1145,33 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
         "UnitReworkAmended must NOT fire for an empty amendment string"
     );
 }
+
+// ── core#120: tool-dependency preflight refuses at the SYNC fast path ────────────────────────────
+
+#[test]
+fn launch_refuses_synchronously_when_a_tool_phase_binary_is_missing() {
+    let core = Core::spawn_with_engine(
+        db_path("preflight-refusal"),
+        Arc::new(NumericDispatcher),
+        Arc::new(OkRunner),
+    );
+    core.register_workflow(
+        r#"{"id":"tooly-preflight","phases":[
+            {"id":"index","executor":{"type":"tool","cmd":["definitely-not-a-real-binary-xyzzy"]}}
+        ]}"#
+        .to_string(),
+    )
+    .expect("register workflow");
+
+    let mut s = spec("preflight-refusal-run", vec![cli("claude")]);
+    s.workflow = Some("tooly-preflight".into());
+    let err = core
+        .launch_run(s)
+        .expect_err("launch must refuse synchronously");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unresolved tool dependencies")
+            && msg.contains("definitely-not-a-real-binary-xyzzy"),
+        "refusal must be loud and name the tool, got: {msg}"
+    );
+}
