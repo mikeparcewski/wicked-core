@@ -289,6 +289,45 @@ pub enum PhaseExecutor {
     },
 }
 
+/// LAUNCH PREFLIGHT for Tool-executor phases (core#120). A `PhaseExecutor::Tool` phase is a
+/// deterministic dependency: if its binary cannot be resolved, the run must REFUSE TO START —
+/// loudly, at launch — rather than let the unit fall through to agent dispatch where a CLI
+/// improvises plausible prose and the expected artifact silently never materialises.
+pub fn preflight_tool_phases(def: &WorkflowDef) -> anyhow::Result<()> {
+    let mut missing: Vec<String> = Vec::new();
+    for phase in &def.phases {
+        if let PhaseExecutor::Tool { cmd } = &phase.executor {
+            match cmd.first() {
+                None => missing.push(format!("phase '{}' has an empty tool cmd", phase.id)),
+                Some(bin) if !tool_binary_resolves(bin) => missing.push(format!(
+                    "phase '{}' requires tool '{bin}' (not found on PATH or at that path)",
+                    phase.id
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "workflow '{}' cannot start — unresolved tool dependencies: {}. Install the missing tool(s) or fix PATH, then relaunch.",
+            def.id,
+            missing.join("; ")
+        )
+    }
+}
+
+/// Resolve a tool binary the way `Command::new` will: an explicit path must exist as a file; a
+/// bare name must resolve on `PATH` via the shared PATHEXT-aware [`crate::validator::find_on_path`].
+fn tool_binary_resolves(bin: &str) -> bool {
+    let p = std::path::Path::new(bin);
+    if p.components().count() > 1 || p.is_absolute() {
+        return p.is_file();
+    }
+    crate::validator::find_on_path(bin).is_some()
+}
+
 /// One ordered phase of a workflow — pure DATA the reducer dispatches on.
 /// `deny_unknown_fields`: a misspelled key in a drop-in JSON is a loud parse error (naming the
 /// file), never a silently-dropped default — matching the workflows/README.md contract.
@@ -791,6 +830,50 @@ mod workflow_def_tests {
             ],
             "evaluator-distinct must force the critic/verdict onto a different CLI"
         );
+    }
+
+    #[test]
+    fn preflight_refuses_a_missing_tool_binary_loudly() {
+        let def = WorkflowDef {
+            id: "tooly".to_string(),
+            phases: vec![
+                PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
+                    cmd: vec!["definitely-not-a-real-binary-xyzzy".to_string()],
+                }),
+            ],
+        };
+        let err = preflight_tool_phases(&def).unwrap_err().to_string();
+        assert!(err.contains("cannot start"), "loud refusal, got: {err}");
+        assert!(
+            err.contains("definitely-not-a-real-binary-xyzzy"),
+            "names the missing tool, got: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_passes_agent_phases_and_resolvable_absolute_paths() {
+        // Agent phases have no tool dependency — always pass.
+        let agent_only = WorkflowDef {
+            id: "agenty".to_string(),
+            phases: vec![PhaseDef::new("explore", StageKind::Recon)],
+        };
+        assert!(preflight_tool_phases(&agent_only).is_ok());
+
+        // An absolute path that exists resolves (existence check — cross-platform).
+        let dir = std::env::temp_dir().join(format!("wicked-preflight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("toolbin");
+        std::fs::write(&file, b"#!/bin/sh\n").unwrap();
+        let def = WorkflowDef {
+            id: "tooly".to_string(),
+            phases: vec![
+                PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
+                    cmd: vec![file.to_string_lossy().into_owned()],
+                }),
+            ],
+        };
+        assert!(preflight_tool_phases(&def).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

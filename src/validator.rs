@@ -387,7 +387,7 @@ pub fn sandbox_availability() -> (SandboxLevel, Option<&'static str>) {
 
 /// Find `bin` on the process `PATH` (cross-platform: `PATH` is split with the platform separator, and on
 /// Windows each `PATHEXT` suffix is tried). `Some(path)` if an executable file is found, else `None`.
-fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exts: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
