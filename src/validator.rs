@@ -1041,10 +1041,12 @@ fn parse_triage_decision(raw: &str) -> (TriageDecision, String) {
     (decision, analysis)
 }
 
-/// Parse the reviewer's verdict FAIL-CLOSED. Reads ONLY the first non-empty line (a compliant reviewer
-/// puts the one-word verdict there) and requires its first whitespace token to EQUAL `PASS` or `REJECT`
-/// (after trimming edge punctuation + uppercasing) AND that the line does not also name the OTHER
-/// verdict word. Anything else — `PASSABLE`, `PASSING criteria: not met`, `PASS or REJECT: REJECT`, a
+/// Parse the reviewer's verdict FAIL-CLOSED via CONTRACT LINES (core#128). Line 1 keeps the rich
+/// rule: its first whitespace token must EQUAL `PASS` or `REJECT` (after trimming edge punctuation
+/// + uppercasing), reasoning may follow on the same line, and naming the OTHER verdict word there
+/// ambiguates. LATER lines are decisive only when the line is the keyword ALONE — a CLI-prepended
+/// warning banner followed by a bare `PASS` parses, while keyword-led prose deeper in the output
+/// (`PASS if criteria were met`) can never fail open. Anything else — `PASSABLE`, `PASSING criteria: not met`, `PASS or REJECT: REJECT`, a
 /// missing verdict — resolves to REJECT. This is what stops the old loose `starts_with`-per-line
 /// fail-OPEN (FINDING 3/14): a model can never sneak a pass past an ambiguous or malformed first line.
 fn parse_agent_verdict(raw: &str) -> AgentVerdict {
