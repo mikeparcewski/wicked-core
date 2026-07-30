@@ -67,16 +67,16 @@ export declare class Core {
    * JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
    * also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
    */
-  chatOpen(chatId: string, clisJson: string, cwd?: string | undefined | null): Promise<unknown>
+  chatOpen(chatId: string, clisJson: string, cwd?: string | undefined | null): Promise<string>
   /**
    * Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
    * resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
    */
-  chatSend(chatId: string, text: string, targetsJson?: string | undefined | null, cwd?: string | undefined | null): Promise<unknown>
+  chatSend(chatId: string, text: string, targetsJson?: string | undefined | null, cwd?: string | undefined | null): Promise<string>
   /** The seats currently warm for a chat — JSON array of cli keys. */
-  chatSeats(chatId: string): Promise<unknown>
+  chatSeats(chatId: string): Promise<string>
   /** Close a chat's warm sessions (idempotent); emits `chatClosed`. */
-  chatClose(chatId: string): Promise<unknown>
+  chatClose(chatId: string): Promise<string>
   /**
    * Launch an interactive, resumable run: plans + distributes, then executes each unit off-thread
    * (or pauses at a human-confirm gate). Resolves to the run id. Progress arrives as `CoreEvent`s

@@ -879,7 +879,7 @@ impl Core {
     /// Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13). Resolves to a
     /// JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
     /// also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_open(&self, chat_id: String, clis_json: String, cwd: Option<String>) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -900,7 +900,7 @@ impl Core {
 
     /// Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
     /// resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_send(
         &self,
         chat_id: String,
@@ -922,7 +922,7 @@ impl Core {
     }
 
     /// The seats currently warm for a chat — JSON array of cli keys.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_seats(&self, chat_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
@@ -932,7 +932,7 @@ impl Core {
     }
 
     /// Close a chat's warm sessions (idempotent); emits `chatClosed`.
-    #[napi]
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_close(&self, chat_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
