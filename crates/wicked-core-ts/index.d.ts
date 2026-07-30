@@ -63,6 +63,21 @@ export declare class Core {
   /** Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`). */
   ping(): Promise<string>
   /**
+   * Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13). Resolves to a
+   * JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
+   * also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
+   */
+  chatOpen(chatId: string, clisJson: string, cwd?: string | undefined | null): Promise<unknown>
+  /**
+   * Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
+   * resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
+   */
+  chatSend(chatId: string, text: string, targetsJson?: string | undefined | null, cwd?: string | undefined | null): Promise<unknown>
+  /** The seats currently warm for a chat — JSON array of cli keys. */
+  chatSeats(chatId: string): Promise<unknown>
+  /** Close a chat's warm sessions (idempotent); emits `chatClosed`. */
+  chatClose(chatId: string): Promise<unknown>
+  /**
    * Launch an interactive, resumable run: plans + distributes, then executes each unit off-thread
    * (or pauses at a human-confirm gate). Resolves to the run id. Progress arrives as `CoreEvent`s
    * — `subscribe()` first. Rejects with a busy error if a run with that id is already in flight.
