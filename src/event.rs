@@ -35,6 +35,30 @@ pub struct InjectedContext {
 pub enum CoreEvent {
     /// Liveness tick (also the P1 proof that subscribe→emit works end to end).
     Heartbeat,
+    /// A chat seat's warm ACP session is ready to receive messages (crew#165 / core#13).
+    ChatSessionReady { chat: String, cli_key: String },
+    /// A chat seat's session could not start (or died); the seat is out of the group
+    /// until re-opened. `reason` is operator-facing.
+    ChatSessionFailed {
+        chat: String,
+        cli_key: String,
+        reason: String,
+    },
+    /// A streamed token/delta from one seat's in-progress chat reply.
+    ChatDelta {
+        chat: String,
+        cli_key: String,
+        text: String,
+    },
+    /// One seat's completed reply to a chat message (terminal per message × seat).
+    ChatReply {
+        chat: String,
+        cli_key: String,
+        text: String,
+        ok: bool,
+    },
+    /// The chat's warm sessions were closed and their processes reaped.
+    ChatClosed { chat: String },
     /// A session was created and planning began.
     SessionStarted {
         session: String,

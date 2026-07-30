@@ -682,6 +682,156 @@ impl AcpStepRunner {
         let _ = self.tx.send(Command::EmitEvent(ev));
     }
 
+    // ── Chat sessions (crew#165 / core#13) ──────────────────────────────────────
+    //
+    // A chat reuses the SAME session pool as runs, keyed `("chat:<id>", cli)`. Turns
+    // are RAW conversation — no governance arming, no council, no unit machinery, no
+    // wrapped-CLI fallback (a dead seat is reported honestly and re-warmed on the
+    // next ensure, never silently downgraded to one-shot).
+
+    fn chat_pool_key(chat_id: &str) -> String {
+        format!("chat:{chat_id}")
+    }
+
+    fn chat_timeout() -> Duration {
+        let secs = std::env::var("WICKED_CHAT_TURN_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300);
+        Duration::from_secs(secs)
+    }
+
+    /// Warm (or return the existing) ACP session for one chat seat. Unlike the run
+    /// path, a failed start is NOT cached as poisoned — chats are interactive, so
+    /// every ensure retries and the operator sees each failure.
+    fn chat_ensure(
+        &self,
+        chat_id: &str,
+        cli_key: &str,
+        cwd: &std::path::Path,
+    ) -> Result<Arc<Mutex<AcpProcess>>, String> {
+        let key = (Self::chat_pool_key(chat_id), cli_key.to_string());
+        {
+            let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(Some(arc)) = guard.get(&key) {
+                return Ok(arc.clone());
+            }
+        }
+        let config =
+            acp_config_for(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
+        if config.transport == AcpTransport::Http {
+            return Err(format!(
+                "ACP HTTP transport not supported for chat ('{cli_key}')"
+            ));
+        }
+        let proc = start_acp_process(&config, cwd, None).map_err(|e| e.to_string())?;
+        let arc = Arc::new(Mutex::new(proc));
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        // A racing ensure may have inserted first — reuse theirs, drop ours.
+        if let Some(Some(existing)) = guard.get(&key) {
+            return Ok(existing.clone());
+        }
+        guard.insert(key, Some(arc.clone()));
+        Ok(arc)
+    }
+
+    /// Eagerly warm one session per seat; per-seat outcome, `ChatSessionReady`/
+    /// `ChatSessionFailed` emitted for each.
+    pub fn chat_open(
+        &self,
+        chat_id: &str,
+        clis: &[String],
+        cwd: &std::path::Path,
+    ) -> Vec<(String, Result<(), String>)> {
+        clis.iter()
+            .map(|cli| {
+                let outcome = self.chat_ensure(chat_id, cli, cwd).map(|_| ());
+                match &outcome {
+                    Ok(()) => self.emit_event(CoreEvent::ChatSessionReady {
+                        chat: chat_id.to_string(),
+                        cli_key: cli.clone(),
+                    }),
+                    Err(reason) => self.emit_event(CoreEvent::ChatSessionFailed {
+                        chat: chat_id.to_string(),
+                        cli_key: cli.clone(),
+                        reason: reason.clone(),
+                    }),
+                }
+                (cli.clone(), outcome)
+            })
+            .collect()
+    }
+
+    /// One seat's turn on a chat message. Streams deltas via `ChatDelta`, returns the
+    /// completed reply text. On failure the seat's session is EVICTED (next ensure
+    /// re-warms) and the error is returned — never floored, never faked.
+    pub fn chat_turn(
+        &self,
+        chat_id: &str,
+        cli_key: &str,
+        text: &str,
+        cwd: &std::path::Path,
+    ) -> Result<String, String> {
+        let arc = self.chat_ensure(chat_id, cli_key, cwd)?;
+        let tx = self.tx.clone();
+        let (chat_ev, cli_ev) = (chat_id.to_string(), cli_key.to_string());
+        let emit: Box<crate::workflow::DeltaSink> = Box::new(move |delta: &str| {
+            let _ = tx.send(Command::EmitEvent(CoreEvent::ChatDelta {
+                chat: chat_ev.clone(),
+                cli_key: cli_ev.clone(),
+                text: delta.to_string(),
+            }));
+        });
+        let result = {
+            let mut proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+            exec_turn_acp(&mut proc, text, &[], &emit, Self::chat_timeout())
+        };
+        match result {
+            Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.output),
+            Ok(turn) => {
+                self.chat_evict(chat_id, cli_key);
+                Err(format!(
+                    "seat '{cli_key}' turn ended {:?}: {}",
+                    turn.status, turn.output
+                ))
+            }
+            Err(e) => {
+                self.chat_evict(chat_id, cli_key);
+                Err(format!("seat '{cli_key}' session error: {e}"))
+            }
+        }
+    }
+
+    fn chat_evict(&self, chat_id: &str, cli_key: &str) {
+        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(&(Self::chat_pool_key(chat_id), cli_key.to_string()));
+    }
+
+    /// The seats currently warm for a chat (fan-out default for `targets: None`).
+    pub fn chat_seats(&self, chat_id: &str) -> Vec<String> {
+        let prefix = Self::chat_pool_key(chat_id);
+        let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let mut seats: Vec<String> = guard
+            .iter()
+            .filter(|((rid, _), slot)| rid == &prefix && slot.is_some())
+            .map(|((_, cli), _)| cli.clone())
+            .collect();
+        seats.sort();
+        seats
+    }
+
+    /// Close a chat's warm sessions and reap their processes. Idempotent.
+    pub fn chat_close(&self, chat_id: &str) {
+        let prefix = Self::chat_pool_key(chat_id);
+        {
+            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            guard.retain(|(rid, _), _| rid != &prefix);
+        }
+        self.emit_event(CoreEvent::ChatClosed {
+            chat: chat_id.to_string(),
+        });
+    }
+
     /// Close all ACP sessions for `run_id` and kill their child processes. Idempotent.
     /// Call this after the last unit of a run completes (mirrors
     /// [`PersistentStepRunner::drop_session`]).
@@ -1170,6 +1320,51 @@ mod tests {
     fn runner() -> AcpStepRunner {
         let (tx, _rx) = std::sync::mpsc::channel();
         AcpStepRunner::new(tx)
+    }
+
+    #[test]
+    fn chat_pool_is_isolated_from_run_sessions_and_close_is_idempotent() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        // Poisoned run entry + poisoned chat entry (None = failed start; constructing a real
+        // AcpProcess needs a live child, so pool-shape tests use the None slot).
+        {
+            let mut guard = r.sessions.lock().unwrap();
+            guard.insert(("run1".into(), "claude".into()), None);
+            guard.insert((AcpStepRunner::chat_pool_key("c1"), "claude".into()), None);
+        }
+        // Seats lists only WARM (Some) sessions — poisoned slots are not seats.
+        assert!(r.chat_seats("c1").is_empty());
+        // Dropping a RUN's sessions must not touch the chat pool, and vice versa.
+        r.drop_session("run1");
+        assert_eq!(r.sessions.lock().unwrap().len(), 1);
+        r.chat_close("c1");
+        assert_eq!(r.sessions.lock().unwrap().len(), 0);
+        r.chat_close("c1"); // idempotent
+                            // Both closes emitted ChatClosed through the actor emit point.
+        let evs: Vec<_> = rx.try_iter().collect();
+        let closed = evs
+            .iter()
+            .filter(
+                |c| matches!(c, Command::EmitEvent(CoreEvent::ChatClosed { chat }) if chat == "c1"),
+            )
+            .count();
+        assert_eq!(closed, 2);
+    }
+
+    #[test]
+    fn chat_ensure_fails_loud_for_unknown_cli_and_does_not_poison() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let cwd = std::env::temp_dir();
+        let err = match r.chat_ensure("c1", "no-such-cli-xyz", &cwd) {
+            Err(e) => e,
+            Ok(_) => panic!("unknown cli must fail"),
+        };
+        assert!(err.contains("no ACP config"), "{err}");
+        // Chat failures are retryable — nothing cached, seat list stays empty.
+        assert!(r.chat_seats("c1").is_empty());
+        assert!(r.sessions.lock().unwrap().is_empty());
     }
 
     #[test]

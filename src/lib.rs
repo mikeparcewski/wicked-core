@@ -167,6 +167,11 @@ pub struct Core {
     /// `resize_terminal` act on this DIRECTLY — no store round-trip — so keystroke I/O never queues
     /// behind the single store-writer actor. Shared (cloned) with the actor, which owns open/close.
     pty: terminal::PtyMap,
+    /// The concrete ACP runner handle for CHAT sessions (crew#165 / core#13). Chat acts on the
+    /// session pool DIRECTLY (off-actor — warm-ups and turns are slow I/O that must not queue
+    /// behind the single store-writer); its events still flow through the actor's emit point.
+    /// `None` when the engine was spawned with an injected non-ACP runner — chat unsupported.
+    chat: Option<std::sync::Arc<AcpStepRunner>>,
     _shutdown: Arc<ShutdownGuard>,
 }
 
@@ -182,6 +187,84 @@ impl Core {
     pub fn spawn(path: impl Into<String>) -> Core {
         let (core, _runner) = Core::spawn_with_acp_sessions(path);
         core
+    }
+
+    // ── Chat sessions (crew#165 / core#13): warm ACP seats + group fan-out ─────────
+
+    fn chat_runner(&self) -> anyhow::Result<&std::sync::Arc<AcpStepRunner>> {
+        self.chat.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("chat unsupported: engine spawned without the ACP runner")
+        })
+    }
+
+    /// Eagerly warm one ACP session per seat for `chat_id`. Blocking (spawn + handshake per
+    /// seat) — call off any latency-sensitive thread. Per-seat outcomes returned; the same
+    /// outcomes stream to subscribers as `ChatSessionReady`/`ChatSessionFailed`.
+    pub fn chat_open(
+        &self,
+        chat_id: &str,
+        clis: &[String],
+        cwd: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Vec<(String, Result<(), String>)>> {
+        let runner = self.chat_runner()?;
+        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        Ok(runner.chat_open(chat_id, clis, &cwd))
+    }
+
+    /// Fan `text` out to the chat's warm seats (all, or the named subset) — one thread per
+    /// seat so replies stream in parallel as `ChatDelta`/`ChatReply` events. Ack-fast:
+    /// returns the seats targeted, not their replies.
+    pub fn chat_send(
+        &self,
+        chat_id: &str,
+        text: &str,
+        targets: Option<Vec<String>>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<Vec<String>> {
+        let runner = self.chat_runner()?;
+        let seats = match targets {
+            Some(t) if !t.is_empty() => t,
+            _ => runner.chat_seats(chat_id),
+        };
+        if seats.is_empty() {
+            anyhow::bail!("chat '{chat_id}' has no warm seats — open it first");
+        }
+        let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        for cli in &seats {
+            let runner = runner.clone();
+            let tx = self.tx.clone();
+            let (chat_id, cli, text, cwd) = (
+                chat_id.to_string(),
+                cli.clone(),
+                text.to_string(),
+                cwd.clone(),
+            );
+            std::thread::spawn(move || {
+                let outcome = runner.chat_turn(&chat_id, &cli, &text, &cwd);
+                let (ok, body) = match outcome {
+                    Ok(reply) => (true, reply),
+                    Err(e) => (false, e),
+                };
+                let _ = tx.send(Command::EmitEvent(CoreEvent::ChatReply {
+                    chat: chat_id,
+                    cli_key: cli,
+                    text: body,
+                    ok,
+                }));
+            });
+        }
+        Ok(seats)
+    }
+
+    /// The seats currently warm for `chat_id`.
+    pub fn chat_seats(&self, chat_id: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self.chat_runner()?.chat_seats(chat_id))
+    }
+
+    /// Close a chat's warm sessions (idempotent); emits `ChatClosed`.
+    pub fn chat_close(&self, chat_id: &str) -> anyhow::Result<()> {
+        self.chat_runner()?.chat_close(chat_id);
+        Ok(())
     }
 
     /// Spawn the store actor with INJECTED engine seams — the council `dispatcher` (vote collection)
@@ -242,6 +325,7 @@ impl Core {
         let core = Core {
             tx: tx.clone(),
             pty,
+            chat: None, // PTY runner — ACP chat sessions unavailable
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -277,6 +361,7 @@ impl Core {
         let core = Core {
             tx: tx.clone(),
             pty,
+            chat: Some(runner.clone()),
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -301,6 +386,7 @@ impl Core {
         Core {
             tx: tx.clone(),
             pty,
+            chat: None, // injected runner (tests / bus seam) — ACP chat sessions unavailable
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }

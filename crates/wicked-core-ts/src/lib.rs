@@ -638,6 +638,21 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
         // than a compile break in the operative napi crate the daemon loads. When a new variant
         // lands, add an explicit arm ABOVE this one (and pin it in the drift test).
+        CoreEvent::ChatSessionReady { chat, cli_key } => {
+            json!({ "type": "chatSessionReady", "chat": chat, "cliKey": cli_key })
+        }
+        CoreEvent::ChatSessionFailed { chat, cli_key, reason } => {
+            json!({ "type": "chatSessionFailed", "chat": chat, "cliKey": cli_key, "reason": reason })
+        }
+        CoreEvent::ChatDelta { chat, cli_key, text } => {
+            json!({ "type": "chatDelta", "chat": chat, "cliKey": cli_key, "text": text })
+        }
+        CoreEvent::ChatReply { chat, cli_key, text, ok } => {
+            json!({ "type": "chatReply", "chat": chat, "cliKey": cli_key, "text": text, "ok": ok })
+        }
+        CoreEvent::ChatClosed { chat } => {
+            json!({ "type": "chatClosed", "chat": chat })
+        }
         _ => json!({ "type": "unknown" }),
     }
 }
@@ -857,6 +872,71 @@ impl Core {
         let core = self.inner.clone();
         task(move || {
             core.ping();
+            Ok("ok".to_string())
+        })
+    }
+
+    /// Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13). Resolves to a
+    /// JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
+    /// also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
+    #[napi]
+    pub fn chat_open(&self, chat_id: String, clis_json: String, cwd: Option<String>) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let clis: Vec<String> = serde_json::from_str(&clis_json).map_err(err)?;
+            let outcomes = core
+                .chat_open(&chat_id, &clis, cwd.map(std::path::PathBuf::from))
+                .map_err(err)?;
+            let arr: Vec<serde_json::Value> = outcomes
+                .into_iter()
+                .map(|(cli, r)| match r {
+                    Ok(()) => serde_json::json!({ "cliKey": cli, "ok": true }),
+                    Err(e) => serde_json::json!({ "cliKey": cli, "ok": false, "error": e }),
+                })
+                .collect();
+            serde_json::to_string(&arr).map_err(err)
+        })
+    }
+
+    /// Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
+    /// resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
+    #[napi]
+    pub fn chat_send(
+        &self,
+        chat_id: String,
+        text: String,
+        targets_json: Option<String>,
+        cwd: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let targets: Option<Vec<String>> = match targets_json {
+                Some(t) => Some(serde_json::from_str(&t).map_err(err)?),
+                None => None,
+            };
+            let seats = core
+                .chat_send(&chat_id, &text, targets, cwd.map(std::path::PathBuf::from))
+                .map_err(err)?;
+            serde_json::to_string(&seats).map_err(err)
+        })
+    }
+
+    /// The seats currently warm for a chat — JSON array of cli keys.
+    #[napi]
+    pub fn chat_seats(&self, chat_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let seats = core.chat_seats(&chat_id).map_err(err)?;
+            serde_json::to_string(&seats).map_err(err)
+        })
+    }
+
+    /// Close a chat's warm sessions (idempotent); emits `chatClosed`.
+    #[napi]
+    pub fn chat_close(&self, chat_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.chat_close(&chat_id).map_err(err)?;
             Ok("ok".to_string())
         })
     }
@@ -1319,6 +1399,36 @@ mod tests {
     fn every_mapped_variant_has_stable_tag_and_keys() {
         let s = || "s".to_string();
         check(CoreEvent::Heartbeat, "heartbeat", &["type"]);
+        check(
+            CoreEvent::ChatSessionReady { chat: "c".into(), cli_key: "claude".into() },
+            "chatSessionReady",
+            &["type", "chat", "cliKey"],
+        );
+        check(
+            CoreEvent::ChatSessionFailed {
+                chat: "c".into(),
+                cli_key: "claude".into(),
+                reason: "boom".into(),
+            },
+            "chatSessionFailed",
+            &["type", "chat", "cliKey", "reason"],
+        );
+        check(
+            CoreEvent::ChatDelta { chat: "c".into(), cli_key: "claude".into(), text: "t".into() },
+            "chatDelta",
+            &["type", "chat", "cliKey", "text"],
+        );
+        check(
+            CoreEvent::ChatReply {
+                chat: "c".into(),
+                cli_key: "claude".into(),
+                text: "t".into(),
+                ok: true,
+            },
+            "chatReply",
+            &["type", "chat", "cliKey", "text", "ok"],
+        );
+        check(CoreEvent::ChatClosed { chat: "c".into() }, "chatClosed", &["type", "chat"]);
         check(
             CoreEvent::SessionStarted {
                 session: s(),
