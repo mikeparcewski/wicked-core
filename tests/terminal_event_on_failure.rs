@@ -19,6 +19,7 @@
 //! launches through `launch_run_inner`, which plans SYNCHRONOUSLY and returns the error to
 //! `campaign::dispatch` — that path reconciles the node itself and was never affected.
 
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -150,7 +151,12 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
                 saw_error = true;
             }
             Ok(_) => {}
-            Err(_) => {}
+            Err(RecvTimeoutError::Timeout) => {}
+            // The actor dropped the sender — no further event can arrive, so spinning to the
+            // deadline would only turn an actor crash into a misleading "no SessionFailed" verdict.
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("the event stream disconnected before the run reached a terminal state")
+            }
         }
     }
 
