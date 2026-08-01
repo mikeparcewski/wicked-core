@@ -58,6 +58,10 @@ struct AcpProcess {
     /// Unbounded so the reader never blocks the child on a full pipe.
     line_rx: std::sync::mpsc::Receiver<String>,
     _reader: std::thread::JoinHandle<()>,
+    /// Bounded tail of the bridge's stderr, kept for the life of the session so a turn-level
+    /// failure can report what the bridge said rather than only that it stopped answering.
+    stderr_tail: StderrTail,
+    _stderr_reader: Option<std::thread::JoinHandle<()>>,
     session_id: String,
     next_id: u64,
 }
@@ -69,11 +73,165 @@ impl Drop for AcpProcess {
     }
 }
 
+// ── Handshake budgets and start concurrency ───────────────────────────────────
+//
+// The two handshake calls are budgeted SEPARATELY because they have different cost profiles.
+// Sweeping bridge-startup concurrency directly (K bridges released simultaneously on a barrier,
+// same host, same binary):
+//
+//   K   initialize (id=1)   session/new (id=2) med / max   trips a 10s budget
+//   1   0.31 – 0.69s        1.67s  /  1.67s                0/1
+//   2   0.31 – 0.69s        1.74s  /  1.75s                0/2
+//   4   0.31 – 0.69s        3.41s  /  5.31s                0/4
+//   8   0.31 – 0.69s        7.12s  / 11.57s                2/8
+//
+// `initialize` is flat at every K; `session/new` scales ~linearly past K=2. A single constant
+// applied to both under-budgets exactly the call that contends — and every ACP timeout observed
+// in the field names id=2. Host load does NOT predict this: K=1 returned 1.67s at load average
+// 37.86, the highest load and the fastest sample in the same experiment.
+//
+// This is a governance defect, not a latency one. A handshake timeout does not fail the unit; it
+// silently downgrades it to the single-shot wrapped-CLI path. So under-budgeting trades the
+// governed execution path for latency without saying so, and does it most often exactly when
+// parallelism is highest — which is when governance matters most. (FINDING-022)
+
+fn env_secs(key: &str, default: u64) -> Duration {
+    let secs = std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .unwrap_or(default);
+    Duration::from_secs(secs)
+}
+
+/// Budget for `initialize`. Generous relative to the 0.69s worst case above because the FIRST
+/// spawn after daemon start is cold and was measured at 9.83s.
+fn initialize_budget() -> Duration {
+    env_secs("WICKED_ACP_INIT_SECS", 60)
+}
+
+/// Budget for `session/new` — the call whose cost scales with concurrency. 60s is ~7x the median
+/// measured in the slow regime and ~5x its worst case.
+fn session_new_budget() -> Duration {
+    env_secs("WICKED_ACP_SESSION_NEW_SECS", 60)
+}
+
+/// How many ACP bridges may be inside `initialize` + `session/new` at once.
+///
+/// Defaults to 2 — the highest concurrency measured with no degradation. What is bounded is
+/// contention, not useful work: a queued handshake succeeds where a contended one silently
+/// downgrades its unit to ungoverned execution. Set to a large number to disable the gate.
+fn start_permits() -> usize {
+    std::env::var("WICKED_ACP_START_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2)
+}
+
+struct StartGate {
+    available: Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl StartGate {
+    fn new(permits: usize) -> Self {
+        Self {
+            available: Mutex::new(permits),
+            released: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Waits for a permit, but only up to `wait`. On timeout it returns `None` and the caller
+    /// proceeds ANYWAY: the gate reduces contention, it is not a correctness barrier, and a
+    /// contended handshake that might still succeed beats a queue that looks like a hang. Without
+    /// the cap, two bridges stuck for their full budget would stall every other start behind them.
+    fn acquire(&'static self, wait: Duration) -> Option<StartPermit> {
+        let guard = self.available.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut n, wait_result) = self
+            .released
+            .wait_timeout_while(guard, wait, |n| *n == 0)
+            .unwrap_or_else(|p| p.into_inner());
+        if wait_result.timed_out() {
+            return None;
+        }
+        *n -= 1;
+        Some(StartPermit { gate: self })
+    }
+}
+
+/// The process-wide gate. Tests build their own [`StartGate`] instead of exhausting this one,
+/// so a test that deliberately holds every permit cannot stall a concurrent one.
+fn start_gate() -> &'static StartGate {
+    static GATE: std::sync::OnceLock<StartGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| StartGate::new(start_permits()))
+}
+
+/// A permit to run a handshake. Released on drop, so an early return or a panic mid-handshake
+/// cannot leak one.
+struct StartPermit {
+    gate: &'static StartGate,
+}
+
+impl Drop for StartPermit {
+    fn drop(&mut self) {
+        let mut n = self
+            .gate
+            .available
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *n += 1;
+        self.gate.released.notify_one();
+    }
+}
+
+/// The tail of a bridge's stderr, kept so a failed handshake can report what the bridge itself
+/// said. Bounded: a chatty bridge must not grow memory in a runner that lives as long as the
+/// daemon. Previously stderr was `Stdio::null()`, which is why every failure in this path — a
+/// contended handshake, a missing binary, an auth hang — collapsed to one opaque string
+/// containing a raw JSON-RPC id.
+type StderrTail = Arc<Mutex<std::collections::VecDeque<String>>>;
+
+const STDERR_TAIL_LINES: usize = 20;
+
+fn drain_stderr(stderr: std::process::ChildStderr) -> (StderrTail, std::thread::JoinHandle<()>) {
+    let tail: StderrTail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let sink = tail.clone();
+    let handle = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut t = sink.lock().unwrap_or_else(|p| p.into_inner());
+            if t.len() == STDERR_TAIL_LINES {
+                t.pop_front();
+            }
+            t.push_back(line);
+        }
+    });
+    (tail, handle)
+}
+
+/// Renders the tail for an error message, or a note that the bridge said nothing — which is
+/// itself diagnostic: silence points at contention or a hang, output points at the bridge.
+fn stderr_context(tail: &StderrTail) -> String {
+    let t = tail.lock().unwrap_or_else(|p| p.into_inner());
+    if t.is_empty() {
+        return "; bridge stderr: (silent)".to_string();
+    }
+    format!(
+        "; bridge stderr (last {} of {}): {}",
+        t.len(),
+        STDERR_TAIL_LINES,
+        t.iter().cloned().collect::<Vec<_>>().join(" | ")
+    )
+}
+
 // ── Session startup ───────────────────────────────────────────────────────────
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake.
-/// Returns `Err` if the binary is not on PATH, the process fails to start, or the
-/// handshake does not complete within 10 s.
+/// Returns `Err` if the binary is not on PATH, the process fails to start, or either
+/// handshake call exceeds its budget (see [`initialize_budget`] / [`session_new_budget`]).
 ///
 /// When `gov` is `Some`, `--settings <path>` is prepended to the binary's argv (before
 /// `config.start_args`) so Claude's PreToolUse gate-hook fires on every tool call, and the
@@ -103,9 +261,12 @@ fn start_acp_process(
         cmd.current_dir(cwd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null());
+        cmd.stderr(Stdio::piped());
         cmd
     };
+
+    // Held for the spawn and both handshake calls, released when this function returns.
+    let _permit = start_gate().acquire(session_new_budget());
 
     let mut child = match build_cmd(&config.binary).spawn() {
         Ok(c) => c,
@@ -128,6 +289,19 @@ fn start_acp_process(
             })?
         }
         Err(e) => return Err(anyhow::anyhow!("ACP binary '{}': {e}", config.binary)),
+    };
+
+    // Start draining stderr immediately: a bridge that fails during startup writes its reason
+    // there, and a piped stream nobody reads eventually blocks the writer.
+    let (stderr_tail, stderr_reader) = match child.stderr.take() {
+        Some(s) => {
+            let (tail, handle) = drain_stderr(s);
+            (tail, Some(handle))
+        }
+        None => (
+            Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            None,
+        ),
     };
 
     // Take stdout/stdin before spawning the reader — kill the child if either fails so we
@@ -161,16 +335,17 @@ fn start_acp_process(
     });
 
     // Helper: kills the child and waits before returning a handshake error so we don't leak
-    // the background process when initialize/session-new fails or times out.
+    // the background process when initialize/session-new fails or times out. The bridge's own
+    // stderr is appended to every one of these — the failure reason reaches `AcpFallback`, which
+    // is the operator's only signal that the governed path was abandoned.
     macro_rules! handshake_err {
         ($child:expr, $e:expr) => {{
             let _ = $child.kill();
             let _ = $child.wait();
-            return Err($e);
+            let e: anyhow::Error = $e;
+            return Err(anyhow::anyhow!("{e}{}", stderr_context(&stderr_tail)));
         }};
     }
-
-    const HANDSHAKE: Duration = Duration::from_secs(10);
 
     if let Err(e) = rpc_send(
         &mut stdin,
@@ -184,7 +359,7 @@ fn start_acp_process(
     ) {
         handshake_err!(child, e);
     }
-    if let Err(e) = rpc_expect(&rx, 1, HANDSHAKE) {
+    if let Err(e) = rpc_expect(&rx, 1, initialize_budget()) {
         handshake_err!(child, e);
     }
 
@@ -201,7 +376,7 @@ fn start_acp_process(
     ) {
         handshake_err!(child, e);
     }
-    let resp = match rpc_expect(&rx, 2, HANDSHAKE) {
+    let resp = match rpc_expect(&rx, 2, session_new_budget()) {
         Ok(v) => v,
         Err(e) => handshake_err!(child, e),
     };
@@ -218,6 +393,8 @@ fn start_acp_process(
         stdin,
         line_rx: rx,
         _reader: reader_thread,
+        stderr_tail,
+        _stderr_reader: stderr_reader,
         session_id,
         next_id: 3,
     })
@@ -398,6 +575,16 @@ prior output you are reviewing, testing, or revising."
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+
+    // No `stopReason` and no timeout means the bridge stopped answering — it died mid-turn. Its
+    // stderr is the only account of why, and `StepOutput.output` is where an operator looks, so
+    // say it there rather than reporting a Failed unit with an empty reason.
+    if !found && !timed_out {
+        output.push_str(&format!(
+            "\n[wicked-core] ACP turn ended with no stopReason (the bridge stopped answering){}",
+            stderr_context(&proc.stderr_tail)
+        ));
     }
 
     Ok(TurnResult {
@@ -1343,6 +1530,201 @@ mod tests {
     fn runner() -> AcpStepRunner {
         let (tx, _rx) = std::sync::mpsc::channel();
         AcpStepRunner::new(tx)
+    }
+
+    // ── FINDING-022: handshake budgets, start gate, stderr capture ──────────────
+
+    #[test]
+    fn the_two_handshake_calls_have_separate_budgets_and_neither_is_the_old_10s_constant() {
+        // The defect was ONE constant covering two calls with different cost profiles, at a value
+        // that sat inside the measured spread of the slower one. Pinning both to >10s is what
+        // stops a reviewer reinstating a single shared constant at the old value.
+        assert!(initialize_budget() > Duration::from_secs(10));
+        assert!(session_new_budget() > Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_budget_override_must_be_a_positive_number_or_the_default_stands() {
+        // Env parsing only — `env_secs` is called per handshake, so a typo'd or zero override
+        // must not silently become an instant timeout, which would fail EVERY handshake open and
+        // downgrade every unit to ungoverned execution.
+        let unset = "WICKED_ACP_BUDGET_TEST_UNSET_VAR_DOES_NOT_EXIST";
+        assert_eq!(env_secs(unset, 60), Duration::from_secs(60));
+    }
+
+    /// A gate of its own per test — exhausting the process-wide one would stall any concurrent
+    /// test that starts a bridge, which is the very failure mode these tests exist to prevent.
+    fn test_gate(permits: usize) -> &'static StartGate {
+        Box::leak(Box::new(StartGate::new(permits)))
+    }
+
+    #[test]
+    fn the_start_gate_hands_out_a_bounded_number_of_permits_and_reclaims_them_on_drop() {
+        let gate = test_gate(2);
+        let held: Vec<StartPermit> = (0..2)
+            .map(|_| gate.acquire(Duration::from_secs(5)).expect("a free permit"))
+            .collect();
+        // Exhausted: the next caller waits rather than piling onto the contended handshake.
+        assert!(
+            gate.acquire(Duration::from_millis(50)).is_none(),
+            "the gate handed out more than its 2 permits"
+        );
+        drop(held);
+        // Reclaimed on drop — an early return or a panic mid-handshake cannot leak a permit.
+        assert!(
+            gate.acquire(Duration::from_millis(500)).is_some(),
+            "dropping a permit did not return it to the gate"
+        );
+    }
+
+    #[test]
+    fn waiting_for_a_permit_times_out_rather_than_blocking_forever() {
+        // The gate is a contention reducer, not a correctness barrier: if every permit is held by
+        // a stuck bridge, callers must proceed anyway rather than queue behind it indefinitely.
+        let gate = test_gate(1);
+        let _held = gate.acquire(Duration::from_secs(5)).unwrap();
+        let t0 = Instant::now();
+        assert!(gate.acquire(Duration::from_millis(100)).is_none());
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "acquire() blocked past its wait bound"
+        );
+    }
+
+    #[test]
+    fn the_default_start_concurrency_is_bounded_and_non_zero() {
+        // Zero would deadlock every start behind a permit that never exists; unbounded would
+        // reinstate the contention that makes `session/new` outrun its budget.
+        let n = start_permits();
+        assert!(n > 0 && n <= 8, "start concurrency {n} is out of range");
+    }
+
+    /// Writes a stub ACP bridge: answers `initialize` and `session/new`, and brackets its own
+    /// handshake window with `+` / `-` in a shared file so the test can reconstruct how many
+    /// bridges were genuinely inside a handshake at the same moment.
+    #[cfg(unix)]
+    fn stub_bridge(dir: &std::path::Path, ledger: &std::path::Path) -> std::path::PathBuf {
+        let script = dir.join("stub-acp-bridge.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '+' >> "{ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+# Hold the window open so genuinely-concurrent starts overlap in the ledger.
+sleep 0.4
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"stub"}}}}'
+printf -- '-' >> "{ledger}"
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The fix that matters most. `session/new` cost scales with how many bridges start at once
+    /// (1.67s at K=1 → 7.12s median / 11.57s max at K=8), and a handshake that outruns its budget
+    /// does not fail the unit — it silently downgrades it to ungoverned execution. Bounding the
+    /// overlap is what keeps that cost off the curve.
+    ///
+    /// Measured through the real `start_acp_process`, not the gate in isolation, so deleting the
+    /// permit acquisition fails this test rather than leaving a passing unit test behind.
+    #[test]
+    #[cfg(unix)]
+    fn eight_simultaneous_starts_never_exceed_the_gate_in_flight() {
+        let dir = std::env::temp_dir().join(format!("wicked-acp-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("overlap.txt");
+        std::fs::write(&ledger, "").unwrap();
+        let script = stub_bridge(&dir, &ledger);
+
+        let config = AcpConfig {
+            binary: script.to_string_lossy().to_string(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+        };
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let config = config.clone();
+                let cwd = dir.clone();
+                std::thread::spawn(move || start_acp_process(&config, &cwd, None))
+            })
+            .collect();
+        let procs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Every start must still SUCCEED. A gate that bounded contention by failing starts would
+        // trade one silent downgrade for another.
+        for p in &procs {
+            assert!(p.is_ok(), "a gated start failed: {:?}", p.as_ref().err());
+        }
+
+        // Replay the ledger for the peak number of simultaneous handshakes.
+        let marks = std::fs::read_to_string(&ledger).unwrap();
+        let (mut cur, mut peak) = (0i32, 0i32);
+        for c in marks.chars() {
+            match c {
+                '+' => {
+                    cur += 1;
+                    peak = peak.max(cur);
+                }
+                '-' => cur -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(marks.matches('+').count(), 8, "all 8 bridges ran: {marks}");
+        assert!(
+            peak <= start_permits() as i32,
+            "peak concurrent handshakes {peak} exceeded the gate's {} permits (ledger: {marks})",
+            start_permits()
+        );
+
+        drop(procs); // kills the stub children
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_bridge_that_writes_to_stderr_has_its_last_lines_kept_and_older_ones_dropped() {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("i=1; while [ $i -le 50 ]; do echo line$i >&2; i=$((i+1)); done")
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let (tail, handle) = drain_stderr(child.stderr.take().unwrap());
+        handle.join().unwrap();
+        let _ = child.wait();
+
+        let ctx = stderr_context(&tail);
+        assert!(
+            ctx.contains("line50"),
+            "the most recent stderr line must survive: {ctx}"
+        );
+        assert!(
+            !ctx.contains("line1 "),
+            "the tail must be bounded, not the whole stream: {ctx}"
+        );
+        assert_eq!(
+            tail.lock().unwrap().len(),
+            STDERR_TAIL_LINES,
+            "the tail is capped at STDERR_TAIL_LINES"
+        );
+    }
+
+    #[test]
+    fn a_silent_bridge_is_reported_as_silent_rather_than_as_no_information() {
+        // Silence is itself diagnostic — it points at contention or a hang rather than at the
+        // bridge rejecting something — so it must be stated, not rendered as an empty string.
+        let empty: StderrTail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        assert!(stderr_context(&empty).contains("silent"));
     }
 
     #[test]
