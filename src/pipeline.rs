@@ -250,16 +250,42 @@ fn attach_pinned_validators(
                 def.id,
                 phase.id
             ),
+            // Name the CLI, not just the Rust API — the UNAPPROVED arm above already does, and an
+            // operator who hits this one is strictly worse off for the inconsistency. The shipped
+            // coverage pin has a purpose-built one-liner (`seed-domain-validators`); every other pin
+            // goes through the generic author→approve pair. Both are commands the operator can run.
             None => anyhow::bail!(
-                "workflow `{}` phase `{}` pins validator `{pin}`, which is not in the vault \
-                 (author + approve it out of band via provision_validator/approve_and_store before \
-                 running this workflow) — refusing to run the phase ungated (fail-closed)",
+                "workflow `{}` phase `{}` pins validator `{pin}`, which is not in the vault — \
+                 refusing to run the phase ungated (fail-closed). {}",
                 def.id,
-                phase.id
+                phase.id,
+                missing_pin_remedy(pin)
             ),
         }
     }
     Ok(())
+}
+
+/// The operator-runnable remedy named by [`attach_pinned_validators`]'s missing-pin refusal.
+///
+/// The shipped `domain-extraction` drop-in pins a hand-authored validator that the LLM writer path
+/// cannot reproduce (its script is deterministic, so `provision-validator` would author a *different*
+/// script and therefore a different pin). `seed-domain-validators` exists for exactly that pin and is
+/// idempotent. Pointing an operator at the generic author→approve pair for it would send them down a
+/// path that cannot produce the pin they need.
+fn missing_pin_remedy(pin: &str) -> String {
+    if pin == crate::domain_extraction::COVERAGE_VALIDATOR_PIN {
+        "This is the coverage validator the shipped `domain-extraction` workflow pins: run \
+         `wicked-core seed-domain-validators` once to vault + approve it (idempotent, and it yields \
+         exactly this pin)."
+            .to_string()
+    } else {
+        format!(
+            "Author + approve it first: `wicked-core provision-validator --criterion \"...\"` then \
+             `wicked-core approve-validator --pin <unapproved pin>`, and pin the APPROVED pin \
+             (`{pin}` resolves to nothing today)."
+        )
+    }
 }
 
 pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
@@ -1221,5 +1247,38 @@ mod resolve_tests {
         );
         // No prior creator before ord 1 ⇒ None (the caller falls back to the unit's own output).
         assert!(creator_output_for(&store, "s", 1).is_none());
+    }
+
+    /// A fail-closed refusal has to leave the operator with a command to run. The shipped coverage
+    /// pin has a purpose-built one, and the generic author→approve pair cannot reproduce it — so
+    /// sending them to `provision-validator` for that pin would be actively misleading.
+    #[test]
+    fn the_shipped_coverage_pin_is_pointed_at_its_own_seed_command() {
+        let remedy = missing_pin_remedy(crate::domain_extraction::COVERAGE_VALIDATOR_PIN);
+        assert!(
+            remedy.contains("wicked-core seed-domain-validators"),
+            "the shipped pin must name its purpose-built seed command: {remedy}"
+        );
+        assert!(
+            !remedy.contains("provision-validator"),
+            "the LLM writer path authors a different script and so a DIFFERENT pin — pointing at it \
+             here sends the operator somewhere that cannot produce this pin: {remedy}"
+        );
+    }
+
+    /// Any other unresolved pin is an operator-authored one: name the author→approve pair, and name
+    /// it as a CLI (the UNAPPROVED sibling arm already does — this arm used to name only the Rust API).
+    #[test]
+    fn an_unknown_pin_is_pointed_at_the_author_approve_pair() {
+        let remedy = missing_pin_remedy("deadbeefdeadbeef");
+        assert!(
+            remedy.contains("wicked-core provision-validator"),
+            "{remedy}"
+        );
+        assert!(remedy.contains("wicked-core approve-validator"), "{remedy}");
+        assert!(
+            remedy.contains("deadbeefdeadbeef"),
+            "the message must name the pin that failed to resolve: {remedy}"
+        );
     }
 }
