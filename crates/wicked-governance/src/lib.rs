@@ -32,7 +32,7 @@ mod ingest;
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
     claim_from_node, claim_symbol, claim_to_node, conform, decide, decide_as, register_policy,
-    select, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
+    select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
 };
 
 // Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B).
@@ -178,6 +178,41 @@ mod tests {
 
         let miss = select(&store, "repo:acme", "release", &ctx).expect("select release");
         assert!(miss.is_empty(), "phase mismatch must return no policies");
+    }
+
+    /// SELECT_ANY matches a policy on ANY supplied token, and never returns it twice.
+    ///
+    /// Regression for FINDING-021: the engine selected only on the synthetic `unit-<ord>` execution
+    /// phase, so a policy authored against the workflow phase id an operator actually sees
+    /// (`applies_to: ["build"]`) registered successfully and then never fired — a silent fail-open.
+    #[test]
+    fn select_any_matches_workflow_phase_id_alongside_synthetic_unit_phase() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        // pol-allow-notify applies_to == ["build"] — the operator-authored workflow phase id.
+        register_policy(&mut store, &allow_with_conditions_policy()).expect("register");
+
+        let ctx = serde_json::json!({});
+
+        // The pre-fix behaviour: the synthetic token alone finds nothing.
+        let synthetic_only = select(&store, "repo:acme", "unit-2", &ctx).expect("select unit-2");
+        assert!(
+            synthetic_only.is_empty(),
+            "the synthetic execution phase alone must not match an operator-authored applies_to"
+        );
+
+        // The fix: the gate passes BOTH tokens, so the policy fires.
+        let hit = select_any(&store, "repo:acme", &["unit-2", "build"], &ctx).expect("select_any");
+        assert_eq!(hit.len(), 1, "the workflow phase id must select the policy");
+        assert_eq!(hit[0].id, "pol-allow-notify");
+
+        // Overlapping tokens must not double-count a policy (each is yielded at most once).
+        let dedup = select_any(&store, "repo:acme", &["build", "build"], &ctx).expect("select_any");
+        assert_eq!(dedup.len(), 1, "a policy matching twice is returned once");
+
+        // A token set matching nothing still returns empty (no accidental widening to match-all).
+        let miss =
+            select_any(&store, "repo:acme", &["unit-2", "release"], &ctx).expect("select_any");
+        assert!(miss.is_empty(), "no matching token must return no policies");
     }
 
     /// conform: after recording, the claim node is retrievable and carries the decision, and a

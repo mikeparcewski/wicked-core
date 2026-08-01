@@ -65,14 +65,31 @@ pub fn register_policy(store: &mut dyn GraphStore, policy: &Policy) -> anyhow::R
 // SELECT — index-only fast lane
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Select candidate policies for `phase`: load every `Other(POLICY)` node and keep those whose
-/// `applies_to` includes the phase. Bounded, deterministic (returned in id order). `scope` and
-/// `context` are accepted for parity with the prototype/hot-path signature; the fast lane keys on
-/// `phase` only (overlay/memory enrichment is the deferred slow lane, ARCHITECTURE §2.1).
+/// Select candidate policies for `phase`. Equivalent to [`select_any`] with a single token.
 pub fn select(
     store: &dyn GraphRead,
-    _scope: &str,
+    scope: &str,
     phase: &str,
+    context: &serde_json::Value,
+) -> anyhow::Result<Vec<Policy>> {
+    select_any(store, scope, &[phase], context)
+}
+
+/// Select candidate policies matching ANY of `phases`: load every `Other(POLICY)` node and keep
+/// those whose `applies_to` includes at least one token. Bounded, deterministic (returned in id
+/// order). `scope` and `context` are accepted for parity with the prototype/hot-path signature; the
+/// fast lane keys on the phase tokens only (overlay/memory enrichment is the deferred slow lane,
+/// ARCHITECTURE §2.1).
+///
+/// Callers pass BOTH the synthetic execution phase (`unit-<ord>`, [`crate`]-external
+/// `scope::unit_phase`) and the workflow PHASE ID the operator actually sees in the API
+/// (`<session>:<phase_id>` → `phase_id`). Matching only the former made every policy authored
+/// against a real phase name register successfully and then never fire — a silent fail-open on the
+/// primary safety control. Both tokens are accepted so the obvious authoring choice works.
+pub fn select_any(
+    store: &dyn GraphRead,
+    _scope: &str,
+    phases: &[&str],
     _context: &serde_json::Value,
 ) -> anyhow::Result<Vec<Policy>> {
     // Index-only: restrict to the POLICY kind. find_symbols with no text/exact_name does a single
@@ -86,7 +103,11 @@ pub fn select(
     let mut selected: Vec<Policy> = Vec::new();
     for node in &nodes {
         let policy = Policy::from_node(node)?;
-        if policy.applies_to.iter().any(|p| p == phase) {
+        if policy
+            .applies_to
+            .iter()
+            .any(|p| phases.iter().any(|phase| p == phase))
+        {
             selected.push(policy);
         }
     }

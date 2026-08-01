@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
     HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
-    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_SCOPE_ENV,
+    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -55,6 +55,15 @@ fn resolve_hook_arg(args: &[String], flag_name: &str, env_var: &str) -> String {
     flag(args, flag_name)
         .or_else(|| env_nonempty(env_var))
         .unwrap_or_default()
+}
+
+/// The OPTIONAL workflow-phase alias for a hook run (`--phase-id` ELSE `WICKED_GATE_PHASE_ID`).
+/// Unlike scope/phase this has no meaningful default: absent means "no alias", which must stay
+/// distinct from the empty string (an empty token would match a policy authored as `applies_to: [""]`).
+fn hook_phase_alias(args: &[String]) -> Option<String> {
+    flag(args, "--phase-id")
+        .filter(|s| !s.is_empty())
+        .or_else(|| env_nonempty(GATE_PHASE_ID_ENV))
 }
 
 fn store_path(args: &[String]) -> String {
@@ -98,8 +107,14 @@ fn main() {
         // travel via env, so caller-controlled ids can't inject shell metacharacters (security fix).
         let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
         let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
+        let phase_id = hook_phase_alias(&args);
         let db = flag(&args, "--db").or_else(|| env_nonempty(ESTATE_DB_ENV));
-        std::process::exit(run_gate_hook(&scope, &phase, db.as_deref()));
+        std::process::exit(run_gate_hook(
+            &scope,
+            &phase,
+            phase_id.as_deref(),
+            db.as_deref(),
+        ));
     }
 
     // output-gate-hook is the PER-OUTPUT sibling: same read-only-then-append discipline, but it
@@ -108,8 +123,14 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("output-gate-hook") {
         let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
         let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
+        let phase_id = hook_phase_alias(&args);
         let db = flag(&args, "--db").or_else(|| env_nonempty(ESTATE_DB_ENV));
-        std::process::exit(run_output_gate_hook(&scope, &phase, db.as_deref()));
+        std::process::exit(run_output_gate_hook(
+            &scope,
+            &phase,
+            phase_id.as_deref(),
+            db.as_deref(),
+        ));
     }
 
     // provision-validator / approve-validator drive the rev0.4 pin+vault authoring flow DIRECTLY on the

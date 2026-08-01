@@ -369,6 +369,9 @@ impl WrappedCliStepRunner {
                 cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
                 cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
                 cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
+                if !g.phase_id.is_empty() {
+                    cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
+                }
             }
             match run_bounded(cmd, self.timeout, emit, adapter) {
                 Ok((0, out, _, usage, files)) => (StepStatus::Ok, out, usage, files),
@@ -529,6 +532,9 @@ struct GovLaunch {
     db_path: String,
     scope: String,
     phase: String,
+    /// The unit's WORKFLOW phase id (e.g. `review`) — set as `WICKED_GATE_PHASE_ID` so the hook's
+    /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
+    phase_id: String,
 }
 
 /// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
@@ -633,6 +639,7 @@ fn arm_input_governance(
         db_path: gov.db_path.clone(),
         scope,
         phase,
+        phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
     })
 }
 
