@@ -97,23 +97,44 @@ fn is_terminal(s: SessionStatus) -> bool {
     )
 }
 
-fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(8);
+/// Upper bound on how long a governed run may take before the test gives up.
+///
+/// Deliberately far above the ~2s a run actually takes. Every wait below returns the instant its
+/// condition holds and fails fast on a terminal-but-wrong outcome, so a generous bound costs nothing
+/// on an idle host and only ever spends time on a run that is genuinely stuck. An 8s bound was
+/// reachable by scheduling noise alone — on a host under load these tests failed roughly one run in
+/// three, on unmodified `main`, which is a test reporting a defect that isn't there (FINDING-028).
+const RUN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Waits for `run_id` to reach `want`. `Err` says which way it went wrong — a timeout and a run that
+/// terminated in the wrong status are different defects and must not read the same in the output.
+fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> Result<(), String> {
+    let deadline = Instant::now() + RUN_DEADLINE;
+    let mut last = None;
     while Instant::now() < deadline {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == run_id) {
                 if v.session.status == want {
-                    return true;
+                    return Ok(());
                 }
                 // Fail fast: a terminal status that isn't the one we want will never change.
-                if want != v.session.status && is_terminal(v.session.status) {
-                    return false;
+                if is_terminal(v.session.status) {
+                    return Err(format!(
+                        "run {run_id} terminated as {:?}, wanted {want:?}",
+                        v.session.status
+                    ));
                 }
+                last = Some(v.session.status);
             }
         }
         std::thread::sleep(Duration::from_millis(15));
     }
-    false
+    Err(format!(
+        "run {run_id} did not reach {want:?} within {}s — it was still {} when the wait gave up, so \
+         this is a timeout, not a wrong outcome",
+        RUN_DEADLINE.as_secs(),
+        last.map_or_else(|| "absent from sessions_detail".to_string(), |s| format!("{s:?}"))
+    ))
 }
 
 /// Seed ONE behavior node. `accounted` ⇒ a validated requirement + a business-rule annotation so the
@@ -324,10 +345,8 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
     launch(&core, "run-happy", &repo_id);
 
     // The domain-graph phase carries a human-confirm gate → the run parks awaiting a human.
-    assert!(
-        wait_status(&core, "run-happy", SessionStatus::AwaitingHuman),
-        "the run reaches the domain-graph human-confirm gate"
-    );
+    wait_status(&core, "run-happy", SessionStatus::AwaitingHuman)
+        .expect("the run reaches the domain-graph human-confirm gate");
     let wt = worktree(&repo, "run-happy");
     assert!(
         wt.join("coverage-report.json").is_file(),
@@ -341,10 +360,8 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
     // Approve the human gate → the run completes.
     core.confirm_gate("run-happy", HumanDecision::Approve { amend: None })
         .expect("approve the domain-graph gate");
-    assert!(
-        wait_status(&core, "run-happy", SessionStatus::Completed),
-        "approving the final gate completes the governed run"
-    );
+    wait_status(&core, "run-happy", SessionStatus::Completed)
+        .expect("approving the final gate completes the governed run");
 }
 
 // --- TEST 2: a policy violation in a phase's output denies the phase ---
@@ -367,10 +384,8 @@ fn a_policy_violation_denies_a_phase_and_halts_the_run() {
     }
     launch(&core, "run-deny", &repo_id);
 
-    assert!(
-        wait_status(&core, "run-deny", SessionStatus::Failed),
-        "a policy violation in the extractor phase's output denies it → the run fails"
-    );
+    wait_status(&core, "run-deny", SessionStatus::Failed)
+        .expect("a policy violation in the extractor phase's output denies it → the run fails");
     // Attribute the failure to the EXTRACTOR phase (ord 3 / unit_ix 2) specifically — not an unrelated
     // gate — so the test proves the policy-over-output deny, not just "some failure".
     let views = core.sessions_detail().unwrap();
@@ -419,10 +434,8 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
         .unwrap();
     }
     launch(&core, "run-recall", &repo_id);
-    assert!(
-        wait_status(&core, "run-recall", SessionStatus::AwaitingHuman),
-        "the run reaches the domain-graph gate"
-    );
+    wait_status(&core, "run-recall", SessionStatus::AwaitingHuman)
+        .expect("the run reaches the domain-graph gate");
 
     // The recall→gate wiring fires per unit: at least one persisted conformance claim carries the rule
     // as an obligation. Before this milestone, no run claim ever carried a recalled rule.
@@ -476,8 +489,9 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
     // Poll until the coverage phase (ord 4 / unit_ix 3) is REJECTED — the deterministic coverage
     // validator denied the sub-1.0 report. A not-pass verdict on the `human_confirm_if verdict_not_pass`
     // coverage gate escalates rather than hard-failing, so assert on the UNIT, not the session status.
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + RUN_DEADLINE;
     let mut rejected = false;
+    let mut last = None;
     while Instant::now() < deadline {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == "run-hole") {
@@ -485,6 +499,7 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
                     rejected = true;
                     break;
                 }
+                last = Some((v.session.status, v.units.get(3).map(|u| u.status)));
             }
         }
         std::thread::sleep(Duration::from_millis(15));
@@ -492,7 +507,9 @@ fn a_coverage_hole_is_denied_by_the_pinned_validator_in_a_run() {
     assert!(
         rejected,
         "the pinned coverage validator DENIES a sub-1.0 coverage report in a run (the gate has teeth; \
-         the agent-PASS shim does not rescue a hole)"
+         the agent-PASS shim does not rescue a hole) — the coverage unit was never rejected within {}s; \
+         last seen: {last:?}",
+        RUN_DEADLINE.as_secs()
     );
     let wt = worktree(&repo, "run-hole");
     // The report WAS written (< 1.0) — so the deny is the sub-1.0 coverage path, not a missing-file
