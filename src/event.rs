@@ -527,11 +527,13 @@ impl CoreEvent {
     /// reading a real event trail. Anything that needs to name a `CoreEvent` now goes through here, so
     /// the log, the socket, and the evidence bundle cannot drift apart.
     ///
-    /// The `type` value is also the log's routing key via [`crate::event_log::run_key`], which reads
-    /// `session` (or `runId`, for campaign node events) straight out of this object rather than
-    /// re-matching the enum — a second hand-written per-variant match would be a second thing to
-    /// forget to update. `runId`, not `run_id`: the emitted JSON is camelCase throughout, and an
-    /// earlier cut of `run_key` looked for a key this function emits nowhere.
+    /// The object this returns is also what the log routes on. [`crate::event_log::run_key`] picks
+    /// the per-run file by reading `session` — or `runId`, for campaign node events — straight out
+    /// of it, rather than re-matching the enum: a second hand-written per-variant match would be a
+    /// second thing to forget to update. (`type` names the event; it is not the routing key.)
+    ///
+    /// `runId`, not `run_id`: the emitted JSON is camelCase throughout, and an earlier cut of
+    /// `run_key` looked for a key this function emits nowhere.
     ///
     /// The match is EXHAUSTIVE and must stay that way. `CoreEvent` is `#[non_exhaustive]`, so while
     /// this lived outside the crate it needed catch-all arms — and a variant nobody had mapped
