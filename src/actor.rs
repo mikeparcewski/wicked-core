@@ -1880,6 +1880,9 @@ pub(crate) fn run(
                                     &self_tx,
                                     &mut session,
                                     ord,
+                                    // The failed unit's own output is the artifact: the operator
+                                    // is judging what unit `ord` produced, not the next phase.
+                                    Some(ord),
                                     prompt,
                                 ) {
                                     emit_run_error(&mut subscribers, &run_id, e);
@@ -1919,6 +1922,7 @@ pub(crate) fn run(
                             &self_tx,
                             &mut session,
                             ord,
+                            Some(ord),
                             prompt,
                         ) {
                             emit_run_error(&mut subscribers, &run_id, e);
@@ -2628,7 +2632,15 @@ fn apply_step_result(
                      reassign the unit to a different CLI first.",
                         refusal.reason
                     );
-                    pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
+                    pause_for_human(
+                        store,
+                        subscribers,
+                        self_tx,
+                        &mut session,
+                        ord,
+                        Some(ord),
+                        prompt,
+                    )?;
                     return Ok(StepApplied::Paused);
                 }
             } else if human_present {
@@ -2822,6 +2834,10 @@ fn apply_step_result(
                 self_tx,
                 &mut session,
                 ord,
+                // `HumanConfirmIf(VerdictNotPass)` is declared on unit `ord` itself and fires
+                // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
+                // reviewed unit coincide here.
+                Some(ord),
                 format!(
                     "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run"
                 ),
@@ -2895,6 +2911,7 @@ fn pause_for_human(
     self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
     ord: u32,
+    reviewing_ord: Option<u32>,
     prompt: String,
 ) -> anyhow::Result<()> {
     session.status = SessionStatus::AwaitingHuman;
@@ -2904,6 +2921,7 @@ fn pause_for_human(
         CoreEvent::AwaitingHuman {
             session: session.id.clone(),
             ord,
+            reviewing_ord,
             prompt: prompt.clone(),
         },
     );
@@ -2947,6 +2965,9 @@ fn advance_or_pause(
                     self_tx,
                     &mut session,
                     term.ord,
+                    // The terminal gate is always DEF-declared — `term`'s own `GateSpec` is what
+                    // this branch matched on — so it is attributable, and to itself.
+                    Some(term.ord),
                     format!(
                         "Approve completion after the final phase (unit {}): {}",
                         term.ord, term.description
@@ -2958,13 +2979,43 @@ fn advance_or_pause(
         return Ok(Progress::Done);
     };
 
-    if should_pause(&session, &units, unit_ix) {
-        let prompt = format!(
-            "Approve unit {} before it runs: {}",
-            unit.ord, unit.description
-        );
+    if let Some(reason) = should_pause(&session, &units, unit_ix) {
+        // Describe the decision the operator is actually being asked to make. A DEF-declared gate
+        // fires AFTER the preceding phase's work, so the artifact under review is that phase's
+        // output — naming the upcoming phase instead (FINDING-032) pointed the operator at work
+        // that had not run and, in the common case, at a phase that had declared no gate at all.
+        let (reviewing_ord, prompt) = match reason {
+            PauseReason::DefGate { reviewing_ord } => {
+                let done = units
+                    .iter()
+                    .find(|u| u.ord == reviewing_ord)
+                    .map_or_else(|| format!("unit {reviewing_ord}"), |p| p.description.clone());
+                (
+                    Some(reviewing_ord),
+                    format!(
+                        "Approve the output of unit {} ({}) before unit {} runs: {}",
+                        reviewing_ord, done, unit.ord, unit.description
+                    ),
+                )
+            }
+            PauseReason::RunLevel => (
+                None,
+                format!(
+                    "Approve unit {} before it runs: {}",
+                    unit.ord, unit.description
+                ),
+            ),
+        };
         let ord = unit.ord;
-        pause_for_human(store, subscribers, self_tx, &mut session, ord, prompt)?;
+        pause_for_human(
+            store,
+            subscribers,
+            self_tx,
+            &mut session,
+            ord,
+            reviewing_ord,
+            prompt,
+        )?;
         return Ok(Progress::Paused);
     }
 
@@ -3030,17 +3081,37 @@ fn prior_context_label(
     }
 }
 
-/// Whether to pause for a human before dispatching `units[unit_ix]`. Two sources, OR'd:
+/// Why a run paused before dispatching a unit — not merely *that* it did.
+///
+/// The distinction is the operator's entire context. A `DefGate` pause asks about work that has
+/// already happened (the preceding phase's output); a `RunLevel` pause asks about work that is about
+/// to happen. Collapsing both into `bool` is what produced FINDING-032: every mid-run gate was
+/// described as "approve unit N before it runs" even when the artifact under review was unit N-1's
+/// output and unit N had declared no gate at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseReason {
+    /// The run-level `--confirm` policy (`All`, or `Before(ord)` matching this unit).
+    RunLevel,
+    /// The PRECEDING phase declared the gate; its ord is carried so the prompt and the event can
+    /// name the phase whose output is actually being approved.
+    DefGate { reviewing_ord: u32 },
+}
+
+/// Why to pause for a human before dispatching `units[unit_ix]`, or `None` to dispatch. Two sources:
 ///  1. the run-level `--confirm` policy (None / All / Before(ord)); and
 ///  2. the DEF-declared gate on the PRECEDING phase (its `GateSpec` fires *after* its work, i.e.
 ///     before this unit) — so a `WorkflowDef`'s own HumanConfirm gates drive the run, not just the
 ///     run-level flag. `HumanConfirm` always pauses; `HumanConfirmIf(VerdictNotPass)` pauses when the
 ///     preceding unit is not a clean pass (`status != Done`); `Auto` defers to the run-level policy.
+///
+/// `DefGate` wins when both fire. It is the more specific statement — a workflow author named this
+/// exact seam — and it is the one carrying an ord to attribute the pause to, so preferring it never
+/// discards information `RunLevel` would have supplied. Whether to pause is unchanged either way.
 fn should_pause(
     session: &crate::domain::AgentSession,
     units: &[crate::domain::WorkUnit],
     unit_ix: usize,
-) -> bool {
+) -> Option<PauseReason> {
     let ord = units[unit_ix].ord;
     let run_level = match session.human_confirm {
         crate::domain::HumanConfirm::None => false,
@@ -3050,15 +3121,17 @@ fn should_pause(
     let def_gate = unit_ix
         .checked_sub(1)
         .and_then(|i| units.get(i))
-        .map(|prev| match prev.gate {
+        .filter(|prev| match prev.gate {
             crate::workflow::GateSpec::Auto => false,
             crate::workflow::GateSpec::HumanConfirm { .. } => true,
             crate::workflow::GateSpec::HumanConfirmIf(
                 crate::workflow::GateCond::VerdictNotPass,
             ) => prev.status != crate::domain::UnitStatus::Done,
         })
-        .unwrap_or(false);
-    run_level || def_gate
+        .map(|prev| PauseReason::DefGate {
+            reviewing_ord: prev.ord,
+        });
+    def_gate.or(run_level.then_some(PauseReason::RunLevel))
 }
 
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
@@ -3705,7 +3778,7 @@ fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionVie
 
 #[cfg(test)]
 mod gate_pause_tests {
-    use super::should_pause;
+    use super::{should_pause, PauseReason};
     use crate::domain::{AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit};
     use crate::scope::EntityMode;
     use crate::workflow::{GateCond, GateSpec};
@@ -3748,9 +3821,17 @@ mod gate_pause_tests {
             ),
             unit(2, GateSpec::Auto, UnitStatus::Pending),
         ];
-        assert!(should_pause(&s, &units, 1), "preceding def gate must pause");
-        assert!(
-            !should_pause(&s, &units, 0),
+        // Attributed to unit 1, not unit 2. That attribution is the whole point: unit 2 declared
+        // `Auto` and has produced nothing, so a pause reported against it tells the operator to
+        // approve work that does not exist (FINDING-032).
+        assert_eq!(
+            should_pause(&s, &units, 1),
+            Some(PauseReason::DefGate { reviewing_ord: 1 }),
+            "preceding def gate must pause, and name itself as the unit under review"
+        );
+        assert_eq!(
+            should_pause(&s, &units, 0),
+            None,
             "no preceding phase ⇒ no def pause"
         );
     }
@@ -3761,10 +3842,35 @@ mod gate_pause_tests {
             unit(1, GateSpec::Auto, UnitStatus::Done),
             unit(2, GateSpec::Auto, UnitStatus::Pending),
         ];
-        assert!(!should_pause(&sess(HumanConfirm::None), &units, 1));
-        assert!(
+        assert_eq!(should_pause(&sess(HumanConfirm::None), &units, 1), None);
+        assert_eq!(
             should_pause(&sess(HumanConfirm::All), &units, 1),
-            "run-level All still pauses when the def gate is Auto"
+            Some(PauseReason::RunLevel),
+            "run-level All still pauses when the def gate is Auto — and reviews nothing, because \
+             the pause is a policy applied BEFORE unit 2 rather than a judgement on unit 1"
+        );
+    }
+
+    #[test]
+    fn a_def_gate_outranks_the_run_level_policy_when_both_fire() {
+        // Both sources fire. `DefGate` must win: it is the only one that can name what the
+        // operator is looking at, so resolving the tie the other way would silently drop the
+        // attribution on exactly the runs that are MOST supervised.
+        let s = sess(HumanConfirm::All);
+        let units = vec![
+            unit(
+                1,
+                GateSpec::HumanConfirm {
+                    unconditional: false,
+                },
+                UnitStatus::Done,
+            ),
+            unit(2, GateSpec::Auto, UnitStatus::Pending),
+        ];
+        assert_eq!(
+            should_pause(&s, &units, 1),
+            Some(PauseReason::DefGate { reviewing_ord: 1 }),
+            "the more specific source wins the tie; the run still pauses either way"
         );
     }
 
@@ -3779,10 +3885,7 @@ mod gate_pause_tests {
             ),
             unit(2, GateSpec::Auto, UnitStatus::Pending),
         ];
-        assert!(
-            !should_pause(&s, &passed, 1),
-            "clean pass (Done) ⇒ no pause"
-        );
+        assert_eq!(should_pause(&s, &passed, 1), None, "clean pass (Done) ⇒ no pause");
         let not_passed = vec![
             unit(
                 1,
@@ -3791,9 +3894,10 @@ mod gate_pause_tests {
             ),
             unit(2, GateSpec::Auto, UnitStatus::Pending),
         ];
-        assert!(
+        assert_eq!(
             should_pause(&s, &not_passed, 1),
-            "not a clean pass ⇒ pause for a human"
+            Some(PauseReason::DefGate { reviewing_ord: 1 }),
+            "not a clean pass ⇒ pause for a human, reviewing the unit that did not pass"
         );
     }
 }

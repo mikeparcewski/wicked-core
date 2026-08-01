@@ -1032,9 +1032,9 @@ mod tests {
             &["type", "session", "ord"],
         );
         check(
-            CoreEvent::AwaitingHuman { session: s(), ord: 1, prompt: s() },
+            CoreEvent::AwaitingHuman { session: s(), ord: 1, reviewing_ord: Some(1), prompt: s() },
             "awaitingHuman",
-            &["type", "session", "ord", "prompt"],
+            &["type", "session", "ord", "reviewingOrd", "prompt"],
         );
         check(
             CoreEvent::Resumed { session: s(), ord: 1 },
