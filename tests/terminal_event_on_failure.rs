@@ -148,6 +148,11 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
                     message.contains("deadbeefdeadbeef"),
                     "the Error must carry the fail-closed reason: {message}"
                 );
+                // A refusal the operator cannot act on is only half a message.
+                assert!(
+                    message.contains("wicked-core provision-validator"),
+                    "the fail-closed reason must name a command that resolves it: {message}"
+                );
                 saw_error = true;
             }
             Ok(_) => {}
