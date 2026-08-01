@@ -53,6 +53,9 @@ pub struct EvaluationOutcome {
     pub claim_id: String,
     pub decision: String,
     pub approved: bool,
+    /// Ids of the policies APPLICABLE to this unit's eval phase. Empty ⇒ nothing applied and
+    /// `approved` is a vacuous default-allow, not an enforced pass (FINDING-025).
+    pub policies: Vec<String>,
 }
 
 /// Apply one unit's governance gate + writes given an **already-produced** `output`. The worker
@@ -264,11 +267,18 @@ pub fn evaluate_unit(
     let claim_id = claim.claim_id.clone();
     conform(store, &claim)?;
 
+    // The APPLICABLE policy ids, not merely the ones whose trigger matched. A selected policy did
+    // examine this unit; returning Allow because its trigger found nothing is genuine enforcement.
+    // An EMPTY list is the honest signal that nothing applied and `approved` is a default-allow
+    // (FINDING-025) — the distinction `approved` alone cannot express.
+    let policies = selected.iter().map(|p| p.id.clone()).collect();
+
     Ok(EvaluationOutcome {
         evaluator_identity,
         claim_id,
         decision,
         approved,
+        policies,
     })
 }
 
@@ -403,6 +413,73 @@ mod tests {
             get_work_output(&store, "s:u2").as_deref(),
             Some("the approved output"),
             "an approved unit stores its work_output"
+        );
+    }
+
+    /// FINDING-025: `evaluate_unit` must report WHICH policies it applied, because `approved`
+    /// alone cannot distinguish an enforced pass from a default-allow. The policy engine runs on
+    /// every unit and returns Allow on an empty selection, so a consumer that reads only
+    /// `approved` credits governance to units nothing ever gated — which is exactly what the
+    /// studio ledger did.
+    #[test]
+    fn evaluate_unit_reports_an_empty_policy_list_when_nothing_applied() {
+        use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut unit = WorkUnit::pending("s:review", "s", 1, "review it");
+        unit.assigned_cli = Some("claude".into());
+
+        // No policy registered at all: approved, but VACUOUSLY so.
+        let bare =
+            evaluate_unit(&mut store, &unit, "output", "codex", "scope-a", "unit-1", 1).unwrap();
+        assert!(bare.approved, "an empty policy set default-allows");
+        assert!(
+            bare.policies.is_empty(),
+            "nothing applied ⇒ the list must be EMPTY so the caller can see the pass is vacuous"
+        );
+
+        // A policy applicable to this eval phase, whose trigger does NOT match. It still EXAMINED
+        // the unit, so it is reported: an allow from a policy that looked is genuine enforcement,
+        // unlike an allow from no policy at all.
+        register_policy(
+            &mut store,
+            &Policy {
+                id: "pol-review-secrets".into(),
+                kind: "guard".into(),
+                // `evaluate_unit` runs at `eval-<phase>`; the alias pair covers `eval-review`.
+                applies_to: vec!["eval-review".into()],
+                effect: Effect::Deny,
+                trigger: Trigger {
+                    contains: Some("AKIA".into()),
+                },
+                obligations: vec![],
+                criteria: "review: no credentials in output".into(),
+                rule: "deny review output containing an AWS key id".into(),
+                severity: Severity::High,
+            },
+        )
+        .unwrap();
+
+        // Pass the SYNTHETIC `unit-1` that production actually passes (`apply_and_finish_unit` uses
+        // `scope::unit_phase`), NOT `review`. That makes `eval_phase` = `eval-unit-1`, so selecting
+        // `eval-review` is only possible through the alias derived from the unit id — the real path.
+        // Passing `review` here would match on the primary token and leave the alias untested, so a
+        // regression that stopped aliasing would still pass this test (FINDING-021's failure mode).
+        let gated = evaluate_unit(
+            &mut store,
+            &unit,
+            "clean output",
+            "codex",
+            "scope-a",
+            "unit-1",
+            2,
+        )
+        .unwrap();
+        assert!(gated.approved, "the trigger did not match, so it allows");
+        assert_eq!(
+            gated.policies,
+            vec!["pol-review-secrets".to_string()],
+            "a policy that examined the unit must be named, so the allow reads as ENFORCED"
         );
     }
 

@@ -624,6 +624,13 @@ pub(crate) fn apply_and_finish_unit(
     // visible: `Some(false)` when this layer denied (det may still have passed + no agent judge ran),
     // `Some(true)` when it approved, `None` when it did not run.
     let evaluator_pass = eval.as_ref().map(|e| e.approved);
+    // (FINDING-025) The policies that second pass actually applied. `evaluator_pass` is vacuously
+    // true when none did — the policy engine runs on every unit and default-allows on an empty
+    // selection — so this is what lets a consumer tell an ENFORCED pass from an UNGATED one.
+    let evaluator_policies = eval
+        .as_ref()
+        .map(|e| e.policies.clone())
+        .unwrap_or_default();
     let evaluator_denial = eval.as_ref().and_then(|e| {
         (!e.approved).then(|| {
             format!(
@@ -740,6 +747,7 @@ pub(crate) fn apply_and_finish_unit(
         agent_verdict: agent_verdict_str,
         agent_reasoning,
         evaluator_pass,
+        evaluator_policies,
         denial_reason,
         combined: outcome.approved,
     });

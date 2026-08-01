@@ -218,6 +218,8 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
         // (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `gateDecided`. camelCase fields;
         // `criterion`/`agentVerdict`/`agentReasoning`/`denialReason` are nullable (Option → null),
         // `evaluatorPass` is a nullable bool (`None` = the evaluator≠creator pass did not run).
+        // `evaluatorPolicies` is the applicable-policy id list; EMPTY alongside `evaluatorPass: true`
+        // means nothing applied — a default-allow, not an enforced pass (FINDING-025).
         CoreEvent::GateEvaluated {
             session,
             ord,
@@ -227,6 +229,7 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             agent_verdict,
             agent_reasoning,
             evaluator_pass,
+            evaluator_policies,
             denial_reason,
             combined,
         } => json!({
@@ -239,6 +242,7 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
             "agentVerdict": agent_verdict,
             "agentReasoning": agent_reasoning,
             "evaluatorPass": evaluator_pass,
+            "evaluatorPolicies": evaluator_policies,
             "denialReason": denial_reason,
             "combined": combined,
         }),
@@ -1496,6 +1500,7 @@ mod tests {
                 agent_verdict: Some(s()),
                 agent_reasoning: Some(s()),
                 evaluator_pass: Some(true),
+                evaluator_policies: vec![s()],
                 denial_reason: None,
                 combined: true,
             },
@@ -1510,6 +1515,7 @@ mod tests {
                 "agentVerdict",
                 "agentReasoning",
                 "evaluatorPass",
+                "evaluatorPolicies",
                 "denialReason",
                 "combined",
             ],
