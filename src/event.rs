@@ -1084,11 +1084,10 @@ impl CoreEvent {
                 "stepStatus": step_status,
                 "governed": governed,
             }),
-            // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
-            // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
-            // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
-            // than a compile break in the operative napi crate the daemon loads. When a new variant
-            // lands, add an explicit arm ABOVE this one (and pin it in the drift test).
+            // This mapping used to live in the napi crate, OUTSIDE the defining one, where
+            // `#[non_exhaustive]` forced a `_` arm and an unmapped variant surfaced as a benign
+            // `{"type":"unknown"}` frame. In here that arm is dead code and has been removed: a new
+            // variant without an arm is a BUILD failure, not a silent hole in the audit trail.
             CoreEvent::ChatSessionReady { chat, cli_key } => {
                 json!({ "type": "chatSessionReady", "chat": chat, "cliKey": cli_key })
             }

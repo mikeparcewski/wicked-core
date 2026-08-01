@@ -141,14 +141,19 @@ const fn high_volume_type_names() -> [&'static str; 4] {
 
 /// The run a tagged event belongs to, read out of the JSON rather than re-matched per variant.
 ///
-/// Most variants carry `session`; campaign node events carry the node's `run_id`. Deriving the key
-/// from the emitted object means a NEW variant that follows the convention is logged automatically —
-/// a second hand-written 125-arm match would be a second thing to forget. `None` ⇒ not run-scoped
-/// (chat, terminal, campaign-level), so not part of any run's evidence.
+/// Most variants carry `session`; campaign node events carry the node's run as `runId`. Deriving
+/// the key from the emitted object means a NEW variant that follows the convention is logged
+/// automatically — a second hand-written 125-arm match would be a second thing to forget.
+/// `None` ⇒ not run-scoped (chat, terminal, campaign-level), so not part of any run's evidence.
+///
+/// The key is `runId`, not `run_id`, because the emitted JSON is camelCase throughout. An earlier
+/// cut of this function looked for `run_id` — a key `to_json` emits nowhere — so both campaign node
+/// events were dropped from every run's history while the code read as though it handled them.
+/// `campaign_node_events_are_routed_to_their_run` pins the live spelling.
 pub fn run_key(json: &serde_json::Value) -> Option<&str> {
     json.get("session")
         .and_then(|v| v.as_str())
-        .or_else(|| json.get("run_id").and_then(|v| v.as_str()))
+        .or_else(|| json.get("runId").and_then(|v| v.as_str()))
 }
 
 /// One unit of work for the writer thread: a fully-resolved destination and the exact line to append.
@@ -553,6 +558,49 @@ mod tests {
                 ev.to_json()["type"]
             );
         }
+    }
+
+    /// Campaign node events name their run as `runId`, not `session`. They are the ONLY variants
+    /// routed by the second key, so a wrong spelling there costs an entire class of history while
+    /// every other test still passes — which is exactly what happened: `run_key` first looked for
+    /// `run_id`, a key nothing emits, and both variants were dropped.
+    #[test]
+    fn campaign_node_events_are_routed_to_their_run() {
+        let events = [
+            CoreEvent::CampaignNodeStarted {
+                campaign: "c1".to_string(),
+                node: "n1".to_string(),
+                run_id: "run-7".to_string(),
+            },
+            CoreEvent::CampaignNodeAwaitingHuman {
+                campaign: "c1".to_string(),
+                node: "n1".to_string(),
+                run_id: "run-7".to_string(),
+                prompt: "approve?".to_string(),
+            },
+        ];
+        for ev in &events {
+            let json = ev.to_json();
+            assert_eq!(
+                run_key(&json),
+                Some("run-7"),
+                "{} carries a run but was not routed to it",
+                json["type"]
+            );
+        }
+
+        // And end-to-end through the sink, so the routing key and the file it lands in agree.
+        let root = tmp("campaign-node");
+        let mut sink = EventSink::persistent(root.clone());
+        for ev in events {
+            sink.emit(ev);
+        }
+        let recorded = read_run(&root, "run-7");
+        assert_eq!(
+            recorded.len(),
+            2,
+            "campaign node events must appear in their run's history, got {recorded:?}"
+        );
     }
 
     /// A crash mid-append leaves a torn final line. That must cost the torn record only — not the
