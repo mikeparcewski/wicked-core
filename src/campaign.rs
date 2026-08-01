@@ -613,9 +613,12 @@ pub(crate) struct Seams<'a> {
     pub registry: &'a crate::workflow::WorkflowRegistry,
 }
 
-/// Fan an event out to every live subscriber (mirrors the actor's single-emit-point helper).
-fn emit(subscribers: &mut Vec<Sender<CoreEvent>>, ev: CoreEvent) {
-    subscribers.retain(|s| s.send(ev.clone()).is_ok());
+/// Record + fan out one event (mirrors the actor's single-emit-point helper). Both helpers now bottom
+/// out in [`crate::event_log::EventSink::emit`], so campaign events land in the durable per-run log on
+/// the same terms as the actor's — a second emit path that only fanned out would be a hole in the
+/// audit trail exactly where a campaign's node history lives (FINDING-014).
+fn emit(subscribers: &mut crate::event_log::EventSink, ev: CoreEvent) {
+    subscribers.emit(ev);
 }
 
 /// Persist the campaign (one node round-trip). Mirrors `pending_decision` into its serde shape first.
@@ -628,7 +631,7 @@ fn persist(store: &mut dyn GraphStore, campaign: &mut Campaign) -> anyhow::Resul
 /// `Ready`, `try_fill()`. Returns the campaign id.
 pub(crate) fn launch(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
     def: CampaignDef,
@@ -668,7 +671,7 @@ pub(crate) fn launch(
 
 /// Promote every newly-satisfied `Pending` node to `Ready` (emit `CampaignNodeReady`). Pure ready-set
 /// computation drives it; this is the side-effecting half.
-fn promote_ready(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
+fn promote_ready(campaign: &mut Campaign, subscribers: &mut crate::event_log::EventSink) {
     let rs = ready_set(
         &campaign.def.nodes,
         &campaign.def.edges,
@@ -695,7 +698,7 @@ fn promote_ready(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent
 fn try_fill(
     campaign: &mut Campaign,
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
 ) -> anyhow::Result<()> {
@@ -718,7 +721,7 @@ fn dispatch(
     campaign: &mut Campaign,
     node_id: &str,
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
 ) -> anyhow::Result<()> {
@@ -819,7 +822,7 @@ fn dispatch(
 /// bounded linear scan (an abandoned prior-attempt id maps to no node and is safely dropped).
 pub(crate) fn on_run_finished(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
     run_id: &str,
@@ -860,7 +863,7 @@ fn reconcile_terminal(
     node_id: &str,
     outcome: NodeOutcome,
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
 ) -> anyhow::Result<()> {
@@ -900,7 +903,7 @@ fn reconcile_terminal(
 /// prompt, and `try_fill()` so independent work uses the freed slot.
 pub(crate) fn on_node_awaiting(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
     run_id: &str,
@@ -937,7 +940,7 @@ pub(crate) fn on_node_awaiting(
 /// (`Retry`/`Skip`/`Abort` on a queued `Failed` node).
 pub(crate) fn confirm_gate(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
     id: &str,
@@ -1041,7 +1044,7 @@ pub(crate) fn confirm_gate(
 /// `PauseCampaign` (DES §4 step 6): stop dispatching new nodes; in-flight continue cooperatively.
 pub(crate) fn pause(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     id: &str,
 ) -> anyhow::Result<CampaignStatus> {
     let mut campaign =
@@ -1064,7 +1067,7 @@ pub(crate) fn pause(
 /// `Cancelled`.
 pub(crate) fn cancel(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
     id: &str,
@@ -1121,7 +1124,7 @@ pub(crate) fn cancel(
 /// duplicates (the run id is derived, and `dispatch()` is the sole writer of `node_run_id`).
 pub(crate) fn resume(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
     id: &str,
@@ -1312,7 +1315,7 @@ fn apply_failure_policy(
     campaign: &mut Campaign,
     failed_node: &str,
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
 ) -> anyhow::Result<()> {
@@ -1356,7 +1359,7 @@ fn fail_fast(
     campaign: &mut Campaign,
     _failed_node: &str,
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     in_flight: &mut HashSet<String>,
     seams: &Seams,
 ) -> anyhow::Result<()> {
@@ -1392,7 +1395,7 @@ fn fail_fast(
 }
 
 /// Recompute `blocked_by_failure` and mark newly-blocked nodes `Blocked` (emit `CampaignNodeBlocked`).
-fn apply_blocking(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
+fn apply_blocking(campaign: &mut Campaign, subscribers: &mut crate::event_log::EventSink) {
     let blocked = blocked_by_failure(
         &campaign.def.nodes,
         &campaign.def.edges,
@@ -1418,7 +1421,7 @@ fn apply_blocking(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEven
 /// `AwaitingHuman`/`ReadyToResume`, and nothing dispatchable. `Completed` if all nodes `Completed`;
 /// `Failed` if fail-fast tripped; else `PartiallyCompleted` (some blocked/failed under
 /// continue-independent). No-op while Paused/terminal (guarded on `Running`).
-fn finalize_if_done(campaign: &mut Campaign, subscribers: &mut Vec<Sender<CoreEvent>>) {
+fn finalize_if_done(campaign: &mut Campaign, subscribers: &mut crate::event_log::EventSink) {
     if campaign.status != CampaignStatus::Running {
         return;
     }

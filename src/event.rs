@@ -513,3 +513,610 @@ pub enum CoreEvent {
     /// The campaign was cancelled by the operator.
     CampaignCancelled { campaign: String },
 }
+
+impl CoreEvent {
+    /// Serialize to the tagged JSON object (`{ "type": "...", ...fields }`) that IS this event's
+    /// wire identity — the shape the studio's `/ws` stream carries and the shape the durable event
+    /// log ([`crate::event_log`]) records. `CoreEvent` is deliberately not `serde::Serialize`
+    /// (variant names are snake_cased and several fields are reshaped for JS), so every variant is
+    /// mapped by hand.
+    ///
+    /// One mapping, two consumers, on purpose (FINDING-014). This previously lived PRIVATE inside the
+    /// napi bridge, so core had no way to name its own events — which is how the daemon came to invent
+    /// its own vocabulary (`routingDecided`) for evidence it re-derived from unit records instead of
+    /// reading a real event trail. Anything that needs to name a `CoreEvent` now goes through here, so
+    /// the log, the socket, and the evidence bundle cannot drift apart.
+    ///
+    /// The `type` value is also the log's routing key via [`crate::event_log::run_key`], which reads
+    /// `session` (or `run_id`) straight out of this object rather than re-matching the enum — a second
+    /// hand-written per-variant match would be a second thing to forget to update.
+    ///
+    /// The match is EXHAUSTIVE and must stay that way. `CoreEvent` is `#[non_exhaustive]`, so while
+    /// this lived outside the crate it needed catch-all arms — and a variant nobody had mapped
+    /// serialized as `{"type":"unknown"}`, a silent hole in the very trail this is the evidence for.
+    /// In the defining crate `non_exhaustive` does not apply, so those arms are dead and have been
+    /// removed: adding a variant without mapping it is now a BUILD failure, not a mystery event.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            CoreEvent::Heartbeat => json!({ "type": "heartbeat" }),
+            CoreEvent::SessionStarted {
+                session,
+                problem,
+                workflow_id,
+                cli_count,
+                governed,
+                entity_mode,
+            } => {
+                json!({
+                    "type": "sessionStarted",
+                    "session": session,
+                    "problem": problem,
+                    "workflowId": workflow_id,
+                    "cliCount": cli_count,
+                    "governed": governed,
+                    "entityMode": entity_mode,
+                })
+            }
+            CoreEvent::UnitPlanned {
+                session,
+                ord,
+                description,
+                stage,
+                role,
+                gate,
+                skill_ref,
+                has_validator_pin,
+                executor_type,
+            } => json!({
+                "type": "unitPlanned",
+                "session": session,
+                "ord": ord,
+                "description": description,
+                "stage": stage,
+                "role": role,
+                "gate": gate,
+                "skillRef": skill_ref,
+                "hasValidatorPin": has_validator_pin,
+                "executorType": executor_type,
+            }),
+            CoreEvent::UnitDistributed {
+                session,
+                ord,
+                cli,
+                routing_method,
+                agreement_pct,
+                returned,
+                dissent,
+                degraded_reason,
+            } => {
+                json!({
+                    "type": "unitDistributed",
+                    "session": session,
+                    "ord": ord,
+                    "cli": cli,
+                    "routingMethod": routing_method,
+                    "agreementPct": agreement_pct,
+                    "returned": returned,
+                    "dissent": dissent,
+                    "degradedReason": degraded_reason,
+                })
+            }
+            CoreEvent::CouncilConvened { session, ord, clis } => json!({
+                "type": "councilConvened",
+                "session": session,
+                "ord": ord,
+                "clis": clis,
+            }),
+            CoreEvent::CouncilDeliberated {
+                session,
+                ord,
+                round,
+                agreement_pct,
+                needed_pct,
+                votes,
+            } => json!({
+                "type": "councilDeliberated",
+                "session": session,
+                "ord": ord,
+                "round": round,
+                "agreementPct": agreement_pct,
+                "neededPct": needed_pct,
+                "votes": votes,
+            }),
+            CoreEvent::CouncilVoted {
+                session,
+                ord,
+                consensus,
+                agreement_pct,
+                votes,
+            } => json!({
+                "type": "councilVoted",
+                "session": session,
+                "ord": ord,
+                "consensus": consensus,
+                "agreementPct": agreement_pct,
+                "votes": votes,
+            }),
+            CoreEvent::UnitExecuting { session, ord } => {
+                json!({ "type": "unitExecuting", "session": session, "ord": ord })
+            }
+            CoreEvent::CliOutputDelta {
+                session,
+                ord,
+                chunk,
+            } => {
+                json!({ "type": "cliOutputDelta", "session": session, "ord": ord, "chunk": chunk })
+            }
+            CoreEvent::GateDecided {
+                session,
+                ord,
+                allow,
+            } => json!({ "type": "gateDecided", "session": session, "ord": ord, "allow": allow }),
+            // (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `gateDecided`. camelCase fields;
+            // `criterion`/`agentVerdict`/`agentReasoning`/`denialReason` are nullable (Option → null),
+            // `evaluatorPass` is a nullable bool (`None` = the evaluator≠creator pass did not run).
+            // `evaluatorPolicies` is the applicable-policy id list; EMPTY alongside `evaluatorPass: true`
+            // means nothing applied — a default-allow, not an enforced pass (FINDING-025).
+            CoreEvent::GateEvaluated {
+                session,
+                ord,
+                criterion,
+                has_deterministic_floor,
+                deterministic_pass,
+                agent_verdict,
+                agent_reasoning,
+                evaluator_pass,
+                evaluator_policies,
+                denial_reason,
+                combined,
+            } => json!({
+                "type": "gateEvaluated",
+                "session": session,
+                "ord": ord,
+                "criterion": criterion,
+                "hasDeterministicFloor": has_deterministic_floor,
+                "deterministicPass": deterministic_pass,
+                "agentVerdict": agent_verdict,
+                "agentReasoning": agent_reasoning,
+                "evaluatorPass": evaluator_pass,
+                "evaluatorPolicies": evaluator_policies,
+                "denialReason": denial_reason,
+                "combined": combined,
+            }),
+            // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`
+            // marks a re-dispatch.
+            CoreEvent::UnitDispatched {
+                session,
+                ord,
+                attempt,
+            } => {
+                json!({ "type": "unitDispatched", "session": session, "ord": ord, "attempt": attempt })
+            }
+            // (DES-STUDIO-COCKPIT-001 §3 B3) Token/cost burn for one unit run. `costUsd` is nullable
+            // (`None` → null when the CLI reports no cost and no price table resolves it).
+            CoreEvent::CliUsage {
+                session,
+                ord,
+                attempt,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+            } => json!({
+                "type": "cliUsage",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "costUsd": cost_usd,
+            }),
+            // (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched.
+            CoreEvent::DataUsed {
+                session,
+                ord,
+                files,
+            } => json!({ "type": "dataUsed", "session": session, "ord": ord, "files": files }),
+            CoreEvent::UnitDone { session, ord } => {
+                json!({ "type": "unitDone", "session": session, "ord": ord })
+            }
+            CoreEvent::UnitDenied { session, ord } => {
+                json!({ "type": "unitDenied", "session": session, "ord": ord })
+            }
+            CoreEvent::AwaitingHuman {
+                session,
+                ord,
+                prompt,
+            } => {
+                json!({ "type": "awaitingHuman", "session": session, "ord": ord, "prompt": prompt })
+            }
+            CoreEvent::Resumed { session, ord } => {
+                json!({ "type": "resumed", "session": session, "ord": ord })
+            }
+            CoreEvent::RunCancelled { session } => {
+                json!({ "type": "runCancelled", "session": session })
+            }
+            CoreEvent::SessionFailed { session, ord } => {
+                json!({ "type": "sessionFailed", "session": session, "ord": ord })
+            }
+            CoreEvent::RepoRegistered { repo_ref } => {
+                json!({ "type": "repoRegistered", "repoRef": repo_ref })
+            }
+            CoreEvent::SessionCompleted { session } => {
+                json!({ "type": "sessionCompleted", "session": session })
+            }
+            CoreEvent::WorkerMessageQueued {
+                session,
+                message,
+                target,
+            } => json!({
+                "type": "workerMessageQueued",
+                "session": session,
+                "message": message,
+                "target": target,
+            }),
+            CoreEvent::WorkerMessageInjected {
+                session,
+                message,
+                target,
+            } => json!({
+                "type": "workerMessageInjected",
+                "session": session,
+                "message": message,
+                "target": target,
+            }),
+            CoreEvent::UnitReassigned {
+                session,
+                ord,
+                attempt,
+                previous_cli,
+                new_cli,
+            } => json!({
+                "type": "unitReassigned",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "previousCli": previous_cli,
+                "newCli": new_cli,
+            }),
+            CoreEvent::Error { session, message } => {
+                json!({ "type": "error", "session": session, "message": message })
+            }
+            // PTY terminal sessions (DES-TERMINAL-001). Mapped minimally to keep this exhaustive match
+            // compiling now that core carries the terminal capability; the full TS surface (openTerminal
+            // etc.) is a separate follow-on task.
+            CoreEvent::TerminalOpened { id, cwd } => {
+                json!({ "type": "terminalOpened", "id": id, "cwd": cwd })
+            }
+            CoreEvent::TerminalOutput { id, seq, bytes_b64 } => {
+                json!({ "type": "terminalOutput", "id": id, "seq": seq, "bytesB64": bytes_b64 })
+            }
+            CoreEvent::TerminalExited { id, status } => {
+                json!({ "type": "terminalExited", "id": id, "status": status })
+            }
+            // Campaign DAG scheduler (DES-CAMPAIGN-001). Additive tagged-JSON mappings — the studio
+            // ignores unknown event types, so these never disturb existing consumers. The full campaign
+            // binding surface (launchCampaign etc.) is a separate follow-on task.
+            CoreEvent::CampaignLaunched { campaign } => {
+                json!({ "type": "campaignLaunched", "campaign": campaign })
+            }
+            CoreEvent::CampaignNodeReady { campaign, node } => {
+                json!({ "type": "campaignNodeReady", "campaign": campaign, "node": node })
+            }
+            CoreEvent::CampaignNodeStarted {
+                campaign,
+                node,
+                run_id,
+            } => {
+                json!({ "type": "campaignNodeStarted", "campaign": campaign, "node": node, "runId": run_id })
+            }
+            CoreEvent::CampaignNodeAwaitingHuman {
+                campaign,
+                node,
+                run_id,
+                prompt,
+            } => {
+                json!({ "type": "campaignNodeAwaitingHuman", "campaign": campaign, "node": node, "runId": run_id, "prompt": prompt })
+            }
+            CoreEvent::CampaignNodeCompleted { campaign, node } => {
+                json!({ "type": "campaignNodeCompleted", "campaign": campaign, "node": node })
+            }
+            CoreEvent::CampaignNodeFailed { campaign, node } => {
+                json!({ "type": "campaignNodeFailed", "campaign": campaign, "node": node })
+            }
+            CoreEvent::CampaignNodeBlocked { campaign, node } => {
+                json!({ "type": "campaignNodeBlocked", "campaign": campaign, "node": node })
+            }
+            CoreEvent::CampaignPaused { campaign } => {
+                json!({ "type": "campaignPaused", "campaign": campaign })
+            }
+            CoreEvent::CampaignCompleted { campaign } => {
+                json!({ "type": "campaignCompleted", "campaign": campaign })
+            }
+            CoreEvent::CampaignFailed { campaign } => {
+                json!({ "type": "campaignFailed", "campaign": campaign })
+            }
+            CoreEvent::CampaignCancelled { campaign } => {
+                json!({ "type": "campaignCancelled", "campaign": campaign })
+            }
+            // P1 observability events — worker failure + crash recovery.
+            CoreEvent::StepFailed {
+                session,
+                ord,
+                attempt,
+                detail,
+                failure_kind,
+            } => json!({
+                "type": "stepFailed",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "detail": detail,
+                "failureKind": match failure_kind {
+                    StepFailureKind::WorkerError => "workerError",
+                    StepFailureKind::EnvironmentRefused => "environmentRefused",
+                },
+            }),
+            CoreEvent::WorkerStalled {
+                session,
+                ord,
+                terminal_id,
+                stalled_secs,
+            } => json!({
+                "type": "workerStalled",
+                "session": session,
+                "ord": ord,
+                "terminalId": terminal_id,
+                "stalledSecs": stalled_secs,
+            }),
+            CoreEvent::AssumptionRecorded {
+                session,
+                ord,
+                kind,
+                library,
+                transform,
+                known,
+                detail,
+            } => json!({
+                "type": "assumptionRecorded",
+                "session": session,
+                "ord": ord,
+                "kind": kind,
+                "library": library,
+                "transform": transform,
+                "known": known,
+                "detail": detail,
+            }),
+            CoreEvent::FailureTriaged {
+                session,
+                ord,
+                decision,
+                analysis,
+            } => json!({
+                "type": "failureTriaged",
+                "session": session,
+                "ord": ord,
+                "decision": decision,
+                "analysis": analysis,
+            }),
+            CoreEvent::CrashRecoveryRedrive {
+                session,
+                ord,
+                attempt,
+            } => json!({
+                "type": "crashRecoveryRedrive",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+            }),
+            CoreEvent::WorkerSessionStarted {
+                session,
+                terminal_id,
+                cli_key,
+            } => json!({
+                "type": "workerSessionStarted",
+                "session": session,
+                "terminalId": terminal_id,
+                "cliKey": cli_key,
+            }),
+            CoreEvent::AcpSessionStarted {
+                session,
+                cli_key,
+                acp_session_id,
+            } => json!({
+                "type": "acpSessionStarted",
+                "session": session,
+                "cliKey": cli_key,
+                "acpSessionId": acp_session_id,
+            }),
+            CoreEvent::AcpFallback {
+                session,
+                cli_key,
+                reason,
+                fallback_kind,
+            } => json!({
+                "type": "acpFallback",
+                "session": session,
+                "cliKey": cli_key,
+                "reason": reason,
+                "fallbackKind": fallback_kind,
+            }),
+            // P2 observability events — worker-lifecycle wave (EVT-003, EVT-004, EVT-007).
+            CoreEvent::WorkerSessionReused {
+                session,
+                terminal_id,
+                ord,
+            } => json!({
+                "type": "workerSessionReused",
+                "session": session,
+                "terminalId": terminal_id,
+                "ord": ord,
+            }),
+            CoreEvent::WorkerSessionClosed {
+                session,
+                terminal_id,
+                reason,
+            } => json!({
+                "type": "workerSessionClosed",
+                "session": session,
+                "terminalId": terminal_id,
+                "reason": reason,
+            }),
+            CoreEvent::UnitContextInjected {
+                session,
+                ord,
+                recipient_cli,
+                prior_units,
+            } => json!({
+                "type": "unitContextInjected",
+                "session": session,
+                "ord": ord,
+                "recipientCli": recipient_cli,
+                "priorUnits": prior_units.iter().map(|c| json!({
+                    "ord": c.ord,
+                    "label": c.label,
+                    "outputBytes": c.output_bytes,
+                })).collect::<Vec<_>>(),
+            }),
+            // ── P2 governance-deep wave (EVT-008, EVT-009, EVT-010, EVT-011, EVT-016) ──────────
+            CoreEvent::GovernanceHookFired {
+                session,
+                ord,
+                attempt,
+                tool_name,
+                decision,
+                denying_policy,
+            } => json!({
+                "type": "governanceHookFired",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "toolName": tool_name,
+                "decision": decision,
+                "denyingPolicy": denying_policy,
+            }),
+            CoreEvent::ValidationPinAttached {
+                session,
+                ord,
+                pin,
+                criterion,
+            } => json!({
+                "type": "validationPinAttached",
+                "session": session,
+                "ord": ord,
+                "pin": pin,
+                "criterion": criterion,
+            }),
+            CoreEvent::GateEscalated {
+                session,
+                ord,
+                condition,
+                verdict_summary,
+            } => json!({
+                "type": "gateEscalated",
+                "session": session,
+                "ord": ord,
+                "condition": condition,
+                "verdictSummary": verdict_summary,
+            }),
+            CoreEvent::ToolExecutorDispatched {
+                session,
+                ord,
+                cmd,
+                workdir,
+            } => json!({
+                "type": "toolExecutorDispatched",
+                "session": session,
+                "ord": ord,
+                "cmd": cmd,
+                "workdir": workdir,
+            }),
+            CoreEvent::GovernanceContextArmed {
+                session,
+                ord,
+                attempt,
+                path,
+                db_path,
+            } => json!({
+                "type": "governanceContextArmed",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "path": path,
+                "dbPath": db_path,
+            }),
+            // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
+            CoreEvent::WorkflowSelected {
+                session,
+                workflow_id,
+                unit_count,
+            } => json!({
+                "type": "workflowSelected",
+                "session": session,
+                "workflowId": workflow_id,
+                "unitCount": unit_count,
+            }),
+            CoreEvent::UnitReworkAmended {
+                session,
+                ord,
+                amendment,
+                updated_description,
+            } => json!({
+                "type": "unitReworkAmended",
+                "session": session,
+                "ord": ord,
+                "amendment": amendment,
+                "updatedDescription": updated_description,
+            }),
+            CoreEvent::UnitOutputCaptured {
+                session,
+                ord,
+                attempt,
+                output_bytes,
+                step_status,
+                governed,
+            } => json!({
+                "type": "unitOutputCaptured",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "outputBytes": output_bytes,
+                "stepStatus": step_status,
+                "governed": governed,
+            }),
+            // Defensive floor: `CoreEvent` is `#[non_exhaustive]`, so a future variant added to
+            // wicked-core cannot silently break THIS crate's build (C1). It surfaces as a benign
+            // `{"type":"unknown"}` frame the studio's additive event switch already ignores — better
+            // than a compile break in the operative napi crate the daemon loads. When a new variant
+            // lands, add an explicit arm ABOVE this one (and pin it in the drift test).
+            CoreEvent::ChatSessionReady { chat, cli_key } => {
+                json!({ "type": "chatSessionReady", "chat": chat, "cliKey": cli_key })
+            }
+            CoreEvent::ChatSessionFailed {
+                chat,
+                cli_key,
+                reason,
+            } => {
+                json!({ "type": "chatSessionFailed", "chat": chat, "cliKey": cli_key, "reason": reason })
+            }
+            CoreEvent::ChatDelta {
+                chat,
+                cli_key,
+                text,
+            } => {
+                json!({ "type": "chatDelta", "chat": chat, "cliKey": cli_key, "text": text })
+            }
+            CoreEvent::ChatReply {
+                chat,
+                cli_key,
+                text,
+                ok,
+            } => {
+                json!({ "type": "chatReply", "chat": chat, "cliKey": cli_key, "text": text, "ok": ok })
+            }
+            CoreEvent::ChatClosed { chat } => {
+                json!({ "type": "chatClosed", "chat": chat })
+            }
+        }
+    }
+}

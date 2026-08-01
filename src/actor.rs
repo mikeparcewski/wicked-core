@@ -130,6 +130,24 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
     Some(crate::workflow::GovernanceContext { db_path: abs })
 }
 
+/// The FILESYSTEM base the per-core sidecars hang off: `<base>.mem`, `<base>.knowledge` and
+/// `<base>.events`.
+///
+/// When the graph store is a URL backend (e.g. `postgres://…`), `path` is not a filesystem path and
+/// appending `.mem` would yield a bogus `postgres://….mem`, so the sidecars anchor at the local estate
+/// default instead.
+///
+/// Shared rather than inlined because [`crate::Core`] derives the event-log root from it too, off the
+/// actor thread — two copies of this rule would mean a reader that looks in the wrong directory for a
+/// postgres-backed core, and the symptom would be an empty evidence trail rather than an error.
+pub(crate) fn sidecar_base(path: &str) -> String {
+    if path.contains("://") {
+        ".wicked-estate/graph.db".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
@@ -162,15 +180,7 @@ pub(crate) fn run(
     // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
     GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
 
-    // The memory + knowledge sidecars are SQLite-only local stores keyed off a FILESYSTEM base
-    // (`<base>.mem` / `<base>.knowledge`). When the graph store is a URL backend (e.g.
-    // `postgres://…`), `path` is NOT a filesystem path, so appending `.mem` would yield a bogus
-    // `postgres://….mem`. In that case anchor the sidecars at the local estate default instead.
-    let sidecar_base: String = if path.contains("://") {
-        ".wicked-estate/graph.db".to_string()
-    } else {
-        path.clone()
-    };
+    let sidecar_base: String = sidecar_base(&path);
 
     // The orchestrator's episodic memory (a SEPARATE single-writer store, sibling of the estate db).
     // Best-effort: a memory-open failure must never stop the engine, so it's an `Option`.
@@ -190,7 +200,12 @@ pub(crate) fn run(
         }
     };
 
-    let mut subscribers: Vec<Sender<CoreEvent>> = Vec::new();
+    // Fans out to live subscribers AND records to the durable per-run event log (FINDING-014), so a
+    // run's evidence no longer depends on someone holding a socket while it happened. Rooted at
+    // `<store>.events` — the same sidecar anchor as memory/knowledge above, so a core opened against a
+    // scratch db keeps its logs there instead of in a shared global tree.
+    let mut subscribers =
+        crate::event_log::EventSink::persistent(crate::event_log::log_root(&sidecar_base));
     // Runs with a worker step in flight — guards against double-dispatch (non-idempotent side effects).
     let mut in_flight: HashSet<String> = HashSet::new();
     // The actor-owned PTY terminal registry (id → status + seq). Byte-I/O lives off-actor in
@@ -1983,7 +1998,7 @@ pub(crate) fn run(
 fn finish_terminal(
     terminals: &mut HashMap<String, TermReg>,
     map: &PtyMap,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     id: &str,
     kill: bool,
 ) {
@@ -2102,7 +2117,7 @@ fn validate_session_id(run_id: &str) -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_run_inner(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -2175,7 +2190,7 @@ pub(crate) fn launch_run_inner(
 /// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
 pub(crate) fn resume_run_inner(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
@@ -2255,7 +2270,7 @@ pub(crate) fn resume_run_inner(
 /// cross-restart durability and must stay byte-for-byte unchanged, so it is never re-driven.
 fn redrive_executing_sessions(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
@@ -2384,7 +2399,7 @@ fn environment_refusal(output: &str) -> Option<EnvironmentRefusal> {
 /// per-actor `in_flight` set cannot provide (it can't see results from a different actor/process).
 fn apply_step_result(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
@@ -2850,7 +2865,7 @@ fn apply_step_result(
 /// a terminal `SessionFailed`. Returns `Finished` so the actor clears `in_flight`.
 fn fail_run(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
@@ -2876,7 +2891,7 @@ fn fail_run(
 /// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
 fn pause_for_human(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     self_tx: &Sender<Command>,
     session: &mut crate::domain::AgentSession,
     ord: u32,
@@ -2906,7 +2921,7 @@ fn pause_for_human(
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
 fn advance_or_pause(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
@@ -3051,7 +3066,7 @@ fn should_pause(
 /// `unit_ix` is past the last unit (nothing to dispatch — the run is done).
 fn dispatch_unit(
     store: &dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
@@ -3310,7 +3325,7 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
 /// finalize surfaces as a run error (rather than silently wedging the run in `in_flight`).
 fn finalize_run(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
@@ -3336,7 +3351,7 @@ fn finalize_run(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn confirm_gate(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
@@ -3492,7 +3507,7 @@ pub(crate) fn confirm_gate(
 /// terminal guard.
 pub(crate) fn cancel_run(
     store: &mut dyn GraphStore,
-    subscribers: &mut Vec<Sender<CoreEvent>>,
+    subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     run_id: &str,
@@ -3630,7 +3645,7 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-fn emit_run_error(subscribers: &mut Vec<Sender<CoreEvent>>, run_id: &str, e: anyhow::Error) {
+fn emit_run_error(subscribers: &mut crate::event_log::EventSink, run_id: &str, e: anyhow::Error) {
     emit(
         subscribers,
         CoreEvent::Error {
@@ -3640,9 +3655,14 @@ fn emit_run_error(subscribers: &mut Vec<Sender<CoreEvent>>, run_id: &str, e: any
     );
 }
 
-/// Fan an event out to every live subscriber, dropping any whose receiver has hung up.
-fn emit(subscribers: &mut Vec<Sender<CoreEvent>>, ev: CoreEvent) {
-    subscribers.retain(|s| s.send(ev.clone()).is_ok());
+/// The single point every one of core's event emissions passes through: record to the run's durable
+/// log, then fan out to live subscribers (dropping any whose receiver has hung up).
+///
+/// Kept as a free fn over a bare method call because it is the chokepoint the whole event stream is
+/// funnelled through — 47 call sites — and because the sink has to be a SEPARATE `&mut` from the store
+/// the same call sites borrow. See [`crate::event_log`] for why the log is a file and not the store.
+fn emit(subscribers: &mut crate::event_log::EventSink, ev: CoreEvent) {
+    subscribers.emit(ev);
 }
 
 /// Overridable per-CLI price-table fallback for `CliUsage.cost_usd` (DES-STUDIO-COCKPIT-001 §3 B-cost /
@@ -3839,7 +3859,7 @@ mod terminal_gate_tests {
                 unconditional: true,
             },
         );
-        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let mut subs = crate::event_log::EventSink::default();
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
 
@@ -3858,7 +3878,7 @@ mod terminal_gate_tests {
     fn a_terminal_auto_gate_finalizes_without_pausing() {
         let mut store = open_store(Some(":memory:")).unwrap();
         seed_session(&mut store, GateSpec::Auto);
-        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let mut subs = crate::event_log::EventSink::default();
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
 
@@ -3927,7 +3947,7 @@ mod phase_boundary_governance_tests {
     fn approve_without_policies_is_allow() {
         let mut store = open_store(Some(":memory:")).unwrap();
         awaiting_session(&mut store);
-        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let mut subs = crate::event_log::EventSink::default();
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let mut in_flight = HashSet::new();
@@ -3977,7 +3997,7 @@ mod phase_boundary_governance_tests {
         };
         register_policy(&mut store, &deny_pol).unwrap();
 
-        let mut subs: Vec<Sender<CoreEvent>> = Vec::new();
+        let mut subs = crate::event_log::EventSink::default();
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let mut in_flight = HashSet::new();
