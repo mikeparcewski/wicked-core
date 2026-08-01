@@ -2977,6 +2977,44 @@ fn resolve_workdir(
     ))
 }
 
+/// Decide whether `prior` is context for `unit`, and how to label it. `None` ⇒ not injected.
+///
+/// Pure (no store) so the selection rule is testable on its own — the dispatch site pairs it with a
+/// `get_work_output` read. Two independent reasons to inject, unioned:
+///
+///  1. DECLARED DEPENDENCY (FINDING-024) — `prior`'s phase id appears in `unit.depends_on`. The def
+///     already states the handoff graph; the engine honored it for ordering and dropped it for
+///     context, so an Evaluator phase declared `.after("build")` ran blind to the build and
+///     re-solved the original task. Keying off the declaration keeps the bound author-controlled.
+///  2. CROSS-CLI HANDOFF — `prior` ran on a DIFFERENT CLI, so no conversational state can be shared
+///     and the output must be passed explicitly whatever the def says. This used to be the ONLY
+///     reason, which is why single-CLI runs (every shipped workflow's default) injected nothing.
+///
+/// Ordering is the caller's: only units with `ord < unit.ord` are offered, so a declared dependency
+/// on a LATER phase cannot leak backwards. `phase_id()` is `None` for prose-planned units, which
+/// correctly matches no declaration — absent a def there is no declared graph to honor.
+fn prior_context_label(
+    unit: &crate::domain::WorkUnit,
+    prior: &crate::domain::WorkUnit,
+    current_cli: &str,
+) -> Option<String> {
+    if prior.ord >= unit.ord {
+        return None;
+    }
+    let cli = prior.assigned_cli.as_deref().unwrap_or("claude");
+    let declared_phase = prior
+        .phase_id()
+        .filter(|p| unit.depends_on.iter().any(|d| d == p));
+    match declared_phase {
+        // Name WHY it is here. A phase being handed the artifact it declared it consumes reads
+        // differently from a bare cross-CLI carry-over, and an operator should be able to tell them
+        // apart in the transcript without diffing the def.
+        Some(p) => Some(format!("[{cli} — unit {} — depends_on `{p}`]", prior.ord)),
+        None if cli != current_cli => Some(format!("[{cli} — unit {}]", prior.ord)),
+        None => None,
+    }
+}
+
 /// Whether to pause for a human before dispatching `units[unit_ix]`. Two sources, OR'd:
 ///  1. the run-level `--confirm` policy (None / All / Before(ord)); and
 ///  2. the DEF-declared gate on the PRECEDING phase (its `GateSpec` fires *after* its work, i.e.
@@ -3054,24 +3092,34 @@ fn dispatch_unit(
     } else {
         None
     };
-    // CROSS-CLI SHARED CONTEXT (ACP multi-CLI, Tutti-inspired "@"-workspace): collect completed prior
-    // units whose assigned CLI differs from the current unit's CLI and inject their work output as
-    // context blocks. Read on the actor thread (store access) before the worker is dispatched; the
-    // worker holds no store handle (single-writer invariant). Empty for single-CLI runs.
-    // Reuses `units` already fetched above — no second store read.
+    // SHARED CONTEXT — the prior work this unit is supposed to build on. Read on the actor thread
+    // (store access) before the worker is dispatched; the worker holds no store handle (single-writer
+    // invariant). Reuses `units` already fetched above — no second store read.
+    //
+    // Two independent reasons to inject a prior unit; a unit qualifying under either is injected once.
+    //
+    //  1. DECLARED DEPENDENCY (FINDING-024). The def says `adversarial-review.after("build")`, and the
+    //     engine honored that for ordering while dropping it for context — so the Evaluator phase ran
+    //     blind to the very work it was created to evaluate, and re-solved the original task instead.
+    //     Keying off `depends_on` makes the bound author-controlled: a phase gets exactly the priors
+    //     it declared, not a guessed window.
+    //  2. CROSS-CLI HANDOFF (ACP multi-CLI, Tutti-inspired "@"-workspace). A prior unit on a DIFFERENT
+    //     CLI cannot have shared conversational state, so its output must be passed explicitly
+    //     regardless of what the def declares. This was previously the ONLY reason, which is why
+    //     single-CLI runs — every shipped workflow's default — injected nothing at all.
+    //
+    // Union, not replacement: dropping (2) would regress multi-CLI runs whose defs declare no graph,
+    // and dropping (1) is the bug. Declared-dependency membership is by PHASE ID, the token the def
+    // uses; `phase_id()` returns None for prose-planned units, which correctly matches nothing.
     let current_cli = unit.assigned_cli.as_deref().unwrap_or("claude");
     // Single-pass: build both the worker's prior-output list and the EVT-007 context items
     // simultaneously via `unzip` — no intermediate Vec and no second store read.
     let (prior_outputs, context_items): (Vec<PriorUnitOutput>, Vec<crate::event::InjectedContext>) =
         units
             .iter()
-            .filter(|u| {
-                u.ord < unit.ord && u.assigned_cli.as_deref().unwrap_or("claude") != current_cli
-            })
             .filter_map(|u| {
+                let label = prior_context_label(unit, u, current_cli)?;
                 let output = crate::domain::get_work_output(store, &u.id)?;
-                let cli = u.assigned_cli.as_deref().unwrap_or("claude");
-                let label = format!("[{cli} — unit {}]", u.ord);
                 let output_bytes = output.len();
                 Some((
                     PriorUnitOutput {
@@ -3086,8 +3134,9 @@ fn dispatch_unit(
                 ))
             })
             .unzip();
-    // (EVT-007) Emit UnitContextInjected when prior cross-CLI outputs are being injected.
-    // Only fires for multi-CLI runs where earlier units on a different CLI have completed.
+    // (EVT-007) Emit UnitContextInjected when prior outputs are being injected — a cross-CLI carry-over
+    // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
+    // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
     if !context_items.is_empty() {
         emit(
             subscribers,
@@ -3996,5 +4045,102 @@ mod environment_refusal_tests {
         assert!(environment_refusal("error: test suite failed: 3 assertions").is_none());
         assert!(environment_refusal("panicked at src/lib.rs:42").is_none());
         assert!(environment_refusal("").is_none());
+    }
+}
+
+/// FINDING-024 — the phase-handoff selection rule. Run `7620a086` (`feature`, single-CLI) injected
+/// NOTHING into any of its six units: the filter required a differing CLI, so `adversarial-review`
+/// never saw the `build` output it was declared `.after(...)` of, and produced an unrelated proposal
+/// against a different file. These pin the rule that fixes it — and that the cross-CLI path it
+/// replaced still works, since dropping that would regress multi-CLI runs with no declared graph.
+#[cfg(test)]
+mod prior_context_tests {
+    use super::prior_context_label;
+    use crate::domain::WorkUnit;
+
+    /// A def-driven unit: id is `<session>:<phase_id>`, which is where `phase_id()` reads from.
+    fn phase_unit(ord: u32, phase: &str, cli: &str) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("s:{phase}"), "s", ord, "d");
+        u.assigned_cli = Some(cli.to_string());
+        u
+    }
+
+    /// THE regression. Same CLI, and `adversarial-review` declares `depends_on: ["build"]` exactly as
+    /// `feature_def` does. Before the fix this returned `None` and the evaluator ran blind.
+    #[test]
+    fn a_declared_dependency_is_injected_even_on_a_single_cli_run() {
+        let build = phase_unit(3, "build", "claude");
+        let mut review = phase_unit(4, "adversarial-review", "claude");
+        review.depends_on = vec!["build".into()];
+
+        let label = prior_context_label(&review, &build, "claude")
+            .expect("a declared dependency must be injected regardless of CLI");
+        assert!(
+            label.contains("depends_on `build`"),
+            "the label names the declared dependency so the handoff is legible: {label}"
+        );
+    }
+
+    /// The bound is the DECLARATION, not a window: a prior phase the unit did not declare is not
+    /// injected on a single-CLI run. `feature`'s `test` phase declares only `build`, so `clarify` and
+    /// `design` stay out — this is what keeps prompt growth author-controlled.
+    #[test]
+    fn an_undeclared_prior_phase_is_not_injected_on_the_same_cli() {
+        let clarify = phase_unit(1, "clarify", "claude");
+        let mut test = phase_unit(5, "test", "claude");
+        test.depends_on = vec!["build".into()];
+        assert!(prior_context_label(&test, &clarify, "claude").is_none());
+    }
+
+    /// The cross-CLI path is unchanged: a peer CLI's output rides along with no declaration at all,
+    /// because peers share no conversational state. Removing this would regress multi-CLI runs.
+    #[test]
+    fn a_cross_cli_prior_is_still_injected_without_any_declaration() {
+        let prior = phase_unit(1, "explore", "codex");
+        let current = phase_unit(2, "build", "claude");
+        assert!(current.depends_on.is_empty());
+        let label =
+            prior_context_label(&current, &prior, "claude").expect("cross-CLI still injects");
+        assert!(label.contains("codex") && !label.contains("depends_on"));
+    }
+
+    /// Both reasons at once must not double-count or mislabel: a declared dependency that also ran on
+    /// another CLI is injected ONCE, labelled as the declaration (the stronger, more specific reason).
+    #[test]
+    fn a_declared_cross_cli_prior_is_labelled_as_the_declaration() {
+        let build = phase_unit(1, "build", "codex");
+        let mut review = phase_unit(2, "review", "claude");
+        review.depends_on = vec!["build".into()];
+        let label = prior_context_label(&review, &build, "claude").unwrap();
+        assert!(label.contains("depends_on `build`"), "{label}");
+    }
+
+    /// Ordering is enforced here too, not only by the caller's filter: a declaration naming a LATER
+    /// phase must not pull a future unit's output backwards. `validate()` rejects forward
+    /// `depends_on`, so this is defence in depth against a hand-built or migrated unit.
+    #[test]
+    fn a_declaration_never_reaches_forward_to_a_later_unit() {
+        let later = phase_unit(5, "verify", "claude");
+        let mut current = phase_unit(2, "build", "claude");
+        current.depends_on = vec!["verify".into()];
+        assert!(prior_context_label(&current, &later, "claude").is_none());
+        // ...and not even when the later unit is also on a different CLI.
+        let later_other = phase_unit(5, "verify", "codex");
+        assert!(prior_context_label(&current, &later_other, "claude").is_none());
+    }
+
+    /// Prose-planned units carry `u<ord>` ids and no declarations; nothing is invented for them. The
+    /// pre-existing cross-CLI behaviour is all they get.
+    #[test]
+    fn prose_planned_units_declare_nothing_and_get_only_the_cross_cli_path() {
+        let mut prior = WorkUnit::pending("s:u1", "s", 1, "d");
+        prior.assigned_cli = Some("claude".into());
+        let mut current = WorkUnit::pending("s:u2", "s", 2, "d");
+        current.assigned_cli = Some("claude".into());
+        assert!(current.depends_on.is_empty());
+        assert!(prior_context_label(&current, &prior, "claude").is_none());
+
+        prior.assigned_cli = Some("codex".into());
+        assert!(prior_context_label(&current, &prior, "claude").is_some());
     }
 }
