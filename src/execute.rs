@@ -460,13 +460,18 @@ mod tests {
         )
         .unwrap();
 
+        // Pass the SYNTHETIC `unit-1` that production actually passes (`apply_and_finish_unit` uses
+        // `scope::unit_phase`), NOT `review`. That makes `eval_phase` = `eval-unit-1`, so selecting
+        // `eval-review` is only possible through the alias derived from the unit id — the real path.
+        // Passing `review` here would match on the primary token and leave the alias untested, so a
+        // regression that stopped aliasing would still pass this test (FINDING-021's failure mode).
         let gated = evaluate_unit(
             &mut store,
             &unit,
             "clean output",
             "codex",
             "scope-a",
-            "review",
+            "unit-1",
             2,
         )
         .unwrap();

@@ -150,13 +150,16 @@ pub enum CoreEvent {
     /// whenever `combined == false`, so the record can never read "det pass + agent none + combined
     /// false" with no visible denying layer.
     ///
-    /// HONESTY (FINDING-025): `evaluator_policies` lists the policy ids the second pass actually
-    /// applied. It is the layer-3 analogue of `has_deterministic_floor`: that flag exists so a
-    /// vacuously-true `deterministic_pass` is not misread as an enforced pass, and `evaluator_pass`
-    /// has exactly the same failure mode. The policy engine runs on every unit and returns
-    /// `approved = true` when NOTHING matched, so `Some(true)` alone cannot distinguish "a policy
-    /// examined this unit and approved it" from "no policy applied, default-allow". An EMPTY list
-    /// with `evaluator_pass == Some(true)` means the latter — the unit was effectively UNGATED by
+    /// HONESTY (FINDING-025): `evaluator_policies` lists the policy ids that were APPLICABLE to the
+    /// unit's eval phase — the second pass's SELECTION, not the subset whose triggers fired. It is
+    /// the layer-3 analogue of `has_deterministic_floor`: that flag exists so a vacuously-true
+    /// `deterministic_pass` is not misread as an enforced pass, and `evaluator_pass` has exactly the
+    /// same failure mode. The policy engine runs on every unit and default-allows on an EMPTY
+    /// SELECTION (no policy declared `applies_to` this phase), so `Some(true)` alone cannot
+    /// distinguish "a policy examined this unit and approved it" from "no policy applied at all".
+    /// The distinction is selection, not triggering: a selected policy whose trigger found nothing
+    /// to deny DID examine the unit and is listed — that allow is genuine enforcement. An EMPTY list
+    /// with `evaluator_pass == Some(true)` is the other case — the unit was effectively UNGATED by
     /// this layer, and no consumer may present it as governed.
     GateEvaluated {
         session: String,
