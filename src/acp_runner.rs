@@ -95,6 +95,9 @@ fn start_acp_process(
             cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
             cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
             cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
+            if !g.phase_id.is_empty() {
+                cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
+            }
         }
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);
@@ -548,6 +551,9 @@ struct AcpGovArmed {
     scope: String,
     /// The unit's orchestration phase, e.g. `unit-3` (set as `WICKED_GATE_PHASE`).
     phase: String,
+    /// The unit's WORKFLOW phase id, e.g. `review` (set as `WICKED_GATE_PHASE_ID`) so the hook's
+    /// policy `select` also matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
+    phase_id: String,
 }
 
 /// Arm input governance for a governed ACP session. Produces and writes the per-(unit, attempt)
@@ -616,6 +622,7 @@ fn arm_acp_governance(input: &StepInput, gov: &GovernanceContext) -> std::io::Re
         db_path: gov.db_path.clone(),
         scope,
         phase,
+        phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
     })
 }
 

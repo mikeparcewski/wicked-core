@@ -24,7 +24,7 @@ use wicked_apps_core::{
 };
 use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
-use wicked_governance::{conform, decide, select};
+use wicked_governance::{conform, decide, select_any};
 
 use crate::command::Command;
 use crate::domain::{put_node, AgentSession, SessionStatus};
@@ -3316,8 +3316,8 @@ pub(crate) fn confirm_gate(
             // always returns Allow — the check is a no-op until policies are populated.
             {
                 let units = crate::domain::session_units(store, run_id)?;
-                let phase_name = units
-                    .get(session.unit_ix)
+                let unit = units.get(session.unit_ix);
+                let phase_name = unit
                     .map(|u| crate::scope::unit_phase(u.ord))
                     .unwrap_or_else(|| "terminal".to_owned());
                 let scope = session.collection_scope.as_deref().unwrap_or(run_id);
@@ -3327,7 +3327,12 @@ pub(crate) fn confirm_gate(
                     "run_id": run_id,
                     "gate": "phase-boundary",
                 });
-                let selected = select(store, scope, &phase_name, &context)?;
+                // Match the synthetic execution phase AND the workflow phase id the operator sees
+                // in the API — an `applies_to: ["review"]` must select here, not silently never
+                // fire (FINDING-021). The claim still records the canonical `unit-<ord>`.
+                let phases =
+                    crate::scope::phase_aliases(&phase_name, unit.and_then(|u| u.phase_id()));
+                let selected = select_any(store, scope, &phases, &context)?;
                 let claim: ConformanceClaim = decide(
                     &selected,
                     scope,
@@ -3473,10 +3478,16 @@ pub(crate) fn cancel_run(
 }
 
 /// Number of per-unit execution phases a UI deny policy is registered against (`unit-1..=unit-N`).
-/// Governance matches `applies_to` EXACTLY against the phase name (`engine.rs`: `p == phase`), and a
-/// run's units execute under phases `unit-{ord}` — so a policy must enumerate those phases to fire.
-/// A run with MORE units than this is REJECTED at launch (`pipeline::MAX_UNITS`) rather than allowed
-/// to silently run units past the policy's coverage — governance must never fail open.
+/// Governance matches `applies_to` by EQUALITY against each candidate token (`engine.rs`:
+/// `select_any`), and a run's units execute under phases `unit-{ord}` — so a policy must enumerate
+/// those phases to fire on every unit. A run with MORE units than this is REJECTED at launch
+/// (`pipeline::MAX_UNITS`) rather than allowed to silently run units past the policy's coverage —
+/// governance must never fail open.
+///
+/// NOTE (FINDING-028): the gate now ALSO matches the workflow phase id, so this fan-out is no longer
+/// the only way to make a deny fire. It is retained deliberately: narrowing to the caller's single
+/// `phase` would make an unrecognized phase string yield an INERT policy (fail-open), which needs
+/// registration-time phase validation first. Over-matching is the fail-closed direction.
 pub(crate) const DENY_PHASE_SPAN: u32 = 256;
 
 /// Capture a TERMINAL run's outcome into memory (best-effort). Names the run + its result (and, for a
@@ -3527,7 +3538,11 @@ fn capture_run_outcome(
 /// Register a deny policy on the store (single-writer). The UI's `trigger` is a literal string, so we
 /// regex-escape it (governance matches `Trigger.contains` as a regex over the call context). The
 /// policy is registered against EVERY unit-execution phase (`unit-1..=unit-N`), not the abstract
-/// `phase` label — otherwise it would match no real gate and silently never deny.
+/// `phase` label — see [`DENY_PHASE_SPAN`] for why this stays broad.
+///
+/// CONTRACT MISMATCH (FINDING-028): `Core::register_deny_policy` documents "blocks any tool-call in
+/// `phase`", but the fan-out means the deny fires in EVERY phase — `phase` only shapes the policy id
+/// and its human-readable `criteria`/`rule`. Callers get a broader block than they asked for.
 fn register_deny_policy(
     store: &mut dyn GraphStore,
     phase: &str,

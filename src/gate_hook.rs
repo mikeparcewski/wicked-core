@@ -36,7 +36,7 @@ use wicked_apps_core::{
     open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
     CONFORMANCE_CLAIM,
 };
-use wicked_governance::{conform, decide, recall_rules, select, RuleQuery};
+use wicked_governance::{conform, decide, recall_rules, select_any, RuleQuery};
 use wicked_orchestration::{apply_gate, get_phase, Phase};
 
 use crate::domain::put_node;
@@ -60,6 +60,12 @@ pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 pub const GATE_SCOPE_ENV: &str = "WICKED_GATE_SCOPE";
 pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
 
+/// The WORKFLOW phase id backing the unit (e.g. `review`), carried alongside [`GATE_PHASE_ENV`]'s
+/// synthetic `unit-{ord}`. Policy `select` matches either, so an operator's `applies_to: ["review"]`
+/// fires in the subprocess hook exactly as it does in-process (FINDING-021). Unset/empty ⇒ the
+/// synthetic token alone, which is the pre-fix behaviour.
+pub const GATE_PHASE_ID_ENV: &str = "WICKED_GATE_PHASE_ID";
+
 /// Environment variable carrying the estate store path to the gate-hook subprocess (the injected command
 /// drops `--db`). One exported const so the launcher setter + the bin resolver never drift on the name.
 pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
@@ -69,11 +75,13 @@ pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 /// `scope`/`phase` are resolved by the caller (`bin/wicked-core`) from argv (standalone) ELSE the
 /// `WICKED_GATE_SCOPE`/`WICKED_GATE_PHASE` env the launcher sets — pinned to the unit's real
 /// `resolve_scope(...)` / `unit-{ord}`. They ride env (NOT the shell hook command) so caller-controlled
-/// ids can't inject the command. `db` is the shared estate store, used only to *read* policies (we never
-/// write governance/claim/domain data — see the module-level note about the open path).
+/// ids can't inject the command. `phase_alias` is the workflow phase id ([`GATE_PHASE_ID_ENV`]) and
+/// widens policy selection only — the recorded `claim.phase` stays `phase`. `db` is the shared estate
+/// store, used only to *read* policies (we never write governance/claim/domain data — see the
+/// module-level note about the open path).
 /// Fails CLOSED (returns 2) if the decisions path is unset, the store can't be opened, or governance
 /// can't decide — an un-evaluable tool-call is never silently allowed.
-pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Option<&str>) -> i32 {
     // A store-unavailable DENY leaves no synthetic claim (there may be no resolvable decisions path yet),
     // unlike the store-open/select infra failures below. That is fine: in a GOVERNED run the launcher only
     // ever arms a file-backed store (`in_process_governance` filters `:memory:`/`postgres://`), so this
@@ -149,7 +157,8 @@ pub fn run_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
             return 2;
         }
     };
-    let selected = match select(&store, scope, phase, &context) {
+    let phases = crate::scope::phase_aliases(phase, phase_alias);
+    let selected = match select_any(&store, scope, &phases, &context) {
         Ok(s) => s,
         Err(e) => {
             append_infra_deny(
@@ -896,7 +905,12 @@ pub const OUTPUT_FRAMEWORK_ENV: &str = "WICKED_OUTPUT_FRAMEWORK";
 /// rule carries no regex) — that verification is the downstream per-turn checker's job (garden). This
 /// entry point is the DETERMINISTIC half: policy-over-output + recall wiring. Fails CLOSED (exit 2)
 /// exactly like the input hook — an un-evaluable or un-recordable output is never silently allowed.
-pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
+pub fn run_output_gate_hook(
+    scope: &str,
+    phase: &str,
+    phase_alias: Option<&str>,
+    db: Option<&str>,
+) -> i32 {
     if let Some(reason) = store_unavailable(db) {
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
@@ -925,7 +939,8 @@ pub fn run_output_gate_hook(scope: &str, phase: &str, db: Option<&str>) -> i32 {
             return 2;
         }
     };
-    let selected = match select(&store, scope, phase, &context) {
+    let phases = crate::scope::phase_aliases(phase, phase_alias);
+    let selected = match select_any(&store, scope, &phases, &context) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("wicked-governance: DENY (policy select failed: {e})");
@@ -1337,14 +1352,17 @@ mod tests {
         // A real file store is usable.
         assert!(store_unavailable(Some("/tmp/estate.db")).is_none());
         // The hook denies (exit 2) for each fail-open case BEFORE reading stdin — never mis-creates a store.
-        assert_eq!(run_gate_hook("s", "unit-1", Some("postgres://h/db")), 2);
-        assert_eq!(run_gate_hook("s", "unit-1", None), 2);
-        assert_eq!(run_gate_hook("s", "unit-1", Some(":memory:")), 2);
         assert_eq!(
-            run_output_gate_hook("s", "unit-1", Some("postgres://h/db")),
+            run_gate_hook("s", "unit-1", None, Some("postgres://h/db")),
             2
         );
-        assert_eq!(run_output_gate_hook("s", "unit-1", None), 2);
+        assert_eq!(run_gate_hook("s", "unit-1", None, None), 2);
+        assert_eq!(run_gate_hook("s", "unit-1", None, Some(":memory:")), 2);
+        assert_eq!(
+            run_output_gate_hook("s", "unit-1", None, Some("postgres://h/db")),
+            2
+        );
+        assert_eq!(run_output_gate_hook("s", "unit-1", None, None), 2);
     }
 
     #[test]

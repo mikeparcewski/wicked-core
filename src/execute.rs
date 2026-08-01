@@ -8,7 +8,7 @@ use wicked_apps_core::{
     synthetic_symbol, ConformanceClaim, Decision, GraphStore, Language, Location, Node, NodeKind,
     Span, ToNode, SYMBOL_SCHEME,
 };
-use wicked_governance::{conform, decide, decide_as, select};
+use wicked_governance::{conform, decide, decide_as, select_any};
 use wicked_orchestration::{apply_event, apply_gate, get_phase, Event, Phase, PhaseStatus};
 
 use crate::domain::{put_node, WorkUnit};
@@ -106,8 +106,10 @@ pub(crate) fn apply_unit(
         "work": output,
     });
 
-    // 3. governance SELECT + DECIDE → a ConformanceClaim.
-    let selected = select(store, &collection_scope, &phase_name, &context)?;
+    // 3. governance SELECT + DECIDE → a ConformanceClaim. Select on the synthetic execution phase
+    // AND the workflow phase id (FINDING-021); the claim keeps the canonical `unit-<ord>`.
+    let phases = crate::scope::phase_aliases(&phase_name, unit.phase_id());
+    let selected = select_any(store, &collection_scope, &phases, &context)?;
     let evaluated_at = EVAL_AT_BASE + unit.ord as i64;
     let mut claim: ConformanceClaim = decide(
         &selected,
@@ -241,7 +243,11 @@ pub fn evaluate_unit(
         "output": output,
     });
 
-    let selected = select(store, collection_scope, &eval_phase, &eval_context)?;
+    // The evaluator pass runs at `eval-<phase>`, so its aliases are the eval-prefixed pair
+    // (`eval-unit-3` / `eval-review`) — see [`crate::scope::phase_aliases`].
+    let eval_alias = unit.phase_id().map(|p| format!("eval-{p}"));
+    let phases = crate::scope::phase_aliases(&eval_phase, eval_alias.as_deref());
+    let selected = select_any(store, collection_scope, &phases, &eval_context)?;
     let claim = decide_as(
         &selected,
         collection_scope,
@@ -397,6 +403,84 @@ mod tests {
             get_work_output(&store, "s:u2").as_deref(),
             Some("the approved output"),
             "an approved unit stores its work_output"
+        );
+    }
+
+    /// FINDING-021 (end-to-end): a policy authored against the WORKFLOW phase id — the token an
+    /// operator sees in the def and in `POST /governance/policies` — must actually deny the unit.
+    ///
+    /// Before the fix the gate selected only on the synthetic `unit-{ord}`, so this policy
+    /// registered successfully, matched nothing, and `decide` returned Allow on an empty policy
+    /// set: the run completed with the deny silently inert. That is a fail-open on the primary
+    /// safety control, and it is what made every shipped workflow's governance vacuous.
+    #[test]
+    fn a_policy_on_the_workflow_phase_id_denies_the_unit() {
+        use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_policy(
+            &mut store,
+            &Policy {
+                id: "pol-deny-review-secrets".into(),
+                kind: "guard".into(),
+                // The operator-natural token: the workflow phase id, NOT `unit-1`.
+                applies_to: vec!["review".into()],
+                effect: Effect::Deny,
+                trigger: Trigger {
+                    contains: Some("AKIA".into()),
+                },
+                obligations: vec![],
+                criteria: "review: no credentials in output".into(),
+                rule: "deny review output containing an AWS key id".into(),
+                severity: Severity::High,
+            },
+        )
+        .unwrap();
+
+        // Unit id `<session>:<phase_id>` — exactly what `plan_from_def` mints for a `review` phase.
+        let mut unit = WorkUnit::pending("s:review", "s", 1, "review it");
+        unit.assigned_cli = Some("claude".into());
+        let outcome = apply_unit(
+            &mut store,
+            &unit,
+            "found AKIAIOSFODNN7EXAMPLE in the config",
+            "wf-s",
+            EntityMode::Shared,
+            "s",
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert!(
+            !outcome.approved,
+            "a policy on the workflow phase id must deny — an inert policy is a fail-open"
+        );
+        assert_eq!(outcome.phase_status, "rejected");
+        assert_eq!(outcome.decision.as_deref(), Some("deny"));
+        assert!(
+            get_work_output(&store, "s:review").is_none(),
+            "a denied unit must leak no work_output"
+        );
+
+        // CONTROL: the same triggering output under a DIFFERENT phase is untouched. This is what
+        // separates the fix from "widen until everything matches" — scoping must still hold.
+        let mut other = WorkUnit::pending("s:build", "s", 2, "build it");
+        other.assigned_cli = Some("claude".into());
+        let allowed = apply_unit(
+            &mut store,
+            &other,
+            "found AKIAIOSFODNN7EXAMPLE in the config",
+            "wf-s",
+            EntityMode::Shared,
+            "s",
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(
+            allowed.approved,
+            "a `review`-scoped policy must NOT fire on the `build` phase"
         );
     }
 }

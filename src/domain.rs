@@ -324,6 +324,21 @@ impl WorkUnit {
             status: UnitStatus::Pending,
         }
     }
+
+    /// The workflow PHASE ID backing this unit — the suffix of [`Self::id`] after the session
+    /// prefix (`<session>:<phase_id>` for def-driven runs, `<session>:u<ord>` for prose-planned
+    /// ones; see [`crate::plan`]). Distinct from [`Self::phase_ref`], which the execute path sets
+    /// to the synthetic ORCHESTRATION phase (`unit-<ord>`).
+    ///
+    /// This is the token an operator actually sees in the API and would naturally author a
+    /// governance `applies_to` against, so policy selection matches it alongside `unit-<ord>`.
+    /// `None` when the id does not carry the session prefix (hand-built units in tests).
+    pub fn phase_id(&self) -> Option<&str> {
+        self.id
+            .strip_prefix(&self.session_id)?
+            .strip_prefix(':')
+            .filter(|suffix| !suffix.is_empty())
+    }
 }
 
 impl ToNode for WorkUnit {
