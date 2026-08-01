@@ -134,7 +134,10 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
     let mut saw_error = false;
     let mut failed_ord = None;
     let deadline = Instant::now() + DEADLINE;
-    while Instant::now() < deadline && failed_ord.is_none() {
+    // Collect BOTH signals before stopping. Bailing on the first `SessionFailed` would make the
+    // `saw_error` assertion below depend on the current emission order (`Error` then `SessionFailed`);
+    // this test is about which events exist, not the order they arrive in.
+    while Instant::now() < deadline && !(saw_error && failed_ord.is_some()) {
         match events.recv_timeout(Duration::from_millis(200)) {
             Ok(CoreEvent::SessionFailed { session, ord }) if session == "r" => {
                 failed_ord = Some(ord);
