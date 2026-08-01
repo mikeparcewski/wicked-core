@@ -178,11 +178,16 @@ impl StartGate {
     /// the cap, two bridges stuck for their full budget would stall every other start behind them.
     fn acquire(&'static self, wait: Duration) -> Option<StartPermit> {
         let guard = self.available.lock().unwrap_or_else(|p| p.into_inner());
-        let (mut n, wait_result) = self
+        let (mut n, _) = self
             .released
             .wait_timeout_while(guard, wait, |n| *n == 0)
             .unwrap_or_else(|p| p.into_inner());
-        if wait_result.timed_out() {
+        // Decide on the permit count, NOT on `WaitTimeoutResult::timed_out()`. The two agree here
+        // — `wait_timeout_while` only reports a timeout with its predicate still true, and the lock
+        // is held from that check to the return — but the count is what actually decides, and
+        // reading it directly means this cannot start refusing an available permit if that detail
+        // of the std implementation ever shifts.
+        if *n == 0 {
             return None;
         }
         *n -= 1;
@@ -224,6 +229,24 @@ type StderrTail = Arc<Mutex<std::collections::VecDeque<String>>>;
 
 const STDERR_TAIL_LINES: usize = 20;
 
+/// Per-line byte cap. A line count alone does not bound anything: one bridge writing a single
+/// megabyte-long line without a newline would sit in the tail whole. Both bounds together make the
+/// rendered tail small enough to append to a capped output without argument.
+const STDERR_TAIL_LINE_BYTES: usize = 512;
+
+/// Truncates on a char boundary and SAYS it truncated — a silently clipped line reads as a bridge
+/// that stopped mid-sentence, which is a different diagnosis than one that said too much.
+fn clip_stderr_line(line: String) -> String {
+    if line.len() <= STDERR_TAIL_LINE_BYTES {
+        return line;
+    }
+    let mut cut = STDERR_TAIL_LINE_BYTES;
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…(+{} bytes)", &line[..cut], line.len() - cut)
+}
+
 fn drain_stderr(stderr: std::process::ChildStderr) -> (StderrTail, std::thread::JoinHandle<()>) {
     let tail: StderrTail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
     let sink = tail.clone();
@@ -236,10 +259,25 @@ fn drain_stderr(stderr: std::process::ChildStderr) -> (StderrTail, std::thread::
             if t.len() == STDERR_TAIL_LINES {
                 t.pop_front();
             }
-            t.push_back(line);
+            t.push_back(clip_stderr_line(line));
         }
     });
     (tail, handle)
+}
+
+/// Appends `note` to `output` while keeping `output` within `max_out`, trimming the OLDER text to
+/// make room. `handle_update` holds streamed output to that cap and appending must not quietly
+/// break it — but the note outranks what it displaces: by the time one is written, `output` is
+/// already a truncated fragment of a turn that failed, and the note is the only account of why.
+fn append_within_cap(output: &mut String, note: &str, max_out: usize) {
+    if output.len() + note.len() > max_out {
+        let mut cut = max_out.saturating_sub(note.len()).min(output.len());
+        while cut > 0 && !output.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        output.truncate(cut);
+    }
+    output.push_str(note);
 }
 
 /// Renders the tail for an error message, or a note that the bridge said nothing — which is
@@ -295,7 +333,9 @@ fn start_acp_process(
         cmd
     };
 
-    // Held for the spawn and both handshake calls, released when this function returns.
+    // Held for the spawn and both handshake calls, released when this function returns — or NOT
+    // held at all, if no permit came free inside `START_WAIT`. That is the designed outcome, not a
+    // failure: the start proceeds either way, contended rather than queued.
     let _permit = start_gate().acquire(START_WAIT);
 
     let mut child = match build_cmd(&config.binary).spawn() {
@@ -611,10 +651,11 @@ prior output you are reviewing, testing, or revising."
     // stderr is the only account of why, and `StepOutput.output` is where an operator looks, so
     // say it there rather than reporting a Failed unit with an empty reason.
     if !found && !timed_out {
-        output.push_str(&format!(
+        let note = format!(
             "\n[wicked-core] ACP turn ended with no stopReason (the bridge stopped answering){}",
             stderr_context(&proc.stderr_tail)
-        ));
+        );
+        append_within_cap(&mut output, &note, MAX_OUT);
     }
 
     Ok(TurnResult {
@@ -1647,10 +1688,11 @@ mod tests {
 
     #[test]
     fn the_default_start_concurrency_is_bounded_and_non_zero() {
-        // Zero would deadlock every start behind a permit that never exists; unbounded would
-        // reinstate the contention that makes `session/new` outrun its budget. Asserted on
-        // `parse_permits(None)` rather than `start_permits()` so a host that sets the (supported)
-        // override does not fail a test about the shipped default.
+        // Zero would make every start wait out START_WAIT before proceeding contended anyway —
+        // pure dead time, since the gate is not a correctness barrier and nothing is gained by
+        // the wait. Unbounded would reinstate the contention that makes `session/new` outrun its
+        // budget. Asserted on `parse_permits(None)` rather than `start_permits()` so a host that
+        // sets the (supported) override does not fail a test about the shipped default.
         let n = parse_permits(None);
         assert!(
             n > 0 && n <= 8,
@@ -1793,6 +1835,56 @@ sleep 30
             STDERR_TAIL_LINES,
             "the tail is capped at STDERR_TAIL_LINES"
         );
+    }
+
+    #[test]
+    fn appending_the_died_mid_turn_note_keeps_output_inside_its_cap() {
+        // The streaming path caps `output` at MAX_OUT; this append used to run after that cap and
+        // straight past it. It must fit — and the note, not the truncated stream it displaces, is
+        // what an operator needs when a bridge dies mid-turn.
+        let note = "\n[wicked-core] died".to_string();
+        let mut at_cap = "a".repeat(100);
+        append_within_cap(&mut at_cap, &note, 100);
+        assert_eq!(at_cap.len(), 100, "the cap holds");
+        assert!(at_cap.ends_with(&note), "the note survives the trim");
+
+        // Room to spare: nothing is trimmed.
+        let mut small = "abc".to_string();
+        append_within_cap(&mut small, &note, 10_000);
+        assert_eq!(small, format!("abc{note}"));
+
+        // A multi-byte boundary at the cut point must not panic or corrupt.
+        let mut wide = "é".repeat(50);
+        append_within_cap(&mut wide, &note, 60);
+        assert!(wide.len() <= 60);
+        assert!(wide.ends_with(&note));
+    }
+
+    #[test]
+    fn one_enormous_stderr_line_cannot_grow_the_tail_without_bound() {
+        // A line COUNT bounds nothing on its own: a bridge that writes a megabyte and no newline
+        // would sit in the tail whole, in a runner that lives as long as the daemon — and the tail
+        // is appended to a capped `output`, so an unbounded line escapes that cap too.
+        let huge = "x".repeat(100_000);
+        let clipped = clip_stderr_line(huge);
+        assert!(
+            clipped.len() < STDERR_TAIL_LINE_BYTES + 64,
+            "clipped to {}",
+            clipped.len()
+        );
+        assert!(
+            clipped.contains("+99488 bytes"),
+            "a clipped line must say it was clipped: {clipped}"
+        );
+
+        // Multi-byte input must not be cut mid-character — `clip_stderr_line` returns a String, so
+        // a bad boundary would panic rather than corrupt.
+        let wide = "é".repeat(1_000);
+        assert!(clip_stderr_line(wide).len() < STDERR_TAIL_LINE_BYTES + 64);
+
+        // A line at the limit is passed through untouched.
+        let small = "y".repeat(STDERR_TAIL_LINE_BYTES);
+        assert_eq!(clip_stderr_line(small.clone()), small);
     }
 
     #[test]
