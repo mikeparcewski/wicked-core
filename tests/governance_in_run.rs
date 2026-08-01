@@ -220,8 +220,25 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
-fn wait_terminal(core: &Core, run_id: &str) -> Option<SessionStatus> {
-    let deadline = Instant::now() + Duration::from_secs(6);
+/// Upper bound on how long a governed run may take before the test gives up.
+///
+/// Same reasoning as `domain_extraction_e2e`'s `RUN_DEADLINE` (FINDING-028), and the same defect
+/// this file carried independently: the wait returns the instant the run goes terminal, so a
+/// generous bound costs nothing on an idle host and is only ever spent on a run that is genuinely
+/// stuck. The previous 6s was reachable by scheduling noise alone — under `cargo test --all` on a
+/// loaded host this test failed while `cargo test --test governance_in_run` passed 8/8, which is a
+/// test reporting a governance defect that isn't there.
+const RUN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Waits for `run_id` to reach a terminal status.
+///
+/// `Err` rather than `None` on timeout, because the two outcomes accuse different things: a run that
+/// terminated in the wrong status is a governance defect, while a run that never terminated is this
+/// host being slow. Collapsing them into `Option` made a timeout read as "governance did not fail
+/// the session".
+fn wait_terminal(core: &Core, run_id: &str) -> Result<SessionStatus, String> {
+    let deadline = Instant::now() + RUN_DEADLINE;
+    let mut last = None;
     while Instant::now() < deadline {
         if let Ok(v) = core.sessions_detail() {
             if let Some(s) = v.iter().find(|s| s.session.id == run_id) {
@@ -229,13 +246,22 @@ fn wait_terminal(core: &Core, run_id: &str) -> Option<SessionStatus> {
                     s.session.status,
                     SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Cancelled
                 ) {
-                    return Some(s.session.status);
+                    return Ok(s.session.status);
                 }
+                last = Some(s.session.status);
             }
         }
         std::thread::sleep(Duration::from_millis(15));
     }
-    None
+    Err(format!(
+        "run {run_id} never reached a terminal status within {}s — it was still {} when the wait \
+         gave up, so this is a timeout, not a governance outcome",
+        RUN_DEADLINE.as_secs(),
+        last.map_or_else(
+            || "absent from sessions_detail".to_string(),
+            |s| format!("{s:?}")
+        )
+    ))
 }
 
 #[test]
@@ -261,11 +287,11 @@ fn a_denied_tool_call_fails_the_session() {
     })
     .unwrap();
 
-    let status = wait_terminal(&core, "gov-fail");
+    let status = wait_terminal(&core, "gov-fail").expect("the run reaches a terminal status");
     assert_eq!(
         status,
-        Some(SessionStatus::Failed),
-        "a governance-denied tool-call drives the SESSION to Failed (not a silent Completed): {status:?}"
+        SessionStatus::Failed,
+        "a governance-denied tool-call drives the SESSION to Failed (not a silent Completed)"
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(gov_run_dir("gov-fail"));
