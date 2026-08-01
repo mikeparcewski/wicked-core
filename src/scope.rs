@@ -54,11 +54,15 @@ pub fn unit_phase(ord: u32) -> String {
 /// synthetic token alone meant a policy authored as `applies_to: ["review"]` registered fine and
 /// then never fired: a silent fail-open on the primary safety control (FINDING-021). Accept both.
 ///
-/// `alias` is [`crate::domain::WorkUnit::phase_id`]; it is dropped when absent or already equal to
-/// `phase` so the result is duplicate-free.
+/// `alias` is [`crate::domain::WorkUnit::phase_id`]; it is dropped when absent, EMPTY, or already
+/// equal to `phase`, so the result is duplicate-free and never carries a token no operator could
+/// have authored. The empty case is guarded here rather than at the call sites: an empty alias
+/// reaches this function from an unset `WICKED_GATE_PHASE_ID` or a bare `--phase-id`, and admitting
+/// `""` would select any policy registered as `applies_to: [""]` on EVERY unit. Callers still
+/// filter, but the invariant belongs to the function that depends on it.
 pub fn phase_aliases<'a>(phase: &'a str, alias: Option<&'a str>) -> Vec<&'a str> {
     let mut tokens = vec![phase];
-    if let Some(alias) = alias.filter(|a| *a != phase) {
+    if let Some(alias) = alias.filter(|a| !a.is_empty() && *a != phase) {
         tokens.push(alias);
     }
     tokens
@@ -90,6 +94,9 @@ mod tests {
         assert_eq!(phase_aliases("unit-3", None), vec!["unit-3"]);
         // A workflow phase literally named `unit-3` must not be listed twice.
         assert_eq!(phase_aliases("unit-3", Some("unit-3")), vec!["unit-3"]);
+        // An EMPTY alias is dropped, not selected on: a bare `--phase-id` or an unset
+        // WICKED_GATE_PHASE_ID must not match a policy registered as `applies_to: [""]`.
+        assert_eq!(phase_aliases("unit-3", Some("")), vec!["unit-3"]);
     }
 
     /// `phase_id` recovers the workflow phase from the unit id, and refuses to guess when the id
