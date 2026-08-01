@@ -64,7 +64,7 @@ unpublished `wicked-estate-store` 0.13, plus four vendored engine crates marked 
 3. Idempotency via attempt-scoped event IDs is the target design — duplicate `StepResult` messages for an already-applied unit should be detected and discarded (ISS-002: the guard is not yet implemented in `apply_step_result` — tracked in RAID.md).
 
 ### Flow 4 — HITL gate (human-in-the-loop)
-1. The actor sets `session.status = SessionStatus::AwaitingHuman` and emits `CoreEvent::AwaitingHuman { session, ord, prompt }`.
+1. The actor sets `session.status = SessionStatus::AwaitingHuman` and emits `CoreEvent::AwaitingHuman { session, ord, reviewing_ord, prompt }`. `ord` is the unit the pause BLOCKS; `reviewing_ord` is the unit whose OUTPUT the operator is being asked to judge, which is usually not `ord` — a phase's declared gate fires *after* its own work, so the preceding phase is what is under review. `None` means nothing has been produced yet: the run-level `--confirm` policy paused before `ord` ran.
 2. The wicked-crew daemon surfaces the prompt to the operator (terminal CLI or wicked-studio panel).
 3. The operator calls `Core::confirm_gate(run_id, decision)` which applies the human decision and
    re-enters the run from the cursor.
