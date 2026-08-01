@@ -25,6 +25,7 @@ mod docs;
 mod domain;
 mod domain_extraction;
 mod event;
+pub mod event_log;
 mod execute;
 mod execute_wrapped;
 mod gate_hook;
@@ -173,6 +174,11 @@ pub struct Core {
     /// behind the single store-writer); its events still flow through the actor's emit point.
     /// `None` when the engine was spawned with an injected non-ACP runner — chat unsupported.
     chat: Option<std::sync::Arc<AcpStepRunner>>,
+    /// Where this core's durable event logs live (`<store>.events`, see [`crate::event_log`]). Held on
+    /// the handle rather than fetched from the actor because reading a run's history is a plain file
+    /// read: routing it through the command channel would queue an evidence read behind whatever the
+    /// single writer is doing.
+    log_root: std::path::PathBuf,
     _shutdown: Arc<ShutdownGuard>,
 }
 
@@ -312,6 +318,9 @@ impl Core {
             pty.clone(),
         ));
         let runner_actor = runner.clone();
+        // Captured before `path` moves into the actor thread: the handle needs the same store path to
+        // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
+        let log_path = path.clone();
         std::thread::spawn(move || {
             actor::run(
                 path,
@@ -327,6 +336,7 @@ impl Core {
             tx: tx.clone(),
             pty,
             chat: None, // PTY runner — ACP chat sessions unavailable
+            log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -348,6 +358,9 @@ impl Core {
         let pty_actor = pty.clone();
         let runner = std::sync::Arc::new(AcpStepRunner::new(tx.clone()));
         let runner_actor = runner.clone();
+        // Captured before `path` moves into the actor thread: the handle needs the same store path to
+        // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
+        let log_path = path.clone();
         std::thread::spawn(move || {
             actor::run(
                 path,
@@ -363,6 +376,7 @@ impl Core {
             tx: tx.clone(),
             pty,
             chat: Some(runner.clone()),
+            log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -381,6 +395,8 @@ impl Core {
         // actor for open/close/shutdown. Both reach the same sessions behind its mutex.
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
+        // Captured before `path` moves into the actor thread (see `spawn_with_pty_sessions`).
+        let log_path = path.clone();
         std::thread::spawn(move || {
             actor::run(path, rx, self_tx, dispatcher, runner, pty_actor, exec_bus)
         });
@@ -388,6 +404,7 @@ impl Core {
             tx: tx.clone(),
             pty,
             chat: None, // injected runner (tests / bus seam) — ACP chat sessions unavailable
+            log_root: crate::event_log::log_root(&actor::sidecar_base(&log_path)),
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }
@@ -797,6 +814,24 @@ impl Core {
             .send(Command::WorkOutput(unit_id.to_string(), reply))
             .ok()?;
         rx.recv().ok().flatten()
+    }
+
+    /// A run's recorded event history, oldest first — each entry the event's own tagged JSON
+    /// ([`CoreEvent::to_json`], the same object `/ws` carries) plus a capture-time `ts` and an
+    /// ordering `seq`.
+    ///
+    /// This is the read half of FINDING-014. Consumers that need a run's event trail after the fact
+    /// (evidence bundles, above all) read it HERE rather than re-deriving pseudo-events from unit
+    /// records — a re-derivation cannot recover what it never saw, and invents its own type names
+    /// doing it. Reads the log directly rather than going through the actor: the log is
+    /// independently owned and append-only, so a read needs no store handle and cannot block on the
+    /// actor's queue while a run is mid-flight.
+    ///
+    /// Empty for a run that emitted nothing, one that predates the log, or an unknown id — an absent
+    /// history is not an error. Streaming chunk events are excluded by design; see
+    /// [`crate::event_log`].
+    pub fn run_events(&self, run_id: &str) -> Vec<serde_json::Value> {
+        crate::event_log::read_run(&self.log_root, run_id)
     }
 
     /// Drain a run's out-of-process gate-hook decisions (`decisions.ndjson`) into the store. The
