@@ -109,6 +109,21 @@ export declare class Core {
   /** A unit's captured work output (transcript), as a JSON value — a string, or `null` if none. */
   workOutput(unitId: string): Promise<string>
   /**
+   * A run's recorded event history, oldest first, as a JSON array. Each entry is the SAME tagged
+   * object the `/ws` stream carries ([`CoreEvent::to_json`]) plus a capture-time `ts` (epoch millis)
+   * and an ordering `seq`.
+   *
+   * The read half of FINDING-014: an evidence bundle assembled after a run must read what actually
+   * happened rather than re-derive pseudo-events from unit records, which cannot recover what it
+   * never saw and invents its own type names doing it. Because the log and the socket serialize
+   * through one mapping, an event named here is the event named live.
+   *
+   * Empty array for an unknown run, one that emitted nothing, or one predating the log — an absent
+   * history is not an error. Streaming chunk events (`cliOutputDelta`, `chatDelta`,
+   * `terminalOutput`, `heartbeat`) are excluded by design.
+   */
+  runEvents(runId: string): Promise<string>
+  /**
    * Register a git repository the orchestrator can run within. Validates it is a git repo with
    * ≥1 commit; resolves to the persisted `RepoEntry` as a JSON object.
    */
