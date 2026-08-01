@@ -537,11 +537,7 @@ pub(crate) fn run(
                 ) {
                     Err(e) => {
                         in_flight.remove(&run_id);
-                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                            s.status = SessionStatus::Failed;
-                            let _ = put_node(&mut store, s.to_node());
-                        }
-                        emit_run_error(&mut subscribers, &run_id, e);
+                        fail_run_by_id(&mut store, &mut subscribers, &runner, &self_tx, &run_id, e);
                     }
                     Ok(pre) => {
                         // Blocking half (worker thread): convene the council off the actor thread
@@ -712,11 +708,7 @@ pub(crate) fn run(
                                 let _ = std::fs::remove_dir_all(p);
                             });
                         }
-                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                            s.status = SessionStatus::Failed;
-                            let _ = put_node(&mut store, s.to_node());
-                        }
-                        emit_run_error(&mut subscribers, &run_id, e);
+                        fail_run_by_id(&mut store, &mut subscribers, &runner, &self_tx, &run_id, e);
                     }
                     Ok(pre) => {
                         let tx = self_tx.clone();
@@ -781,7 +773,7 @@ pub(crate) fn run(
                 // Guard: only update if the session is not already in a terminal state (e.g.
                 // it may have been cancelled while the worktree thread was running).
                 in_flight.remove(&run_id);
-                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                if let Ok(Some(s)) = crate::domain::get_session(&store, &run_id) {
                     // Best-effort: prune any stale git worktree metadata left by a partial
                     // `git worktree add`. Spawned off the actor thread — git can be slow.
                     if let Some(ref ref_id) = s.repo_ref {
@@ -791,15 +783,15 @@ pub(crate) fn run(
                             std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
                         }
                     }
-                    if !matches!(
-                        s.status,
-                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
-                    ) {
-                        s.status = SessionStatus::Failed;
-                        let _ = put_node(&mut store, s.to_node());
-                        emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{error}"));
-                    }
                 }
+                fail_run_by_id(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &run_id,
+                    anyhow::anyhow!("{error}"),
+                );
             }
             Command::PlanReady {
                 run_id,
@@ -833,11 +825,14 @@ pub(crate) fn run(
                     ) {
                         Err(e) => {
                             in_flight.remove(&run_id);
-                            if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                                s.status = SessionStatus::Failed;
-                                let _ = put_node(&mut store, s.to_node());
-                            }
-                            emit_run_error(&mut subscribers, &run_id, e);
+                            fail_run_by_id(
+                                &mut store,
+                                &mut subscribers,
+                                &runner,
+                                &self_tx,
+                                &run_id,
+                                e,
+                            );
                         }
                         Ok(()) => {
                             match advance_or_pause(
@@ -869,13 +864,14 @@ pub(crate) fn run(
                                     // was already written to Executing — mark it Failed so the UI
                                     // shows a terminal state, not a permanently-stuck Executing.
                                     in_flight.remove(&run_id);
-                                    if let Ok(Some(mut s)) =
-                                        crate::domain::get_session(&store, &run_id)
-                                    {
-                                        s.status = SessionStatus::Failed;
-                                        let _ = put_node(&mut store, s.to_node());
-                                    }
-                                    emit_run_error(&mut subscribers, &run_id, e);
+                                    fail_run_by_id(
+                                        &mut store,
+                                        &mut subscribers,
+                                        &runner,
+                                        &self_tx,
+                                        &run_id,
+                                        e,
+                                    );
                                 }
                             }
                         }
@@ -884,22 +880,16 @@ pub(crate) fn run(
             }
             Command::PlanFailed { run_id, error } => {
                 in_flight.remove(&run_id);
-                // Guard: do not clobber Cancelled with Failed if the run was cancelled while the
-                // council thread was running.
-                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                    if !matches!(
-                        s.status,
-                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
-                    ) {
-                        s.status = SessionStatus::Failed;
-                        let _ = put_node(&mut store, s.to_node());
-                        emit_run_error(
-                            &mut subscribers,
-                            &run_id,
-                            anyhow::anyhow!("council distribution failed: {error}"),
-                        );
-                    }
-                }
+                // `fail_run_by_id` guards the terminal statuses: do not clobber Cancelled with
+                // Failed if the run was cancelled while the council thread was running.
+                fail_run_by_id(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &run_id,
+                    anyhow::anyhow!("council distribution failed: {error}"),
+                );
             }
             Command::ResumeRun { run_id, reply } => {
                 let res = resume_run_inner(
@@ -1574,12 +1564,14 @@ pub(crate) fn run(
                                 // Wedge prevention: dispatch failed, so no worker will ever
                                 // post ApplyStepResult. Mark the run Failed and surface the error.
                                 in_flight.remove(&run_id);
-                                if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id)
-                                {
-                                    s.status = SessionStatus::Failed;
-                                    let _ = put_node(&mut store, s.to_node());
-                                }
-                                emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{e}"));
+                                fail_run_by_id(
+                                    &mut store,
+                                    &mut subscribers,
+                                    &runner,
+                                    &self_tx,
+                                    &run_id,
+                                    anyhow::anyhow!("{e}"),
+                                );
                                 let _ = reply.send(Err(e));
                             }
                         }
@@ -1728,11 +1720,14 @@ pub(crate) fn run(
                     Err(e) => {
                         // Wedge prevention: no worker will post ApplyStepResult on failure.
                         in_flight.remove(&run_id);
-                        if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                            s.status = SessionStatus::Failed;
-                            let _ = put_node(&mut store, s.to_node());
-                        }
-                        emit_run_error(&mut subscribers, &run_id, anyhow::anyhow!("{e}"));
+                        fail_run_by_id(
+                            &mut store,
+                            &mut subscribers,
+                            &runner,
+                            &self_tx,
+                            &run_id,
+                            anyhow::anyhow!("{e}"),
+                        );
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -3726,6 +3721,58 @@ fn emit_run_error(subscribers: &mut crate::event_log::EventSink, run_id: &str, e
             message: e.to_string(),
         },
     );
+}
+
+/// Terminal-failure path for the asynchronous actor-loop faults that abort a run *outside*
+/// `apply_step_result` — pre-distribute, worktree, council, and re-dispatch failures.
+///
+/// Each of those sites used to write `SessionStatus::Failed` straight to the store and emit only
+/// [`CoreEvent::Error`]. `Error` is **not** a terminal event — it is also emitted for non-fatal
+/// conditions on a run that keeps going — so the store said the run had ended while the live stream
+/// only said "an error happened" and then went quiet. A consumer cannot tell that apart from a run
+/// still working, and waits forever. Observed as `sessionStarted → error → silence` on `/ws` against
+/// a run `GET /runs/<id>` already reported as `failed`.
+///
+/// Routing them all through [`fail_run`] keeps the store write, the terminal `SessionFailed`, the
+/// campaign notify, and the runner's resource release (ACP sessions, PTY terminals) from drifting
+/// apart again — eight hand-rolled copies is how they drifted in the first place.
+///
+/// The campaign notify is consistency with that canonical path rather than a fix for an observed
+/// wedge: a campaign node launches via [`launch_run_inner`], which plans synchronously and hands the
+/// error back to `campaign::dispatch` to reconcile, so it never arrives here. These sites belong to
+/// the standalone `LaunchRun` path, which defers planning off-thread.
+///
+/// `e` is emitted as `Error` *in addition to* `SessionFailed`: `Error` carries the human-readable
+/// reason, `SessionFailed` carries the lifecycle transition. Neither substitutes for the other.
+/// `ord` mirrors `apply_step_result`'s convention — the cursor unit, which is `0` for a run that
+/// never dispatched one.
+fn fail_run_by_id(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    run_id: &str,
+    e: anyhow::Error,
+) {
+    match crate::domain::get_session(store, run_id) {
+        Ok(Some(mut session)) => {
+            // Already terminal (typically cancelled while an off-thread stage was running):
+            // do not clobber the status, do not emit a second terminal event, and do not add
+            // error noise to a run the operator already ended.
+            if matches!(
+                session.status,
+                SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+            ) {
+                return;
+            }
+            emit_run_error(subscribers, run_id, e);
+            let ord = session.unit_ix as u32;
+            let _ = fail_run(store, subscribers, runner, self_tx, &mut session, ord);
+        }
+        // Session unreadable or absent — no lifecycle transition is possible, but the operator
+        // still needs the reason, which is all these sites surfaced before.
+        _ => emit_run_error(subscribers, run_id, e),
+    }
 }
 
 /// The single point every one of core's event emissions passes through: record to the run's durable
