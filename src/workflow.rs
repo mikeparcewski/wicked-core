@@ -22,12 +22,19 @@
 use crate::domain::WorkUnit;
 use crate::scope::EntityMode;
 
-/// Output from a prior completed unit that ran on a DIFFERENT CLI — injected into the current
-/// unit's ACP context so each agent sees what its peers produced. Actor-populated (store read on
-/// the actor thread); the worker never queries the store (single-writer invariant).
+/// Output from a prior completed unit, injected into the current unit's ACP context so a phase sees
+/// the work it builds on. Actor-populated (store read on the actor thread); the worker never queries
+/// the store (single-writer invariant).
+///
+/// Selection is `actor::prior_context_label`: a prior qualifies either because this unit's
+/// [`WorkUnit::depends_on`] names its phase (the def's DECLARED handoff — FINDING-024) or because it
+/// ran on a DIFFERENT CLI (no conversational state can be shared, so it must be passed explicitly).
+/// The two are unioned; the declared path is why this is **no longer cross-CLI-only**.
 #[derive(Debug, Clone)]
 pub struct PriorUnitOutput {
-    /// Human-readable label for the context block, e.g. `"[codex — unit 2]"`.
+    /// Human-readable label for the context block. `[codex — unit 2]` for a cross-CLI carry-over;
+    /// ``[claude — unit 2 — depends_on `build`]`` when the def declared the dependency, so an
+    /// operator can tell the two apart in the transcript without diffing the def.
     pub label: String,
     /// The unit's produced work output.
     pub output: String,
@@ -56,10 +63,12 @@ pub struct StepInput {
     /// must never self-govern against an empty scope. `None` is the unambiguous ungoverned signal
     /// (distinct from a governed unit that merely has an empty scope).
     pub governance: Option<GovernanceContext>,
-    /// Completed outputs from units that ran on a DIFFERENT CLI earlier in the same run — shared
-    /// cross-CLI context injected as additional prompt blocks by the ACP runner. Empty for
-    /// single-CLI runs, same-CLI sequences, and non-ACP fallback paths. Actor-populated so the
-    /// worker holds no store handle (single-writer invariant).
+    /// Completed outputs from earlier units in the same run, injected as additional prompt blocks by
+    /// the ACP runner. Populated when this unit's [`WorkUnit::depends_on`] names the prior's phase
+    /// (the DECLARED handoff) **or** the prior ran on a different CLI — see [`PriorUnitOutput`].
+    /// Empty for prose-planned runs with a single CLI (nothing declares a dependency and no CLI
+    /// boundary is crossed) and for non-ACP fallback paths. Actor-populated so the worker holds no
+    /// store handle (single-writer invariant).
     pub prior_outputs: Vec<PriorUnitOutput>,
 }
 

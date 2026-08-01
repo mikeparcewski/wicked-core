@@ -320,9 +320,17 @@ pub enum CoreEvent {
         /// Why the session was closed: `"run_complete"`, `"error"`, or `"reassigned"`.
         reason: String,
     },
-    /// (EVT-007) One or more cross-CLI prior unit outputs were injected into the current unit's
-    /// ACP context before dispatch (the multi-CLI Tutti-inspired context sharing path). Only fires
-    /// when `prior_units` is non-empty. Fires before `UnitExecuting` for the receiving unit.
+    /// (EVT-007) One or more prior unit outputs were injected into the current unit's ACP context
+    /// before dispatch. Only fires when `prior_units` is non-empty; fires before `UnitExecuting` for
+    /// the receiving unit.
+    ///
+    /// Two independent reasons put a prior in this list, and the `label` says which
+    /// (`actor::prior_context_label`): the receiving unit's `depends_on` DECLARED the
+    /// prior's phase, or the prior ran on a different CLI (the original multi-CLI Tutti-inspired
+    /// sharing path). Before FINDING-024 only the second reason existed, so this event **never
+    /// fired on a single-CLI run** — every shipped workflow's default. Its absence across the whole
+    /// P3 campaign is what proved those phases executed context-free, so treat a run with declared
+    /// dependencies and no EVT-007 as a regression signal, not as a quiet success.
     UnitContextInjected {
         session: String,
         /// The unit receiving the injected context.

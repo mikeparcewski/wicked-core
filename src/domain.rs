@@ -191,6 +191,17 @@ pub struct WorkUnit {
     /// `None` for Agent-executor units. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_cmd: Option<Vec<String>>,
+    /// The PHASE IDS this unit's work depends on — carried verbatim from the backing phase's
+    /// [`depends_on`](crate::workflow::PhaseDef::depends_on) at plan time (FINDING-024).
+    ///
+    /// The def already states the handoff graph and the engine already honors it for ORDERING; this
+    /// field carries it to the dispatch site so it can also drive CONTEXT. Without it the actor has
+    /// no route back to the def — [`AgentSession`] records only a synthetic `wf-<session>` id, not the
+    /// workflow that produced the plan — so the declared dependency was structurally unreachable at
+    /// the moment it was needed. Empty for prose-planned runs (no def ⇒ no declared graph, and none
+    /// is invented). `#[serde(default)]` for back-compat with units planned before this existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -321,6 +332,7 @@ impl WorkUnit {
             role: crate::workflow::PhaseRole::default(),
             validator: None,
             tool_cmd: None,
+            depends_on: Vec::new(),
             status: UnitStatus::Pending,
         }
     }

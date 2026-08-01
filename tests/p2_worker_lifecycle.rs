@@ -92,6 +92,7 @@ mod tests {
             role: PhaseRole::default(),
             validator: None,
             tool_cmd: None,
+            depends_on: Vec::new(),
             status: UnitStatus::Pending,
         }
     }

@@ -83,6 +83,12 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Carry the evaluator≠creator role (§4) so the gate can do real artifact-passing (an
             // Evaluator unit reviews the prior Creator's cold output).
             unit.role = phase.role;
+            // Carry the DECLARED dependency graph (FINDING-024). The def states which phases this one
+            // consumes; the engine honored that for ordering and dropped it for context, so an
+            // Evaluator phase declared `.after("build")` still ran blind to the build. Carrying it
+            // onto the unit is what lets the dispatch site inject the right priors — and keeps the
+            // bound author-controlled rather than a guessed "last N units".
+            unit.depends_on = phase.depends_on.clone();
             // Carry the tool command for Tool-executor phases so the actor can run it directly.
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());
@@ -190,6 +196,94 @@ mod tests {
         assert_eq!(units[0].ord, 1);
         assert_eq!(units.last().unwrap().ord, units.len() as u32);
         assert!(units.iter().all(|u| u.status == UnitStatus::Pending));
+    }
+
+    /// FINDING-024: the DECLARED dependency graph reaches the unit, so the dispatch site can inject
+    /// the priors a phase actually consumes. Asserted against the SHIPPED `feature` def rather than a
+    /// fixture — the whole finding was that real workflows already declare the edges the engine
+    /// dropped, so a synthetic def would prove nothing about them.
+    #[test]
+    fn plan_from_def_carries_the_declared_dependency_graph_onto_the_unit() {
+        let def = feature_def();
+        let units = plan_from_def(&def, "add SSO login", "s1");
+        for (unit, phase) in units.iter().zip(def.phases.iter()) {
+            assert_eq!(
+                unit.depends_on, phase.depends_on,
+                "phase `{}` must carry its own depends_on verbatim",
+                phase.id
+            );
+        }
+
+        let dep = |id: &str| {
+            units
+                .iter()
+                .find(|u| u.id == format!("s1:{id}"))
+                .unwrap_or_else(|| panic!("feature has a `{id}` phase"))
+                .depends_on
+                .clone()
+        };
+        // The Evaluator phase declares the Creator phase it reviews — the exact edge whose loss made
+        // `adversarial-review` re-solve the original task against a different file.
+        assert_eq!(dep("adversarial-review"), vec!["build".to_string()]);
+        assert_eq!(dep("test"), vec!["build".to_string()]);
+        assert_eq!(dep("review"), vec!["test".to_string()]);
+        // The first phase depends on nothing; an empty list must stay empty (not a defaulted guess).
+        assert!(dep("clarify").is_empty());
+    }
+
+    /// FINDING-024, the join that makes the fix work at all. `prior_context_label` matches a prior's
+    /// `phase_id()` (the unit-id suffix) against this unit's `depends_on` (phase ids copied from the
+    /// def). Those are two different vocabularies meeting at a string compare, which is exactly the
+    /// shape of FINDING-021 — there the phase token the policy engine selected on and the token the
+    /// public API accepted diverged, and every gate silently no-op'd while looking correct.
+    ///
+    /// Nothing above proves they agree: the plan test proves the list is COPIED, and the actor tests
+    /// construct units by hand, so both would still pass if real defs named their dependencies in a
+    /// vocabulary `phase_id()` never produces — and the fix would inject nothing, silently, on every
+    /// shipped workflow. This asserts the join RESOLVES across every builtin: each declared id must
+    /// name a real phase that is planned EARLIER, since `prior_context_label` only offers priors with
+    /// a lower ord. A forward or dangling edge is unreachable context, not a handoff.
+    #[test]
+    fn every_builtin_declares_dependencies_that_actually_resolve_to_earlier_units() {
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let mut edges = 0usize;
+        for id in registry.ids() {
+            let def = registry.get(&id).expect("registry returned its own id");
+            let units = plan_from_def(def, "some intent", "s1");
+            // The lookup `prior_context_label` performs, built from the same `phase_id()` accessor.
+            let by_phase: Vec<(Option<&str>, u32)> =
+                units.iter().map(|u| (u.phase_id(), u.ord)).collect();
+            for unit in &units {
+                for dep in &unit.depends_on {
+                    let target = by_phase
+                        .iter()
+                        .find(|(phase, _)| *phase == Some(dep.as_str()))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "workflow `{id}`: phase `{}` declares depends_on `{dep}`, which no \
+                                 unit's phase_id() yields — the declared graph and the unit-id \
+                                 vocabulary have diverged, so injection silently no-ops",
+                                unit.phase_id().unwrap_or("<none>")
+                            )
+                        });
+                    assert!(
+                        target.1 < unit.ord,
+                        "workflow `{id}`: phase `{}` (ord {}) depends on `{dep}` (ord {}), which is \
+                         not EARLIER — a forward edge is never offered to the dispatch site",
+                        unit.phase_id().unwrap_or("<none>"),
+                        unit.ord,
+                        target.1
+                    );
+                    edges += 1;
+                }
+            }
+        }
+        // Guard the guard: if the builtins ever stop declaring dependencies this test would pass
+        // vacuously while asserting nothing at all.
+        assert!(
+            edges >= 10,
+            "expected the builtin defs to declare a real dependency graph, found {edges} edges"
+        );
     }
 
     #[test]

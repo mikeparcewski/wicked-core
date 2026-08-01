@@ -289,10 +289,11 @@ struct TurnResult {
 /// Send one `session/prompt` request and collect `session/update` notifications until
 /// the response arrives (or `timeout` elapses). Streams text deltas through `emit`.
 ///
-/// `prior_outputs` are injected as leading ACP prompt blocks so the agent sees what peer CLIs
-/// produced before this turn. For a single-CLI run this slice is empty; the prompt stays
-/// a single text block exactly as before. For multi-CLI runs each prior block is prefixed with
-/// its label so the agent can attribute each peer's contribution.
+/// `prior_outputs` are injected as leading ACP prompt blocks so the agent sees the work this turn is
+/// supposed to build on — a peer CLI's output, or (FINDING-024) the output of a phase this one
+/// declared `depends_on`. Each block is prefixed with its label so the agent can attribute the
+/// contribution, and a contract header precedes them stating that they are the subject of the task.
+/// When the slice is empty the prompt stays a single text block exactly as before — no header.
 fn exec_turn_acp(
     proc: &mut AcpProcess,
     prompt: &str,
@@ -303,16 +304,31 @@ fn exec_turn_acp(
     let id = proc.next_id;
     proc.next_id += 1;
 
-    // Build the prompt block array: prior-CLI context (if any) followed by the work prompt.
-    let mut blocks: Vec<Value> = prior_outputs
-        .iter()
-        .map(|p| {
-            json!({
-                "type": "text",
-                "text": format!("{}\n{}", p.label, p.output)
-            })
+    // Build the prompt block array: a contract header, the prior outputs, then the work prompt.
+    let mut blocks: Vec<Value> = Vec::new();
+    if !prior_outputs.is_empty() {
+        // FINDING-024 (3): STATE the contract; do not let the phase name imply it. Labelled blobs
+        // alone were read as background — an `adversarial-review` phase handed the build's output
+        // still re-solved the original task, because nothing told it the blob was the subject. The
+        // phase name is not an instruction, so this says plainly what the blocks are and what to do
+        // with them. Only emitted when there IS prior context, so single-CLI runs with no declared
+        // dependency keep the exact prompt they had before.
+        blocks.push(json!({
+            "type": "text",
+            "text": "CONTEXT (prior phases of this run): the block(s) below are the verbatim output \
+of earlier phases in this same workflow run. Blocks marked `depends_on` are the artifacts your \
+phase explicitly declared it consumes — treat them as the SUBJECT of your task, not as background. \
+Build on this work; do not re-solve the original problem from scratch, and do not choose a different \
+target than the one the prior phase worked on. If your phase reviews, tests, or revises, it is that \
+prior output you are reviewing, testing, or revising."
+        }));
+    }
+    blocks.extend(prior_outputs.iter().map(|p| {
+        json!({
+            "type": "text",
+            "text": format!("{}\n{}", p.label, p.output)
         })
-        .collect();
+    }));
     blocks.push(json!({"type": "text", "text": prompt}));
 
     rpc_send(
