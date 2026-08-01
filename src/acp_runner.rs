@@ -95,38 +95,68 @@ impl Drop for AcpProcess {
 // governed execution path for latency without saying so, and does it most often exactly when
 // parallelism is highest — which is when governance matters most. (FINDING-022)
 
-fn env_secs(key: &str, default: u64) -> Duration {
-    let secs = std::env::var(key)
-        .ok()
+/// Budget for `initialize`. Generous relative to the 0.69s worst case above because the FIRST
+/// spawn after daemon start is cold and was measured at 9.83s.
+const INIT_DEFAULT_SECS: u64 = 60;
+
+/// Budget for `session/new` — the call whose cost scales with concurrency. ~7x the median measured
+/// in the slow regime and ~5x its worst case.
+const SESSION_NEW_DEFAULT_SECS: u64 = 60;
+
+/// How many ACP bridges may be inside `initialize` + `session/new` at once. 2 is the highest
+/// concurrency measured with no degradation. What is bounded is contention, not useful work: a
+/// queued handshake succeeds where a contended one silently downgrades its unit to ungoverned
+/// execution. Set the env override to a large number to disable the gate.
+const START_PERMITS_DEFAULT: usize = 2;
+
+/// How long a start waits for a permit before giving up and proceeding contended.
+///
+/// Deliberately NOT [`session_new_budget`]. That wait is pure overhead spent before the bridge is
+/// even spawned, and the waiter still needs its full budget *after* admission — so tying the two
+/// together makes them compound, and raising the budget to fix slow handshakes would lengthen the
+/// queue in front of them.
+///
+/// 30s comes from the drain rate the gate itself enforces: held to 2 concurrent starts a handshake
+/// costs ~1.75s (K=2 in the table above), so a fan-out of roughly 34 simultaneous units is still
+/// admitted inside the bound — well past any run this platform dispatches. Beyond that the gate is
+/// no longer the thing helping (a permit holder is stuck near its own budget, or arrivals far
+/// exceed what serialising can absorb) and proceeding contended beats waiting longer.
+const START_WAIT: Duration = Duration::from_secs(30);
+
+/// Parses a seconds override, falling back to `default`.
+///
+/// Split from the env lookup so the defaults are testable without the process environment: a test
+/// that asserted on [`initialize_budget`] would fail on any host that legitimately sets the
+/// override, which is a supported configuration and not a defect.
+fn parse_secs(raw: Option<String>, default: u64) -> Duration {
+    let secs = raw
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|s| *s > 0)
         .unwrap_or(default);
     Duration::from_secs(secs)
 }
 
-/// Budget for `initialize`. Generous relative to the 0.69s worst case above because the FIRST
-/// spawn after daemon start is cold and was measured at 9.83s.
+fn env_secs(key: &str, default: u64) -> Duration {
+    parse_secs(std::env::var(key).ok(), default)
+}
+
 fn initialize_budget() -> Duration {
-    env_secs("WICKED_ACP_INIT_SECS", 60)
+    env_secs("WICKED_ACP_INIT_SECS", INIT_DEFAULT_SECS)
 }
 
-/// Budget for `session/new` — the call whose cost scales with concurrency. 60s is ~7x the median
-/// measured in the slow regime and ~5x its worst case.
 fn session_new_budget() -> Duration {
-    env_secs("WICKED_ACP_SESSION_NEW_SECS", 60)
+    env_secs("WICKED_ACP_SESSION_NEW_SECS", SESSION_NEW_DEFAULT_SECS)
 }
 
-/// How many ACP bridges may be inside `initialize` + `session/new` at once.
-///
-/// Defaults to 2 — the highest concurrency measured with no degradation. What is bounded is
-/// contention, not useful work: a queued handshake succeeds where a contended one silently
-/// downgrades its unit to ungoverned execution. Set to a large number to disable the gate.
-fn start_permits() -> usize {
-    std::env::var("WICKED_ACP_START_CONCURRENCY")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+/// Parses the start-concurrency override. Pure, for the same reason as [`parse_secs`].
+fn parse_permits(raw: Option<String>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
         .filter(|n| *n > 0)
-        .unwrap_or(2)
+        .unwrap_or(START_PERMITS_DEFAULT)
+}
+
+fn start_permits() -> usize {
+    parse_permits(std::env::var("WICKED_ACP_START_CONCURRENCY").ok())
 }
 
 struct StartGate {
@@ -266,7 +296,7 @@ fn start_acp_process(
     };
 
     // Held for the spawn and both handshake calls, released when this function returns.
-    let _permit = start_gate().acquire(session_new_budget());
+    let _permit = start_gate().acquire(START_WAIT);
 
     let mut child = match build_cmd(&config.binary).spawn() {
         Ok(c) => c,
@@ -1539,17 +1569,41 @@ mod tests {
         // The defect was ONE constant covering two calls with different cost profiles, at a value
         // that sat inside the measured spread of the slower one. Pinning both to >10s is what
         // stops a reviewer reinstating a single shared constant at the old value.
-        assert!(initialize_budget() > Duration::from_secs(10));
-        assert!(session_new_budget() > Duration::from_secs(10));
+        //
+        // Asserted on the defaults, not on `initialize_budget()` / `session_new_budget()`: those
+        // read the process env, and an override is a supported configuration — a host that sets
+        // one must not fail a test about what the code ships with.
+        assert!(parse_secs(None, INIT_DEFAULT_SECS) > Duration::from_secs(10));
+        assert!(parse_secs(None, SESSION_NEW_DEFAULT_SECS) > Duration::from_secs(10));
     }
 
     #[test]
     fn a_budget_override_must_be_a_positive_number_or_the_default_stands() {
-        // Env parsing only — `env_secs` is called per handshake, so a typo'd or zero override
-        // must not silently become an instant timeout, which would fail EVERY handshake open and
-        // downgrade every unit to ungoverned execution.
-        let unset = "WICKED_ACP_BUDGET_TEST_UNSET_VAR_DOES_NOT_EXIST";
-        assert_eq!(env_secs(unset, 60), Duration::from_secs(60));
+        // `parse_secs` runs per handshake, so a typo'd or zero override must not silently become
+        // an instant timeout — that would fail EVERY handshake open and downgrade every unit to
+        // ungoverned execution, which is the exact failure this whole change exists to stop.
+        let default = Duration::from_secs(60);
+        assert_eq!(parse_secs(None, 60), default, "unset");
+        assert_eq!(parse_secs(Some("0".into()), 60), default, "zero");
+        assert_eq!(parse_secs(Some("".into()), 60), default, "empty");
+        assert_eq!(parse_secs(Some("ninety".into()), 60), default, "garbage");
+        assert_eq!(parse_secs(Some("-5".into()), 60), default, "negative");
+        assert_eq!(
+            parse_secs(Some("90".into()), 60),
+            Duration::from_secs(90),
+            "valid"
+        );
+    }
+
+    #[test]
+    fn the_permit_wait_is_not_tied_to_the_budget_of_the_call_it_guards() {
+        // Coupling them compounds: the wait is spent BEFORE the bridge is spawned and the waiter
+        // still needs its full budget after admission, so raising the budget to fix slow
+        // handshakes would also lengthen the queue in front of them.
+        assert!(
+            START_WAIT < parse_secs(None, SESSION_NEW_DEFAULT_SECS),
+            "the permit wait must stay strictly under the budget of the call it guards"
+        );
     }
 
     /// A gate of its own per test — exhausting the process-wide one would stall any concurrent
@@ -1594,9 +1648,31 @@ mod tests {
     #[test]
     fn the_default_start_concurrency_is_bounded_and_non_zero() {
         // Zero would deadlock every start behind a permit that never exists; unbounded would
-        // reinstate the contention that makes `session/new` outrun its budget.
-        let n = start_permits();
-        assert!(n > 0 && n <= 8, "start concurrency {n} is out of range");
+        // reinstate the contention that makes `session/new` outrun its budget. Asserted on
+        // `parse_permits(None)` rather than `start_permits()` so a host that sets the (supported)
+        // override does not fail a test about the shipped default.
+        let n = parse_permits(None);
+        assert!(
+            n > 0 && n <= 8,
+            "default start concurrency {n} is out of range"
+        );
+    }
+
+    #[test]
+    fn a_start_concurrency_override_must_be_a_positive_number_or_the_default_stands() {
+        // Zero is the dangerous one: a gate with no permits would make every start wait out
+        // START_WAIT before proceeding contended anyway — 30s of dead time per unit.
+        assert_eq!(
+            parse_permits(Some("0".into())),
+            START_PERMITS_DEFAULT,
+            "zero"
+        );
+        assert_eq!(
+            parse_permits(Some("two".into())),
+            START_PERMITS_DEFAULT,
+            "garbage"
+        );
+        assert_eq!(parse_permits(Some("6".into())), 6, "valid");
     }
 
     /// Writes a stub ACP bridge: answers `initialize` and `session/new`, and brackets its own
