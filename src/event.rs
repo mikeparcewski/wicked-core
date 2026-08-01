@@ -255,9 +255,20 @@ pub enum CoreEvent {
     },
     /// The run paused at a human-confirm gate BEFORE the unit with this `ord`. The operator must
     /// `confirm_gate` (approve / reject / cancel) to proceed. `prompt` is the gate question.
+    ///
+    /// `reviewing_ord` names the unit whose OUTPUT the human is being asked to judge, which is
+    /// usually not `ord`. A DEF-declared gate fires *after* its phase's work, so the preceding
+    /// phase demanded the pause and its output is the artifact under review; a triage, refusal, or
+    /// not-pass-verdict escalation is about the failed unit's own output. `None` means nothing has
+    /// been produced to review — the run-level `--confirm` policy paused before `ord` ran.
+    ///
+    /// Without it the log cannot answer "why did this run pause here, and on what?" — recovering
+    /// that took re-reading the workflow def and re-deriving `should_pause` by hand (FINDING-032).
+    /// For a system that re-derives "done" from evidence, a governance pause has to describe itself.
     AwaitingHuman {
         session: String,
         ord: u32,
+        reviewing_ord: Option<u32>,
         prompt: String,
     },
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
@@ -730,9 +741,10 @@ impl CoreEvent {
             CoreEvent::AwaitingHuman {
                 session,
                 ord,
+                reviewing_ord,
                 prompt,
             } => {
-                json!({ "type": "awaitingHuman", "session": session, "ord": ord, "prompt": prompt })
+                json!({ "type": "awaitingHuman", "session": session, "ord": ord, "reviewingOrd": reviewing_ord, "prompt": prompt })
             }
             CoreEvent::Resumed { session, ord } => {
                 json!({ "type": "resumed", "session": session, "ord": ord })

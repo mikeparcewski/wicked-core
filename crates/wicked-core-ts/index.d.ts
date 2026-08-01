@@ -237,7 +237,7 @@ export declare class Subscription {
  * A CoreEvent, delivered as a JSON string to the {@link Core.subscribe} callback. Discriminated on
  * `type`. Fields vary by variant (see wicked-core `CoreEvent`): e.g.
  * `sessionStarted` `{session, problem}`, `unitPlanned` `{session, ord, description}`,
- * `unitDistributed` `{session, ord, cli}`, `awaitingHuman` `{session, ord, prompt}`,
+ * `unitDistributed` `{session, ord, cli}`, `awaitingHuman` `{session, ord, reviewingOrd, prompt}`,
  * `gateDecided` `{session, ord, allow}`, `unitDone`/`unitExecuting`/`resumed` `{session, ord}`,
  * `sessionCompleted` `{session}`, `sessionFailed` `{session, ord}`, `error` `{session, message}`.
  * PTY terminal sessions emit `terminalOpened` `{id, cwd}`, `terminalOutput` `{id, seq, bytesB64}`
