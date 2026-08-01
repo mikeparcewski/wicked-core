@@ -231,6 +231,61 @@ mod tests {
         assert!(dep("clarify").is_empty());
     }
 
+    /// FINDING-024, the join that makes the fix work at all. `prior_context_label` matches a prior's
+    /// `phase_id()` (the unit-id suffix) against this unit's `depends_on` (phase ids copied from the
+    /// def). Those are two different vocabularies meeting at a string compare, which is exactly the
+    /// shape of FINDING-021 — there the phase token the policy engine selected on and the token the
+    /// public API accepted diverged, and every gate silently no-op'd while looking correct.
+    ///
+    /// Nothing above proves they agree: the plan test proves the list is COPIED, and the actor tests
+    /// construct units by hand, so both would still pass if real defs named their dependencies in a
+    /// vocabulary `phase_id()` never produces — and the fix would inject nothing, silently, on every
+    /// shipped workflow. This asserts the join RESOLVES across every builtin: each declared id must
+    /// name a real phase that is planned EARLIER, since `prior_context_label` only offers priors with
+    /// a lower ord. A forward or dangling edge is unreachable context, not a handoff.
+    #[test]
+    fn every_builtin_declares_dependencies_that_actually_resolve_to_earlier_units() {
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let mut edges = 0usize;
+        for id in registry.ids() {
+            let def = registry.get(&id).expect("registry returned its own id");
+            let units = plan_from_def(def, "some intent", "s1");
+            // The lookup `prior_context_label` performs, built from the same `phase_id()` accessor.
+            let by_phase: Vec<(Option<&str>, u32)> =
+                units.iter().map(|u| (u.phase_id(), u.ord)).collect();
+            for unit in &units {
+                for dep in &unit.depends_on {
+                    let target = by_phase
+                        .iter()
+                        .find(|(phase, _)| *phase == Some(dep.as_str()))
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "workflow `{id}`: phase `{}` declares depends_on `{dep}`, which no \
+                                 unit's phase_id() yields — the declared graph and the unit-id \
+                                 vocabulary have diverged, so injection silently no-ops",
+                                unit.phase_id().unwrap_or("<none>")
+                            )
+                        });
+                    assert!(
+                        target.1 < unit.ord,
+                        "workflow `{id}`: phase `{}` (ord {}) depends on `{dep}` (ord {}), which is \
+                         not EARLIER — a forward edge is never offered to the dispatch site",
+                        unit.phase_id().unwrap_or("<none>"),
+                        unit.ord,
+                        target.1
+                    );
+                    edges += 1;
+                }
+            }
+        }
+        // Guard the guard: if the builtins ever stop declaring dependencies this test would pass
+        // vacuously while asserting nothing at all.
+        assert!(
+            edges >= 10,
+            "expected the builtin defs to declare a real dependency graph, found {edges} edges"
+        );
+    }
+
     #[test]
     fn plan_from_def_takes_stage_from_the_phase_not_the_words() {
         // Every unit shares the SAME prose ("build ..."), which the keyword classifier would
