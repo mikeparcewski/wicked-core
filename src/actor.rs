@@ -2986,10 +2986,10 @@ fn advance_or_pause(
         // that had not run and, in the common case, at a phase that had declared no gate at all.
         let (reviewing_ord, prompt) = match reason {
             PauseReason::DefGate { reviewing_ord } => {
-                let done = units
-                    .iter()
-                    .find(|u| u.ord == reviewing_ord)
-                    .map_or_else(|| format!("unit {reviewing_ord}"), |p| p.description.clone());
+                let done = units.iter().find(|u| u.ord == reviewing_ord).map_or_else(
+                    || format!("unit {reviewing_ord}"),
+                    |p| p.description.clone(),
+                );
                 (
                     Some(reviewing_ord),
                     format!(
@@ -3885,7 +3885,11 @@ mod gate_pause_tests {
             ),
             unit(2, GateSpec::Auto, UnitStatus::Pending),
         ];
-        assert_eq!(should_pause(&s, &passed, 1), None, "clean pass (Done) ⇒ no pause");
+        assert_eq!(
+            should_pause(&s, &passed, 1),
+            None,
+            "clean pass (Done) ⇒ no pause"
+        );
         let not_passed = vec![
             unit(
                 1,

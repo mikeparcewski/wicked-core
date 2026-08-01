@@ -31,7 +31,10 @@ use wicked_council::{AgenticCli, CouncilTask};
 const GATE_DEADLINE: Duration = Duration::from_secs(60);
 
 fn db_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("wicked-core-gateattr-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-core-gateattr-{name}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("estate.db").to_str().unwrap().to_string()
@@ -162,7 +165,10 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
 
     let (ord, reviewing_ord, prompt) = wait_for_gate(&ev, "attr-def").expect("the run pauses");
 
-    assert_eq!(ord, 2, "the pause blocks unit 2 — that part was always right");
+    assert_eq!(
+        ord, 2,
+        "the pause blocks unit 2 — that part was always right"
+    );
     assert_eq!(
         reviewing_ord,
         Some(1),
