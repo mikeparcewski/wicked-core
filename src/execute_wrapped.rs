@@ -13,7 +13,7 @@
 //! deadlock (the bug the P2 review flagged for this phase). The run is bounded by a timeout.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -329,6 +329,41 @@ fn argv_states(argv: &[String], names: &[&str]) -> bool {
     })
 }
 
+/// How `dir` is spelled inside a permission rule, or `None` when it has no faithful spelling.
+///
+/// Two different problems, and only the first is about Windows:
+///
+///  - **Separators.** A Windows path is `C:\Users\me\.claude`, and in the rule's glob syntax a
+///    backslash is the ESCAPE character, not a separator. Left alone, `Read(C:\Users\me\.claude/**)`
+///    unescapes to `C:Usersme.claude/**` and matches nothing — the fence would be listed in the
+///    settings file, look present to anyone reading it, and deny NOTHING at runtime. So on a
+///    backslash-separator OS the separators are rewritten to `/`, which the matcher accepts
+///    everywhere. The rewrite is conditioned on the OS separator because on POSIX a backslash is a
+///    legal filename byte: rewriting it there would fence off a DIFFERENT directory than the one
+///    asked for, which is the same silent-hole failure in the other direction.
+///  - **Characters with no literal spelling.** After that rewrite, a surviving backslash (POSIX only,
+///    by the above) or a comma — the character `--disallowedTools` joins its list on — still cannot be
+///    written into a rule. Refused rather than mangled, so the caller can warn.
+///
+/// Glob metacharacters (`*`, `?`, `[`) are deliberately NOT refused. A directory named `a*b` yields a
+/// rule that denies MORE than intended, and on a DENY list erring wide is the safe direction; refusing
+/// it would instead open the exact hole this function exists to close.
+fn rule_path(dir: &Path) -> Option<String> {
+    rule_path_sep(dir.to_str()?, std::path::MAIN_SEPARATOR)
+}
+
+/// [`rule_path`] with the OS separator injected, so the Windows behaviour is testable from any host.
+/// A `#[cfg(windows)]` test would only ever run on one of the three CI platforms, which is exactly
+/// how a separator bug survives review in the first place.
+fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
+    let p = if os_sep == '\\' {
+        p.replace('\\', "/")
+    } else {
+        p.to_string()
+    };
+    (!p.contains('\\') && !p.contains(',')).then_some(p)
+}
+
 /// The deny rules, in Claude's permission-rule syntax. Used two ways: comma-joined as the
 /// `--disallowedTools` value on the wrapped-CLI path, and as `permissions.deny` inside the settings
 /// file both the wrapped and ACP paths write (the ACP bridge forwards settings but has its own flag
@@ -342,15 +377,18 @@ fn argv_states(argv: &[String], names: &[&str]) -> bool {
 ///    here would have taken `Bash(sudo:*)` and `Bash(find /:*)` down with the path rules, silently,
 ///    in exactly the unattended environment where that matters most. So the path rules are skipped
 ///    with a warning and the verb rules still ship.
-///  - **An individual directory cannot be expressed** — non-UTF8, or containing the comma the list is
-///    joined on. Skipped with a warning; the remaining rules still ship. Dropping the other dozen
-///    because one path is unrepresentable would trade a small hole for a total one.
+///  - **An individual directory cannot be expressed** — see [`rule_path`]. Skipped with a warning; the
+///    remaining rules still ship. Dropping the other dozen because one path is unrepresentable would
+///    trade a small hole for a total one.
 ///
 /// This is documented as a deny-list rather than a sandbox (see [`inject_isolation_flags`]), so a
 /// partial list is a real if reduced boundary. What must never happen is a gap being SILENT — an
 /// operator who reads "the worker is fenced off from `~/.ssh`" needs to hear when it isn't.
 ///
 /// The return is a plain `Vec` because it can never be empty: `DENIED_BASH` is unconditional.
+///
+/// The rule strings themselves are built by [`rule_path`], which is where the platform difference
+/// lives.
 pub(crate) fn deny_rules() -> Vec<String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -374,14 +412,12 @@ pub(crate) fn deny_rules() -> Vec<String> {
                 .flat_map(|h| DENIED_HOME_SUBDIRS.iter().map(|d| h.join(d))),
         );
     for dir in dirs {
-        // A rule carrying a comma would split the joined list into two malformed rules; a non-UTF8
-        // path cannot be written into one at all. Skip the entry, but SAY SO — see the doc comment:
-        // the hole is acceptable, hiding it is not.
-        let representable = dir.to_str().filter(|p| !p.contains(','));
-        let Some(p) = representable else {
+        // Skip what cannot be spelled, but SAY SO — see the doc comment: the hole is acceptable,
+        // hiding it is not.
+        let Some(p) = rule_path(&dir) else {
             eprintln!(
-                "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8 or \
-                 contains a comma); this path is NOT fenced off from workers",
+                "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8, or it \
+                 contains a backslash or a comma); this path is NOT fenced off from workers",
                 dir.display()
             );
             continue;
@@ -1652,6 +1688,40 @@ mod tests {
             denied.contains("Bash(find /:*)") && denied.contains("Bash(pkill:*)"),
             "the two verbs no path rule can catch, both observed in campaign transcripts: {denied}"
         );
+    }
+
+    /// A Windows path must reach the rule as a path, not as a string of escapes.
+    ///
+    /// `C:\Users\me\.claude` written into a glob rule verbatim unescapes to `C:Usersme.claude`, so
+    /// the rule matches nothing and the fence is gone — while still LISTED in the settings file,
+    /// which is the worst version: an operator reading it sees `.claude` denied, and it is not. The
+    /// separator is injected rather than `#[cfg(windows)]`-gated so this runs on all three CI
+    /// platforms; a Windows-only test is precisely how a separator bug survives review.
+    #[test]
+    fn a_windows_path_is_spelled_with_separators_the_matcher_understands() {
+        let got =
+            rule_path_sep(r"C:\Users\me\.claude", '\\').expect("a Windows path is expressible");
+        assert_eq!(got, "C:/Users/me/.claude");
+        assert!(
+            !got.contains('\\'),
+            "a surviving backslash is an escape, not a separator: {got}"
+        );
+
+        // The same bytes on POSIX are a filename containing backslashes, NOT separators. Rewriting
+        // them would fence off a different directory than the one asked for, so this is refused (and
+        // the caller warns) rather than silently mangled.
+        assert_eq!(
+            rule_path_sep(r"/home/me/we\ird", '/'),
+            None,
+            "a POSIX path with a literal backslash has no faithful rule spelling"
+        );
+        // Unchanged on POSIX, and the comma refusal survives the rewrite on both.
+        assert_eq!(
+            rule_path_sep("/home/me/.ssh", '/').as_deref(),
+            Some("/home/me/.ssh")
+        );
+        assert_eq!(rule_path_sep("/home/a,b/.ssh", '/'), None);
+        assert_eq!(rule_path_sep(r"C:\Users\a,b", '\\'), None);
     }
 
     /// Dropping user scope drops the permission mode that lived there, and a `-p` session with no
