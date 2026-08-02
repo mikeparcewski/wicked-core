@@ -72,6 +72,21 @@ impl wicked_council::EventSink for RelaySink {
                     .round() as u8,
                 votes: payload["votes"].as_u64().unwrap_or(0) as u32,
             },
+            wicked_apps_core::EV_COUNCIL_SEAT_FAILED => CoreEvent::CouncilSeatFailed {
+                session: self.session.clone(),
+                ord: self.ord,
+                round: payload["round"].as_u64().unwrap_or(0) as u32,
+                cli: payload["cli"].as_str().unwrap_or_default().to_string(),
+                kind: payload["kind"].as_str().unwrap_or("unreported").to_string(),
+                // `as_i64` is None for a JSON null (a seat that never reached exit), which is
+                // exactly the case `exit_code: None` represents.
+                exit_code: payload["exit_code"].as_i64().map(|c| c as i32),
+                stderr: payload["stderr"].as_str().unwrap_or_default().to_string(),
+                detail: payload["detail"].as_str().unwrap_or_default().to_string(),
+                // Separates a seat that never started from one that burned the whole budget —
+                // the two look identical without it.
+                latency_ms: payload["latency_ms"].as_u64().unwrap_or(0),
+            },
             wicked_apps_core::EV_COUNCIL_VOTED => CoreEvent::CouncilVoted {
                 session: self.session.clone(),
                 ord: self.ord,
@@ -314,6 +329,38 @@ fn pct(x: f32) -> u8 {
     (x.clamp(0.0, 1.0) * 100.0).round() as u8
 }
 
+/// Why a council in a non-`Voted` state produced nothing, as specifically as the record allows.
+///
+/// This replaces the single string `"council did not reach a vote"`, which was emitted for
+/// `TimedOut`, `Failed`, `Queued` and `Running` alike and named no seat. A campaign of 27
+/// convened councils degraded 25 times, every one of them reporting that same sentence — there
+/// was nothing in it to act on.
+///
+/// Three levels, most specific first: the seats' own reported failures; failing that, the
+/// lifecycle state (which at least distinguishes "ran out of time" from "could not start" from
+/// "still running when polled"); and the state is always named so the two are never confused.
+fn no_vote_reason(status: &PollStatus) -> String {
+    let state = match status.state {
+        TaskState::Queued => "never started (still queued when polled)",
+        TaskState::Running => "still running when polled",
+        TaskState::TimedOut => "no seat returned a vote",
+        TaskState::Failed => "could not run",
+        // `Voted` does not reach here — the caller checks for it first.
+        TaskState::Voted => "reported a vote but was not in the voted state",
+    };
+
+    if status.seat_failures.is_empty() {
+        return format!("council {state} (no per-seat reason recorded)");
+    }
+
+    let seats: Vec<String> = status
+        .seat_failures
+        .iter()
+        .map(|f| format!("{}: {}", f.cli, f.failure.reason()))
+        .collect();
+    format!("council {state} — {}", seats.join("; "))
+}
+
 /// Resolve the assigned CLI from the council's poll status AND the routing provenance.
 ///
 /// Voters respond with a **capability-profile number** (e.g. "2"), never a CLI name.
@@ -344,7 +391,7 @@ fn route_from_status(
         return degrade("council returned no status");
     };
     if status.state != TaskState::Voted {
-        return degrade("council did not reach a vote");
+        return degrade(&no_vote_reason(status));
     }
     let Some(verdict) = &status.verdict else {
         return degrade("council produced no verdict");
@@ -405,6 +452,7 @@ mod tests {
                 risk_convergence: vec![],
                 dissent: vec![],
             }),
+            seat_failures: vec![],
         }
     }
 

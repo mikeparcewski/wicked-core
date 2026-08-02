@@ -90,18 +90,76 @@ mod tests {
     }
 
     #[test]
-    fn council_events_match_wicked_apps_core_catalog() {
-        assert_eq!(
-            COUNCIL_EVENTS,
-            [
-                wicked_apps_core::EV_COUNCIL_REQUESTED,
-                wicked_apps_core::EV_COUNCIL_VOTED,
-                wicked_apps_core::EV_CLI_RANKED
-            ]
+    fn council_events_are_in_the_shared_catalog_and_grammar_valid() {
+        for ev in COUNCIL_EVENTS {
+            assert!(
+                wicked_apps_core::EVENT_CATALOG.contains(&ev),
+                "{ev} is declared as produced but is not in the shared catalog"
+            );
+            assert!(
+                wicked_apps_core::validate_event_type(ev),
+                "{ev} is not a grammar-valid bus event type"
+            );
+        }
+    }
+
+    /// `COUNCIL_EVENTS` is the crate's published contract, so it must list every event the
+    /// crate actually emits.
+    ///
+    /// The previous test asserted `COUNCIL_EVENTS == [the same three literals]`, which is
+    /// tautological — it restates the constant rather than checking it, and passes no matter
+    /// how far the constant drifts from reality. It did drift: `EV_COUNCIL_DELIBERATED` was
+    /// emitted for several releases without ever being declared. Scanning the emitting source
+    /// is the only version of this check that can fail.
+    #[test]
+    fn council_events_are_the_events_the_crate_emits() {
+        let sources = [
+            include_str!("worker.rs"),
+            include_str!("dispatch.rs"),
+            include_str!("store.rs"),
+        ];
+        let mut emitted: Vec<&str> = Vec::new();
+        for src in sources {
+            for (idx, _) in src.match_indices("events.emit(") {
+                // The const path follows the open paren: `wicked_apps_core::EV_FOO,`
+                let rest = &src[idx..];
+                let Some(start) = rest.find("wicked_apps_core::EV_") else {
+                    continue;
+                };
+                let name: String = rest[start + "wicked_apps_core::".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || *c == '_' || c.is_ascii_digit())
+                    .collect();
+                // Map the const NAME back to its value via the declared list.
+                let value = COUNCIL_EVENTS.iter().find(|v| match name.as_str() {
+                    "EV_COUNCIL_REQUESTED" => **v == wicked_apps_core::EV_COUNCIL_REQUESTED,
+                    "EV_COUNCIL_DELIBERATED" => **v == wicked_apps_core::EV_COUNCIL_DELIBERATED,
+                    "EV_COUNCIL_SEAT_FAILED" => **v == wicked_apps_core::EV_COUNCIL_SEAT_FAILED,
+                    "EV_COUNCIL_VOTED" => **v == wicked_apps_core::EV_COUNCIL_VOTED,
+                    "EV_CLI_RANKED" => **v == wicked_apps_core::EV_CLI_RANKED,
+                    _ => false,
+                });
+                assert!(
+                    value.is_some(),
+                    "{name} is emitted by this crate but is not declared in COUNCIL_EVENTS — \
+                     the published event contract is incomplete"
+                );
+                emitted.push(value.expect("checked above"));
+            }
+        }
+        // The scan must have found something; an empty scan would make the assertion above
+        // vacuous and hide the very drift this test exists to catch.
+        assert!(
+            emitted.len() >= COUNCIL_EVENTS.len(),
+            "scanned {} emit sites for {} declared events — the scan is not finding them",
+            emitted.len(),
+            COUNCIL_EVENTS.len()
         );
-        // All three are grammar-valid bus event types.
-        assert!(COUNCIL_EVENTS
-            .iter()
-            .all(|e| wicked_apps_core::validate_event_type(e)));
+        for declared in COUNCIL_EVENTS {
+            assert!(
+                emitted.contains(&declared),
+                "{declared} is declared as produced but nothing in this crate emits it"
+            );
+        }
     }
 }

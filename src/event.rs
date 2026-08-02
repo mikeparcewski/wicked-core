@@ -110,6 +110,29 @@ pub enum CoreEvent {
         needed_pct: u8,
         votes: u32,
     },
+    /// One convened seat produced no vote — the named dispatch branch plus what the CLI wrote.
+    ///
+    /// The council used to collapse ten distinct failure branches into a bare "no vote", so a
+    /// 92.6% degradation rate had no signal to diagnose it from. Every no-vote emits one of these.
+    CouncilSeatFailed {
+        session: String,
+        ord: u32,
+        /// The ballot the seat failed on (1-based).
+        round: u32,
+        /// The roster key of the seat.
+        cli: String,
+        /// Which dispatch branch was taken (`spawn_failed`, `non_zero_exit`, `timed_out`, …).
+        kind: String,
+        /// The process exit code, when the process ran to completion.
+        exit_code: Option<i32>,
+        /// Captured stderr, truncated. The artifact `run_in_isolation` used to discard.
+        stderr: String,
+        /// The OS/IO error text, where the branch has one.
+        detail: String,
+        /// How long the seat ran before failing. A spawn error costs ~0 ms; a timeout costs the
+        /// whole budget. Without this the two are indistinguishable in the event stream.
+        latency_ms: u64,
+    },
     /// The council reached a verdict for a unit's assignment vote.
     CouncilVoted {
         session: String,
@@ -638,6 +661,28 @@ impl CoreEvent {
                 "agreementPct": agreement_pct,
                 "neededPct": needed_pct,
                 "votes": votes,
+            }),
+            CoreEvent::CouncilSeatFailed {
+                session,
+                ord,
+                round,
+                cli,
+                kind,
+                exit_code,
+                stderr,
+                detail,
+                latency_ms,
+            } => json!({
+                "type": "councilSeatFailed",
+                "session": session,
+                "ord": ord,
+                "round": round,
+                "cli": cli,
+                "kind": kind,
+                "exitCode": exit_code,
+                "stderr": stderr,
+                "detail": detail,
+                "latencyMs": latency_ms,
             }),
             CoreEvent::CouncilVoted {
                 session,

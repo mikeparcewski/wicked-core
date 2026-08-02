@@ -20,11 +20,11 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use crate::store::{Ledger, TaskRecord};
+use crate::store::{Ledger, SeatFailureRecord, TaskRecord};
 use crate::synthesis;
 use crate::types::{
-    AgenticCli, BallotContext, CouncilTask, Dispatcher, EventSink, RankSignal, RankStore,
-    TaskState, Verdict, SEATS,
+    AgenticCli, BallotContext, CouncilTask, DispatchOutcome, Dispatcher, EventSink, RankSignal,
+    RankStore, TaskState, Verdict, SEATS,
 };
 
 /// The share of seats that must converge on one option before the council stops
@@ -85,6 +85,7 @@ impl Worker {
             convened: convened.clone(),
             votes: Vec::new(),
             verdict: None,
+            seat_failures: Vec::new(),
         });
 
         self.events.emit(
@@ -140,6 +141,7 @@ impl Worker {
             returned: rec.votes.len() as u32,
             pending: rec.convened.len().saturating_sub(rec.votes.len()) as u32,
             verdict: rec.verdict,
+            seat_failures: rec.seat_failures,
         })
     }
 }
@@ -157,6 +159,13 @@ pub struct PollStatus {
     pub pending: u32,
     /// The verdict, once `state == Voted`.
     pub verdict: Option<Verdict>,
+    /// Seats that were convened but did not vote on the latest ballot, and why.
+    ///
+    /// Do not read this off `pending`: `pending` is `convened - returned`, which lumps a seat
+    /// that has not been dispatched yet together with one that was dispatched and failed. This
+    /// list is only the second kind, and it is what the caller renders the degrade reason from
+    /// instead of the old catch-all "council did not reach a vote".
+    pub seat_failures: Vec<SeatFailureRecord>,
 }
 
 /// The body the detached thread runs: dispatch → collect → synthesize → rank → emit.
@@ -198,6 +207,7 @@ fn run_council(
         // Dispatch each CLI in isolation, recording per-CLI latency for ranking.
         // (Sequential; isolation guarantees independence — parallelism is a follow-up.)
         let mut votes = Vec::new();
+        let mut failures: Vec<SeatFailureRecord> = Vec::new();
         for (i, cli) in roster.iter().enumerate() {
             let ctx = BallotContext {
                 seat: Some(SEATS[i % SEATS.len()].clone()),
@@ -207,19 +217,48 @@ fn run_council(
                 dissent_arguments: dissent_arguments.clone(),
             };
             let started = Instant::now();
-            let vote = dispatcher.dispatch_ballot(cli, task, &ctx);
+            let outcome = dispatcher.dispatch_ballot_detailed(cli, task, &ctx);
             let latency_ms = started.elapsed().as_millis() as u64;
             let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
-            entry.0 = vote.is_some();
+            entry.0 = outcome.is_voted();
             entry.1 += latency_ms;
-            if let Some(v) = vote {
-                votes.push(v);
+            match outcome {
+                DispatchOutcome::Voted(v) => votes.push(v),
+                DispatchOutcome::Failed(failure) => {
+                    // A seat that does not vote is a governance event, not a silent gap: it
+                    // shrinks the quorum the verdict rests on. Surface it per seat, with the
+                    // branch and the CLI's own stderr, so the degrade is diagnosable from the
+                    // event stream alone.
+                    events.emit(
+                        wicked_apps_core::EV_COUNCIL_SEAT_FAILED,
+                        &serde_json::json!({
+                            "task_id": task.id,
+                            "round": ballot,
+                            "cli": cli.key,
+                            "kind": failure.kind.as_str(),
+                            "exit_code": failure.exit_code,
+                            "stderr": failure.stderr,
+                            "detail": failure.detail,
+                            "latency_ms": latency_ms,
+                        }),
+                    );
+                    failures.push(SeatFailureRecord {
+                        cli: cli.key.clone(),
+                        failure,
+                    });
+                }
             }
         }
 
-        // Persist this ballot's votes (the record always reflects the latest ballot).
+        // Persist this ballot's votes and failures (the record always reflects the latest
+        // ballot). Both are written together so a reader never sees votes from this ballot
+        // beside failures from the previous one.
         let collected = votes.clone();
-        ledger.update(&task.id, |rec| rec.votes = collected);
+        let collected_failures = failures.clone();
+        ledger.update(&task.id, |rec| {
+            rec.votes = collected;
+            rec.seat_failures = collected_failures;
+        });
 
         // No votes at all (every seat timed out / errored) → timed_out.
         if votes.is_empty() {
