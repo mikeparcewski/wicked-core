@@ -420,6 +420,7 @@ mod tests {
         // Not run-scoped: must not be filed under either run.
         sink.emit(CoreEvent::ChatClosed {
             chat: "c1".to_string(),
+            reason: "requested".to_string(),
         });
         sink.emit(CoreEvent::RepoRegistered {
             repo_ref: "org-a/repo".to_string(),

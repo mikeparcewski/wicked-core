@@ -75,7 +75,21 @@ export declare class Core {
   chatSend(chatId: string, text: string, targetsJson?: string | undefined | null, cwd?: string | undefined | null): Promise<string>
   /** The seats currently warm for a chat — JSON array of cli keys. */
   chatSeats(chatId: string): Promise<string>
-  /** Close a chat's warm sessions (idempotent); emits `chatClosed`. */
+  /**
+   * Every chat currently holding pool state — JSON array of
+   * `[{chatId, seats, idleSecs}]`, sorted by id.
+   *
+   * Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
+   * chat ids freely, so without this an accumulation is invisible until the host runs out of
+   * memory (FINDING-027). `idleSecs` is seconds since the chat's last open/ensure/turn;
+   * `18446744073709551615` (u64::MAX) means no activity was ever recorded, which the reaper
+   * treats as idle-since-forever.
+   */
+  chatList(): Promise<string>
+  /**
+   * Close a chat's warm sessions (idempotent); emits
+   * `chatClosed` with `reason: "requested"`.
+   */
   chatClose(chatId: string): Promise<string>
   /**
    * Launch an interactive, resumable run: plans + distributes, then executes each unit off-thread
@@ -149,6 +163,26 @@ export declare class Core {
    * Validates server-side (INV-C1/C2/C4). Idempotent on stable id.
    */
   upsertConformanceRule(ruleJson: string): Promise<string>
+  /**
+   * Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
+   * append-only, so a mis-authored policy denied forever).
+   *
+   * Retire, not delete: the node stays readable so a past decision citing this id can still be
+   * explained, but SELECT stops returning it, so it can never decide another gate.
+   *
+   * Resolves to a JSON-encoded boolean: the four characters `true` if a policy with that id
+   * existed, the five characters `false` if none did. Like every method here it hands JS a
+   * `Promise<string>` carrying JSON, so it must be `JSON.parse`d — a bare truthiness test
+   * passes on BOTH values and would read a miss as a hit, losing exactly the 200-vs-404
+   * distinction this return value exists to carry.
+   */
+  retirePolicy(id: string): Promise<string>
+  /**
+   * Withdraw a conformance rule from recall. Same retire-not-delete contract as
+   * [`Core::retire_policy`], and the same JSON-encoded `true`/`false` reply that must be
+   * parsed rather than tested for truthiness.
+   */
+  retireConformanceRule(id: string): Promise<string>
   /**
    * Register (or replace) a workflow definition in the actor's runtime registry. `json` is a
    * JSON-serialised `WorkflowDef` object (fields: id, description, phases — see the wicked-core
@@ -237,7 +271,7 @@ export declare class Subscription {
  * A CoreEvent, delivered as a JSON string to the {@link Core.subscribe} callback. Discriminated on
  * `type`. Fields vary by variant (see wicked-core `CoreEvent`): e.g.
  * `sessionStarted` `{session, problem}`, `unitPlanned` `{session, ord, description}`,
- * `unitDistributed` `{session, ord, cli}`, `awaitingHuman` `{session, ord, reviewingOrd, prompt}`,
+ * `unitDistributed` `{session, ord, cli}`, `awaitingHuman` `{session, ord, prompt}`,
  * `gateDecided` `{session, ord, allow}`, `unitDone`/`unitExecuting`/`resumed` `{session, ord}`,
  * `sessionCompleted` `{session}`, `sessionFailed` `{session, ord}`, `error` `{session, message}`.
  * PTY terminal sessions emit `terminalOpened` `{id, cwd}`, `terminalOutput` `{id, seq, bytesB64}`

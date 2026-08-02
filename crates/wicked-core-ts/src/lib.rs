@@ -388,7 +388,35 @@ impl Core {
         })
     }
 
-    /// Close a chat's warm sessions (idempotent); emits `chatClosed`.
+    /// Every chat currently holding pool state — JSON array of
+    /// `[{chatId, seats, idleSecs}]`, sorted by id.
+    ///
+    /// Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
+    /// chat ids freely, so without this an accumulation is invisible until the host runs out of
+    /// memory (FINDING-027). `idleSecs` is seconds since the chat's last open/ensure/turn;
+    /// `18446744073709551615` (u64::MAX) means no activity was ever recorded, which the reaper
+    /// treats as idle-since-forever.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn chat_list(&self) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let chats = core.chat_list().map_err(err)?;
+            let arr: Vec<serde_json::Value> = chats
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "chatId": c.chat_id,
+                        "seats": c.seats,
+                        "idleSecs": c.idle_secs,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&arr).map_err(err)
+        })
+    }
+
+    /// Close a chat's warm sessions (idempotent); emits
+    /// `chatClosed` with `reason: "requested"`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_close(&self, chat_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
@@ -956,9 +984,12 @@ mod tests {
             &["type", "chat", "cliKey", "text", "ok"],
         );
         check(
-            CoreEvent::ChatClosed { chat: "c".into() },
+            CoreEvent::ChatClosed {
+                chat: "c".into(),
+                reason: "idle".into(),
+            },
             "chatClosed",
-            &["type", "chat"],
+            &["type", "chat", "reason"],
         );
         check(
             CoreEvent::SessionStarted {

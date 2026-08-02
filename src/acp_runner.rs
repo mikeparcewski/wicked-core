@@ -938,8 +938,49 @@ pub struct AcpStepRunner {
     /// (the ACP inject path — there is no PTY to write into mid-turn). Keyed by run_id;
     /// drained in [`AcpStepRunner::exec_turn`], pruned with the run's sessions.
     pending_injects: InjectQueue,
+    /// Last activity per CHAT id — set on open, on every ensure, and on every turn.
+    ///
+    /// Idleness is a property of the chat, not of a seat: `chat_close` reaps a whole chat, so that
+    /// is the granularity a reaper can act on. Kept beside the pool rather than inside it because
+    /// the pool is keyed per seat and a chat with zero warm seats still needs a last-touch (it may
+    /// be mid-`chat_open`, warming its first seat).
+    chat_activity: Arc<Mutex<HashMap<String, Instant>>>,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
+}
+
+/// Why a chat's warm sessions were released — carried on `ChatClosed` so an operator can tell a
+/// chat they ended from one the daemon reclaimed underneath them (FINDING-027).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatCloseReason {
+    /// An explicit close from the operator or the UI.
+    Requested,
+    /// Reclaimed after `WICKED_CHAT_IDLE_SECS` with no turn.
+    Idle,
+    /// Evicted as the least-recently-used chat when the pool reached `WICKED_CHAT_POOL_MAX`.
+    PoolCap,
+}
+
+impl ChatCloseReason {
+    /// The wire token. Stable — consumers branch on it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChatCloseReason::Requested => "requested",
+            ChatCloseReason::Idle => "idle",
+            ChatCloseReason::PoolCap => "pool_cap",
+        }
+    }
+}
+
+/// One live chat, for the enumerate surface. A leak nobody can list is a leak nobody can reclaim
+/// (FINDING-027 gap 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatInfo {
+    pub chat_id: String,
+    /// The seats currently warm, sorted.
+    pub seats: Vec<String>,
+    /// Seconds since the last open/ensure/turn on this chat.
+    pub idle_secs: u64,
 }
 
 impl AcpStepRunner {
@@ -955,6 +996,7 @@ impl AcpStepRunner {
             tx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
+            chat_activity: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs(secs),
         }
     }
@@ -982,6 +1024,159 @@ impl AcpStepRunner {
         Duration::from_secs(secs)
     }
 
+    /// How long a chat may sit with no turn before the reaper reclaims it.
+    ///
+    /// This is NOT [`Self::chat_timeout`]: that is a per-turn response budget and never fires on a
+    /// chat nobody is talking to. Idle eviction is the only reclamation path that covers a chat
+    /// orphaned by a closed or crashed tab, which no client-side teardown can reach (FINDING-027).
+    ///
+    /// 30 minutes by default: a warm seat costs ~520 MB resident, and a chat untouched for half an
+    /// hour is far more likely abandoned than mid-thought. Re-warming is a few seconds.
+    pub fn chat_idle_ttl() -> Duration {
+        let secs = std::env::var("WICKED_CHAT_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1800);
+        Duration::from_secs(secs)
+    }
+
+    /// The most chats that may hold warm seats at once. A backstop for the case the TTL cannot
+    /// cover: many chats opened faster than the idle window retires them.
+    ///
+    /// Floored at 1 — a cap of 0 would evict the chat being opened, which is not a smaller pool but
+    /// a broken one.
+    pub fn chat_pool_cap() -> usize {
+        std::env::var("WICKED_CHAT_POOL_MAX")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(8)
+            .max(1)
+    }
+
+    /// Mark a chat as active NOW. Called on open, ensure, and turn — anything that proves someone
+    /// is still using it.
+    fn chat_touch(&self, chat_id: &str) {
+        let mut guard = self.chat_activity.lock().unwrap_or_else(|p| p.into_inner());
+        guard.insert(chat_id.to_string(), Instant::now());
+    }
+
+    /// Every chat holding pool entries, with how long it has been idle.
+    ///
+    /// Chats are enumerated from the SESSION POOL, not from the activity map: the pool is what
+    /// actually pins processes, so this can never report a chat that costs nothing while missing
+    /// one that does.
+    ///
+    /// A chat with a pool entry but no WARM seat still lists, with `seats` empty. That differs from
+    /// [`Self::chat_seats`] on purpose: `seats` answers "who can take a turn", this answers "what
+    /// is holding pool state". Anything in the map is something only a close removes, so anything
+    /// in the map has to be listable and reapable — an entry no surface reports is the shape of the
+    /// leak this whole mechanism exists to end.
+    pub fn chat_list(&self) -> Vec<ChatInfo> {
+        let mut by_chat: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            for ((rid, cli), slot) in guard.iter() {
+                let Some(chat_id) = rid.strip_prefix("chat:") else {
+                    continue;
+                };
+                let seats = by_chat.entry(chat_id.to_string()).or_default();
+                if slot.is_some() {
+                    seats.push(cli.clone());
+                }
+            }
+        }
+        let now = Instant::now();
+        let activity = self
+            .chat_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let mut out: Vec<ChatInfo> = by_chat
+            .into_iter()
+            .map(|(chat_id, mut seats)| {
+                seats.sort();
+                // A warm chat with no recorded activity is treated as idle-since-forever rather
+                // than as fresh: the conservative reading reclaims it, and the alternative would
+                // let any gap in touch-recording pin memory permanently — the exact defect here.
+                let idle_secs = activity
+                    .get(&chat_id)
+                    .map(|t| now.saturating_duration_since(*t).as_secs())
+                    .unwrap_or(u64::MAX);
+                ChatInfo {
+                    chat_id,
+                    seats,
+                    idle_secs,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        out
+    }
+
+    /// Close every chat idle longer than `ttl`. Returns the ids reaped, oldest first.
+    pub fn chat_reap_idle(&self, ttl: Duration) -> Vec<String> {
+        let ttl_secs = ttl.as_secs();
+        let mut victims: Vec<(u64, String)> = self
+            .chat_list()
+            .into_iter()
+            .filter(|c| c.idle_secs >= ttl_secs)
+            .map(|c| (c.idle_secs, c.chat_id))
+            .collect();
+        // Oldest first, so a caller reading the returned list sees them in the order they aged out.
+        victims.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let reaped: Vec<String> = victims
+            .into_iter()
+            .map(|(_, id)| {
+                self.chat_close(&id, ChatCloseReason::Idle);
+                id
+            })
+            .collect();
+        self.prune_orphan_activity(ttl);
+        reaped
+    }
+
+    /// Drop activity entries with no pool entry behind them.
+    ///
+    /// `chat_close` prunes the chat it closes, but a turn outliving the TTL re-touches on the way
+    /// out — after the reaper already closed the chat — leaving an entry nothing else collects.
+    /// Tiny individually; unbounded over a long-lived daemon, which is the shape of bug this whole
+    /// change exists to end.
+    ///
+    /// Only entries older than `ttl` are dropped. `chat_ensure` touches BEFORE inserting its pool
+    /// entry, so a chat mid-open is briefly touched-but-unpooled; pruning on absence alone would
+    /// race with it, erase its timestamp, and get it reaped on the next sweep as
+    /// idle-since-forever. A just-touched entry is never old enough to qualify.
+    fn prune_orphan_activity(&self, ttl: Duration) {
+        let pooled: std::collections::HashSet<String> =
+            self.chat_list().into_iter().map(|c| c.chat_id).collect();
+        let now = Instant::now();
+        let mut activity = self.chat_activity.lock().unwrap_or_else(|p| p.into_inner());
+        activity.retain(|id, t| pooled.contains(id) || now.saturating_duration_since(*t) < ttl);
+    }
+
+    /// Evict least-recently-used chats until at most `cap` remain. Returns the ids evicted.
+    pub fn chat_enforce_cap(&self, cap: usize) -> Vec<String> {
+        let cap = cap.max(1);
+        let mut live = self.chat_list();
+        let Some(excess) = live.len().checked_sub(cap).filter(|n| *n > 0) else {
+            return Vec::new();
+        };
+        // Most idle first. The caller touches the chat it is opening BEFORE calling this, so that
+        // chat sorts last and opening a chat can never evict the chat being opened.
+        live.sort_by(|a, b| {
+            b.idle_secs
+                .cmp(&a.idle_secs)
+                .then_with(|| a.chat_id.cmp(&b.chat_id))
+        });
+        live.into_iter()
+            .take(excess)
+            .map(|c| {
+                self.chat_close(&c.chat_id, ChatCloseReason::PoolCap);
+                c.chat_id
+            })
+            .collect()
+    }
+
     /// Warm (or return the existing) ACP session for one chat seat. Unlike the run
     /// path, a failed start is NOT cached as poisoned — chats are interactive, so
     /// every ensure retries and the operator sees each failure.
@@ -991,6 +1186,10 @@ impl AcpStepRunner {
         cli_key: &str,
         cwd: &std::path::Path,
     ) -> Result<Arc<Mutex<AcpProcess>>, String> {
+        // Touch FIRST, and unconditionally: a chat whose seat is warming is in use, and recording
+        // that only on success would leave a chat mid-`chat_open` looking idle-since-forever to a
+        // reaper running concurrently.
+        self.chat_touch(chat_id);
         let key = (Self::chat_pool_key(chat_id), cli_key.to_string());
         {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -1024,7 +1223,8 @@ impl AcpStepRunner {
         clis: &[String],
         cwd: &std::path::Path,
     ) -> Vec<(String, Result<(), String>)> {
-        clis.iter()
+        let opened: Vec<(String, Result<(), String>)> = clis
+            .iter()
             .map(|cli| {
                 let outcome = self.chat_ensure(chat_id, cli, cwd).map(|_| ());
                 match &outcome {
@@ -1040,7 +1240,17 @@ impl AcpStepRunner {
                 }
                 (cli.clone(), outcome)
             })
-            .collect()
+            .collect();
+        // Enforce the cap only AFTER the new chat is warm and touched, so it is the freshest entry
+        // and therefore the last possible victim. Doing it first would let a full pool evict a
+        // chat, warm the new one, and leave the pool at the cap anyway — same memory, one more
+        // reap. Cap breaches are rare, so paying the reap on the open path costs nothing typical.
+        //
+        // Evictions are not logged here: each one emits `ChatClosed { reason: "pool_cap" }`, which
+        // is the surface an operator actually watches. A second, log-only channel would be the one
+        // that goes stale.
+        self.chat_enforce_cap(Self::chat_pool_cap());
+        opened
     }
 
     /// One seat's turn on a chat message. Streams deltas via `ChatDelta`, returns the
@@ -1067,6 +1277,10 @@ impl AcpStepRunner {
             let mut proc = arc.lock().unwrap_or_else(|p| p.into_inner());
             exec_turn_acp(&mut proc, text, &[], &emit, Self::chat_timeout())
         };
+        // Touch again on the way out. `chat_ensure` touched on the way in, but a long turn would
+        // then be counted as idle for its whole duration — a 40-minute agent turn would be reaped
+        // out from under the operator the moment it finished.
+        self.chat_touch(chat_id);
         match result {
             Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.output),
             Ok(turn) => {
@@ -1102,14 +1316,25 @@ impl AcpStepRunner {
     }
 
     /// Close a chat's warm sessions and reap their processes. Idempotent.
-    pub fn chat_close(&self, chat_id: &str) {
+    ///
+    /// `reason` reaches the operator on `ChatClosed`: a chat that vanished because the daemon
+    /// reclaimed it is a different event from one the operator ended, and a UI that cannot tell
+    /// them apart reports a reclaim as a mystery.
+    pub fn chat_close(&self, chat_id: &str, reason: ChatCloseReason) {
         let prefix = Self::chat_pool_key(chat_id);
         {
             let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard.retain(|(rid, _), _| rid != &prefix);
         }
+        // Drop the activity entry too. It is small, but it is keyed by an unbounded stream of
+        // client-minted chat ids — leaving it behind trades a 520 MB leak for a slower one.
+        self.chat_activity
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(chat_id);
         self.emit_event(CoreEvent::ChatClosed {
             chat: chat_id.to_string(),
+            reason: reason.as_str().to_string(),
         });
     }
 
@@ -1911,18 +2136,222 @@ sleep 30
         // Dropping a RUN's sessions must not touch the chat pool, and vice versa.
         r.drop_session("run1");
         assert_eq!(r.sessions.lock().unwrap().len(), 1);
-        r.chat_close("c1");
+        r.chat_close("c1", ChatCloseReason::Requested);
         assert_eq!(r.sessions.lock().unwrap().len(), 0);
-        r.chat_close("c1"); // idempotent
-                            // Both closes emitted ChatClosed through the actor emit point.
+        r.chat_close("c1", ChatCloseReason::Requested); // idempotent
+                                                        // Both closes emitted ChatClosed through
+                                                        // the actor emit point, carrying the
+                                                        // reason the caller asked for.
         let evs: Vec<_> = rx.try_iter().collect();
         let closed = evs
             .iter()
-            .filter(
-                |c| matches!(c, Command::EmitEvent(CoreEvent::ChatClosed { chat }) if chat == "c1"),
-            )
+            .filter(|c| {
+                matches!(c, Command::EmitEvent(CoreEvent::ChatClosed { chat, reason })
+                    if chat == "c1" && reason == "requested")
+            })
             .count();
         assert_eq!(closed, 2);
+    }
+
+    /// Put `chat_id` in the pool and backdate its last-touch by `idle` seconds.
+    ///
+    /// Backdating beats sleeping: the reaper's whole contract is about elapsed time, and a test
+    /// that slept for it would be both slow and flaky. Constructing a real `AcpProcess` needs a
+    /// live child, so — as in the pool-shape test above — the slot is `None`; `chat_list` counts
+    /// pool ENTRIES, which is what the reaper acts on.
+    fn seed_chat(r: &AcpStepRunner, chat_id: &str, idle: u64) {
+        r.sessions.lock().unwrap().insert(
+            (AcpStepRunner::chat_pool_key(chat_id), "claude".into()),
+            None,
+        );
+        r.chat_activity.lock().unwrap().insert(
+            chat_id.to_string(),
+            Instant::now() - Duration::from_secs(idle),
+        );
+    }
+
+    fn closed_chats(rx: &std::sync::mpsc::Receiver<Command>) -> Vec<(String, String)> {
+        rx.try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(CoreEvent::ChatClosed { chat, reason }) => Some((chat, reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The core of FINDING-027: nothing ever reclaimed an abandoned chat, so ~520 MB per seat
+    /// stayed pinned for the daemon's lifetime. A chat past the TTL must go; one inside it must
+    /// not, or an operator loses a session they are still using.
+    #[test]
+    fn idle_chats_are_reaped_and_active_ones_are_left_alone() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "stale", 3600);
+        seed_chat(&r, "fresh", 5);
+
+        let reaped = r.chat_reap_idle(Duration::from_secs(1800));
+
+        assert_eq!(reaped, vec!["stale".to_string()]);
+        assert_eq!(
+            r.chat_list().iter().map(|c| &c.chat_id).collect::<Vec<_>>(),
+            vec!["fresh"],
+            "the chat inside its TTL must survive"
+        );
+        assert_eq!(
+            closed_chats(&rx),
+            vec![("stale".to_string(), "idle".to_string())],
+            "a reclaim must be distinguishable from an operator's own close"
+        );
+    }
+
+    /// A touch is what proves a chat is still in use, and `chat_ensure` is the funnel every use
+    /// passes through (`chat_turn` calls it too). Without the touch there, a chat being actively
+    /// talked to would age out mid-conversation.
+    ///
+    /// Driven through the FAILING ensure path deliberately: it is the one reachable without a live
+    /// child, and it pins the stronger claim — the touch is unconditional, so a chat mid-warm-up
+    /// is never mistaken for an abandoned one by a reaper running concurrently.
+    #[test]
+    fn ensuring_a_seat_touches_the_chat_even_when_the_seat_fails_to_start() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "c1", 3600);
+
+        assert!(r
+            .chat_ensure("c1", "no-such-cli-xyz", &std::env::temp_dir())
+            .is_err());
+
+        assert!(
+            r.chat_reap_idle(Duration::from_secs(1800)).is_empty(),
+            "a chat someone just tried to warm a seat on is not idle"
+        );
+    }
+
+    /// The TTL cannot cover chats opened faster than it retires them. The cap is the backstop —
+    /// and it must evict the LEAST recently used, never the one being opened.
+    #[test]
+    fn the_pool_cap_evicts_least_recently_used_and_never_the_newest() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        for (id, idle) in [
+            ("oldest", 300),
+            ("middle", 200),
+            ("newer", 100),
+            ("newest", 0),
+        ] {
+            seed_chat(&r, id, idle);
+        }
+
+        let evicted = r.chat_enforce_cap(2);
+
+        assert_eq!(evicted, vec!["oldest".to_string(), "middle".to_string()]);
+        assert_eq!(
+            r.chat_list().iter().map(|c| &c.chat_id).collect::<Vec<_>>(),
+            vec!["newer", "newest"]
+        );
+        let reasons: Vec<String> = closed_chats(&rx).into_iter().map(|(_, r)| r).collect();
+        assert_eq!(reasons, vec!["pool_cap".to_string(); 2]);
+    }
+
+    /// `WICKED_CHAT_POOL_MAX=0` must not mean "evict everything the instant it opens". A pool that
+    /// cannot hold the chat being opened is not a smaller pool, it is a broken one.
+    #[test]
+    fn a_zero_pool_cap_is_floored_at_one_rather_than_evicting_everything() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "only", 0);
+
+        assert!(r.chat_enforce_cap(0).is_empty());
+        assert_eq!(r.chat_list().len(), 1);
+    }
+
+    /// Closing must drop the activity entry too. Chat ids are minted by clients without bound, so
+    /// a map that only ever grows trades a 520 MB leak for a slower one.
+    #[test]
+    fn closing_a_chat_forgets_its_activity() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        seed_chat(&r, "c1", 10);
+
+        r.chat_close("c1", ChatCloseReason::Requested);
+
+        assert!(r.chat_activity.lock().unwrap().is_empty());
+        assert!(r.chat_list().is_empty());
+    }
+
+    /// A turn outliving the TTL re-touches on its way out, AFTER the reaper has already closed the
+    /// chat — leaving an activity entry `chat_close` cannot collect because it ran first. The
+    /// sweep must collect it, or the daemon trades a 520 MB leak for a slow unbounded one.
+    ///
+    /// And it must NOT collect an entry that is merely unpooled-so-far: `chat_ensure` touches
+    /// before it inserts, so a chat mid-open looks exactly like an orphan for an instant.
+    #[test]
+    fn the_sweep_collects_stale_orphan_activity_but_spares_a_chat_mid_open() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        {
+            let mut activity = r.chat_activity.lock().unwrap();
+            // Re-touched by a long turn after its chat was already closed.
+            activity.insert(
+                "orphan".to_string(),
+                Instant::now() - Duration::from_secs(3600),
+            );
+            // Touched by `chat_ensure`, whose pool insert has not landed yet.
+            activity.insert("opening".to_string(), Instant::now());
+        }
+
+        r.chat_reap_idle(Duration::from_secs(1800));
+
+        let remaining: Vec<String> = r.chat_activity.lock().unwrap().keys().cloned().collect();
+        assert_eq!(
+            remaining,
+            vec!["opening".to_string()],
+            "the stale orphan goes, the chat mid-open stays"
+        );
+    }
+
+    /// A pool entry with no recorded activity must read as idle-since-forever, not as fresh.
+    /// The conservative reading reclaims it; the other one would let any gap in touch-recording
+    /// pin memory permanently — which is exactly the defect being fixed.
+    #[test]
+    fn a_chat_with_no_recorded_activity_is_reaped_rather_than_treated_as_fresh() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        r.sessions.lock().unwrap().insert(
+            (AcpStepRunner::chat_pool_key("orphan"), "claude".into()),
+            None,
+        );
+
+        assert_eq!(r.chat_list()[0].idle_secs, u64::MAX);
+        assert_eq!(
+            r.chat_reap_idle(Duration::from_secs(1800)),
+            vec!["orphan".to_string()]
+        );
+    }
+
+    /// The enumerate surface (FINDING-027 gap 4): a leak nobody can list is a leak nobody can
+    /// reclaim. Two seats of one chat collapse to ONE entry, and a run's sessions are not chats.
+    #[test]
+    fn chat_list_collapses_a_chats_seats_and_ignores_run_sessions() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        {
+            let mut guard = r.sessions.lock().unwrap();
+            guard.insert(("run1".into(), "claude".into()), None);
+            guard.insert((AcpStepRunner::chat_pool_key("c1"), "codex".into()), None);
+            guard.insert((AcpStepRunner::chat_pool_key("c1"), "claude".into()), None);
+        }
+        r.chat_touch("c1");
+
+        let listed = r.chat_list();
+
+        assert_eq!(listed.len(), 1, "a run session is not a chat: {listed:?}");
+        assert_eq!(listed[0].chat_id, "c1");
+        assert!(listed[0].idle_secs < 5);
+        // `seats` is the WARM subset, and these slots are `None` — a real `AcpProcess` needs a
+        // live child, so unit tests cannot produce one. The seat-name path is covered by
+        // `chat_seats`, which reads the same map with the same warm filter.
+        assert!(listed[0].seats.is_empty());
     }
 
     #[test]
