@@ -982,6 +982,7 @@ mod tests {
                 routing_method: s(),
                 agreement_pct: None,
                 returned: None,
+                seated: None,
                 dissent: None,
                 degraded_reason: None,
             },
@@ -994,6 +995,10 @@ mod tests {
                 "routingMethod",
                 "agreementPct",
                 "returned",
+                // The quorum denominator `returned` must be read against. Emitted unconditionally
+                // (null when unknown) so a consumer never has to guess whether its absence means
+                // "one-seat council" or "field not sent" (FINDING-026 D).
+                "seated",
                 "dissent",
                 "degradedReason",
             ],
