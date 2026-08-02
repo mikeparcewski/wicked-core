@@ -468,4 +468,90 @@ mod tests {
         }
         let _ = std::fs::remove_file(&spool);
     }
+
+    // ── retire (FINDING-038) ────────────────────────────────────────────────
+
+    /// The defect this fixes: a policy registered with a too-broad trigger denied every matching
+    /// unit forever, and no layer offered a way to withdraw it.
+    #[test]
+    fn a_retired_policy_is_no_longer_selected_for_its_phase() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        register_policy(&mut store, &deny_policy()).expect("register policy");
+
+        let ctx = serde_json::json!({});
+        let before = select(&store, "s", "build", &ctx).expect("select before");
+        assert_eq!(before.len(), 1, "precondition: the policy is selected");
+
+        assert!(
+            engine::retire_policy(&mut store, "pol-deny-secrets").expect("retire ok"),
+            "retiring an existing policy reports that it was found"
+        );
+
+        let after = select(&store, "s", "build", &ctx).expect("select after");
+        assert!(
+            after.is_empty(),
+            "a retired policy must not be selected for enforcement: {after:?}"
+        );
+    }
+
+    /// Retire, not delete. A decision records the policy ids that produced it, so the node has to
+    /// stay resolvable or a past denial becomes unexplainable.
+    #[test]
+    fn a_retired_policy_is_still_readable_so_past_decisions_stay_explicable() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        register_policy(&mut store, &deny_policy()).expect("register policy");
+        engine::retire_policy(&mut store, "pol-deny-secrets").expect("retire ok");
+
+        let node = store
+            .get_node(&wicked_apps_core::synthetic_symbol(
+                wicked_apps_core::POLICY,
+                "pol-deny-secrets",
+            ))
+            .expect("get_node ok")
+            .expect("the node must survive retirement");
+        let recovered = Policy::from_node(&node).expect("from_node ok");
+        assert!(recovered.retired, "the node records that it was retired");
+        assert_eq!(
+            recovered.rule, deny_policy().rule,
+            "retirement must not lose the policy's content"
+        );
+    }
+
+    /// Retiring is idempotent and total: retrying a request must not error, and an id that was
+    /// never registered must be reported as absent rather than silently succeeding.
+    #[test]
+    fn retiring_reports_absence_and_tolerates_repetition() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        assert!(
+            !engine::retire_policy(&mut store, "pol-never-registered").expect("retire ok"),
+            "an unknown id must report false, not a spurious success"
+        );
+
+        register_policy(&mut store, &deny_policy()).expect("register policy");
+        assert!(engine::retire_policy(&mut store, "pol-deny-secrets").expect("first retire"));
+        assert!(
+            engine::retire_policy(&mut store, "pol-deny-secrets").expect("second retire"),
+            "retiring twice is the same end state, so it must not fail a retrying caller"
+        );
+    }
+
+    /// A policy written before `retired` existed has no such key in its metadata bag. With
+    /// `deny_unknown_fields` on the struct, the `serde(default)` is the only thing keeping those
+    /// nodes readable — and they must read back as ACTIVE, which is what they were.
+    #[test]
+    fn a_policy_persisted_before_the_field_existed_reads_back_active() {
+        let mut node = deny_policy().to_node();
+        node.metadata.remove("retired");
+        assert!(
+            !node.metadata.contains_key("retired"),
+            "precondition: the legacy node has no retired key"
+        );
+
+        let recovered = Policy::from_node(&node).expect("a pre-field node must still parse");
+        assert!(
+            !recovered.retired,
+            "absent must mean active — the policy was enforcing when it was written"
+        );
+    }
+
 }

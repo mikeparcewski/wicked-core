@@ -647,4 +647,91 @@ mod tests {
             vec!["PAT-001"]
         );
     }
+
+    // ── retire (FINDING-038) ────────────────────────────────────────────────
+
+    #[test]
+    fn a_retired_rule_is_no_longer_recalled() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-001",
+                RuleType::Pattern,
+                ConfSeverity::Warn,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            recall_rules(&store, &RuleQuery::default()).unwrap().len(),
+            1,
+            "precondition: the rule is recalled"
+        );
+
+        assert!(retire_rule(&mut store, "PAT-001").unwrap());
+        assert!(
+            recall_rules(&store, &RuleQuery::default())
+                .unwrap()
+                .is_empty(),
+            "a retired rule must not be recalled for enforcement"
+        );
+    }
+
+    #[test]
+    fn retiring_a_rule_reports_absence_and_keeps_the_node() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        assert!(
+            !retire_rule(&mut store, "PAT-999").unwrap(),
+            "an unknown id must report false"
+        );
+
+        let original = rule(
+            "PAT-002",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            Targets::default(),
+        );
+        register_rule(&mut store, &original).unwrap();
+        assert!(retire_rule(&mut store, "PAT-002").unwrap());
+
+        // Retire, not delete — a past claim citing PAT-002 must still resolve.
+        let node = store
+            .get_node(&synthetic_symbol(CONFORMANCE_RULE, "PAT-002"))
+            .unwrap()
+            .expect("the node must survive retirement");
+        let recovered = ConformanceRule::from_node(&node).unwrap();
+        assert!(recovered.retired);
+        assert_eq!(recovered.statement, original.statement);
+    }
+
+
+    /// The `serde(default)` on `retired` is the back-compat hinge: rules registered before the
+    /// field existed have no `retired` key in their metadata bag. Without the default that read is
+    /// a hard parse error and every pre-existing rule becomes unrecallable.
+    #[test]
+    fn a_rule_persisted_before_the_field_existed_reads_back_active() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut node = rule(
+            "PAT-003",
+            RuleType::Pattern,
+            ConfSeverity::Info,
+            Targets::default(),
+        )
+        .to_node();
+        // Exactly what a node written by the previous release looks like.
+        node.metadata.remove("retired");
+        store.begin_batch().unwrap();
+        store.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+        store.commit_batch().unwrap();
+
+        let recalled = recall_rules(&store, &RuleQuery::default()).unwrap();
+        assert_eq!(
+            recalled.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-003"],
+            "a rule with no `retired` key must read back as active and stay enforceable"
+        );
+        assert!(!recalled[0].retired);
+    }
+
 }
