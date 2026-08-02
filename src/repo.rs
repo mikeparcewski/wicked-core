@@ -280,6 +280,21 @@ const MAX_ROOT_FILES: usize = 12;
 /// clipped one and knows the cheap way to get the rest.
 pub(crate) const LAYOUT_TRUNCATED: &str = "; …truncated, run `ls` for the rest";
 
+/// Joins one map entry to the next.
+///
+/// Named rather than written as a literal at the join site because its width is charged against the
+/// budget: a hardcoded `2` at the accounting site and a `"; "` at the join site are free to drift,
+/// and the first cut of this did exactly that — charging the separator for every entry when `join`
+/// only writes one BETWEEN entries, so a map was billed 2 bytes it never spent (PR #157 review).
+const LAYOUT_SEP: &str = "; ";
+
+/// What `part` adds to the width of the joined map: itself, plus a separator only when something
+/// already precedes it. `join` writes N-1 separators for N parts, so charging one per part bills the
+/// map for bytes it never occupies.
+fn joined_cost(part: &str, preceded: bool) -> usize {
+    part.len() + if preceded { LAYOUT_SEP.len() } else { 0 }
+}
+
 /// A compact, deterministic map of what is at `dir`'s root — the thing no unit prompt carried.
 ///
 /// FINDING-048: 0 of 32 prompts described the target tree, and 12 of 32 sessions burned turns on
@@ -333,12 +348,13 @@ pub(crate) fn worktree_layout_within(dir: &Path, layout_budget: usize) -> Option
         if let Some(inner) = project_children(&child) {
             part.push_str(&format!(" {{{}}}", inner.join(", ")));
         }
-        // +2 for the "; " that will join this part to the previous one.
-        if part.len() + 2 > budget {
+        // The separator is only paid for when there is a previous part to join this one to.
+        let cost = joined_cost(&part, !parts.is_empty());
+        if cost > budget {
             truncated = true;
             break;
         }
-        budget -= part.len() + 2;
+        budget -= cost;
         parts.push(part);
     }
 
@@ -355,7 +371,8 @@ pub(crate) fn worktree_layout_within(dir: &Path, layout_budget: usize) -> Option
             .collect::<Vec<_>>()
             .join(", ");
         let part = format!("root files: {joined}");
-        if part.len() + 2 <= budget {
+        let cost = joined_cost(&part, !parts.is_empty());
+        if cost <= budget {
             parts.push(part);
         } else {
             truncated = true;
@@ -365,7 +382,7 @@ pub(crate) fn worktree_layout_within(dir: &Path, layout_budget: usize) -> Option
     if parts.is_empty() {
         return None;
     }
-    let mut out = parts.join("; ");
+    let mut out = parts.join(LAYOUT_SEP);
     if truncated {
         out.push_str(LAYOUT_TRUNCATED);
     }
@@ -500,6 +517,32 @@ mod tests {
         );
         let map = worktree_layout(&root).unwrap();
         assert_eq!(map, "src/; root files: Cargo.toml");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A budget that exactly fits the map spends all of it and clips nothing.
+    ///
+    /// The separator is only written BETWEEN entries, so an N-entry map pays for N-1 of them. An
+    /// earlier cut charged one per entry (PR #157 review), which made a map cost 2 bytes more than
+    /// it occupies — enough to drop the last entry and stamp a complete map `…truncated` a byte
+    /// before it had to. Harmless-looking, but the pty path is precisely where the budget is small
+    /// and computed, so 2 bytes is a whole root-files line there.
+    ///
+    /// Pinned at the exact boundary in both directions: one byte less genuinely does not fit.
+    #[test]
+    fn a_budget_that_exactly_fits_the_map_clips_nothing() {
+        let root = scratch("exact", &["src/main.rs", "Cargo.toml"]);
+        let whole = "src/; root files: Cargo.toml";
+        // `whole.len()` rather than a literal: the point is that the budget equals the OUTPUT, and
+        // hardcoding it would restate the same off-by-two this test exists to catch.
+        let map = worktree_layout_within(&root, whole.len()).expect("an exactly-fitting map");
+        assert_eq!(map, whole, "a budget equal to the map must not clip it");
+
+        let tight = worktree_layout_within(&root, whole.len() - 1).unwrap();
+        assert!(
+            tight.ends_with(LAYOUT_TRUNCATED) && !tight.contains("Cargo.toml"),
+            "one byte short must actually clip, or the budget means nothing: {tight}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
