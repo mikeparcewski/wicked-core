@@ -862,7 +862,7 @@ fn arm_acp_governance(input: &StepInput, gov: &GovernanceContext) -> std::io::Re
         // because the ACP binary is a bridge with its own flag surface — `--disallowedTools` is not
         // ours to assume it accepts, but it does forward `--settings`.
         "permissions": {
-            "deny": crate::execute_wrapped::deny_rules().unwrap_or_default()
+            "deny": crate::execute_wrapped::deny_rules()
         }
     });
     let dir = decisions_path
