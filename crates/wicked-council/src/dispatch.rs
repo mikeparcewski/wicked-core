@@ -578,12 +578,27 @@ mod failure_diagnostics_tests {
     }
 
     /// A shell seat running `script`, spelled for the host platform.
+    ///
+    /// The wrapper is per-platform; the SCRIPT is not. Use [`shell_seq_seat`] whenever the script
+    /// is more than one command.
     fn shell_seat(key: &str, script: &str) -> AgenticCli {
         if cfg!(windows) {
             seat(key, "cmd", &format!("cmd /C \"{script}\""))
         } else {
             seat(key, "sh", &format!("sh -c \"{script}\""))
         }
+    }
+
+    /// A shell seat running `commands` in order, joined with the host shell's separator.
+    ///
+    /// `sh` sequences with `;`; `cmd` does not — it treats `;` as ordinary text. So
+    /// `"echo needle 1>&2; exit 3"` under `cmd /C` echoes the whole string *including* the
+    /// `; exit 3` and then exits **0**. The failure that produces is maximally unhelpful: the seat
+    /// succeeds, parses a vote, and the assertion that fires is "this seat must not vote" — which
+    /// names nothing about shell syntax. Joining here keeps the separator in one place.
+    fn shell_seq_seat(key: &str, commands: &[&str]) -> AgenticCli {
+        let sep = if cfg!(windows) { " & " } else { "; " };
+        shell_seat(key, &commands.join(sep))
     }
 
     fn failure_of(cli: &AgenticCli, timeout: Duration) -> SeatFailure {
@@ -620,7 +635,7 @@ mod failure_diagnostics_tests {
     fn a_non_zero_exit_keeps_the_code_and_the_stderr() {
         // The leading hypothesis for the observed 92.6% degradation was a non-zero exit whose
         // stderr was discarded. This is the branch that used to throw the evidence away.
-        let cli = shell_seat("boom", "echo diagnostic-needle 1>&2; exit 3");
+        let cli = shell_seq_seat("boom", &["echo diagnostic-needle 1>&2", "exit 3"]);
         let f = failure_of(&cli, Duration::from_secs(30));
         assert_eq!(f.kind, SeatFailureKind::NonZeroExit);
         assert_eq!(f.exit_code, Some(3), "the exit code must survive: {f:?}");

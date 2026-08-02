@@ -76,6 +76,16 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      # wicked-core-ts is EXCLUDED from the workspace (its `[profile.release]` lto+strip shapes the
+      # shipped .node artifact, and cargo ignores member profiles). Every gate above therefore skips
+      # it, so it gets its own — it is the crate the daemon actually loads, and until now CI never
+      # compiled it at all.
+      - name: cargo fmt/clippy/test wicked-core-ts (excluded from the workspace)
+        run: |
+          cargo fmt --manifest-path crates/wicked-core-ts/Cargo.toml --check
+          cargo clippy --manifest-path crates/wicked-core-ts/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path crates/wicked-core-ts/Cargo.toml
+
       # Backend-parity compile check (DES-OUTGOV-001 §5): estate's Postgres backend, wired through
       # the engine's `dyn GraphStore` seam + `AnyStore`, must keep COMPILING under `--features
       # postgres` (it pulls sqlx + tokio). No Postgres SERVICE is needed for the compile — the
