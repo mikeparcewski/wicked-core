@@ -1148,11 +1148,17 @@ mod failure_diagnostics_tests {
         // wall clock therefore covers a queue wait it did not choose and a run it did. Only the
         // run is budgeted, and only the run says anything about how fast that CLI is - so the
         // two must come back separately, not summed.
+        //
+        // Every threshold below sits MIDWAY between the two outcomes it separates, never on the
+        // boundary. Timings are measured, so a threshold equal to the expected value decides on
+        // scheduler jitter and `as_millis` truncation, not on behaviour: this test failed on a CI
+        // runner reading 119ms for a wait of exactly RUN. Midpoints leave RUN/2 of slack on both
+        // sides, which is the widest margin the two hypotheses allow.
         let permits = SeatPermits {
             free: std::sync::Mutex::new(2),
             returned: std::sync::Condvar::new(),
         };
-        const RUN: Duration = Duration::from_millis(120);
+        const RUN: Duration = Duration::from_millis(200);
 
         let timed: Vec<(u64, u64)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..3)
@@ -1173,15 +1179,15 @@ mod failure_diagnostics_tests {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        let waited = timed
-            .iter()
-            .filter(|(q, _)| *q >= RUN.as_millis() as u64)
-            .count();
+        // A seat that got a permit immediately waits ~0; the one that queued waits ~RUN.
+        let run_ms = RUN.as_millis() as u64;
+        let waited = timed.iter().filter(|(q, _)| *q > run_ms / 2).count();
         assert_eq!(waited, 1, "exactly one seat should have queued: {timed:?}");
 
+        // Correct: every seat reports ~RUN. Summed (the bug): the queued seat reports ~2×RUN.
         for (queued, ran) in &timed {
             assert!(
-                *ran < 2 * RUN.as_millis() as u64,
+                *ran < run_ms + run_ms / 2,
                 "run time must exclude the queue wait, got ran={ran}ms queued={queued}ms"
             );
         }
