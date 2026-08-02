@@ -160,7 +160,7 @@ fn spec(session_id: &str, problem: &str) -> LaunchSpec {
 }
 
 fn db_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("wicked-core-p2c-{name}"));
+    let dir = std::env::temp_dir().join(format!("wicked-core-p2c-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("estate.db").to_str().unwrap().to_string()

@@ -20,7 +20,7 @@ use wicked_core::Core;
 const GATE_HOOK_BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 
 fn tmp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("wicked-core-p0-{name}"));
+    let dir = std::env::temp_dir().join(format!("wicked-core-p0-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

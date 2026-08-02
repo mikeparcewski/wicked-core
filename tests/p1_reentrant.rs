@@ -115,7 +115,7 @@ fn spec(session_id: &str) -> LaunchSpec {
 }
 
 fn tmp_db(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("wicked-core-p1-{name}"));
+    let dir = std::env::temp_dir().join(format!("wicked-core-p1-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("estate.db").to_str().unwrap().to_string()

@@ -205,7 +205,7 @@ fn rid(campaign: &str, node: &str) -> String {
 }
 
 fn tmp_db(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("wicked-core-p13-{name}"));
+    let dir = std::env::temp_dir().join(format!("wicked-core-p13-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("estate.db").to_str().unwrap().to_string()
