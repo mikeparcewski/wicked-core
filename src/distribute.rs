@@ -4,7 +4,6 @@
 //! (distribution ALWAYS yields an assignment — never fails a unit).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use wicked_council::dispatch::RealDispatcher;
 use wicked_council::types::Dispatcher;
@@ -18,11 +17,14 @@ use crate::event::CoreEvent;
 
 /// The production dispatcher — spawns real CLI subprocesses to collect council votes. Injected so
 /// tests can substitute a deterministic stub (no subprocess, no flaky dispatch).
+///
+/// The budgets come from `RealDispatcher::from_env` rather than being written here. This function
+/// used to hardcode 30 s for both, which is half the library's own default and below what any
+/// shipped seat needs to answer a ballot — every seat was killed mid-reasoning and the council
+/// degraded on 25 of 27 units (FINDING-026). A budget stated in one place cannot silently
+/// contradict the one the library documents.
 pub fn real_dispatcher() -> Arc<dyn Dispatcher + Send + Sync> {
-    Arc::new(RealDispatcher {
-        timeout: Duration::from_secs(30),
-        local_runner_timeout: Duration::from_secs(30),
-    })
+    Arc::new(RealDispatcher::from_env())
 }
 
 /// Fans council lifecycle events back to the actor's single emit point (via

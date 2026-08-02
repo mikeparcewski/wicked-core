@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::types::{
     AgenticCli, BallotContext, Category, CouncilTask, DispatchOutcome, Dispatcher, InputMode,
-    SeatFailure, SeatFailureKind, Vote,
+    SeatFailure, SeatFailureKind, TimedOutcome, Vote, STDERR_CAPTURE_LIMIT,
 };
 
 /// The fixed 4-question scaffold, rendered onto the task.
@@ -119,16 +119,64 @@ pub struct RealDispatcher {
     pub local_runner_timeout: Duration,
 }
 
+/// Env var overriding the agentic/chat CLI budget, in whole seconds.
+pub const ENV_TIMEOUT_SECS: &str = "WICKED_COUNCIL_TIMEOUT_SECS";
+/// Env var overriding the local-runner budget, in whole seconds.
+pub const ENV_LOCAL_TIMEOUT_SECS: &str = "WICKED_COUNCIL_LOCAL_TIMEOUT_SECS";
+
+/// Default budget for an agentic/chat CLI seat.
+///
+/// A council ballot asks a coding CLI to read a task, weigh several capability profiles and
+/// justify a pick — a reasoning turn, not a shell command. Measured cost of that turn on the
+/// shipped roster is 21.5–35.5 s (`tools/council_probe.py`, 8 ballots), so anything near 30 s
+/// kills seats that were about to answer and reports it as the seat's failure.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default budget for a local runner, which pays a cold model load before it reasons at all.
+const DEFAULT_LOCAL_RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl Default for RealDispatcher {
     fn default() -> Self {
         RealDispatcher {
-            timeout: Duration::from_secs(60),
-            local_runner_timeout: Duration::from_secs(120),
+            timeout: DEFAULT_TIMEOUT,
+            local_runner_timeout: DEFAULT_LOCAL_RUNNER_TIMEOUT,
         }
     }
 }
 
+/// Parse a whole-second duration from a raw env value, falling back when it says nothing usable.
+///
+/// A malformed or zero value falls back rather than failing the run: the council is a routing
+/// aid, and refusing to dispatch because an env var is misspelled trades a degraded decision for
+/// no decision. Zero is rejected specifically because it would kill every seat the instant it
+/// spawned and report the result as a roster-wide timeout — the same symptom this finding is
+/// about, reintroduced by configuration.
+///
+/// Takes the value rather than the variable name so it is testable without mutating the
+/// process environment, which test threads share.
+fn secs_or(raw: Option<String>, fallback: Duration) -> Duration {
+    raw.and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(fallback)
+}
+
 impl RealDispatcher {
+    /// The dispatcher the engine runs, with both budgets overridable from the environment.
+    ///
+    /// Callers should prefer this over constructing the struct literally. The engine used to
+    /// hardcode 30 s for both fields — half the default below, and short enough that the shipped
+    /// roster timed out on most ballots (FINDING-026). Routing the value through one function
+    /// keeps the production budget and the documented default from drifting apart again.
+    pub fn from_env() -> Self {
+        RealDispatcher {
+            timeout: secs_or(std::env::var(ENV_TIMEOUT_SECS).ok(), DEFAULT_TIMEOUT),
+            local_runner_timeout: secs_or(
+                std::env::var(ENV_LOCAL_TIMEOUT_SECS).ok(),
+                DEFAULT_LOCAL_RUNNER_TIMEOUT,
+            ),
+        }
+    }
+
     fn timeout_for(&self, cli: &AgenticCli) -> Duration {
         match cli.category {
             Category::LocalRunner => self.local_runner_timeout,
@@ -149,29 +197,55 @@ impl RealDispatcher {
         task: &CouncilTask,
         prompt: &str,
     ) -> DispatchOutcome {
+        self.dispatch_prompt_timed(cli, task, prompt).outcome
+    }
+
+    /// The dispatch path, reporting the queue wait and the run separately. See
+    /// [`TimedOutcome`] for why the two must not be summed.
+    fn dispatch_prompt_timed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        prompt: &str,
+    ) -> TimedOutcome {
         // Isolation: a per-dispatch tempdir under the system temp root.
         let workdir = match make_tempdir(&cli.key, &task.id) {
             Ok(d) => d,
             Err(e) => {
-                return DispatchOutcome::Failed(SeatFailure::new(
-                    SeatFailureKind::WorkdirUnavailable,
-                    e.to_string(),
-                ))
+                return TimedOutcome {
+                    outcome: DispatchOutcome::Failed(SeatFailure::new(
+                        SeatFailureKind::WorkdirUnavailable,
+                        e.to_string(),
+                    )),
+                    queued_ms: 0,
+                    ran_ms: 0,
+                }
             }
         };
 
         let timeout = self.timeout_for(cli);
-        let result = run_in_isolation(cli, prompt, &workdir, timeout);
+        // Hold a permit for the subprocess only. Seats are dispatched concurrently at two levels
+        // — every unit convenes its own council, and every council now dispatches its own seats —
+        // and those multiply. Without a ceiling, a 3-unit run on a 3-seat roster puts 9 agentic
+        // CLIs on the machine at once and they starve each other into their own budgets.
+        //
+        // The permit is taken here, not around the whole ballot, so a seat waiting for one is not
+        // burning its budget: `run_in_isolation` starts the clock when it spawns.
+        let queue_started = Instant::now();
+        let (result, queued, ran) = {
+            let _permit = seat_permits().acquire();
+            let queued = queue_started.elapsed();
+            let run_started = Instant::now();
+            let result = run_in_isolation(cli, prompt, &workdir, timeout);
+            (result, queued, run_started.elapsed())
+        };
 
         // Best-effort cleanup; never fail the dispatch on a cleanup error.
         let _ = std::fs::remove_dir_all(&workdir);
 
-        let run = match result {
-            Ok(r) => r,
-            Err(f) => return DispatchOutcome::Failed(f),
-        };
-        if !run.exit_ok {
-            return DispatchOutcome::Failed(
+        let outcome = match result {
+            Err(f) => DispatchOutcome::Failed(f),
+            Ok(run) if !run.exit_ok => DispatchOutcome::Failed(
                 SeatFailure {
                     kind: SeatFailureKind::NonZeroExit,
                     exit_code: run.exit_code,
@@ -179,9 +253,14 @@ impl RealDispatcher {
                     detail: String::new(),
                 }
                 .with_stderr(&run.stderr),
-            );
+            ),
+            Ok(run) => DispatchOutcome::Voted(parse_vote(cli, &run.stdout)),
+        };
+        TimedOutcome {
+            outcome,
+            queued_ms: queued.as_millis() as u64,
+            ran_ms: ran.as_millis() as u64,
         }
-        DispatchOutcome::Voted(parse_vote(cli, &run.stdout))
     }
 }
 
@@ -207,6 +286,15 @@ impl Dispatcher for RealDispatcher {
         ctx: &BallotContext,
     ) -> DispatchOutcome {
         self.dispatch_prompt(cli, task, &render_ballot(task, ctx))
+    }
+
+    fn dispatch_ballot_timed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &BallotContext,
+    ) -> TimedOutcome {
+        self.dispatch_prompt_timed(cli, task, &render_ballot(task, ctx))
     }
 }
 
@@ -324,6 +412,14 @@ fn run_in_isolation(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Give the seat its own process group so the timeout path can signal the whole tree. Without
+    // this, killing a CLI that shelled out leaves the grandchild alive and holding our pipes.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     if stdin_payload.is_some() {
         command.stdin(Stdio::piped());
     } else {
@@ -355,14 +451,16 @@ fn run_in_isolation(
             Ok(Some(_)) => break,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    // Reap, and keep whatever the CLI wrote before the budget ran out. A partial
-                    // stderr is frequently the whole diagnosis — an auth prompt, a rate-limit
-                    // notice — and the old code discarded it along with the exit status.
-                    let partial = child
-                        .wait_with_output()
-                        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-                        .unwrap_or_default();
+                    // Kill the whole group, not just the seat's own pid: an agentic CLI that
+                    // shelled out leaves the grandchild holding the pipes we are about to read.
+                    kill_process_tree(&mut child);
+                    // Keep whatever the CLI wrote before the budget ran out — a partial stderr is
+                    // frequently the whole diagnosis (an auth prompt, a rate-limit notice). The
+                    // drain is itself bounded; see `drain_stderr`.
+                    let partial = drain_stderr(&mut child, DRAIN_BUDGET);
+                    // Reap. `wait` does not read the pipes, so unlike `wait_with_output` it
+                    // returns as soon as the direct child is collected.
+                    let _ = child.wait();
                     return Err(SeatFailure::new(
                         SeatFailureKind::TimedOut,
                         format!("exceeded {timeout:?} dispatch budget"),
@@ -385,6 +483,177 @@ fn run_in_isolation(
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
+}
+
+/// Env var overriding how many seat subprocesses may run at once, process-wide.
+pub const ENV_MAX_CONCURRENT_SEATS: &str = "WICKED_COUNCIL_MAX_CONCURRENT_SEATS";
+
+/// Default ceiling on concurrent seat subprocesses.
+///
+/// Not a CPU bound — a seat is a network-bound LLM client that spends its budget waiting, and the
+/// host has cores to spare. The bound that bites is the shared one: every extra concurrent seat
+/// competes for the same provider quota and the same few hundred MB apiece, and a seat starved
+/// past its budget is indistinguishable from a broken one.
+///
+/// Three is what the sequential build effectively ran (one seat per council, three councils) and
+/// the configuration under which the roster demonstrably voted.
+const DEFAULT_MAX_CONCURRENT_SEATS: usize = 3;
+
+/// A counting semaphore over concurrent seat subprocesses, shared by every council in the process.
+struct SeatPermits {
+    /// Permits still available.
+    free: std::sync::Mutex<usize>,
+    /// Signalled when a permit is returned.
+    returned: std::sync::Condvar,
+}
+
+impl SeatPermits {
+    /// Block until a permit is available, then hold it until the guard drops.
+    fn acquire(&self) -> SeatPermit<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.returned.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        SeatPermit { permits: self }
+    }
+}
+
+/// Returns its permit on drop, including when the dispatch unwinds.
+struct SeatPermit<'a> {
+    permits: &'a SeatPermits,
+}
+
+impl Drop for SeatPermit<'_> {
+    fn drop(&mut self) {
+        let mut free = self.permits.free.lock().unwrap_or_else(|e| e.into_inner());
+        *free += 1;
+        self.permits.returned.notify_one();
+    }
+}
+
+/// The process-wide seat permits, sized from the environment on first use.
+fn seat_permits() -> &'static SeatPermits {
+    static PERMITS: std::sync::OnceLock<SeatPermits> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| SeatPermits {
+        free: std::sync::Mutex::new(max_concurrent_seats(
+            std::env::var(ENV_MAX_CONCURRENT_SEATS).ok(),
+        )),
+        returned: std::sync::Condvar::new(),
+    })
+}
+
+/// Parse the seat ceiling from a raw env value.
+///
+/// Anything unusable falls back to the default. Zero is rejected for a specific reason: a ceiling
+/// of zero is not "no limit", it is a deadlock — every seat would block forever waiting for a
+/// permit that no one holds.
+fn max_concurrent_seats(raw: Option<String>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_SEATS)
+}
+
+/// How long the timeout path will wait for a killed seat's stderr to drain.
+///
+/// Bounding this is what makes the dispatch budget mean anything. `wait_with_output` reads the
+/// pipes to EOF, and EOF does not arrive while *any* process still holds the write end — so a
+/// grandchild that outlived its parent used to extend a 30 s budget to 72 s (measured), with no
+/// upper bound in principle. Two seconds is far more than a dead process needs to flush what it
+/// already wrote, and the only thing a longer value could buy is a longer overrun.
+const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// SIGKILL the seat's whole process group, falling back to the direct child.
+///
+/// Unix only signals the group — `process_group(0)` at spawn made the child a group leader, so
+/// `kill -KILL -<pid>` reaches everything it started. We shell out to `kill(1)` rather than take a
+/// `libc` dependency for one call; a failure here is not worth reporting because the direct-child
+/// kill below is the outcome that actually matters, and the drain is bounded either way.
+///
+/// On Windows there is no group to signal, so this is exactly the old behaviour: the direct child
+/// dies, any grandchild is left to the bounded drain.
+/// Minimal direct FFI into libc (always linked on unix) so we can signal the child's whole PROCESS
+/// GROUP. Declared here rather than taking a `libc` crate dependency, matching the pattern already
+/// used in `wicked-core`'s terminal teardown.
+#[cfg(unix)]
+mod sig {
+    extern "C" {
+        pub fn killpg(pgrp: i32, sig: i32) -> i32;
+        pub fn getpgid(pid: i32) -> i32;
+    }
+    pub const SIGKILL: i32 = 9;
+}
+
+/// Kill the seat and everything it spawned.
+///
+/// Killing only the direct child is what let a timed-out seat overrun its budget: a grandchild
+/// that outlives it holds the pipes open. The seat is spawned into its own process group
+/// (`process_group(0)`), so on unix one `killpg` reaches the whole tree.
+///
+/// `killpg` rather than shelling out to `kill(1)`: no `PATH` lookup to hijack, no dependency on a
+/// userland binary that a minimal container may not ship, and no argument parsing to get wrong.
+/// SIGKILL directly rather than a SIGTERM grace — the seat has already exceeded its budget, and
+/// the whole point of this path is that it stops costing time.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // Signal the group ONLY if this child actually leads one.
+        //
+        // `run_in_isolation` spawns every seat with `process_group(0)`, so its pid IS the group
+        // id. A child spawned without that flag inherits OUR group instead — and passing its pid
+        // to `killpg` would then SIGKILL our own process group, this process included. Checked
+        // rather than assumed: the cost of the check is one syscall and the cost of being wrong
+        // is the whole daemon. (Found the hard way: an early version of the drain test spawned
+        // without the flag and killed the test runner.)
+        if unsafe { sig::getpgid(pid) } == pid {
+            unsafe { sig::killpg(pid, sig::SIGKILL) };
+        }
+    }
+    #[cfg(windows)]
+    {
+        // No process groups to signal here, and `Child::kill` reaches only the direct child.
+        // `taskkill /T` walks the tree by parent pid, which is the closest equivalent.
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID"])
+            .arg(child.id().to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    // Belt and braces on every platform: if the group/tree kill did not apply or did not take,
+    // the direct child still dies here.
+    let _ = child.kill();
+}
+
+/// Read what the seat wrote to stderr, giving up after `budget`.
+///
+/// The read happens on its own thread because there is no portable way to poll a pipe for
+/// readiness in std. If the budget expires the thread is abandoned rather than joined: it is
+/// blocked on a pipe whose writer we do not control, and joining it would reintroduce the exact
+/// unbounded wait this function exists to remove. It exits on its own once the last writer closes.
+fn drain_stderr(child: &mut std::process::Child, budget: Duration) -> String {
+    let Some(mut pipe) = child.stderr.take() else {
+        return String::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        // Bounded at the READ, not just at the wait. The wait below is what this function
+        // returns on; this thread outlives it and keeps reading. A grandchild that survived the
+        // group kill and is writing in a loop would otherwise grow `buf` without limit for as
+        // long as it lives. Callers retain at most `STDERR_CAPTURE_LIMIT` anyway, so reading
+        // more was never useful — it was only a way to run out of memory. It also cost the
+        // diagnostic outright: an unbounded read never returns for such a process, so the wait
+        // below expires and the caller gets nothing instead of the head it needed.
+        let _ = pipe
+            .by_ref()
+            .take(STDERR_CAPTURE_LIMIT as u64)
+            .read_to_end(&mut buf);
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    rx.recv_timeout(budget).unwrap_or_default()
 }
 
 /// Whitespace tokenizer that keeps double-quoted spans together and strips the
@@ -712,6 +981,282 @@ mod failure_diagnostics_tests {
         let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stderr(&huge);
         assert!(f.stderr.len() <= STDERR_CAPTURE_LIMIT);
         assert!(f.stderr.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn the_timeout_path_returns_within_the_budget() {
+        // The budget is a promise about wall clock, and the old timeout path did not keep it:
+        // after killing the seat it read the pipes to EOF, which waits on every process still
+        // holding the write end. Measured live at 72s under a 30s budget.
+        let cli = if cfg!(windows) {
+            seat("slow", "cmd", "cmd /C \"ping -n 30 127.0.0.1\"")
+        } else {
+            shell_seat("slow", "sleep 30")
+        };
+        let started = Instant::now();
+        let f = failure_of(&cli, Duration::from_millis(250));
+        let elapsed = started.elapsed();
+        assert_eq!(f.kind, SeatFailureKind::TimedOut);
+        // Budget + the drain bound + slack for process teardown on a loaded CI box. Deliberately
+        // loose: the defect being guarded overran by 42 SECONDS, so anything in this range proves
+        // the bound holds while leaving no room for that class of regression to slip through.
+        let ceiling = Duration::from_millis(250) + DRAIN_BUDGET + Duration::from_secs(5);
+        assert!(
+            elapsed < ceiling,
+            "the timeout path must return within its own budget: took {elapsed:?}, ceiling {ceiling:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_surviving_grandchild_cannot_extend_the_budget() {
+        // The exact live shape: an agentic CLI shells out, the grandchild inherits the pipes, and
+        // killing the direct child leaves EOF pending on a process we never signalled. `sh` exits
+        // as soon as it is killed, but the backgrounded `sleep` holds stdout/stderr open for 20s.
+        //
+        // Unix-only because the fix has two halves and only one is portable: the process-group
+        // kill (which makes the grandchild actually die) needs `process_group`, while the drain
+        // bound (which makes the budget hold regardless) is covered on every platform by the test
+        // above.
+        let cli = shell_seat("forker", "sh -c 'sleep 20' & wait");
+        let started = Instant::now();
+        let f = failure_of(&cli, Duration::from_millis(250));
+        let elapsed = started.elapsed();
+        assert_eq!(f.kind, SeatFailureKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "a grandchild holding the pipes must not extend the budget: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn the_engine_budget_matches_the_documented_default() {
+        // The engine hardcoded 30s while this crate documented 60s/120s, and the gap is the
+        // finding. `from_env` with nothing set is the one place both now come from.
+        let d = RealDispatcher::from_env();
+        let expected = RealDispatcher::default();
+        // Guarded so a developer with the override exported does not see a spurious failure.
+        if std::env::var(ENV_TIMEOUT_SECS).is_err() {
+            assert_eq!(d.timeout, expected.timeout);
+        }
+        if std::env::var(ENV_LOCAL_TIMEOUT_SECS).is_err() {
+            assert_eq!(d.local_runner_timeout, expected.local_runner_timeout);
+        }
+        assert!(
+            expected.timeout >= Duration::from_secs(60),
+            "the shipped roster answers a ballot in 21.5-35.5s; a budget at or below that kills \
+             seats mid-reasoning and reports it as their failure"
+        );
+    }
+
+    #[test]
+    fn a_misconfigured_budget_falls_back_instead_of_killing_every_seat() {
+        let fallback = Duration::from_secs(60);
+        assert_eq!(
+            secs_or(Some("90".into()), fallback),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            secs_or(Some(" 90 ".into()), fallback),
+            Duration::from_secs(90),
+            "a value pasted with whitespace is still a value"
+        );
+        assert_eq!(secs_or(None, fallback), fallback);
+        assert_eq!(secs_or(Some("".into()), fallback), fallback);
+        assert_eq!(secs_or(Some("abc".into()), fallback), fallback);
+        assert_eq!(secs_or(Some("-5".into()), fallback), fallback);
+        assert_eq!(
+            secs_or(Some("0".into()), fallback),
+            fallback,
+            "zero would kill every seat on spawn and report a roster-wide timeout"
+        );
+    }
+
+    #[test]
+    fn the_seat_ceiling_falls_back_rather_than_deadlocking() {
+        assert_eq!(max_concurrent_seats(Some("6".into())), 6);
+        assert_eq!(max_concurrent_seats(Some(" 6 ".into())), 6);
+        assert_eq!(
+            max_concurrent_seats(None),
+            DEFAULT_MAX_CONCURRENT_SEATS,
+            "unset means the default, not unbounded"
+        );
+        assert_eq!(
+            max_concurrent_seats(Some("abc".into())),
+            DEFAULT_MAX_CONCURRENT_SEATS
+        );
+        assert_eq!(
+            max_concurrent_seats(Some("-1".into())),
+            DEFAULT_MAX_CONCURRENT_SEATS
+        );
+        assert_eq!(
+            max_concurrent_seats(Some("0".into())),
+            DEFAULT_MAX_CONCURRENT_SEATS,
+            "a ceiling of zero is not 'no limit', it is every seat blocking forever"
+        );
+    }
+
+    #[test]
+    fn seat_permits_bound_concurrency_and_survive_a_panicking_holder() {
+        let permits = SeatPermits {
+            free: std::sync::Mutex::new(2),
+            returned: std::sync::Condvar::new(),
+        };
+        let peak = std::sync::Mutex::new(0usize);
+        let live = std::sync::Mutex::new(0usize);
+
+        std::thread::scope(|scope| {
+            for i in 0..6 {
+                scope.spawn(|| {
+                    let _p = permits.acquire();
+                    {
+                        let mut n = live.lock().unwrap();
+                        *n += 1;
+                        let mut hi = peak.lock().unwrap();
+                        *hi = (*hi).max(*n);
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                    *live.lock().unwrap() -= 1;
+                });
+                // One holder unwinds mid-dispatch. Its permit must come back, or the remaining
+                // seats block forever and the council never resolves - a worse failure than the
+                // contention the ceiling exists to prevent.
+                if i == 2 {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _p = permits.acquire();
+                        panic!("seat exploded");
+                    }));
+                }
+            }
+        });
+
+        assert!(
+            *peak.lock().unwrap() <= 2,
+            "the ceiling must hold: peaked at {}",
+            *peak.lock().unwrap()
+        );
+        assert_eq!(
+            *permits.free.lock().unwrap(),
+            2,
+            "every permit must be back, including the panicking holder's"
+        );
+    }
+
+    #[test]
+    fn a_queued_seat_is_not_charged_for_waiting() {
+        // Two slots, three seats: the third must wait for one of the first two to finish. Its
+        // wall clock therefore covers a queue wait it did not choose and a run it did. Only the
+        // run is budgeted, and only the run says anything about how fast that CLI is - so the
+        // two must come back separately, not summed.
+        //
+        // Every threshold below sits MIDWAY between the two outcomes it separates, never on the
+        // boundary. Timings are measured, so a threshold equal to the expected value decides on
+        // scheduler jitter and `as_millis` truncation, not on behaviour: this test failed on a CI
+        // runner reading 119ms for a wait of exactly RUN. Midpoints leave RUN/2 of slack on both
+        // sides, which is the widest margin the two hypotheses allow.
+        let permits = SeatPermits {
+            free: std::sync::Mutex::new(2),
+            returned: std::sync::Condvar::new(),
+        };
+        const RUN: Duration = Duration::from_millis(200);
+
+        let timed: Vec<(u64, u64)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..3)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let queue_started = Instant::now();
+                        let (queued, ran) = {
+                            let _permit = permits.acquire();
+                            let queued = queue_started.elapsed();
+                            let run_started = Instant::now();
+                            std::thread::sleep(RUN);
+                            (queued, run_started.elapsed())
+                        };
+                        (queued.as_millis() as u64, ran.as_millis() as u64)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // A seat that got a permit immediately waits ~0; the one that queued waits ~RUN.
+        let run_ms = RUN.as_millis() as u64;
+        let waited = timed.iter().filter(|(q, _)| *q > run_ms / 2).count();
+        assert_eq!(waited, 1, "exactly one seat should have queued: {timed:?}");
+
+        // Correct: every seat reports ~RUN. Summed (the bug): the queued seat reports ~2×RUN.
+        for (queued, ran) in &timed {
+            assert!(
+                *ran < run_ms + run_ms / 2,
+                "run time must exclude the queue wait, got ran={ran}ms queued={queued}ms"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_drain_stops_reading_at_the_cap_not_at_eof() {
+        // The drain thread outlives the bounded WAIT: `drain_stderr` returns after its budget,
+        // but the thread it spawned keeps reading. A grandchild that survived the group kill and
+        // writes in a loop would grow that buffer for as long as it lives, so the READ has to be
+        // bounded too - not just the wait. Callers retain at most STDERR_CAPTURE_LIMIT anyway.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("yes 0123456789 1>&2")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own group, exactly as `run_in_isolation` spawns a seat. Without this the child
+            // sits in the TEST RUNNER's group and `kill_process_tree` would signal us.
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("spawn a writer that never stops");
+
+        let drained = drain_stderr(&mut child, Duration::from_secs(5));
+        // Reap BEFORE asserting: a failing assertion unwinds, and a leaked `yes` outlives the
+        // whole test binary.
+        kill_process_tree(&mut child);
+        let _ = child.wait();
+
+        assert!(
+            !drained.is_empty(),
+            "an endless writer must still yield its head"
+        );
+        assert!(
+            drained.len() <= STDERR_CAPTURE_LIMIT,
+            "the read must stop at the cap, got {} bytes",
+            drained.len()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn killing_a_child_that_leads_no_group_does_not_kill_us() {
+        // A child spawned WITHOUT `process_group(0)` inherits this process's group. Handing its
+        // pid to `killpg` would SIGKILL that group - this test binary included - so the guard in
+        // `kill_process_tree` has to notice. There is no way to mutation-check this one by
+        // letting it fail: without the guard the process dies outright rather than reporting.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a child in our own group");
+
+        assert_eq!(
+            unsafe { sig::getpgid(child.id() as i32) },
+            unsafe { sig::getpgid(0) },
+            "fixture precondition: the child must share OUR group"
+        );
+
+        kill_process_tree(&mut child);
+        let reaped = child.wait().expect("the direct child still dies");
+
+        // Reaching this line at all is the assertion: the guard held and we were not signalled.
+        assert!(!reaped.success(), "killed, not exited cleanly");
     }
 
     #[test]
