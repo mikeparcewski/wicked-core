@@ -336,8 +336,8 @@ pub enum SandboxLevel {
 }
 
 /// Per-validator wall-clock bound. A validator check (`test`/`grep`/`find` …) is fast; a script that
-/// hangs or loops is KILLED at this bound and the run reports a fail-closed `Ok(false)`.
-const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
+/// hangs or loops is KILLED at this bound and the run reports a fail-closed [`ValidatorOutcome::TimedOut`].
+pub(crate) const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The environment variables PASSED THROUGH to the (otherwise cleared) child: enough for the shell +
 /// standard tools to resolve and run, and nothing that carries a secret. Everything else — API keys,
@@ -622,8 +622,9 @@ fn reap_bounded(child: &mut std::process::Child) {
 }
 
 /// Spawn `cmd` and wait up to `timeout`; kill the whole tree + BOUNDED-reap on timeout. `Ok(Some(status))`
-/// on natural exit, `Ok(None)` on timeout (fail-closed by the caller), `Err` only if the child could not
-/// be spawned. On unix the child is spawned in its OWN process group so a timeout kills the GROUP (C4),
+/// on natural exit, `Ok(None)` on timeout (fail-closed by the caller), `Err` when the OS refused —
+/// the spawn failing, or (rarer) a `try_wait` on a child that had started. On unix the child is spawned
+/// in its OWN process group so a timeout kills the GROUP (C4),
 /// and the post-kill reap is BOUNDED (C5) so it can never hang. Non-unix keeps the single-child kill.
 fn run_bounded_status(
     mut cmd: Command,
@@ -661,7 +662,51 @@ fn run_bounded_status(
 /// cwd, bounded timeout, + a real OS sandbox WHEN one is on PATH). Use [`run_validator_reporting`] to also
 /// learn the [`SandboxLevel`] actually applied.
 pub fn run_validator(v: &DeterministicValidator, cwd: &Path) -> anyhow::Result<bool> {
-    Ok(run_validator_reporting(v, cwd, None)?.0)
+    Ok(run_validator_reporting(v, cwd, None)?.0 == ValidatorOutcome::Passed)
+}
+
+/// WHY a deterministic re-verify did not pass — the distinction the gate's denial message needs.
+///
+/// Fail-closed policy is unchanged: every variant except [`Passed`](Self::Passed) denies. What changes
+/// is the DIAGNOSIS. All three non-passing causes used to collapse into one bool, so the operator was
+/// told `pinned validator failed: <criterion>` whether the script had genuinely evaluated the criterion
+/// to false, been killed at the 120s timeout, or never started at all. Only the first of those is a
+/// statement about their work; the other two are statements about the machine, and reading them as the
+/// first sends an operator to inspect a diff when they should be inspecting their PATH.
+///
+/// That collapse became load-bearing when the built-in workflows gained their evidence floors
+/// (`builtin_floors`): `feature`, `bug` and `migration` now ALWAYS run a pinned script, so a host where
+/// the shell cannot be spawned fails every run of every built-in with a message about the worktree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatorOutcome {
+    /// Ran to completion, exit 0 — the criterion holds.
+    Passed,
+    /// Ran to completion, exit non-zero — the criterion genuinely does not hold. The only variant that
+    /// says anything about the work being gated.
+    Failed,
+    /// Exceeded [`VALIDATOR_TIMEOUT`] and was killed with its process tree. Says nothing about the
+    /// criterion: the script never reached a verdict.
+    TimedOut,
+    /// The run never produced an exit status — carries the OS error string. Usually the spawn itself
+    /// failing on a missing `sh` (or missing sandbox wrapper) on PATH, which the cleared child env
+    /// ([`apply_minimal_env`]) makes likelier than an inherited-env process would; it also covers the
+    /// rarer case of the wait failing on a child that HAD started. Both are the same thing to a gate —
+    /// an OS-level failure, with no verdict on the criterion — so they share a variant, and the carried
+    /// error string is what distinguishes them for a human.
+    Unrunnable(String),
+}
+
+impl ValidatorOutcome {
+    /// Map the bounded-run result onto the outcome. Split out from [`run_validator_reporting`] so each
+    /// arm is directly testable — [`VALIDATOR_TIMEOUT`] is 120s, far too long to provoke end to end.
+    fn from_bounded(res: std::io::Result<Option<std::process::ExitStatus>>) -> Self {
+        match res {
+            Ok(Some(status)) if status.success() => Self::Passed,
+            Ok(Some(_)) => Self::Failed,
+            Ok(None) => Self::TimedOut,
+            Err(e) => Self::Unrunnable(e.to_string()),
+        }
+    }
 }
 
 /// Like [`run_validator`], but ALSO reports the [`SandboxLevel`] the child actually ran under — the
@@ -673,7 +718,7 @@ pub fn run_validator_reporting(
     v: &DeterministicValidator,
     cwd: &Path,
     db_path: Option<&str>,
-) -> anyhow::Result<(bool, SandboxLevel)> {
+) -> anyhow::Result<(ValidatorOutcome, SandboxLevel)> {
     if !v.approved {
         anyhow::bail!(
             "refusing to run an UNAPPROVED validator (fail-closed): an LLM-authored script must be \
@@ -726,12 +771,10 @@ pub fn run_validator_reporting(
         }
     }
 
-    let pass = match run_bounded_status(cmd, VALIDATOR_TIMEOUT) {
-        Ok(Some(status)) => status.success(),
-        // Timed out ⇒ fail-closed; could-not-spawn ⇒ fail-closed (matches the prior `unwrap_or(false)`).
-        Ok(None) | Err(_) => false,
-    };
-    Ok((pass, launcher.level))
+    // Every non-Passed outcome denies, exactly as before; the variant only records WHY, so the gate can
+    // say "the shell could not be spawned" instead of attributing that to the operator's worktree.
+    let outcome = ValidatorOutcome::from_bounded(run_bounded_status(cmd, VALIDATOR_TIMEOUT));
+    Ok((outcome, launcher.level))
 }
 
 /// The AGENT half of the rev0.4 dual validator: a reviewer seat judges whether `work` satisfies
@@ -1414,6 +1457,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// FINDING-050. The three non-passing causes must stay TOLD APART. All of them deny — that is the
+    /// fail-closed rule and it is not what this guards — but only `Failed` is a claim about the work
+    /// being gated. Collapsing the other two into it tells an operator whose `sh` is missing, or whose
+    /// script hung, that their worktree carries no change: a true-sounding sentence about the wrong
+    /// subject, on a gate that (since the built-in evidence floors landed) every `feature`, `bug` and
+    /// `migration` run must clear.
+    ///
+    /// Drives the mapping directly: `VALIDATOR_TIMEOUT` is 120s, so provoking a real timeout through
+    /// `run_validator_reporting` would cost two minutes of wall clock per assertion.
+    #[test]
+    fn every_non_passing_cause_is_reported_as_a_distinct_outcome() {
+        use std::io::{Error, ErrorKind};
+
+        let ran = |script: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "wicked-val-outcome-{}-{}",
+                std::process::id(),
+                script.len()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script).current_dir(&dir);
+            apply_minimal_env(&mut cmd);
+            let out = ValidatorOutcome::from_bounded(run_bounded_status(cmd, VALIDATOR_TIMEOUT));
+            let _ = std::fs::remove_dir_all(&dir);
+            out
+        };
+
+        assert_eq!(ran("exit 0"), ValidatorOutcome::Passed);
+        assert_eq!(
+            ran("exit 1"),
+            ValidatorOutcome::Failed,
+            "a script that RAN and said no is the only outcome that speaks about the criterion"
+        );
+        assert_eq!(
+            ValidatorOutcome::from_bounded(Ok(None)),
+            ValidatorOutcome::TimedOut,
+            "killed at the bound — the criterion was never evaluated, so it must not read as Failed"
+        );
+
+        // The spawn failure an operator actually hits: `sh` absent from PATH. The cleared child env
+        // makes this MORE reachable than an inherited-env process, which is why it needs its own voice.
+        let no_sh = Error::new(
+            ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        let outcome = ValidatorOutcome::from_bounded(Err(no_sh));
+        match &outcome {
+            ValidatorOutcome::Unrunnable(msg) => assert!(
+                msg.contains("No such file or directory"),
+                "the OS cause must survive into the outcome, not be flattened to a bare denial: {msg}"
+            ),
+            other => panic!("a failure to spawn must be Unrunnable, got {other:?}"),
+        }
+        assert_ne!(
+            outcome,
+            ValidatorOutcome::Failed,
+            "a shell that never started says nothing about the operator's worktree"
+        );
+    }
+
     #[test]
     fn run_validator_discriminates_pass_from_fail() {
         // Deterministic (no LLM): a hand-written, APPROVED check passes in a dir with the file, fails
@@ -1492,9 +1597,10 @@ mod tests {
             script: "test -f marker.txt".into(),
             approved: true,
         };
-        let (pass, level) = run_validator_reporting(&benign, &dir, None).expect("runs");
-        assert!(
-            pass,
+        let (outcome, level) = run_validator_reporting(&benign, &dir, None).expect("runs");
+        assert_eq!(
+            outcome,
+            ValidatorOutcome::Passed,
             "a read-only check must PASS under the hardening layer"
         );
 
