@@ -88,6 +88,9 @@ pub enum CoreEvent {
         routing_method: String,
         agreement_pct: Option<u8>,
         returned: Option<u32>,
+        /// Seats convened for the council that produced this assignment. `returned` on its own
+        /// cannot say whether the quorum held, and `agreement_pct` is a ratio over `returned`.
+        seated: Option<u32>,
         dissent: Option<u32>,
         degraded_reason: Option<String>,
     },
@@ -140,6 +143,9 @@ pub enum CoreEvent {
         consensus: bool,
         agreement_pct: u8,
         votes: u32,
+        /// Seats convened. `votes` alone cannot distinguish a unanimous council from the one
+        /// survivor of a collapsed one, and `agreement_pct` is computed over `votes`.
+        seated: u32,
     },
     /// A unit's execution started.
     UnitExecuting { session: String, ord: u32 },
@@ -625,6 +631,7 @@ impl CoreEvent {
                 routing_method,
                 agreement_pct,
                 returned,
+                seated,
                 dissent,
                 degraded_reason,
             } => {
@@ -636,6 +643,7 @@ impl CoreEvent {
                     "routingMethod": routing_method,
                     "agreementPct": agreement_pct,
                     "returned": returned,
+                    "seated": seated,
                     "dissent": dissent,
                     "degradedReason": degraded_reason,
                 })
@@ -690,6 +698,7 @@ impl CoreEvent {
                 consensus,
                 agreement_pct,
                 votes,
+                seated,
             } => json!({
                 "type": "councilVoted",
                 "session": session,
@@ -697,6 +706,7 @@ impl CoreEvent {
                 "consensus": consensus,
                 "agreementPct": agreement_pct,
                 "votes": votes,
+                "seated": seated,
             }),
             CoreEvent::UnitExecuting { session, ord } => {
                 json!({ "type": "unitExecuting", "session": session, "ord": ord })

@@ -34,7 +34,27 @@ fn panic_detail(payload: &Box<dyn std::any::Any + Send>) -> String {
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "seat dispatch panicked".to_string())
+        // Framing is the caller's job — this is used for both a seat's panic and the council's.
+        .unwrap_or_else(|| "panicked with a non-string payload".to_string())
+}
+
+/// Close out a council whose worker thread unwound.
+///
+/// Only moves a row that is still MID-LIFECYCLE. A panic after the verdict was recorded (in
+/// event emission, say) leaves a real verdict behind, and overwriting it with `Failed` would
+/// discard a decision the council genuinely reached — trading a lost diagnostic for a lost
+/// result. The detail is recorded either way, so a completed-then-panicked council is still
+/// visible as one.
+fn record_council_panic(ledger: &Ledger, task_id: &str, detail: String) {
+    ledger.update(task_id, |rec| {
+        if !matches!(
+            rec.state,
+            TaskState::Voted | TaskState::TimedOut | TaskState::Failed
+        ) {
+            rec.state = TaskState::Failed;
+        }
+        rec.failure_detail = Some(detail.clone());
+    });
 }
 
 /// The share of seats that must converge on one option before the council stops
@@ -84,7 +104,8 @@ impl Worker {
     ///
     /// Returns `(task_id, JoinHandle)`. The handle is the worker thread; callers on the hot
     /// path **drop it** (the thread is detached and writes its result to the ledger + estate
-    /// store). Tests may `join()` it for determinism — see [`Worker::queue_blocking`].
+    /// store, including if it panics). Callers that need the result before continuing use
+    /// [`Worker::queue_blocking`] instead of joining the handle themselves.
     pub fn queue(&self, task: CouncilTask) -> (String, JoinHandle<()>) {
         let task_id = task.id.clone();
         let convened: Vec<String> = self.roster.iter().map(|c| c.key.clone()).collect();
@@ -96,6 +117,7 @@ impl Worker {
             votes: Vec::new(),
             verdict: None,
             seat_failures: Vec::new(),
+            failure_detail: None,
         });
 
         self.events.emit(
@@ -119,27 +141,52 @@ impl Worker {
         let work_kind = self.work_kind.clone();
         let task_for_thread = task;
 
+        let ledger_for_panic = ledger.clone();
+        let id_for_panic = task_id.clone();
         let handle = std::thread::spawn(move || {
-            run_council(
-                &ledger,
-                dispatcher.as_ref(),
-                rank_store.as_ref(),
-                events.as_ref(),
-                &roster,
-                &work_kind,
-                &task_for_thread,
-            );
+            // Catch the council's own unwind HERE, in the thread body, so the row is closed out
+            // no matter who is watching. `queue` detaches — nobody joins that handle — so a
+            // panic used to vanish entirely and leave the row at `Running` forever, which the
+            // caller then reported as "still running when polled" rather than as a crash.
+            // Catching at the join instead would have fixed that for `queue_blocking` only.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_council(
+                    &ledger,
+                    dispatcher.as_ref(),
+                    rank_store.as_ref(),
+                    events.as_ref(),
+                    &roster,
+                    &work_kind,
+                    &task_for_thread,
+                );
+            }));
+            if let Err(e) = outcome {
+                record_council_panic(&ledger_for_panic, &id_for_panic, panic_detail(&e));
+            }
         });
 
         (task_id, handle)
     }
 
-    /// Test helper: queue then `join` the worker thread so the council has resolved when
-    /// this returns. The production contract is [`Worker::queue`] (non-blocking); this only
-    /// removes the poll loop from deterministic unit tests.
+    /// Queue `task` and block until its council has resolved.
+    ///
+    /// This is production API, not a test shim. It used to be annotated as a test helper while
+    /// `distribute.rs` called it for every real distribution, and it ended in
+    /// `.expect("worker thread panicked")` — so one unit's council taking down its thread
+    /// aborted the whole distribution, which is precisely the blast radius a quorum exists to
+    /// contain (FINDING-026 E).
+    ///
+    /// A dead council is now reported the way every other lost council is: through the ledger.
+    /// The caller polls, sees a non-`Voted` state with a named reason, and degrades that ONE
+    /// unit. Nothing about that path is special-cased for panics.
     pub fn queue_blocking(&self, task: CouncilTask) -> String {
         let (id, handle) = self.queue(task);
-        handle.join().expect("worker thread panicked");
+        if let Err(e) = handle.join() {
+            // Defensive: the thread body already catches its own unwind, so reaching here means
+            // the panic escaped that (a panic in the catch handler, or a `panic = "abort"`-style
+            // change). Record it rather than re-panicking on the caller's thread.
+            record_council_panic(&self.ledger, &id, panic_detail(&e));
+        }
         id
     }
 
@@ -147,8 +194,10 @@ impl Worker {
     pub fn poll(&self, task_id: &str) -> Option<PollStatus> {
         self.ledger.get(task_id).map(|rec| PollStatus {
             task_id: task_id.to_string(),
+            failure_detail: rec.failure_detail,
             state: rec.state,
             returned: rec.votes.len() as u32,
+            seated: rec.convened.len() as u32,
             pending: rec.convened.len().saturating_sub(rec.votes.len()) as u32,
             verdict: rec.verdict,
             seat_failures: rec.seat_failures,
@@ -165,10 +214,19 @@ pub struct PollStatus {
     pub state: TaskState,
     /// Votes collected so far.
     pub returned: u32,
+    /// Seats convened — the quorum denominator `returned` must be read against.
+    ///
+    /// Present as a first-class field rather than left for the caller to fetch off the session's
+    /// roster: `returned: 1` is a complete council or a collapsed one depending entirely on this
+    /// number, and a reader that has to go looking for it will read the flattering one.
+    pub seated: u32,
     /// CLIs still outstanding.
     pub pending: u32,
     /// The verdict, once `state == Voted`.
     pub verdict: Option<Verdict>,
+    /// Why the COUNCIL itself failed, when it did — a panic in synthesis, ranking or emission,
+    /// which belongs to no seat. `None` on every council that ran to a conclusion.
+    pub failure_detail: Option<String>,
     /// Seats that were convened but did not vote on the latest ballot, and why.
     ///
     /// Do not read this off `pending`: `pending` is `convened - returned`, which lumps a seat
@@ -345,8 +403,11 @@ fn run_council(
             return;
         }
 
-        // Synthesize the verdict (layer c) for this ballot.
-        let verdict = synthesis::synthesize(&task.id, &votes);
+        // Synthesize the verdict (layer c) for this ballot. The roster length is the QUORUM
+        // denominator: every seat that did not vote is already accounted for in `failures`, and
+        // without that count a one-of-three ballot is arithmetically identical to a one-seat
+        // council (FINDING-026 D).
+        let verdict = synthesis::synthesize(&task.id, &votes, roster.len() as u32);
 
         if verdict.agreement_ratio >= APPROVAL_THRESHOLD || ballot >= MAX_BALLOTS {
             break (votes, verdict);
@@ -417,6 +478,9 @@ fn run_council(
             "consensus": verdict.consensus,
             "agreement_ratio": verdict.agreement_ratio,
             "votes": votes.len(),
+            // The quorum denominator travels with the ratio. A consumer that sees only
+            // `votes` cannot tell a unanimous council from a council of one survivor.
+            "seated": verdict.seated,
         }),
     );
     events.emit(
@@ -485,6 +549,28 @@ mod tests {
         }
     }
 
+    /// Panics where the council does its own bookkeeping — after the ballot loop, so it is
+    /// outside the per-seat `catch_unwind` and belongs to the council rather than to any seat.
+    struct PanickingRank;
+    impl RankStore for PanickingRank {
+        fn record(&self, _cli: &str, _work_kind: &str, _signal: &RankSignal) {
+            panic!("rank store exploded");
+        }
+        fn best_for(&self, _work_kind: &str, _top: usize) -> Vec<Ranking> {
+            Vec::new()
+        }
+    }
+
+    /// Panics on the post-verdict emission — the row is already `Voted` by then.
+    struct PanickingEvents;
+    impl EventSink for PanickingEvents {
+        fn emit(&self, event: &str, _payload: &serde_json::Value) {
+            if event == wicked_apps_core::EV_COUNCIL_VOTED {
+                panic!("bus exploded");
+            }
+        }
+    }
+
     /// Scripted deliberation: ballot 1 splits 2/1/1 (50% < 75%); on ballot 2 every seat
     /// sees the tally (ctx.ballot == 2, non-empty prior_tally) and converges on "1".
     struct ConvergingDispatcher {
@@ -523,12 +609,26 @@ mod tests {
     }
 
     fn worker_with(dispatcher: Arc<dyn Dispatcher + Send + Sync>, keys: &[&str]) -> Worker {
+        worker_with_parts(
+            dispatcher,
+            Arc::new(NoopRank),
+            Arc::new(NoopEventSink),
+            keys,
+        )
+    }
+
+    fn worker_with_parts(
+        dispatcher: Arc<dyn Dispatcher + Send + Sync>,
+        rank_store: Arc<dyn RankStore + Send + Sync>,
+        events: Arc<dyn EventSink + Send + Sync>,
+        keys: &[&str],
+    ) -> Worker {
         let estate = EstateHandle::in_memory().expect("estate");
         Worker::new(
             Ledger::new(estate),
             dispatcher,
-            Arc::new(NoopRank),
-            Arc::new(NoopEventSink),
+            rank_store,
+            events,
             keys.iter().map(|k| cli(k)).collect(),
             "general",
         )
@@ -800,6 +900,89 @@ mod tests {
         assert_eq!(
             status.seat_failures[0].failure.kind,
             SeatFailureKind::Panicked
+        );
+    }
+    #[test]
+    fn a_council_that_panics_degrades_its_own_unit_instead_of_aborting_the_caller() {
+        // `queue_blocking` used to end in `.expect("worker thread panicked")` on the production
+        // distribute path, so one unit's council taking down its thread took the whole
+        // distribution with it — the opposite of what a quorum is for (FINDING-026 E).
+        let worker = worker_with_parts(
+            Arc::new(UnanimousDispatcher),
+            Arc::new(PanickingRank),
+            Arc::new(NoopEventSink),
+            &["a", "b", "c"],
+        );
+
+        // Returns normally. The assertion is that this line is reached at all.
+        let id = worker.queue_blocking(task());
+
+        let status = worker
+            .poll(&id)
+            .expect("a panicked council still has a row");
+        assert_eq!(
+            status.state,
+            TaskState::Failed,
+            "a dead council must not be left mid-lifecycle: {status:?}"
+        );
+        assert_eq!(
+            status.failure_detail.as_deref(),
+            Some("rank store exploded"),
+            "the panic message is the only account of what happened — it must survive: {status:?}"
+        );
+        assert!(
+            status.seat_failures.is_empty(),
+            "the seats all voted; the failure is the council's own and must not be pinned on              them: {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_panic_after_the_verdict_is_recorded_without_discarding_the_verdict() {
+        // The council reached a real decision and then unwound on the way out (emission, here).
+        // Overwriting `Voted` with `Failed` would trade a lost diagnostic for a lost RESULT.
+        let worker = worker_with_parts(
+            Arc::new(UnanimousDispatcher),
+            Arc::new(NoopRank),
+            Arc::new(PanickingEvents),
+            &["a", "b", "c"],
+        );
+        let id = worker.queue_blocking(task());
+
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(
+            status.state,
+            TaskState::Voted,
+            "the verdict was reached before the panic and stands: {status:?}"
+        );
+        assert!(status.verdict.is_some(), "{status:?}");
+        assert_eq!(
+            status.failure_detail.as_deref(),
+            Some("bus exploded"),
+            "a completed-then-panicked council is still visible as one: {status:?}"
+        );
+    }
+
+    #[test]
+    fn a_detached_council_that_panics_still_closes_out_its_row() {
+        // `queue` detaches — nobody joins the handle — so catching the unwind at the JOIN would
+        // have left this path's rows stranded at `Running` forever, reported to whoever polled
+        // as "still running" rather than as a crash.
+        let worker = worker_with_parts(
+            Arc::new(UnanimousDispatcher),
+            Arc::new(PanickingRank),
+            Arc::new(NoopEventSink),
+            &["a", "b", "c"],
+        );
+        let (id, handle) = worker.queue(task());
+        // Join only to make the test deterministic; the catch under test is in the thread body,
+        // not here — this test would pass identically if the handle were dropped and polled.
+        let _ = handle.join();
+
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Failed, "{status:?}");
+        assert_eq!(
+            status.failure_detail.as_deref(),
+            Some("rank store exploded")
         );
     }
 }

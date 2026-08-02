@@ -167,6 +167,10 @@ pub fn task_to_node(rec: &TaskRecord) -> Node {
     m.insert("convened".into(), serde_json::json!(rec.convened));
     m.insert("votes".into(), serde_json::json!(rec.votes));
     m.insert("seat_failures".into(), serde_json::json!(rec.seat_failures));
+    m.insert(
+        "failure_detail".into(),
+        serde_json::json!(rec.failure_detail),
+    );
     node
 }
 
@@ -188,6 +192,9 @@ pub fn task_from_node(node: &Node) -> anyhow::Result<TaskRecord> {
     // reading of "this row does not say", and matches a run where every seat voted.
     let seat_failures: Vec<SeatFailureRecord> =
         json_meta(node, "seat_failures").unwrap_or_default();
+    // Absent on rows written before council-level failures were recorded, and `null` on every
+    // row where the council did not fail — both read as `None`.
+    let failure_detail: Option<String> = json_meta(node, "failure_detail").unwrap_or_default();
     let state = str_meta(node, "state")
         .and_then(|s| TaskState::from_str_opt(&s))
         .unwrap_or(TaskState::Queued);
@@ -205,6 +212,7 @@ pub fn task_from_node(node: &Node) -> anyhow::Result<TaskRecord> {
         votes,
         verdict: None,
         seat_failures,
+        failure_detail,
     })
 }
 
@@ -430,6 +438,12 @@ pub struct TaskRecord {
     /// this, `convened.len() > votes.len()` was the only trace a seat had failed at all, and the
     /// reason was gone.
     pub seat_failures: Vec<SeatFailureRecord>,
+    /// Why the COUNCIL itself failed, as opposed to a seat within it.
+    ///
+    /// Set when the worker thread unwound: a panic in synthesis, ranking or event emission is
+    /// not attributable to any seat, so it has no home in `seat_failures`, and without a home it
+    /// used to leave the row stranded mid-lifecycle with nothing to read (FINDING-026 E).
+    pub failure_detail: Option<String>,
 }
 
 /// One convened seat's failure to vote, attributed to the seat.
@@ -567,6 +581,7 @@ mod tests {
                 }
                 .with_stderr("agy: unknown flag --headless"),
             }],
+            failure_detail: None,
         };
         let node = task_to_node(&rec);
         let back = task_from_node(&node).expect("round-trip");
@@ -601,6 +616,7 @@ mod tests {
             votes: vec![sample_vote("claude")],
             verdict: None,
             seat_failures: vec![],
+            failure_detail: None,
         };
         let mut node = task_to_node(&rec);
         node.metadata.remove("seat_failures");
@@ -609,11 +625,43 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_written_before_quorum_was_tracked_still_loads() {
+        // `seated` was added by FINDING-026 D. Verdicts persisted before it exist in the estate,
+        // and a hard parse error on them would make every historical council decision
+        // unreadable - the opposite of the evidence-integrity goal the field serves. It reads
+        // back as 0, which `synthesize` treats as "no better information than the cast count".
+        let verdict = Verdict {
+            task_id: "t-legacy".into(),
+            kind: "Consensus: JWT (2/2)".into(),
+            consensus: true,
+            seated: 2,
+            winning_recommendation: Some("JWT".into()),
+            agreement_ratio: 1.0,
+            risk_convergence: vec![],
+            dissent: vec![],
+        };
+        let mut node = verdict_to_node(&verdict);
+        // Strip the key exactly as a pre-field writer would have left it.
+        if let Some(serde_json::Value::Object(inner)) = node.metadata.get_mut("verdict") {
+            inner.remove("seated");
+        } else {
+            panic!("the verdict node must carry the struct under `verdict`");
+        }
+        let back = verdict_from_node(&node).expect("a pre-quorum verdict must still load");
+        assert_eq!(
+            back.seated, 0,
+            "an absent quorum reads as unrecorded, not as a parse error"
+        );
+        assert_eq!(back.winning_recommendation.as_deref(), Some("JWT"));
+    }
+
+    #[test]
     fn verdict_node_round_trips() {
         let verdict = Verdict {
             task_id: "t1".into(),
-            kind: "Consensus: JWT (2/2)".into(),
+            kind: "Consensus: JWT (2/2 seats)".into(),
             consensus: true,
+            seated: 2,
             winning_recommendation: Some("JWT".into()),
             agreement_ratio: 1.0,
             risk_convergence: vec![("revocation".into(), 2)],
@@ -637,14 +685,16 @@ mod tests {
             votes: vec![],
             verdict: None,
             seat_failures: vec![],
+            failure_detail: None,
         });
         ledger.update("t-persist", |rec| {
             rec.state = TaskState::Voted;
             rec.votes = vec![sample_vote("claude"), sample_vote("agy")];
             rec.verdict = Some(Verdict {
                 task_id: "t-persist".into(),
-                kind: "Consensus: JWT (2/2)".into(),
+                kind: "Consensus: JWT (2/2 seats)".into(),
                 consensus: true,
+                seated: 2,
                 winning_recommendation: Some("JWT".into()),
                 agreement_ratio: 1.0,
                 risk_convergence: vec![("revocation".into(), 2)],

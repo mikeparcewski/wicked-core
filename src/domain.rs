@@ -289,6 +289,13 @@ pub enum RoutingInfo {
         agreement_pct: u8,
         /// How many seats returned a vote.
         returned: u32,
+        /// How many seats were CONVENED — the denominator `returned` must be read against.
+        ///
+        /// `returned: 1` describes a complete one-seat council and a three-seat council that
+        /// lost two seats, and only this field separates them. Recorded on the routing artifact
+        /// itself so an auditor reading a stored decision never has to reconstruct the quorum
+        /// from the session's roster (FINDING-026 D).
+        seated: u32,
         /// How many dissenting voices the verdict recorded.
         dissent: u32,
     },

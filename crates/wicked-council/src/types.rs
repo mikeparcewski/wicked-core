@@ -289,11 +289,31 @@ pub struct Verdict {
     pub task_id: String,
     /// Human/machine summary: "Consensus" | "NoConsensus" prefix.
     pub kind: String,
-    /// `true` when a strict majority of votes converge on one recommendation.
+    /// `true` when a strict majority of the **seated** council converges on one recommendation.
+    ///
+    /// The denominator is [`Verdict::seated`], not the votes cast. A council of three that hears
+    /// back from one is not unanimous — it is quorate-failed, and saying otherwise puts a
+    /// three-seat agreement in the audit trail that never happened (FINDING-026 D).
     pub consensus: bool,
+    /// Seats CONVENED for this council — the quorum denominator.
+    ///
+    /// Distinct from the number of votes cast: a seat that timed out is seated and did not
+    /// return. Carried on the verdict so a reader never has to reconstruct the quorum by
+    /// comparing a separate `returned` field against the session's roster length.
+    ///
+    /// `#[serde(default)]` because a `Verdict` round-trips through the estate store: records
+    /// written before this field existed must still load, and 0 reads as "not recorded", which
+    /// the arithmetic below treats as "no better information than the cast count".
+    #[serde(default)]
+    pub seated: u32,
     /// The recommendation the most votes converged on (the winner), if any.
     pub winning_recommendation: Option<String>,
-    /// Agreement ratio in `[0.0, 1.0]`: winning vote count / total votes.
+    /// Agreement ratio in `[0.0, 1.0]`: winning vote count / votes **cast**.
+    ///
+    /// Deliberately NOT quorum-adjusted — it answers "of the seats that answered, how many
+    /// agreed?", which is what drives the runoff loop. Quorum is a separate axis and lives on
+    /// `consensus` + `seated`; folding it in here would silently re-scope the approval
+    /// threshold and send every degraded council to a runoff that loses the same seats again.
     /// Emitted on `wicked.council.voted`. Counts agreement, NOT averaged confidence.
     pub agreement_ratio: f32,
     /// Risk convergence: each distinct `top_risk` and how many CLIs cited it,
