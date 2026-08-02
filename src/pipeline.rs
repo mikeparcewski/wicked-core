@@ -851,9 +851,42 @@ fn pinned_validator_denial(
         ));
     };
     match crate::validator::run_validator_reporting(v, cwd, db_path) {
-        Ok((true, _)) => None,
-        Ok((false, _)) => Some(format!("pinned validator failed: {}", v.criterion)),
+        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion),
         Err(e) => Some(format!("pinned validator error: {e}")),
+    }
+}
+
+/// Render the operator-facing denial for a re-verify outcome (FINDING-050). Every outcome except
+/// [`ValidatorOutcome::Passed`] denies — the fail-closed rule is unchanged and is NOT what this
+/// distinguishes. What it distinguishes is the CLAIM: only `Failed` means the script ran and judged the
+/// criterion false. `TimedOut` and `Unrunnable` mean no verdict was ever reached, and reporting those as
+/// a criterion failure sends the operator to audit a diff when the fault is in their host.
+///
+/// Split out from [`pinned_validator_denial`] so the wording of each arm is directly testable without
+/// having to provoke a real 120s timeout or a real missing shell.
+fn denial_for_outcome(
+    outcome: &crate::validator::ValidatorOutcome,
+    criterion: &str,
+) -> Option<String> {
+    use crate::validator::ValidatorOutcome as O;
+    match outcome {
+        O::Passed => None,
+        O::Failed => Some(format!("pinned validator failed: {criterion}")),
+        O::TimedOut => Some(format!(
+            "pinned validator TIMED OUT before reaching a verdict (fail-closed — a phase that cannot \
+             be re-verified is treated as NOT-passed, so this is a DENY, not a criterion failure). \
+             The criterion `{}` was never evaluated; the script was killed at the {}s bound. Check \
+             the script for a command that waits on input or the network.",
+            criterion,
+            crate::validator::VALIDATOR_TIMEOUT.as_secs()
+        )),
+        O::Unrunnable(e) => Some(format!(
+            "pinned validator COULD NOT BE RUN on this host (fail-closed — a phase that cannot be \
+             re-verified is treated as NOT-passed, so this is a DENY, not a criterion failure). The \
+             criterion `{criterion}` was never evaluated: {e}. The script runs as `sh -c`, under a \
+             cleared environment that keeps only a fixed allowlist, so `sh` and anything the script \
+             calls must resolve on the inherited PATH."
+        )),
     }
 }
 
@@ -924,6 +957,63 @@ fn next_cli_in_roster(creator: &str, roster: &[String]) -> String {
             .first()
             .cloned()
             .unwrap_or_else(|| "wicked-evaluator".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod denial_message_tests {
+    use super::*;
+    use crate::validator::ValidatorOutcome as O;
+
+    const CRITERION: &str = "the run left a change in its worktree";
+
+    /// FINDING-050. A distinguishable enum is worth nothing if the operator still reads one sentence.
+    /// Asserts the property, not the prose: a no-verdict outcome must never be phrased as the criterion
+    /// having failed, must say the criterion went unevaluated, and must name its own cause.
+    #[test]
+    fn a_no_verdict_outcome_is_never_worded_as_a_criterion_failure() {
+        assert_eq!(
+            denial_for_outcome(&O::Passed, CRITERION),
+            None,
+            "pass ⇒ no denial"
+        );
+
+        let failed = denial_for_outcome(&O::Failed, CRITERION).expect("denies");
+        assert_eq!(
+            failed,
+            format!("pinned validator failed: {CRITERION}"),
+            "the genuine criterion failure keeps its established wording"
+        );
+
+        let timed_out = denial_for_outcome(&O::TimedOut, CRITERION).expect("denies");
+        let unrunnable = denial_for_outcome(
+            &O::Unrunnable("No such file or directory (os error 2)".into()),
+            CRITERION,
+        )
+        .expect("denies");
+
+        for (name, msg) in [("TimedOut", &timed_out), ("Unrunnable", &unrunnable)] {
+            assert_ne!(
+                msg, &failed,
+                "{name} must not render as the criterion-failure message"
+            );
+            assert!(
+                msg.contains("never evaluated"),
+                "{name} must say the criterion went unevaluated, not that it was judged false: {msg}"
+            );
+        }
+
+        assert!(
+            timed_out.contains("TIMED OUT")
+                && timed_out.contains(&crate::validator::VALIDATOR_TIMEOUT.as_secs().to_string()),
+            "a timeout must name itself and the bound it hit: {timed_out}"
+        );
+        assert!(
+            unrunnable.contains("COULD NOT BE RUN")
+                && unrunnable.contains("No such file or directory")
+                && unrunnable.contains("PATH"),
+            "an unrunnable check must carry the OS cause and point at PATH: {unrunnable}"
+        );
     }
 }
 

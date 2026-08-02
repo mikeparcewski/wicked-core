@@ -97,7 +97,7 @@ pub use sources::{add_node_note, add_source, base_dir, enrich_source, index_docs
 pub use validator::{
     agent_validate, author_deterministic_validator, combine_verdict, gate_phase, run_validator,
     run_validator_reporting, sandbox_availability, AgentVerdict, DeterministicValidator,
-    GateVerdict, SandboxLevel, DETERMINISTIC_VALIDATOR_SEAT,
+    GateVerdict, SandboxLevel, ValidatorOutcome, DETERMINISTIC_VALIDATOR_SEAT,
 };
 pub use validator_vault::{
     approve_and_store, load_validator, pin, provision_validator, store_validator, VALIDATOR_VAULT,
