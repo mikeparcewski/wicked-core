@@ -441,6 +441,13 @@ pub enum SeatFailureKind {
     /// that has not adopted [`Dispatcher::dispatch_ballot_detailed`] land here — it records
     /// "not reported", which is honest, rather than inventing a cause.
     Unreported,
+    /// The dispatch itself panicked.
+    ///
+    /// Seats are dispatched on their own threads, so one that unwinds is caught and recorded as
+    /// that seat's failure rather than propagated. The alternative — letting it reach the council
+    /// thread — turns one bad seat into a failed distribution, which is the opposite of what a
+    /// quorum is for.
+    Panicked,
 }
 
 impl SeatFailureKind {
@@ -456,6 +463,7 @@ impl SeatFailureKind {
             SeatFailureKind::WaitFailed => "wait_failed",
             SeatFailureKind::NonZeroExit => "non_zero_exit",
             SeatFailureKind::Unreported => "unreported",
+            SeatFailureKind::Panicked => "panicked",
         }
     }
 }
@@ -542,6 +550,24 @@ pub enum DispatchOutcome {
     Failed(SeatFailure),
 }
 
+/// A seat's outcome with its wall clock split into the part the budget governs and the part it
+/// does not.
+///
+/// The two must stay separate. A seat that waited two minutes for a concurrency permit and then
+/// ran for sixty seconds has a two-minute wall clock, but its dispatch budget was never exceeded;
+/// reporting the sum next to "exceeded 60s dispatch budget" reproduces exactly the contradiction
+/// FINDING-026 was about. Queue time is also a property of how loaded the council is, not of the
+/// CLI, so folding it into the ranking signal would penalise whichever seat happened to queue.
+#[derive(Debug, Clone)]
+pub struct TimedOutcome {
+    /// What the seat returned.
+    pub outcome: DispatchOutcome,
+    /// Time spent waiting for a dispatch slot before the process started. Not budgeted.
+    pub queued_ms: u64,
+    /// Time the seat's process actually ran. This is what the dispatch budget bounds.
+    pub ran_ms: u64,
+}
+
 impl DispatchOutcome {
     /// Lift a legacy `Option<Vote>`. A bare `None` becomes [`SeatFailureKind::Unreported`]
     /// rather than an empty failure, so the "no vote ⇒ some reason" invariant holds even for
@@ -602,6 +628,27 @@ pub trait Dispatcher {
         ctx: &BallotContext,
     ) -> DispatchOutcome {
         DispatchOutcome::from_option(self.dispatch_ballot(cli, task, ctx))
+    }
+
+    /// Dispatch one ballot and report how long the seat *ran* separately from how long it
+    /// *waited for a slot*.
+    ///
+    /// The default is right for every dispatcher that does not queue: nothing waits, so the whole
+    /// wall clock is run time. Only [`crate::dispatch::RealDispatcher`], which holds a
+    /// process-wide concurrency permit, overrides it.
+    fn dispatch_ballot_timed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &BallotContext,
+    ) -> TimedOutcome {
+        let started = std::time::Instant::now();
+        let outcome = self.dispatch_ballot_detailed(cli, task, ctx);
+        TimedOutcome {
+            outcome,
+            queued_ms: 0,
+            ran_ms: started.elapsed().as_millis() as u64,
+        }
     }
 }
 

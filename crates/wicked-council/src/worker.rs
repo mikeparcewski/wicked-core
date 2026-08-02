@@ -18,14 +18,24 @@
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 use crate::store::{Ledger, SeatFailureRecord, TaskRecord};
 use crate::synthesis;
+use std::time::Instant;
+
 use crate::types::{
     AgenticCli, BallotContext, CouncilTask, DispatchOutcome, Dispatcher, EventSink, RankSignal,
-    RankStore, TaskState, Verdict, SEATS,
+    RankStore, SeatFailure, SeatFailureKind, TaskState, TimedOutcome, Verdict, SEATS,
 };
+
+/// Recover a readable message from a caught panic payload.
+fn panic_detail(payload: &Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "seat dispatch panicked".to_string())
+}
 
 /// The share of seats that must converge on one option before the council stops
 /// deliberating — the approval bar every voter is told about in its ballot prompt.
@@ -175,7 +185,9 @@ pub struct PollStatus {
 #[allow(clippy::too_many_arguments)]
 fn run_council(
     ledger: &Ledger,
-    dispatcher: &dyn Dispatcher,
+    // `Sync` because seats are dispatched concurrently; the `Worker` already holds it as
+    // `Arc<dyn Dispatcher + Send + Sync>`, so this only stops the bound being dropped here.
+    dispatcher: &(dyn Dispatcher + Send + Sync),
     rank_store: &dyn RankStore,
     events: &dyn EventSink,
     roster: &[AgenticCli],
@@ -198,30 +210,93 @@ fn run_council(
     let mut ballot: u32 = 1;
     let mut prior_tally: Vec<(String, u32)> = Vec::new();
     let mut dissent_arguments: Vec<String> = Vec::new();
-    // Per-CLI ranking signal accumulated ACROSS ballots: total latency summed over every
+    // Per-CLI ranking signal accumulated ACROSS ballots: total RUN time summed over every
     // dispatch (a 3-ballot deliberation costs 3 dispatches and is reported as such), and
     // success from the seat's final ballot (the one the verdict is synthesized from).
     let mut signal_acc: std::collections::BTreeMap<String, (bool, u64)> =
         std::collections::BTreeMap::new();
     let (votes, verdict) = loop {
-        // Dispatch each CLI in isolation, recording per-CLI latency for ranking.
-        // (Sequential; isolation guarantees independence — parallelism is a follow-up.)
+        // Dispatch every seat CONCURRENTLY, recording per-CLI latency for ranking.
+        //
+        // Isolation is what makes this safe, and it was already a hard requirement: each seat
+        // runs in its own tempdir, its own subprocess and its own budget, and no seat reads
+        // another's output. Nothing was shared to begin with.
+        //
+        // It is also what makes the budget affordable. A ballot used to cost the SUM of its
+        // seats and now costs the SLOWEST — and since a below-bar ballot re-runs the whole
+        // roster, the sequential version multiplied that sum by the ballot count. Measured on
+        // the shipped 3-seat roster: 4m30s to route 3 units, against a budget claiming 30s.
+        //
+        // Results are collected by seat index and processed below in roster order, so the votes,
+        // the failure list and the emitted events are identical to the sequential version. Only
+        // the wall clock changes.
         let mut votes = Vec::new();
         let mut failures: Vec<SeatFailureRecord> = Vec::new();
-        for (i, cli) in roster.iter().enumerate() {
-            let ctx = BallotContext {
-                seat: Some(SEATS[i % SEATS.len()].clone()),
-                ballot,
-                approval_threshold: APPROVAL_THRESHOLD,
-                prior_tally: prior_tally.clone(),
-                dissent_arguments: dissent_arguments.clone(),
-            };
-            let started = Instant::now();
-            let outcome = dispatcher.dispatch_ballot_detailed(cli, task, &ctx);
-            let latency_ms = started.elapsed().as_millis() as u64;
+        let dispatched: Vec<TimedOutcome> = std::thread::scope(|scope| {
+            let handles: Vec<_> = roster
+                .iter()
+                .enumerate()
+                .map(|(i, cli)| {
+                    let ctx = BallotContext {
+                        seat: Some(SEATS[i % SEATS.len()].clone()),
+                        ballot,
+                        approval_threshold: APPROVAL_THRESHOLD,
+                        prior_tally: prior_tally.clone(),
+                        dissent_arguments: dissent_arguments.clone(),
+                    };
+                    scope.spawn(move || {
+                        let started = Instant::now();
+                        // Catch the unwind HERE rather than at the join, so a seat that panicked
+                        // after doing real work still reports the time it spent. Reporting 0
+                        // would not merely lose information: the ranking signal sums this, and a
+                        // failed seat that looks instantaneous is a lie in the flattering
+                        // direction.
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            dispatcher.dispatch_ballot_timed(cli, task, &ctx)
+                        }))
+                        .unwrap_or_else(|e| TimedOutcome {
+                            outcome: DispatchOutcome::Failed(SeatFailure::new(
+                                SeatFailureKind::Panicked,
+                                panic_detail(&e),
+                            )),
+                            queued_ms: 0,
+                            ran_ms: started.elapsed().as_millis() as u64,
+                        })
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    // A seat that unwinds is that seat's failure, not the council's. Letting the
+                    // panic propagate would abort the whole distribution over one bad seat —
+                    // exactly the blast radius a quorum exists to contain.
+                    h.join().unwrap_or_else(|e| TimedOutcome {
+                        // Unreachable while the closure catches its own unwind; kept so a future
+                        // change there cannot turn one bad seat into an aborted distribution.
+                        outcome: DispatchOutcome::Failed(SeatFailure::new(
+                            SeatFailureKind::Panicked,
+                            panic_detail(&e),
+                        )),
+                        queued_ms: 0,
+                        ran_ms: 0,
+                    })
+                })
+                .collect()
+        });
+
+        for (i, timed) in dispatched.into_iter().enumerate() {
+            let TimedOutcome {
+                outcome,
+                queued_ms,
+                ran_ms,
+            } = timed;
+            let cli = &roster[i];
             let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
             entry.0 = outcome.is_voted();
-            entry.1 += latency_ms;
+            // Rank on run time only. Queue time measures how busy the council was, not how fast
+            // this CLI is, and charging it to the seat would rank whichever seat happened to wait.
+            entry.1 += ran_ms;
             match outcome {
                 DispatchOutcome::Voted(v) => votes.push(v),
                 DispatchOutcome::Failed(failure) => {
@@ -239,7 +314,11 @@ fn run_council(
                             "exit_code": failure.exit_code,
                             "stderr": failure.stderr,
                             "detail": failure.detail,
-                            "latency_ms": latency_ms,
+                            // The run, not the wall clock: this sits next to a message naming
+                            // the dispatch budget, and the budget governs the run. Queue time is
+                            // reported beside it rather than folded in.
+                            "latency_ms": ran_ms,
+                            "queued_ms": queued_ms,
                         }),
                     );
                     failures.push(SeatFailureRecord {
@@ -366,6 +445,7 @@ mod tests {
     use crate::types::{Confidence, NoopEventSink, RankStore, Ranking, Vote};
     use crate::EstateHandle;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     fn cli(key: &str) -> AgenticCli {
         AgenticCli {
@@ -561,6 +641,165 @@ mod tests {
             *dispatcher.ballots_seen.lock().unwrap(),
             MAX_BALLOTS,
             "deliberation capped at MAX_BALLOTS"
+        );
+    }
+
+    /// Sleeps a fixed span per seat so wall clock distinguishes concurrent from sequential.
+    struct SlowDispatcher {
+        per_seat: std::time::Duration,
+        peak_concurrent: Arc<Mutex<usize>>,
+        in_flight: Arc<Mutex<usize>>,
+    }
+    impl Dispatcher for SlowDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            {
+                let mut n = self.in_flight.lock().unwrap();
+                *n += 1;
+                let mut peak = self.peak_concurrent.lock().unwrap();
+                *peak = (*peak).max(*n);
+            }
+            std::thread::sleep(self.per_seat);
+            *self.in_flight.lock().unwrap() -= 1;
+            Some(vote(&cli.key, "2 — best"))
+        }
+    }
+
+    #[test]
+    fn a_ballot_costs_its_slowest_seat_not_the_sum_of_them() {
+        // The council used to dispatch seats one after another, so a ballot cost the SUM of its
+        // seats and a below-bar ballot multiplied that by the ballot count. On the shipped 3-seat
+        // roster that was 4m30s to route 3 units, against a 30s budget.
+        let per_seat = std::time::Duration::from_millis(300);
+        let peak = Arc::new(Mutex::new(0usize));
+        let dispatcher = Arc::new(SlowDispatcher {
+            per_seat,
+            peak_concurrent: peak.clone(),
+            in_flight: Arc::new(Mutex::new(0)),
+        });
+        let worker = worker_with(dispatcher, &["a", "b", "c", "d"]);
+
+        let started = Instant::now();
+        let id = worker.queue_blocking(task());
+        let elapsed = started.elapsed();
+
+        assert_eq!(worker.poll(&id).expect("status").state, TaskState::Voted);
+        assert_eq!(
+            *peak.lock().unwrap(),
+            4,
+            "every seat on the ballot must be in flight at once"
+        );
+        // Sequential would be 4 x 300ms = 1.2s. Concurrent is one 300ms span plus overhead;
+        // the ceiling sits between the two so neither a slow CI box nor a partial regression
+        // (say, two-at-a-time) can pass.
+        assert!(
+            elapsed < per_seat * 3,
+            "a ballot must cost its slowest seat, not the sum: {elapsed:?}"
+        );
+    }
+
+    /// Panics on one named seat; every other seat votes.
+    struct PanickingSeatDispatcher {
+        victim: String,
+    }
+    impl Dispatcher for PanickingSeatDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            assert!(cli.key != self.victim, "seat {} is a crash test", cli.key);
+            Some(vote(&cli.key, "2 — best"))
+        }
+    }
+
+    /// Records what the ranking store was actually told, so a test can assert on the signal
+    /// rather than on the code path that produces it.
+    #[derive(Default)]
+    struct RecordingRank {
+        seen: Mutex<Vec<(String, bool, u64)>>,
+    }
+    impl RankStore for RecordingRank {
+        fn record(&self, cli: &str, _work_kind: &str, signal: &RankSignal) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((cli.to_string(), signal.success, signal.latency_ms));
+        }
+        fn best_for(&self, _work_kind: &str, _top: usize) -> Vec<Ranking> {
+            Vec::new()
+        }
+    }
+
+    /// Panics only AFTER burning measurable time, which is the case that matters: a seat that
+    /// unwinds instantly is indistinguishable from one that was never charged for its work.
+    struct SlowThenPanickingDispatcher {
+        victim: String,
+        work: Duration,
+    }
+    impl Dispatcher for SlowThenPanickingDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            std::thread::sleep(self.work);
+            assert!(cli.key != self.victim, "seat {} is a crash test", cli.key);
+            Some(vote(&cli.key, "2 — best"))
+        }
+    }
+
+    #[test]
+    fn a_panicking_seat_is_still_charged_for_the_time_it_burned() {
+        // A failed seat that reports zero latency is not merely missing data - the ranking signal
+        // sums it, so the seat looks FASTER than every seat that succeeded. That is a lie in the
+        // flattering direction, and it biases future routing toward the CLI that crashed.
+        const WORK: Duration = Duration::from_millis(150);
+        let rank = Arc::new(RecordingRank::default());
+        let estate = EstateHandle::in_memory().expect("estate");
+        let worker = Worker::new(
+            Ledger::new(estate),
+            Arc::new(SlowThenPanickingDispatcher {
+                victim: "b".to_string(),
+                work: WORK,
+            }),
+            rank.clone(),
+            Arc::new(NoopEventSink),
+            ["a", "b", "c"].iter().map(|k| cli(k)).collect(),
+            "general",
+        );
+        let id = worker.queue_blocking(task());
+        worker.poll(&id).expect("the council must still resolve");
+
+        let seen = rank.seen.lock().unwrap().clone();
+        let (_, success, latency_ms) = seen
+            .iter()
+            .find(|(k, _, _)| k == "b")
+            .expect("the panicking seat must still be ranked: {seen:?}");
+        assert!(!success, "the seat failed");
+        assert!(
+            *latency_ms >= WORK.as_millis() as u64,
+            "a seat that worked for {WORK:?} before panicking must not be ranked as instant, \
+             got {latency_ms}ms"
+        );
+    }
+
+    #[test]
+    fn a_panicking_seat_degrades_itself_not_the_council() {
+        // Seats run on their own threads now. An unwinding seat that reached the council thread
+        // would abort the whole distribution over one bad CLI - the opposite of what a quorum is
+        // for - so it is caught and recorded as that seat's failure.
+        let worker = worker_with(
+            Arc::new(PanickingSeatDispatcher {
+                victim: "b".to_string(),
+            }),
+            &["a", "b", "c"],
+        );
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("the council must still resolve");
+
+        assert_eq!(status.state, TaskState::Voted);
+        assert_eq!(status.returned, 2, "the surviving seats still voted");
+        let failed: Vec<&str> = status
+            .seat_failures
+            .iter()
+            .map(|f| f.cli.as_str())
+            .collect();
+        assert_eq!(failed, vec!["b"], "the panicking seat is named: {failed:?}");
+        assert_eq!(
+            status.seat_failures[0].failure.kind,
+            SeatFailureKind::Panicked
         );
     }
 }
