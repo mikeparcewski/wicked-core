@@ -435,14 +435,19 @@ fn run_council(
 
         let matrix = synthesis::build_matrix(&votes);
         prior_tally = matrix.recommendation_counts;
-        let winning_norm = verdict
+        // Keyed the same way the matrix keys it (`synthesis::rec_key`), which is the same way the
+        // router reads it: a vote is the option number, not the sentence explaining it. Comparing
+        // full text here made a dissenter of every seat that agreed in a different sentence — and
+        // since the ballot MANDATES a rationale, that was all of them but one, so `dissent` was
+        // pinned at `seated - 1` no matter how the council actually voted (FINDING-056).
+        let winning_key = verdict
             .winning_recommendation
             .as_deref()
-            .map(normalize)
+            .map(synthesis::rec_key)
             .unwrap_or_default();
         dissent_arguments = votes
             .iter()
-            .filter(|v| normalize(&v.recommendation) != winning_norm)
+            .filter(|v| synthesis::rec_key(&v.recommendation) != winning_key)
             .filter(|v| !v.top_risk.trim().is_empty())
             .take(3)
             .map(|v| v.top_risk.clone())
@@ -454,8 +459,15 @@ fn run_council(
     // Record per-CLI ranking signals: did the seat succeed on the deciding ballot, did it
     // agree with the eventual consensus winner, and what did the whole deliberation cost?
     for (cli_key, (success, total_latency_ms)) in &signal_acc {
+        // Same keying, and this one is the durable half: `agreement_with_consensus` feeds the CLI
+        // ranking store, which later routing consults to pick seats. Under full-text comparison a
+        // seat that voted FOR the winner but explained itself differently was recorded as having
+        // disagreed — so the ranking data did not merely miss agreement, it inverted it, and every
+        // council since has compounded the error into future seat selection.
         let agreement = match (&winning, votes.iter().find(|v| &v.cli == cli_key)) {
-            (Some(win), Some(v)) => normalize(&v.recommendation) == normalize(win),
+            (Some(win), Some(v)) => {
+                synthesis::rec_key(&v.recommendation) == synthesis::rec_key(win)
+            }
             _ => false,
         };
         rank_store.record(
@@ -500,14 +512,11 @@ fn run_council(
     );
 }
 
-/// Local copy of the synthesis normaliser so the worker doesn't reach into a private fn —
-/// keeps the agreement check consistent with the matrix.
-fn normalize(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
-}
+// The local `normalize` copy that used to live here is gone. Its own doc claimed it existed to keep
+// "the agreement check consistent with the matrix" — but a copy can only hold that invariant while
+// both sides agree on what a vote is, and it silently stopped holding the moment recommendations
+// began keying on their option number. The worker now calls `synthesis::rec_key` directly, so the
+// consistency is structural rather than asserted in a comment.
 
 #[cfg(test)]
 mod tests {
@@ -1030,6 +1039,99 @@ mod tests {
         assert!(
             !detail.contains('\n'),
             "detail must be single-line: {detail:?}"
+        );
+    }
+
+    /// Records the ranking store's *agreement* signal per seat. (`RecordingRank` above captures
+    /// success/latency instead — this is the same store seen through the other field.)
+    struct AgreementRank {
+        seen: Mutex<Vec<(String, bool)>>,
+    }
+    impl RankStore for AgreementRank {
+        fn record(&self, cli: &str, _work_kind: &str, signal: &RankSignal) {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((cli.to_string(), signal.agreement_with_consensus));
+        }
+        fn best_for(&self, _work_kind: &str, _top: usize) -> Vec<Ranking> {
+            Vec::new()
+        }
+    }
+
+    /// Every seat explains itself in its own words on both ballots — which is what the ballot
+    /// asks for. Ballot 1 splits 2/1/1 by option; ballot 2 is unanimous on option 1.
+    struct DistinctRationalesDispatcher {
+        ballot2_dissent: Mutex<Vec<String>>,
+    }
+    impl Dispatcher for DistinctRationalesDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot");
+        }
+        fn dispatch_ballot(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> Option<Vote> {
+            if ctx.ballot == 1 {
+                let rec = match cli.key.as_str() {
+                    "a" => "1 — alpha's own phrasing",
+                    "b" => "1 — worded nothing like alpha",
+                    "c" => "2 — a different option entirely",
+                    _ => "3 — a third option",
+                };
+                Some(vote(&cli.key, rec))
+            } else {
+                *self.ballot2_dissent.lock().unwrap() = ctx.dissent_arguments.clone();
+                Some(vote(&cli.key, &format!("1 — {}'s runoff wording", cli.key)))
+            }
+        }
+    }
+
+    #[test]
+    fn agreeing_in_different_words_is_neither_dissent_nor_a_ranking_penalty() {
+        // The worker's two recommendation comparisons are the other half of FINDING-056: the
+        // matrix counted votes by option number while the worker still compared whole sentences,
+        // so a seat that voted WITH the winner in its own words was filed as a dissenter and
+        // recorded in the ranking store as having disagreed.
+        let dispatcher = Arc::new(DistinctRationalesDispatcher {
+            ballot2_dissent: Mutex::new(Vec::new()),
+        });
+        let rank = Arc::new(AgreementRank {
+            seen: Mutex::new(Vec::new()),
+        });
+        let worker = worker_with_parts(
+            dispatcher.clone(),
+            rank.clone(),
+            Arc::new(NoopEventSink),
+            &["a", "b", "c", "d"],
+        );
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+
+        // Ballot 1 was 2/4 on option 1 — under the bar, so a runoff ran and carried dissent into
+        // it. `b` agreed with `a` on the option, so only the seats that named OTHER options are
+        // dissenters. Comparing full text made a dissenter of `b` too.
+        let dissent = dispatcher.ballot2_dissent.lock().unwrap().clone();
+        assert!(
+            dissent.contains(&"c risk".to_string()) && dissent.contains(&"d risk".to_string()),
+            "seats naming other options dissent: {dissent:?}"
+        );
+        assert!(
+            !dissent.contains(&"b risk".to_string()),
+            "b voted for the winning option and must not be quoted as dissent: {dissent:?}"
+        );
+
+        // The durable half: ballot 2 was unanimous on option 1 in four different sentences, so
+        // every seat agreed with the consensus. Under full-text comparison only the seat whose
+        // wording happened to become the winner's display would have scored `true`.
+        let seen = rank.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 4, "one signal per seat: {seen:?}");
+        assert!(
+            seen.iter().all(|(_, agreed)| *agreed),
+            "all four voted option 1: {seen:?}"
         );
     }
 }
