@@ -1176,13 +1176,21 @@ mod failure_diagnostics_tests {
         // scheduler jitter and `as_millis` truncation, not on behaviour: this test failed on a CI
         // runner reading 119ms for a wait of exactly RUN. Midpoints leave RUN/2 of slack on both
         // sides, which is the widest margin the two hypotheses allow.
+        //
+        // The run-time assertion is additionally SELF-CALIBRATING: it compares the queued seat's
+        // run against the UNQUEUED seats' runs, measured on the same machine in the same scope,
+        // rather than against a constant derived from RUN. Every seat sleeps the same RUN, so
+        // whatever the scheduler adds on top is common-mode and cancels. A constant does not
+        // cancel it - `ran < RUN * 3/2` failed on a contended CI runner at ran=333ms for
+        // RUN=200ms, i.e. the runner's fixed overhead ate a margin sized for a quiet machine and
+        // the test reported the summed-timing bug against code that does not have it.
         let permits = SeatPermits {
             free: std::sync::Mutex::new(2),
             returned: std::sync::Condvar::new(),
         };
-        const RUN: Duration = Duration::from_millis(200);
+        const RUN: Duration = Duration::from_millis(300);
 
-        let timed: Vec<(u64, u64)> = std::thread::scope(|scope| {
+        let mut timed: Vec<(u64, u64)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..3)
                 .map(|_| {
                     scope.spawn(|| {
@@ -1201,18 +1209,36 @@ mod failure_diagnostics_tests {
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
-        // A seat that got a permit immediately waits ~0; the one that queued waits ~RUN.
+        // A seat that got a permit immediately waits ~0; the one that queued waits ~RUN. Longest
+        // wait first, so the head IS the queued seat and the tail is the comparison group.
+        timed.sort_by_key(|(queued, _)| std::cmp::Reverse(*queued));
+        let (&(queued_wait, queued_ran), unqueued) = timed
+            .split_first()
+            .expect("three seats were spawned, so three timings come back");
         let run_ms = RUN.as_millis() as u64;
-        let waited = timed.iter().filter(|(q, _)| *q > run_ms / 2).count();
-        assert_eq!(waited, 1, "exactly one seat should have queued: {timed:?}");
+        assert!(
+            queued_wait > run_ms / 2,
+            "two permits and three seats: one seat must have queued for about a run: {timed:?}"
+        );
+        assert!(
+            unqueued.iter().all(|(queued, _)| *queued <= run_ms / 2),
+            "only one seat should have queued: {timed:?}"
+        );
 
-        // Correct: every seat reports ~RUN. Summed (the bug): the queued seat reports ~2×RUN.
-        for (queued, ran) in &timed {
-            assert!(
-                *ran < run_ms + run_ms / 2,
-                "run time must exclude the queue wait, got ran={ran}ms queued={queued}ms"
-            );
-        }
+        // Correct: the queued seat's run matches the unqueued seats' - it slept the same RUN.
+        // Summed (the bug): it exceeds them by its whole queue wait, ~RUN more. Half the measured
+        // wait is the midpoint between those two outcomes, and it scales with what was measured
+        // rather than with what was expected.
+        let baseline = unqueued
+            .iter()
+            .map(|(_, ran)| *ran)
+            .max()
+            .expect("two seats ran without queueing");
+        assert!(
+            queued_ran < baseline + queued_wait / 2,
+            "run time must exclude the queue wait: the queued seat ran={queued_ran}ms after \
+             waiting {queued_wait}ms, while unqueued seats ran at most {baseline}ms ({timed:?})"
+        );
     }
 
     /// Block — with NO budget — until the child has actually written its first byte.
