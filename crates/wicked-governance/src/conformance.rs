@@ -245,18 +245,15 @@ pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyh
 ///
 /// Retire, not delete — see [`crate::engine::retire_policy`] for why the node has to survive.
 pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool> {
+    // O(1) by synthetic symbol rather than a scan-and-filter over every rule node — see
+    // [`crate::engine::retire_policy`].
     let symbol = synthetic_symbol(CONFORMANCE_RULE, id);
-    let query = SymbolQuery {
-        kinds: vec![NodeKind::Rule],
-        ..Default::default()
-    };
-    let Some(node) = store
-        .find_symbols(&query)?
-        .into_iter()
-        .find(|n| n.symbol == symbol)
-    else {
+    let Some(node) = store.get_node(&symbol)? else {
         return Ok(false);
     };
+    if node.kind != NodeKind::Rule {
+        return Ok(false);
+    }
     let mut rule = ConformanceRule::from_node(&node)?;
     if rule.retired {
         return Ok(true);

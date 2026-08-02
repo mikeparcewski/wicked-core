@@ -74,18 +74,19 @@ pub fn register_policy(store: &mut dyn GraphStore, policy: &Policy) -> anyhow::R
 /// policy ids that produced them, and a decision citing an id that no longer resolves cannot be
 /// explained afterwards. So the node stays and stops being selected.
 pub fn retire_policy(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool> {
+    // Addressed directly by its synthetic symbol. The earlier form loaded and JSON-parsed EVERY
+    // policy node to find the one already named by `symbol`, so retiring one rule cost the whole
+    // policy set (review on #149).
     let symbol = synthetic_symbol(POLICY, id);
-    let query = SymbolQuery {
-        kinds: vec![NodeKind::Other(POLICY.to_string())],
-        ..Default::default()
-    };
-    let Some(node) = store
-        .find_symbols(&query)?
-        .into_iter()
-        .find(|n| n.symbol == symbol)
-    else {
+    let Some(node) = store.get_node(&symbol)? else {
         return Ok(false);
     };
+    // The symbol namespaces on POLICY, so a kind mismatch means the graph is inconsistent rather
+    // than that the caller asked for something absent. Kept as a guard because the scan it
+    // replaces filtered on kind, and "not a policy" must stay `false`, not a parse error.
+    if node.kind != NodeKind::Other(POLICY.to_string()) {
+        return Ok(false);
+    }
     let mut policy = Policy::from_node(&node)?;
     if policy.retired {
         // Already withdrawn. Report success rather than an error: retiring twice should be safe for
