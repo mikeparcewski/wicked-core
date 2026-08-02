@@ -267,17 +267,28 @@ const PROJECT_MANIFESTS: &[&str] = &[
 /// Total character budget. The prompt-composition audit behind FINDING-048 found task-specific text
 /// was already only 5% of a 74.5k-char prompt; a layout that solves path-guessing by drowning the
 /// task would trade one problem for a worse one.
-const LAYOUT_BUDGET: usize = 1400;
+const LAYOUT_BUDGET: usize = 1200;
 
 /// Caps on breadth. A repo with 200 top-level entries is not made legible by listing all 200.
 const MAX_TOP_LEVEL: usize = 32;
 const MAX_CHILDREN: usize = 10;
+/// Root files are the cheapest thing to rediscover (`ls`) and the least directional, so they get the
+/// tightest cap — ragflow's 33 of them would otherwise be over half the map.
+const MAX_ROOT_FILES: usize = 12;
+
+/// Appended in place of whatever did not fit, so a reader can always tell a complete map from a
+/// clipped one and knows the cheap way to get the rest.
+pub(crate) const LAYOUT_TRUNCATED: &str = "; …truncated, run `ls` for the rest";
 
 /// A compact, deterministic map of what is at `dir`'s root — the thing no unit prompt carried.
 ///
 /// FINDING-048: 0 of 32 prompts described the target tree, and 12 of 32 sessions burned turns on
 /// `cd: no such file or directory` rediscovering that AutoGPT is a two-era monorepo. The worker knows
 /// its task and nothing about where the task lives, so it guesses paths and pays for each miss.
+///
+/// SINGLE-LINE by contract, for the same reason as [`crate::assumptions::PROMPT_CONVENTION`]: the PTY
+/// session runner writes a prompt line-based, so an embedded newline would end the turn early and send
+/// the rest of the map as its own turn. `;` separates top-level entries, `{…}` holds a descent.
 ///
 /// Deliberately shallow. Depth 1 always; depth 2 ONLY for a top-level directory that is not itself a
 /// project root but contains ones — precisely the monorepo shape that produced the failures, and the
@@ -287,58 +298,78 @@ const MAX_CHILDREN: usize = 10;
 /// Returns `None` when `dir` cannot be read or has nothing worth reporting, so a caller that has no
 /// worktree (or an empty one) appends nothing rather than an empty heading.
 #[must_use]
-pub fn worktree_layout(dir: &Path) -> Option<String> {
+pub(crate) fn worktree_layout(dir: &Path) -> Option<String> {
+    worktree_layout_within(dir, LAYOUT_BUDGET)
+}
+
+/// [`worktree_layout`] against a caller-supplied character budget.
+///
+/// The PTY session runner needs this: it writes a prompt as ONE line, and a pty in canonical mode
+/// discards any line that reaches `MAX_CANON` (1024 bytes) without ever delivering it, so the map has
+/// to fit in whatever the rest of the prompt leaves rather than in a fixed 1200. A budget too small
+/// for even one entry yields `None`, which reads as "no map" and costs the caller nothing.
+#[must_use]
+pub(crate) fn worktree_layout_within(dir: &Path, layout_budget: usize) -> Option<String> {
     let (dirs, files) = read_split(dir)?;
     if dirs.is_empty() && files.is_empty() {
         return None;
     }
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut budget = LAYOUT_BUDGET;
-    let mut truncated = dirs.len() > MAX_TOP_LEVEL || files.len() > MAX_TOP_LEVEL;
+    let mut parts: Vec<String> = Vec::new();
+    let mut budget = layout_budget;
+    let mut truncated = dirs.len() > MAX_TOP_LEVEL;
 
     for name in dirs.iter().take(MAX_TOP_LEVEL) {
         let child = dir.join(name);
-        let mut line = format!("{name}/");
+        let mut part = format!("{name}/");
         if let Some(m) = manifest_of(&child) {
-            // A project root: say what builds it, and stop. Its children are the project's business.
-            line.push_str(&format!("  [{m}]"));
-        } else if let Some(inner) = project_children(&child) {
-            // The monorepo case — the level that was actually missing.
-            line.push_str(&format!("  ({})", inner.join(", ")));
+            part.push_str(&format!(" [{m}]"));
         }
-        if line.len() + 1 > budget {
+        // Both, not either. An earlier cut of this treated a manifest as "this is the project, stop
+        // descending" — and AutoGPT, the repo the finding is ABOUT, rendered as
+        // `autogpt_platform/ [Makefile]` with `backend/` and `frontend/` still invisible, because a
+        // container can carry a Makefile that drives the projects underneath it. A directory being a
+        // project root and being a container of project roots are independent facts; report both.
+        if let Some(inner) = project_children(&child) {
+            part.push_str(&format!(" {{{}}}", inner.join(", ")));
+        }
+        // +2 for the "; " that will join this part to the previous one.
+        if part.len() + 2 > budget {
             truncated = true;
             break;
         }
-        budget -= line.len() + 1;
-        lines.push(line);
+        budget -= part.len() + 2;
+        parts.push(part);
     }
 
     // Root files last and cheaply: they matter far less than the directory shape, and a worker can
     // always `ls`. Listing them at all is what tells it whether the root IS the project.
-    let root_files: Vec<&String> = files.iter().take(MAX_TOP_LEVEL).collect();
-    if !root_files.is_empty() {
-        let joined = root_files
+    if !files.is_empty() {
+        if files.len() > MAX_ROOT_FILES {
+            truncated = true;
+        }
+        let joined = files
             .iter()
-            .map(|s| s.as_str())
+            .take(MAX_ROOT_FILES)
+            .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ");
-        let line = format!("(root files: {joined})");
-        if line.len() + 1 <= budget {
-            lines.push(line);
+        let part = format!("root files: {joined}");
+        if part.len() + 2 <= budget {
+            parts.push(part);
         } else {
             truncated = true;
         }
     }
 
-    if lines.is_empty() {
+    if parts.is_empty() {
         return None;
     }
+    let mut out = parts.join("; ");
     if truncated {
-        lines.push("(…truncated — run `ls` for the rest)".to_string());
+        out.push_str(LAYOUT_TRUNCATED);
     }
-    Some(lines.join("\n"))
+    Some(out)
 }
 
 /// Split a directory into (subdirectory names, file names), both sorted, both filtered of hidden
@@ -393,6 +424,132 @@ mod tests {
     fn slug_takes_four_kebab_words() {
         assert_eq!(slug("My Cool Repo Name Extra"), "my-cool-repo-name");
         assert_eq!(slug("!!!"), "repo");
+    }
+
+    /// A scratch tree, named per-test AND per-process so concurrent test binaries never collide.
+    /// Each entry is `"a/b/c"` for a directory or `"a/b/file.ext"` for an (empty) file — the layout
+    /// only ever looks at names and file-vs-dir, never at content.
+    fn scratch(name: &str, entries: &[&str]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wicked-layout-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for e in entries {
+            let p = root.join(e);
+            if p.extension().is_some() {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, "").unwrap();
+            } else {
+                std::fs::create_dir_all(&p).unwrap();
+            }
+        }
+        root
+    }
+
+    /// The exact shape FINDING-048 was about: `cd autogpt_platform/backend` is not guessable from
+    /// depth 1, so depth 1 alone would have left the 12 failing sessions failing. Pinned as a whole
+    /// string, which also holds the sort (a map that reorders between runs is not a stable prompt)
+    /// and the single-line contract.
+    ///
+    /// `classic/` is the case that a first cut of this got WRONG and the real AutoGPT clone exposed:
+    /// it carries a manifest AND contains project roots. Treating the manifest as "stop here" hid
+    /// `autogpt_platform/backend` behind `autogpt_platform/ [Makefile]` — the one path the finding
+    /// exists to surface. Both facts are reported.
+    #[test]
+    fn a_project_root_that_also_contains_projects_reports_both() {
+        let root = scratch(
+            "monorepo",
+            &[
+                "autogpt_platform/backend/pyproject.toml",
+                "autogpt_platform/frontend/package.json",
+                "classic/pyproject.toml",
+                "classic/forge/setup.py",
+                "docs/content",
+                "README.md",
+            ],
+        );
+        let map = worktree_layout(&root).expect("a populated tree has a map");
+        assert_eq!(
+            map,
+            "autogpt_platform/ {backend/ [pyproject.toml], frontend/ [package.json]}; \
+             classic/ [pyproject.toml] {forge/ [setup.py]}; docs/; root files: README.md"
+        );
+        // Stated separately from the equality above because it is a CONTRACT, not an incidental
+        // property of this fixture: the PTY runner writes the prompt line-based.
+        assert!(!map.contains('\n'), "the map must stay single-line: {map}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `.git` alone would dwarf the rest of the map, and no work unit is ever about `node_modules`.
+    #[test]
+    fn hidden_and_build_output_directories_never_reach_the_prompt() {
+        let root = scratch(
+            "noise",
+            &[
+                ".git/objects",
+                ".venv/lib",
+                "node_modules/react",
+                "target/debug",
+                "dist/bundle.js",
+                "src/main.rs",
+                "Cargo.toml",
+            ],
+        );
+        let map = worktree_layout(&root).unwrap();
+        assert_eq!(map, "src/; root files: Cargo.toml");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bounded, and HONEST about being bounded — a clipped map that reads as complete would send a
+    /// worker looking for a directory it was simply never shown.
+    #[test]
+    fn a_wide_tree_is_clipped_and_says_so() {
+        let mut entries: Vec<String> = (0..MAX_TOP_LEVEL + 5)
+            .map(|i| format!("dir{i:03}"))
+            .collect();
+        entries.extend((0..MAX_ROOT_FILES + 5).map(|i| format!("file{i:03}.txt")));
+        let refs: Vec<&str> = entries.iter().map(String::as_str).collect();
+        let root = scratch("wide", &refs);
+        let map = worktree_layout(&root).unwrap();
+        assert!(
+            map.ends_with(LAYOUT_TRUNCATED),
+            "a clipped map must say so: {map}"
+        );
+        assert!(
+            map.len() <= LAYOUT_BUDGET + LAYOUT_TRUNCATED.len(),
+            "the map must stay inside its budget, got {} chars",
+            map.len()
+        );
+        assert!(
+            map.contains(&format!("dir{:03}/", MAX_TOP_LEVEL - 1))
+                && !map.contains(&format!("dir{MAX_TOP_LEVEL:03}/")),
+            "the directory cap is where it says it is: {map}"
+        );
+        assert!(
+            map.contains(&format!("file{:03}.txt", MAX_ROOT_FILES - 1))
+                && !map.contains(&format!("file{MAX_ROOT_FILES:03}.txt")),
+            "root files get their own tighter cap: {map}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// No worktree, or an empty one, must append NOTHING — a bare heading over an empty map is worse
+    /// than silence, because it reads as "this repo has nothing in it".
+    #[test]
+    fn nothing_worth_saying_yields_no_map_at_all() {
+        assert_eq!(
+            worktree_layout(&std::env::temp_dir().join("wicked-layout-does-not-exist")),
+            None
+        );
+        let root = scratch("empty", &[]);
+        assert_eq!(worktree_layout(&root), None);
+        let hidden_only = scratch("hidden-only", &[".git/objects"]);
+        assert_eq!(worktree_layout(&hidden_only), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&hidden_only);
     }
 
     #[test]
