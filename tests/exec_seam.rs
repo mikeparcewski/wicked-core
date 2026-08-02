@@ -448,7 +448,9 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
 
     // A NEW task.dispatched for the verify unit at attempt 1 appears — the fresh key proves a genuine
     // re-dispatch reached a worker (the wedge would have left NO new dispatch and no progress).
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 15s to match this file's other bus waits: 5s was close enough to the unloaded time that a
+    // concurrent `cargo test --all` could time it out before the re-dispatch landed.
+    let deadline = Instant::now() + Duration::from_secs(15);
     let mut saw_attempt1 = false;
     while Instant::now() < deadline {
         let hit = bus

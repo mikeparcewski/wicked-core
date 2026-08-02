@@ -64,24 +64,42 @@ fn cli(key: &str) -> AgenticCli {
 }
 
 fn db_path(name: &str) -> String {
-    let dir = std::env::temp_dir().join(format!("wicked-core-p10-{name}"));
+    let dir = std::env::temp_dir().join(format!("wicked-core-p10-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("estate.db").to_str().unwrap().to_string()
 }
 
+/// How long a completion wait may take before it is called a failure.
+///
+/// Far above the ~2s an unloaded run needs, because the only thing a longer budget can change is
+/// whether a slow-but-correct run under concurrent test load is misreported as a broken one.
+const WAIT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Poll until `run_id` completes.
+///
+/// On timeout it reports the status it actually observed: the caller asserts on a bare `bool`, and
+/// "assertion failed" alone cannot distinguish a run that stalled (a real defect) from one that was
+/// merely slow under `cargo test --all` load (a harness problem).
 fn wait_done(core: &Core, run_id: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(v) = core.sessions_detail() {
-            if v.iter()
-                .any(|s| s.session.id == run_id && s.session.status == SessionStatus::Completed)
-            {
-                return true;
+    let start = Instant::now();
+    let mut last: Option<SessionStatus> = None;
+    while start.elapsed() < WAIT_BUDGET {
+        if let Ok(views) = core.sessions_detail() {
+            if let Some(v) = views.iter().find(|s| s.session.id == run_id) {
+                if v.session.status == SessionStatus::Completed {
+                    return true;
+                }
+                last = Some(v.session.status);
             }
         }
         std::thread::sleep(Duration::from_millis(15));
     }
+    eprintln!(
+        "wait_done({run_id}): timed out after {:?} waiting for Completed; last observed {last:?} \
+         (None means the run never appeared in sessions_detail at all)",
+        start.elapsed()
+    );
     false
 }
 

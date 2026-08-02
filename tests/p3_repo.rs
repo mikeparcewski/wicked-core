@@ -76,7 +76,7 @@ fn cli(key: &str) -> AgenticCli {
 
 /// Create a throwaway git repo with one commit; returns its absolute path.
 fn make_git_repo(name: &str) -> PathBuf {
-    let repo = std::env::temp_dir().join(format!("wicked-core-p3-{name}"));
+    let repo = std::env::temp_dir().join(format!("wicked-core-p3-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
@@ -98,7 +98,7 @@ fn make_git_repo(name: &str) -> PathBuf {
 }
 
 fn core_for(name: &str) -> (Core, Arc<Mutex<Vec<Option<PathBuf>>>>) {
-    let dir = std::env::temp_dir().join(format!("wicked-core-p3db-{name}"));
+    let dir = std::env::temp_dir().join(format!("wicked-core-p3db-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("estate.db").to_str().unwrap().to_string();
@@ -123,18 +123,45 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
     }
 }
 
+/// How long a status wait may take before it is called a failure.
+///
+/// Far above the ~2s an unloaded run needs, because the only thing a longer budget can change is
+/// whether a slow-but-correct run under concurrent test load is misreported as a broken one.
+const WAIT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Poll until `run_id` reaches `want`.
+///
+/// Two things about this helper are deliberate.
+///
+/// The budget is generous. A satisfied wait returns the moment the status matches, so raising it
+/// costs nothing on the happy path — it only changes the outcome in the case that would otherwise
+/// be a false failure. `cargo test --all` runs dozens of test binaries concurrently, and the old
+/// 5s budget sat close enough to the ~2s an unloaded run takes that these files failed
+/// intermittently under that load.
+///
+/// On timeout it reports the status it actually observed. Every caller wraps this in
+/// `assert!(wait_status(..))`, and a bare `false` makes libtest print only "assertion failed" —
+/// which cannot distinguish a run that stalled (a real defect) from one that was merely slow (a
+/// harness problem). Naming the last-seen status is what makes the next occurrence diagnosable.
 fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
+    let start = Instant::now();
+    let mut last: Option<SessionStatus> = None;
+    while start.elapsed() < WAIT_BUDGET {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == run_id) {
                 if v.session.status == want {
                     return true;
                 }
+                last = Some(v.session.status);
             }
         }
         std::thread::sleep(Duration::from_millis(15));
     }
+    eprintln!(
+        "wait_status({run_id}): timed out after {:?} waiting for {want:?}; last observed {last:?} \
+         (None means the run never appeared in sessions_detail at all)",
+        start.elapsed()
+    );
     false
 }
 
@@ -158,7 +185,7 @@ fn register_validates_git_repo_and_lists_it() {
     assert_eq!(repos[0].root_path, repo.to_str().unwrap());
 
     // A non-git path is rejected.
-    let bad = std::env::temp_dir().join("wicked-core-p3-not-git");
+    let bad = std::env::temp_dir().join(format!("wicked-core-p3-not-git-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&bad);
     assert!(
         core.register_repo(RepoSpec {

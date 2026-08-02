@@ -52,7 +52,7 @@ fn echo_cli() -> AgenticCli {
 }
 
 fn make_git_repo(name: &str) -> std::path::PathBuf {
-    let repo = std::env::temp_dir().join(format!("wicked-core-p4a-{name}"));
+    let repo = std::env::temp_dir().join(format!("wicked-core-p4a-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&repo);
     std::fs::create_dir_all(&repo).unwrap();
     let git = |a: &[&str]| {
@@ -91,7 +91,7 @@ fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
 #[test]
 fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
     let repo = make_git_repo("e2e");
-    let dir = std::env::temp_dir().join("wicked-core-p4a-db");
+    let dir = std::env::temp_dir().join(format!("wicked-core-p4a-db-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let db = dir.join("estate.db").to_str().unwrap().to_string();
