@@ -2153,6 +2153,24 @@ sleep 30
         assert_eq!(closed, 2);
     }
 
+    /// The TTL these tests reap against. Deliberately small: `Instant` is monotonic-since-boot, so
+    /// every backdate below has to be representable on a host that just booted. Keeping the whole
+    /// scale within `MAX_BACKDATE` seconds means these tests never depend on machine uptime.
+    const TEST_TTL: Duration = Duration::from_secs(4);
+    const MAX_BACKDATE: u64 = 10;
+
+    /// An `Instant` `secs` in the past.
+    ///
+    /// `checked_sub` rather than `-`: subtracting past the start of the monotonic clock panics, and
+    /// a bare panic here would read as a reaper bug rather than as a host with less uptime than the
+    /// backdate. Every caller stays under `MAX_BACKDATE`, so the expect is unreachable in practice.
+    fn backdated(secs: u64) -> Instant {
+        debug_assert!(secs <= MAX_BACKDATE, "keep test backdates small");
+        Instant::now()
+            .checked_sub(Duration::from_secs(secs))
+            .expect("monotonic clock older than the backdate (host uptime under 10s?)")
+    }
+
     /// Put `chat_id` in the pool and backdate its last-touch by `idle` seconds.
     ///
     /// Backdating beats sleeping: the reaper's whole contract is about elapsed time, and a test
@@ -2164,10 +2182,10 @@ sleep 30
             (AcpStepRunner::chat_pool_key(chat_id), "claude".into()),
             None,
         );
-        r.chat_activity.lock().unwrap().insert(
-            chat_id.to_string(),
-            Instant::now() - Duration::from_secs(idle),
-        );
+        r.chat_activity
+            .lock()
+            .unwrap()
+            .insert(chat_id.to_string(), backdated(idle));
     }
 
     fn closed_chats(rx: &std::sync::mpsc::Receiver<Command>) -> Vec<(String, String)> {
@@ -2186,10 +2204,10 @@ sleep 30
     fn idle_chats_are_reaped_and_active_ones_are_left_alone() {
         let (tx, rx) = std::sync::mpsc::channel();
         let r = AcpStepRunner::new(tx);
-        seed_chat(&r, "stale", 3600);
-        seed_chat(&r, "fresh", 5);
+        seed_chat(&r, "stale", MAX_BACKDATE);
+        seed_chat(&r, "fresh", 0);
 
-        let reaped = r.chat_reap_idle(Duration::from_secs(1800));
+        let reaped = r.chat_reap_idle(TEST_TTL);
 
         assert_eq!(reaped, vec!["stale".to_string()]);
         assert_eq!(
@@ -2215,14 +2233,14 @@ sleep 30
     fn ensuring_a_seat_touches_the_chat_even_when_the_seat_fails_to_start() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let r = AcpStepRunner::new(tx);
-        seed_chat(&r, "c1", 3600);
+        seed_chat(&r, "c1", MAX_BACKDATE);
 
         assert!(r
             .chat_ensure("c1", "no-such-cli-xyz", &std::env::temp_dir())
             .is_err());
 
         assert!(
-            r.chat_reap_idle(Duration::from_secs(1800)).is_empty(),
+            r.chat_reap_idle(TEST_TTL).is_empty(),
             "a chat someone just tried to warm a seat on is not idle"
         );
     }
@@ -2233,12 +2251,7 @@ sleep 30
     fn the_pool_cap_evicts_least_recently_used_and_never_the_newest() {
         let (tx, rx) = std::sync::mpsc::channel();
         let r = AcpStepRunner::new(tx);
-        for (id, idle) in [
-            ("oldest", 300),
-            ("middle", 200),
-            ("newer", 100),
-            ("newest", 0),
-        ] {
+        for (id, idle) in [("oldest", 3), ("middle", 2), ("newer", 1), ("newest", 0)] {
             seed_chat(&r, id, idle);
         }
 
@@ -2292,15 +2305,12 @@ sleep 30
         {
             let mut activity = r.chat_activity.lock().unwrap();
             // Re-touched by a long turn after its chat was already closed.
-            activity.insert(
-                "orphan".to_string(),
-                Instant::now() - Duration::from_secs(3600),
-            );
+            activity.insert("orphan".to_string(), backdated(MAX_BACKDATE));
             // Touched by `chat_ensure`, whose pool insert has not landed yet.
             activity.insert("opening".to_string(), Instant::now());
         }
 
-        r.chat_reap_idle(Duration::from_secs(1800));
+        r.chat_reap_idle(TEST_TTL);
 
         let remaining: Vec<String> = r.chat_activity.lock().unwrap().keys().cloned().collect();
         assert_eq!(
@@ -2323,10 +2333,7 @@ sleep 30
         );
 
         assert_eq!(r.chat_list()[0].idle_secs, u64::MAX);
-        assert_eq!(
-            r.chat_reap_idle(Duration::from_secs(1800)),
-            vec!["orphan".to_string()]
-        );
+        assert_eq!(r.chat_reap_idle(TEST_TTL), vec!["orphan".to_string()]);
     }
 
     /// The enumerate surface (FINDING-027 gap 4): a leak nobody can list is a leak nobody can

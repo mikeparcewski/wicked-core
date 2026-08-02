@@ -393,9 +393,13 @@ impl Core {
     ///
     /// Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
     /// chat ids freely, so without this an accumulation is invisible until the host runs out of
-    /// memory (FINDING-027). `idleSecs` is seconds since the chat's last open/ensure/turn;
-    /// `18446744073709551615` (u64::MAX) means no activity was ever recorded, which the reaper
-    /// treats as idle-since-forever.
+    /// memory (FINDING-027). `idleSecs` is seconds since the chat's last open/ensure/turn, or
+    /// `null` when no activity was ever recorded — which the reaper treats as idle-since-forever.
+    ///
+    /// `null` rather than the `u64::MAX` the Rust side uses for that case: a JS `number` is an
+    /// f64, so `u64::MAX` arrives as `18446744073709552000` and no consumer can test for the
+    /// sentinel by equality. `null` is checkable, and it stops a caller from doing arithmetic on a
+    /// value that never meant a duration.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn chat_list(&self) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
@@ -407,7 +411,7 @@ impl Core {
                     serde_json::json!({
                         "chatId": c.chat_id,
                         "seats": c.seats,
-                        "idleSecs": c.idle_secs,
+                        "idleSecs": (c.idle_secs != u64::MAX).then_some(c.idle_secs),
                     })
                 })
                 .collect();
