@@ -536,6 +536,52 @@ mod tests {
         );
     }
 
+    /// `retire_policy` addresses the node by synthetic symbol but writes it back through
+    /// `to_node()`, which recomputes that symbol from the metadata `id`. If the two disagree, the
+    /// write lands on a DIFFERENT policy: the one the operator named stays enforcing, an unrelated
+    /// one goes dark, and the call still reports success. It must refuse instead (review on #149).
+    #[test]
+    fn retiring_a_misfiled_policy_errors_instead_of_retiring_a_different_one() {
+        // Scoped to this test: no other test in this module writes a node by hand, and hoisting the
+        // trait would put raw graph writes in reach of every one of them.
+        use wicked_apps_core::GraphWrite;
+
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+
+        // The victim: a well-formed policy that must be left alone.
+        let mut victim = deny_policy();
+        victim.id = "pol-victim".to_string();
+        register_policy(&mut store, &victim).expect("register victim");
+
+        // The misfiled node: metadata says `pol-victim`, but it is filed under `pol-misfiled`.
+        let mut node = victim.to_node();
+        node.symbol = wicked_apps_core::synthetic_symbol(wicked_apps_core::POLICY, "pol-misfiled");
+        store.begin_batch().expect("begin");
+        store.upsert_nodes(&[node]).expect("upsert misfiled node");
+        store.commit_batch().expect("commit");
+
+        let err = engine::retire_policy(&mut store, "pol-misfiled")
+            .expect_err("a symbol/id mismatch must be an error, not a silent cross-write");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pol-misfiled") && msg.contains("pol-victim"),
+            "the error must name both ids so the inconsistency is diagnosable, got: {msg}"
+        );
+
+        let victim_node = store
+            .get_node(&wicked_apps_core::synthetic_symbol(
+                wicked_apps_core::POLICY,
+                "pol-victim",
+            ))
+            .expect("get victim ok")
+            .expect("victim must still be present");
+        let recovered = Policy::from_node(&victim_node).expect("victim parses");
+        assert!(
+            !recovered.retired,
+            "the policy nobody asked to retire must still be enforcing"
+        );
+    }
+
     /// A policy written before `retired` existed has no such key in its metadata bag. With
     /// `deny_unknown_fields` on the struct, the `serde(default)` is the only thing keeping those
     /// nodes readable — and they must read back as ACTIVE, which is what they were.

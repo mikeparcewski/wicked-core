@@ -88,6 +88,18 @@ pub fn retire_policy(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<boo
         return Ok(false);
     }
     let mut policy = Policy::from_node(&node)?;
+    // The write below goes through `policy.to_node()`, which recomputes the symbol from
+    // `policy.id`. If the stored metadata disagrees with the symbol it is filed under, that write
+    // lands somewhere else entirely: the policy the operator asked to retire stays live, an
+    // unrelated one is marked retired, and this still returns `true`. An error, not `Ok(false)` —
+    // `false` means "no such policy", and saying that about a policy sitting right there in the
+    // graph is the least diagnosable outcome available (review on #149).
+    if policy.id != id {
+        anyhow::bail!(
+            "policy graph is inconsistent: node at {symbol} carries id {:?}, not {id:?}",
+            policy.id
+        );
+    }
     if policy.retired {
         // Already withdrawn. Report success rather than an error: retiring twice should be safe for
         // a caller retrying a request, and the end state the caller asked for already holds.

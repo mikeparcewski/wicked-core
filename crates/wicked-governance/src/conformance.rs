@@ -255,6 +255,15 @@ pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool>
         return Ok(false);
     }
     let mut rule = ConformanceRule::from_node(&node)?;
+    // Same reasoning as [`crate::engine::retire_policy`]: the write recomputes the symbol from
+    // `rule.id`, so a node filed under a symbol that disagrees with its own metadata would retire
+    // something else and report success.
+    if rule.id != id {
+        anyhow::bail!(
+            "conformance graph is inconsistent: node at {symbol} carries id {:?}, not {id:?}",
+            rule.id
+        );
+    }
     if rule.retired {
         return Ok(true);
     }
@@ -700,6 +709,44 @@ mod tests {
         let recovered = ConformanceRule::from_node(&node).unwrap();
         assert!(recovered.retired);
         assert_eq!(recovered.statement, original.statement);
+    }
+
+    /// `retire_rule` reads by synthetic symbol but writes back through `to_node()`, which
+    /// recomputes that symbol from `rule.id`. A node whose metadata id disagrees with the symbol it
+    /// is filed under would therefore retire a DIFFERENT rule and report success — see the twin
+    /// test on `retire_policy` (review on #149).
+    #[test]
+    fn retiring_a_misfiled_rule_errors_instead_of_retiring_a_different_one() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+
+        let victim = rule(
+            "PAT-800",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            Targets::default(),
+        );
+        register_rule(&mut store, &victim).unwrap();
+
+        // Metadata says PAT-800; the node is filed under PAT-801.
+        let mut node = victim.to_node();
+        node.symbol = synthetic_symbol(CONFORMANCE_RULE, "PAT-801");
+        store.begin_batch().unwrap();
+        store.upsert_nodes(std::slice::from_ref(&node)).unwrap();
+        store.commit_batch().unwrap();
+
+        let err = retire_rule(&mut store, "PAT-801")
+            .expect_err("a symbol/id mismatch must be an error, not a silent cross-write");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("PAT-801") && msg.contains("PAT-800"),
+            "the error must name both ids so the inconsistency is diagnosable, got: {msg}"
+        );
+
+        let recalled = recall_rules(&store, &RuleQuery::default()).unwrap();
+        assert!(
+            recalled.iter().any(|r| r.id == "PAT-800"),
+            "the rule nobody asked to retire must still be recalled for enforcement"
+        );
     }
 
     /// The `serde(default)` on `retired` is the back-compat hinge: rules registered before the
