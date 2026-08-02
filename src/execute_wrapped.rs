@@ -142,14 +142,21 @@ impl OutputAdapter for ClaudeStreamJson {
                 // `usage` must leave `usage = None` so NO `CliUsage` row is emitted for the unit — never
                 // a fabricated "$0.00, 0 tokens" total.
                 if let Some(usage) = v.get("usage") {
-                    let input_tokens = usage
-                        .get("input_tokens")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    let output_tokens = usage
-                        .get("output_tokens")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
+                    let field = |k: &str| usage.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+                    // Input is fresh + cached, matching `acp_runner::parse_result_usage` — same
+                    // `Usage` struct, same `CliUsage.inputTokens` on the wire, same column in the
+                    // studio, so the two paths have to mean the same thing by it (FINDING-058).
+                    //
+                    // `usage.input_tokens` alone is the NON-CACHED input only; on any real coding
+                    // turn the cache fields are the overwhelming majority of the context actually
+                    // presented to the model. Counting only the fresh part understated the wrapped
+                    // path by orders of magnitude while `total_cost_usd` — which does bill the
+                    // cache — stayed correct, so a run showed a plausible dollar figure beside a
+                    // token count too small to explain it, and the pair invited belief in both.
+                    let input_tokens = field("input_tokens")
+                        .saturating_add(field("cache_read_input_tokens"))
+                        .saturating_add(field("cache_creation_input_tokens"));
+                    let output_tokens = field("output_tokens");
                     let cost_usd = v.get("total_cost_usd").and_then(|c| c.as_f64());
                     out.usage = Some(Usage {
                         input_tokens,
@@ -1651,16 +1658,49 @@ mod tests {
             "only assistant text blocks become readable deltas"
         );
         // Usage from the terminal result: tokens + cost DIRECTLY from claude (no price table needed).
+        // Input is fresh + cache-creation + cache-read = 25789 + 26103 + 34098. This test used to
+        // assert the fresh 25789 alone while the fixture carried all three all along — 70% of the
+        // context the model was actually given, and the part `total_cost_usd` bills for, was read
+        // past (FINDING-058).
         assert_eq!(
             out.usage,
             Some(Usage {
-                input_tokens: 25789,
+                input_tokens: 85_990,
                 output_tokens: 83,
                 cost_usd: Some(0.409099),
             })
         );
         // Files from the tool_use `input.file_path`.
         assert_eq!(out.files, vec!["/tmp/wc-probe.txt".to_string()]);
+    }
+
+    #[test]
+    fn claude_input_tokens_agree_with_the_acp_paths_definition() {
+        // The two execution paths feed one `Usage` struct, one `CliUsage.inputTokens` on the wire,
+        // and one column in the studio, so "input tokens" has to mean the same thing on both.
+        // `acp_runner::parse_result_usage` sums fresh + cached reads/writes and says so in its doc;
+        // this path must match, or a run's totals are not comparable across its own seats.
+        let mut adapter = ClaudeStreamJson::default();
+        let out = drive(
+            &mut adapter,
+            &[
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":2,"cache_read_input_tokens":15273,"cache_creation_input_tokens":18195,"output_tokens":4}}"#,
+            ],
+        );
+        let u = out.usage.expect("usage");
+        assert_eq!(u.input_tokens, 2 + 15273 + 18195);
+        assert_eq!(u.output_tokens, 4);
+
+        // Absent cache fields are simply zero — an older CLI, or a turn with no cache, still
+        // reports its fresh input rather than degrading to nothing.
+        let mut adapter = ClaudeStreamJson::default();
+        let out = drive(
+            &mut adapter,
+            &[
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","usage":{"input_tokens":7,"output_tokens":1}}"#,
+            ],
+        );
+        assert_eq!(out.usage.expect("usage").input_tokens, 7);
     }
 
     #[test]
