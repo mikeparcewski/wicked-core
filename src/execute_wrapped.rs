@@ -13,7 +13,7 @@
 //! deadlock (the bug the P2 review flagged for this phase). The run is bounded by a timeout.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -191,6 +191,245 @@ pub(crate) fn binary_is_claude(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Set to any value to let workers run under the operator's own CLI configuration again.
+///
+/// The escape hatch for the one legitimate case: an operator deliberately testing their own hooks
+/// or skills through a run. It is opt-IN because the safe default has to be the one you get by not
+/// knowing this exists.
+pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPERATOR_CONFIG";
+
+/// Directories a worker has no business reading: the operator's agent-tooling state and their
+/// credentials. Relative to `$HOME` (or `$USERPROFILE` on Windows).
+///
+/// `.claude` is listed even though `$CLAUDE_CONFIG_DIR` usually supersedes it — both are denied,
+/// because which one is live depends on the daemon's environment and a boundary that depends on
+/// environment is not a boundary.
+const DENIED_HOME_SUBDIRS: &[&str] = &[
+    ".claude",           // operator CLAUDE.md, hooks, memory, plugins, transcripts
+    ".wicked",           // this engine's own run state, decisions logs, settings files
+    ".wicked-brain",     // an index of a DIFFERENT repo than the one under test
+    ".something-wicked", // ecosystem app state (event outbox, app dbs)
+    ".config/wicked-core",
+    ".config/wicked-council",
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config/gcloud",
+];
+
+/// Bash verbs that leave the worktree by construction, so no path rule can catch them.
+///
+/// `find /` and `pkill` are not hypotheticals: transcript forensics caught two whole-filesystem
+/// scans and one `pkill` from campaign workers (FINDING-045).
+const DENIED_BASH: &[&str] = &[
+    "Bash(sudo:*)",
+    "Bash(pkill:*)",
+    "Bash(killall:*)",
+    "Bash(find /:*)",
+    "Bash(shutdown:*)",
+    "Bash(reboot:*)",
+];
+
+/// Keep a worker session out of the operator's own machine state.
+///
+/// Two separate leaks, one seam (FINDING-047 + FINDING-045):
+///
+///  1. **Config inheritance.** A worker loaded the operator's user-scope settings — their hooks,
+///     their permission defaults, their plugins. Observed consequences: 8 blocked writes from an
+///     operator memory hook, 4 skill calls into a brain indexed on an unrelated repo, and 2 writes
+///     refused because the operator's settings put the session in `dontAsk`. A run whose behaviour
+///     depends on whose laptop it is on is not reproducible. `--setting-sources project,local`
+///     drops user scope while leaving auth and the repo's own settings alone.
+///
+///  2. **No filesystem boundary.** 41 of 331 path-bearing tool calls left the worktree.
+///     `--disallowedTools` denies the file tools a path into the directories above.
+///
+/// LIMITS, stated plainly: this is a deny-list, not a sandbox. `Read(...)` rules govern the file
+/// TOOLS — a `Bash(cat …)` of a denied path still gets through, and `DENIED_BASH` only names verbs
+/// that are unsalvageable rather than every command that could escape. The rules are also inert
+/// under `bypassPermissions` / `--dangerously-skip-permissions`, which is why the mode is pinned
+/// below; note the council's seat dispatch DOES pass that trust flag ([`wicked_council::dispatch`]),
+/// so seat votes are outside this boundary. The real boundary belongs in the PreToolUse gate-hook,
+/// which already sees every call and can reject on the resolved path; this closes the observed leaks
+/// in the meantime and does not pretend to close the class.
+///
+/// The engine's own governance is unaffected: the gate-hook rides a wicked-written `--settings`
+/// file ([`arm_input_governance`]), which is a separate source from the three scopes named here.
+pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>, invocation: &str) {
+    if std::env::var_os(INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+        return;
+    }
+    // Deference is decided against the TEMPLATE, not against the built argv. The argv also holds
+    // the prompt, which is workflow- and model-authored, and `build_argv` may place it as a bare
+    // token (`-p {PROMPT}` puts it before any `--` guard). Scanning the argv therefore let a prompt
+    // whose text began `--setting-sources=…` read as "the operator already pinned this" and suppress
+    // the whole injection — untrusted text switching off a boundary. The template is the only place
+    // an operator's intent is actually expressed, and `{PROMPT}` tokenizes to the literal
+    // placeholder, so prompt content cannot appear here at all.
+    let stated = tokenize(invocation);
+    let mut flags: Vec<String> = Vec::new();
+    // An operator template that already pins its own scopes wins — the same deference
+    // `inject_claude_stream_flags` shows `--output-format`.
+    if !argv_states(&stated, &["--setting-sources"]) {
+        flags.push("--setting-sources".into());
+        flags.push("project,local".into());
+    }
+    // Dropping user scope also drops whatever permission mode lived there, and a `-p` session with
+    // no mode denies its own Write calls — verified: the same probe that wrote `probe.txt` under
+    // `acceptEdits` got "Claude requested permissions to write to …" with the mode left unset. So
+    // the mode has to be stated, not inherited.
+    //
+    // `acceptEdits` and not `bypassPermissions`/`auto`: both of those make the deny rules below
+    // inert. Measured on the live CLI with an identical probe — under `acceptEdits` the read of the
+    // operator's config was refused by the rule, under `auto` it went straight through, and under
+    // `--dangerously-skip-permissions` likewise. `acceptEdits` is the only mode where a worker can
+    // do its job AND stay inside the boundary.
+    if !argv_states(&stated, &["--permission-mode"]) {
+        flags.push("--permission-mode".into());
+        flags.push("acceptEdits".into());
+    }
+    if !argv_states(&stated, &["--disallowedTools", "--disallowed-tools"]) {
+        let rules = deny_rules();
+        if !rules.is_empty() {
+            flags.push("--disallowedTools".into());
+            // Comma-joined into a SINGLE argv entry rather than spread across several: the flag is
+            // variadic, and a bare sequence of values invites a parser to keep swallowing until the
+            // next `-`-prefixed token — which is exactly where `--settings` lands.
+            flags.push(rules.join(","));
+        }
+    }
+    if flags.is_empty() {
+        return;
+    }
+    match argv.iter().position(|a| a == "--") {
+        Some(i) => {
+            for (k, f) in flags.into_iter().enumerate() {
+                argv.insert(i + k, f);
+            }
+        }
+        None => argv.extend(flags),
+    }
+}
+
+/// Does `argv` already state any of `names`, in EITHER accepted spelling — `--flag value` or
+/// `--flag=value`?
+///
+/// Exists so the three guards in [`inject_isolation_flags`] cannot drift apart. Written out inline,
+/// they did: the first two checked both forms and the third checked only the separate-token one, so
+/// a template using `--disallowedTools=…` would have had a second copy injected next to it. One
+/// helper makes "both forms, every flag" true by construction instead of by three-way vigilance.
+///
+/// `names` is a slice because some flags have more than one accepted spelling (`--disallowedTools`
+/// and `--disallowed-tools` are the same flag); a template using either one must suppress injection.
+fn argv_states(argv: &[String], names: &[&str]) -> bool {
+    argv.iter().any(|a| {
+        names
+            .iter()
+            .any(|n| a == n || (a.starts_with(n) && a.as_bytes().get(n.len()) == Some(&b'=')))
+    })
+}
+
+/// How `dir` is spelled inside a permission rule, or `None` when it has no faithful spelling.
+///
+/// Two different problems, and only the first is about Windows:
+///
+///  - **Separators.** A Windows path is `C:\Users\me\.claude`, and in the rule's glob syntax a
+///    backslash is the ESCAPE character, not a separator. Left alone, `Read(C:\Users\me\.claude/**)`
+///    unescapes to `C:Usersme.claude/**` and matches nothing — the fence would be listed in the
+///    settings file, look present to anyone reading it, and deny NOTHING at runtime. So on a
+///    backslash-separator OS the separators are rewritten to `/`, which the matcher accepts
+///    everywhere. The rewrite is conditioned on the OS separator because on POSIX a backslash is a
+///    legal filename byte: rewriting it there would fence off a DIFFERENT directory than the one
+///    asked for, which is the same silent-hole failure in the other direction.
+///  - **Characters with no literal spelling.** After that rewrite, a surviving backslash (POSIX only,
+///    by the above) or a comma — the character `--disallowedTools` joins its list on — still cannot be
+///    written into a rule. Refused rather than mangled, so the caller can warn.
+///
+/// Glob metacharacters (`*`, `?`, `[`) are deliberately NOT refused. A directory named `a*b` yields a
+/// rule that denies MORE than intended, and on a DENY list erring wide is the safe direction; refusing
+/// it would instead open the exact hole this function exists to close.
+fn rule_path(dir: &Path) -> Option<String> {
+    rule_path_sep(dir.to_str()?, std::path::MAIN_SEPARATOR)
+}
+
+/// [`rule_path`] with the OS separator injected, so the Windows behaviour is testable from any host.
+/// A `#[cfg(windows)]` test would only ever run on one of the three CI platforms, which is exactly
+/// how a separator bug survives review in the first place.
+fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
+    let p = if os_sep == '\\' {
+        p.replace('\\', "/")
+    } else {
+        p.to_string()
+    };
+    (!p.contains('\\') && !p.contains(',')).then_some(p)
+}
+
+/// The deny rules, in Claude's permission-rule syntax. Used two ways: comma-joined as the
+/// `--disallowedTools` value on the wrapped-CLI path, and as `permissions.deny` inside the settings
+/// file both the wrapped and ACP paths write (the ACP bridge forwards settings but has its own flag
+/// surface, so the file is the only carrier that reaches both).
+///
+/// Nothing is ever dropped silently. Two things can go wrong, and each degrades to the largest
+/// boundary still expressible rather than to none:
+///
+///  - **No home directory resolves** (HOME and USERPROFILE both unset — plausible for a daemon under
+///    launchd/systemd). Only the PATH rules need a home; [`DENIED_BASH`] does not. Returning nothing
+///    here would have taken `Bash(sudo:*)` and `Bash(find /:*)` down with the path rules, silently,
+///    in exactly the unattended environment where that matters most. So the path rules are skipped
+///    with a warning and the verb rules still ship.
+///  - **An individual directory cannot be expressed** — see [`rule_path`]. Skipped with a warning; the
+///    remaining rules still ship. Dropping the other dozen because one path is unrepresentable would
+///    trade a small hole for a total one.
+///
+/// This is documented as a deny-list rather than a sandbox (see [`inject_isolation_flags`]), so a
+/// partial list is a real if reduced boundary. What must never happen is a gap being SILENT — an
+/// operator who reads "the worker is fenced off from `~/.ssh`" needs to hear when it isn't.
+///
+/// The return is a plain `Vec` because it can never be empty: `DENIED_BASH` is unconditional.
+///
+/// The rule strings themselves are built by [`rule_path`], which is where the platform difference
+/// lives.
+pub(crate) fn deny_rules() -> Vec<String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    if home.is_none() {
+        eprintln!(
+            "wicked-core: neither HOME nor USERPROFILE is set, so worker isolation cannot build \
+             the path deny rules; operator config, credentials and brain state are NOT fenced off \
+             from workers (the Bash verb rules still apply)"
+        );
+    }
+    let mut rules: Vec<String> = Vec::new();
+    // `$CLAUDE_CONFIG_DIR` first: when the daemon inherits one it is the live config dir, and it is
+    // frequently NOT `~/.claude` (that redirection is how the operator's own tooling stays separate).
+    // It is also home-independent, so it still contributes when no home resolves.
+    let dirs = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(
+            home.iter()
+                .flat_map(|h| DENIED_HOME_SUBDIRS.iter().map(|d| h.join(d))),
+        );
+    for dir in dirs {
+        // Skip what cannot be spelled, but SAY SO — see the doc comment: the hole is acceptable,
+        // hiding it is not.
+        let Some(p) = rule_path(&dir) else {
+            eprintln!(
+                "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8, or it \
+                 contains a backslash or a comma); this path is NOT fenced off from workers",
+                dir.display()
+            );
+            continue;
+        };
+        for tool in ["Read", "Edit", "Write"] {
+            rules.push(format!("{tool}({p}/**)"));
+        }
+    }
+    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules
+}
+
 /// Append claude's `--output-format stream-json --verbose` flags to an already-built argv, INSERTED
 /// before any `--` end-of-options guard so they are parsed as flags (never demoted to positional args
 /// after the prompt). Per-binary rule — only applied when the resolved binary is `claude`; no other
@@ -301,6 +540,10 @@ impl WrappedCliStepRunner {
         let is_claude = argv.first().map(|a| binary_is_claude(a)).unwrap_or(false);
         if is_claude {
             inject_claude_stream_flags(&mut argv);
+            // Before governance arms: isolation applies to EVERY claude unit, governed or not. An
+            // ungoverned unit reading the operator's config is the same defect as a governed one
+            // doing it (FINDING-047/045).
+            inject_isolation_flags(&mut argv, &invocation);
         }
 
         // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
@@ -584,6 +827,10 @@ fn arm_input_governance(
                 { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
             ]
         },
+        // The same boundary `inject_isolation_flags` puts on argv, restated in the file. Belt and
+        // braces on purpose: the flag is the one that survives if this file fails to arm, and the
+        // file is the one that survives an operator template that pins its own `--disallowedTools`.
+        "permissions": { "deny": deny_rules() },
         "mcpServers": {
             "wicked-estate": {
                 "command": estate_mcp_exe,
@@ -1359,6 +1606,302 @@ mod tests {
                 "--",
                 "hi"
             ]
+        );
+    }
+
+    /// Serializes the test that unsets HOME against the tests whose assertions depend on it.
+    ///
+    /// Environment variables are process-global and cargo runs this module's tests on many threads,
+    /// so an unsynchronized `remove_var("HOME")` would intermittently strip the path rules out from
+    /// under a concurrent reader — a flake that reads exactly like a real isolation defect. Every
+    /// test that asserts on a HOME-DERIVED rule must take this lock; the ones that only assert which
+    /// flags got injected do not, because `DENIED_BASH` is unconditional and so the deny flag is
+    /// present either way. Poison-tolerant on purpose: one panicking test must not cascade.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Read the value that follows `flag` in an argv.
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = argv.iter().position(|a| a == flag)?;
+        argv.get(i + 1).map(String::as_str)
+    }
+
+    /// Does `argv` carry `flag` IMMEDIATELY followed by `value`, anywhere?
+    ///
+    /// [`flag_value`] reads the first token matching `flag`, which is the wrong answer when the
+    /// PROMPT is itself that string: the prompt lands in argv as an ordinary token, so the first
+    /// match is the prompt and the "value" read back is the injected flag name. That is a property
+    /// of the assertion, not of the injection — this pair form asks the question the hostile-prompt
+    /// test actually means.
+    fn states_pair(argv: &[String], flag: &str, value: &str) -> bool {
+        argv.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    /// FINDING-047: a worker that loads the operator's user-scope settings inherits their hooks,
+    /// their permission defaults, and their plugins — and behaves differently because of it. The
+    /// run stops being a property of the repo and becomes a property of the laptop.
+    #[test]
+    fn isolation_drops_user_scope_settings_and_lands_before_the_guard() {
+        let inv = "claude {PROMPT}";
+        let mut argv = build_argv(inv, "hi", &[]);
+        inject_isolation_flags(&mut argv, inv);
+
+        assert_eq!(
+            flag_value(&argv, "--setting-sources"),
+            Some("project,local"),
+            "project and local scope stay; the operator's user scope does not"
+        );
+        let guard = argv.iter().position(|a| a == "--").expect("the -- guard");
+        let flag = argv
+            .iter()
+            .position(|a| a == "--setting-sources")
+            .expect("the flag");
+        assert!(
+            flag < guard,
+            "past the guard it would be read as prompt text, not as a flag: {argv:?}"
+        );
+    }
+
+    /// FINDING-045: 41 of 331 path-bearing tool calls left the worktree — into the operator's
+    /// brain index, their CLI config, and twice into whole-filesystem scans.
+    #[test]
+    fn isolation_denies_the_operator_state_the_campaign_saw_workers_reach_into() {
+        // Asserts on HOME-derived rules, so it must not run while the no-home test has HOME unset.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let inv = "claude -p {PROMPT}";
+        let mut argv = build_argv(inv, "hi", &[]);
+        inject_isolation_flags(&mut argv, inv);
+
+        let denied = flag_value(&argv, "--disallowedTools").expect("a deny list");
+        // One argv entry, not several: `--disallowedTools` is variadic, and a bare sequence of
+        // values would keep swallowing tokens up to the next flag.
+        assert!(
+            denied.contains(','),
+            "the rules ride one comma-joined value: {denied}"
+        );
+        for dir in [".wicked-brain", ".claude", ".ssh"] {
+            assert!(
+                denied.contains(&format!("{dir}/**)")),
+                "{dir} must be denied to the file tools: {denied}"
+            );
+        }
+        assert!(
+            denied.contains("Bash(find /:*)") && denied.contains("Bash(pkill:*)"),
+            "the two verbs no path rule can catch, both observed in campaign transcripts: {denied}"
+        );
+    }
+
+    /// A Windows path must reach the rule as a path, not as a string of escapes.
+    ///
+    /// `C:\Users\me\.claude` written into a glob rule verbatim unescapes to `C:Usersme.claude`, so
+    /// the rule matches nothing and the fence is gone — while still LISTED in the settings file,
+    /// which is the worst version: an operator reading it sees `.claude` denied, and it is not. The
+    /// separator is injected rather than `#[cfg(windows)]`-gated so this runs on all three CI
+    /// platforms; a Windows-only test is precisely how a separator bug survives review.
+    #[test]
+    fn a_windows_path_is_spelled_with_separators_the_matcher_understands() {
+        let got =
+            rule_path_sep(r"C:\Users\me\.claude", '\\').expect("a Windows path is expressible");
+        assert_eq!(got, "C:/Users/me/.claude");
+        assert!(
+            !got.contains('\\'),
+            "a surviving backslash is an escape, not a separator: {got}"
+        );
+
+        // The same bytes on POSIX are a filename containing backslashes, NOT separators. Rewriting
+        // them would fence off a different directory than the one asked for, so this is refused (and
+        // the caller warns) rather than silently mangled.
+        assert_eq!(
+            rule_path_sep(r"/home/me/we\ird", '/'),
+            None,
+            "a POSIX path with a literal backslash has no faithful rule spelling"
+        );
+        // Unchanged on POSIX, and the comma refusal survives the rewrite on both.
+        assert_eq!(
+            rule_path_sep("/home/me/.ssh", '/').as_deref(),
+            Some("/home/me/.ssh")
+        );
+        assert_eq!(rule_path_sep("/home/a,b/.ssh", '/'), None);
+        assert_eq!(rule_path_sep(r"C:\Users\a,b", '\\'), None);
+    }
+
+    /// Dropping user scope drops the permission mode that lived there, and a `-p` session with no
+    /// mode denies its own Write calls. Verified against the live CLI: same probe, mode unset ⇒
+    /// "Claude requested permissions to write to …" and no file; mode `acceptEdits` ⇒ file written.
+    /// The mode must be stated or the isolation fix breaks every unit that writes anything.
+    #[test]
+    fn isolation_states_a_permission_mode_that_still_honours_the_deny_rules() {
+        let inv = "claude -p {PROMPT}";
+        let mut argv = build_argv(inv, "hi", &[]);
+        inject_isolation_flags(&mut argv, inv);
+        assert_eq!(
+            flag_value(&argv, "--permission-mode"),
+            Some("acceptEdits"),
+            "`auto` and `bypassPermissions` both make --disallowedTools inert (measured); \
+             acceptEdits is the only mode that lets a worker write AND stay inside the boundary"
+        );
+    }
+
+    /// An operator template that pins its own scopes or deny list is making a deliberate choice.
+    /// Injecting a second copy of either flag is how you get a CLI that refuses to start.
+    #[test]
+    fn isolation_defers_to_a_template_that_already_pins_these_flags() {
+        let inv =
+            "claude --setting-sources user --permission-mode plan --disallowedTools Edit -p {PROMPT}";
+        let mut argv = build_argv(inv, "hi", &[]);
+        let before = argv.clone();
+        inject_isolation_flags(&mut argv, inv);
+        assert_eq!(argv, before, "nothing injected over an explicit choice");
+        assert_eq!(argv.iter().filter(|a| *a == "--setting-sources").count(), 1);
+    }
+
+    /// The `--flag=value` form defers exactly like the `--flag value` form, for EVERY flag and both
+    /// spellings of the deny flag.
+    ///
+    /// This is a regression test with a known origin: the three guards were written out inline and
+    /// the `--disallowedTools` one checked only the separate-token form, so a template written as
+    /// `--disallowedTools=Edit` got a SECOND `--disallowedTools` injected beside it. Table-driven so
+    /// a flag added later without an `argv_states` guard shows up here as a failure rather than as a
+    /// duplicated flag in a live worker's argv.
+    #[test]
+    fn isolation_defers_to_the_equals_form_of_every_flag_it_would_inject() {
+        for stated in [
+            "--setting-sources=user",
+            "--permission-mode=plan",
+            "--disallowedTools=Edit",
+            "--disallowed-tools=Edit",
+        ] {
+            let inv = format!("claude {stated} -p {{PROMPT}}");
+            let mut argv = build_argv(&inv, "hi", &[]);
+            inject_isolation_flags(&mut argv, &inv);
+            let flag = stated.split('=').next().unwrap();
+            assert!(
+                !argv.iter().any(|a| a == flag),
+                "`{stated}` already states this flag, but a separate `{flag}` was injected \
+                 alongside it: {argv:?}"
+            );
+        }
+    }
+
+    /// `argv_states` must key off the whole flag name, not a prefix of it. `--permission-mode-foo`
+    /// and `--setting-sourcesX` are different flags; treating them as a match would silently
+    /// suppress the isolation this whole module exists to apply.
+    #[test]
+    fn a_longer_flag_that_merely_starts_the_same_is_not_a_match() {
+        assert!(argv_states(
+            &["--permission-mode=plan".to_string()],
+            &["--permission-mode"]
+        ));
+        assert!(argv_states(
+            &["--permission-mode".to_string()],
+            &["--permission-mode"]
+        ));
+        assert!(!argv_states(
+            &["--permission-mode-extra".to_string()],
+            &["--permission-mode"]
+        ));
+        assert!(!argv_states(
+            &["--permission-modes".to_string()],
+            &["--permission-mode"]
+        ));
+    }
+
+    /// The deny list is a `--disallowedTools` value AND a `permissions.deny` array in the settings
+    /// file. A rule carrying a comma would split into two malformed rules in the first of those, so
+    /// no rule may contain one.
+    #[test]
+    fn no_deny_rule_contains_the_character_that_joins_them() {
+        let rules = deny_rules();
+        assert!(!rules.is_empty());
+        for r in &rules {
+            assert!(!r.contains(','), "rule would split when joined: {r}");
+        }
+    }
+
+    /// A PROMPT that looks like a flag must not switch the boundary off.
+    ///
+    /// Deference used to be decided by scanning the built argv — which contains the prompt. Prompt
+    /// text is workflow- and model-authored, and `build_argv` places it as a bare token when the
+    /// template ends in a value-taking flag (`-p {PROMPT}` puts it BEFORE any `--` guard), so a
+    /// prompt reading exactly `--setting-sources=user` was indistinguishable from an operator
+    /// pinning that flag: the injection was suppressed and the worker ran with the operator's
+    /// config, their deny rules absent, on untrusted text alone. Deference now reads the template,
+    /// where `{PROMPT}` is a literal placeholder and prompt content cannot appear.
+    #[test]
+    fn a_prompt_that_looks_like_a_flag_cannot_suppress_the_isolation() {
+        for hostile in [
+            "--setting-sources=user",
+            "--setting-sources",
+            "--permission-mode=bypassPermissions",
+            "--disallowedTools=",
+            "--disallowed-tools=nothing",
+        ] {
+            // `-p {PROMPT}` on purpose: that is the shape that leaves the prompt un-guarded.
+            let inv = "claude -p {PROMPT}";
+            let mut argv = build_argv(inv, hostile, &[]);
+            inject_isolation_flags(&mut argv, inv);
+            assert!(
+                states_pair(&argv, "--setting-sources", "project,local"),
+                "prompt `{hostile}` suppressed the scope isolation: {argv:?}"
+            );
+            assert!(
+                states_pair(&argv, "--permission-mode", "acceptEdits"),
+                "prompt `{hostile}` suppressed the permission mode: {argv:?}"
+            );
+            assert!(
+                argv.windows(2)
+                    .any(|w| w[0] == "--disallowedTools" && w[1].contains("Bash(sudo:*)")),
+                "prompt `{hostile}` suppressed the deny rules: {argv:?}"
+            );
+            // The prompt is still handed to the CLI verbatim — this hardens the boundary without
+            // rewriting what the worker is asked to do. Scoped claim: verbatim IN ARGV. A prompt
+            // that opens with `--` may still be read as a flag by the CLI's own parser, because
+            // `build_argv` omits the `--` guard when the template ends in a bare flag (`-p
+            // {PROMPT}`). That is a pre-existing argv-construction question and a correctness one;
+            // what this test pins is that it is no longer a SECURITY one.
+            assert!(
+                argv.iter().any(|a| a == hostile),
+                "the prompt must still reach the worker: {argv:?}"
+            );
+        }
+    }
+
+    /// Losing the home directory must not take the home-INDEPENDENT rules with it.
+    ///
+    /// `deny_rules` used to return `None` when neither HOME nor USERPROFILE resolved, which dropped
+    /// `Bash(sudo:*)` / `Bash(find /:*)` / `Bash(pkill:*)` as collateral — none of which need a home
+    /// path — and did it silently, in precisely the unattended daemon environment (launchd, systemd)
+    /// where an unset HOME is plausible and nobody is watching.
+    ///
+    /// Serialized against the other env-mutating tests in this module via [`ENV_LOCK`]; the vars are
+    /// restored before the assertions run so a failure cannot leave the process without a home.
+    #[test]
+    fn no_home_still_denies_the_verbs_that_never_needed_one() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+        let rules = deny_rules();
+        for (k, v) in saved {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+
+        for verb in DENIED_BASH {
+            assert!(
+                rules.iter().any(|r| r == verb),
+                "`{verb}` needs no home directory and must survive one going missing: {rules:?}"
+            );
+        }
+        assert!(
+            !rules.iter().any(|r| r.starts_with("Read(")),
+            "with no home there is no path to fence, and a rule claiming otherwise would be a lie: {rules:?}"
         );
     }
 }
