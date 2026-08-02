@@ -434,13 +434,18 @@ impl PhaseDef {
     }
     /// Pin the shipped deterministic evidence floor onto this phase (FINDING-025 item 1). Engages
     /// gate layers 1 AND 2 — layer 2 (the agent judge) is keyed off the same `Option` layer 1 is,
-    /// so a phase with no pin has neither. Paired with `.role(PhaseRole::Evaluator)` on every
-    /// built-in; `builtin_floors::tests::every_builtin_evaluator_phase_carries_the_floor` asserts
-    /// the pairing so a future Evaluator phase cannot ship ungated.
+    /// so a phase with no pin has neither.
     ///
-    /// Safe to embed as data because the actor seeds the pin into the vault on every store open
-    /// (`builtin_floors::seed_builtin_floors`), before any run can plan — `attach_pinned_validators`
-    /// is fail-closed on an unresolvable pin.
+    /// `builtin_floors::tests::the_floor_is_pinned_exactly_where_a_diff_is_the_evidence` asserts
+    /// the placement in BOTH directions — which phases carry the floor and which must not — so
+    /// neither a new Evaluator shipping ungated nor the floor spreading to a phase that writes no
+    /// code can land silently.
+    ///
+    /// Safe to embed as data because `pipeline::plan_and_distribute` seeds the pin into the vault
+    /// immediately before `attach_pinned_validators` reads it (`builtin_floors::seed_builtin_floors`,
+    /// idempotent and content-addressed). The seed is on the PLAN path, not just at actor boot,
+    /// because `attach_pinned_validators` is fail-closed on an unresolvable pin and `run_session` is
+    /// a public entry point that never constructs an actor.
     fn evidence_floor(mut self) -> Self {
         self.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
         self

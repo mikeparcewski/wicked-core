@@ -112,11 +112,19 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         Some(approved_pin.as_str()),
         "the build phase carries the approved pin — the gate is armed"
     );
-    // Every OTHER phase kept exactly the pin the base def gave it — `gate-phase` adds one pin, it
-    // does not disturb the rest. Compared against the base rather than against `None`, because the
-    // built-ins are no longer uniformly unpinned: `feature`'s `adversarial-review` ships the
-    // evidence floor (FINDING-025 item 1). Asserting `None` here would have quietly turned this
-    // into "gate-phase must be the only source of pins", which was never the property under test.
+    // `gate-phase` adds ONE pin and disturbs nothing else. Two assertions, in order, because the
+    // second is only meaningful given the first: `zip` stops at the shorter side, so a produced def
+    // that dropped, added, or reordered phases would slip through a pin-only comparison — the loop
+    // would simply compare fewer pairs, or the right pins against the wrong phases, and still pass.
+    assert_eq!(
+        resolved.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
+        base.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
+        "gate-phase must reproduce the base phase list exactly — same phases, same order"
+    );
+    // Compared against the base rather than against `None`, because the built-ins are no longer
+    // uniformly unpinned: `feature`'s `adversarial-review` ships the evidence floor (FINDING-025
+    // item 1). Asserting `None` here would have quietly turned this into "gate-phase must be the
+    // only source of pins", which was never the property under test.
     for (got, want) in resolved
         .phases
         .iter()

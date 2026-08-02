@@ -346,6 +346,20 @@ pub(crate) fn pre_distribute(
     }
 
     if let Some(def) = &selected_def {
+        // The built-in floors are seeded HERE, at the plan, and not only at actor boot.
+        //
+        // `attach_pinned_validators` is fail-closed on a pin that is not in the vault, and the
+        // shipped `feature`/`bug`/`migration` defs now pin the evidence floor. Seeding only at boot
+        // made that correct for the daemon and BROKEN for everyone else: `run_session` is public and
+        // takes a store directly, so an embedder — or the engine's own `pipeline` test — opened a
+        // fresh store, planned a SHIPPED workflow, and got a hard bail naming a pin they never
+        // wrote. A built-in floor that depends on which entry point you came through is not a floor.
+        //
+        // This is the one choke point both paths cross (actor launch and `run_session`), the writes
+        // are content-addressed upserts, and the pin is a compile-time constant — so it is idempotent
+        // and costs two `put_node`s per plan. The boot-time seed stays as the loud early warning and
+        // to make the floor visible in the vault before a first run; this is the invariant.
+        crate::builtin_floors::seed_builtin_floors(store)?;
         attach_pinned_validators(store, &mut units, def)?;
         // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
     }
@@ -1099,6 +1113,51 @@ mod resolve_tests {
             units[0].validator.as_ref(),
             Some(&approved),
             "the phase's approved validator is loaded from the vault and pinned onto the unit — the gate ENGAGES"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SHIPPED workflow must plan against a store nobody seeded.
+    ///
+    /// Regression, and a sharp one: the evidence floor was seeded at actor boot only, so the daemon
+    /// worked and every other caller broke. `run_session` is public and takes a store directly — an
+    /// embedder opening a fresh store and asking for the shipped `feature` workflow got a fail-closed
+    /// bail naming a pin they had never heard of. The test above uses a HAND-BUILT def and vaults its
+    /// validator by hand, which is precisely why it did not catch this; this one uses the real
+    /// registry def and seeds only what the plan path seeds.
+    #[test]
+    fn a_shipped_def_plans_against_a_store_nobody_seeded() {
+        use wicked_apps_core::open_store;
+        let dir = std::env::temp_dir().join(format!("wicked-unseeded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let def = registry.get("feature").expect("the shipped feature def");
+        assert!(
+            def.phases.iter().any(|p| p.validator_pin.is_some()),
+            "this test is only meaningful while a shipped def pins a floor"
+        );
+
+        // The two lines `plan_and_distribute` runs, in order. The seed is what makes the attach
+        // resolve; drop it and this is the exact bail CI caught.
+        let mut units = crate::plan::plan_from_def(def, "do it", "s");
+        crate::builtin_floors::seed_builtin_floors(&mut store).unwrap();
+        attach_pinned_validators(&store, &mut units, def)
+            .expect("a shipped def must never bail on its own built-in floor");
+
+        let gated = units
+            .iter()
+            .filter(|u| u.validator.as_ref().is_some_and(|v| v.approved))
+            .count();
+        assert_eq!(
+            gated,
+            def.phases
+                .iter()
+                .filter(|p| p.validator_pin.is_some())
+                .count(),
+            "every pinned phase came back with an APPROVED validator attached"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

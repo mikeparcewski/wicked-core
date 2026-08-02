@@ -180,16 +180,19 @@ pub(crate) fn run(
     // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
     GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
 
-    // Seed the deterministic floor the built-in Evaluator phases pin (FINDING-025 item 1). This is
-    // load-bearing and it is why it sits HERE: `pipeline::attach_pinned_validators` is fail-closed on
-    // a pin the vault does not hold, so a built-in that ships a pin only runs if the seed has already
-    // happened. This is the single-writer thread and no command has been served yet, so "before any
-    // run can plan" is structural rather than a matter of timing. Idempotent (content-addressed), so
-    // re-seeding on every launch rewrites the same nodes.
+    // Seed the deterministic floor the built-in Evaluator phases pin (FINDING-025 item 1).
     //
-    // NOT best-effort, unlike the memory/knowledge sidecars below: a failure here would leave every
-    // `feature`/`bug`/`migration` run bailing at plan time with an unresolvable pin, so it is louder
-    // than the pin error the operator would otherwise be left to decode.
+    // This copy is an EARLY WARNING, not the guarantee. The guarantee lives on the plan path
+    // (`pipeline::plan_and_distribute` seeds immediately before `attach_pinned_validators`), because
+    // that is the one choke point every caller crosses — including `run_session`, which is public and
+    // never constructs an actor. Seeding only here is exactly the bug that shipped in the first cut:
+    // correct for the daemon, a hard bail for everyone else.
+    //
+    // What this call buys, at boot rather than at first run: the floor is visible to an operator
+    // listing the vault, and a store that cannot hold it says so once, here, in terms naming the
+    // cause — instead of surfacing later as an unresolvable-pin error they have to decode. So it is
+    // best-effort in the same sense as the sidecars below, and for the same reason: a failure must
+    // not stop the engine coming up, and the plan path will try again and fail loudly if it must.
     if let Err(e) = crate::builtin_floors::seed_builtin_floors(&mut store) {
         eprintln!(
             "wicked-core: could not seed the built-in evidence floor ({e}); runs of the built-in \

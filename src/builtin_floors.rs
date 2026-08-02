@@ -64,9 +64,11 @@ pub const EVIDENCE_CRITERION: &str =
 /// 128 and write its error to STDERR, so `grep` sees empty stdin and the script exits non-zero — a
 /// DENY, consistent with the module-level rule that "can't re-verify" is treated as NOT-passed.
 ///
-/// Built only from `git`/`grep`/`|` so it passes the [`looks_dangerous`](crate::validator) denylist:
-/// no redirection, no `$(`/backtick substitution, no destructive or network token. A single `|` is
-/// permitted (only `>` is denied) — the pipe is what avoids needing command substitution here.
+/// Built only from `git`/`grep`/`|` so it passes the [`looks_dangerous`](crate::validator) denylist.
+/// That denylist rejects the substrings `>`, `/dev/`, `:(){`, `$(` and a backtick, plus a table of
+/// whole-word tokens (`rm`, `curl`, `sudo`, `eval`, `exec`, …) — this script carries none of them.
+/// A single `|` is deliberately NOT denied (denying it would also flag every legitimate `||`), and
+/// that pipe is what lets this express "any line at all" without command substitution.
 pub const EVIDENCE_SCRIPT: &str = "git status --porcelain | grep -q .";
 
 /// The APPROVED content-address pin the built-in Evaluator phases carry. Content-hash over
