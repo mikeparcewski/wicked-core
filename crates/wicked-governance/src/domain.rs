@@ -83,6 +83,15 @@ pub struct Policy {
     /// Human-prose statement of the rule.
     #[serde(default)]
     pub rule: String,
+    /// Withdrawn from enforcement. A retired policy is skipped by SELECT, so it can never decide a
+    /// gate again, but its node survives so any past decision that cited it stays resolvable —
+    /// deleting the row would make the audit trail reference an id that no longer exists.
+    ///
+    /// `#[serde(default)]` is load-bearing: policies registered before this field existed have no
+    /// `retired` key in their metadata bag, and `deny_unknown_fields` means the round-trip is
+    /// otherwise exact. Absent reads as active, which is what those policies were.
+    #[serde(default)]
+    pub retired: bool,
 }
 
 impl Policy {

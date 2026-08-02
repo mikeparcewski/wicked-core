@@ -179,6 +179,7 @@ fn deny_policy(phase: &str, pattern: &str) -> Policy {
         criteria: String::new(),
         severity: Severity::High,
         rule: "deny".into(),
+        retired: false,
     }
 }
 
@@ -288,6 +289,64 @@ fn a_deny_policy_registered_through_the_engine_api_actually_halts_a_run() {
             .is_some_and(|r| r.contains("DENIED")),
         "the halted unit explains WHY, got: {:?}",
         v.units[0].denial_reason
+    );
+}
+
+#[test]
+fn a_retired_policy_stops_denying_and_the_same_run_then_completes() {
+    // FINDING-038: governance state was append-only. A policy authored with a too-broad trigger
+    // denied every matching unit forever — no layer had a way to withdraw it, so a mis-authored
+    // rule kept failing live runs until the store was wiped. This drives the exact scenario end to
+    // end through the actor: deny, retire, re-run.
+    let db = db_path("retire-deny");
+    {
+        let mut store = open_store(Some(&db)).unwrap();
+        register_policy(&mut store, &deny_policy("unit-1", "DENYME")).unwrap();
+    }
+    let ran: Ran = Arc::new(Mutex::new(Vec::new()));
+    let core = Core::spawn_with_engine(
+        db,
+        Arc::new(StubDispatcher),
+        Arc::new(OutRunner {
+            out: "result contains DENYME token".into(),
+            ran: ran.clone(),
+        }),
+    );
+
+    core.launch_run(spec("before", "task one")).unwrap();
+    assert!(
+        wait_status(&core, "before", SessionStatus::Failed),
+        "precondition: the policy denies"
+    );
+
+    assert!(
+        core.retire_policy("deny-unit-1").unwrap(),
+        "retiring a registered policy reports that it existed"
+    );
+    assert!(
+        !core.retire_policy("deny-never-registered").unwrap(),
+        "an unknown id reports absence, so a caller can answer 404 rather than a false success"
+    );
+
+    // Same problem, same output, same trigger text — only the policy changed.
+    core.launch_run(spec("after", "task one")).unwrap();
+    assert!(
+        wait_status(&core, "after", SessionStatus::Completed),
+        "once retired, the policy can no longer decide a gate — the identical run completes"
+    );
+    let views = core.sessions_detail().unwrap();
+    let v = views.iter().find(|v| v.session.id == "after").unwrap();
+    assert_eq!(v.units[0].status, UnitStatus::Done);
+
+    // Retire, not delete: the FIRST run's denial must still name a policy that resolves.
+    let before = views.iter().find(|v| v.session.id == "before").unwrap();
+    assert!(
+        before.units[0]
+            .denial_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("DENIED")),
+        "the past denial is still on the record, got: {:?}",
+        before.units[0].denial_reason
     );
 }
 

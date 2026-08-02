@@ -1110,6 +1110,7 @@ mod tests {
                 symbol_ref: None,
                 compliance: None,
                 provenance: RuleProvenance::default(),
+                retired: false,
             },
         )
         .unwrap();
@@ -1160,6 +1161,7 @@ mod tests {
             symbol_ref: None,
             compliance: None,
             provenance: RuleProvenance::default(),
+            retired: false,
         };
         register_rule(&mut store, &mk("PAT-001", "python")).unwrap();
         register_rule(&mut store, &mk("PAT-002", "rust")).unwrap();

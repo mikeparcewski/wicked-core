@@ -642,6 +642,38 @@ impl Core {
         })
     }
 
+    /// Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
+    /// append-only, so a mis-authored policy denied forever).
+    ///
+    /// Retire, not delete: the node stays readable so a past decision citing this id can still be
+    /// explained, but SELECT stops returning it, so it can never decide another gate.
+    ///
+    /// Resolves to a JSON-encoded boolean: the four characters `true` if a policy with that id
+    /// existed, the five characters `false` if none did. Like every method here it hands JS a
+    /// `Promise<string>` carrying JSON, so it must be `JSON.parse`d — a bare truthiness test
+    /// passes on BOTH values and would read a miss as a hit, losing exactly the 200-vs-404
+    /// distinction this return value exists to carry.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn retire_policy(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let found = core.retire_policy(&id).map_err(err)?;
+            serde_json::to_string(&found).map_err(err)
+        })
+    }
+
+    /// Withdraw a conformance rule from recall. Same retire-not-delete contract as
+    /// [`Core::retire_policy`], and the same JSON-encoded `true`/`false` reply that must be
+    /// parsed rather than tested for truthiness.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn retire_conformance_rule(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let found = core.retire_conformance_rule(&id).map_err(err)?;
+            serde_json::to_string(&found).map_err(err)
+        })
+    }
+
     /// Register (or replace) a workflow definition in the actor's runtime registry. `json` is a
     /// JSON-serialised `WorkflowDef` object (fields: id, description, phases — see the wicked-core
     /// workflow schema). Validates server-side (id + ≥1 phase required); rejects invalid JSON or a

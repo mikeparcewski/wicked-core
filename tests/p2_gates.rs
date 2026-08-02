@@ -434,6 +434,7 @@ fn t_d5_gate_evaluated_surfaces_the_evaluator_denial_reason() {
                 criteria: String::new(),
                 severity: Severity::High,
                 rule: "deny".into(),
+                retired: false,
             },
         )
         .unwrap();

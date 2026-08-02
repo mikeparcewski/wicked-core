@@ -456,6 +456,7 @@ mod tests {
                 criteria: "review: no credentials in output".into(),
                 rule: "deny review output containing an AWS key id".into(),
                 severity: Severity::High,
+                retired: false,
             },
         )
         .unwrap();
@@ -510,6 +511,7 @@ mod tests {
                 criteria: "review: no credentials in output".into(),
                 rule: "deny review output containing an AWS key id".into(),
                 severity: Severity::High,
+                retired: false,
             },
         )
         .unwrap();

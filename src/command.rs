@@ -115,6 +115,18 @@ pub(crate) enum Command {
         rule_json: String,
         reply: Sender<anyhow::Result<()>>,
     },
+    /// Withdraw a governance policy from enforcement. Retire, not delete: the node survives so
+    /// past decisions citing the id stay resolvable, but SELECT stops returning it. Replies `false`
+    /// if no policy with that id exists, so a caller can answer 404 rather than a silent success.
+    RetirePolicy {
+        id: String,
+        reply: Sender<anyhow::Result<bool>>,
+    },
+    /// Withdraw a conformance rule from recall. Same retire-not-delete contract as [`Self::RetirePolicy`].
+    RetireConformanceRule {
+        id: String,
+        reply: Sender<anyhow::Result<bool>>,
+    },
     /// Capture an episodic memory (a learned fact/decision) at `scope` (e.g. `app:<id>`; "" = root).
     CaptureMemory {
         content: String,

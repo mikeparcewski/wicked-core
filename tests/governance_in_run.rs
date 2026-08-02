@@ -45,6 +45,7 @@ fn deny_policy(phase: &str) -> Policy {
         criteria: "no DENYME in a tool-call".into(),
         severity: Severity::High,
         rule: "tool-calls containing DENYME are denied".into(),
+        retired: false,
     }
 }
 

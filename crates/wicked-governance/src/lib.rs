@@ -32,13 +32,13 @@ mod ingest;
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
     claim_from_node, claim_symbol, claim_to_node, conform, decide, decide_as, register_policy,
-    select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
+    retire_policy, select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
 };
 
 // Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B).
 pub use conformance::{
-    recall_rules, register_rule, Compliance, ConfSeverity, ConformanceRule, RuleProvenance,
-    RuleQuery, RuleType, Targets,
+    recall_rules, register_rule, retire_rule, Compliance, ConfSeverity, ConformanceRule,
+    RuleProvenance, RuleQuery, RuleType, Targets,
 };
 
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).
@@ -80,6 +80,7 @@ mod tests {
             criteria: "no aws access keys in the context".to_string(),
             severity: Severity::High,
             rule: "Deny any plan that embeds an AWS access key id.".to_string(),
+            retired: false,
         }
     }
 
@@ -97,6 +98,7 @@ mod tests {
             criteria: "secops must be notified".to_string(),
             severity: Severity::Medium,
             rule: "Builds are allowed but secops must be notified.".to_string(),
+            retired: false,
         }
     }
 
@@ -465,5 +467,137 @@ mod tests {
             std::env::remove_var(wicked_apps_core::emit::DEADLETTER_ENV);
         }
         let _ = std::fs::remove_file(&spool);
+    }
+
+    // ── retire (FINDING-038) ────────────────────────────────────────────────
+
+    /// The defect this fixes: a policy registered with a too-broad trigger denied every matching
+    /// unit forever, and no layer offered a way to withdraw it.
+    #[test]
+    fn a_retired_policy_is_no_longer_selected_for_its_phase() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        register_policy(&mut store, &deny_policy()).expect("register policy");
+
+        let ctx = serde_json::json!({});
+        let before = select(&store, "s", "build", &ctx).expect("select before");
+        assert_eq!(before.len(), 1, "precondition: the policy is selected");
+
+        assert!(
+            engine::retire_policy(&mut store, "pol-deny-secrets").expect("retire ok"),
+            "retiring an existing policy reports that it was found"
+        );
+
+        let after = select(&store, "s", "build", &ctx).expect("select after");
+        assert!(
+            after.is_empty(),
+            "a retired policy must not be selected for enforcement: {after:?}"
+        );
+    }
+
+    /// Retire, not delete. A decision records the policy ids that produced it, so the node has to
+    /// stay resolvable or a past denial becomes unexplainable.
+    #[test]
+    fn a_retired_policy_is_still_readable_so_past_decisions_stay_explicable() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        register_policy(&mut store, &deny_policy()).expect("register policy");
+        engine::retire_policy(&mut store, "pol-deny-secrets").expect("retire ok");
+
+        let node = store
+            .get_node(&wicked_apps_core::synthetic_symbol(
+                wicked_apps_core::POLICY,
+                "pol-deny-secrets",
+            ))
+            .expect("get_node ok")
+            .expect("the node must survive retirement");
+        let recovered = Policy::from_node(&node).expect("from_node ok");
+        assert!(recovered.retired, "the node records that it was retired");
+        assert_eq!(
+            recovered.rule,
+            deny_policy().rule,
+            "retirement must not lose the policy's content"
+        );
+    }
+
+    /// Retiring is idempotent and total: retrying a request must not error, and an id that was
+    /// never registered must be reported as absent rather than silently succeeding.
+    #[test]
+    fn retiring_reports_absence_and_tolerates_repetition() {
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+        assert!(
+            !engine::retire_policy(&mut store, "pol-never-registered").expect("retire ok"),
+            "an unknown id must report false, not a spurious success"
+        );
+
+        register_policy(&mut store, &deny_policy()).expect("register policy");
+        assert!(engine::retire_policy(&mut store, "pol-deny-secrets").expect("first retire"));
+        assert!(
+            engine::retire_policy(&mut store, "pol-deny-secrets").expect("second retire"),
+            "retiring twice is the same end state, so it must not fail a retrying caller"
+        );
+    }
+
+    /// `retire_policy` addresses the node by synthetic symbol but writes it back through
+    /// `to_node()`, which recomputes that symbol from the metadata `id`. If the two disagree, the
+    /// write lands on a DIFFERENT policy: the one the operator named stays enforcing, an unrelated
+    /// one goes dark, and the call still reports success. It must refuse instead (review on #149).
+    #[test]
+    fn retiring_a_misfiled_policy_errors_instead_of_retiring_a_different_one() {
+        // Scoped to this test: no other test in this module writes a node by hand, and hoisting the
+        // trait would put raw graph writes in reach of every one of them.
+        use wicked_apps_core::GraphWrite;
+
+        let mut store = SqliteStore::in_memory().expect("open in-memory store");
+
+        // The victim: a well-formed policy that must be left alone.
+        let mut victim = deny_policy();
+        victim.id = "pol-victim".to_string();
+        register_policy(&mut store, &victim).expect("register victim");
+
+        // The misfiled node: metadata says `pol-victim`, but it is filed under `pol-misfiled`.
+        let mut node = victim.to_node();
+        node.symbol = wicked_apps_core::synthetic_symbol(wicked_apps_core::POLICY, "pol-misfiled");
+        store.begin_batch().expect("begin");
+        store.upsert_nodes(&[node]).expect("upsert misfiled node");
+        store.commit_batch().expect("commit");
+
+        let err = engine::retire_policy(&mut store, "pol-misfiled")
+            .expect_err("a symbol/id mismatch must be an error, not a silent cross-write");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pol-misfiled") && msg.contains("pol-victim"),
+            "the error must name both ids so the inconsistency is diagnosable, got: {msg}"
+        );
+
+        let victim_node = store
+            .get_node(&wicked_apps_core::synthetic_symbol(
+                wicked_apps_core::POLICY,
+                "pol-victim",
+            ))
+            .expect("get victim ok")
+            .expect("victim must still be present");
+        let recovered = Policy::from_node(&victim_node).expect("victim parses");
+        assert!(
+            !recovered.retired,
+            "the policy nobody asked to retire must still be enforcing"
+        );
+    }
+
+    /// A policy written before `retired` existed has no such key in its metadata bag. With
+    /// `deny_unknown_fields` on the struct, the `serde(default)` is the only thing keeping those
+    /// nodes readable — and they must read back as ACTIVE, which is what they were.
+    #[test]
+    fn a_policy_persisted_before_the_field_existed_reads_back_active() {
+        let mut node = deny_policy().to_node();
+        node.metadata.remove("retired");
+        assert!(
+            !node.metadata.contains_key("retired"),
+            "precondition: the legacy node has no retired key"
+        );
+
+        let recovered = Policy::from_node(&node).expect("a pre-field node must still parse");
+        assert!(
+            !recovered.retired,
+            "absent must mean active — the policy was enforcing when it was written"
+        );
     }
 }
