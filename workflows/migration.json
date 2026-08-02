@@ -17,7 +17,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "execute",
@@ -33,7 +36,10 @@
       "role": "creator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "cutover",
@@ -53,7 +59,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "verify",
@@ -71,7 +80,10 @@
       "role": "evaluator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": "2fcde907d57f3ee2",
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "cleanup",
@@ -87,7 +99,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     }
   ]
 }

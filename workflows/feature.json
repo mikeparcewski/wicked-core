@@ -17,7 +17,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "design",
@@ -33,7 +36,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "build",
@@ -49,7 +55,10 @@
       "role": "creator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "adversarial-review",
@@ -69,7 +78,10 @@
       "role": "evaluator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": "2fcde907d57f3ee2",
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "test",
@@ -87,7 +99,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "review",
@@ -103,7 +118,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     }
   ]
 }

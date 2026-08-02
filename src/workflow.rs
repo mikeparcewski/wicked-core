@@ -432,6 +432,19 @@ impl PhaseDef {
         self.role = r;
         self
     }
+    /// Pin the shipped deterministic evidence floor onto this phase (FINDING-025 item 1). Engages
+    /// gate layers 1 AND 2 — layer 2 (the agent judge) is keyed off the same `Option` layer 1 is,
+    /// so a phase with no pin has neither. Paired with `.role(PhaseRole::Evaluator)` on every
+    /// built-in; `builtin_floors::tests::every_builtin_evaluator_phase_carries_the_floor` asserts
+    /// the pairing so a future Evaluator phase cannot ship ungated.
+    ///
+    /// Safe to embed as data because the actor seeds the pin into the vault on every store open
+    /// (`builtin_floors::seed_builtin_floors`), before any run can plan — `attach_pinned_validators`
+    /// is fail-closed on an unresolvable pin.
+    fn evidence_floor(mut self) -> Self {
+        self.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
+        self
+    }
     fn after(mut self, dep: &str) -> Self {
         self.depends_on.push(dep.to_string());
         self
@@ -699,6 +712,7 @@ pub fn feature_def() -> WorkflowDef {
                     },
                 )
                 .role(PhaseRole::Evaluator)
+                .evidence_floor()
                 .after("build"),
             PhaseDef::new("test", StageKind::Test)
                 .gate(
@@ -736,6 +750,7 @@ pub fn bug_def() -> WorkflowDef {
                 )
                 .verified()
                 .role(PhaseRole::Evaluator)
+                .evidence_floor()
                 .after("fix"),
         ],
     }
@@ -774,6 +789,7 @@ pub fn migration_def() -> WorkflowDef {
                 )
                 .verified()
                 .role(PhaseRole::Evaluator)
+                .evidence_floor()
                 .after("cutover"),
             PhaseDef::new("cleanup", StageKind::Build).after("verify"),
         ],

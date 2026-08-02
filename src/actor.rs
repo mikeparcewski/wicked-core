@@ -180,6 +180,23 @@ pub(crate) fn run(
     // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
     GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
 
+    // Seed the deterministic floor the built-in Evaluator phases pin (FINDING-025 item 1). This is
+    // load-bearing and it is why it sits HERE: `pipeline::attach_pinned_validators` is fail-closed on
+    // a pin the vault does not hold, so a built-in that ships a pin only runs if the seed has already
+    // happened. This is the single-writer thread and no command has been served yet, so "before any
+    // run can plan" is structural rather than a matter of timing. Idempotent (content-addressed), so
+    // re-seeding on every launch rewrites the same nodes.
+    //
+    // NOT best-effort, unlike the memory/knowledge sidecars below: a failure here would leave every
+    // `feature`/`bug`/`migration` run bailing at plan time with an unresolvable pin, so it is louder
+    // than the pin error the operator would otherwise be left to decode.
+    if let Err(e) = crate::builtin_floors::seed_builtin_floors(&mut store) {
+        eprintln!(
+            "wicked-core: could not seed the built-in evidence floor ({e}); runs of the built-in \
+             workflows will fail closed at plan time on an unresolvable validator pin"
+        );
+    }
+
     let sidecar_base: String = sidecar_base(&path);
 
     // The orchestrator's episodic memory (a SEPARATE single-writer store, sibling of the estate db).
