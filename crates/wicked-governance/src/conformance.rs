@@ -129,6 +129,10 @@ pub struct ConformanceRule {
     pub compliance: Option<Compliance>,
     #[serde(default)]
     pub provenance: RuleProvenance,
+    /// Withdrawn from recall. See [`crate::domain::Policy::retired`] — same contract, same reason
+    /// for the `serde(default)`: rules written before the field existed read back as active.
+    #[serde(default)]
+    pub retired: bool,
 }
 
 impl ConformanceRule {
@@ -237,6 +241,33 @@ pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyh
     Ok(())
 }
 
+/// Withdraw `id` from recall. Returns `false` if no such rule exists.
+///
+/// Retire, not delete — see [`crate::engine::retire_policy`] for why the node has to survive.
+pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool> {
+    let symbol = synthetic_symbol(CONFORMANCE_RULE, id);
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Rule],
+        ..Default::default()
+    };
+    let Some(node) = store
+        .find_symbols(&query)?
+        .into_iter()
+        .find(|n| n.symbol == symbol)
+    else {
+        return Ok(false);
+    };
+    let mut rule = ConformanceRule::from_node(&node)?;
+    if rule.retired {
+        return Ok(true);
+    }
+    rule.retired = true;
+    store.begin_batch()?;
+    store.upsert_nodes(std::slice::from_ref(&rule.to_node()))?;
+    store.commit_batch()?;
+    Ok(true)
+}
+
 /// A recall query slice. Any `None` field matches every value of that facet.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,6 +313,11 @@ pub fn recall_rules(
             continue;
         }
         let rule = ConformanceRule::from_node(&node)?;
+        // Withdrawn rules are skipped here, the single funnel every recall goes through — same
+        // reasoning as `engine::select_any`.
+        if rule.retired {
+            continue;
+        }
         if facet_matches(&rule.targets.language, &query.language)
             && facet_matches(&rule.targets.layer, &query.layer)
             && facet_matches(&rule.targets.framework, &query.framework)
@@ -317,6 +353,7 @@ mod tests {
             symbol_ref: None,
             compliance: None,
             provenance: RuleProvenance::default(),
+            retired: false,
         }
     }
 

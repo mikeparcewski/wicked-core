@@ -3697,6 +3697,7 @@ fn register_deny_policy(
         criteria: format!("{phase}: deny `{trigger}`"),
         severity: Severity::High,
         rule: format!("deny {phase}-phase tool-calls containing `{trigger}`"),
+        retired: false,
     };
     register_policy(store, &policy)
 }
@@ -4149,6 +4150,7 @@ mod phase_boundary_governance_tests {
             criteria: "test deny criterion".to_string(),
             severity: Severity::High,
             rule: "Test: deny this phase gate unconditionally.".to_string(),
+            retired: false,
         };
         register_policy(&mut store, &deny_pol).unwrap();
 

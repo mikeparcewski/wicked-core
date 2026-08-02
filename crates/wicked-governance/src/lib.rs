@@ -80,6 +80,7 @@ mod tests {
             criteria: "no aws access keys in the context".to_string(),
             severity: Severity::High,
             rule: "Deny any plan that embeds an AWS access key id.".to_string(),
+            retired: false,
         }
     }
 
@@ -97,6 +98,7 @@ mod tests {
             criteria: "secops must be notified".to_string(),
             severity: Severity::Medium,
             rule: "Builds are allowed but secops must be notified.".to_string(),
+            retired: false,
         }
     }
 

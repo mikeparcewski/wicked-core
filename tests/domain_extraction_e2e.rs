@@ -87,6 +87,7 @@ fn deny_policy(phase: &str, pattern: &str) -> Policy {
         criteria: String::new(),
         severity: Severity::High,
         rule: "deny".into(),
+        retired: false,
     }
 }
 
@@ -429,6 +430,7 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
                 symbol_ref: None,
                 compliance: None,
                 provenance: RuleProvenance::default(),
+                retired: false,
             },
         )
         .unwrap();

@@ -62,6 +62,44 @@ pub fn register_policy(store: &mut dyn GraphStore, policy: &Policy) -> anyhow::R
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// retire_policy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Withdraw `id` from enforcement. Returns `false` if no such policy exists.
+///
+/// Retire, not delete. A governance system whose rules cannot be withdrawn has no way to correct a
+/// mistake — a policy authored with a too-broad trigger denies every matching unit forever
+/// (FINDING-038, where three test policies could not be removed and kept failing live runs). But
+/// hard-deleting the node would break the other half of the contract: past decisions record the
+/// policy ids that produced them, and a decision citing an id that no longer resolves cannot be
+/// explained afterwards. So the node stays and stops being selected.
+pub fn retire_policy(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool> {
+    let symbol = synthetic_symbol(POLICY, id);
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(POLICY.to_string())],
+        ..Default::default()
+    };
+    let Some(node) = store
+        .find_symbols(&query)?
+        .into_iter()
+        .find(|n| n.symbol == symbol)
+    else {
+        return Ok(false);
+    };
+    let mut policy = Policy::from_node(&node)?;
+    if policy.retired {
+        // Already withdrawn. Report success rather than an error: retiring twice should be safe for
+        // a caller retrying a request, and the end state the caller asked for already holds.
+        return Ok(true);
+    }
+    policy.retired = true;
+    store.begin_batch()?;
+    store.upsert_nodes(std::slice::from_ref(&policy.to_node()))?;
+    store.commit_batch()?;
+    Ok(true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SELECT — index-only fast lane
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -103,6 +141,13 @@ pub fn select_any(
     let mut selected: Vec<Policy> = Vec::new();
     for node in &nodes {
         let policy = Policy::from_node(node)?;
+        // Retired policies are withdrawn from enforcement. Filtering HERE rather than in `decide`
+        // is deliberate: SELECT is the single funnel every enforcement path goes through, so one
+        // check covers the gate, the coverage report, and any future caller. A filter in `decide`
+        // would leave a retired policy still counted as "applies to this phase" everywhere else.
+        if policy.retired {
+            continue;
+        }
         if policy
             .applies_to
             .iter()

@@ -249,6 +249,7 @@ fn deny_policy(phase: &str, pattern: &str) -> Policy {
         criteria: String::new(),
         severity: Severity::High,
         rule: "deny".into(),
+        retired: false,
     }
 }
 

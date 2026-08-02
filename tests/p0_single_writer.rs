@@ -40,6 +40,7 @@ fn deny_policy(id: &str, phase: &str, pattern: &str) -> Policy {
         criteria: String::new(),
         severity: Severity::High,
         rule: format!("deny anything containing {pattern}"),
+        retired: false,
     }
 }
 
