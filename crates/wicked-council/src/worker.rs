@@ -161,8 +161,10 @@ pub struct PollStatus {
     pub verdict: Option<Verdict>,
     /// Seats that were convened but did not vote on the latest ballot, and why.
     ///
-    /// `pending` counts them; this says what happened. The caller renders the degrade reason
-    /// from these instead of the old catch-all "council did not reach a vote".
+    /// Do not read this off `pending`: `pending` is `convened - returned`, which lumps a seat
+    /// that has not been dispatched yet together with one that was dispatched and failed. This
+    /// list is only the second kind, and it is what the caller renders the degrade reason from
+    /// instead of the old catch-all "council did not reach a vote".
     pub seat_failures: Vec<SeatFailureRecord>,
 }
 

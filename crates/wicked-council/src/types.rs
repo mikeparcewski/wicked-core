@@ -8,16 +8,24 @@
 //! carry no premature runtime dependency.
 //!
 //! The three bus events this app produces are mirrored in `wicked-apps-core`
-//! (`EV_COUNCIL_REQUESTED` / `EV_COUNCIL_VOTED` / `EV_CLI_RANKED`); [`COUNCIL_EVENTS`]
-//! re-states them here so the engine can enumerate its own contract.
+//! (`EV_COUNCIL_REQUESTED` / `EV_COUNCIL_DELIBERATED` / `EV_COUNCIL_SEAT_FAILED` /
+//! `EV_COUNCIL_VOTED` / `EV_CLI_RANKED`); [`COUNCIL_EVENTS`] re-states them here so the engine
+//! can enumerate its own contract.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// The three bus events this app **produces**, per the shared catalog
-/// (`wicked-apps-core`: `EV_COUNCIL_REQUESTED` / `EV_COUNCIL_VOTED` / `EV_CLI_RANKED`).
-pub const COUNCIL_EVENTS: [&str; 3] = [
+/// The bus events this app **produces**, per the shared catalog in `wicked-apps-core`.
+///
+/// This is the crate's published contract, so it has to list what `worker.rs` actually emits —
+/// not a subset. It had already drifted once (`EV_COUNCIL_DELIBERATED` shipped without being
+/// declared here) because the test below only restated the same literals back, which no amount
+/// of drift can fail. `council_events_are_the_events_the_crate_emits` now checks the list
+/// against the emitting source instead.
+pub const COUNCIL_EVENTS: [&str; 5] = [
     wicked_apps_core::EV_COUNCIL_REQUESTED,
+    wicked_apps_core::EV_COUNCIL_DELIBERATED,
+    wicked_apps_core::EV_COUNCIL_SEAT_FAILED,
     wicked_apps_core::EV_COUNCIL_VOTED,
     wicked_apps_core::EV_CLI_RANKED,
 ];
