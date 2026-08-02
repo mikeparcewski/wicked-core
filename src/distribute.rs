@@ -83,6 +83,9 @@ impl wicked_council::EventSink for RelaySink {
                 exit_code: payload["exit_code"].as_i64().map(|c| c as i32),
                 stderr: payload["stderr"].as_str().unwrap_or_default().to_string(),
                 detail: payload["detail"].as_str().unwrap_or_default().to_string(),
+                // Separates a seat that never started from one that burned the whole budget —
+                // the two look identical without it.
+                latency_ms: payload["latency_ms"].as_u64().unwrap_or(0),
             },
             wicked_apps_core::EV_COUNCIL_VOTED => CoreEvent::CouncilVoted {
                 session: self.session.clone(),

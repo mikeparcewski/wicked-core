@@ -23,8 +23,8 @@ use std::time::Instant;
 use crate::store::{Ledger, SeatFailureRecord, TaskRecord};
 use crate::synthesis;
 use crate::types::{
-    AgenticCli, BallotContext, CouncilTask, Dispatcher, EventSink, RankSignal, RankStore,
-    SeatFailure, SeatFailureKind, TaskState, Verdict, SEATS,
+    AgenticCli, BallotContext, CouncilTask, DispatchOutcome, Dispatcher, EventSink, RankSignal,
+    RankStore, TaskState, Verdict, SEATS,
 };
 
 /// The share of seats that must converge on one option before the council stops
@@ -218,21 +218,15 @@ fn run_council(
             let outcome = dispatcher.dispatch_ballot_detailed(cli, task, &ctx);
             let latency_ms = started.elapsed().as_millis() as u64;
             let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
-            entry.0 = outcome.vote.is_some();
+            entry.0 = outcome.is_voted();
             entry.1 += latency_ms;
-            match outcome.vote {
-                Some(v) => votes.push(v),
-                None => {
+            match outcome {
+                DispatchOutcome::Voted(v) => votes.push(v),
+                DispatchOutcome::Failed(failure) => {
                     // A seat that does not vote is a governance event, not a silent gap: it
                     // shrinks the quorum the verdict rests on. Surface it per seat, with the
                     // branch and the CLI's own stderr, so the degrade is diagnosable from the
                     // event stream alone.
-                    let failure = outcome.failure.unwrap_or_else(|| {
-                        SeatFailure::new(
-                            SeatFailureKind::Unreported,
-                            "dispatcher returned no vote and reported no reason",
-                        )
-                    });
                     events.emit(
                         wicked_apps_core::EV_COUNCIL_SEAT_FAILED,
                         &serde_json::json!({

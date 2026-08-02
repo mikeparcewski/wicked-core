@@ -522,45 +522,43 @@ impl SeatFailure {
 
 /// One seat's dispatch result: a vote, or the named reason there is none.
 ///
-/// The invariant is that exactly one side is populated — a `None` vote always carries a
-/// `SeatFailure`, even if only [`SeatFailureKind::Unreported`]. That is what stops a silent
-/// no-vote from re-entering the system.
+/// An enum, not a struct with two `Option`s: the whole point of this type is that a no-vote
+/// always carries a reason — even if only [`SeatFailureKind::Unreported`] — and a pair of
+/// public `Option` fields would let a caller construct the exact state the type exists to
+/// forbid (both empty), reintroducing the silent no-vote through the back door.
 #[derive(Debug, Clone)]
-pub struct DispatchOutcome {
-    /// The vote, when the seat produced one.
-    pub vote: Option<Vote>,
-    /// Why there is no vote. `Some` exactly when `vote` is `None`.
-    pub failure: Option<SeatFailure>,
+pub enum DispatchOutcome {
+    /// The seat voted.
+    Voted(Vote),
+    /// The seat did not vote, and this is why.
+    Failed(SeatFailure),
 }
 
 impl DispatchOutcome {
-    /// A successful ballot.
-    pub fn voted(vote: Vote) -> Self {
-        DispatchOutcome {
-            vote: Some(vote),
-            failure: None,
-        }
-    }
-
-    /// A named failure.
-    pub fn failed(failure: SeatFailure) -> Self {
-        DispatchOutcome {
-            vote: None,
-            failure: Some(failure),
-        }
-    }
-
     /// Lift a legacy `Option<Vote>`. A bare `None` becomes [`SeatFailureKind::Unreported`]
     /// rather than an empty failure, so the "no vote ⇒ some reason" invariant holds even for
     /// dispatchers that never adopted the detailed path.
     pub fn from_option(vote: Option<Vote>) -> Self {
         match vote {
-            Some(v) => DispatchOutcome::voted(v),
-            None => DispatchOutcome::failed(SeatFailure::new(
+            Some(v) => DispatchOutcome::Voted(v),
+            None => DispatchOutcome::Failed(SeatFailure::new(
                 SeatFailureKind::Unreported,
                 "dispatcher returned no vote and reported no reason",
             )),
         }
+    }
+
+    /// The vote, discarding the reason — for the legacy `Option<Vote>` callers.
+    pub fn into_vote(self) -> Option<Vote> {
+        match self {
+            DispatchOutcome::Voted(v) => Some(v),
+            DispatchOutcome::Failed(_) => None,
+        }
+    }
+
+    /// Whether the seat voted, without consuming the outcome.
+    pub fn is_voted(&self) -> bool {
+        matches!(self, DispatchOutcome::Voted(_))
     }
 }
 

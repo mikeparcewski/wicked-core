@@ -129,6 +129,9 @@ pub enum CoreEvent {
         stderr: String,
         /// The OS/IO error text, where the branch has one.
         detail: String,
+        /// How long the seat ran before failing. A spawn error costs ~0 ms; a timeout costs the
+        /// whole budget. Without this the two are indistinguishable in the event stream.
+        latency_ms: u64,
     },
     /// The council reached a verdict for a unit's assignment vote.
     CouncilVoted {
@@ -668,6 +671,7 @@ impl CoreEvent {
                 exit_code,
                 stderr,
                 detail,
+                latency_ms,
             } => json!({
                 "type": "councilSeatFailed",
                 "session": session,
@@ -678,6 +682,7 @@ impl CoreEvent {
                 "exitCode": exit_code,
                 "stderr": stderr,
                 "detail": detail,
+                "latencyMs": latency_ms,
             }),
             CoreEvent::CouncilVoted {
                 session,

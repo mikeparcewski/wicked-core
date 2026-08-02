@@ -153,7 +153,7 @@ impl RealDispatcher {
         let workdir = match make_tempdir(&cli.key, &task.id) {
             Ok(d) => d,
             Err(e) => {
-                return DispatchOutcome::failed(SeatFailure::new(
+                return DispatchOutcome::Failed(SeatFailure::new(
                     SeatFailureKind::WorkdirUnavailable,
                     e.to_string(),
                 ))
@@ -168,10 +168,10 @@ impl RealDispatcher {
 
         let run = match result {
             Ok(r) => r,
-            Err(f) => return DispatchOutcome::failed(f),
+            Err(f) => return DispatchOutcome::Failed(f),
         };
         if !run.exit_ok {
-            return DispatchOutcome::failed(
+            return DispatchOutcome::Failed(
                 SeatFailure {
                     kind: SeatFailureKind::NonZeroExit,
                     exit_code: run.exit_code,
@@ -181,13 +181,14 @@ impl RealDispatcher {
                 .with_stderr(&run.stderr),
             );
         }
-        DispatchOutcome::voted(parse_vote(cli, &run.stdout))
+        DispatchOutcome::Voted(parse_vote(cli, &run.stdout))
     }
 }
 
 impl Dispatcher for RealDispatcher {
     fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
-        self.dispatch_prompt(cli, task, &render_scaffold(task)).vote
+        self.dispatch_prompt(cli, task, &render_scaffold(task))
+            .into_vote()
     }
 
     fn dispatch_ballot(
@@ -196,7 +197,7 @@ impl Dispatcher for RealDispatcher {
         task: &CouncilTask,
         ctx: &BallotContext,
     ) -> Option<Vote> {
-        self.dispatch_ballot_detailed(cli, task, ctx).vote
+        self.dispatch_ballot_detailed(cli, task, ctx).into_vote()
     }
 
     fn dispatch_ballot_detailed(
@@ -364,7 +365,7 @@ fn run_in_isolation(
                         .unwrap_or_default();
                     return Err(SeatFailure::new(
                         SeatFailureKind::TimedOut,
-                        format!("exceeded {}s dispatch budget", timeout.as_secs()),
+                        format!("exceeded {timeout:?} dispatch budget"),
                     )
                     .with_stderr(&partial));
                 }
@@ -590,12 +591,12 @@ mod failure_diagnostics_tests {
             timeout,
             local_runner_timeout: timeout,
         };
-        let outcome = d.dispatch_prompt(cli, &task(), "ignored");
-        assert!(
-            outcome.vote.is_none(),
-            "this seat must not vote — the test is about the failure path"
-        );
-        outcome.failure.expect("a no-vote must carry a reason")
+        match d.dispatch_prompt(cli, &task(), "ignored") {
+            DispatchOutcome::Failed(f) => f,
+            DispatchOutcome::Voted(_) => {
+                panic!("this seat must not vote — the test is about the failure path")
+            }
+        }
     }
 
     #[test]
@@ -648,6 +649,13 @@ mod failure_diagnostics_tests {
             f.detail.contains("budget"),
             "the timeout must say it was a budget, not an error: {f:?}"
         );
+        // A sub-second budget must render as itself. `as_secs()` truncated this to
+        // "exceeded 0s dispatch budget", which reads as a bug in the budget rather than a
+        // slow seat — the exact confusion this finding is about.
+        assert!(
+            f.detail.contains("250ms"),
+            "a sub-second budget must not be truncated to 0s: {f:?}"
+        );
     }
 
     #[test]
@@ -678,8 +686,7 @@ mod failure_diagnostics_tests {
         let outcome = d.dispatch_prompt(&cli, &task(), "ignored");
         // The control case: without it, a bug that made EVERY dispatch fail would still pass
         // every assertion above.
-        assert!(outcome.vote.is_some(), "exit 0 must produce a vote");
-        assert!(outcome.failure.is_none());
+        assert!(outcome.is_voted(), "exit 0 must produce a vote");
     }
 
     #[test]
