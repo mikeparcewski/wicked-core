@@ -37,7 +37,7 @@ use base64::Engine as _;
 use crate::command::Command;
 use crate::event::CoreEvent;
 use crate::execute_wrapped::{
-    binary_is_claude, build_argv, inject_claude_stream_flags, resolve_invocation, skill_prompt,
+    binary_is_claude, build_argv, inject_claude_stream_flags, pty_unit_prompt, resolve_invocation,
     AdapterOut, ClaudeStreamJson, OutputAdapter,
 };
 use crate::terminal;
@@ -290,7 +290,13 @@ impl PersistentStepRunner {
         // Subscribe BEFORE writing so no output bytes are lost between write and drain.
         let events = self.subscribe();
 
-        let prompt = format!("{}\n", skill_prompt(&input.unit));
+        // Line-length is a correctness constraint here, not a nicety: an over-long line is dropped by
+        // the terminal with no error, so the alternative to failing now is a turn that waits out its
+        // full timeout for output the CLI was never given the chance to produce.
+        let prompt = match pty_unit_prompt(input) {
+            Ok(p) => format!("{p}\n"),
+            Err(e) => return failed_output(input, e),
+        };
         if let Err(e) = self.write_terminal(&terminal_id, prompt.as_bytes()) {
             // (EVT-004) The PTY write failed — emit the closed event before dropping the session
             // so observers see the full lifecycle (opened → reused? → closed:error).

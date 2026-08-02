@@ -529,11 +529,7 @@ impl WrappedCliStepRunner {
             .assigned_invocation
             .clone()
             .unwrap_or_else(|| resolve_invocation(&cli_key));
-        let mut argv = build_argv(
-            &invocation,
-            &skill_prompt(&input.unit),
-            &input.unit.allowed_skills,
-        );
+        let mut argv = build_argv(&invocation, &unit_prompt(input), &input.unit.allowed_skills);
 
         // Per-binary output adapter (B-runner). claude → stream-json (+ the two flags, injected before the
         // `--` guard); every other binary → passthrough (byte-identical to the pre-adapter raw-line stream).
@@ -1053,9 +1049,10 @@ fn tokenize(s: &str) -> Vec<String> {
 /// `{SKILLS}` placeholder — see [`build_argv`]. The template author picks the per-CLI flag (e.g.
 /// `claude … --allowedTools {SKILLS}`), so the engine never hard-codes one CLI's semantics.
 /// Real work units additionally carry the structured-assumptions conventions appendix
-/// ([`crate::assumptions::PROMPT_CONVENTION`]); engine-internal `validator`/`triage`
-/// sessions return the authored prompt byte-exact.
-pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
+/// ([`crate::assumptions::PROMPT_CONVENTION`]) and, when the caller has a worktree to describe, a
+/// one-line map of it (`layout`, from [`crate::repo::worktree_layout`] — see [`unit_prompt`]);
+/// engine-internal `validator`/`triage` sessions return the authored prompt byte-exact.
+pub(crate) fn skill_prompt(unit: &WorkUnit, layout: Option<&str>) -> String {
     let base = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => {
             // NOT a slash line: plugin SKILLS are not slash commands — a "/name" prompt hits the
@@ -1070,12 +1067,90 @@ pub(crate) fn skill_prompt(unit: &WorkUnit) -> String {
         }
         _ => unit.description.clone(),
     };
-    // Engine-internal judge/triage prompts are fully authored — no conventions appendix
-    // (their verdict contracts must stay byte-exact).
+    // Engine-internal judge/triage prompts are fully authored — no conventions appendix, and no
+    // layout either (their verdict contracts must stay byte-exact).
     if matches!(unit.session_id.as_str(), "validator" | "triage") {
         return base;
     }
-    format!("{base}{}", crate::assumptions::PROMPT_CONVENTION)
+    // FINDING-048: the unit knows WHAT to do and nothing about WHERE. 12 of 32 pilot sessions burned
+    // turns on `cd: no such file or directory` guessing at a monorepo's shape. One line up front is
+    // cheaper than the turns it saves. Placed before the conventions appendix so the appendix stays
+    // the last thing the model reads — it is an output contract, and output contracts read last.
+    let layout = layout
+        .map(|l| format!("{LAYOUT_PREFIX}{l}"))
+        .unwrap_or_default();
+    format!("{base}{layout}{}", crate::assumptions::PROMPT_CONVENTION)
+}
+
+/// Frames the [`crate::repo::worktree_layout`] map inside a prompt. Single-line, like everything else
+/// appended here — the PTY session runner writes prompts line-based.
+const LAYOUT_PREFIX: &str =
+    " ||| WORKTREE LAYOUT (the root of your working copy — every path below \
+     is relative to it; `dir/ [manifest]` marks a project root, `dir/ {…}` a container of them): ";
+
+/// The prompt for `input`'s unit, including the worktree map when there is a worktree to map.
+///
+/// The split exists because [`skill_prompt`] is pure and testable without a filesystem, while the map
+/// is a directory read; this is the one place the two meet, so every runner (wrapped, PTY, ACP) gets
+/// the same prompt from the same code rather than three chances to diverge.
+pub(crate) fn unit_prompt(input: &StepInput) -> String {
+    let layout = input
+        .workdir
+        .as_deref()
+        .and_then(crate::repo::worktree_layout);
+    skill_prompt(&input.unit, layout.as_deref())
+}
+
+/// Ceiling on a prompt written to a pty as a single line, with headroom under `MAX_CANON`.
+///
+/// A pty in canonical mode assembles input into a fixed line buffer — `MAX_CANON`, 1024 bytes on
+/// Darwin and Linux. A line that reaches it is not truncated and not delivered: it is DISCARDED, and
+/// the reader simply never sees a turn. Probed on this platform: a 1022-byte line round-trips, a
+/// 1023-byte line never returns. There is no error and no signal, so the caller waits out its whole
+/// turn timeout for output that cannot arrive.
+pub(crate) const PTY_PROMPT_LIMIT: usize = 1000;
+
+/// Below this the map cannot say anything a worker could not get from `ls`, so it is not worth
+/// spending the line budget on.
+const MIN_USEFUL_LAYOUT: usize = 40;
+
+/// [`unit_prompt`] constrained to one pty-writable line.
+///
+/// Only the PTY runner needs this. The wrapped runner passes the prompt as an argv element and the
+/// ACP runner as a JSON string field; neither goes through a terminal line discipline, so neither has
+/// a length limit worth imposing.
+///
+/// The worktree map is the elastic part and gets whatever the task text leaves. `Err` is reserved for
+/// the case no trimming can fix — a unit description that alone overruns the line — because the
+/// honest outcome there is a fast, named failure rather than a turn that burns its timeout in silence
+/// (which is what this path did for any description over ~509 bytes, before and after FINDING-048).
+pub(crate) fn pty_unit_prompt(input: &StepInput) -> Result<String, String> {
+    // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
+    let plain = skill_prompt(&input.unit, None);
+    let overhead = plain.len() + 1;
+    if overhead > PTY_PROMPT_LIMIT {
+        return Err(format!(
+            "prompt is {overhead} bytes and a pty turn cannot exceed {PTY_PROMPT_LIMIT}; \
+             a longer line is discarded by the terminal, not truncated. Shorten unit {}'s \
+             description ({} bytes) or route this unit to a non-interactive CLI.",
+            input.unit.ord,
+            input.unit.description.len(),
+        ));
+    }
+    // Everything the map could cost beyond its own budget: the heading, plus the truncation marker
+    // `worktree_layout_within` may append after spending the budget.
+    let framing = LAYOUT_PREFIX.len() + crate::repo::LAYOUT_TRUNCATED.len();
+    let room = PTY_PROMPT_LIMIT - overhead;
+    let layout = room
+        .checked_sub(framing)
+        .filter(|budget| *budget >= MIN_USEFUL_LAYOUT)
+        .and_then(|budget| {
+            input
+                .workdir
+                .as_deref()
+                .and_then(|d| crate::repo::worktree_layout_within(d, budget))
+        });
+    Ok(skill_prompt(&input.unit, layout.as_deref()))
 }
 
 /// Map a dash-form `skill_ref` onto the CLI's invocable name. Claude Code invokes PLUGIN skills
@@ -1260,28 +1335,163 @@ mod tests {
         let appendix = crate::assumptions::PROMPT_CONVENTION;
         let mut u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
         // authored path: no skill → bare description + the conventions appendix.
-        assert_eq!(skill_prompt(&u), format!("add SSO login{appendix}"));
+        assert_eq!(skill_prompt(&u, None), format!("add SSO login{appendix}"));
         // skill-driven: leads with /<skill> so the harness expands the named skill deterministically.
         u.skill_ref = Some("wicked-testing-semantic-reviewer".to_string());
         assert_eq!(
-            skill_prompt(&u),
+            skill_prompt(&u, None),
             format!("Invoke your skill \"wicked-testing:semantic-reviewer\" (via the Skill tool) and complete this task under its instructions: add SSO login{appendix}")
         );
         // an empty skill_ref is treated as no skill (authored path), never a bare "/ ...".
         u.skill_ref = Some(String::new());
-        assert_eq!(skill_prompt(&u), format!("add SSO login{appendix}"));
+        assert_eq!(skill_prompt(&u, None), format!("add SSO login{appendix}"));
         // Engine-internal judge/triage prompts stay byte-exact — no appendix.
         let judge = WorkUnit::pending("validator-agent", "validator", 1, "judge this");
-        assert_eq!(skill_prompt(&judge), "judge this");
+        assert_eq!(skill_prompt(&judge, None), "judge this");
         let triage = WorkUnit::pending("triage-agent", "triage", 1, "triage this");
-        assert_eq!(skill_prompt(&triage), "triage this");
+        assert_eq!(skill_prompt(&triage, None), "triage this");
+    }
+
+    /// FINDING-048. Three things have to hold at once for the map to be worth carrying: a real unit
+    /// gets it, an engine-internal judge/triage prompt still does NOT (its verdict contract is
+    /// byte-exact), and the appendix stays last so the output contract is the final instruction read.
+    #[test]
+    fn the_worktree_map_reaches_work_units_and_no_engine_internal_prompt() {
+        let appendix = crate::assumptions::PROMPT_CONVENTION;
+        let map = "src/ [Cargo.toml]; root files: README.md";
+        let u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
+
+        let with = skill_prompt(&u, Some(map));
+        assert_eq!(
+            with,
+            format!("add SSO login{LAYOUT_PREFIX}{map}{appendix}"),
+            "the map sits between the task and the appendix"
+        );
+        assert!(!with.contains('\n'), "prompts stay single-line: {with}");
+        // No worktree ⇒ the prompt is byte-identical to the pre-FINDING-048 one. A caller with
+        // nothing to say must say nothing, not print an empty heading.
+        assert_eq!(skill_prompt(&u, None), format!("add SSO login{appendix}"));
+
+        for internal in ["validator", "triage"] {
+            let unit = WorkUnit::pending("agent", internal, 1, "judge this");
+            assert_eq!(
+                skill_prompt(&unit, Some(map)),
+                "judge this",
+                "{internal} prompts are authored end to end — a map would corrupt the verdict contract"
+            );
+        }
+    }
+
+    /// The seam between the pure prompt builder and the filesystem: `unit_prompt` must actually read
+    /// the workdir it is given, and must degrade to the plain prompt when there is no workdir (or the
+    /// path does not exist) rather than failing the unit.
+    #[test]
+    fn unit_prompt_reads_the_workdir_and_tolerates_its_absence() {
+        let root = std::env::temp_dir().join(format!("wicked-unitprompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("backend")).unwrap();
+        std::fs::write(root.join("backend").join("pyproject.toml"), "").unwrap();
+
+        let unit = WorkUnit::pending("s:build", "s", 1, "fix the API");
+        let mut input = StepInput {
+            run_id: "layout-seam".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: unit.clone(),
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(root.clone()),
+            governance: None,
+            prior_outputs: vec![],
+        };
+        let seen = unit_prompt(&input);
+        assert!(
+            seen.contains("backend/ [pyproject.toml]"),
+            "the real tree must reach the prompt: {seen}"
+        );
+
+        input.workdir = None;
+        assert_eq!(unit_prompt(&input), skill_prompt(&unit, None));
+        input.workdir = Some(root.join("gone"));
+        assert_eq!(
+            unit_prompt(&input),
+            skill_prompt(&unit, None),
+            "a workdir that is not there degrades to the plain prompt — it never fails the unit"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A pty turn is submitted as one line, and a canonical-mode terminal DISCARDS any line that
+    /// reaches `MAX_CANON` (1024) — it does not truncate it and does not report anything, so the
+    /// runner waits out its full timeout for output that can never come. Two `session_runner` tests
+    /// hung for 80 minutes on exactly this before the limit existed: with a workdir set, the map put
+    /// the prompt 854 bytes over the line even with an empty description.
+    #[test]
+    fn a_pty_prompt_always_fits_one_terminal_line() {
+        let root = std::env::temp_dir().join(format!("wicked-ptyprompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // A tree wide enough that an unbounded map would blow the line on its own.
+        for i in 0..40 {
+            std::fs::create_dir_all(root.join(format!("service-{i:03}"))).unwrap();
+            std::fs::write(root.join(format!("service-{i:03}")).join("Cargo.toml"), "").unwrap();
+        }
+
+        let mut input = StepInput {
+            run_id: "pty-line".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("s:build", "s", 1, "fix the API"),
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(root.clone()),
+            governance: None,
+            prior_outputs: vec![],
+        };
+
+        let p = pty_unit_prompt(&input).expect("a short description must not fail");
+        // The submitting newline occupies the same line buffer, so it counts against the limit.
+        let line_bytes = p.len() + 1;
+        assert!(
+            line_bytes <= PTY_PROMPT_LIMIT,
+            "prompt is {line_bytes} bytes with the newline, over the {PTY_PROMPT_LIMIT} limit"
+        );
+        assert!(
+            !p.contains('\n'),
+            "an embedded newline would end the turn early: {p}"
+        );
+        // Trimmed, not dropped: the map is the point of FINDING-048 and still has to survive.
+        assert!(
+            p.contains("service-000/ [Cargo.toml]"),
+            "the map must still reach the worker: {p}"
+        );
+        // The unbounded prompt is what would have deadlocked, so the cap has to be doing real work.
+        assert!(
+            unit_prompt(&input).len() + 1 > PTY_PROMPT_LIMIT,
+            "this fixture no longer exercises the cap"
+        );
+
+        // A description that cannot fit fails fast and names the cause. Silence here is the bug:
+        // this path burned the whole turn timeout for any description over ~509 bytes, pre-048 too.
+        input.unit.description = "x".repeat(PTY_PROMPT_LIMIT);
+        let err = pty_unit_prompt(&input).expect_err("an over-long description must not be sent");
+        assert!(
+            err.contains("pty turn cannot exceed"),
+            "the failure must say why: {err}"
+        );
+
+        // No worktree ⇒ same prompt the non-pty runners build; the cap changes nothing on its own.
+        input.unit.description = "fix the API".to_string();
+        input.workdir = None;
+        assert_eq!(pty_unit_prompt(&input).unwrap(), unit_prompt(&input));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn a_skill_prompt_flows_through_build_argv_as_one_guarded_arg() {
         let mut u = WorkUnit::pending("s:build", "s", 1, "do it");
         u.skill_ref = Some("wicked-testing-plan".to_string());
-        let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u), &[]);
+        let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u, None), &[]);
         assert_eq!(argv.len(), 3, "one guarded prompt arg");
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "-p");

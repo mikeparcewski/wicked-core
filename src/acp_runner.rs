@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 
 use crate::command::Command;
 use crate::event::CoreEvent;
-use crate::execute_wrapped::{skill_prompt, WrappedCliStepRunner};
+use crate::execute_wrapped::{unit_prompt, WrappedCliStepRunner};
 use crate::workflow::{
     DeltaSink, GovernanceContext, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus,
     Usage,
@@ -1517,7 +1517,7 @@ impl AcpStepRunner {
                 }
             };
 
-            let prompt = skill_prompt(&input.unit);
+            let prompt = unit_prompt(input);
             return match exec_turn_acp(&mut proc, &prompt, prior_outputs, emit, self.timeout) {
                 Ok(result) if result.status == StepStatus::Ok => StepOutput {
                     run_id: input.run_id.clone(),
@@ -1659,7 +1659,7 @@ impl AcpStepRunner {
         };
 
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let prompt = skill_prompt(&input.unit);
+        let prompt = unit_prompt(input);
 
         match exec_turn_acp(&mut proc, &prompt, prior_outputs, emit, self.timeout) {
             Ok(result) if result.status == StepStatus::Ok => StepOutput {
