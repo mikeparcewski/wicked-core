@@ -856,6 +856,13 @@ fn arm_acp_governance(input: &StepInput, gov: &GovernanceContext) -> std::io::Re
             "PreToolUse": [
                 { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
             ]
+        },
+        // FINDING-045: keep the session out of the operator's agent-tooling state and credentials.
+        // The wrapped path carries this on argv as well; here the settings file is the only carrier,
+        // because the ACP binary is a bridge with its own flag surface — `--disallowedTools` is not
+        // ours to assume it accepts, but it does forward `--settings`.
+        "permissions": {
+            "deny": crate::execute_wrapped::deny_rules().unwrap_or_default()
         }
     });
     let dir = decisions_path
