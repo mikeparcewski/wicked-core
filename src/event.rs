@@ -58,7 +58,16 @@ pub enum CoreEvent {
         ok: bool,
     },
     /// The chat's warm sessions were closed and their processes reaped.
-    ChatClosed { chat: String },
+    ChatClosed {
+        chat: String,
+        /// Why — `"requested"`, `"idle"`, or `"pool_cap"`
+        /// (see [`crate::acp_runner::ChatCloseReason`]).
+        ///
+        /// Required, not optional: the daemon now closes chats on its own, and a client that saw
+        /// only `chat` could not tell a reclaim from an operator's own close — it would report the
+        /// reclaim as a chat that disappeared for no reason.
+        reason: String,
+    },
     /// A session was created and planning began.
     SessionStarted {
         session: String,
@@ -1190,8 +1199,8 @@ impl CoreEvent {
             } => {
                 json!({ "type": "chatReply", "chat": chat, "cliKey": cli_key, "text": text, "ok": ok })
             }
-            CoreEvent::ChatClosed { chat } => {
-                json!({ "type": "chatClosed", "chat": chat })
+            CoreEvent::ChatClosed { chat, reason } => {
+                json!({ "type": "chatClosed", "chat": chat, "reason": reason })
             }
         }
     }

@@ -159,6 +159,42 @@ impl Drop for ShutdownGuard {
     }
 }
 
+/// Start the background thread that reclaims idle chats.
+///
+/// Every warm chat seat pins an ACP bridge plus an agent child process — ~520 MB resident apiece —
+/// and nothing else ever releases them: `chat_close` reaps correctly but is only called by a
+/// client that is still alive to call it. A closed laptop lid, a crashed tab, or a page navigated
+/// away leaves the seats warm for the daemon's whole lifetime (FINDING-027: 25 processes / 3.30 GB
+/// after 7h34m, still climbing during pure observation). This thread is the only reclamation path
+/// that does not depend on the client, which is exactly why it has to exist.
+///
+/// Holds a [`Weak`](std::sync::Weak), so it stops when the last `Core`/runner handle drops instead
+/// of pinning the runner alive forever and inverting the leak it was written to fix.
+///
+/// `WICKED_CHAT_IDLE_SECS=0` disables it entirely, for a host that would rather pay the memory
+/// than ever have a chat reclaimed underneath it.
+fn spawn_chat_reaper(runner: &std::sync::Arc<AcpStepRunner>) {
+    let ttl = AcpStepRunner::chat_idle_ttl();
+    if ttl.is_zero() {
+        return;
+    }
+    let weak = std::sync::Arc::downgrade(runner);
+    // Sweep at a fraction of the TTL so a chat is reclaimed within ~10% of when it aged out rather
+    // than up to a full TTL late; floored at 1s so a tiny test TTL cannot spin the CPU.
+    let tick = std::cmp::max(ttl / 10, std::time::Duration::from_secs(1));
+    std::thread::spawn(move || loop {
+        std::thread::sleep(tick);
+        // Upgrade, act, and DROP the strong ref before sleeping again — holding it across the
+        // sleep would keep the runner (and its child processes) alive past the Core.
+        match weak.upgrade() {
+            Some(runner) => {
+                runner.chat_reap_idle(ttl);
+            }
+            None => break,
+        }
+    });
+}
+
 /// A handle to the core runtime. Clone freely — every clone funnels into the single store-owning
 /// actor thread, so callers compose the core services without contending on the SQLite file. When
 /// the last clone drops, the actor shuts down (see [`ShutdownGuard`]).
@@ -268,9 +304,23 @@ impl Core {
         Ok(self.chat_runner()?.chat_seats(chat_id))
     }
 
-    /// Close a chat's warm sessions (idempotent); emits `ChatClosed`.
+    /// Every chat currently holding warm seats, with how long each has been idle.
+    ///
+    /// Each warm seat pins a bridge plus an agent child process (~520 MB resident), and clients
+    /// mint chat ids freely — without an enumerate surface an accumulation is invisible until the
+    /// host runs out of memory (FINDING-027).
+    pub fn chat_list(&self) -> anyhow::Result<Vec<crate::acp_runner::ChatInfo>> {
+        Ok(self.chat_runner()?.chat_list())
+    }
+
+    /// Close a chat's warm sessions (idempotent); emits `ChatClosed { reason: "requested" }`.
+    ///
+    /// Always `Requested`: this entry point is only ever reached from an operator surface. The
+    /// daemon's own reclamations go through the runner directly with their own reason, so a client
+    /// can always tell "I closed this" from "the daemon took it back".
     pub fn chat_close(&self, chat_id: &str) -> anyhow::Result<()> {
-        self.chat_runner()?.chat_close(chat_id);
+        self.chat_runner()?
+            .chat_close(chat_id, crate::acp_runner::ChatCloseReason::Requested);
         Ok(())
     }
 
@@ -348,6 +398,8 @@ impl Core {
     /// caller can call [`AcpStepRunner::drop_session`] after each run completes to release the
     /// ACP child processes. See [`Core::spawn`] for the simpler version that manages the runner
     /// internally.
+    ///
+    /// Also starts the chat reaper — see [`spawn_chat_reaper`].
     pub fn spawn_with_acp_sessions(
         path: impl Into<String>,
     ) -> (Core, std::sync::Arc<AcpStepRunner>) {
@@ -372,6 +424,7 @@ impl Core {
                 None,
             )
         });
+        spawn_chat_reaper(&runner);
         let core = Core {
             tx: tx.clone(),
             pty,
