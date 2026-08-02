@@ -432,6 +432,26 @@ impl PhaseDef {
         self.role = r;
         self
     }
+    /// Pin the shipped deterministic evidence floor onto this phase (FINDING-025 item 1). Engages
+    /// gate layers 1 AND 2 — layer 2 (the agent judge) is keyed off the same `Option` layer 1 is,
+    /// so a phase with no pin has neither.
+    ///
+    /// `builtin_floors::tests::the_floor_is_pinned_exactly_where_a_diff_is_the_evidence` asserts
+    /// the placement in BOTH directions — which phases carry the floor and which must not — so
+    /// neither a new Evaluator shipping ungated nor the floor spreading to a phase that writes no
+    /// code can land silently.
+    ///
+    /// Safe to embed as data because `pipeline::pre_distribute` seeds the pin into the vault
+    /// immediately before `attach_pinned_validators` reads it (`builtin_floors::seed_builtin_floors`,
+    /// idempotent and content-addressed). `pre_distribute` — not the `plan_and_distribute` wrapper —
+    /// because that is what the actor calls directly, so it is the one function BOTH entries reach.
+    /// The seed is on the PLAN path, not just at actor boot, because `attach_pinned_validators` is
+    /// fail-closed on an unresolvable pin and `run_session` is a public entry point that never
+    /// constructs an actor.
+    fn evidence_floor(mut self) -> Self {
+        self.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
+        self
+    }
     fn after(mut self, dep: &str) -> Self {
         self.depends_on.push(dep.to_string());
         self
@@ -699,6 +719,7 @@ pub fn feature_def() -> WorkflowDef {
                     },
                 )
                 .role(PhaseRole::Evaluator)
+                .evidence_floor()
                 .after("build"),
             PhaseDef::new("test", StageKind::Test)
                 .gate(
@@ -736,6 +757,7 @@ pub fn bug_def() -> WorkflowDef {
                 )
                 .verified()
                 .role(PhaseRole::Evaluator)
+                .evidence_floor()
                 .after("fix"),
         ],
     }
@@ -774,6 +796,7 @@ pub fn migration_def() -> WorkflowDef {
                 )
                 .verified()
                 .role(PhaseRole::Evaluator)
+                .evidence_floor()
                 .after("cutover"),
             PhaseDef::new("cleanup", StageKind::Build).after("verify"),
         ],

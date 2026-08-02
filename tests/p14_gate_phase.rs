@@ -1,7 +1,10 @@
-//! Proves the `gate-phase` seam closes the "shipped workflows are ungated" gap: a produced drop-in
-//! workflow genuinely ENGAGES the rev0.4 dual-validator gate. The built-in feature/bug/migration defs
-//! ship with `validator_pin: null` on every phase, so the gate is INERT for them; `gate-phase` pins an
-//! APPROVED validator onto a phase and writes a re-id'd drop-in. This test re-derives that produced
+//! Proves the `gate-phase` seam lets an operator arm a gate on a phase of their choosing: a produced
+//! drop-in workflow genuinely ENGAGES the rev0.4 dual-validator gate. The built-ins now ship a
+//! deterministic floor on their Evaluator phases (FINDING-025 item 1), but every OTHER phase is still
+//! unpinned — `feature`'s `build` among them — so an operator who wants a criterion of their own on a
+//! specific phase still needs this seam. `gate-phase` pins an APPROVED validator onto a phase and
+//! writes a re-id'd drop-in, leaving the shipped floors and the built-in itself untouched. This test
+//! re-derives that produced
 //! artifact WITHOUT a live `claude` call: it builds an approved `DeterministicValidator` directly,
 //! vaults it, pins it onto a `feature_def` phase, serializes to a temp overlay dir, and then loads the
 //! drop-in back through the SAME registry the planner uses — asserting the phase carries the pin and the
@@ -49,8 +52,9 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         "store returns the content pin"
     );
 
-    // 2. The base shipped def ships UNGATED — its `build` phase carries no validator_pin. Prove that,
-    //    so the pinning below is a genuine change of state (inert → engaged).
+    // 2. The `build` phase ships with no validator_pin (the shipped floor sits on the Evaluator,
+    //    `adversarial-review`, not here). Prove that, so the pinning below is a genuine change of
+    //    state for THIS phase (inert → engaged) rather than an overwrite of something already there.
     let base = feature_def();
     const PHASE: &str = "build";
     let base_build = base
@@ -60,7 +64,7 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         .expect("feature def has a build phase");
     assert!(
         base_build.validator_pin.is_none(),
-        "the shipped feature `build` phase is ungated (validator_pin: null) — the gap this closes"
+        "the shipped feature `build` phase carries no pin of its own — the gap this seam closes"
     );
 
     // 3. Pin the approved validator onto that phase and RE-ID the def (what `gate-phase` does), then
@@ -108,14 +112,31 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         Some(approved_pin.as_str()),
         "the build phase carries the approved pin — the gate is armed"
     );
-    assert!(
-        resolved
-            .phases
-            .iter()
-            .filter(|p| p.id != PHASE)
-            .all(|p| p.validator_pin.is_none()),
-        "only the named phase was gated"
+    // `gate-phase` adds ONE pin and disturbs nothing else. Two assertions, in order, because the
+    // second is only meaningful given the first: `zip` stops at the shorter side, so a produced def
+    // that dropped, added, or reordered phases would slip through a pin-only comparison — the loop
+    // would simply compare fewer pairs, or the right pins against the wrong phases, and still pass.
+    assert_eq!(
+        resolved.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
+        base.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
+        "gate-phase must reproduce the base phase list exactly — same phases, same order"
     );
+    // Compared against the base rather than against `None`, because the built-ins are no longer
+    // uniformly unpinned: `feature`'s `adversarial-review` ships the evidence floor (FINDING-025
+    // item 1). Asserting `None` here would have quietly turned this into "gate-phase must be the
+    // only source of pins", which was never the property under test.
+    for (got, want) in resolved
+        .phases
+        .iter()
+        .zip(base.phases.iter())
+        .filter(|(p, _)| p.id != PHASE)
+    {
+        assert_eq!(
+            got.validator_pin, want.validator_pin,
+            "gate-phase changed the pin on `{}`, which it was not asked to gate",
+            got.id
+        );
+    }
 
     // 5b. That pin resolves to the APPROVED validator in the vault — the exact read
     //     `attach_pinned_validators` performs to attach it and engage the gate. This is the proof the

@@ -180,6 +180,26 @@ pub(crate) fn run(
     // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
     GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
 
+    // Seed the deterministic floor the built-in Evaluator phases pin (FINDING-025 item 1).
+    //
+    // This copy is an EARLY WARNING, not the guarantee. The guarantee lives on the plan path
+    // (`pipeline::plan_and_distribute` seeds immediately before `attach_pinned_validators`), because
+    // that is the one choke point every caller crosses — including `run_session`, which is public and
+    // never constructs an actor. Seeding only here is exactly the bug that shipped in the first cut:
+    // correct for the daemon, a hard bail for everyone else.
+    //
+    // What this call buys, at boot rather than at first run: the floor is visible to an operator
+    // listing the vault, and a store that cannot hold it says so once, here, in terms naming the
+    // cause — instead of surfacing later as an unresolvable-pin error they have to decode. So it is
+    // best-effort in the same sense as the sidecars below, and for the same reason: a failure must
+    // not stop the engine coming up, and the plan path will try again and fail loudly if it must.
+    if let Err(e) = crate::builtin_floors::seed_builtin_floors(&mut store) {
+        eprintln!(
+            "wicked-core: could not seed the built-in evidence floor ({e}); runs of the built-in \
+             workflows will fail closed at plan time on an unresolvable validator pin"
+        );
+    }
+
     let sidecar_base: String = sidecar_base(&path);
 
     // The orchestrator's episodic memory (a SEPARATE single-writer store, sibling of the estate db).

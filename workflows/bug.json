@@ -13,7 +13,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "reproduce",
@@ -29,7 +32,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "fix",
@@ -45,7 +51,10 @@
       "role": "creator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "agent"
+      }
     },
     {
       "id": "verify",
@@ -63,7 +72,10 @@
       "role": "evaluator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": "2fcde907d57f3ee2",
+      "executor": {
+        "type": "agent"
+      }
     }
   ]
 }
