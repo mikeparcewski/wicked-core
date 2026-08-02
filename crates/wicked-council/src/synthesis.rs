@@ -69,12 +69,19 @@ fn sort_counts(map: BTreeMap<String, (String, u32)>) -> Vec<(String, u32)> {
 /// Synthesize the [`Verdict`] (layer c) from votes.
 ///
 /// - Winner = the recommendation with the most votes (deterministic tie-break by name).
-/// - `agreement_ratio` = winning count / total votes.
-/// - Consensus = a **strict majority** (winner count * 2 > total). Counts agreement, never
-///   confidence.
+/// - `agreement_ratio` = winning count / votes **cast**.
+/// - Consensus = a **strict majority of the SEATED council** (winner count * 2 > seated).
+///   Counts agreement, never confidence.
 /// - `risk_convergence` = risks cited by ≥1 CLI, most-cited first (the high-signal axis).
 /// - `dissent` = non-winning recommendations.
-pub fn synthesize(task_id: &str, votes: &[Vote]) -> Verdict {
+///
+/// `seated` is how many seats were convened, which is ≥ the number of votes cast — every seat
+/// that did not answer is the difference. It is a parameter rather than something derivable
+/// from `votes` precisely because a missing vote leaves no trace in the vote list: without it,
+/// one seat answering out of three is arithmetically indistinguishable from a one-seat council,
+/// and both render as 100% unanimous (FINDING-026 D). Pass 0 only when the seated count is
+/// genuinely unknown; it then degrades to the cast count, i.e. the pre-quorum behaviour.
+pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32) -> Verdict {
     let matrix = build_matrix(votes);
     let total = matrix.total;
 
@@ -89,8 +96,11 @@ pub fn synthesize(task_id: &str, votes: &[Vote]) -> Verdict {
         winning_count as f32 / total as f32
     };
 
-    // Strict majority of the cast votes converge on the winner.
-    let consensus = total > 0 && winning_count * 2 > total;
+    // Strict majority of the SEATED council converges on the winner. `max(total)` is defensive:
+    // an under-reported `seated` (including the 0 that legacy records deserialize to) must never
+    // be able to manufacture a majority — it can only fail to detect a lost one.
+    let seated = seated.max(total);
+    let consensus = total > 0 && winning_count * 2 > seated;
 
     let dissent: Vec<String> = matrix
         .recommendation_counts
@@ -99,8 +109,17 @@ pub fn synthesize(task_id: &str, votes: &[Vote]) -> Verdict {
         .map(|(rec, _)| rec.clone())
         .collect();
 
+    // Among the seats that ANSWERED, did the winner take a majority? This separates the two
+    // reasons a council fails to reach consensus, which the summary string must not conflate:
+    // the seats disagreed, or the seats never spoke. Only the first is a split.
+    let split_among_cast = winning_count * 2 <= total;
+
     let kind = match &winning_recommendation {
-        Some(rec) if consensus => format!("Consensus: {rec} ({winning_count}/{total})"),
+        Some(rec) if consensus => format!("Consensus: {rec} ({winning_count}/{seated} seats)"),
+        // Would have carried among those who answered; what stopped it is the seats that didn't.
+        Some(rec) if !split_among_cast => format!(
+            "NoConsensus (quorum lost): {rec} ({winning_count}/{seated} seats, {total} returned)"
+        ),
         Some(rec) => {
             let alt = dissent.first().cloned().unwrap_or_default();
             if alt.is_empty() {
@@ -116,6 +135,7 @@ pub fn synthesize(task_id: &str, votes: &[Vote]) -> Verdict {
         task_id: task_id.to_string(),
         kind,
         consensus,
+        seated,
         winning_recommendation,
         agreement_ratio,
         risk_convergence: matrix.risk_counts,
@@ -146,7 +166,7 @@ mod tests {
             vote("a", "Option A", "latency"),
             vote("b", "Option A", "latency"),
         ];
-        let v = synthesize("t1", &votes);
+        let v = synthesize("t1", &votes, 2);
         assert!(v.consensus, "2/2 on A must be consensus");
         assert_eq!(v.winning_recommendation.as_deref(), Some("Option A"));
         assert_eq!(v.agreement_ratio, 1.0);
@@ -163,7 +183,7 @@ mod tests {
             vote("a", "Option A", "latency"),
             vote("b", "Option B", "cost"),
         ];
-        let v = synthesize("t2", &votes);
+        let v = synthesize("t2", &votes, 2);
         assert!(!v.consensus, "1-1 split is not a strict majority");
         assert!((v.agreement_ratio - 0.5).abs() < f32::EPSILON);
         assert!(v.kind.starts_with("NoConsensus"));
@@ -176,7 +196,7 @@ mod tests {
             vote("b", "A", "latency"),
             vote("c", "B", "cost"),
         ];
-        let v = synthesize("t3", &votes);
+        let v = synthesize("t3", &votes, 3);
         assert!(v.consensus, "2 of 3 is a strict majority");
         assert_eq!(v.winning_recommendation.as_deref(), Some("A"));
         // 2 cite latency, 1 cites cost → latency converges higher.
@@ -188,12 +208,79 @@ mod tests {
     }
 
     #[test]
+    fn one_seat_of_three_answering_is_not_unanimous() {
+        // The FINDING-026 D record, verbatim: a three-seat council where two seats timed out and
+        // the survivor's pick was persisted as `agreement=100% dissent=0 degraded=None`. Nothing
+        // in the artifact said the quorum was lost, so the audit trail asserted a three-seat
+        // consensus that never happened.
+        let votes = vec![vote("a", "Option A", "latency")];
+        let v = synthesize("t5", &votes, 3);
+        assert!(
+            !v.consensus,
+            "1 of 3 seats is not a majority of the council: {v:?}"
+        );
+        assert_eq!(
+            v.seated, 3,
+            "the quorum denominator must survive on the record"
+        );
+        // Agreement is unchanged and still honest about what it measures: of the seats that
+        // answered, all of them agreed. It is `consensus` + `seated` that carry the quorum.
+        assert_eq!(v.agreement_ratio, 1.0);
+        assert!(
+            v.kind.contains("quorum lost") && v.kind.contains("1/3 seats"),
+            "the summary must name the lost quorum, got {:?}",
+            v.kind
+        );
+    }
+
+    #[test]
+    fn two_seats_of_three_agreeing_still_carries() {
+        // Quorum is a majority of the seated council, not unanimity: losing one seat of three
+        // must not veto a decision the remaining two genuinely converged on. Otherwise the fix
+        // for a false positive would just manufacture false negatives.
+        let votes = vec![vote("a", "A", "latency"), vote("b", "A", "latency")];
+        let v = synthesize("t6", &votes, 3);
+        assert!(v.consensus, "2 of 3 seats is a strict majority: {v:?}");
+        assert!(
+            v.kind.starts_with("Consensus: A (2/3 seats)"),
+            "{:?}",
+            v.kind
+        );
+    }
+
+    #[test]
+    fn a_split_among_the_seats_that_answered_is_not_reported_as_lost_quorum() {
+        // Two distinct reasons a council fails to converge, and the summary must not conflate
+        // them: 1-1 among two of three seats is a genuine disagreement, not silence.
+        let votes = vec![vote("a", "A", "latency"), vote("b", "B", "cost")];
+        let v = synthesize("t7", &votes, 3);
+        assert!(!v.consensus);
+        assert!(
+            !v.kind.contains("quorum lost"),
+            "a real split must not be reported as absence, got {:?}",
+            v.kind
+        );
+        assert_eq!(v.kind, "NoConsensus: A vs B");
+    }
+
+    #[test]
+    fn an_unreported_seated_count_degrades_to_the_cast_count() {
+        // `seated: 0` is what a pre-quorum record deserializes to (`#[serde(default)]`) and what
+        // a caller passes when it genuinely does not know. It must never MANUFACTURE a majority
+        // by shrinking the denominator below what was actually cast.
+        let votes = vec![vote("a", "A", "latency"), vote("b", "A", "latency")];
+        let v = synthesize("t8", &votes, 0);
+        assert!(v.consensus, "2/2 stands on the cast count alone");
+        assert_eq!(v.seated, 2, "0 must widen to the cast count, never stay 0");
+    }
+
+    #[test]
     fn case_insensitive_recommendations_converge() {
         let votes = vec![
             vote("a", "JWT", "revocation"),
             vote("b", "jwt", "revocation"),
         ];
-        let v = synthesize("t4", &votes);
+        let v = synthesize("t4", &votes, 2);
         assert!(v.consensus);
         assert_eq!(v.agreement_ratio, 1.0);
     }

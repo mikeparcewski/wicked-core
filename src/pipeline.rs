@@ -480,17 +480,21 @@ pub(crate) fn apply_distributions(
         u.routing = Some(dist.routing.clone());
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
-        let (routing_method, agreement_pct, returned, dissent, degraded_reason) =
+        let (routing_method, agreement_pct, returned, seated, dissent, degraded_reason) =
             match &dist.routing {
                 RoutingInfo::Council {
                     agreement_pct,
                     returned,
+                    seated,
                     dissent,
                     ..
                 } => (
                     "council".to_string(),
                     Some(*agreement_pct),
                     Some(*returned),
+                    // Already an Option — an unknown seat count stays unknown on the wire rather
+                    // than being flattened into a number no one measured.
+                    *seated,
                     Some(*dissent),
                     None,
                 ),
@@ -499,12 +503,18 @@ pub(crate) fn apply_distributions(
                     None,
                     None,
                     None,
+                    None,
                     Some(reason.clone()),
                 ),
-                RoutingInfo::EvaluatorDistinct { .. } => {
-                    ("evaluator_distinct".to_string(), None, None, None, None)
-                }
-                RoutingInfo::Tool => ("tool".to_string(), None, None, None, None),
+                RoutingInfo::EvaluatorDistinct { .. } => (
+                    "evaluator_distinct".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                RoutingInfo::Tool => ("tool".to_string(), None, None, None, None, None),
             };
         emit(CoreEvent::UnitDistributed {
             session: pre.session_id.clone(),
@@ -513,6 +523,7 @@ pub(crate) fn apply_distributions(
             routing_method,
             agreement_pct,
             returned,
+            seated,
             dissent,
             degraded_reason,
         });

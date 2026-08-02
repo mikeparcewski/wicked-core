@@ -100,6 +100,12 @@ impl wicked_council::EventSink for RelaySink {
                     * 100.0)
                     .round() as u8,
                 votes: payload["votes"].as_u64().unwrap_or(0) as u32,
+                // `map`, not `unwrap_or`: an absent key means the emitter reported no seat count,
+                // and both candidate sentinels lie — `0` is an impossible denominator a consumer
+                // could divide by, and `votes` would state that every seat answered. The live
+                // emitter always sends it (same binary), so this only decides how a replayed or
+                // hand-built payload reads.
+                seated: payload["seated"].as_u64().map(|s| s as u32),
             },
             _ => return,
         };
@@ -339,8 +345,11 @@ fn pct(x: f32) -> u8 {
 /// was nothing in it to act on.
 ///
 /// Three levels, most specific first: the seats' own reported failures; failing that, the
-/// lifecycle state (which at least distinguishes "ran out of time" from "could not start" from
-/// "still running when polled"); and the state is always named so the two are never confused.
+/// council's OWN failure (a panic in synthesis or emission belongs to no seat, so it has no
+/// entry in `seat_failures` — without this it reproduced the same undiagnosable string the
+/// finding exists to eliminate, FINDING-026 E); failing that, the lifecycle state (which at
+/// least distinguishes "ran out of time" from "could not start" from "still running when
+/// polled"). The state is always named so the levels are never confused.
 fn no_vote_reason(status: &PollStatus) -> String {
     let state = match status.state {
         TaskState::Queued => "never started (still queued when polled)",
@@ -352,7 +361,10 @@ fn no_vote_reason(status: &PollStatus) -> String {
     };
 
     if status.seat_failures.is_empty() {
-        return format!("council {state} (no per-seat reason recorded)");
+        return match &status.failure_detail {
+            Some(detail) => format!("council {state} — the council itself failed: {detail}"),
+            None => format!("council {state} (no per-seat reason recorded)"),
+        };
     }
 
     let seats: Vec<String> = status
@@ -360,7 +372,13 @@ fn no_vote_reason(status: &PollStatus) -> String {
         .iter()
         .map(|f| format!("{}: {}", f.cli, f.failure.reason()))
         .collect();
-    format!("council {state} — {}", seats.join("; "))
+    let seats = format!("council {state} — {}", seats.join("; "));
+    // Both can be present: seats failed AND the council then unwound. Neither explains the
+    // other, so neither is dropped.
+    match &status.failure_detail {
+        Some(detail) => format!("{seats}; the council itself failed: {detail}"),
+        None => seats,
+    }
 }
 
 /// Resolve the assigned CLI from the council's poll status AND the routing provenance.
@@ -423,6 +441,11 @@ fn route_from_status(
                     winner: seat,
                     agreement_pct: pct(verdict.agreement_ratio),
                     returned: status.returned,
+                    // Off the STATUS, not the verdict: the verdict's own `seated` degrades to the
+                    // cast count when it was not recorded, while the status counts the seats the
+                    // ledger actually convened. They agree on every live path; where they don't,
+                    // the ledger is the one that observed the council.
+                    seated: Some(status.seated),
                     dissent: verdict.dissent.len() as u32,
                 },
             );
@@ -444,17 +467,20 @@ mod tests {
             task_id: "t".into(),
             state,
             returned: 1,
+            seated: 1,
             pending: 0,
             verdict: winner.map(|w| Verdict {
                 task_id: "t".into(),
                 kind: "Consensus".into(),
                 consensus: true,
+                seated: 1,
                 winning_recommendation: Some(w.to_string()),
                 agreement_ratio: 1.0,
                 risk_convergence: vec![],
                 dissent: vec![],
             }),
             seat_failures: vec![],
+            failure_detail: None,
         }
     }
 
@@ -524,6 +550,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_council_that_failed_on_its_own_names_that_in_the_degrade_reason() {
+        // A panic in synthesis, ranking or emission belongs to no seat, so `seat_failures` is
+        // empty and the old text fell through to "(no per-seat reason recorded)" — exactly the
+        // undiagnosable string FINDING-026 exists to eliminate, on the one path where the cause
+        // WAS captured.
+        let roster = vec!["fake-a".to_string(), "fake-b".to_string()];
+        let map = cap_map(&["fake-a", "fake-b"]);
+        let mut st = status_with_winner(None, TaskState::Failed);
+        st.failure_detail = Some("rank store exploded".into());
+
+        let (cli, routing) = route_from_status(Some(&st), &roster, &map);
+        assert_eq!(cli, "fake-a", "the unit still routes somewhere");
+        let RoutingInfo::Degraded { reason } = &routing else {
+            panic!("a failed council degrades: {routing:?}");
+        };
+        assert!(
+            reason.contains("rank store exploded"),
+            "the council's own failure is the only account of what happened, got {reason:?}"
+        );
+        assert!(
+            !reason.contains("no per-seat reason recorded"),
+            "a recorded cause must not be reported as an absent one, got {reason:?}"
+        );
+    }
+
     /// RelaySink translates the council's string-keyed events into run-scoped CoreEvents
     /// with the owning (session, ord) attached, and drops non-run-scoped event types.
     #[test]
@@ -544,7 +596,7 @@ mod tests {
         );
         sink.emit(
             wicked_apps_core::EV_COUNCIL_VOTED,
-            &serde_json::json!({"consensus": true, "agreement_ratio": 0.5, "votes": 4}),
+            &serde_json::json!({"consensus": true, "agreement_ratio": 0.5, "votes": 4, "seated": 5}),
         );
         // Not run-scoped — must be dropped, not translated.
         sink.emit(wicked_apps_core::EV_CLI_RANKED, &serde_json::json!({}));
@@ -558,7 +610,7 @@ mod tests {
             events[0]
         );
         assert!(
-            matches!(&events[1], CoreEvent::CouncilVoted { session, ord, consensus: true, agreement_pct: 50, votes: 4 }
+            matches!(&events[1], CoreEvent::CouncilVoted { session, ord, consensus: true, agreement_pct: 50, votes: 4, seated: Some(5) }
                 if session == "s1" && *ord == 3),
             "voted → CouncilVoted with ratio as percent, got {:?}",
             events[1]
@@ -600,10 +652,15 @@ mod tests {
                     consensus: false,
                     agreement_pct: 0,
                     votes: 0,
+                    // NOT `Some(0)` and NOT `Some(votes)`. A seat count nobody reported is
+                    // unknown: `0` is an impossible denominator a consumer could divide by, and
+                    // copying `votes` would assert that every seat answered — the false-complete
+                    // reading this field exists to prevent (review on #151).
+                    seated: None,
                     ..
                 }
             ),
-            "mistyped fields → zero defaults, got {:?}",
+            "mistyped fields → zero defaults, absent seat count → unknown, got {:?}",
             events[1]
         );
     }

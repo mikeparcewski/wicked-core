@@ -289,6 +289,27 @@ pub enum RoutingInfo {
         agreement_pct: u8,
         /// How many seats returned a vote.
         returned: u32,
+        /// How many seats were CONVENED — the denominator `returned` must be read against.
+        ///
+        /// `returned: 1` describes a complete one-seat council and a three-seat council that
+        /// lost two seats, and only this field separates them. Recorded on the routing artifact
+        /// itself so an auditor reading a stored decision never has to reconstruct the quorum
+        /// from the session's roster (FINDING-026 D).
+        ///
+        /// `None` means UNKNOWN, never "equal to `returned`" — a unit distributed by an engine
+        /// older than that fix has no seat count on it.
+        ///
+        /// The `Option` is what carries the back-compat: serde reads a missing `Option` field as
+        /// `None`, so the `default` below is belt-and-braces (proven by mutation — the legacy-load
+        /// test passes with it removed). It matters because `WorkUnit` round-trips its WHOLE
+        /// struct through `metadata` and `session_units` DROPS any unit that fails to deserialize
+        /// (`from_node(n).ok()`): a required field here would silently erase every historical
+        /// council unit from the run view, no error anywhere.
+        ///
+        /// Not `u32` defaulting to 0 — that is an impossible denominator, and it would reach the
+        /// UI as "3 of 0 seats" instead of falling back to the unquantified wording.
+        #[serde(default)]
+        seated: Option<u32>,
         /// How many dissenting voices the verdict recorded.
         dissent: u32,
     },
@@ -495,6 +516,59 @@ mod tests {
         assert_eq!(
             u, back,
             "WorkUnit must survive a node round-trip losslessly"
+        );
+    }
+
+    /// A unit distributed before `seated` existed must still load. `WorkUnit::from_node` parses the
+    /// whole struct out of `metadata`, and `session_units` drops anything that fails
+    /// (`from_node(n).ok()`), so a required `seated` would have made every historical council unit
+    /// vanish from the run view with no error anywhere — the run would just show fewer units than
+    /// it ran. Caught in review on #151.
+    #[test]
+    fn a_council_unit_stored_before_seated_existed_still_loads() {
+        let mut u = WorkUnit::pending("s-legacy:u1", "s-legacy", 1, "Do step one");
+        u.status = UnitStatus::Distributed;
+        u.assigned_cli = Some("claude".to_string());
+        let mut node = u.to_node();
+
+        // Rewrite the routing artifact into its pre-`seated` shape, exactly as it sits on disk.
+        node.metadata.insert(
+            "routing".to_string(),
+            serde_json::json!({
+                "method": "council",
+                "winner": "claude",
+                "agreement_pct": 100,
+                "returned": 1,
+                "dissent": 0,
+            }),
+        );
+
+        let back = WorkUnit::from_node(&node).expect("a pre-`seated` council unit must still load");
+        let routing = back.routing.expect("a council unit carries routing");
+        let RoutingInfo::Council {
+            seated, returned, ..
+        } = &routing
+        else {
+            panic!("expected council routing, got {routing:?}");
+        };
+        assert_eq!(*returned, 1);
+        assert_eq!(
+            *seated, None,
+            "an absent seat count is UNKNOWN — inferring `seated == returned` would relabel every \
+             historical collapsed council as a complete one"
+        );
+
+        // …and it goes back out as an explicit `null`, NOT as an absent key. There is no
+        // `skip_serializing_if` here on purpose: the event surface already emits `seated: null`
+        // when unknown, so a UI reading a routing artifact and a UI reading the event stream get
+        // ONE rule for "unknown" instead of two. It is pinned by a test because the run view
+        // reserializes every unit it loads, which makes `null` — not absence — the shape a
+        // consumer actually sees for a legacy council.
+        let wire = serde_json::to_value(&routing).expect("serialize");
+        assert_eq!(
+            wire["seated"],
+            serde_json::Value::Null,
+            "unknown must reach consumers as null, got {wire}"
         );
     }
 
