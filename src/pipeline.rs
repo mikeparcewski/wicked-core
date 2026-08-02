@@ -883,9 +883,10 @@ fn denial_for_outcome(
         O::Unrunnable(e) => Some(format!(
             "pinned validator COULD NOT BE RUN on this host (fail-closed — a phase that cannot be \
              re-verified is treated as NOT-passed, so this is a DENY, not a criterion failure). The \
-             criterion `{criterion}` was never evaluated: {e}. The script runs as `sh -c`, under a \
-             cleared environment that keeps only a fixed allowlist, so `sh` and anything the script \
-             calls must resolve on the inherited PATH."
+             criterion `{criterion}` was never evaluated: {e}. The usual cause is resolution: the \
+             script runs as `sh -c` under a cleared environment that keeps only a fixed allowlist, so \
+             `sh` and anything the script calls must be found on the inherited PATH. Read the OS error \
+             above first — it is the authority on what actually failed."
         )),
     }
 }

@@ -337,7 +337,7 @@ pub enum SandboxLevel {
 
 /// Per-validator wall-clock bound. A validator check (`test`/`grep`/`find` …) is fast; a script that
 /// hangs or loops is KILLED at this bound and the run reports a fail-closed [`ValidatorOutcome::TimedOut`].
-pub const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The environment variables PASSED THROUGH to the (otherwise cleared) child: enough for the shell +
 /// standard tools to resolve and run, and nothing that carries a secret. Everything else — API keys,
@@ -622,8 +622,9 @@ fn reap_bounded(child: &mut std::process::Child) {
 }
 
 /// Spawn `cmd` and wait up to `timeout`; kill the whole tree + BOUNDED-reap on timeout. `Ok(Some(status))`
-/// on natural exit, `Ok(None)` on timeout (fail-closed by the caller), `Err` only if the child could not
-/// be spawned. On unix the child is spawned in its OWN process group so a timeout kills the GROUP (C4),
+/// on natural exit, `Ok(None)` on timeout (fail-closed by the caller), `Err` when the OS refused —
+/// the spawn failing, or (rarer) a `try_wait` on a child that had started. On unix the child is spawned
+/// in its OWN process group so a timeout kills the GROUP (C4),
 /// and the post-kill reap is BOUNDED (C5) so it can never hang. Non-unix keeps the single-child kill.
 fn run_bounded_status(
     mut cmd: Command,
@@ -686,9 +687,12 @@ pub enum ValidatorOutcome {
     /// Exceeded [`VALIDATOR_TIMEOUT`] and was killed with its process tree. Says nothing about the
     /// criterion: the script never reached a verdict.
     TimedOut,
-    /// The child could not be spawned at all — carries the OS error string. Typically a missing `sh`
-    /// (or missing sandbox wrapper) on PATH, which the cleared child env
-    /// ([`apply_minimal_env`]) makes more likely than an inherited-env process would.
+    /// The run never produced an exit status — carries the OS error string. Usually the spawn itself
+    /// failing on a missing `sh` (or missing sandbox wrapper) on PATH, which the cleared child env
+    /// ([`apply_minimal_env`]) makes likelier than an inherited-env process would; it also covers the
+    /// rarer case of the wait failing on a child that HAD started. Both are the same thing to a gate —
+    /// an OS-level failure, with no verdict on the criterion — so they share a variant, and the carried
+    /// error string is what distinguishes them for a human.
     Unrunnable(String),
 }
 
