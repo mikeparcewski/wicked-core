@@ -30,13 +30,45 @@ fn norm(s: &str) -> String {
         .to_lowercase()
 }
 
+/// The convergence key for a **recommendation**, which is not the same question as for a risk.
+///
+/// A risk is free prose and `norm` is the whole of its identity. A recommendation is a CHOICE
+/// AMONG ENUMERATED OPTIONS: `render_ballot` numbers them `1.`, `2.`, … and the ballot asks for
+/// `RECOMMENDATION: <option number and rationale>`. The consumer already knows this — the router
+/// resolves a winner by parsing exactly that leading integer and indexing the option table
+/// (`distribute.rs`, "Parse the leading integer from the recommendation text"). So the option
+/// number IS the vote; the rationale trailing it is commentary on the vote.
+///
+/// Keying the whole line instead made the counter and the consumer disagree about what a vote is,
+/// and because the ballot MANDATES a rationale, two seats that picked the same option always
+/// disagreed — they had explained themselves differently. At three seats every ratio was therefore
+/// 1/3, `APPROVAL_THRESHOLD` (0.75) was unreachable in principle, every council spent all
+/// `MAX_BALLOTS` rounds, and the winner fell to the tie-break: the lowest option number any seat
+/// named, i.e. position rather than judgement (FINDING-056).
+///
+/// Padded so the key orders numerically — the tie-break is key-ascending, and "10" sorts before
+/// "2" as text. A recommendation that does not lead with a digit falls back to `norm`, which is
+/// both the old behaviour and the right one: it is a council choosing among un-numbered options,
+/// where the prose is all the identity there is.
+fn rec_key(s: &str) -> String {
+    let lead: String = s
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    match lead.parse::<u32>() {
+        Ok(n) => format!("#{n:06}"),
+        Err(_) => norm(s),
+    }
+}
+
 /// Build the matrix (layer b) from raw votes (layer a).
 pub fn build_matrix(votes: &[Vote]) -> Matrix {
     let mut rec: BTreeMap<String, (String, u32)> = BTreeMap::new();
     let mut risk: BTreeMap<String, (String, u32)> = BTreeMap::new();
 
     for v in votes {
-        let rk = norm(&v.recommendation);
+        let rk = rec_key(&v.recommendation);
         if !rk.is_empty() {
             let entry = rec.entry(rk).or_insert((v.recommendation.clone(), 0));
             entry.1 += 1;
@@ -58,17 +90,30 @@ pub fn build_matrix(votes: &[Vote]) -> Matrix {
     }
 }
 
-/// Collapse a `key -> (display, count)` map into a `(display, count)` list sorted by count
-/// desc, then display asc (deterministic tie-break).
+/// Collapse a `key -> (display, count)` map into a `(display, count)` list sorted by count desc,
+/// then **key** asc.
+///
+/// The tie-break is on the key and not the display because for recommendations they now differ:
+/// the key is the option number and the display is whichever seat's rationale was seen first, so
+/// ordering by display would rank a dead tie by prose. Risks key on `norm(display)`, so for them
+/// this is the same ordering it always was, modulo case.
 fn sort_counts(map: BTreeMap<String, (String, u32)>) -> Vec<(String, u32)> {
-    let mut v: Vec<(String, u32)> = map.into_values().collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    v
+    let mut v: Vec<(String, String, u32)> = map
+        .into_iter()
+        .map(|(k, (display, count))| (k, display, count))
+        .collect();
+    v.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    v.into_iter()
+        .map(|(_, display, count)| (display, count))
+        .collect()
 }
 
 /// Synthesize the [`Verdict`] (layer c) from votes.
 ///
-/// - Winner = the recommendation with the most votes (deterministic tie-break by name).
+/// - Winner = the option with the most votes, where two seats picking the same option agree
+///   however differently they justified it (see [`rec_key`]). A dead tie breaks to the lowest
+///   option number — deterministic, and honestly reported: a 1-1-1 split is exactly the
+///   `NoConsensus` that `kind` and `agreement_ratio` then say it is.
 /// - `agreement_ratio` = winning count / votes **cast**.
 /// - Consensus = a **strict majority of the SEATED council** (winner count * 2 > seated).
 ///   Counts agreement, never confidence.
@@ -283,5 +328,84 @@ mod tests {
         let v = synthesize("t4", &votes, 2);
         assert!(v.consensus);
         assert_eq!(v.agreement_ratio, 1.0);
+    }
+
+    // FINDING-056. Shaped like a real ballot, because the defect only appears in that shape: the
+    // prompt asks for "<option number and rationale>", so two seats picking the same option in
+    // good faith still emit different strings, and keying on the whole string counted them as a
+    // disagreement. Every live council sat at exactly this — 33%, dissent 2, three seats.
+    #[test]
+    fn same_option_with_different_rationales_is_agreement() {
+        let votes = vec![
+            vote(
+                "a",
+                "1 — strongest at multi-file refactors",
+                "context limits",
+            ),
+            vote(
+                "b",
+                "1 because it handles large repos best",
+                "context limits",
+            ),
+            vote("c", "2 — faster iteration on small edits", "shallow review"),
+        ];
+        let v = synthesize("t9", &votes, 3);
+        assert!(
+            v.consensus,
+            "two seats named option 1; that is a majority however they phrased it"
+        );
+        assert!(
+            (v.agreement_ratio - 2.0 / 3.0).abs() < 1e-6,
+            "expected 2/3, got {} — the rationale is not part of the vote",
+            v.agreement_ratio
+        );
+        // The display keeps the first seat's full line, which is what the router parses its
+        // leading integer out of, so the winner still resolves to option 1.
+        assert!(
+            v.winning_recommendation
+                .as_deref()
+                .expect("winner")
+                .starts_with('1'),
+            "winner must still lead with its option number for the router to resolve it"
+        );
+        assert_eq!(v.dissent.len(), 1, "only option 2 dissents");
+    }
+
+    // The other half of the same defect: with all three seats on distinct options nothing has a
+    // majority, and the tie-break must not be able to pretend otherwise. It resolves low — but
+    // `consensus` is false and the ratio says 1/3, so the caller is told what it is buying.
+    #[test]
+    fn three_distinct_options_tie_break_low_without_claiming_consensus() {
+        let votes = vec![
+            vote("a", "3 — best at tests", "slow"),
+            vote("b", "10 — best at docs", "verbose"),
+            vote("c", "2 — best at refactors", "cost"),
+        ];
+        let v = synthesize("t10", &votes, 3);
+        assert!(!v.consensus, "1-1-1 is not consensus");
+        assert!((v.agreement_ratio - 1.0 / 3.0).abs() < 1e-6);
+        // 2 < 3 < 10 numerically. Keying on the raw text would have ranked "10" first, since it
+        // sorts before "2" as a string — which is why the key is padded.
+        assert!(
+            v.winning_recommendation
+                .as_deref()
+                .expect("winner")
+                .starts_with('2'),
+            "tie-break is the lowest option NUMBER, not the lowest digit character"
+        );
+    }
+
+    // Un-numbered recommendations are a different kind of council — no option table to index, so
+    // the prose is the whole identity. Pinned because the fix must not have widened its reach:
+    // these two are still two votes, not one.
+    #[test]
+    fn free_text_recommendations_still_key_on_their_prose() {
+        let votes = vec![
+            vote("a", "adopt JWT", "revocation"),
+            vote("b", "adopt sessions", "sticky routing"),
+        ];
+        let v = synthesize("t11", &votes, 2);
+        assert!(!v.consensus, "two different prose picks are still a split");
+        assert!((v.agreement_ratio - 0.5).abs() < f32::EPSILON);
     }
 }
