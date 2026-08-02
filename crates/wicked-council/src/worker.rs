@@ -363,7 +363,7 @@ fn normalize(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::store::Ledger;
-    use crate::types::{Confidence, EventSink, NoopEventSink, RankStore, Ranking, Vote};
+    use crate::types::{Confidence, NoopEventSink, RankStore, Ranking, Vote};
     use crate::EstateHandle;
     use std::sync::Mutex;
 

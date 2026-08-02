@@ -2,7 +2,7 @@
 #
 # Without this section the root package is the whole workspace, so `cargo test --workspace` — the
 # command CI runs — resolves to this package alone. The engine crates are compiled (they are
-# dependencies) but their own test targets are never built, and 119 tests across the four crates
+# dependencies) but their own test targets are never built, and 107 tests across the four crates
 # below never execute in CI. Membership is what makes `--workspace` mean what it reads as.
 #
 # wicked-core-ts is excluded deliberately, not by oversight: it declares a `[profile.release]`
