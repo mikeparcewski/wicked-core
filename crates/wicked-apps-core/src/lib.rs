@@ -148,6 +148,12 @@ pub const EV_COUNCIL_REQUESTED: &str = "wicked.crew.council.requested";
 pub const EV_COUNCIL_VOTED: &str = "wicked.crew.council.voted";
 /// A deliberation ballot completed BELOW the approval threshold — another round follows.
 pub const EV_COUNCIL_DELIBERATED: &str = "wicked.crew.council.deliberated";
+/// One convened seat produced no vote, with the named branch and its captured stderr.
+///
+/// A seat that does not vote shrinks the quorum the verdict rests on, so it is a governance
+/// event rather than a log line. The noun is `council_seat` (not `council`) because the subject
+/// is one seat, not the council — the same reason `agent_session` is its own noun.
+pub const EV_COUNCIL_SEAT_FAILED: &str = "wicked.crew.council_seat.failed";
 pub const EV_CLI_RANKED: &str = "wicked.crew.cli.ranked";
 
 // wicked.crew.* — agent subsystem (producer: wicked-crew). Agent-qualified nouns keep them under
@@ -175,6 +181,7 @@ pub const EVENT_CATALOG: &[&str] = &[
     EV_COUNCIL_REQUESTED,
     EV_COUNCIL_VOTED,
     EV_COUNCIL_DELIBERATED,
+    EV_COUNCIL_SEAT_FAILED,
     EV_CLI_RANKED,
     EV_AGENT_SESSION_STARTED,
     EV_AGENT_PLAN_CREATED,

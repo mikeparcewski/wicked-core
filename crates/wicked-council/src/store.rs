@@ -29,7 +29,10 @@ use wicked_apps_core::{
     Span, SqliteStore, CLI_RANKING, COUNCIL_TASK, COUNCIL_VERDICT, DECIDES, SYMBOL_SCHEME,
 };
 
-use crate::types::{CouncilTask, RankSignal, RankStore, Ranking, TaskState, Verdict, Vote};
+use crate::types::{
+    CouncilTask, RankSignal, RankStore, Ranking, SeatFailure, TaskState, Verdict, Vote,
+};
+use serde::{Deserialize, Serialize};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // A shared, cloneable handle to the estate store.
@@ -163,6 +166,7 @@ pub fn task_to_node(rec: &TaskRecord) -> Node {
     m.insert("criteria".into(), serde_json::json!(task.criteria));
     m.insert("convened".into(), serde_json::json!(rec.convened));
     m.insert("votes".into(), serde_json::json!(rec.votes));
+    m.insert("seat_failures".into(), serde_json::json!(rec.seat_failures));
     node
 }
 
@@ -180,6 +184,10 @@ pub fn task_from_node(node: &Node) -> anyhow::Result<TaskRecord> {
     let criteria: Vec<String> = json_meta(node, "criteria").unwrap_or_default();
     let convened: Vec<String> = json_meta(node, "convened").unwrap_or_default();
     let votes: Vec<Vote> = json_meta(node, "votes").unwrap_or_default();
+    // Absent on rows written before seat failures were recorded — an empty list is the honest
+    // reading of "this row does not say", and matches a run where every seat voted.
+    let seat_failures: Vec<SeatFailureRecord> =
+        json_meta(node, "seat_failures").unwrap_or_default();
     let state = str_meta(node, "state")
         .and_then(|s| TaskState::from_str_opt(&s))
         .unwrap_or(TaskState::Queued);
@@ -196,6 +204,7 @@ pub fn task_from_node(node: &Node) -> anyhow::Result<TaskRecord> {
         convened,
         votes,
         verdict: None,
+        seat_failures,
     })
 }
 
@@ -415,6 +424,21 @@ pub struct TaskRecord {
     pub votes: Vec<Vote>,
     /// The synthesized verdict, once `state == Voted`.
     pub verdict: Option<Verdict>,
+    /// Seats that were convened but produced no vote, and why — from the latest ballot.
+    ///
+    /// A convened seat is accounted for exactly once: it is either in `votes` or here. Without
+    /// this, `convened.len() > votes.len()` was the only trace a seat had failed at all, and the
+    /// reason was gone.
+    pub seat_failures: Vec<SeatFailureRecord>,
+}
+
+/// One convened seat's failure to vote, attributed to the seat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatFailureRecord {
+    /// The CLI key of the seat that failed.
+    pub cli: String,
+    /// The named branch and its captured diagnostics.
+    pub failure: SeatFailure,
 }
 
 /// A cloneable handle to the shared ledger. Cloning shares the same underlying in-memory
@@ -499,7 +523,7 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Confidence;
+    use crate::types::{Confidence, SeatFailureKind};
 
     fn sample_task(id: &str) -> CouncilTask {
         CouncilTask {
@@ -531,6 +555,18 @@ mod tests {
             convened: vec!["claude".into(), "agy".into()],
             votes: vec![sample_vote("claude")],
             verdict: None,
+            // Two seats convened, one voted — so the other's failure is the row's account of
+            // where it went. This is the pairing the round-trip has to preserve.
+            seat_failures: vec![SeatFailureRecord {
+                cli: "agy".into(),
+                failure: SeatFailure {
+                    kind: SeatFailureKind::NonZeroExit,
+                    exit_code: Some(2),
+                    stderr: String::new(),
+                    detail: String::new(),
+                }
+                .with_stderr("agy: unknown flag --headless"),
+            }],
         };
         let node = task_to_node(&rec);
         let back = task_from_node(&node).expect("round-trip");
@@ -544,6 +580,32 @@ mod tests {
         assert_eq!(back.convened, vec!["claude".to_string(), "agy".to_string()]);
         assert_eq!(back.votes.len(), 1);
         assert_eq!(back.votes[0].cli, "claude");
+        // The diagnostics are the whole point of recording them — a round-trip that keeps the
+        // kind but drops the stderr would leave the degrade string as uninformative as before.
+        assert_eq!(back.seat_failures, rec.seat_failures);
+        assert_eq!(back.seat_failures[0].failure.exit_code, Some(2));
+        assert!(back.seat_failures[0]
+            .failure
+            .stderr
+            .contains("unknown flag"));
+    }
+
+    /// Rows written before seat failures were recorded have no `seat_failures` key. They must
+    /// read back as "nothing recorded" rather than failing the whole round-trip.
+    #[test]
+    fn a_task_node_without_seat_failures_round_trips_to_an_empty_list() {
+        let rec = TaskRecord {
+            task: sample_task("t2"),
+            state: TaskState::Voted,
+            convened: vec!["claude".into()],
+            votes: vec![sample_vote("claude")],
+            verdict: None,
+            seat_failures: vec![],
+        };
+        let mut node = task_to_node(&rec);
+        node.metadata.remove("seat_failures");
+        let back = task_from_node(&node).expect("round-trip");
+        assert!(back.seat_failures.is_empty());
     }
 
     #[test]
@@ -574,6 +636,7 @@ mod tests {
             convened: vec!["claude".into(), "agy".into()],
             votes: vec![],
             verdict: None,
+            seat_failures: vec![],
         });
         ledger.update("t-persist", |rec| {
             rec.state = TaskState::Voted;

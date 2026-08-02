@@ -402,6 +402,168 @@ impl Default for BallotContext {
     }
 }
 
+/// Why one seat produced no vote.
+///
+/// The dispatch path has ten distinct ways to yield no vote and used to collapse all of them
+/// into a bare `None`, which `distribute.rs` then rendered as the single string "council did not
+/// reach a vote". That string is the same whether the binary is missing, the CLI exited non-zero,
+/// or the seat was skipped outright — so a 92.6% degradation rate was undiagnosable by
+/// construction. Naming the branch is what makes it diagnosable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatFailureKind {
+    /// `headless_invocation` tokenized to nothing, or yielded no program token.
+    InvocationEmpty,
+    /// `InputMode::PtySession`: the council dispatcher does not manage PTY sessions, so the
+    /// seat is skipped before any process is spawned. Structurally incapable of voting.
+    PtyUnsupported,
+    /// The per-dispatch isolation tempdir could not be created.
+    WorkdirUnavailable,
+    /// The prompt file could not be written into the isolation dir.
+    PromptWriteFailed,
+    /// The process could not be spawned — missing binary, not executable, permissions.
+    SpawnFailed,
+    /// The process outlived the dispatch budget and was killed.
+    TimedOut,
+    /// Waiting on the process failed.
+    WaitFailed,
+    /// The process ran to completion and exited non-zero.
+    NonZeroExit,
+    /// The dispatcher reported no vote without saying why. Test stubs and any implementation
+    /// that has not adopted [`Dispatcher::dispatch_ballot_detailed`] land here — it records
+    /// "not reported", which is honest, rather than inventing a cause.
+    Unreported,
+}
+
+impl SeatFailureKind {
+    /// Stable snake_case token for events and degrade reasons.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeatFailureKind::InvocationEmpty => "invocation_empty",
+            SeatFailureKind::PtyUnsupported => "pty_unsupported",
+            SeatFailureKind::WorkdirUnavailable => "workdir_unavailable",
+            SeatFailureKind::PromptWriteFailed => "prompt_write_failed",
+            SeatFailureKind::SpawnFailed => "spawn_failed",
+            SeatFailureKind::TimedOut => "timed_out",
+            SeatFailureKind::WaitFailed => "wait_failed",
+            SeatFailureKind::NonZeroExit => "non_zero_exit",
+            SeatFailureKind::Unreported => "unreported",
+        }
+    }
+}
+
+/// The captured diagnostics for one seat that failed to vote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatFailure {
+    /// Which of the dispatch branches was taken.
+    pub kind: SeatFailureKind,
+    /// The process exit code, when the process ran to completion.
+    pub exit_code: Option<i32>,
+    /// Captured stderr, truncated to [`STDERR_CAPTURE_LIMIT`]. `run_in_isolation` already
+    /// piped stderr and then dropped it on the floor; this is that artifact, kept.
+    pub stderr: String,
+    /// The OS/IO error text, where the branch has one.
+    pub detail: String,
+}
+
+/// Cap on retained stderr per seat. Enough to carry a usage message or a stack trace's head,
+/// bounded so a runaway CLI cannot balloon an event payload or the task record.
+pub const STDERR_CAPTURE_LIMIT: usize = 4096;
+
+impl SeatFailure {
+    /// A failure with no captured process output — the pre-spawn branches.
+    pub fn new(kind: SeatFailureKind, detail: impl Into<String>) -> Self {
+        SeatFailure {
+            kind,
+            exit_code: None,
+            stderr: String::new(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Attach captured stderr, truncated on a char boundary so the result stays valid UTF-8.
+    pub fn with_stderr(mut self, stderr: &str) -> Self {
+        let end = if stderr.len() <= STDERR_CAPTURE_LIMIT {
+            stderr.len()
+        } else {
+            // `floor_char_boundary` is unstable; walk back to the nearest boundary ourselves.
+            let mut i = STDERR_CAPTURE_LIMIT;
+            while i > 0 && !stderr.is_char_boundary(i) {
+                i -= 1;
+            }
+            i
+        };
+        self.stderr = stderr[..end].to_string();
+        self
+    }
+
+    /// One-line reason suitable for a degrade string: the branch, plus the most specific
+    /// evidence available for it.
+    pub fn reason(&self) -> String {
+        let mut s = self.kind.as_str().to_string();
+        if let Some(code) = self.exit_code {
+            s.push_str(&format!(" (exit {code})"));
+        }
+        // stderr is the more specific artifact when both are present — it is the CLI's own words.
+        let evidence = if !self.stderr.is_empty() {
+            self.stderr.trim()
+        } else {
+            self.detail.trim()
+        };
+        if !evidence.is_empty() {
+            // Degrade strings land in single-line contexts (events, logs, the studio).
+            let flat: String = evidence.split_whitespace().collect::<Vec<_>>().join(" ");
+            s.push_str(": ");
+            s.push_str(&flat);
+        }
+        s
+    }
+}
+
+/// One seat's dispatch result: a vote, or the named reason there is none.
+///
+/// The invariant is that exactly one side is populated — a `None` vote always carries a
+/// `SeatFailure`, even if only [`SeatFailureKind::Unreported`]. That is what stops a silent
+/// no-vote from re-entering the system.
+#[derive(Debug, Clone)]
+pub struct DispatchOutcome {
+    /// The vote, when the seat produced one.
+    pub vote: Option<Vote>,
+    /// Why there is no vote. `Some` exactly when `vote` is `None`.
+    pub failure: Option<SeatFailure>,
+}
+
+impl DispatchOutcome {
+    /// A successful ballot.
+    pub fn voted(vote: Vote) -> Self {
+        DispatchOutcome {
+            vote: Some(vote),
+            failure: None,
+        }
+    }
+
+    /// A named failure.
+    pub fn failed(failure: SeatFailure) -> Self {
+        DispatchOutcome {
+            vote: None,
+            failure: Some(failure),
+        }
+    }
+
+    /// Lift a legacy `Option<Vote>`. A bare `None` becomes [`SeatFailureKind::Unreported`]
+    /// rather than an empty failure, so the "no vote ⇒ some reason" invariant holds even for
+    /// dispatchers that never adopted the detailed path.
+    pub fn from_option(vote: Option<Vote>) -> Self {
+        match vote {
+            Some(v) => DispatchOutcome::voted(v),
+            None => DispatchOutcome::failed(SeatFailure::new(
+                SeatFailureKind::Unreported,
+                "dispatcher returned no vote and reported no reason",
+            )),
+        }
+    }
+}
+
 /// Isolated, timeboxed dispatch of the 4-question scaffold to one CLI.
 pub trait Dispatcher {
     /// Dispatch the scaffold to one CLI and collect its vote (`None` on failure/timeout).
@@ -418,6 +580,22 @@ pub trait Dispatcher {
         _ctx: &BallotContext,
     ) -> Option<Vote> {
         self.dispatch(cli, task)
+    }
+
+    /// Dispatch one ballot and report *why* on failure.
+    ///
+    /// Extension point, added the same way `dispatch_ballot` was: the default delegates to
+    /// [`Dispatcher::dispatch_ballot`] and labels a bare `None` as
+    /// [`SeatFailureKind::Unreported`], so every existing implementation keeps compiling
+    /// unchanged. The real dispatcher overrides it to name the branch and carry the CLI's
+    /// stderr out.
+    fn dispatch_ballot_detailed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &BallotContext,
+    ) -> DispatchOutcome {
+        DispatchOutcome::from_option(self.dispatch_ballot(cli, task, ctx))
     }
 }
 

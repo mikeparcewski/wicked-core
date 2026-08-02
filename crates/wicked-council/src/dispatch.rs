@@ -13,7 +13,10 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::types::{AgenticCli, BallotContext, Category, CouncilTask, Dispatcher, InputMode, Vote};
+use crate::types::{
+    AgenticCli, BallotContext, Category, CouncilTask, DispatchOutcome, Dispatcher, InputMode,
+    SeatFailure, SeatFailureKind, Vote,
+};
 
 /// The fixed 4-question scaffold, rendered onto the task.
 ///
@@ -136,9 +139,26 @@ impl RealDispatcher {
 
 impl RealDispatcher {
     /// Shared dispatch body: render the given prompt, run isolated, parse the vote.
-    fn dispatch_prompt(&self, cli: &AgenticCli, task: &CouncilTask, prompt: &str) -> Option<Vote> {
+    ///
+    /// Every no-vote exit names its branch. The stderr the CLI wrote is carried out with it —
+    /// `run_in_isolation` has always piped stderr, and used to drop it when `output` fell out of
+    /// scope, which left a non-zero exit indistinguishable from a spawn failure.
+    fn dispatch_prompt(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        prompt: &str,
+    ) -> DispatchOutcome {
         // Isolation: a per-dispatch tempdir under the system temp root.
-        let workdir = make_tempdir(&cli.key, &task.id)?;
+        let workdir = match make_tempdir(&cli.key, &task.id) {
+            Ok(d) => d,
+            Err(e) => {
+                return DispatchOutcome::failed(SeatFailure::new(
+                    SeatFailureKind::WorkdirUnavailable,
+                    e.to_string(),
+                ))
+            }
+        };
 
         let timeout = self.timeout_for(cli);
         let result = run_in_isolation(cli, prompt, &workdir, timeout);
@@ -146,17 +166,28 @@ impl RealDispatcher {
         // Best-effort cleanup; never fail the dispatch on a cleanup error.
         let _ = std::fs::remove_dir_all(&workdir);
 
-        let (exit_ok, stdout) = result?;
-        if !exit_ok {
-            return None;
+        let run = match result {
+            Ok(r) => r,
+            Err(f) => return DispatchOutcome::failed(f),
+        };
+        if !run.exit_ok {
+            return DispatchOutcome::failed(
+                SeatFailure {
+                    kind: SeatFailureKind::NonZeroExit,
+                    exit_code: run.exit_code,
+                    stderr: String::new(),
+                    detail: String::new(),
+                }
+                .with_stderr(&run.stderr),
+            );
         }
-        Some(parse_vote(cli, &stdout))
+        DispatchOutcome::voted(parse_vote(cli, &run.stdout))
     }
 }
 
 impl Dispatcher for RealDispatcher {
     fn dispatch(&self, cli: &AgenticCli, task: &CouncilTask) -> Option<Vote> {
-        self.dispatch_prompt(cli, task, &render_scaffold(task))
+        self.dispatch_prompt(cli, task, &render_scaffold(task)).vote
     }
 
     fn dispatch_ballot(
@@ -165,12 +196,21 @@ impl Dispatcher for RealDispatcher {
         task: &CouncilTask,
         ctx: &BallotContext,
     ) -> Option<Vote> {
+        self.dispatch_ballot_detailed(cli, task, ctx).vote
+    }
+
+    fn dispatch_ballot_detailed(
+        &self,
+        cli: &AgenticCli,
+        task: &CouncilTask,
+        ctx: &BallotContext,
+    ) -> DispatchOutcome {
         self.dispatch_prompt(cli, task, &render_ballot(task, ctx))
     }
 }
 
 /// Create an isolated working directory `<tmp>/wicked-council/<task>-<cli>-<n>`.
-fn make_tempdir(cli_key: &str, task_id: &str) -> Option<PathBuf> {
+fn make_tempdir(cli_key: &str, task_id: &str) -> std::io::Result<PathBuf> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
@@ -178,8 +218,16 @@ fn make_tempdir(cli_key: &str, task_id: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir()
         .join("wicked-council")
         .join(format!("{safe_task}-{cli_key}-{n}"));
-    std::fs::create_dir_all(&dir).ok()?;
-    Some(dir)
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// One isolated CLI run that reached completion.
+struct IsolatedRun {
+    exit_ok: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 /// Build the argv from `headless_invocation` and `input_mode`, run it isolated in
@@ -194,10 +242,16 @@ fn run_in_isolation(
     prompt: &str,
     workdir: &PathBuf,
     timeout: Duration,
-) -> Option<(bool, String)> {
+) -> Result<IsolatedRun, SeatFailure> {
     let mut argv = tokenize(&cli.headless_invocation);
     if argv.is_empty() {
-        return None;
+        return Err(SeatFailure::new(
+            SeatFailureKind::InvocationEmpty,
+            format!(
+                "`headless_invocation` for seat `{}` tokenized to nothing",
+                cli.key
+            ),
+        ));
     }
 
     // Substitute / deliver the prompt per input mode.
@@ -222,7 +276,12 @@ fn run_in_isolation(
         InputMode::AtFile | InputMode::MessageFile => {
             // Write the prompt to a file inside the isolated workdir, substitute path.
             let pfile = workdir.join("prompt.txt");
-            std::fs::write(&pfile, prompt).ok()?;
+            if let Err(e) = std::fs::write(&pfile, prompt) {
+                return Err(SeatFailure::new(
+                    SeatFailureKind::PromptWriteFailed,
+                    format!("{}: {e}", pfile.display()),
+                ));
+            }
             let path_str = pfile.display().to_string();
             for tok in argv.iter_mut() {
                 if tok.contains("{PROMPT}") {
@@ -232,14 +291,30 @@ fn run_in_isolation(
         }
         InputMode::PtySession => {
             // The council dispatcher doesn't manage PTY sessions; skip this seat entirely.
-            return None;
+            // No shipped seat declares this mode, but one that did would be structurally
+            // incapable of ever voting — worth naming rather than looking like a timeout.
+            return Err(SeatFailure::new(
+                SeatFailureKind::PtyUnsupported,
+                format!(
+                    "seat `{}` declares InputMode::PtySession, which the council dispatcher \
+                     does not manage",
+                    cli.key
+                ),
+            ));
         }
     }
 
     // Append trust flags so the CLI never blocks on an interactive prompt.
     argv.extend(cli.trust_flags.iter().cloned());
 
-    let (program, args) = argv.split_first()?;
+    let Some((program, args)) = argv.split_first() else {
+        // Unreachable while the `argv.is_empty()` guard above stands, but splitting after the
+        // trust-flag extend means the guard is no longer adjacent to this call.
+        return Err(SeatFailure::new(
+            SeatFailureKind::InvocationEmpty,
+            format!("no program token in argv for seat `{}`", cli.key),
+        ));
+    };
 
     let mut command = Command::new(program);
     command
@@ -254,7 +329,15 @@ fn run_in_isolation(
         command.stdin(Stdio::null());
     }
 
-    let mut child = command.spawn().ok()?;
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(SeatFailure::new(
+                SeatFailureKind::SpawnFailed,
+                format!("{program}: {e}"),
+            ))
+        }
+    };
 
     if let Some(payload) = stdin_payload {
         use std::io::Write;
@@ -272,18 +355,35 @@ fn run_in_isolation(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
-                    let _ = child.wait();
-                    return None; // treated as timeout → no vote
+                    // Reap, and keep whatever the CLI wrote before the budget ran out. A partial
+                    // stderr is frequently the whole diagnosis — an auth prompt, a rate-limit
+                    // notice — and the old code discarded it along with the exit status.
+                    let partial = child
+                        .wait_with_output()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                        .unwrap_or_default();
+                    return Err(SeatFailure::new(
+                        SeatFailureKind::TimedOut,
+                        format!("exceeded {}s dispatch budget", timeout.as_secs()),
+                    )
+                    .with_stderr(&partial));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => return None,
+            Err(e) => return Err(SeatFailure::new(SeatFailureKind::WaitFailed, e.to_string())),
         }
     }
 
-    let output = child.wait_with_output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    Some((output.status.success(), stdout))
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return Err(SeatFailure::new(SeatFailureKind::WaitFailed, e.to_string())),
+    };
+    Ok(IsolatedRun {
+        exit_ok: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
 }
 
 /// Whitespace tokenizer that keeps double-quoted spans together and strips the
@@ -431,5 +531,173 @@ mod tests {
             p.contains("Never converge"),
             "anti-groupthink guard present"
         );
+    }
+}
+
+/// FINDING-026 fix #1: every no-vote names its branch and keeps the CLI's own words.
+///
+/// These drive the REAL dispatcher against real processes, because the defect was never in the
+/// logic — it was that `Option<Vote>` had nowhere to put the answer. A stub dispatcher would
+/// assert nothing about it.
+///
+/// Cross-platform per the pattern already used in `probe.rs`: `sh` on unix, `cmd` on Windows.
+#[cfg(test)]
+mod failure_diagnostics_tests {
+    use super::*;
+    use crate::types::{Category, Confidence, STDERR_CAPTURE_LIMIT};
+
+    fn task() -> CouncilTask {
+        CouncilTask {
+            id: "t".into(),
+            topic: "route this".into(),
+            options: vec!["profile one".into()],
+            criteria: vec!["general".into()],
+            session_id: "s".into(),
+        }
+    }
+
+    /// A seat whose `headless_invocation` is the given argv template. No `{PROMPT}` — these
+    /// tests are about the failure path, not prompt delivery.
+    fn seat(key: &str, binary: &str, invocation: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.to_string(),
+            display_name: key.to_string(),
+            binary: binary.to_string(),
+            headless_invocation: invocation.to_string(),
+            category: Category::AgenticCoder,
+            input_mode: InputMode::PromptArg,
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::Verified,
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+        }
+    }
+
+    /// A shell seat running `script`, spelled for the host platform.
+    fn shell_seat(key: &str, script: &str) -> AgenticCli {
+        if cfg!(windows) {
+            seat(key, "cmd", &format!("cmd /C \"{script}\""))
+        } else {
+            seat(key, "sh", &format!("sh -c \"{script}\""))
+        }
+    }
+
+    fn failure_of(cli: &AgenticCli, timeout: Duration) -> SeatFailure {
+        let d = RealDispatcher {
+            timeout,
+            local_runner_timeout: timeout,
+        };
+        let outcome = d.dispatch_prompt(cli, &task(), "ignored");
+        assert!(
+            outcome.vote.is_none(),
+            "this seat must not vote — the test is about the failure path"
+        );
+        outcome.failure.expect("a no-vote must carry a reason")
+    }
+
+    #[test]
+    fn a_missing_binary_reports_spawn_failed_and_names_it() {
+        let cli = seat(
+            "ghost",
+            "wicked-council-no-such-binary-xyzzy",
+            "wicked-council-no-such-binary-xyzzy --headless",
+        );
+        let f = failure_of(&cli, Duration::from_secs(5));
+        assert_eq!(f.kind, SeatFailureKind::SpawnFailed);
+        // Naming the binary is the difference between "council did not reach a vote" and a
+        // one-line fix.
+        assert!(
+            f.detail.contains("wicked-council-no-such-binary-xyzzy"),
+            "the detail must name the binary that could not spawn: {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_zero_exit_keeps_the_code_and_the_stderr() {
+        // The leading hypothesis for the observed 92.6% degradation was a non-zero exit whose
+        // stderr was discarded. This is the branch that used to throw the evidence away.
+        let cli = shell_seat("boom", "echo diagnostic-needle 1>&2; exit 3");
+        let f = failure_of(&cli, Duration::from_secs(30));
+        assert_eq!(f.kind, SeatFailureKind::NonZeroExit);
+        assert_eq!(f.exit_code, Some(3), "the exit code must survive: {f:?}");
+        assert!(
+            f.stderr.contains("diagnostic-needle"),
+            "the CLI's own stderr is the artifact that identifies the failure: {f:?}"
+        );
+        // And it has to reach the one-line rendering the degrade string uses.
+        let reason = f.reason();
+        assert!(reason.contains("non_zero_exit"), "{reason}");
+        assert!(reason.contains("exit 3"), "{reason}");
+        assert!(reason.contains("diagnostic-needle"), "{reason}");
+    }
+
+    #[test]
+    fn a_seat_that_outlives_the_budget_reports_timed_out_not_a_bare_no_vote() {
+        // 250ms budget against a process that sleeps far longer.
+        let cli = if cfg!(windows) {
+            seat("slow", "cmd", "cmd /C \"ping -n 30 127.0.0.1\"")
+        } else {
+            shell_seat("slow", "sleep 30")
+        };
+        let f = failure_of(&cli, Duration::from_millis(250));
+        assert_eq!(f.kind, SeatFailureKind::TimedOut);
+        assert!(
+            f.detail.contains("budget"),
+            "the timeout must say it was a budget, not an error: {f:?}"
+        );
+    }
+
+    #[test]
+    fn a_pty_seat_is_named_rather_than_silently_skipped() {
+        // `InputMode::PtySession` returns before spawning anything. No shipped seat declares it,
+        // but one that did would never vote — and used to look exactly like a timeout.
+        let mut cli = shell_seat("pty", "exit 0");
+        cli.input_mode = InputMode::PtySession;
+        let f = failure_of(&cli, Duration::from_secs(5));
+        assert_eq!(f.kind, SeatFailureKind::PtyUnsupported);
+        assert!(f.detail.contains("PtySession"), "{f:?}");
+    }
+
+    #[test]
+    fn an_empty_invocation_is_named() {
+        let cli = seat("empty", "irrelevant", "   ");
+        let f = failure_of(&cli, Duration::from_secs(5));
+        assert_eq!(f.kind, SeatFailureKind::InvocationEmpty);
+    }
+
+    #[test]
+    fn a_seat_that_exits_zero_votes() {
+        let cli = shell_seat("ok", "echo RECOMMENDATION: 1");
+        let d = RealDispatcher {
+            timeout: Duration::from_secs(30),
+            local_runner_timeout: Duration::from_secs(30),
+        };
+        let outcome = d.dispatch_prompt(&cli, &task(), "ignored");
+        // The control case: without it, a bug that made EVERY dispatch fail would still pass
+        // every assertion above.
+        assert!(outcome.vote.is_some(), "exit 0 must produce a vote");
+        assert!(outcome.failure.is_none());
+    }
+
+    #[test]
+    fn captured_stderr_is_bounded_and_stays_valid_utf8() {
+        // A runaway CLI must not balloon an event payload. The truncation walks back to a char
+        // boundary, so a multi-byte char straddling the limit cannot corrupt the string.
+        let huge = "é".repeat(STDERR_CAPTURE_LIMIT);
+        let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stderr(&huge);
+        assert!(f.stderr.len() <= STDERR_CAPTURE_LIMIT);
+        assert!(f.stderr.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn the_reason_line_never_spans_lines() {
+        // Degrade reasons land in single-line contexts (events, the studio's routing badge).
+        let f = SeatFailure::new(SeatFailureKind::SpawnFailed, "").with_stderr("one\ntwo\nthree");
+        let reason = f.reason();
+        assert!(!reason.contains('\n'), "{reason}");
+        assert!(reason.contains("one two three"), "{reason}");
     }
 }
