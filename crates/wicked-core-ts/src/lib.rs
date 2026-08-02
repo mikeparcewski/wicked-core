@@ -647,8 +647,11 @@ impl Core {
     ///
     /// Retire, not delete: the node stays readable so a past decision citing this id can still be
     /// explained, but SELECT stops returning it, so it can never decide another gate. Resolves to
-    /// the JSON boolean `true` if a policy with that id existed, `false` if none did — the caller
-    /// needs that to answer 404 rather than report a success that removed nothing.
+    /// Returns a JSON-encoded boolean — the STRING `"true"` if a policy with that id existed,
+    /// `"false"` if none did. JS must `JSON.parse` it; the raw value is truthy either way, so
+    /// testing it directly reads a miss as a hit. (Every method here returns `Promise<string>`
+    /// carrying JSON; this one is the easy one to misread, hence the spelling-out.) The caller
+    /// needs that distinction to answer 404 rather than report a success that removed nothing.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn retire_policy(&self, id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
@@ -658,8 +661,9 @@ impl Core {
         })
     }
 
-    /// Withdraw a conformance rule from recall. Same retire-not-delete contract, same JSON-boolean
-    /// reply, as [`Core::retire_policy`].
+    /// Withdraw a conformance rule from recall. Same retire-not-delete contract as
+    /// [`Core::retire_policy`], and the same `"true"`/`"false"` JSON-encoded reply that must be
+    /// parsed rather than tested for truthiness.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn retire_conformance_rule(&self, id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
