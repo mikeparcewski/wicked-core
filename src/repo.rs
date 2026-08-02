@@ -230,6 +230,161 @@ pub fn reap_orphan_worktrees(repos: &[RepoEntry], live_run_ids: &HashSet<String>
     }
 }
 
+// ── Worktree layout summary (FINDING-048) ────────────────────────────────────────────────────────
+
+/// Directory names never worth a line in the summary: build output, vendored dependencies and
+/// virtualenvs. They are large, uninformative, and present in nearly every repo.
+const LAYOUT_NOISE: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "out",
+    "vendor",
+    "__pycache__",
+    "venv",
+    "site-packages",
+    "coverage",
+];
+
+/// Files that mark a directory as a project root. Their presence is the signal a worker needs: it is
+/// what makes `autogpt_platform/backend` a place you can `cd` into and run something.
+const PROJECT_MANIFESTS: &[&str] = &[
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "Cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "Gemfile",
+    "composer.json",
+    "CMakeLists.txt",
+    "Makefile",
+];
+
+/// Total character budget. The prompt-composition audit behind FINDING-048 found task-specific text
+/// was already only 5% of a 74.5k-char prompt; a layout that solves path-guessing by drowning the
+/// task would trade one problem for a worse one.
+const LAYOUT_BUDGET: usize = 1400;
+
+/// Caps on breadth. A repo with 200 top-level entries is not made legible by listing all 200.
+const MAX_TOP_LEVEL: usize = 32;
+const MAX_CHILDREN: usize = 10;
+
+/// A compact, deterministic map of what is at `dir`'s root — the thing no unit prompt carried.
+///
+/// FINDING-048: 0 of 32 prompts described the target tree, and 12 of 32 sessions burned turns on
+/// `cd: no such file or directory` rediscovering that AutoGPT is a two-era monorepo. The worker knows
+/// its task and nothing about where the task lives, so it guesses paths and pays for each miss.
+///
+/// Deliberately shallow. Depth 1 always; depth 2 ONLY for a top-level directory that is not itself a
+/// project root but contains ones — precisely the monorepo shape that produced the failures, and the
+/// only case where the extra level carries information a worker cannot get from `ls`. Entries are
+/// sorted, so the same tree yields the same string on every host and every run.
+///
+/// Returns `None` when `dir` cannot be read or has nothing worth reporting, so a caller that has no
+/// worktree (or an empty one) appends nothing rather than an empty heading.
+#[must_use]
+pub fn worktree_layout(dir: &Path) -> Option<String> {
+    let (dirs, files) = read_split(dir)?;
+    if dirs.is_empty() && files.is_empty() {
+        return None;
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut budget = LAYOUT_BUDGET;
+    let mut truncated = dirs.len() > MAX_TOP_LEVEL || files.len() > MAX_TOP_LEVEL;
+
+    for name in dirs.iter().take(MAX_TOP_LEVEL) {
+        let child = dir.join(name);
+        let mut line = format!("{name}/");
+        if let Some(m) = manifest_of(&child) {
+            // A project root: say what builds it, and stop. Its children are the project's business.
+            line.push_str(&format!("  [{m}]"));
+        } else if let Some(inner) = project_children(&child) {
+            // The monorepo case — the level that was actually missing.
+            line.push_str(&format!("  ({})", inner.join(", ")));
+        }
+        if line.len() + 1 > budget {
+            truncated = true;
+            break;
+        }
+        budget -= line.len() + 1;
+        lines.push(line);
+    }
+
+    // Root files last and cheaply: they matter far less than the directory shape, and a worker can
+    // always `ls`. Listing them at all is what tells it whether the root IS the project.
+    let root_files: Vec<&String> = files.iter().take(MAX_TOP_LEVEL).collect();
+    if !root_files.is_empty() {
+        let joined = root_files
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let line = format!("(root files: {joined})");
+        if line.len() + 1 <= budget {
+            lines.push(line);
+        } else {
+            truncated = true;
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    if truncated {
+        lines.push("(…truncated — run `ls` for the rest)".to_string());
+    }
+    Some(lines.join("\n"))
+}
+
+/// Split a directory into (subdirectory names, file names), both sorted, both filtered of hidden
+/// entries and [`LAYOUT_NOISE`]. `None` if the dir cannot be read at all.
+fn read_split(dir: &Path) -> Option<(Vec<String>, Vec<String>)> {
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Hidden entries are excluded wholesale — `.git` above all, which is enormous and never the
+        // subject of a work unit.
+        if name.starts_with('.') || LAYOUT_NOISE.contains(&name.as_str()) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => dirs.push(name),
+            Ok(_) => files.push(name),
+            Err(_) => continue,
+        }
+    }
+    dirs.sort();
+    files.sort();
+    Some((dirs, files))
+}
+
+/// The first [`PROJECT_MANIFESTS`] entry present directly in `dir`, if any. Order is the constant's
+/// order, so the answer is stable for a directory carrying more than one.
+fn manifest_of(dir: &Path) -> Option<&'static str> {
+    PROJECT_MANIFESTS
+        .iter()
+        .copied()
+        .find(|m| dir.join(m).is_file())
+}
+
+/// The child directories of `dir` that ARE project roots, rendered `name/ [manifest]`. `None` when
+/// there are none — which is what keeps depth 2 from firing on ordinary nested directories.
+fn project_children(dir: &Path) -> Option<Vec<String>> {
+    let (dirs, _) = read_split(dir)?;
+    let found: Vec<String> = dirs
+        .iter()
+        .filter_map(|name| manifest_of(&dir.join(name)).map(|m| format!("{name}/ [{m}]")))
+        .take(MAX_CHILDREN)
+        .collect();
+    (!found.is_empty()).then_some(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
