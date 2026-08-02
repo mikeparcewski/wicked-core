@@ -262,10 +262,7 @@ pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>) {
     let mut flags: Vec<String> = Vec::new();
     // An operator template that already pins its own scopes wins — the same deference
     // `inject_claude_stream_flags` shows `--output-format`.
-    if !argv
-        .iter()
-        .any(|a| a == "--setting-sources" || a.starts_with("--setting-sources="))
-    {
+    if !argv_states(argv, &["--setting-sources"]) {
         flags.push("--setting-sources".into());
         flags.push("project,local".into());
     }
@@ -279,17 +276,11 @@ pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>) {
     // operator's config was refused by the rule, under `auto` it went straight through, and under
     // `--dangerously-skip-permissions` likewise. `acceptEdits` is the only mode where a worker can
     // do its job AND stay inside the boundary.
-    if !argv
-        .iter()
-        .any(|a| a == "--permission-mode" || a.starts_with("--permission-mode="))
-    {
+    if !argv_states(argv, &["--permission-mode"]) {
         flags.push("--permission-mode".into());
         flags.push("acceptEdits".into());
     }
-    if !argv
-        .iter()
-        .any(|a| a == "--disallowedTools" || a == "--disallowed-tools")
-    {
+    if !argv_states(argv, &["--disallowedTools", "--disallowed-tools"]) {
         if let Some(rules) = deny_rules() {
             flags.push("--disallowedTools".into());
             // Comma-joined into a SINGLE argv entry rather than spread across several: the flag is
@@ -311,13 +302,38 @@ pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>) {
     }
 }
 
+/// Does `argv` already state any of `names`, in EITHER accepted spelling — `--flag value` or
+/// `--flag=value`?
+///
+/// Exists so the three guards in [`inject_isolation_flags`] cannot drift apart. Written out inline,
+/// they did: the first two checked both forms and the third checked only the separate-token one, so
+/// a template using `--disallowedTools=…` would have had a second copy injected next to it. One
+/// helper makes "both forms, every flag" true by construction instead of by three-way vigilance.
+///
+/// `names` is a slice because some flags have more than one accepted spelling (`--disallowedTools`
+/// and `--disallowed-tools` are the same flag); a template using either one must suppress injection.
+fn argv_states(argv: &[String], names: &[&str]) -> bool {
+    argv.iter().any(|a| {
+        names
+            .iter()
+            .any(|n| a == n || (a.starts_with(n) && a.as_bytes().get(n.len()) == Some(&b'=')))
+    })
+}
+
 /// The deny rules, in Claude's permission-rule syntax. Used two ways: comma-joined as the
 /// `--disallowedTools` value on the wrapped-CLI path, and as `permissions.deny` inside the settings
 /// file both the wrapped and ACP paths write (the ACP bridge forwards settings but has its own flag
 /// surface, so the file is the only carrier that reaches both).
 ///
-/// `None` when no home directory can be resolved: the path rules would all be malformed, and a
-/// half-built boundary that looks whole is worse than none.
+/// `None` when no home directory can be resolved: EVERY path rule would be malformed, so there is no
+/// boundary left to build and claiming one would be a lie.
+///
+/// An INDIVIDUAL directory that cannot be expressed as a rule — non-UTF8, or containing the comma the
+/// list is joined on — is skipped WITH A WARNING, and the remaining rules are still returned. That is
+/// a deliberate asymmetry, not an oversight: this is documented as a deny-list rather than a sandbox
+/// (see [`inject_isolation_flags`]), and dropping the other dozen rules because one path is
+/// unrepresentable would trade a small hole for a total one. What must never happen is the skip being
+/// SILENT — an operator reading "the worker is fenced off from `~/.ssh`" needs to hear when it isn't.
 pub(crate) fn deny_rules() -> Option<Vec<String>> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -330,11 +346,18 @@ pub(crate) fn deny_rules() -> Option<Vec<String>> {
         .into_iter()
         .chain(DENIED_HOME_SUBDIRS.iter().map(|d| home.join(d)));
     for dir in dirs {
-        let Some(p) = dir.to_str() else { continue };
-        // A rule carrying a comma would split the joined list into two malformed rules.
-        if p.contains(',') {
+        // A rule carrying a comma would split the joined list into two malformed rules; a non-UTF8
+        // path cannot be written into one at all. Skip the entry, but SAY SO — see the doc comment:
+        // the hole is acceptable, hiding it is not.
+        let representable = dir.to_str().filter(|p| !p.contains(','));
+        let Some(p) = representable else {
+            eprintln!(
+                "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8 or \
+                 contains a comma); this path is NOT fenced off from workers",
+                dir.display()
+            );
             continue;
-        }
+        };
         for tool in ["Read", "Edit", "Write"] {
             rules.push(format!("{tool}({p}/**)"));
         }
@@ -1607,6 +1630,56 @@ mod tests {
         inject_isolation_flags(&mut argv);
         assert_eq!(argv, before, "nothing injected over an explicit choice");
         assert_eq!(argv.iter().filter(|a| *a == "--setting-sources").count(), 1);
+    }
+
+    /// The `--flag=value` form defers exactly like the `--flag value` form, for EVERY flag and both
+    /// spellings of the deny flag.
+    ///
+    /// This is a regression test with a known origin: the three guards were written out inline and
+    /// the `--disallowedTools` one checked only the separate-token form, so a template written as
+    /// `--disallowedTools=Edit` got a SECOND `--disallowedTools` injected beside it. Table-driven so
+    /// a flag added later without an `argv_states` guard shows up here as a failure rather than as a
+    /// duplicated flag in a live worker's argv.
+    #[test]
+    fn isolation_defers_to_the_equals_form_of_every_flag_it_would_inject() {
+        for stated in [
+            "--setting-sources=user",
+            "--permission-mode=plan",
+            "--disallowedTools=Edit",
+            "--disallowed-tools=Edit",
+        ] {
+            let mut argv = build_argv(&format!("claude {stated} -p {{PROMPT}}"), "hi", &[]);
+            inject_isolation_flags(&mut argv);
+            let flag = stated.split('=').next().unwrap();
+            assert!(
+                !argv.iter().any(|a| a == flag),
+                "`{stated}` already states this flag, but a separate `{flag}` was injected \
+                 alongside it: {argv:?}"
+            );
+        }
+    }
+
+    /// `argv_states` must key off the whole flag name, not a prefix of it. `--permission-mode-foo`
+    /// and `--setting-sourcesX` are different flags; treating them as a match would silently
+    /// suppress the isolation this whole module exists to apply.
+    #[test]
+    fn a_longer_flag_that_merely_starts_the_same_is_not_a_match() {
+        assert!(argv_states(
+            &["--permission-mode=plan".to_string()],
+            &["--permission-mode"]
+        ));
+        assert!(argv_states(
+            &["--permission-mode".to_string()],
+            &["--permission-mode"]
+        ));
+        assert!(!argv_states(
+            &["--permission-mode-extra".to_string()],
+            &["--permission-mode"]
+        ));
+        assert!(!argv_states(
+            &["--permission-modes".to_string()],
+            &["--permission-mode"]
+        ));
     }
 
     /// The deny list is a `--disallowedTools` value AND a `permissions.deny` array in the settings
