@@ -44,9 +44,18 @@
 //! ## Why it can ship pinned at all
 //!
 //! `attach_pinned_validators` is fail-closed on a pin that is not in the vault: an unseeded pin
-//! would bail every run of every built-in. [`seed_builtin_floors`] is therefore called by the actor
-//! on the one single-writer thread immediately after the store opens, before any run can plan. It
-//! is idempotent (content-addressed) and cheap (two `put_node`s that collapse onto themselves).
+//! would bail every run of every built-in. [`seed_builtin_floors`] is therefore called on the PLAN
+//! path — `pipeline::pre_distribute`, immediately before the attach — which is the one choke point
+//! every entry crosses. That placement is the guarantee, and it was learned the hard way: seeding at
+//! actor boot alone was correct for the daemon and broken for `run_session`, which is public, takes
+//! a store directly, and never constructs an actor. A floor that depends on which entry point you
+//! came through is not a floor.
+//!
+//! The actor still seeds at boot, but only as an early warning and to make the floor visible in the
+//! vault before a first run — not as the thing that makes a plan resolve.
+//!
+//! Seeding per plan is affordable because it is idempotent (content-addressed) and cheap (two
+//! `put_node`s that collapse onto themselves).
 
 use crate::validator::DeterministicValidator;
 

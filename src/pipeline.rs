@@ -1123,8 +1123,13 @@ mod resolve_tests {
     /// worked and every other caller broke. `run_session` is public and takes a store directly — an
     /// embedder opening a fresh store and asking for the shipped `feature` workflow got a fail-closed
     /// bail naming a pin they had never heard of. The test above uses a HAND-BUILT def and vaults its
-    /// validator by hand, which is precisely why it did not catch this; this one uses the real
-    /// registry def and seeds only what the plan path seeds.
+    /// validator by hand, which is precisely why it did not catch this.
+    ///
+    /// This one drives `pre_distribute` — the actual function that was fixed — rather than replaying
+    /// the seed and attach calls itself. Replaying them tests that the two functions compose, which
+    /// was never in doubt; the defect was that the plan path did not CALL one of them, and a test
+    /// that makes the call itself cannot observe that. Delete the seed from `pre_distribute` and this
+    /// test fails; that is the whole point of it.
     #[test]
     fn a_shipped_def_plans_against_a_store_nobody_seeded() {
         use wicked_apps_core::open_store;
@@ -1134,29 +1139,44 @@ mod resolve_tests {
         let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
 
         let registry = crate::workflow::WorkflowRegistry::with_defaults();
-        let def = registry.get("feature").expect("the shipped feature def");
+        let pinned = registry
+            .get("feature")
+            .expect("the shipped feature def")
+            .phases
+            .iter()
+            .filter(|p| p.validator_pin.is_some())
+            .count();
         assert!(
-            def.phases.iter().any(|p| p.validator_pin.is_some()),
+            pinned > 0,
             "this test is only meaningful while a shipped def pins a floor"
         );
 
-        // The two lines `plan_and_distribute` runs, in order. The seed is what makes the attach
-        // resolve; drop it and this is the exact bail CI caught.
-        let mut units = crate::plan::plan_from_def(def, "do it", "s");
-        crate::builtin_floors::seed_builtin_floors(&mut store).unwrap();
-        attach_pinned_validators(&store, &mut units, def)
-            .expect("a shipped def must never bail on its own built-in floor");
+        // No CLIs: `pre_distribute` only counts them and copies the keys onto the session — it does
+        // not distribute (that is the caller's thread). Nothing here needs a seat.
+        let pre = pre_distribute(
+            &mut store,
+            &[],
+            "do it",
+            EntityMode::Isolated,
+            "s-unseeded",
+            crate::domain::HumanConfirm::None,
+            None,
+            None,
+            Some("feature"),
+            &mut |_| {},
+            Some(&registry),
+            false,
+            false,
+        )
+        .expect("a shipped def must never bail on its own built-in floor");
 
-        let gated = units
+        let gated = pre
+            .units
             .iter()
             .filter(|u| u.validator.as_ref().is_some_and(|v| v.approved))
             .count();
         assert_eq!(
-            gated,
-            def.phases
-                .iter()
-                .filter(|p| p.validator_pin.is_some())
-                .count(),
+            gated, pinned,
             "every pinned phase came back with an APPROVED validator attached"
         );
         let _ = std::fs::remove_dir_all(&dir);

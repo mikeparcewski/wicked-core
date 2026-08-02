@@ -441,11 +441,13 @@ impl PhaseDef {
     /// neither a new Evaluator shipping ungated nor the floor spreading to a phase that writes no
     /// code can land silently.
     ///
-    /// Safe to embed as data because `pipeline::plan_and_distribute` seeds the pin into the vault
+    /// Safe to embed as data because `pipeline::pre_distribute` seeds the pin into the vault
     /// immediately before `attach_pinned_validators` reads it (`builtin_floors::seed_builtin_floors`,
-    /// idempotent and content-addressed). The seed is on the PLAN path, not just at actor boot,
-    /// because `attach_pinned_validators` is fail-closed on an unresolvable pin and `run_session` is
-    /// a public entry point that never constructs an actor.
+    /// idempotent and content-addressed). `pre_distribute` — not the `plan_and_distribute` wrapper —
+    /// because that is what the actor calls directly, so it is the one function BOTH entries reach.
+    /// The seed is on the PLAN path, not just at actor boot, because `attach_pinned_validators` is
+    /// fail-closed on an unresolvable pin and `run_session` is a public entry point that never
+    /// constructs an actor.
     fn evidence_floor(mut self) -> Self {
         self.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
         self
