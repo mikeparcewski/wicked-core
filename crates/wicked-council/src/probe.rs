@@ -24,10 +24,20 @@ pub struct RealProber {
     pub timeout: Duration,
 }
 
+/// Default per-CLI version-probe budget.
+///
+/// A version probe is a trivial command, so this bounds one thing: how long the OS takes to hand
+/// the child a CPU. That is not small on a busy machine. Measured here, the previous 10 s budget
+/// timed out `sh -c "echo ok"` in 4 of 19 runs with every core saturated — and a timed-out probe
+/// does not report slowness, it reports the CLI as UNUSABLE and drops the seat from the roster.
+/// A misjudged budget therefore reads downstream as capability loss (the FINDING-026 symptom),
+/// which is worth far more than the seconds a generous bound costs on the failure path.
+const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Default for RealProber {
     fn default() -> Self {
         RealProber {
-            timeout: Duration::from_secs(10),
+            timeout: DEFAULT_PROBE_TIMEOUT,
         }
     }
 }
@@ -269,7 +279,15 @@ mod tests {
     #[test]
     fn probe_detects_real_binary_as_usable() {
         // `sh` exists on every unix; `cmd` on Windows. Probe with a harmless arg.
-        let prober = RealProber::default();
+        //
+        // The budget is set explicitly and generously rather than taken from `Default`: this test
+        // is about stage 2 CLASSIFYING a real binary as usable, and a budget in the assertion path
+        // makes it a measurement of how quickly a loaded machine schedules a subprocess instead.
+        // At the old 10 s default it failed 4 of 19 runs with every core busy, always as
+        // `reason: Some(Timeout)`.
+        let prober = RealProber {
+            timeout: Duration::from_secs(120),
+        };
         let (bin, probe_argv) = if cfg!(windows) {
             ("cmd", vec!["cmd".to_string(), "/C".into(), "ver".into()])
         } else {

@@ -636,24 +636,46 @@ fn drain_stderr(child: &mut std::process::Child, budget: Duration) -> String {
     let Some(mut pipe) = child.stderr.take() else {
         return String::new();
     };
+    // The reader appends into a SHARED buffer rather than sending its result at the end, because
+    // the end may never come. Sending once — at EOF or at the cap — hands the caller an empty
+    // string in precisely the case the diagnostic matters most: a seat that is still writing when
+    // the budget expires. The bytes existed, the thread was holding them, and the caller got
+    // nothing. Appending under a lock means the budget bounds how long we WAIT, not how much of
+    // what was already read we are allowed to keep.
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer = std::sync::Arc::clone(&buf);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         use std::io::Read;
-        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        let mut total = 0usize;
         // Bounded at the READ, not just at the wait. The wait below is what this function
         // returns on; this thread outlives it and keeps reading. A grandchild that survived the
-        // group kill and is writing in a loop would otherwise grow `buf` without limit for as
-        // long as it lives. Callers retain at most `STDERR_CAPTURE_LIMIT` anyway, so reading
-        // more was never useful — it was only a way to run out of memory. It also cost the
-        // diagnostic outright: an unbounded read never returns for such a process, so the wait
-        // below expires and the caller gets nothing instead of the head it needed.
-        let _ = pipe
-            .by_ref()
-            .take(STDERR_CAPTURE_LIMIT as u64)
-            .read_to_end(&mut buf);
-        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        // group kill and is writing in a loop would otherwise grow the buffer without limit for
+        // as long as it lives. Callers retain at most `STDERR_CAPTURE_LIMIT` anyway, so reading
+        // more was never useful — it was only a way to run out of memory.
+        while total < STDERR_CAPTURE_LIMIT {
+            let want = (STDERR_CAPTURE_LIMIT - total).min(chunk.len());
+            match pipe.read(&mut chunk[..want]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    total += n;
+                    // A poisoned lock means a previous holder panicked mid-append; the bytes are
+                    // still bytes, so recover the buffer rather than poison this thread too.
+                    writer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&chunk[..n]);
+                }
+            }
+        }
+        let _ = tx.send(());
     });
-    rx.recv_timeout(budget).unwrap_or_default()
+    // Either the reader finished (cap or EOF) or the budget expired. Either way the answer is
+    // whatever has been buffered by now — a truncated head still names the failure; nothing does not.
+    let _ = rx.recv_timeout(budget);
+    let bytes = buf.lock().unwrap_or_else(|e| e.into_inner());
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Whitespace tokenizer that keeps double-quoted spans together and strips the
@@ -1193,6 +1215,27 @@ mod failure_diagnostics_tests {
         }
     }
 
+    /// Block — with NO budget — until the child has actually written its first byte.
+    ///
+    /// Spawning a process out of a large, heavily-threaded test binary is not instant: measured at
+    /// ~200ms idle on this machine, and seconds when every core is busy. Both drain tests are about
+    /// what `drain_stderr` does with bytes that EXIST, not about how promptly the OS produces them,
+    /// so waiting here takes process-spawn latency out of the timed assertion that follows. Leaving
+    /// it in made both tests fail under a saturated machine for a reason neither one is testing.
+    ///
+    /// The byte is consumed, not peeked (a pipe has no unread). Callers assert on what comes after.
+    #[cfg(unix)]
+    fn block_until_writing(child: &mut std::process::Child) {
+        use std::io::Read;
+        let mut first = [0u8; 1];
+        child
+            .stderr
+            .as_mut()
+            .expect("the child was spawned with stderr piped")
+            .read_exact(&mut first)
+            .expect("the writer must produce at least one byte");
+    }
+
     #[test]
     #[cfg(unix)]
     fn the_drain_stops_reading_at_the_cap_not_at_eof() {
@@ -1213,21 +1256,64 @@ mod failure_diagnostics_tests {
             command.process_group(0);
         }
         let mut child = command.spawn().expect("spawn a writer that never stops");
+        block_until_writing(&mut child);
 
+        let started = Instant::now();
         let drained = drain_stderr(&mut child, Duration::from_secs(5));
+        let elapsed = started.elapsed();
         // Reap BEFORE asserting: a failing assertion unwinds, and a leaked `yes` outlives the
         // whole test binary.
         kill_process_tree(&mut child);
         let _ = child.wait();
 
+        // Elapsed is in the message on purpose. The two ways this can fail are not the same bug:
+        // returning fast with nothing means the read was discarded, returning at the full budget
+        // with nothing means the writer never got scheduled. Without the timing they look alike.
         assert!(
             !drained.is_empty(),
-            "an endless writer must still yield its head"
+            "an endless writer must still yield its head (returned empty after {elapsed:?})"
         );
         assert!(
             drained.len() <= STDERR_CAPTURE_LIMIT,
             "the read must stop at the cap, got {} bytes",
             drained.len()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_writer_that_never_closes_still_yields_what_it_already_wrote() {
+        // The budget bounds the WAIT, not the yield. A seat that logged its error and then hung
+        // (a hung retry loop, a child holding the pipe open) reaches neither EOF nor the cap, so
+        // the drain always spends its whole budget here — and the head it wrote is exactly the
+        // diagnostic the caller needs. An all-or-nothing hand-off returns the empty string for
+        // this process, silently converting a named failure into an unexplained one.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            // `%s` rather than an interpolated format string: shells differ on whether `printf`
+            // expands escapes in the FORMAT argument, and stdout is /dev/null here, so the
+            // `1>&2` is what puts the line on the pipe being drained. The leading `.` is the
+            // sentinel `block_until_writing` consumes.
+            .arg("printf '%s\\n' '.BOOM: seat could not start' 1>&2; sleep 30")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command.spawn().expect("spawn a writer that then hangs");
+        block_until_writing(&mut child);
+
+        let started = Instant::now();
+        let drained = drain_stderr(&mut child, Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        kill_process_tree(&mut child);
+        let _ = child.wait();
+
+        assert!(
+            drained.contains("BOOM: seat could not start"),
+            "a timed-out drain must still surface what was written, got {drained:?} after {elapsed:?}"
         );
     }
 
