@@ -49,12 +49,12 @@ use napi_derive::napi;
 /// Sized well above any single run's event count so a normal stream is never truncated.
 const EVENT_QUEUE_BOUND: usize = 1024;
 
-use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
-use wicked_council::AgenticCli;
 use wicked_core::{
     CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus,
     StubStepRunner,
 };
+use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
+use wicked_council::AgenticCli;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -279,9 +279,10 @@ impl Core {
         let wrapped: JsFunction = factory.call(None, &[callback])?.try_into()?;
 
         let mut tsfn: ThreadsafeFunction<String, ErrorStrategy::CalleeHandled> = wrapped
-            .create_threadsafe_function(EVENT_QUEUE_BOUND, |ctx: ThreadSafeCallContext<String>| {
-                Ok(vec![ctx.value])
-            })?;
+            .create_threadsafe_function(
+                EVENT_QUEUE_BOUND,
+                |ctx: ThreadSafeCallContext<String>| Ok(vec![ctx.value]),
+            )?;
         // SIG-2: unref the tsfn (via the Env) so the pump does NOT hold the libuv loop open — a normal
         // `main()` return lets Node exit on its own, no `process.exit()` needed. `unref` acts on the
         // shared handle, so the pump thread's clone is unref'd too.
@@ -331,7 +332,12 @@ impl Core {
     /// JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
     /// also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn chat_open(&self, chat_id: String, clis_json: String, cwd: Option<String>) -> AsyncTask<CoreTask> {
+    pub fn chat_open(
+        &self,
+        chat_id: String,
+        clis_json: String,
+        cwd: Option<String>,
+    ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
             let clis: Vec<String> = serde_json::from_str(&clis_json).map_err(err)?;
@@ -556,7 +562,10 @@ impl Core {
             for node in store.find_symbols(&query).map_err(err)? {
                 match Policy::from_node(&node) {
                     Ok(p) => policies.push(p),
-                    Err(e) => eprintln!("wicked-core-ts: policy node '{}' failed to parse: {e}", node.symbol),
+                    Err(e) => eprintln!(
+                        "wicked-core-ts: policy node '{}' failed to parse: {e}",
+                        node.symbol
+                    ),
                 }
             }
             policies.sort_by(|a, b| a.id.cmp(&b.id));
@@ -582,7 +591,9 @@ impl Core {
     pub fn list_conformance_claims(&self) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
         task(move || {
-            use wicked_apps_core::{open_store_ro, ConformanceClaim, GraphRead, NodeKind, CONFORMANCE_CLAIM};
+            use wicked_apps_core::{
+                open_store_ro, ConformanceClaim, GraphRead, NodeKind, CONFORMANCE_CLAIM,
+            };
             use wicked_estate_core::SymbolQuery;
             use wicked_governance::claim_from_node;
             let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
@@ -594,7 +605,10 @@ impl Core {
             for node in store.find_symbols(&query).map_err(err)? {
                 match claim_from_node(&node) {
                     Ok(c) => claims.push(c),
-                    Err(e) => eprintln!("wicked-core-ts: claim node '{}' failed to parse: {e}", node.symbol),
+                    Err(e) => eprintln!(
+                        "wicked-core-ts: claim node '{}' failed to parse: {e}",
+                        node.symbol
+                    ),
                 }
             }
             serde_json::to_string(&claims).map_err(err)
@@ -844,8 +858,8 @@ impl Drop for Subscription {
 mod tests {
     use super::*;
     // Only the tests name a failure kind now that the CoreEvent → JSON mapping lives in core.
-    use wicked_core::StepFailureKind;
     use serde_json::Value;
+    use wicked_core::StepFailureKind;
 
     /// Assert one hand-mapped variant: its `type` tag and the EXACT set of JSON keys it emits. This
     /// pins the hand-written `CoreEvent → JSON` mapping (`event_to_json` — the studio's only view of
@@ -874,7 +888,10 @@ mod tests {
         let s = || "s".to_string();
         check(CoreEvent::Heartbeat, "heartbeat", &["type"]);
         check(
-            CoreEvent::ChatSessionReady { chat: "c".into(), cli_key: "claude".into() },
+            CoreEvent::ChatSessionReady {
+                chat: "c".into(),
+                cli_key: "claude".into(),
+            },
             "chatSessionReady",
             &["type", "chat", "cliKey"],
         );
@@ -888,7 +905,11 @@ mod tests {
             &["type", "chat", "cliKey", "reason"],
         );
         check(
-            CoreEvent::ChatDelta { chat: "c".into(), cli_key: "claude".into(), text: "t".into() },
+            CoreEvent::ChatDelta {
+                chat: "c".into(),
+                cli_key: "claude".into(),
+                text: "t".into(),
+            },
             "chatDelta",
             &["type", "chat", "cliKey", "text"],
         );
@@ -902,7 +923,11 @@ mod tests {
             "chatReply",
             &["type", "chat", "cliKey", "text", "ok"],
         );
-        check(CoreEvent::ChatClosed { chat: "c".into() }, "chatClosed", &["type", "chat"]);
+        check(
+            CoreEvent::ChatClosed { chat: "c".into() },
+            "chatClosed",
+            &["type", "chat"],
+        );
         check(
             CoreEvent::SessionStarted {
                 session: s(),
@@ -913,7 +938,15 @@ mod tests {
                 entity_mode: s(),
             },
             "sessionStarted",
-            &["type", "session", "problem", "workflowId", "cliCount", "governed", "entityMode"],
+            &[
+                "type",
+                "session",
+                "problem",
+                "workflowId",
+                "cliCount",
+                "governed",
+                "entityMode",
+            ],
         );
         check(
             CoreEvent::UnitPlanned {
@@ -928,7 +961,18 @@ mod tests {
                 executor_type: s(),
             },
             "unitPlanned",
-            &["type", "session", "ord", "description", "stage", "role", "gate", "skillRef", "hasValidatorPin", "executorType"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "description",
+                "stage",
+                "role",
+                "gate",
+                "skillRef",
+                "hasValidatorPin",
+                "executorType",
+            ],
         );
         check(
             CoreEvent::UnitDistributed {
@@ -942,20 +986,41 @@ mod tests {
                 degraded_reason: None,
             },
             "unitDistributed",
-            &["type", "session", "ord", "cli", "routingMethod", "agreementPct", "returned", "dissent", "degradedReason"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "cli",
+                "routingMethod",
+                "agreementPct",
+                "returned",
+                "dissent",
+                "degradedReason",
+            ],
         );
         check(
-            CoreEvent::UnitExecuting { session: s(), ord: 1 },
+            CoreEvent::UnitExecuting {
+                session: s(),
+                ord: 1,
+            },
             "unitExecuting",
             &["type", "session", "ord"],
         );
         check(
-            CoreEvent::CliOutputDelta { session: s(), ord: 1, chunk: s() },
+            CoreEvent::CliOutputDelta {
+                session: s(),
+                ord: 1,
+                chunk: s(),
+            },
             "cliOutputDelta",
             &["type", "session", "ord", "chunk"],
         );
         check(
-            CoreEvent::GateDecided { session: s(), ord: 1, allow: true },
+            CoreEvent::GateDecided {
+                session: s(),
+                ord: 1,
+                allow: true,
+            },
             "gateDecided",
             &["type", "session", "ord", "allow"],
         );
@@ -991,7 +1056,11 @@ mod tests {
             ],
         );
         check(
-            CoreEvent::UnitDispatched { session: s(), ord: 1, attempt: 0 },
+            CoreEvent::UnitDispatched {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+            },
             "unitDispatched",
             &["type", "session", "ord", "attempt"],
         );
@@ -1016,28 +1085,46 @@ mod tests {
             ],
         );
         check(
-            CoreEvent::DataUsed { session: s(), ord: 1, files: vec![s()] },
+            CoreEvent::DataUsed {
+                session: s(),
+                ord: 1,
+                files: vec![s()],
+            },
             "dataUsed",
             &["type", "session", "ord", "files"],
         );
         // ── remaining variants ──
         check(
-            CoreEvent::UnitDone { session: s(), ord: 1 },
+            CoreEvent::UnitDone {
+                session: s(),
+                ord: 1,
+            },
             "unitDone",
             &["type", "session", "ord"],
         );
         check(
-            CoreEvent::UnitDenied { session: s(), ord: 1 },
+            CoreEvent::UnitDenied {
+                session: s(),
+                ord: 1,
+            },
             "unitDenied",
             &["type", "session", "ord"],
         );
         check(
-            CoreEvent::AwaitingHuman { session: s(), ord: 1, reviewing_ord: Some(1), prompt: s() },
+            CoreEvent::AwaitingHuman {
+                session: s(),
+                ord: 1,
+                reviewing_ord: Some(1),
+                prompt: s(),
+            },
             "awaitingHuman",
             &["type", "session", "ord", "reviewingOrd", "prompt"],
         );
         check(
-            CoreEvent::Resumed { session: s(), ord: 1 },
+            CoreEvent::Resumed {
+                session: s(),
+                ord: 1,
+            },
             "resumed",
             &["type", "session", "ord"],
         );
@@ -1047,7 +1134,10 @@ mod tests {
             &["type", "session"],
         );
         check(
-            CoreEvent::SessionFailed { session: s(), ord: 1 },
+            CoreEvent::SessionFailed {
+                session: s(),
+                ord: 1,
+            },
             "sessionFailed",
             &["type", "session", "ord"],
         );
@@ -1081,7 +1171,16 @@ mod tests {
                 detail: s(),
             },
             "assumptionRecorded",
-            &["type", "session", "ord", "kind", "library", "transform", "known", "detail"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "kind",
+                "library",
+                "transform",
+                "known",
+                "detail",
+            ],
         );
         check(
             CoreEvent::WorkerMessageQueued {
@@ -1104,7 +1203,10 @@ mod tests {
             &["type", "session", "ord", "attempt", "previousCli", "newCli"],
         );
         check(
-            CoreEvent::Error { session: Some(s()), message: s() },
+            CoreEvent::Error {
+                session: Some(s()),
+                message: s(),
+            },
             "error",
             &["type", "session", "message"],
         );
@@ -1114,12 +1216,19 @@ mod tests {
             &["type", "id", "cwd"],
         );
         check(
-            CoreEvent::TerminalOutput { id: s(), seq: 7, bytes_b64: s() },
+            CoreEvent::TerminalOutput {
+                id: s(),
+                seq: 7,
+                bytes_b64: s(),
+            },
             "terminalOutput",
             &["type", "id", "seq", "bytesB64"],
         );
         check(
-            CoreEvent::TerminalExited { id: s(), status: Some(0) },
+            CoreEvent::TerminalExited {
+                id: s(),
+                status: Some(0),
+            },
             "terminalExited",
             &["type", "id", "status"],
         );
@@ -1129,12 +1238,19 @@ mod tests {
             &["type", "campaign"],
         );
         check(
-            CoreEvent::CampaignNodeReady { campaign: s(), node: s() },
+            CoreEvent::CampaignNodeReady {
+                campaign: s(),
+                node: s(),
+            },
             "campaignNodeReady",
             &["type", "campaign", "node"],
         );
         check(
-            CoreEvent::CampaignNodeStarted { campaign: s(), node: s(), run_id: s() },
+            CoreEvent::CampaignNodeStarted {
+                campaign: s(),
+                node: s(),
+                run_id: s(),
+            },
             "campaignNodeStarted",
             &["type", "campaign", "node", "runId"],
         );
@@ -1149,17 +1265,26 @@ mod tests {
             &["type", "campaign", "node", "runId", "prompt"],
         );
         check(
-            CoreEvent::CampaignNodeCompleted { campaign: s(), node: s() },
+            CoreEvent::CampaignNodeCompleted {
+                campaign: s(),
+                node: s(),
+            },
             "campaignNodeCompleted",
             &["type", "campaign", "node"],
         );
         check(
-            CoreEvent::CampaignNodeFailed { campaign: s(), node: s() },
+            CoreEvent::CampaignNodeFailed {
+                campaign: s(),
+                node: s(),
+            },
             "campaignNodeFailed",
             &["type", "campaign", "node"],
         );
         check(
-            CoreEvent::CampaignNodeBlocked { campaign: s(), node: s() },
+            CoreEvent::CampaignNodeBlocked {
+                campaign: s(),
+                node: s(),
+            },
             "campaignNodeBlocked",
             &["type", "campaign", "node"],
         );
@@ -1195,7 +1320,11 @@ mod tests {
             &["type", "session", "ord", "attempt", "detail", "failureKind"],
         );
         check(
-            CoreEvent::CrashRecoveryRedrive { session: s(), ord: 1, attempt: 1 },
+            CoreEvent::CrashRecoveryRedrive {
+                session: s(),
+                ord: 1,
+                attempt: 1,
+            },
             "crashRecoveryRedrive",
             &["type", "session", "ord", "attempt"],
         );
@@ -1271,7 +1400,15 @@ mod tests {
                 denying_policy: None,
             },
             "governanceHookFired",
-            &["type", "session", "ord", "attempt", "toolName", "decision", "denyingPolicy"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "toolName",
+                "decision",
+                "denyingPolicy",
+            ],
         );
         check(
             CoreEvent::ValidationPinAttached {
@@ -1344,7 +1481,15 @@ mod tests {
                 governed: false,
             },
             "unitOutputCaptured",
-            &["type", "session", "ord", "attempt", "outputBytes", "stepStatus", "governed"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "outputBytes",
+                "stepStatus",
+                "governed",
+            ],
         );
     }
 }

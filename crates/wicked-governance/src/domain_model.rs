@@ -993,7 +993,7 @@ mod tests {
             Location::new("m/bad.py".to_string(), Span::ZERO),
         );
         store.begin_batch().unwrap();
-        store.upsert_nodes(&[n.clone()]).unwrap();
+        store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
         store.commit_batch().unwrap();
         store
             .annotate(
@@ -1035,7 +1035,7 @@ mod tests {
                 Location::new(file.to_string(), Span::ZERO),
             );
             store.begin_batch().unwrap();
-            store.upsert_nodes(&[n.clone()]).unwrap();
+            store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
             store.commit_batch().unwrap();
             n
         }
