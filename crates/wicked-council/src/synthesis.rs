@@ -50,15 +50,21 @@ fn norm(s: &str) -> String {
 /// "2" as text. A recommendation that does not lead with a digit falls back to `norm`, which is
 /// both the old behaviour and the right one: it is a council choosing among un-numbered options,
 /// where the prose is all the identity there is.
-fn rec_key(s: &str) -> String {
+/// `0` is rejected because the consumer rejects it: the router accepts `n >= 1 && n <= options`,
+/// options being 1-indexed. Treating "0 ..." as a numbered vote would let it win a tally here and
+/// then degrade at routing — agreement claimed on a choice that can never be acted on. Falling back
+/// to `norm` keys it as the prose it effectively is. The upper bound is deliberately NOT checked:
+/// the option count is the router's knowledge, not the matrix's, and an out-of-range high number
+/// degrades there exactly as it did before this function existed.
+pub(crate) fn rec_key(s: &str) -> String {
     let lead: String = s
         .trim_start()
         .chars()
         .take_while(char::is_ascii_digit)
         .collect();
     match lead.parse::<u32>() {
-        Ok(n) => format!("#{n:06}"),
-        Err(_) => norm(s),
+        Ok(n) if n >= 1 => format!("#{n:06}"),
+        _ => norm(s),
     }
 }
 
@@ -407,5 +413,23 @@ mod tests {
         let v = synthesize("t11", &votes, 2);
         assert!(!v.consensus, "two different prose picks are still a split");
         assert!((v.agreement_ratio - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn option_zero_is_not_a_numbered_vote() {
+        // Options are 1-indexed and the router accepts only `n >= 1`, so "0" names nothing it can
+        // act on. Keying it numerically would let two seats "agree" on option zero here and then
+        // degrade at routing — consensus reported on a choice no seat can be assigned.
+        assert_eq!(rec_key("0 — none of these"), rec_key("0 — none of these"));
+        assert_ne!(
+            rec_key("0 — none of these"),
+            rec_key("0 — reject them all"),
+            "zero falls back to prose keying, so different zero-votes stay distinct"
+        );
+        assert_eq!(
+            rec_key("1 — first"),
+            rec_key("1 — worded differently"),
+            "a real option number still keys on the number"
+        );
     }
 }
