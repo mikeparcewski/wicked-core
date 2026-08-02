@@ -28,14 +28,21 @@ use crate::types::{
     RankStore, SeatFailure, SeatFailureKind, TaskState, TimedOutcome, Verdict, SEATS,
 };
 
-/// Recover a readable message from a caught panic payload.
+/// Recover a readable message from a caught panic payload, flattened to a single line.
+///
+/// Flattened HERE rather than at each render site: this is the only thing that writes
+/// `failure_detail`, and that value is both persisted and spliced into degrade reasons, which land
+/// in single-line contexts (events, logs, the studio). A `panic!("{:#?}", x)` payload is multi-line,
+/// so leaving it raw breaks whichever of those consumers is added next rather than the one that
+/// exists today. Matches `SeatFailure::reason`, which already flattens its evidence (review on #151).
 fn panic_detail(payload: &Box<dyn std::any::Any + Send>) -> String {
-    payload
+    let raw = payload
         .downcast_ref::<&str>()
         .map(|s| s.to_string())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         // Framing is the caller's job — this is used for both a seat's panic and the council's.
-        .unwrap_or_else(|| "panicked with a non-string payload".to_string())
+        .unwrap_or_else(|| "panicked with a non-string payload".to_string());
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Close out a council whose worker thread unwound.
@@ -983,6 +990,46 @@ mod tests {
         assert_eq!(
             status.failure_detail.as_deref(),
             Some("rank store exploded")
+        );
+    }
+
+    /// Panics with a payload that spans lines, the way `panic!("{:#?}", x)` does.
+    struct MultilinePanicRank;
+    impl RankStore for MultilinePanicRank {
+        fn record(&self, _cli: &str, _work_kind: &str, _signal: &RankSignal) {
+            panic!("rank store exploded:\n  cause: disk full\n  path:   /var/db\n");
+        }
+        fn best_for(&self, _work_kind: &str, _top: usize) -> Vec<Ranking> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_multiline_panic_is_flattened_before_it_is_persisted() {
+        // `failure_detail` is spliced into degrade reasons, which are rendered on single lines
+        // (events, logs, the studio). A raw multi-line payload would break the line those
+        // consumers assume, so it is flattened at capture rather than at each render site.
+        let worker = worker_with_parts(
+            Arc::new(UnanimousDispatcher),
+            Arc::new(MultilinePanicRank),
+            Arc::new(NoopEventSink),
+            &["a", "b", "c"],
+        );
+        let (id, handle) = worker.queue(task());
+        let _ = handle.join();
+
+        let detail = worker
+            .poll(&id)
+            .expect("status")
+            .failure_detail
+            .expect("a panic must record its detail");
+        assert_eq!(
+            detail, "rank store exploded: cause: disk full path: /var/db",
+            "runs of whitespace collapse to one space and the message stays on one line"
+        );
+        assert!(
+            !detail.contains('\n'),
+            "detail must be single-line: {detail:?}"
         );
     }
 }

@@ -145,7 +145,13 @@ pub enum CoreEvent {
         votes: u32,
         /// Seats convened. `votes` alone cannot distinguish a unanimous council from the one
         /// survivor of a collapsed one, and `agreement_pct` is computed over `votes`.
-        seated: u32,
+        ///
+        /// `None` (wire `null`) means the emitter did not report one — the same "unknown" that
+        /// [`CoreEvent::UnitDistributed`] carries, so a consumer has ONE rule for the field rather
+        /// than a sentinel `0` on one event and a null on the other. Never inferred from `votes`:
+        /// that would report every collapsed council as a complete one, which is the defect this
+        /// field exists to expose (FINDING-026 D; review on #151).
+        seated: Option<u32>,
     },
     /// A unit's execution started.
     UnitExecuting { session: String, ord: u32 },

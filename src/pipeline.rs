@@ -492,7 +492,9 @@ pub(crate) fn apply_distributions(
                     "council".to_string(),
                     Some(*agreement_pct),
                     Some(*returned),
-                    Some(*seated),
+                    // Already an Option — an unknown seat count stays unknown on the wire rather
+                    // than being flattened into a number no one measured.
+                    *seated,
                     Some(*dissent),
                     None,
                 ),

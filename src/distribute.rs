@@ -100,7 +100,12 @@ impl wicked_council::EventSink for RelaySink {
                     * 100.0)
                     .round() as u8,
                 votes: payload["votes"].as_u64().unwrap_or(0) as u32,
-                seated: payload["seated"].as_u64().unwrap_or(0) as u32,
+                // `map`, not `unwrap_or`: an absent key means the emitter reported no seat count,
+                // and both candidate sentinels lie — `0` is an impossible denominator a consumer
+                // could divide by, and `votes` would state that every seat answered. The live
+                // emitter always sends it (same binary), so this only decides how a replayed or
+                // hand-built payload reads.
+                seated: payload["seated"].as_u64().map(|s| s as u32),
             },
             _ => return,
         };
@@ -440,7 +445,7 @@ fn route_from_status(
                     // cast count when it was not recorded, while the status counts the seats the
                     // ledger actually convened. They agree on every live path; where they don't,
                     // the ledger is the one that observed the council.
-                    seated: status.seated,
+                    seated: Some(status.seated),
                     dissent: verdict.dissent.len() as u32,
                 },
             );
@@ -605,7 +610,7 @@ mod tests {
             events[0]
         );
         assert!(
-            matches!(&events[1], CoreEvent::CouncilVoted { session, ord, consensus: true, agreement_pct: 50, votes: 4, seated: 5 }
+            matches!(&events[1], CoreEvent::CouncilVoted { session, ord, consensus: true, agreement_pct: 50, votes: 4, seated: Some(5) }
                 if session == "s1" && *ord == 3),
             "voted → CouncilVoted with ratio as percent, got {:?}",
             events[1]
@@ -647,10 +652,15 @@ mod tests {
                     consensus: false,
                     agreement_pct: 0,
                     votes: 0,
+                    // NOT `Some(0)` and NOT `Some(votes)`. A seat count nobody reported is
+                    // unknown: `0` is an impossible denominator a consumer could divide by, and
+                    // copying `votes` would assert that every seat answered — the false-complete
+                    // reading this field exists to prevent (review on #151).
+                    seated: None,
                     ..
                 }
             ),
-            "mistyped fields → zero defaults, got {:?}",
+            "mistyped fields → zero defaults, absent seat count → unknown, got {:?}",
             events[1]
         );
     }
