@@ -694,6 +694,37 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// Withdraw a governance policy from enforcement. Returns `false` if no policy has that id.
+    ///
+    /// Retire, not delete: a governance system whose rules cannot be withdrawn cannot correct a
+    /// mistake, but hard-deleting would strand every past decision that cites the id. The node
+    /// stays readable and stops being selected.
+    pub fn retire_policy(&self, id: &str) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RetirePolicy {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Withdraw a conformance rule from recall. Returns `false` if no rule has that id. Same
+    /// retire-not-delete contract as [`Self::retire_policy`].
+    pub fn retire_conformance_rule(&self, id: &str) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::RetireConformanceRule {
+                id: id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// Capture an episodic memory (a learned fact/decision) into the orchestrator's memory store.
     pub fn capture_memory(&self, content: &str, scope: &str) -> anyhow::Result<()> {
         let (reply, rx) = channel();

@@ -1018,6 +1018,12 @@ pub(crate) fn run(
                     register_rule(&mut store, &rule)
                 })());
             }
+            Command::RetirePolicy { id, reply } => {
+                let _ = reply.send(wicked_governance::retire_policy(&mut store, &id));
+            }
+            Command::RetireConformanceRule { id, reply } => {
+                let _ = reply.send(wicked_governance::retire_rule(&mut store, &id));
+            }
             Command::CliOutputDelta { run_id, ord, chunk } => {
                 // The single emit point fans a worker's live output chunk out to subscribers.
                 emit(

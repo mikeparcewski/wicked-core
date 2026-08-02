@@ -32,13 +32,13 @@ mod ingest;
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
     claim_from_node, claim_symbol, claim_to_node, conform, decide, decide_as, register_policy,
-    select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
+    retire_policy, select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
 };
 
 // Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B).
 pub use conformance::{
-    recall_rules, register_rule, Compliance, ConfSeverity, ConformanceRule, RuleProvenance,
-    RuleQuery, RuleType, Targets,
+    recall_rules, register_rule, retire_rule, Compliance, ConfSeverity, ConformanceRule,
+    RuleProvenance, RuleQuery, RuleType, Targets,
 };
 
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).
@@ -512,7 +512,8 @@ mod tests {
         let recovered = Policy::from_node(&node).expect("from_node ok");
         assert!(recovered.retired, "the node records that it was retired");
         assert_eq!(
-            recovered.rule, deny_policy().rule,
+            recovered.rule,
+            deny_policy().rule,
             "retirement must not lose the policy's content"
         );
     }
@@ -553,5 +554,4 @@ mod tests {
             "absent must mean active — the policy was enforcing when it was written"
         );
     }
-
 }

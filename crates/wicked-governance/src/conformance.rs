@@ -705,7 +705,6 @@ mod tests {
         assert_eq!(recovered.statement, original.statement);
     }
 
-
     /// The `serde(default)` on `retired` is the back-compat hinge: rules registered before the
     /// field existed have no `retired` key in their metadata bag. Without the default that read is
     /// a hard parse error and every pre-existing rule becomes unrecallable.
@@ -733,5 +732,4 @@ mod tests {
         );
         assert!(!recalled[0].retired);
     }
-
 }

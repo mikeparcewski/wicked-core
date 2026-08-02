@@ -642,6 +642,33 @@ impl Core {
         })
     }
 
+    /// Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
+    /// append-only, so a mis-authored policy denied forever).
+    ///
+    /// Retire, not delete: the node stays readable so a past decision citing this id can still be
+    /// explained, but SELECT stops returning it, so it can never decide another gate. Resolves to
+    /// the JSON boolean `true` if a policy with that id existed, `false` if none did — the caller
+    /// needs that to answer 404 rather than report a success that removed nothing.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn retire_policy(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let found = core.retire_policy(&id).map_err(err)?;
+            serde_json::to_string(&found).map_err(err)
+        })
+    }
+
+    /// Withdraw a conformance rule from recall. Same retire-not-delete contract, same JSON-boolean
+    /// reply, as [`Core::retire_policy`].
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn retire_conformance_rule(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let found = core.retire_conformance_rule(&id).map_err(err)?;
+            serde_json::to_string(&found).map_err(err)
+        })
+    }
+
     /// Register (or replace) a workflow definition in the actor's runtime registry. `json` is a
     /// JSON-serialised `WorkflowDef` object (fields: id, description, phases — see the wicked-core
     /// workflow schema). Validates server-side (id + ≥1 phase required); rejects invalid JSON or a
