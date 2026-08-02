@@ -585,10 +585,60 @@ impl WorkflowRegistry {
         r
     }
     /// Register (or replace) a workflow. Validates before inserting.
+    ///
+    /// A replacement may change anything about a workflow EXCEPT quietly ungating it — see
+    /// [`carry_shadowed_pins`](WorkflowRegistry::carry_shadowed_pins).
     pub fn register(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
         def.validate()?;
+        let def = self.carry_shadowed_pins(def);
         self.defs.insert(def.id.clone(), def);
         Ok(())
+    }
+
+    /// A replacement may not silently REMOVE a `validator_pin` the definition it shadows carried.
+    /// Where the incoming phase has no pin and the shadowed one did, the pin is carried forward and
+    /// the substitution is announced.
+    ///
+    /// This exists because replacement is silent and the loss is invisible. `register` overwrites by
+    /// id, `load_dir` runs AFTER `with_defaults`, and both the drop-in dir and the runtime
+    /// `RegisterWorkflow` path funnel through here — so anything re-registering a built-in id
+    /// replaces the shipped def wholesale, and a mirror of that def written before the floors existed
+    /// takes the gates back out with no error, no warning, and a workflow that still reports the
+    /// right id and phases. Observed exactly that way: `~/.config/wicked-core/workflows/feature.json`
+    /// written by a consumer's hand-transcribed copy, `adversarial-review` role `evaluator`,
+    /// `validator_pin: null` — the evidence floor shipped in the built-in and never engaged for the
+    /// one caller that matters.
+    ///
+    /// A gate is a floor, so the safe direction is unambiguous: keep it. Everything else in the
+    /// replacement still applies, which is what a legitimate shadow is actually for (the onboarding
+    /// drop-in, for instance, exists to bake runtime-resolved executor paths). Deliberately dropping
+    /// a gate is still available — under a NEW id, which is what `gate-phase` already does and what
+    /// the warning points at. Changing a pin is untouched: only a phase with NO pin inherits one.
+    fn carry_shadowed_pins(&self, mut def: WorkflowDef) -> WorkflowDef {
+        let Some(shadowed) = self.defs.get(&def.id) else {
+            return def;
+        };
+        for phase in def.phases.iter_mut() {
+            if phase.validator_pin.is_some() {
+                continue;
+            }
+            let Some(pin) = shadowed
+                .phases
+                .iter()
+                .find(|p| p.id == phase.id)
+                .and_then(|p| p.validator_pin.as_deref())
+            else {
+                continue;
+            };
+            eprintln!(
+                "wicked-core: workflow `{}` was re-registered without the validator pin that phase \
+                 `{}` carried ({}); KEEPING the pin — a replacement may change a gate but not \
+                 silently remove one. To run this phase ungated, register under a different id.",
+                def.id, phase.id, pin
+            );
+            phase.validator_pin = Some(pin.to_string());
+        }
+        def
     }
     pub fn get(&self, id: &str) -> Option<&WorkflowDef> {
         self.defs.get(id)
@@ -1177,6 +1227,104 @@ mod workflow_def_tests {
         let feature = reg.get("feature").unwrap();
         assert_eq!(feature.phases.len(), 1);
         assert_eq!(feature.phases[0].id, "ship-it");
+    }
+
+    /// FINDING-049. A drop-in that shadows a built-in must not take its gates out.
+    ///
+    /// This is how the evidence floor was nullified in practice: a consumer wrote a hand-transcribed
+    /// mirror of the shipped `feature` def into the overlay dir, every phase `validator_pin: null`.
+    /// `load_dir` runs after `with_defaults` and `register` overwrites, so the mirror replaced the
+    /// gated built-in — same id, same phases, no gate, no error. The floor shipped and never engaged
+    /// for the one caller that mattered.
+    ///
+    /// The shadow still applies (that is what a drop-in is for); only the REMOVAL of a gate is
+    /// refused. Note the phase list here is the mirror's, not the built-in's.
+    #[test]
+    fn a_drop_in_cannot_silently_ungate_the_builtin_it_shadows() {
+        let dir = ScratchDir::new("ungate");
+        let base = feature_def();
+        let gated = base
+            .phases
+            .iter()
+            .find(|p| p.validator_pin.is_some())
+            .expect("a shipped feature phase pins the evidence floor");
+        let floor = gated.validator_pin.clone().unwrap();
+        let gated_id = gated.id.clone();
+
+        // The mirror: the shadowed phase, plus a phase of its own so the shadow is observably applied
+        // and not just ignored. Every pin null, exactly as transcribed.
+        dir.write(
+            "feature.json",
+            &format!(
+                r#"{{ "id": "feature", "phases": [
+                    {{ "id": "{gated_id}", "kind": "review", "role": "evaluator" }},
+                    {{ "id": "mirror-only", "kind": "build" }}
+                ] }}"#
+            ),
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        reg.load_dir(&dir.0).unwrap();
+        let feature = reg.get("feature").unwrap();
+
+        let ids: Vec<&str> = feature.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![gated_id.as_str(), "mirror-only"],
+            "the drop-in still replaces the def — only the gate is protected"
+        );
+        assert_eq!(
+            feature.phases[0].validator_pin.as_deref(),
+            Some(floor.as_str()),
+            "the shadowed phase keeps the floor the built-in carried"
+        );
+        assert!(
+            feature.phases[1].validator_pin.is_none(),
+            "a phase the built-in never had gains nothing — this carries pins forward, it does not invent them"
+        );
+    }
+
+    /// The other direction: a shadow that states its OWN pin is honoured, and a fresh id inherits
+    /// nothing. Without this, "keep the gate" could have been implemented as "gates are immutable",
+    /// which would break `gate-phase` and lock operators out of their own criteria.
+    #[test]
+    fn carrying_a_pin_forward_never_overrides_one_the_drop_in_states() {
+        let dir = ScratchDir::new("ungate-own");
+        let gated_id = feature_def()
+            .phases
+            .iter()
+            .find(|p| p.validator_pin.is_some())
+            .expect("a pinned phase")
+            .id
+            .clone();
+        dir.write(
+            "feature.json",
+            &format!(
+                r#"{{ "id": "feature", "phases": [
+                    {{ "id": "{gated_id}", "kind": "review", "validator_pin": "operators-own-pin" }}
+                ] }}"#
+            ),
+        );
+        // A brand-new id shadows nothing, so it stays exactly as authored.
+        dir.write(
+            "fresh.json",
+            &format!(
+                r#"{{ "id": "fresh", "phases": [ {{ "id": "{gated_id}", "kind": "review" }} ] }}"#
+            ),
+        );
+        let mut reg = WorkflowRegistry::with_defaults();
+        reg.load_dir(&dir.0).unwrap();
+
+        assert_eq!(
+            reg.get("feature").unwrap().phases[0]
+                .validator_pin
+                .as_deref(),
+            Some("operators-own-pin"),
+            "an operator changing the criterion is the point of the seam"
+        );
+        assert!(
+            reg.get("fresh").unwrap().phases[0].validator_pin.is_none(),
+            "a new id shadows nothing and inherits nothing"
+        );
     }
 
     #[test]
