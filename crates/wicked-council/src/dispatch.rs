@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+use wicked_apps_core::HardenedCommand;
 
 use crate::types::{
     AgenticCli, BallotContext, Category, CouncilTask, DispatchOutcome, Dispatcher, InputMode,
@@ -405,8 +406,15 @@ fn run_in_isolation(
         ));
     };
 
+    // A seat is a real agentic CLI with tool access, running in the caller's workdir — the same
+    // shape of process as a governed worker, reached by a different path. FINDING-067 hardened the
+    // worker paths; enumerating `Command::new` afterwards found this one had never been considered,
+    // and it inherited the daemon's entire environment. Latent rather than live (nothing sets
+    // `WICKED_ESTATE_DB` in the daemon today) — but "latent" here means "until an operator who works
+    // on estate exports it in the shell that starts the daemon".
     let mut command = Command::new(program);
     command
+        .hardened()
         .args(args)
         .current_dir(workdir)
         .stdout(Stdio::piped())
@@ -615,6 +623,7 @@ fn kill_process_tree(child: &mut std::process::Child) {
         // No process groups to signal here, and `Child::kill` reaches only the direct child.
         // `taskkill /T` walks the tree by parent pid, which is the closest equivalent.
         let _ = Command::new("taskkill")
+            .hardened()
             .args(["/T", "/F", "/PID"])
             .arg(child.id().to_string())
             .stdout(Stdio::null())

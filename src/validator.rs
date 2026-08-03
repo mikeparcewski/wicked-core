@@ -66,6 +66,7 @@ use crate::AgenticCli;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use wicked_apps_core::HardenedCommand;
 
 /// A deterministic validator authored for one acceptance criterion — the phase's evidence evaluator.
 /// `script` is a shell command that exits 0 iff the criterion is satisfied. `approved` gates execution:
@@ -743,6 +744,11 @@ pub fn run_validator_reporting(
     argv.push(v.script.clone());
 
     let mut cmd = Command::new(&argv[0]);
+    // `apply_minimal_env` below is strictly stronger than the chokepoint (it `env_clear`s and passes
+    // through an allowlist), so this call strips nothing today. It is here because the rule has no
+    // exceptions (see `wicked_apps_core::spawn`): if the minimal-env floor is ever weakened or reordered,
+    // the engine-internal variables still cannot reach a validator script by inheritance.
+    cmd.hardened();
     cmd.args(&argv[1..]).current_dir(cwd);
     apply_minimal_env(&mut cmd);
     // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without

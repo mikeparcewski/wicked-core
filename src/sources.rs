@@ -7,6 +7,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::execute_wrapped::build_argv;
+use wicked_apps_core::HardenedCommand;
 
 /// `~/.wicked` — the managed base dir for cloned sources + docs.
 pub fn base_dir() -> PathBuf {
@@ -65,6 +66,7 @@ pub fn add_source(origin: &str, name: &str) -> anyhow::Result<String> {
             // Already cloned → ensure FULL history (older clones were shallow → churn / recent-changes
             // need real history), then fast-forward to latest (best-effort).
             if Command::new("git")
+                .hardened()
                 .arg("-C")
                 .arg(&dest)
                 .args(["rev-parse", "--is-shallow-repository"])
@@ -73,12 +75,14 @@ pub fn add_source(origin: &str, name: &str) -> anyhow::Result<String> {
                 .unwrap_or(false)
             {
                 let _ = Command::new("git")
+                    .hardened()
                     .arg("-C")
                     .arg(&dest)
                     .args(["fetch", "--unshallow"])
                     .output();
             }
             let _ = Command::new("git")
+                .hardened()
                 .arg("-C")
                 .arg(&dest)
                 .args(["pull", "--ff-only"])
@@ -88,6 +92,7 @@ pub fn add_source(origin: &str, name: &str) -> anyhow::Result<String> {
         // Blobless PARTIAL clone: full COMMIT history (so git log / churn / recent-changes work) but
         // blobs fetched lazily — fast + small, unlike `--depth 1` which has no history.
         let out = Command::new("git")
+            .hardened()
             .args(["clone", "--filter=blob:none", origin])
             .arg(&dest)
             .output()
@@ -126,7 +131,11 @@ pub struct ReconDoc {
 fn run_cli(invocation: &str, prompt: &str, cwd: &Path, timeout: Duration) -> Option<String> {
     let argv = build_argv(invocation, prompt, &[]); // source recon has no skill allowlist
     let (bin, rest) = argv.split_first()?;
+    // Source recon runs an agentic CLI on a prompt, in the repo — the third agent-facing spawn path
+    // the FINDING-067 enumeration turned up. It is ungoverned by design (recon, not a governed
+    // unit), which makes the environment the only boundary it has.
     let mut child = Command::new(bin)
+        .hardened()
         .args(rest)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -193,6 +202,7 @@ pub fn add_node_note(
 ) -> anyhow::Result<()> {
     let bin = crate::code_graph::indexer_bin();
     let out = Command::new(&bin)
+        .hardened()
         .args([
             "annotate", "--symbol", node_id, "--key", "note", "--value", note,
         ])
@@ -224,6 +234,7 @@ pub fn index_docs(path: &str, graph_db: &str) -> anyhow::Result<String> {
         let _ = std::fs::create_dir_all(parent);
     }
     let out = Command::new(&bin)
+        .hardened()
         .args(["index", path, "--db", graph_db])
         .output()
         .map_err(|e| anyhow::anyhow!("could not run the indexer ({e})"))?;
@@ -240,6 +251,7 @@ pub fn index_docs(path: &str, graph_db: &str) -> anyhow::Result<String> {
 fn annotate_symbol(graph_db: &str, symbol: &str, note: &str, cli: &str) -> bool {
     let bin = crate::code_graph::indexer_bin();
     Command::new(&bin)
+        .hardened()
         .args(["annotate", symbol, "--key", "role", "--value", note])
         .args([
             "--type",

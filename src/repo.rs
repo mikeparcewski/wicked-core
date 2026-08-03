@@ -14,8 +14,8 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
-    synthetic_symbol, FromNode, GraphRead, GraphStore, Language, Location, Node, NodeKind, Span,
-    ToNode, SYMBOL_SCHEME,
+    synthetic_symbol, FromNode, GraphRead, GraphStore, HardenedCommand, Language, Location, Node,
+    NodeKind, Span, ToNode, SYMBOL_SCHEME,
 };
 use wicked_estate_core::SymbolQuery;
 
@@ -103,6 +103,7 @@ fn slug(name: &str) -> String {
 /// Run `git -C <root> <args...>` and return `(success, stdout, stderr)`.
 fn git(root: &str, args: &[&str]) -> anyhow::Result<(bool, String, String)> {
     let out = Command::new("git")
+        .hardened()
         .arg("-C")
         .arg(root)
         .args(args)
