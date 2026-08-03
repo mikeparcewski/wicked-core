@@ -1523,6 +1523,17 @@ mod tests {
             "governanceContextArmed",
             &["type", "session", "ord", "attempt", "path", "dbPath"],
         );
+        check(
+            CoreEvent::GovernanceUnenforced {
+                session: s(),
+                ord: 4,
+                attempt: 0,
+                cli: s(),
+                reason: s(),
+            },
+            "governanceUnenforced",
+            &["type", "session", "ord", "attempt", "cli", "reason"],
+        );
         // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
         check(
             CoreEvent::WorkflowSelected {

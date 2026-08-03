@@ -452,6 +452,31 @@ pub enum CoreEvent {
         path: String,
         db_path: String,
     },
+    /// (EVT-017) A unit that the workflow declared GOVERNED ran with input governance UNENFORCED,
+    /// because the CLI it was routed to has no gate-hook adapter. Input arming is claude-only (it
+    /// works by injecting a PreToolUse hook via `--settings`), so any governed unit the router
+    /// sends elsewhere executes its tool calls unchecked.
+    ///
+    /// This is not a fallback and nothing retries: the unit runs, and `UnitOutputCaptured` reports
+    /// `governed: false`. That bare `false` is indistinguishable from an ungoverned-by-design unit,
+    /// which is why this event exists — it names the CLI and the reason, so an evidence packet can
+    /// tell "no governance was asked for" apart from "governance was asked for and could not be
+    /// applied". Measured on `pilot-migration-001`: the `evaluator_distinct` router moved ord 4 off
+    /// claude to `agy`, and that unit produced no ARMED marker, no hook firings, and no claims,
+    /// while units 1–3 armed normally (FINDING-063).
+    ///
+    /// The routing interaction is the sharp edge: `evaluator_distinct` exists to keep the evaluator
+    /// off the creator's CLI, so on a claude-creator run it *necessarily* selects a CLI that cannot
+    /// be governed. The unit whose job is to judge the work independently is the one structurally
+    /// guaranteed to run unchecked.
+    GovernanceUnenforced {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        /// The binary the unit was actually routed to (argv[0]), not the seat key.
+        cli: String,
+        reason: String,
+    },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
     /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
@@ -1130,6 +1155,20 @@ impl CoreEvent {
                 "attempt": attempt,
                 "path": path,
                 "dbPath": db_path,
+            }),
+            CoreEvent::GovernanceUnenforced {
+                session,
+                ord,
+                attempt,
+                cli,
+                reason,
+            } => json!({
+                "type": "governanceUnenforced",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "reason": reason,
             }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {
