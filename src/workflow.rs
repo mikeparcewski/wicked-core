@@ -72,17 +72,37 @@ pub struct StepInput {
     pub prior_outputs: Vec<PriorUnitOutput>,
 }
 
-/// The governance context threaded to a GOVERNED wrapped-CLI unit (DES-OUTGOV-003 §4). Carries the ONE
-/// value the worker cannot derive from a [`StepInput`] — the estate store path (the worker holds no
-/// store handle); the hook's `scope` (`resolve_scope`), `phase` (`unit-{ord}`), and the decisions-log
-/// path are all derived from the `StepInput`'s own fields. `Serialize`/`Deserialize` so it survives the
-/// exec-mediation bus round-trip on `DispatchedTask`.
+/// The governance context threaded to a GOVERNED wrapped-CLI unit (DES-OUTGOV-003 §4). Carries the
+/// store paths the worker cannot derive from a [`StepInput`] (the worker holds no store handle); the
+/// hook's `scope` (`resolve_scope`), `phase` (`unit-{ord}`), and the decisions-log path are all derived
+/// from the `StepInput`'s own fields. `Serialize`/`Deserialize` so it survives the exec-mediation bus
+/// round-trip on `DispatchedTask`.
+///
+/// The two paths are DIFFERENT STORES ON PURPOSE and must never be collapsed back into one
+/// (FINDING-067). `db_path` is the platform's operational store — every run, unit, phase, policy and
+/// repo registration in it — and only the gate-hook reads it, through `open_store_ro`. The worker's own
+/// tools get `code_graph_db`, a per-repo graph they may freely write. Handing a worker a writable handle
+/// to `db_path` cost the platform its entire operational state once already: a governed worker asked to
+/// recon its repo pointed the estate indexer at the store it had been given, and the indexer's
+/// delete-sweep — "remove nodes whose file is no longer on disk" — deleted all 833 operational nodes,
+/// since `agent_session/<id>` and friends are synthetic locations that never existed on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GovernanceContext {
     /// ABSOLUTE filesystem path of the estate SQLite store the gate-hook subprocess opens to read
     /// policies (never `:memory:` — an in-memory store cannot cross processes — nor `postgres://`,
     /// which the SQLite-only hook cannot open; the launcher only sets this for a file-backed store).
+    ///
+    /// GATE-HOOK ONLY. Never hand this path to anything the worker controls.
     pub db_path: String,
+    /// ABSOLUTE path of the REPO-LOCAL code graph (`<repo_root>/.wicked/code-graph.db`) the worker's
+    /// own estate MCP server opens — the one store it is allowed to write. `None` ⇒ the run targets no
+    /// registered repo (or its root is unreadable), and the launcher then injects NO estate MCP at all
+    /// rather than substituting [`Self::db_path`].
+    ///
+    /// `#[serde(default)]` so a `DispatchedTask` serialized by an older peer still deserializes — as
+    /// `None`, i.e. no estate tools, which is the safe reading of "this peer never told me a repo".
+    #[serde(default)]
+    pub code_graph_db: Option<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

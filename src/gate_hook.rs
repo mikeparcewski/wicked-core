@@ -66,8 +66,25 @@ pub const GATE_PHASE_ENV: &str = "WICKED_GATE_PHASE";
 /// synthetic token alone, which is the pre-fix behaviour.
 pub const GATE_PHASE_ID_ENV: &str = "WICKED_GATE_PHASE_ID";
 
-/// Environment variable carrying the estate store path to the gate-hook subprocess (the injected command
-/// drops `--db`). One exported const so the launcher setter + the bin resolver never drift on the name.
+/// Environment variable carrying the operational store path to the gate-hook subprocess (the injected
+/// command drops `--db`). One exported const so the launcher setter + the bin resolver never drift on
+/// the name.
+///
+/// DELIBERATELY NOT `WICKED_ESTATE_DB` (FINDING-067). The hook is a grandchild of the worker CLI, so
+/// the only way to reach it is through the worker's own environment — which means every tool the
+/// worker spawns sees this variable too. Under the old name, `wicked-estate`, `wicked-estate-mcp` and
+/// `wicked-core` all resolve `--db` ELSE `$WICKED_ESTATE_DB`, so a worker running a bare
+/// `wicked-estate index .` in a Bash call silently pointed the indexer at the platform's operational
+/// store and its delete-sweep took all 833 operational nodes with it. A name no estate tool consumes
+/// keeps the hook working while removing the accident: the worker's tools now resolve their own
+/// default instead of inheriting the engine's. The launcher additionally `env_remove`s the old name so
+/// an inherited value cannot re-open the channel.
+pub const GATE_DB_ENV: &str = "WICKED_GATE_DB";
+
+/// The variable [`GATE_DB_ENV`] replaced — still named here because the launcher must actively STRIP it
+/// from a worker's environment, not merely stop setting it. Every estate binary reads it as the `--db`
+/// fallback, so a daemon started with it exported would hand every worker the operator's store without
+/// the engine ever setting a thing.
 pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
@@ -224,7 +241,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
 }
 
 /// A fail-closed reason the hook must DENY on rather than proceed, or `None` if the store is usable:
-///  - No resolvable store (`--db`/`WICKED_ESTATE_DB` both unset): `open_store(None)` would fall back to a
+///  - No resolvable store (`--db`/`WICKED_GATE_DB` both unset): `open_store(None)` would fall back to a
 ///    default `.wicked-estate/graph.db` (and may CREATE an empty one), evaluating against ZERO policies —
 ///    a silent fail-OPEN. A governed hook MUST have the run's store; deny loudly instead.
 ///  - A `postgres://` spec: governance-in-run is SQLite-only for now (the read-only spec-dispatch opener
@@ -232,7 +249,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
 fn store_unavailable(db: Option<&str>) -> Option<String> {
     match db.filter(|s| !s.is_empty()) {
         None => Some(
-            "no estate store resolvable (set --db or WICKED_ESTATE_DB) — refusing to evaluate against \
+            "no estate store resolvable (set --db or WICKED_GATE_DB) — refusing to evaluate against \
              a default/empty store (fail-closed)"
                 .to_string(),
         ),

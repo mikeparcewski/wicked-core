@@ -211,10 +211,21 @@ pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPER
 /// `.claude` is listed even though `$CLAUDE_CONFIG_DIR` usually supersedes it — both are denied,
 /// because which one is live depends on the daemon's environment and a boundary that depends on
 /// environment is not a boundary.
+/// Spelled out one literal path per entry, never a `~/.wicked*` glob. A glob that the CLI's matcher
+/// does not interpret the way we assume denies nothing while reading like a wider boundary — and a
+/// boundary you cannot verify is not one. Adding a sibling directory here is a one-line cost; getting
+/// the glob subtly wrong costs the store.
 const DENIED_HOME_SUBDIRS: &[&str] = &[
-    ".claude",           // operator CLAUDE.md, hooks, memory, plugins, transcripts
-    ".wicked",           // this engine's own run state, decisions logs, settings files
-    ".wicked-brain",     // an index of a DIFFERENT repo than the one under test
+    ".claude", // operator CLAUDE.md, hooks, memory, plugins, transcripts
+    ".wicked", // this engine's own run state, decisions logs, settings files
+    // THE OPERATIONAL STORE (FINDING-067). `~/.wicked-crew/core.db` is every run, unit, phase, policy
+    // and repo registration the platform has — the daemon's default state home. It was missing here
+    // while `.wicked` (the same engine's *run* state) was listed, so the file tools had a clear path to
+    // the one database whose loss ends the campaign. The MCP no longer hands a worker this store; this
+    // is the other half — a worker that goes looking for it by path.
+    ".wicked-crew",
+    ".wicked-estate", // the operator's own default code graph — a DIFFERENT repo's index
+    ".wicked-brain",  // an index of a DIFFERENT repo than the one under test
     ".something-wicked", // ecosystem app state (event outbox, app dbs)
     ".config/wicked-core",
     ".config/wicked-council",
@@ -631,13 +642,21 @@ impl WrappedCliStepRunner {
             };
             let mut cmd = Command::new(&argv[0]);
             cmd.args(&argv[1..]).current_dir(&cwd);
+            // No estate tool the worker spawns may inherit a store from the environment (FINDING-067).
+            // Stripped UNCONDITIONALLY — governed or not, set by us or exported by whoever started the
+            // daemon. `wicked-estate`, `wicked-estate-mcp` and `wicked-core` all resolve `--db` ELSE
+            // this variable, so leaving it in place is the difference between a worker's `wicked-estate
+            // index .` building its repo's graph and it re-indexing the platform's operational store on
+            // top of itself. A boundary that depends on the daemon's environment is not a boundary.
+            cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
-            // the absolute estate store path, and the unit's scope/phase. Scope/phase travel via ENV
-            // (NOT interpolated into the shell hook command) so caller-controlled ids can never inject
-            // shell metacharacters — the command string carries only the trusted exe (DES-OUTGOV-003 §8).
+            // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
+            // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
+            // inject shell metacharacters — the command string carries only the trusted exe
+            // (DES-OUTGOV-003 §8).
             if let Some(g) = &gov_env {
                 cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
-                cmd.env(crate::gate_hook::ESTATE_DB_ENV, &g.db_path);
+                cmd.env(crate::gate_hook::GATE_DB_ENV, &g.db_path);
                 cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
                 cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
                 if !g.phase_id.is_empty() {
@@ -845,10 +864,28 @@ fn arm_input_governance(
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
     // Include the wicked-estate MCP server so governed workers have access to the 23 estate tools
-    // (graph-view, code-graph, memory recall, etc.). The db_path comes from GovernanceContext —
-    // the same store the gate-hook uses — so no separate lookup is needed. Using the resolved exe
-    // directory to find wicked-estate-mcp avoids hardcoding a PATH dependency.
-    let estate_mcp_exe = resolve_estate_mcp_exe();
+    // (graph-view, code-graph, memory recall, etc.), pointed at the run's REPO-LOCAL graph. Using the
+    // resolved exe directory to find wicked-estate-mcp avoids hardcoding a PATH dependency.
+    //
+    // This USED to pass `gov.db_path` — the operational store — "so no separate lookup is needed".
+    // That handed every governed worker a writable handle to the platform's own state, and FINDING-067
+    // is what happened next: a worker told to recon its repo did the obvious thing, ran the estate
+    // indexer against the store it had been given, and the indexer's delete-sweep removed all 833
+    // operational nodes (`agent_session/<id>` and friends live at synthetic locations that are not
+    // files, so "the file is gone" is true of every one of them). The store it wiped held zero source
+    // files, so the worker got nothing out of it either.
+    //
+    // `None` ⇒ NO estate MCP. Falling back to `gov.db_path` is the bug; falling back to a scratch db
+    // is worse than nothing (tools that answer "not found" for a repo that plainly has the symbol are
+    // how an agent concludes the code does not exist — estate's own R3).
+    let estate_mcp = gov.code_graph_db.as_ref().map(|graph_db| {
+        serde_json::json!({
+            "wicked-estate": {
+                "command": resolve_estate_mcp_exe(),
+                "args": ["--db", graph_db]
+            }
+        })
+    });
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
@@ -859,12 +896,7 @@ fn arm_input_governance(
         // braces on purpose: the flag is the one that survives if this file fails to arm, and the
         // file is the one that survives an operator template that pins its own `--disallowedTools`.
         "permissions": { "deny": deny_rules() },
-        "mcpServers": {
-            "wicked-estate": {
-                "command": estate_mcp_exe,
-                "args": ["--db", &gov.db_path]
-            }
-        }
+        "mcpServers": estate_mcp.unwrap_or_else(|| serde_json::json!({}))
     });
     let dir = decisions_path
         .parent()
@@ -1336,6 +1368,7 @@ mod tests {
             workdir: Some(dir.clone()),
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
             }),
             prior_outputs: vec![],
         };
@@ -1416,6 +1449,7 @@ mod tests {
         u.assigned_cli = Some("claude".to_string());
         let gov = crate::workflow::GovernanceContext {
             db_path: "/abs/estate.db".to_string(),
+            code_graph_db: Some("/abs/repo/.wicked/code-graph.db".to_string()),
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -1482,6 +1516,130 @@ mod tests {
             "the exe path is quoted per-platform ({q}) so $/backtick/space can't be expanded: {cmd}"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir_for_test(&input.run_id));
+    }
+
+    /// FINDING-067, the channel the settings file does not cover. The gate-hook is a GRANDCHILD of the
+    /// worker, so its store path can only reach it through the worker's own environment — and the
+    /// variable it used was `WICKED_ESTATE_DB`, the exact name every estate binary resolves as its
+    /// `--db` fallback. A worker running a bare `wicked-estate index .` in a Bash call therefore
+    /// indexed the platform's operational store, and the indexer's delete-sweep removed every node in
+    /// it. Fixing the MCP's `--db` alone leaves this path wide open, because it is not the MCP.
+    ///
+    /// The strip is unconditional, so this exercises the case that survives a rename: the variable is
+    /// already exported in the environment the daemon was started with, and the launcher never sets it.
+    #[cfg(unix)]
+    #[test]
+    fn no_worker_inherits_an_estate_store_through_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-envstrip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"SEEN=[${WICKED_ESTATE_DB:-UNSET}]\"\n").unwrap();
+
+        // The daemon's own environment names the operational store — the launcher must strip it
+        // rather than merely decline to add it.
+        let op_db = dir.join("operational-core.db");
+        std::env::set_var(crate::gate_hook::ESTATE_DB_ENV, &op_db);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("probe".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        let input = StepInput {
+            run_id: "run-envstrip".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        std::env::remove_var(crate::gate_hook::ESTATE_DB_ENV);
+
+        assert!(
+            out.output.contains("SEEN=[UNSET]"),
+            "the worker must not inherit an estate store from the environment; got: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING-067. The settings file is the ONE place the worker's own tools are handed a store, and
+    /// the store it must never be handed is the operational one — the launcher used to pass exactly
+    /// that, and a worker that ran the estate indexer against it deleted all 833 operational nodes.
+    ///
+    /// Two halves, and the second is the one that decays: with a repo the MCP points at the repo-local
+    /// graph, and with NO repo there is no MCP at all. A future "sensible default" that falls back to
+    /// `gov.db_path` when `code_graph_db` is `None` re-opens the whole hole while still looking correct
+    /// in the happy path — so the `None` case asserts on the whole serialized file, not just the args.
+    #[test]
+    fn the_worker_mcp_never_receives_the_operational_store() {
+        let read_settings = |gov: &crate::workflow::GovernanceContext, run_id: &str| {
+            let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
+            u.assigned_cli = Some("claude".to_string());
+            let input = StepInput {
+                run_id: run_id.to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: Some(gov.clone()),
+                prior_outputs: vec![],
+            };
+            let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
+            arm_input_governance(&input, gov, &mut argv).unwrap();
+            let raw = std::fs::read(std::path::PathBuf::from(&argv[2])).unwrap();
+            let _ = std::fs::remove_dir_all(gov_run_dir_for_test(run_id));
+            (
+                serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+                String::from_utf8(raw).unwrap(),
+            )
+        };
+
+        let op_db = "/abs/operational-core.db";
+        let graph_db = "/abs/repo/.wicked/code-graph.db";
+
+        // WITH a registered repo: the estate MCP is armed, pointed at the REPO-LOCAL graph.
+        let (json, raw) = read_settings(
+            &crate::workflow::GovernanceContext {
+                db_path: op_db.to_string(),
+                code_graph_db: Some(graph_db.to_string()),
+            },
+            &format!("mcptest-repo-{}", std::process::id()),
+        );
+        let args = json["mcpServers"]["wicked-estate"]["args"]
+            .as_array()
+            .expect("the estate MCP is armed when a repo-local graph exists");
+        assert_eq!(args[0], "--db");
+        assert_eq!(args[1], graph_db, "the MCP opens the repo-local graph");
+        assert!(
+            !raw.contains(op_db),
+            "the operational store must not appear ANYWHERE in the worker's settings: {raw}"
+        );
+
+        // WITHOUT one: NO estate MCP. Not the operational store, not a scratch db beside it.
+        let (json, raw) = read_settings(
+            &crate::workflow::GovernanceContext {
+                db_path: op_db.to_string(),
+                code_graph_db: None,
+            },
+            &format!("mcptest-norepo-{}", std::process::id()),
+        );
+        assert!(
+            json["mcpServers"]["wicked-estate"].is_null(),
+            "no repo-local graph ⇒ no estate MCP: {json}"
+        );
+        assert!(
+            !raw.contains(op_db),
+            "the operational store must not be substituted when no graph is known: {raw}"
+        );
+        // The hook still arms — this is a scoping fix, not a governance downgrade.
+        assert_eq!(json["hooks"]["PreToolUse"][0]["matcher"], "*");
     }
 
     // The gov run dir for cleanup — mirrors gate_hook::gov_run_dir without exposing it beyond the crate.
@@ -2084,6 +2242,24 @@ mod tests {
             assert!(
                 denied.contains(&format!("{dir}/**)")),
                 "{dir} must be denied to the file tools: {denied}"
+            );
+        }
+        // FINDING-067: the daemon's OWN state home. `.wicked` was fenced and `.wicked-crew` was not,
+        // which left `~/.wicked-crew/core.db` — every run, unit, policy and repo registration the
+        // platform has — reachable by the file tools. Built through `rule_path` (not string-joined)
+        // so this asserts the rule as the matcher will actually see it, separators and all, and all
+        // three verbs are checked: a READ of that store is a cross-org leak on its own, before any
+        // write destroys anything.
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .expect("a home to derive rules from");
+        let crew = rule_path(&home.join(".wicked-crew")).expect("the state home is expressible");
+        for tool in ["Read", "Edit", "Write"] {
+            let rule = format!("{tool}({crew}/**)");
+            assert!(
+                denied.contains(&rule),
+                "the operational store's home must be denied: expected `{rule}` in {denied}"
             );
         }
         assert!(

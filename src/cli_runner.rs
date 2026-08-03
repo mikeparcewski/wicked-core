@@ -966,6 +966,7 @@ mod tests {
             workdir: None,
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: "/abs/estate.db".into(),
+                code_graph_db: Some("/abs/repo/.wicked/code-graph.db".into()),
             }),
             prior_outputs: vec![],
         };
@@ -987,6 +988,14 @@ mod tests {
         assert_eq!(
             gov.db_path, "/abs/estate.db",
             "the store path the off-actor launcher needs to arm the hook is preserved"
+        );
+        // FINDING-067: the repo-local graph must survive too. Only the actor thread can resolve it
+        // (it holds the store); if the bus drops it, the off-actor launcher sees `None` and ships the
+        // worker no estate tools at all — governance still on, recon silently gone.
+        assert_eq!(
+            gov.code_graph_db.as_deref(),
+            Some("/abs/repo/.wicked/code-graph.db"),
+            "the repo-local code graph survives the bus"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

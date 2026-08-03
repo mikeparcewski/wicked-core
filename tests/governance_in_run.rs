@@ -71,7 +71,7 @@ fn real_gate_hook_denies_a_tripping_tool_call_and_records_it() {
             "unit-1",
         ])
         // The launcher supplies the store path via env (the injected command drops --db).
-        .env("WICKED_ESTATE_DB", &db_s)
+        .env("WICKED_GATE_DB", &db_s)
         .env("WICKED_DECISIONS_PATH", &decisions)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -107,31 +107,46 @@ fn real_gate_hook_denies_a_tripping_tool_call_and_records_it() {
 
 #[test]
 fn gate_hook_via_env_db_resolves_without_an_explicit_db_flag() {
-    // The injected command drops `--db`; the subcommand must fall back to WICKED_ESTATE_DB (finding #6).
+    // The injected command drops `--db`; the subcommand must fall back to the env (finding #6).
+    //
+    // The variable is `WICKED_GATE_DB`, NOT `WICKED_ESTATE_DB` (FINDING-067) — the hook is a
+    // grandchild of the worker, so whatever carries this path is also visible to every tool the worker
+    // spawns, and under the old name `wicked-estate index .` in a worker's Bash call resolved its
+    // `--db` to the platform's operational store and swept it. Both halves are asserted: the new name
+    // RESOLVES, and the old name does NOT. A tolerated alias would quietly restore the whole channel.
     let dir = scratch("envdb");
     let db = dir.join("estate.db");
     let db_s = db.to_str().unwrap().to_string();
     open_store(Some(&db_s)).unwrap(); // create the store (no policies ⇒ Allow)
     let decisions = dir.join("decisions.ndjson");
-    let mut child = Command::new(BIN)
-        .args(["gate-hook", "--scope", "s", "--phase", "unit-1"])
-        .env("WICKED_ESTATE_DB", &db_s)
-        .env("WICKED_DECISIONS_PATH", &decisions)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"tool_name":"Read","tool_input":{"file_path":"/x"}}"#)
-        .unwrap();
+    let run_hook = |var: &str| {
+        let mut child = Command::new(BIN)
+            .args(["gate-hook", "--scope", "s", "--phase", "unit-1"])
+            .env(var, &db_s)
+            .env("WICKED_DECISIONS_PATH", &decisions)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"tool_name":"Read","tool_input":{"file_path":"/x"}}"#)
+            .unwrap();
+        child.wait().unwrap().code()
+    };
     assert_eq!(
-        child.wait().unwrap().code(),
+        run_hook("WICKED_GATE_DB"),
         Some(0),
-        "no policy matches ⇒ ALLOW (exit 0); the store resolved from WICKED_ESTATE_DB, not a garbage file"
+        "no policy matches ⇒ ALLOW (exit 0); the store resolved from WICKED_GATE_DB, not a garbage file"
+    );
+    assert_eq!(
+        run_hook("WICKED_ESTATE_DB"),
+        Some(2),
+        "the old name must NOT resolve the hook's store — an unresolvable store fails CLOSED (deny), \
+         which is also how a stale launcher surfaces instead of evaluating against zero policies"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

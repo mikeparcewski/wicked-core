@@ -7,7 +7,7 @@
 //! `estate-rank` (PageRank) crates it already links. Indexing is a build step; operating on the graph
 //! is the runtime — keeping them separate is what lets us be graph-native without bloat.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use std::collections::HashSet;
@@ -120,13 +120,27 @@ pub(crate) fn indexer_bin() -> String {
     "wicked-estate".to_string()
 }
 
+/// The repo-local code graph path — `<repo>/.wicked/code-graph.db` — with its parent directory created.
+///
+/// The ONE place that spelling lives. Every producer ([`index_repo`]) and every consumer (the governed
+/// worker's estate MCP, `GovernanceContext::code_graph_db`) resolves through here, so a worker's graph
+/// tools read the graph the indexer wrote instead of an empty store beside it.
+///
+/// `Err` when the `.wicked` directory cannot be created. Callers that are choosing a store to hand a
+/// worker must treat that as "no graph" and inject no MCP — never as license to substitute the
+/// operational store (FINDING-067).
+pub(crate) fn code_graph_path(repo: &Path) -> std::io::Result<PathBuf> {
+    let graph = repo.join(".wicked").join("code-graph.db");
+    if let Some(parent) = graph.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(graph)
+}
+
 /// Index `repo` into a code graph at `<repo>/.wicked/code-graph.db` via the wicked-estate indexer
 /// subprocess. Returns the graph db path.
 pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
-    let graph = repo.join(".wicked").join("code-graph.db");
-    if let Some(parent) = graph.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let graph = code_graph_path(repo)?;
     let graph_str = graph.to_string_lossy().to_string();
     let bin = indexer_bin();
     let out = Command::new(&bin)

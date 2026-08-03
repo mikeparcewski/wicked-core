@@ -127,7 +127,26 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
                     .unwrap_or_else(|_| path.clone())
             }
         });
-    Some(crate::workflow::GovernanceContext { db_path: abs })
+    Some(crate::workflow::GovernanceContext {
+        db_path: abs,
+        // Deliberately not resolved here: this function only knows the process-wide store path, not
+        // which repo a run targets. `dispatch_unit` fills it in from the session's registered repo
+        // (`repo_code_graph_db`). Leaving it `None` is the safe default — no repo, no estate MCP.
+        code_graph_db: None,
+    })
+}
+
+/// The repo-local code graph a governed worker's estate MCP may open — `<repo_root>/.wicked/code-graph.db`
+/// for the run's registered repo. `None` when the run targets no repo, the repo id is not registered,
+/// the store read fails, or the `.wicked` directory cannot be created.
+///
+/// Every `None` arm is a decision to ship the worker NO estate tools. That is the point: the only other
+/// store in reach is the operational one, and a worker with a writable handle to it can delete the
+/// platform's entire state (FINDING-067). Fewer tools is a degraded run; a wiped store is a dead one.
+fn repo_code_graph_db(store: &dyn GraphStore, repo_ref: Option<&str>) -> Option<String> {
+    let repo = crate::repo::get_repo(store, repo_ref?).ok().flatten()?;
+    let path = crate::code_graph::code_graph_path(std::path::Path::new(&repo.root_path)).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// The FILESYSTEM base the per-core sidecars hang off: `<base>.mem`, `<base>.knowledge` and
@@ -3267,7 +3286,12 @@ fn dispatch_unit(
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
         // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
         // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
-        governance: in_process_governance(),
+        // The repo-local graph is resolved HERE (the actor thread holds the store; the worker does not)
+        // so the worker's estate tools never need — and never get — the operational store.
+        governance: in_process_governance().map(|g| crate::workflow::GovernanceContext {
+            code_graph_db: repo_code_graph_db(store, session.repo_ref.as_deref()),
+            ..g
+        }),
         prior_outputs,
     };
 

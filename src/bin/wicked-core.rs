@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
     HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
-    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
+    WrappedCliStepRunner, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -108,7 +108,7 @@ fn main() {
         let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
         let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
         let phase_id = hook_phase_alias(&args);
-        let db = flag(&args, "--db").or_else(|| env_nonempty(ESTATE_DB_ENV));
+        let db = flag(&args, "--db").or_else(|| env_nonempty(GATE_DB_ENV));
         std::process::exit(run_gate_hook(
             &scope,
             &phase,
@@ -124,7 +124,7 @@ fn main() {
         let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
         let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
         let phase_id = hook_phase_alias(&args);
-        let db = flag(&args, "--db").or_else(|| env_nonempty(ESTATE_DB_ENV));
+        let db = flag(&args, "--db").or_else(|| env_nonempty(GATE_DB_ENV));
         std::process::exit(run_output_gate_hook(
             &scope,
             &phase,

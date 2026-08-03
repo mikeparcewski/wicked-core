@@ -309,6 +309,11 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         let mut cmd = std::process::Command::new(binary);
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);
+        // Same strip the wrapped launcher applies (FINDING-067): an agent CLI that inherits
+        // `WICKED_ESTATE_DB` has every estate tool it can spawn pointed at the engine's operational
+        // store by default. Governed units do not come through here (they take the wrapped path,
+        // FINDING-060), but an ungoverned worker in a repo runs the same `wicked-estate index .`.
+        cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -2355,6 +2360,7 @@ sleep 30
             workdir: Some(dir.to_path_buf()),
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
             }),
             prior_outputs: Vec::new(),
         }
