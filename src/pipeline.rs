@@ -273,20 +273,39 @@ fn attach_pinned_validators(
 /// script and therefore a different pin). `seed-domain-validators` exists for exactly that pin and is
 /// idempotent. Pointing an operator at the generic author→approve pair for it would send them down a
 /// path that cannot produce the pin they need.
+///
+/// Every arm carries [`VAULT_IS_PER_DB`], because naming a command is only half a remedy: the vault
+/// lives in whichever database the engine opened, and every one of these commands defaults to a
+/// DIFFERENT database than a long-running engine does (FINDING-066). The coverage arm is now
+/// belt-and-braces — `pre_distribute` seeds that pin on the plan path, so reaching it means the seed
+/// itself failed or the engine predates it — but the generic arm is live, and an operator who runs
+/// `provision-validator` in the wrong cwd hits the identical dead end.
 fn missing_pin_remedy(pin: &str) -> String {
     if pin == crate::domain_extraction::COVERAGE_VALIDATOR_PIN {
-        "This is the coverage validator the shipped `domain-extraction` workflow pins: run \
-         `wicked-core seed-domain-validators` once to vault + approve it (idempotent, and it yields \
-         exactly this pin)."
-            .to_string()
+        format!(
+            "This is the coverage validator the shipped `domain-extraction` workflow pins, and the \
+             plan path seeds it automatically — so seeing this means the seed did not take. Run \
+             `wicked-core seed-domain-validators` to vault + approve it (idempotent, and it yields \
+             exactly this pin). {VAULT_IS_PER_DB}"
+        )
     } else {
         format!(
             "Author + approve it first: `wicked-core provision-validator --criterion \"...\"` then \
              `wicked-core approve-validator --pin <unapproved pin>`, and pin the APPROVED pin \
-             (`{pin}` resolves to nothing today)."
+             (`{pin}` resolves to nothing today). {VAULT_IS_PER_DB}"
         )
     }
 }
+
+/// The sentence that turns "run this command" into a remedy that actually lands.
+///
+/// The validator vault is not global state — it is rows in the graph store, so it is scoped to one
+/// database. The CLI resolves `--db` ELSE `WICKED_ESTATE_DB` ELSE a cwd-relative default; a daemon
+/// embedding the engine resolves its own state home. Those agree only by accident, and when they
+/// disagree the seed succeeds, prints the right pin, and changes nothing the engine can see.
+const VAULT_IS_PER_DB: &str = "Pass `--db <the database the engine opened>` (ELSE `WICKED_ESTATE_DB`, \
+     ELSE a cwd-relative default): the vault is rows in that store, so seeding any other database \
+     succeeds, prints the right pin, and leaves this refusal exactly as it was.";
 
 pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {
@@ -360,6 +379,25 @@ pub(crate) fn pre_distribute(
         // and costs two `put_node`s per plan. The boot-time seed stays as the loud early warning and
         // to make the floor visible in the vault before a first run; this is the invariant.
         crate::builtin_floors::seed_builtin_floors(store)?;
+        // The shipped `domain-extraction` drop-in's coverage validator is seeded HERE for the same
+        // reason, and it was NOT — which cost an operator a closed loop (FINDING-066).
+        //
+        // It is the same class of object as the floor above: hand-authored, deterministic,
+        // content-addressed, shipped with the product, and pinned by a def we ship. The only
+        // difference was where it got vaulted — the floor on the plan path, this one only via an
+        // out-of-band `wicked-core seed-domain-validators`. That difference is not survivable,
+        // because THE VAULT IS PER-DATABASE and the CLI's default database is not the engine's:
+        // crew's daemon opens `~/.wicked-crew/core.db`, the CLI falls back to a cwd-relative
+        // `wicked-estate.db`. Measured: the run failed naming this pin, the prescribed command ran
+        // and printed the matching pin, and the relaunch failed identically — the seed had landed in
+        // a database nothing reads. An error whose remedy is inert is worse than an unclear one; the
+        // operator has no signal that they are looping.
+        //
+        // Seeding it here removes the out-of-band step from the critical path entirely, so no
+        // database can be the wrong one. Same cost argument as the floor: two content-addressed
+        // `put_node`s that collapse onto themselves, and the pin is a compile-time constant.
+        // `seed-domain-validators` survives as a visibility/repair tool, not a prerequisite.
+        crate::domain_extraction::provision_and_approve_coverage_validator(store)?;
         attach_pinned_validators(store, &mut units, def)?;
         // EVT-009 is emitted AFTER SessionStarted + UnitPlanned×n below — see the comment there.
     }
@@ -1271,6 +1309,103 @@ mod resolve_tests {
             "every pinned phase came back with an APPROVED validator attached"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING-066. The sibling of the test above, for the shipped DROP-IN rather than the built-ins —
+    /// and it was the missing half. `domain-extraction.json` pins the coverage validator, but nothing on
+    /// the plan path vaulted it; the operator had to run `wicked-core seed-domain-validators` out of
+    /// band. That is not a "one extra step", because the vault is rows in a database and the CLI's
+    /// default database is not a daemon's: measured against the crew daemon, the command succeeded,
+    /// printed the exact pin the run had asked for, and the relaunch failed identically — the seed had
+    /// landed in `$CWD/wicked-estate.db` while the engine read `~/.wicked-crew/core.db`.
+    ///
+    /// A fresh store here stands in for "whichever database the engine happened to open". Delete the
+    /// coverage seed from `pre_distribute` and this fails with the pin-not-in-vault bail.
+    #[test]
+    fn the_shipped_drop_in_plans_against_a_store_nobody_seeded() {
+        use wicked_apps_core::open_store;
+        let dir = std::env::temp_dir().join(format!("wicked-dropin-unseeded-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
+
+        // The real shipped JSON, loaded exactly as an operator's overlay dir would load it — not a
+        // hand-built def. The pin under test is the one that actually ships.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("workflows")
+            .join("domain-extraction.json");
+        let def = crate::workflow::WorkflowRegistry::def_from_file(&path)
+            .expect("domain-extraction.json parses + validates");
+        let coverage_pin = def
+            .phases
+            .iter()
+            .find(|p| p.id == "coverage")
+            .and_then(|p| p.validator_pin.clone())
+            .expect("this test is only meaningful while the coverage phase carries a pin");
+        assert_eq!(
+            coverage_pin,
+            crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
+            "the shipped JSON pins the const the plan path seeds"
+        );
+        let id = def.id.clone();
+        let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
+        registry.register(def).expect("drop-in registers");
+
+        let pre = pre_distribute(
+            &mut store,
+            &[],
+            "extract the domain",
+            EntityMode::Isolated,
+            "s-dropin-unseeded",
+            crate::domain::HumanConfirm::None,
+            None,
+            None,
+            Some(&id),
+            &mut |_| {},
+            Some(&registry),
+            false,
+            false,
+        )
+        .expect("a shipped drop-in must never require an out-of-band seed to plan");
+
+        // Attached AND approved — a pin that resolved to an unapproved validator would plan fine here
+        // and then deny every run at gate time, which is the failure this must not silently become.
+        let gated = pre
+            .units
+            .iter()
+            .filter(|u| {
+                u.validator
+                    .as_ref()
+                    .is_some_and(|v| v.approved && crate::validator_vault::pin(v) == coverage_pin)
+            })
+            .count();
+        assert_eq!(
+            gated, 1,
+            "the coverage phase came back carrying the APPROVED shipped pin"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING-066. Naming a command is only half a remedy when the vault is per-database, so every
+    /// arm of the refusal must say which database to seed. Pinned as a property of the function rather
+    /// than of one message, because the generic arm is the live one and it was the arm with no hint at
+    /// all — an operator running `provision-validator` in the wrong cwd hits the identical dead end.
+    #[test]
+    fn every_missing_pin_remedy_names_the_database() {
+        for pin in [
+            crate::domain_extraction::COVERAGE_VALIDATOR_PIN,
+            "deadbeefdeadbeef",
+        ] {
+            let remedy = missing_pin_remedy(pin);
+            assert!(
+                remedy.contains("--db"),
+                "remedy for `{pin}` must name the db flag, got: {remedy}"
+            );
+            assert!(
+                remedy.contains("WICKED_ESTATE_DB"),
+                "remedy for `{pin}` must name the env fallback, got: {remedy}"
+            );
+        }
     }
 
     #[test]

@@ -345,7 +345,8 @@ fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
 /// (content-addressed). Opens the store as its sole writer (actor not spawned), like the other vault
 /// commands.
 fn seed_domain_validators_cmd(args: &[String]) {
-    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+    let path = store_path(args);
+    let mut store = match wicked_apps_core::open_store(Some(&path)) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("seed-domain-validators: open store failed: {e}"));
@@ -354,9 +355,21 @@ fn seed_domain_validators_cmd(args: &[String]) {
     };
     match wicked_core::provision_and_approve_coverage_validator(&mut store) {
         Ok(pin) => {
-            println!("seeded + approved the domain-extraction coverage validator, pin: {pin}");
+            // Name the DATABASE, not just the pin. The vault is rows in one store, so this command
+            // succeeding says nothing about whether the engine can see the result — and when the two
+            // disagree it prints the exact pin the failing run asked for while changing nothing that
+            // run reads, which is indistinguishable from success (FINDING-066). The path is the only
+            // token that makes the mismatch visible without instrumenting anything.
+            println!(
+                "seeded + approved the domain-extraction coverage validator in {path}, pin: {pin}"
+            );
             println!(
                 "(matches workflows/domain-extraction.json `validator_pin`; the drop-in now runs gated)"
+            );
+            println!(
+                "NOTE: the vault is per-database. If a running engine still refuses this pin, it \
+                 opened a DIFFERENT store than {path} — re-run with `--db <that path>` (a daemon \
+                 embedding the engine uses its own state home, e.g. ~/.wicked-crew/core.db)."
             );
         }
         Err(e) => fail(&format!("seed-domain-validators failed: {e}")),
