@@ -141,8 +141,9 @@ mod tests {
 
         assert_eq!(
             ci, release,
-            "ci.yml pins {KEY}={ci} but napi-release.yml pins {release}. The published addon would \
-             bundle an estate no test in this repo ever exercised. Bump both, or neither."
+            "ci.yml pins {KEY}={ci} but napi-release.yml pins {KEY}={release}. The published \
+             addon would bundle an estate no test in this repo ever exercised. Bump both, or \
+             neither."
         );
     }
 

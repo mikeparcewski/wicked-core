@@ -32,6 +32,7 @@ mod execute_wrapped;
 mod gate_hook;
 mod graph_browser;
 mod knowledge;
+#[cfg(test)]
 mod lockstep;
 mod memory;
 mod pipeline;
