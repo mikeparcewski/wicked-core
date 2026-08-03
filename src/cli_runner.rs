@@ -966,7 +966,7 @@ mod tests {
             workdir: None,
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: "/abs/estate.db".into(),
-                code_graph_db: Some("/abs/repo/.wicked/code-graph.db".into()),
+                code_graph_db: Some("/abs/repo/.codegraph/estate.db".into()),
             }),
             prior_outputs: vec![],
         };
@@ -994,7 +994,7 @@ mod tests {
         // worker no estate tools at all — governance still on, recon silently gone.
         assert_eq!(
             gov.code_graph_db.as_deref(),
-            Some("/abs/repo/.wicked/code-graph.db"),
+            Some("/abs/repo/.codegraph/estate.db"),
             "the repo-local code graph survives the bus"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -120,27 +120,59 @@ pub(crate) fn indexer_bin() -> String {
     "wicked-estate".to_string()
 }
 
-/// The repo-local code graph path — `<repo>/.wicked/code-graph.db` — with its parent directory created.
+/// Where a repo's code graph lives, relative to its root. The ONE spelling.
 ///
-/// The ONE place that spelling lives. Every producer ([`index_repo`]) and every consumer (the governed
-/// worker's estate MCP, `GovernanceContext::code_graph_db`) resolves through here, so a worker's graph
-/// tools read the graph the indexer wrote instead of an empty store beside it.
+/// `.codegraph/estate.db` rather than this engine's own `.wicked/` namespace, because that is the
+/// path that has the data. Both spellings existed — the engine indexed to `.wicked/code-graph.db`
+/// while crew's onboarding launched `wicked-estate index --db <repo>/.codegraph/estate.db` — and in
+/// the deployed topology crew drives onboarding, so on a real repo the 185 MB graph sat at
+/// `.codegraph/estate.db` and `.wicked/code-graph.db` did not exist at all (FINDING-069). Picking the
+/// engine's spelling would have been the tidier name and would have orphaned every indexed repo.
 ///
-/// `Err` when the `.wicked` directory cannot be created. Callers that are choosing a store to hand a
-/// worker must treat that as "no graph" and inject no MCP — never as license to substitute the
-/// operational store (FINDING-067).
-pub(crate) fn code_graph_path(repo: &Path) -> std::io::Result<PathBuf> {
-    let graph = repo.join(".wicked").join("code-graph.db");
+/// Written with `/` because that is how every other artifact in the ecosystem spells it — the crew
+/// CLI flag, the JS `join`, this doc. Do NOT hand it to [`Path::join`] whole; use
+/// [`code_graph_rel`], which is the only correct way to turn it into a path.
+pub(crate) const CODE_GRAPH_DB_REL: &str = ".codegraph/estate.db";
+
+/// [`CODE_GRAPH_DB_REL`] as a path, one segment at a time, so the separator is the platform's.
+///
+/// `repo.join(CODE_GRAPH_DB_REL)` looks like it does this and does not: `join` appends the argument
+/// as a SINGLE component and leaves its `/` untouched, so on Windows it yields
+/// `C:\repo\.codegraph/estate.db` — mixed separators, unequal to the `C:\repo\.codegraph\estate.db`
+/// that crew's Node-side `join` produces for the same repo. Both open the same file, and every
+/// comparison between them is false. The first cut of the FINDING-069 fix had exactly this bug,
+/// with a doc comment asserting the opposite; Windows CI caught it and macOS/Linux could not have.
+pub(crate) fn code_graph_rel() -> PathBuf {
+    CODE_GRAPH_DB_REL.split('/').collect()
+}
+
+/// A repo's code-graph path, resolved for a WRITER, with its parent directory created.
+///
+/// Separate from [`existing_code_graph`] on purpose. This one is allowed to bring the file into
+/// existence; the read side is not. Collapsing them is what made FINDING-069 undetectable: the
+/// consumer called this, `create_dir_all` succeeded, and it returned a path to a database that had
+/// never been indexed — so "no graph" and "graph right here" were the same value.
+pub(crate) fn code_graph_path_for_write(repo: &Path) -> std::io::Result<PathBuf> {
+    let graph = repo.join(code_graph_rel());
     if let Some(parent) = graph.parent() {
         std::fs::create_dir_all(parent)?;
     }
     Ok(graph)
 }
 
-/// Index `repo` into a code graph at `<repo>/.wicked/code-graph.db` via the wicked-estate indexer
-/// subprocess. Returns the graph db path.
+/// A repo's code graph if it has actually been indexed — `None` when the file is not there.
+///
+/// Creates nothing. A consumer choosing a store to hand a governed worker must treat `None` as "no
+/// graph, ship no estate MCP" and never as license to substitute the operational store, which is the
+/// store a worker can delete (FINDING-067).
+pub(crate) fn existing_code_graph(repo: &Path) -> Option<PathBuf> {
+    let graph = repo.join(code_graph_rel());
+    graph.is_file().then_some(graph)
+}
+
+/// Index `repo` into its code graph via the wicked-estate indexer subprocess. Returns the db path.
 pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
-    let graph = code_graph_path(repo)?;
+    let graph = code_graph_path_for_write(repo)?;
     let graph_str = graph.to_string_lossy().to_string();
     let bin = indexer_bin();
     let out = Command::new(&bin)

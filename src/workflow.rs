@@ -94,10 +94,11 @@ pub struct GovernanceContext {
     ///
     /// GATE-HOOK ONLY. Never hand this path to anything the worker controls.
     pub db_path: String,
-    /// ABSOLUTE path of the REPO-LOCAL code graph (`<repo_root>/.wicked/code-graph.db`) the worker's
-    /// own estate MCP server opens — the one store it is allowed to write. `None` ⇒ the run targets no
-    /// registered repo (or its root is unreadable), and the launcher then injects NO estate MCP at all
-    /// rather than substituting [`Self::db_path`].
+    /// ABSOLUTE path of the REPO-LOCAL code graph (`<repo_root>/.codegraph/estate.db`, spelled once at
+    /// `code_graph::CODE_GRAPH_DB_REL`) the worker's own estate MCP server opens — the one store it is
+    /// allowed to write. `None` ⇒ the run targets no registered repo, or that repo has never been
+    /// indexed, and the launcher then injects NO estate MCP at all rather than substituting
+    /// [`Self::db_path`] or pointing at a database nothing has written (FINDING-069).
     ///
     /// `#[serde(default)]` so a `DispatchedTask` serialized by an older peer still deserializes — as
     /// `None`, i.e. no estate tools, which is the safe reading of "this peer never told me a repo".
