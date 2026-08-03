@@ -1278,6 +1278,7 @@ mod failure_diagnostics_tests {
         // but the thread it spawned keeps reading. A grandchild that survived the group kill and
         // writes in a loop would grow that buffer for as long as it lives, so the READ has to be
         // bounded too - not just the wait. Callers retain at most STDERR_CAPTURE_LIMIT anyway.
+        // spawn-audit: test-only — an unbounded stderr writer, to prove the drain stops at the cap rather than at EOF.
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -1323,6 +1324,7 @@ mod failure_diagnostics_tests {
         // the drain always spends its whole budget here — and the head it wrote is exactly the
         // diagnostic the caller needs. An all-or-nothing hand-off returns the empty string for
         // this process, silently converting a named failure into an unexplained one.
+        // spawn-audit: test-only — a writer that never closes its pipe, to prove the drain still yields the head.
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -1359,6 +1361,7 @@ mod failure_diagnostics_tests {
         // pid to `killpg` would SIGKILL that group - this test binary included - so the guard in
         // `kill_process_tree` has to notice. There is no way to mutation-check this one by
         // letting it fail: without the guard the process dies outright rather than reporting.
+        // spawn-audit: test-only — a child in THIS process's group, to prove kill_process_tree refuses to killpg it.
         let mut child = Command::new("sh")
             .arg("-c")
             .arg("sleep 30")

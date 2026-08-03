@@ -1320,6 +1320,7 @@ mod tests {
         let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = lines.clone();
         let emit = move |line: &str| sink.lock().unwrap().push(line.to_string());
+        // spawn-audit: test-only — `printf` fixture proving run_bounded emits each stdout line live.
         let mut cmd = Command::new("printf");
         cmd.arg("alpha\nbeta\ngamma\n");
         let (code, out, _err, _usage, _files) =

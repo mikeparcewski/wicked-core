@@ -17,6 +17,23 @@
 //! actually written in the tree catches that, and catches it in a *new file the author forgot to
 //! wire into anything* — which a type-level guard, by definition, cannot.
 //!
+//! # Every line is scanned; test sites are exempted one at a time
+//!
+//! Test code genuinely must spawn unhardened — several sibling tests set `WICKED_ESTATE_DB` on a
+//! child on purpose, to prove the old name no longer resolves. An earlier version of this audit
+//! handled that by skipping everything after a file's first `#[cfg(test)]`, and that was a fail-open:
+//! `#[cfg(test)]` also decorates individual test-only helpers *mid-file*, so in `src/validator.rs`
+//! and `wicked-council/src/dispatch.rs` the skip began ~900 and ~600 lines early. The audit saw 20 of
+//! the workspace's 36 spawn sites and reported success — a guard covering 55% of the tree while
+//! claiming to cover it.
+//!
+//! Any region-detection scheme has that failure mode, so there is none. Every line of every file is
+//! scanned, and a site is exempt only when [`tests::EXEMPT_MARKER`] appears in its window. That makes
+//! each exemption a deliberate, greppable act rather than a side effect of where an attribute
+//! happened to sit — the same argument [`wicked_apps_core::spawn`] makes for having no allowlist.
+//! The marker carries no authority of its own: it is honoured wherever it is written, and writing one
+//! on production code is a reviewable lie, not a bypass the tooling blesses.
+//!
 //! # What it does not prove
 //!
 //! Textual presence of `.hardened()`, not correct ordering. A site that hardens and then re-sets
@@ -39,6 +56,24 @@ mod tests {
     /// pairing a spawn with a *neighbouring* spawn's hardening — visible in review, and both sites
     /// still had to be hardened for the file to pass at all.
     const LOOKAHEAD: usize = 30;
+
+    /// The one way to exempt a spawn site, written as a comment in its window.
+    ///
+    /// Spelled `test-only` because that is the only justification that has ever been valid: a test
+    /// asserting on what a child inherits cannot have the thing under test stripped out from under
+    /// it. Production code has no exemption — if a path must pass one of these variables, it hardens
+    /// first and sets the variable afterwards (see [`wicked_apps_core::spawn`]'s ordering contract),
+    /// which satisfies this audit without a marker.
+    const EXEMPT_MARKER: &str = "spawn-audit: test-only";
+
+    /// The workspace's true spawn-site count, floored rather than pinned.
+    ///
+    /// The count only ever grows, and pinning it exactly would make every new spawn site edit this
+    /// number — a test you must edit to make green is a test you edit without reading. The floor
+    /// exists for one failure: the detector silently stopping matching (a rename, a formatter change,
+    /// a walk that misses a directory), which would otherwise show up as a passing test with nothing
+    /// behind it. Raise it when the real count moves well clear.
+    const MIN_EXPECTED_SITES: usize = 30;
 
     fn workspace_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -64,22 +99,8 @@ mod tests {
         }
     }
 
-    /// Source lines of `path`, truncated at the first `#[cfg(test)]`.
-    ///
-    /// Test code is exempt, and must be: the audit's own siblings deliberately spawn children with
-    /// `WICKED_ESTATE_DB` set to prove the old name no longer resolves. Hardening those would delete
-    /// the very condition under test. Truncating at the marker (rather than tracking brace depth)
-    /// relies on `#[cfg(test)] mod tests` sitting at the end of the file, which is this codebase's
-    /// invariable layout — and errs toward *under*-scanning a file, never toward a false pass on
-    /// production code, since anything before the marker is still scanned.
-    fn production_lines(path: &Path) -> Vec<String> {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Vec::new();
-        };
-        text.lines()
-            .take_while(|l| !l.trim_start().starts_with("#[cfg(test)]"))
-            .map(str::to_string)
-            .collect()
+    fn is_comment(line: &str) -> bool {
+        line.trim_start().starts_with("//")
     }
 
     /// A `Command::new` occurrence that is real code rather than prose about code.
@@ -88,11 +109,35 @@ mod tests {
     /// documentation (this one included), and a guard that fails on its own explanation of itself
     /// gets deleted rather than satisfied.
     fn is_spawn_site(line: &str) -> bool {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") {
-            return false;
+        !is_comment(line) && line.contains("Command::new")
+    }
+
+    /// Whether a window carries a real hardening call.
+    ///
+    /// Comment lines do not count. `// cmd.hardened();` is what a commented-out call looks like, and
+    /// reading that as "hardened" would let the guard bless the exact edit that removes the
+    /// protection.
+    fn is_hardened(window: &[String]) -> bool {
+        window
+            .iter()
+            .any(|l| !is_comment(l) && l.contains(".hardened()"))
+    }
+
+    /// Whether the spawn site at `i` carries an exemption marker.
+    ///
+    /// The marker must be on the spawn line itself or in the contiguous comment block directly above
+    /// it — the block a reader would take as belonging to this site. Anchoring it that way (rather
+    /// than "somewhere within N lines") means a marker can never bleed onto a neighbouring spawn
+    /// site: any line of code between the two ends the block.
+    fn is_exempt(lines: &[String], i: usize) -> bool {
+        if lines[i].contains(EXEMPT_MARKER) {
+            return true;
         }
-        line.contains("Command::new")
+        lines[..i]
+            .iter()
+            .rev()
+            .take_while(|l| is_comment(l) || l.trim().is_empty())
+            .any(|l| l.contains(EXEMPT_MARKER))
     }
 
     #[test]
@@ -111,15 +156,21 @@ mod tests {
 
         let mut unhardened = Vec::new();
         let mut checked = 0usize;
+        let mut exempted = 0usize;
         for file in &files {
-            let lines = production_lines(file);
+            let Ok(text) = std::fs::read_to_string(file) else {
+                continue;
+            };
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
             for (i, line) in lines.iter().enumerate() {
                 if !is_spawn_site(line) {
                     continue;
                 }
                 checked += 1;
-                let end = (i + 1 + LOOKAHEAD).min(lines.len());
-                if !lines[i..end].iter().any(|l| l.contains(".hardened()")) {
+                let window = &lines[i..(i + 1 + LOOKAHEAD).min(lines.len())];
+                if is_exempt(&lines, i) {
+                    exempted += 1;
+                } else if !is_hardened(window) {
                     let rel = file.strip_prefix(&root).unwrap_or(file);
                     unhardened.push(format!("{}:{} — {}", rel.display(), i + 1, line.trim()));
                 }
@@ -127,12 +178,15 @@ mod tests {
         }
 
         assert!(
-            checked > 15,
-            "found only {checked} spawn sites — the detector stopped matching, which fails open"
+            checked >= MIN_EXPECTED_SITES,
+            "found only {checked} spawn sites, expected at least {MIN_EXPECTED_SITES} — the \
+             detector stopped matching, which fails open"
         );
         assert!(
             unhardened.is_empty(),
-            "\n{} spawn site(s) do not call .hardened() within {LOOKAHEAD} lines after them:\n\n{}\n\n\
+            "\n{} spawn site(s) neither call .hardened() within {LOOKAHEAD} lines nor carry a \
+             `{EXEMPT_MARKER}` marker:\n\n{}\n\n\
+             ({checked} sites scanned, {exempted} exempt.)\n\n\
              Every Command::new in this workspace must chain .hardened() — see \
              wicked_apps_core::spawn. It strips the engine's internal environment (the operational \
              store, the gate hook's store and argument channel) so a child cannot inherit state \
@@ -140,7 +194,9 @@ mod tests {
              happens otherwise: a worker ran `wicked-estate index .`, inherited WICKED_ESTATE_DB, \
              and deleted all 833 nodes of the platform's operational state.\n\n\
              If this new site genuinely must receive one of those variables, harden FIRST and set it \
-             explicitly afterwards. Do not skip the call — the rule has no allowlist on purpose.\n",
+             explicitly afterwards. Do not skip the call — the rule has no allowlist on purpose. If \
+             it is a TEST that must observe what a child inherits, add a `{EXEMPT_MARKER}` comment \
+             saying why.\n",
             unhardened.len(),
             unhardened.join("\n")
         );

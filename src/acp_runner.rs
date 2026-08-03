@@ -1859,6 +1859,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn a_bridge_that_writes_to_stderr_has_its_last_lines_kept_and_older_ones_dropped() {
+        // spawn-audit: test-only — a shell writing 50 stderr lines, to prove the ring buffer keeps the last ones.
         let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg("i=1; while [ $i -le 50 ]; do echo line$i >&2; i=$((i+1)); done")
