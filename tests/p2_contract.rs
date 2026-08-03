@@ -183,24 +183,60 @@ fn deny_policy(phase: &str, pattern: &str) -> Policy {
     }
 }
 
-fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
-    // 20s (was 5s): the heaviest case, `deny_policy_fires_on_a_unit_beyond_the_64th`, drives a
-    // 65-unit run and intermittently exceeded 5s on loaded CI runners (flaked twice, passed on
-    // re-run). The status this polls for is a TERMINAL state, so a longer budget only absorbs CI
-    // scheduling jitter — it can never mask a correctness bug (a wrong deny reaches `Complete`, never
-    // `Failed`, so `want` is never reached regardless of the deadline). Fast paths return early.
-    let deadline = Instant::now() + Duration::from_secs(20);
+/// Terminal states — a run that reaches one of these will never change status again.
+fn is_terminal(s: SessionStatus) -> bool {
+    matches!(
+        s,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    )
+}
+
+/// Block until `run_id` reaches `want`, panicking with a diagnosis if it does not.
+///
+/// This used to return `bool` on a fixed 20s budget, and callers wrapped it in `assert!`. That
+/// conflated the only two ways it can fail, which is exactly the information you need:
+///
+/// * the run settled on a DIFFERENT terminal status (a real contract violation — e.g. a deny that
+///   never fired, so the run `Completed` instead of `Failed`), or
+/// * the run never settled at all inside the budget (a slow or wedged runner).
+///
+/// Both surfaced identically, as `false` at the deadline. `deny_policy_fires_on_a_unit_beyond_the_64th`
+/// then failed on windows-latest with "the deny policy fires on the 65th unit" — a message asserting
+/// the very thing that could not be determined from the run. So: return early the moment a terminal
+/// status is seen, and report what it actually was.
+///
+/// The budget is wall-clock and scales with the runner. windows-latest takes ~2× the ubuntu/macos
+/// time for the same job (7m30s vs 3m38s), and the heaviest case here drives a 65-unit run; 20s was
+/// not enough headroom there. A longer budget cannot mask a correctness bug now that a wrong
+/// terminal status short-circuits instead of spinning to the deadline.
+fn wait_status(core: &Core, run_id: &str, want: SessionStatus, context: &str) {
+    let budget = Duration::from_secs(60);
+    let started = Instant::now();
+    let deadline = started + budget;
+    let mut last_seen: Option<SessionStatus> = None;
     while Instant::now() < deadline {
         if let Ok(views) = core.sessions_detail() {
             if let Some(v) = views.iter().find(|v| v.session.id == run_id) {
-                if v.session.status == want {
-                    return true;
+                let got = v.session.status;
+                last_seen = Some(got);
+                if got == want {
+                    return;
                 }
+                assert!(
+                    !is_terminal(got),
+                    "{context}\n  run `{run_id}` settled on {got:?}, wanted {want:?} \
+                     (terminal — it will not change) after {:?}",
+                    started.elapsed()
+                );
             }
         }
         std::thread::sleep(Duration::from_millis(15));
     }
-    false
+    panic!(
+        "{context}\n  run `{run_id}` never reached {want:?} within {budget:?}; \
+         last status seen: {last_seen:?} (non-terminal — the run was still in flight, \
+         so this is a slow/wedged runner, not a wrong verdict)"
+    );
 }
 
 #[test]
@@ -224,9 +260,11 @@ fn governance_deny_through_the_engine_halts_run_as_failed() {
 
     // Two units; unit 1's output trips the deny → the run must halt as Failed BEFORE unit 2.
     core.launch_run(spec("r", "task one. task two")).unwrap();
-    assert!(
-        wait_status(&core, "r", SessionStatus::Failed),
-        "a governance-denied unit halts the run as Failed (never Completed)"
+    wait_status(
+        &core,
+        "r",
+        SessionStatus::Failed,
+        "a governance-denied unit halts the run as Failed (never Completed)",
     );
 
     let views = core.sessions_detail().unwrap();
@@ -275,10 +313,7 @@ fn a_deny_policy_registered_through_the_engine_api_actually_halts_a_run() {
     );
     core.register_deny_policy("exec", "DEPLOY").unwrap();
     core.launch_run(spec("r", "task one. task two")).unwrap();
-    assert!(
-        wait_status(&core, "r", SessionStatus::Failed),
-        "a deny policy registered via the engine API halts the run (it targets the real unit phases)"
-    );
+    wait_status(&core, "r", SessionStatus::Failed, "a deny policy registered via the engine API halts the run (it targets the real unit phases)");
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
     assert_eq!(v.units[0].status, UnitStatus::Rejected);
@@ -314,9 +349,11 @@ fn a_retired_policy_stops_denying_and_the_same_run_then_completes() {
     );
 
     core.launch_run(spec("before", "task one")).unwrap();
-    assert!(
-        wait_status(&core, "before", SessionStatus::Failed),
-        "precondition: the policy denies"
+    wait_status(
+        &core,
+        "before",
+        SessionStatus::Failed,
+        "precondition: the policy denies",
     );
 
     assert!(
@@ -330,9 +367,11 @@ fn a_retired_policy_stops_denying_and_the_same_run_then_completes() {
 
     // Same problem, same output, same trigger text — only the policy changed.
     core.launch_run(spec("after", "task one")).unwrap();
-    assert!(
-        wait_status(&core, "after", SessionStatus::Completed),
-        "once retired, the policy can no longer decide a gate — the identical run completes"
+    wait_status(
+        &core,
+        "after",
+        SessionStatus::Completed,
+        "once retired, the policy can no longer decide a gate — the identical run completes",
     );
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "after").unwrap();
@@ -370,9 +409,11 @@ fn deny_policy_fires_on_a_unit_beyond_the_64th() {
         .collect::<Vec<_>>()
         .join(". ");
     core.launch_run(spec("r", &problem)).unwrap();
-    assert!(
-        wait_status(&core, "r", SessionStatus::Failed),
-        "the deny policy fires on the 65th unit — governance covers beyond unit-64"
+    wait_status(
+        &core,
+        "r",
+        SessionStatus::Failed,
+        "the deny policy fires on the 65th unit — governance covers beyond unit-64",
     );
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
@@ -431,9 +472,11 @@ fn worker_failure_halts_run_as_failed() {
         }),
     );
     core.launch_run(spec("r", "task one. task two")).unwrap();
-    assert!(
-        wait_status(&core, "r", SessionStatus::Failed),
-        "a worker failure halts the run as Failed"
+    wait_status(
+        &core,
+        "r",
+        SessionStatus::Failed,
+        "a worker failure halts the run as Failed",
     );
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
@@ -462,9 +505,11 @@ fn worker_cancelled_output_terminates_without_wedging() {
         }),
     );
     core.launch_run(spec("r", "task one")).unwrap();
-    assert!(
-        wait_status(&core, "r", SessionStatus::Cancelled),
-        "a Cancelled worker output terminates the run as Cancelled"
+    wait_status(
+        &core,
+        "r",
+        SessionStatus::Cancelled,
+        "a Cancelled worker output terminates the run as Cancelled",
     );
     // CRITICAL: the run must NOT be wedged in_flight — a subsequent command must not be RunBusy.
     let status = core
