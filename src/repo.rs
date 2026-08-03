@@ -90,7 +90,7 @@ impl FromNode for RepoEntry {
 /// This repo's code-graph path, absolute, derived from its root. The only spelling any consumer needs.
 fn code_graph_db(root_path: &str) -> String {
     Path::new(root_path)
-        .join(crate::code_graph::CODE_GRAPH_DB_REL)
+        .join(crate::code_graph::code_graph_rel())
         .to_string_lossy()
         .into_owned()
 }
@@ -717,8 +717,13 @@ mod tests {
     #[test]
     fn the_code_graph_spelling_is_the_one_consumers_expect() {
         assert_eq!(crate::code_graph::CODE_GRAPH_DB_REL, ".codegraph/estate.db");
-        // Joined, not concatenated: the separator is the platform's, so Windows gets a backslash and
-        // a consumer's `join(root, '.codegraph', 'estate.db')` still names the same file.
+        // Joined SEGMENT BY SEGMENT, so the separator is the platform's and a consumer's
+        // `join(root, '.codegraph', 'estate.db')` produces a byte-identical string.
+        //
+        // This assertion is a no-op on Unix and load-bearing on Windows: `Path::join` given the whole
+        // `.codegraph/estate.db` appends it as one component and leaves the `/` alone, which on Unix
+        // is indistinguishable from doing it right. The first cut of this fix did exactly that and
+        // only Windows CI could see it. Do not "simplify" the two `join`s back into one.
         assert_eq!(
             code_graph_db("/repo"),
             Path::new("/repo")

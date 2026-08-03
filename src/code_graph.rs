@@ -129,9 +129,22 @@ pub(crate) fn indexer_bin() -> String {
 /// `.codegraph/estate.db` and `.wicked/code-graph.db` did not exist at all (FINDING-069). Picking the
 /// engine's spelling would have been the tidier name and would have orphaned every indexed repo.
 ///
-/// Written with a `/` and split rather than as a single literal so the same const reads correctly on
-/// Windows: [`Path::join`] produces the platform separator either way, and a test pins the value.
+/// Written with `/` because that is how every other artifact in the ecosystem spells it — the crew
+/// CLI flag, the JS `join`, this doc. Do NOT hand it to [`Path::join`] whole; use
+/// [`code_graph_rel`], which is the only correct way to turn it into a path.
 pub(crate) const CODE_GRAPH_DB_REL: &str = ".codegraph/estate.db";
+
+/// [`CODE_GRAPH_DB_REL`] as a path, one segment at a time, so the separator is the platform's.
+///
+/// `repo.join(CODE_GRAPH_DB_REL)` looks like it does this and does not: `join` appends the argument
+/// as a SINGLE component and leaves its `/` untouched, so on Windows it yields
+/// `C:\repo\.codegraph/estate.db` — mixed separators, unequal to the `C:\repo\.codegraph\estate.db`
+/// that crew's Node-side `join` produces for the same repo. Both open the same file, and every
+/// comparison between them is false. The first cut of the FINDING-069 fix had exactly this bug,
+/// with a doc comment asserting the opposite; Windows CI caught it and macOS/Linux could not have.
+pub(crate) fn code_graph_rel() -> PathBuf {
+    CODE_GRAPH_DB_REL.split('/').collect()
+}
 
 /// A repo's code-graph path, resolved for a WRITER, with its parent directory created.
 ///
@@ -140,7 +153,7 @@ pub(crate) const CODE_GRAPH_DB_REL: &str = ".codegraph/estate.db";
 /// consumer called this, `create_dir_all` succeeded, and it returned a path to a database that had
 /// never been indexed — so "no graph" and "graph right here" were the same value.
 pub(crate) fn code_graph_path_for_write(repo: &Path) -> std::io::Result<PathBuf> {
-    let graph = repo.join(CODE_GRAPH_DB_REL);
+    let graph = repo.join(code_graph_rel());
     if let Some(parent) = graph.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -153,7 +166,7 @@ pub(crate) fn code_graph_path_for_write(repo: &Path) -> std::io::Result<PathBuf>
 /// graph, ship no estate MCP" and never as license to substitute the operational store, which is the
 /// store a worker can delete (FINDING-067).
 pub(crate) fn existing_code_graph(repo: &Path) -> Option<PathBuf> {
-    let graph = repo.join(CODE_GRAPH_DB_REL);
+    let graph = repo.join(code_graph_rel());
     graph.is_file().then_some(graph)
 }
 
