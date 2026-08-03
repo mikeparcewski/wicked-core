@@ -177,13 +177,60 @@ fn worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".wicked").join("worktrees")
 }
 
+/// Is `wt` a live git worktree, rather than merely a directory that sits where one should?
+///
+/// A worktree carries a `.git` **file** (not a directory) pointing at its admin dir, and `rev-parse`
+/// inside it resolves. Both are checked: the file alone can outlive the admin entry that gives it
+/// meaning, and `rev-parse` alone succeeds anywhere beneath the parent repo — including an empty
+/// `.wicked/worktrees/<id>/`, which is exactly the case this exists to reject.
+fn is_live_worktree(wt: &Path) -> bool {
+    if !wt.join(".git").is_file() {
+        return false;
+    }
+    let Some(p) = wt.to_str() else { return false };
+    matches!(git(p, &["rev-parse", "--git-dir"]), Ok((true, _, _)))
+}
+
 /// Create an isolated git worktree for `run_id` at `<repo>/.wicked/worktrees/<run_id>` on a fresh
-/// `wicked/<run_id>` branch. Idempotent-ish: if the path already exists (a resumed run), it is
-/// returned as-is. Returns the worktree path.
+/// `wicked/<run_id>` branch. Idempotent for a genuine resume: a live worktree already at the path is
+/// reused. Returns the worktree path.
+///
+/// The reuse test is [`is_live_worktree`], not `is_dir()`. It used to be `is_dir()`, and the
+/// difference is FINDING-059: `remove_worktree` falls back to `remove_dir_all`, a partial removal
+/// leaves the directory shell behind, and the `git worktree prune` that follows then deregisters the
+/// admin entry *because* the path no longer has a `.git` file. The result is an empty, unregistered
+/// directory sitting exactly where a worktree belongs — which `is_dir()` accepted and returned as an
+/// isolated checkout. The worker handed one noticed ("the assigned worktree is an empty,
+/// unregistered directory, so I'll work in the main repo checkout") and wrote 297 lines onto
+/// `master` of the operator's real clone. A cwd is not a boundary; the worktree is, so its existence
+/// has to be verified rather than inferred from a stat.
 pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf> {
     let wt = worktrees_root(repo_root).join(run_id);
     if wt.is_dir() {
-        return Ok(wt); // already created (resume) — reuse it
+        if is_live_worktree(&wt) {
+            return Ok(wt); // genuine resume — reuse it
+        }
+        // Not a worktree. Recoverable only while it holds nothing: an empty shell can be cleared and
+        // re-added, and `worktree add` accepts an existing empty directory anyway. Anything else is
+        // a directory of unknown provenance, and calling it an isolated checkout is the failure
+        // above — fail the run loudly instead of handing it over.
+        // `unwrap_or(false)` reads an unreadable directory as NOT empty, so a permissions error
+        // fails the run rather than silently taking the recovery branch on a tree we cannot see.
+        let empty = std::fs::read_dir(&wt)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if !empty {
+            anyhow::bail!(
+                "{} exists but is not a git worktree, and is not empty; refusing to run a unit \
+                 against it (a worker given a non-checkout works in the parent repo instead)",
+                wt.display()
+            );
+        }
+        let _ = std::fs::remove_dir(&wt);
+        // The other half of this state: git may still hold an admin entry for the path whose `.git`
+        // file we just found missing, and `worktree add` refuses a path that is "already
+        // registered". Prune drops exactly those dangling entries and touches no live worktree.
+        let _ = git(repo_root, &["worktree", "prune"]);
     }
     std::fs::create_dir_all(worktrees_root(repo_root))?;
     let branch = format!("wicked/{run_id}");
@@ -605,5 +652,133 @@ mod tests {
             registered_at: 42,
         };
         assert_eq!(RepoEntry::from_node(&e.to_node()).unwrap(), e);
+    }
+
+    // ── worktree isolation (FINDING-059) ──────────────────────────────────────
+    //
+    // The defect these pin was one stat: `create_worktree` returned any directory sitting at the
+    // worktree path as an isolated checkout. The state that exploited it — an empty, unregistered
+    // directory left by a partial `remove_worktree` — is cheap to construct, so it is constructed
+    // here rather than described.
+
+    /// A git repo with one commit at a scratch path. Identity and signing are set locally because
+    /// `commit` fails without the first and can hang on the second, and neither is what these are
+    /// about. Named per-process AND per-thread so concurrent test binaries never collide.
+    fn git_repo(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wicked-wt-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.to_str().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "t@example.invalid"],
+            &["config", "user.name", "wicked-test"],
+            &["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(git(p, args).unwrap().0, "git {args:?} failed");
+        }
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        assert!(git(p, &["add", "-A"]).unwrap().0);
+        assert!(git(p, &["commit", "-qm", "base"]).unwrap().0);
+        root
+    }
+
+    /// The heart of FINDING-059. `rev-parse` succeeds anywhere beneath the parent repo, including in
+    /// an empty `.wicked/worktrees/<id>/` — so a check that trusts it (or trusts `is_dir`, as the
+    /// original did) calls the parent repo's own working tree an isolated checkout.
+    #[test]
+    fn an_empty_dir_under_the_repo_is_not_a_worktree_though_rev_parse_succeeds_in_it() {
+        let root = git_repo("revparse");
+        let empty = worktrees_root(root.to_str().unwrap()).join("run-1");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            git(empty.to_str().unwrap(), &["rev-parse", "--git-dir"])
+                .unwrap()
+                .0,
+            "precondition: rev-parse resolves here, which is the trap"
+        );
+        assert!(!is_live_worktree(&empty));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_worktree_reuses_a_live_worktree() {
+        let root = git_repo("reuse");
+        let p = root.to_str().unwrap();
+        let first = create_worktree(p, "run-1").unwrap();
+        std::fs::write(first.join("worker-output.txt"), "from turn 1\n").unwrap();
+
+        let second = create_worktree(p, "run-1").unwrap();
+        assert_eq!(first, second);
+        // Reuse has to mean the same checkout, not a re-add that discards the last turn's work.
+        assert_eq!(
+            std::fs::read_to_string(second.join("worker-output.txt")).unwrap(),
+            "from turn 1\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The observed state: `remove_worktree`'s `remove_dir_all` fallback stripped the `.git` file
+    /// but left the directory, and the `prune` that follows deregistered the path *because* `.git`
+    /// was gone. Recovery, not reuse — the shell is not a checkout.
+    #[test]
+    fn create_worktree_recovers_an_empty_shell_left_by_a_partial_removal() {
+        let root = git_repo("shell");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "run-1").unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        assert!(git(p, &["worktree", "prune"]).unwrap().0);
+        assert!(!is_live_worktree(&wt), "precondition: shell, not worktree");
+
+        let again = create_worktree(p, "run-1").unwrap();
+        assert_eq!(again, wt);
+        assert!(
+            is_live_worktree(&again),
+            "the run must get a real checkout, not the shell it was handed before"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same shell, prune never ran, so git may still hold an admin entry for the path — and
+    /// `worktree add` refuses a path it considers registered. The prune inside `create_worktree`
+    /// is what keeps this recoverable.
+    #[test]
+    fn create_worktree_recovers_a_shell_whose_registration_was_never_pruned() {
+        let root = git_repo("stale-reg");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "run-1").unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let again = create_worktree(p, "run-1").unwrap();
+        assert!(
+            is_live_worktree(&again),
+            "worktrees still registered: {}",
+            git(p, &["worktree", "list"]).unwrap().1
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The case that must fail the run rather than proceed: a directory of unknown provenance. It
+    /// cannot be cleared (that would delete someone's work) and it cannot be handed over (that is
+    /// the 297 lines on `master`), so the only honest answer is to stop.
+    #[test]
+    fn create_worktree_refuses_a_non_empty_directory_that_is_not_a_worktree() {
+        let root = git_repo("occupied");
+        let p = root.to_str().unwrap();
+        let wt = worktrees_root(p).join("run-1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("someone-elses-work.txt"), "not ours\n").unwrap();
+
+        let err = create_worktree(p, "run-1").unwrap_err().to_string();
+        assert!(err.contains("is not a git worktree"), "{err}");
+        // A refusal must not double as a delete.
+        assert!(wt.join("someone-elses-work.txt").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
