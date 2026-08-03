@@ -588,18 +588,24 @@ impl WrappedCliStepRunner {
             // evaluator OFF the creator's CLI and claude is the only governable one — but it must
             // not run quietly. `governed: false` alone cannot be told apart from a unit that never
             // asked for governance, which is exactly how this stayed invisible (FINDING-063).
+            //
+            // Only when there is a binary to name. An empty `argv` means no invocation is
+            // configured at all: the unit fails hard below with exactly that message, and
+            // reporting "governed but unenforced" for it would be a false disclosure — nothing
+            // ran, so nothing ran unchecked. An event whose `cli` is `""` also can't be acted on.
             (Some(_), false) => {
-                let cli = argv.first().cloned().unwrap_or_default();
-                self.emit_event(crate::event::CoreEvent::GovernanceUnenforced {
-                    session: input.run_id.clone(),
-                    ord: input.unit.ord,
-                    attempt: input.attempt,
-                    cli: cli.clone(),
-                    reason: format!(
-                        "unit is governed but '{cli}' has no input-governance adapter \
-                         (gate-hook injection is claude-only); its tool calls are unchecked"
-                    ),
-                });
+                if let Some(cli) = argv.first() {
+                    self.emit_event(crate::event::CoreEvent::GovernanceUnenforced {
+                        session: input.run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        cli: cli.clone(),
+                        reason: format!(
+                            "unit is governed but '{cli}' has no input-governance adapter \
+                             (gate-hook injection is claude-only); its tool calls are unchecked"
+                        ),
+                    });
+                }
                 None
             }
             (None, _) => None,
@@ -1254,6 +1260,25 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Why the two emptiness guards on this path (`argv.is_empty()` before spawning, and the
+    /// `argv.first()` guard on the FINDING-063 disclosure event) are DEFENSIVE and not live: the
+    /// `!placed` fallback at the end of `build_argv` unconditionally pushes the prompt, so there is
+    /// no invocation string — empty, whitespace, or one whose only token elides — that yields an
+    /// empty argv. Pinned rather than assumed: if that fallback is ever made conditional, an empty
+    /// argv becomes reachable, and both guards start carrying real weight instead of documenting a
+    /// state that cannot occur.
+    #[test]
+    fn build_argv_never_yields_an_empty_argv() {
+        for inv in ["", "   ", "\t", "{SKILLS}", "--allowedTools={SKILLS}"] {
+            let argv = build_argv(inv, "the prompt", &[]);
+            assert!(
+                !argv.is_empty(),
+                "build_argv({inv:?}) returned an empty argv; the emptiness guards on the wrapped \
+                 path are no longer merely defensive"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
