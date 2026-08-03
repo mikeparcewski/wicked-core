@@ -1127,17 +1127,39 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
         }
         let keyword_alone = tokens.len() == 1;
         let decisive = ix == 0 || keyword_alone;
+        // The reason the prompt actually asks for lives BELOW the decision line ("…exactly one word
+        // …and nothing else on that line; then a brief reason on the next line"). Recording only the
+        // decision line therefore threw away the rationale in exactly the compliant case: a model
+        // that obeyed the contract produced `agentReasoning: "REJECT"`, while one that violated it
+        // (`REJECT: because X`) produced a useful record. Same shape as the triage parser's
+        // `analysis` above, including its 400-char cap. Verdict parsing itself is untouched — only
+        // the decision line decides, still fail-closed (FINDING-064).
+        let reason_below: String = raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .skip(ix + 1)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(400)
+            .collect();
+        let reasoning = if reason_below.is_empty() {
+            line.to_string()
+        } else {
+            format!("{line} — {reason_below}")
+        };
         match first {
             "PASS" if decisive && !mentions_reject => {
                 return AgentVerdict {
                     pass: true,
-                    reasoning: line.to_string(),
+                    reasoning,
                 }
             }
             "REJECT" if decisive && !mentions_pass => {
                 return AgentVerdict {
                     pass: false,
-                    reasoning: line.to_string(),
+                    reasoning,
                 }
             }
             _ => {
@@ -1232,6 +1254,51 @@ pub fn gate_phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FINDING-064. The judge prompt asks for the verdict alone on line 1 and "a brief reason on the
+    /// next line"; the parser recorded only line 1. A COMPLIANT model therefore produced the bare
+    /// word as its own rationale — observed live as `agentReasoning: "REJECT"` on
+    /// `pilot-migration-001` ord 4 — while a model that broke the contract got a useful record. The
+    /// verdict itself must not move: only the decision line decides, and it still fails closed.
+    #[test]
+    fn a_verdict_keeps_the_reason_the_prompt_asked_for_on_the_next_line() {
+        let v = parse_agent_verdict("REJECT\nThe worktree is unchanged, so nothing was migrated.");
+        assert!(!v.pass);
+        assert!(
+            v.reasoning.contains("worktree is unchanged"),
+            "the reason below the contract line must survive: {}",
+            v.reasoning
+        );
+
+        // Compliant PASS keeps its reason too.
+        let v = parse_agent_verdict("PASS\nEvery acceptance criterion is met.");
+        assert!(
+            v.pass && v.reasoning.contains("acceptance criterion"),
+            "{}",
+            v.reasoning
+        );
+
+        // A bare verdict with nothing below is still just the verdict — no invented rationale.
+        assert_eq!(parse_agent_verdict("REJECT").reasoning, "REJECT");
+
+        // The banner case (core#128): the reason is taken relative to the DECISION line, not line 0,
+        // so the banner above it is never mistaken for the rationale and the text below is kept.
+        let v = parse_agent_verdict(
+            "Warning: Skill descriptions were shortened.\n\nPASS\nCoverage is 1.0.",
+        );
+        assert!(v.pass, "{}", v.reasoning);
+        assert!(v.reasoning.contains("Coverage is 1.0"), "{}", v.reasoning);
+        assert!(
+            !v.reasoning.contains("Skill descriptions"),
+            "the banner ABOVE the verdict is not the reason: {}",
+            v.reasoning
+        );
+
+        // Long rationales are capped like the triage parser's analysis, so one runaway reply cannot
+        // bloat every persisted gate record.
+        let v = parse_agent_verdict(&format!("REJECT\n{}", "x".repeat(900)));
+        assert!(v.reasoning.len() < 500, "capped: {}", v.reasoning.len());
+    }
 
     #[test]
     fn parse_agent_verdict_reads_only_the_first_line_token_fail_closed() {
