@@ -1365,16 +1365,20 @@ impl AcpStepRunner {
         // Non-claude CLIs are unaffected: input arming was always claude-only, so their governed
         // units keep the shared ACP session path below exactly as before.
         if input.governance.is_some() && cli_runs_claude(&cli_key) {
+            // Warned, not just evented. A governed unit that quietly loses multi-turn looks
+            // identical in `StepOutput.output` to one that never had it, and an unobserved path
+            // change is precisely how the ungoverned ACP path survived this long.
+            let reason = format!(
+                "[wicked-core] governed unit for '{cli_key}' runs single-shot: the ACP bridge \
+                 does not apply the input-governance settings it is given"
+            );
             self.emit_event(CoreEvent::AcpFallback {
                 session: run_id.clone(),
                 cli_key: cli_key.clone(),
-                reason: format!(
-                    "[wicked-core] governed unit for '{cli_key}' runs single-shot: the ACP bridge \
-                     does not apply the input-governance settings it is given"
-                ),
+                reason: reason.clone(),
                 fallback_kind: fallback_kind::GOVERNANCE_REQUIRES_WRAPPED.to_string(),
             });
-            return self.fallback.run_unit_streaming(input, emit);
+            return fallback_with_warning(reason, input, emit, &self.fallback);
         }
 
         // SHARED ACP SESSION PATH — ungoverned units of every CLI, plus governed units of
@@ -2291,10 +2295,28 @@ sleep 30
 
     // ── FINDING-060/061: a governed claude unit must never run on ACP ────────────
 
+    /// What the fallback actually invokes, per platform.
+    ///
+    /// The routing this test exists for is platform-independent, so the test itself is NOT
+    /// `#[cfg]`-gated — per the argument at `execute_wrapped.rs`'s `rule_path_sep`, a gated test
+    /// runs on one of three CI platforms, which is how a platform bug survives review. Only the
+    /// *execution* proof needs a real process, and only that assertion is gated.
+    ///
+    /// There is no Windows equivalent of `/bin/echo` here, and `cmd /c echo` is not one:
+    /// `build_argv` appends the skill prompt as a trailing arg whenever the template omits
+    /// `{PROMPT}` (execute_wrapped.rs:1228), and that prompt carries `|||` and newlines — pipes and
+    /// command separators to `cmd`. So Windows names a binary that cannot exist: the spawn fails
+    /// fast, without a shell, and every assertion below except the execution proof still holds,
+    /// because `fallback_with_warning` prepends its warning whether or not the child runs.
+    #[cfg(unix)]
+    const CHEAP_OK: &str = "/bin/echo wicked-fallback-ran";
+    #[cfg(not(unix))]
+    const CHEAP_OK: &str = "wicked-no-such-binary-fallback-probe";
+
     /// A unit assigned to `claude` — the routing predicate reads `assigned_cli` — whose actual
-    /// invocation is `/bin/echo`, so the wrapped fallback this must reach executes something cheap
-    /// and hermetic instead of a real CLI. The two are deliberately different: the ACP branch
-    /// classifies by the assigned key, the wrapped runner by argv[0].
+    /// invocation is [`CHEAP_OK`], so the wrapped fallback this must reach executes something cheap
+    /// instead of a real CLI. The two are deliberately different: the ACP branch classifies by the
+    /// assigned key, the wrapped runner by argv[0].
     fn claude_unit_running_echo() -> crate::domain::WorkUnit {
         crate::domain::WorkUnit {
             id: "u-gov".to_string(),
@@ -2303,7 +2325,7 @@ sleep 30
             description: "a governed unit".to_string(),
             stage: Default::default(),
             assigned_cli: Some("claude".to_string()),
-            assigned_invocation: Some("/bin/echo {PROMPT}".to_string()),
+            assigned_invocation: Some(CHEAP_OK.to_string()),
             council_task_ref: None,
             routing: None,
             denial_reason: None,
@@ -2389,8 +2411,26 @@ sleep 30
                 .is_empty(),
             "a governed unit must not reach the ACP session pool at all"
         );
-        // And it really did execute on the fallback (echo of the prompt), rather than short-circuit.
-        assert_eq!(out.status, StepStatus::Ok, "output: {}", out.output);
+        // The downgrade has to be legible where a human reads the run, not only in the event
+        // stream: every other ACP fallback prepends its `[wicked-core] …` warning to the output,
+        // and a governed unit silently losing multi-turn is the one that most needs to say so.
+        assert!(
+            out.output.contains("[wicked-core]") && out.output.contains("does not apply"),
+            "the reroute warning must be prepended to StepOutput.output: {}",
+            out.output
+        );
+
+        // Execution proof — the reroute reached a runner that ran the invocation, rather than
+        // short-circuiting into a synthetic result. Needs a real echo, so unix only ([`CHEAP_OK`]).
+        #[cfg(unix)]
+        {
+            assert_eq!(out.status, StepStatus::Ok, "output: {}", out.output);
+            assert!(
+                out.output.contains("wicked-fallback-ran"),
+                "the wrapped runner must have actually run the invocation: {}",
+                out.output
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
