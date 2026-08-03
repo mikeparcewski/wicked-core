@@ -874,9 +874,31 @@ pub fn migration_def() -> WorkflowDef {
     }
 }
 
-/// `onboarding` — estate indexing pipeline for a registered repo (3 deterministic tool phases).
+/// `onboarding` — estate indexing pipeline for a registered repo (2 deterministic tool phases).
 /// Phases run in the session's `workdir` (the repo root); no council is convened.
-/// index → annotate → domain (sequential, each after the previous).
+/// index → annotate (sequential).
+///
+/// # What this deliberately does NOT do
+///
+/// It does not produce `requirements_graph.json`. A third phase used to run `wicked-core
+/// domain-graph` here, and it could never succeed: that command gates fail-closed on front-half
+/// coverage == 1.0, and coverage is the fraction of behavior-bearing symbols carrying a requirement
+/// annotation or risk flag. `wicked-estate clusters --annotate` is CLUSTERING — it does not annotate
+/// a single symbol with a requirement. On a real repo (AutoGPT, 42,925 nodes, indexed and annotated
+/// by exactly these two phases) the recompute is **0.0000 — 28,885 of 28,885 behavior-bearing nodes
+/// unaccounted**. Not "usually short of the bar": nothing had ever been in the numerator.
+///
+/// So every repo registration ended `sessionFailed` on a phase that was structurally incapable of
+/// passing, after the two phases that matter had both succeeded (FINDING-068).
+///
+/// Coverage comes from the AGENTIC front-half — [`crate::DOMAIN_EXTRACTION_WORKFLOW_ID`], whose
+/// `extract` phase writes the annotations and whose `coverage` phase measures them. `domain-graph`
+/// is the last phase of THAT workflow, downstream of the four phases that produce its precondition.
+/// Onboarding is deterministic tools and no council by construction, so it cannot host any of them.
+///
+/// The gate is not the defect and must not be relaxed to make this pass: refusing to translate a
+/// partially-annotated graph is the design (DES-OUTGOV-001/005), and a domain model built from a
+/// 0%-covered graph is a file full of confident nonsense.
 pub fn onboarding_def() -> WorkflowDef {
     WorkflowDef {
         id: "onboarding".to_string(),
@@ -893,15 +915,6 @@ pub fn onboarding_def() -> WorkflowDef {
                     ],
                 })
                 .after("index"),
-            PhaseDef::new("domain", StageKind::Recon)
-                .executor(PhaseExecutor::Tool {
-                    // The REAL domain front-end: translates the annotated estate graph into
-                    // requirements_graph.json (fail-closed with an actionable message when the
-                    // domain-extraction front-half hasn't annotated the graph yet). The previous
-                    // `wicked-estate nodes --json` dumped raw nodes and produced no artifact.
-                    cmd: vec!["wicked-core".to_string(), "domain-graph".to_string()],
-                })
-                .after("annotate"),
         ],
     }
 }
@@ -1001,6 +1014,42 @@ mod workflow_def_tests {
         for def in [feature_def(), bug_def(), migration_def()] {
             def.validate()
                 .unwrap_or_else(|e| panic!("{} invalid: {e}", def.id));
+        }
+    }
+
+    /// Onboarding runs the two deterministic phases and stops (FINDING-068).
+    ///
+    /// A third phase ran `wicked-core domain-graph`, which gates fail-closed on front-half coverage
+    /// == 1.0. Neither phase here writes a requirement annotation — `clusters --annotate` is
+    /// clustering — so the recompute is 0.0 and the phase could not pass. Measured on AutoGPT after
+    /// exactly these two phases: 28,885 of 28,885 behavior-bearing nodes unaccounted. Every repo
+    /// registration ended `sessionFailed` after the work that mattered had already succeeded.
+    ///
+    /// `domain-graph` belongs to `domain-extraction`, downstream of the `extract` + `coverage`
+    /// phases that produce its precondition. Do not move it back here to "complete" onboarding, and
+    /// do not relax the coverage gate to make it pass — a domain model translated from a 0%-covered
+    /// graph is confident nonsense, which is why the gate fails closed.
+    #[test]
+    fn onboarding_runs_only_what_it_can_actually_finish() {
+        let def = onboarding_def();
+        def.validate().expect("onboarding is a valid def");
+        assert_eq!(
+            def.phases.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["index", "annotate"]
+        );
+
+        // Stated as "no phase shells out to domain-graph" rather than "no phase named `domain`",
+        // because the defect is the COMMAND's unmeetable precondition, not the phase's name.
+        for phase in &def.phases {
+            if let PhaseExecutor::Tool { cmd } = &phase.executor {
+                assert!(
+                    !cmd.iter().any(|a| a == "domain-graph"),
+                    "onboarding phase `{}` runs `{}`, whose coverage gate no phase in this \
+                     workflow can satisfy — see FINDING-068",
+                    phase.id,
+                    cmd.join(" ")
+                );
+            }
         }
     }
 
