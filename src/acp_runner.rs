@@ -46,6 +46,7 @@ use crate::execute_wrapped::{unit_prompt, WrappedCliStepRunner};
 use crate::workflow::{
     DeltaSink, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus, Usage,
 };
+use wicked_apps_core::HardenedCommand;
 use wicked_council::types::{AcpConfig, AcpTransport};
 
 // ── ACP child process ─────────────────────────────────────────────────────────
@@ -307,13 +308,14 @@ fn stderr_context(tail: &StderrTail) -> String {
 fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Result<AcpProcess> {
     let build_cmd = |binary: &str| {
         let mut cmd = std::process::Command::new(binary);
+        // The engine's internal environment is stripped through the one chokepoint (FINDING-067): an
+        // agent CLI that inherits `WICKED_ESTATE_DB` has every estate tool it can spawn pointed at the
+        // engine's operational store by default. Governed units do not come through here (they take the
+        // wrapped path, FINDING-060), but an ungoverned worker in a repo runs the same
+        // `wicked-estate index .`. Harden FIRST — anything set below is set deliberately.
+        cmd.hardened();
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);
-        // Same strip the wrapped launcher applies (FINDING-067): an agent CLI that inherits
-        // `WICKED_ESTATE_DB` has every estate tool it can spawn pointed at the engine's operational
-        // store by default. Governed units do not come through here (they take the wrapped path,
-        // FINDING-060), but an ungoverned worker in a repo runs the same `wicked-estate index .`.
-        cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -1857,6 +1859,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn a_bridge_that_writes_to_stderr_has_its_last_lines_kept_and_older_ones_dropped() {
+        // spawn-audit: test-only — a shell writing 50 stderr lines, to prove the ring buffer keeps the last ones.
         let mut child = std::process::Command::new("sh")
             .arg("-c")
             .arg("i=1; while [ $i -le 50 ]; do echo line$i >&2; i=$((i+1)); done")

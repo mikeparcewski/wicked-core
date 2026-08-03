@@ -66,6 +66,7 @@ use crate::AgenticCli;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use wicked_apps_core::HardenedCommand;
 
 /// A deterministic validator authored for one acceptance criterion — the phase's evidence evaluator.
 /// `script` is a shell command that exits 0 iff the criterion is satisfied. `approved` gates execution:
@@ -743,6 +744,11 @@ pub fn run_validator_reporting(
     argv.push(v.script.clone());
 
     let mut cmd = Command::new(&argv[0]);
+    // `apply_minimal_env` below is strictly stronger than the chokepoint (it `env_clear`s and passes
+    // through an allowlist), so this call strips nothing today. It is here because the rule has no
+    // exceptions (see `wicked_apps_core::spawn`): if the minimal-env floor is ever weakened or reordered,
+    // the engine-internal variables still cannot reach a validator script by inheritance.
+    cmd.hardened();
     cmd.args(&argv[1..]).current_dir(cwd);
     apply_minimal_env(&mut cmd);
     // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
@@ -1545,6 +1551,8 @@ mod tests {
             ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
+            // spawn-audit: test-only — `apply_minimal_env` below env_clears and passes an allowlist, which is strictly stronger
+            // than the chokepoint; hardening here would be dead code in a test that exists to exercise it.
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(script).current_dir(&dir);
             apply_minimal_env(&mut cmd);
@@ -1767,6 +1775,7 @@ mod tests {
                 argv.push(bash.to_string_lossy().to_string());
                 argv.push("-c".to_string());
                 argv.push("exec 3<>/dev/tcp/8.8.8.8/53".to_string());
+                // spawn-audit: test-only — sandbox network probe. Same `apply_minimal_env` floor as the path it is testing.
                 let mut cmd = Command::new(&argv[0]);
                 cmd.args(&argv[1..]).current_dir(&dir);
                 apply_minimal_env(&mut cmd);
@@ -1826,6 +1835,7 @@ mod tests {
                     argv.push("sh".to_string());
                     argv.push("-c".to_string());
                     argv.push(format!("ls '{}'", existing.display()));
+                    // spawn-audit: test-only — sandbox read probe. Same `apply_minimal_env` floor as the path it is testing.
                     let mut cmd = Command::new(&argv[0]);
                     cmd.args(&argv[1..]).current_dir(&dir);
                     apply_minimal_env(&mut cmd);
@@ -1897,6 +1907,7 @@ mod tests {
         // A script that backgrounds a long sleeper then itself sleeps — the direct child AND the
         // backgrounded descendant must be killed. `sleep`/`&` are not denylisted. Use run_bounded_status
         // directly with a SHORT timeout (VALIDATOR_TIMEOUT is 120s — too long for a test).
+        // spawn-audit: test-only — process-tree kill fixture. Same `apply_minimal_env` floor as the path it is testing.
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg("sleep 60 & sleep 60").current_dir(&dir);
         apply_minimal_env(&mut cmd);

@@ -144,6 +144,7 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str]| {
+            // spawn-audit: test-only — a git fixture building the worktree layout under test; it reads no engine state.
             let out = Command::new("git")
                 .args(args)
                 .current_dir(&repo)
@@ -241,6 +242,7 @@ mod tests {
         // which is not inside a repo on any platform we build on — but if some host ever made that
         // false, `git status` would SUCCEED and this test would fail while pointing at the wrong
         // thing. Check the premise directly so a violation reads as a violation.
+        // spawn-audit: test-only — checks the premise that the scratch dir is outside a repo — plain `git status`.
         let outside = Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&dir)

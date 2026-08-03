@@ -32,6 +32,7 @@ use crate::event::CoreEvent;
 use crate::terminal::{self, PtyMap};
 use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
+use wicked_apps_core::HardenedCommand;
 
 /// The actor-owned terminal registry entry (DES §4 "id → status"). Presence in the registry map IS
 /// the "open" status; removal (on exit/close) is the terminal state — this is the single-emit guard
@@ -3408,8 +3409,12 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
             crate::workflow::StepStatus::Failed,
         );
     };
+    // `cmd` is an arbitrary argv straight out of a `WorkflowDef` — workflows are data, so this runs
+    // whatever a workflow author wrote. A def whose tool phase is `["wicked-estate", "index", "."]`
+    // reproduces FINDING-067 with no agent involved at all: the indexer needs no `--db`, it reads
+    // the inherited environment. Found by enumerating spawn sites, not by a failure.
     let mut proc = Command::new(bin);
-    proc.args(&cmd[1..]);
+    proc.hardened().args(&cmd[1..]);
     if let Some(wd) = workdir {
         proc.current_dir(wd);
     }

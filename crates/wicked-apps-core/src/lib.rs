@@ -453,6 +453,9 @@ pub mod emit;
 pub mod store_any;
 pub use store_any::AnyStore;
 
+pub mod spawn;
+pub use spawn::HardenedCommand;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -40,6 +40,7 @@ mod repo_intel;
 mod scope;
 mod session_runner;
 mod sources;
+mod spawn_audit;
 mod terminal;
 mod validator;
 mod validator_vault;

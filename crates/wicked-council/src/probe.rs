@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::types::{AgenticCli, ProbeOutcome, Prober, UnusableReason};
+use wicked_apps_core::HardenedCommand;
 
 /// The real, subprocess-backed prober.
 #[derive(Debug, Clone)]
@@ -201,6 +202,7 @@ fn run_bounded(
     timeout: Duration,
 ) -> Result<(bool, String), ProbeError> {
     let mut child = Command::new(program)
+        .hardened()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

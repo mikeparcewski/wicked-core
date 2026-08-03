@@ -12,7 +12,7 @@ use std::process::Command;
 
 use std::collections::HashSet;
 
-use wicked_apps_core::{open_store, GraphRead, NodeKind};
+use wicked_apps_core::{open_store, GraphRead, HardenedCommand, NodeKind};
 use wicked_estate_core::{Direction, SymbolId};
 
 /// CALL-SPREAD — the number of DISTINCT files that reference `id`. A LANGUAGE-AGNOSTIC, data-driven
@@ -144,6 +144,7 @@ pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
     let graph_str = graph.to_string_lossy().to_string();
     let bin = indexer_bin();
     let out = Command::new(&bin)
+        .hardened()
         .arg("index")
         .arg(repo)
         .arg("--db")

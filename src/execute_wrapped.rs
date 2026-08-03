@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use crate::domain::WorkUnit;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
+use wicked_apps_core::HardenedCommand;
 
 /// The structured signals an [`OutputAdapter`] extracts from ONE raw stdout line (DES-STUDIO-COCKPIT-001
 /// §3 B-runner). `text` is 0..n readable deltas to stream through the [`DeltaSink`] as `CliOutputDelta`
@@ -641,14 +642,15 @@ impl WrappedCliStepRunner {
                 Box::new(Passthrough)
             };
             let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]).current_dir(&cwd);
             // No estate tool the worker spawns may inherit a store from the environment (FINDING-067).
             // Stripped UNCONDITIONALLY — governed or not, set by us or exported by whoever started the
             // daemon. `wicked-estate`, `wicked-estate-mcp` and `wicked-core` all resolve `--db` ELSE
             // this variable, so leaving it in place is the difference between a worker's `wicked-estate
             // index .` building its repo's graph and it re-indexing the platform's operational store on
             // top of itself. A boundary that depends on the daemon's environment is not a boundary.
-            cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
+            // Harden FIRST so the gate-hook variables set below survive as deliberate exceptions.
+            cmd.hardened();
+            cmd.args(&argv[1..]).current_dir(&cwd);
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
             // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
             // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
@@ -1318,6 +1320,7 @@ mod tests {
         let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = lines.clone();
         let emit = move |line: &str| sink.lock().unwrap().push(line.to_string());
+        // spawn-audit: test-only — `printf` fixture proving run_bounded emits each stdout line live.
         let mut cmd = Command::new("printf");
         cmd.arg("alpha\nbeta\ngamma\n");
         let (code, out, _err, _usage, _files) =

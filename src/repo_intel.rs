@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::process::Command;
 
 use crate::code_graph::indexer_bin;
+use wicked_apps_core::HardenedCommand;
 
 /// A recent commit (subject + author + relative time).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -53,6 +54,7 @@ pub struct RepoProfile {
 
 fn git(repo: &str, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
+        .hardened()
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -152,6 +154,7 @@ pub fn change_digest_since(repo: &str, days: u32) -> String {
 /// Parse the indexer's `--json` `[{file,kind,name}]` output.
 fn indexer_refs(graph_db: &str, subcommand: &str, n: usize) -> Vec<CodeRef> {
     let out = Command::new(indexer_bin())
+        .hardened()
         .args([subcommand, "--json", "--db", graph_db])
         .output();
     let Ok(out) = out else { return vec![] };
@@ -168,6 +171,7 @@ fn indexer_refs(graph_db: &str, subcommand: &str, n: usize) -> Vec<CodeRef> {
 pub fn graph_stats(graph_db: &str) -> GraphStats {
     let mut s = GraphStats::default();
     let Ok(out) = Command::new(indexer_bin())
+        .hardened()
         .args(["stats", "--db", graph_db])
         .output()
     else {
