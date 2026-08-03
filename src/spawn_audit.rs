@@ -29,7 +29,9 @@
 mod tests {
     use std::path::{Path, PathBuf};
 
-    /// Lines to look ahead from a `Command::new` for its `.hardened()`.
+    /// Lines AFTER a `Command::new` that may carry its `.hardened()`. The spawn line itself is
+    /// always scanned too (the single-line `Command::new(x).hardened()` shape), so the window is
+    /// `LOOKAHEAD + 1` lines wide.
     ///
     /// Generous on purpose. Builder chains here run long (args, stdio, `current_dir`, cfg-gated
     /// `process_group`), and the cost of being too tight is a false failure that teaches the next
@@ -116,7 +118,7 @@ mod tests {
                     continue;
                 }
                 checked += 1;
-                let end = (i + LOOKAHEAD).min(lines.len());
+                let end = (i + 1 + LOOKAHEAD).min(lines.len());
                 if !lines[i..end].iter().any(|l| l.contains(".hardened()")) {
                     let rel = file.strip_prefix(&root).unwrap_or(file);
                     unhardened.push(format!("{}:{} — {}", rel.display(), i + 1, line.trim()));
@@ -130,7 +132,7 @@ mod tests {
         );
         assert!(
             unhardened.is_empty(),
-            "\n{} spawn site(s) do not call .hardened() within {LOOKAHEAD} lines:\n\n{}\n\n\
+            "\n{} spawn site(s) do not call .hardened() within {LOOKAHEAD} lines after them:\n\n{}\n\n\
              Every Command::new in this workspace must chain .hardened() — see \
              wicked_apps_core::spawn. It strips the engine's internal environment (the operational \
              store, the gate hook's store and argument channel) so a child cannot inherit state \

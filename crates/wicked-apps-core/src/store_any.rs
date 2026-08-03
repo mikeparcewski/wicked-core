@@ -85,6 +85,9 @@ impl GraphRead for AnyStore {
     fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
         on_backend!(self, s => s.unresolved_refs_for_name(name))
     }
+    fn indexed_files(&self) -> Result<Vec<String>> {
+        on_backend!(self, s => s.indexed_files())
+    }
     fn file_digest(&self, file: &str) -> Result<Option<String>> {
         on_backend!(self, s => s.file_digest(file))
     }

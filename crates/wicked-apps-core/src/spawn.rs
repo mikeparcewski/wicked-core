@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn hardened_removes_every_engine_internal_variable() {
-        // Not a tautology over the const: this asserts the **mechanism*, that `hardened()` actually
+        // Not a tautology over the const: this asserts the **mechanism**, that `hardened()` actually
         // reaches Command's env map, rather than that the list contains what it contains. The
         // observable proof that the strip works end-to-end (a real child reporting UNSET) lives in
         // `execute_wrapped::tests::no_worker_inherits_an_estate_store_through_the_environment`.
