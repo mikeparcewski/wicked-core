@@ -137,16 +137,24 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
     })
 }
 
-/// The repo-local code graph a governed worker's estate MCP may open — `<repo_root>/.wicked/code-graph.db`
-/// for the run's registered repo. `None` when the run targets no repo, the repo id is not registered,
-/// the store read fails, or the `.wicked` directory cannot be created.
+/// The repo-local code graph a governed worker's estate MCP may open, for the run's registered repo.
+/// `None` when the run targets no repo, the repo id is not registered, the store read fails, or the
+/// repo has never been indexed.
+///
+/// That last arm used to be unreachable. The resolver created the graph's parent directory and handed
+/// back the path whether or not anything had ever written it, so a worker on an un-indexed repo got a
+/// live MCP over an empty database — every graph query answering "nothing here" about a repo full of
+/// code, with no error anywhere (FINDING-069). [`existing_code_graph`] creates nothing, so the file
+/// either exists and the worker gets the real graph, or it does not and the worker gets no estate
+/// tools at all.
 ///
 /// Every `None` arm is a decision to ship the worker NO estate tools. That is the point: the only other
 /// store in reach is the operational one, and a worker with a writable handle to it can delete the
-/// platform's entire state (FINDING-067). Fewer tools is a degraded run; a wiped store is a dead one.
+/// platform's entire state (FINDING-067). Fewer tools is a degraded run; a wiped store is a dead one,
+/// and a silently empty one is worse than both because it looks like an answer.
 fn repo_code_graph_db(store: &dyn GraphStore, repo_ref: Option<&str>) -> Option<String> {
     let repo = crate::repo::get_repo(store, repo_ref?).ok().flatten()?;
-    let path = crate::code_graph::code_graph_path(std::path::Path::new(&repo.root_path)).ok()?;
+    let path = crate::code_graph::existing_code_graph(std::path::Path::new(&repo.root_path))?;
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -4098,6 +4106,96 @@ mod terminal_gate_tests {
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
         );
+    }
+}
+
+/// What store a governed worker's estate MCP is pointed at, and when it gets none (FINDING-069).
+#[cfg(test)]
+mod worker_code_graph_tests {
+    use super::*;
+    use crate::repo::{RepoEntry, REPO_ENTRY};
+    use wicked_apps_core::{open_store, ToNode};
+
+    /// A registered repo rooted at `root`, without touching git — `register_repo` validates a real
+    /// checkout, and none of what is under test here depends on one.
+    fn register(store: &mut dyn GraphStore, id: &str, root: &std::path::Path) {
+        let entry = RepoEntry {
+            id: id.into(),
+            name: id.into(),
+            root_path: root.to_string_lossy().into_owned(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(), // derived on read; the value written here is irrelevant
+        };
+        crate::domain::put_node(store, entry.to_node()).unwrap();
+        assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wicked-cgtest-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The regression. A repo that has never been indexed must yield NO store, so the worker is
+    /// launched with no estate MCP at all.
+    ///
+    /// Before the fix this returned `Some(path)`: the resolver ran `create_dir_all` on the graph's
+    /// parent and handed back the path regardless, so every graph tool the worker had answered
+    /// "nothing found" about a repo full of code — an empty result that reads exactly like a real one.
+    #[test]
+    fn an_unindexed_repo_ships_no_estate_mcp() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = scratch("unindexed");
+        register(&mut store, "unindexed", &root);
+
+        assert_eq!(repo_code_graph_db(&store, Some("unindexed")), None);
+        // And it did not bring the directory into existence on the way to saying no. A resolver that
+        // creates as it reads is how the empty database appeared in the first place.
+        assert!(!root.join(".codegraph").exists());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_indexed_repo_gets_the_graph_the_indexer_wrote() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = scratch("indexed");
+        let graph = root.join(".codegraph").join("estate.db");
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        std::fs::write(&graph, b"not really sqlite, but it is a file").unwrap();
+        register(&mut store, "indexed", &root);
+
+        assert_eq!(
+            repo_code_graph_db(&store, Some("indexed")).as_deref(),
+            Some(graph.to_string_lossy().as_ref()),
+            "the worker must get the path crew's onboarding indexed to, not a sibling"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory at the graph's path is not a graph. `is_file` rather than `exists` because
+    /// `.codegraph/estate.db/` is precisely what a half-finished index or a bad `--db` argument
+    /// leaves behind, and handing that to a store opener fails deep inside sqlite rather than here.
+    #[test]
+    fn a_directory_where_the_graph_should_be_is_not_a_graph() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = scratch("dir-not-file");
+        std::fs::create_dir_all(root.join(".codegraph").join("estate.db")).unwrap();
+        register(&mut store, "dir-not-file", &root);
+
+        assert_eq!(repo_code_graph_db(&store, Some("dir-not-file")), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_run_with_no_repo_and_a_run_on_an_unregistered_one_both_get_nothing() {
+        let store = open_store(Some(":memory:")).unwrap();
+        assert_eq!(repo_code_graph_db(&store, None), None);
+        assert_eq!(repo_code_graph_db(&store, Some("never-registered")), None);
     }
 }
 

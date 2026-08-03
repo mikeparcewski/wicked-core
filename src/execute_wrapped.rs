@@ -1452,7 +1452,7 @@ mod tests {
         u.assigned_cli = Some("claude".to_string());
         let gov = crate::workflow::GovernanceContext {
             db_path: "/abs/estate.db".to_string(),
-            code_graph_db: Some("/abs/repo/.wicked/code-graph.db".to_string()),
+            code_graph_db: Some("/abs/repo/.codegraph/estate.db".to_string()),
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -1605,7 +1605,7 @@ mod tests {
         };
 
         let op_db = "/abs/operational-core.db";
-        let graph_db = "/abs/repo/.wicked/code-graph.db";
+        let graph_db = "/abs/repo/.codegraph/estate.db";
 
         // WITH a registered repo: the estate MCP is armed, pointed at the REPO-LOCAL graph.
         let (json, raw) = read_settings(

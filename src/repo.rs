@@ -38,6 +38,18 @@ pub struct RepoEntry {
     /// Registration timestamp (unix seconds), supplied by the caller (no wall-clock in the lib).
     #[serde(default)]
     pub registered_at: i64,
+    /// ABSOLUTE path of this repo's code graph. **Derived, never authoritative in the record.**
+    ///
+    /// It exists so out-of-process consumers stop re-deriving it. crew spelled
+    /// `join(root_path, '.codegraph', 'estate.db')` in five places against the engine's own sixth
+    /// spelling, and nothing failed when they disagreed — the worker just queried an empty database
+    /// (FINDING-069). A field on the record they already read makes the engine the one source.
+    ///
+    /// [`RepoEntry::from_node`] recomputes it from `root_path` and discards whatever was persisted, so
+    /// a record written before this field existed reads back correct, and a repo that moves does not
+    /// carry a stale path forward. Do not write to it expecting it to stick.
+    #[serde(default)]
+    pub code_graph_db: String,
 }
 
 impl ToNode for RepoEntry {
@@ -67,9 +79,20 @@ impl FromNode for RepoEntry {
             NodeKind::Other(k) if k == REPO_ENTRY => {}
             other => anyhow::bail!("expected NodeKind::Other({REPO_ENTRY:?}), got {other:?}"),
         }
-        serde_json::from_value(serde_json::Value::Object(node.metadata.clone()))
-            .map_err(|e| anyhow::anyhow!("node {} is not a valid RepoEntry: {e}", node.name))
+        let mut entry: RepoEntry =
+            serde_json::from_value(serde_json::Value::Object(node.metadata.clone()))
+                .map_err(|e| anyhow::anyhow!("node {} is not a valid RepoEntry: {e}", node.name))?;
+        entry.code_graph_db = code_graph_db(&entry.root_path);
+        Ok(entry)
     }
+}
+
+/// This repo's code-graph path, absolute, derived from its root. The only spelling any consumer needs.
+fn code_graph_db(root_path: &str) -> String {
+    Path::new(root_path)
+        .join(crate::code_graph::CODE_GRAPH_DB_REL)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// What a caller asks to register. The id/branch are resolved by [`register_repo`].
@@ -144,6 +167,7 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
     let entry = RepoEntry {
         id: slug(&spec.name),
         name: spec.name,
+        code_graph_db: code_graph_db(&spec.root_path),
         root_path: spec.root_path,
         default_branch,
         registered_at: spec.registered_at,
@@ -651,8 +675,57 @@ mod tests {
             root_path: "/tmp/demo".into(),
             default_branch: "main".into(),
             registered_at: 42,
+            code_graph_db: code_graph_db("/tmp/demo"),
         };
         assert_eq!(RepoEntry::from_node(&e.to_node()).unwrap(), e);
+    }
+
+    /// A record written before `code_graph_db` existed must read back with the path filled in, not
+    /// with an empty string that a consumer would join onto or hand to a store opener.
+    ///
+    /// This is the arm that makes the field safe to add without a migration: `from_node` derives it
+    /// from `root_path` and ignores whatever the metadata said, so every record ever persisted — and
+    /// every record persisted by a future version that gets the derivation wrong — reads correct.
+    #[test]
+    fn a_record_predating_the_field_still_resolves_its_code_graph() {
+        let mut node = RepoEntry {
+            id: "legacy".into(),
+            name: "Legacy".into(),
+            root_path: "/tmp/legacy".into(),
+            default_branch: "main".into(),
+            registered_at: 7,
+            code_graph_db: String::new(),
+        }
+        .to_node();
+        node.metadata.remove("code_graph_db");
+        // Also covers the stale case: a persisted value from before the repo moved.
+        let mut moved = node.clone();
+        moved.metadata.insert(
+            "code_graph_db".into(),
+            serde_json::Value::String("/somewhere/else/old.db".into()),
+        );
+
+        for n in [node, moved] {
+            let back = RepoEntry::from_node(&n).unwrap();
+            assert_eq!(back.code_graph_db, code_graph_db("/tmp/legacy"));
+        }
+    }
+
+    /// The literal, pinned. Every out-of-process consumer joins this onto a repo root — crew did it in
+    /// five places, and when the engine's spelling and crew's disagreed the worker got a database
+    /// nothing had written (FINDING-069). Changing it is a coordinated release, not a rename.
+    #[test]
+    fn the_code_graph_spelling_is_the_one_consumers_expect() {
+        assert_eq!(crate::code_graph::CODE_GRAPH_DB_REL, ".codegraph/estate.db");
+        // Joined, not concatenated: the separator is the platform's, so Windows gets a backslash and
+        // a consumer's `join(root, '.codegraph', 'estate.db')` still names the same file.
+        assert_eq!(
+            code_graph_db("/repo"),
+            Path::new("/repo")
+                .join(".codegraph")
+                .join("estate.db")
+                .to_string_lossy()
+        );
     }
 
     // ── worktree isolation (FINDING-059) ──────────────────────────────────────
