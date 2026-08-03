@@ -303,7 +303,8 @@ fn missing_pin_remedy(pin: &str) -> String {
 /// database. The CLI resolves `--db` ELSE `WICKED_ESTATE_DB` ELSE a cwd-relative default; a daemon
 /// embedding the engine resolves its own state home. Those agree only by accident, and when they
 /// disagree the seed succeeds, prints the right pin, and changes nothing the engine can see.
-const VAULT_IS_PER_DB: &str = "Pass `--db <the database the engine opened>` (ELSE `WICKED_ESTATE_DB`, \
+const VAULT_IS_PER_DB: &str =
+    "Pass `--db <the database the engine opened>` (ELSE `WICKED_ESTATE_DB`, \
      ELSE a cwd-relative default): the vault is rows in that store, so seeding any other database \
      succeeds, prints the right pin, and leaves this refusal exactly as it was.";
 
@@ -1324,7 +1325,8 @@ mod resolve_tests {
     #[test]
     fn the_shipped_drop_in_plans_against_a_store_nobody_seeded() {
         use wicked_apps_core::open_store;
-        let dir = std::env::temp_dir().join(format!("wicked-dropin-unseeded-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("wicked-dropin-unseeded-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut store = open_store(Some(dir.join("v.db").to_str().unwrap())).unwrap();
