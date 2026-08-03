@@ -248,11 +248,15 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
 ///    is core#30); deny loudly instead of silently creating a garbage SQLite file (findings #13/#18).
 fn store_unavailable(db: Option<&str>) -> Option<String> {
     match db.filter(|s| !s.is_empty()) {
-        None => Some(
-            "no estate store resolvable (set --db or WICKED_GATE_DB) — refusing to evaluate against \
+        // The variable NAME is interpolated from the const, not typed out. This message is the only
+        // instruction an operator gets for a hook that is denying every tool call, so a message that
+        // still names the previous variable after a rename prescribes an inert remedy — the exact
+        // failure FINDING-066 was filed for, in a place where the symptom (total deny) is maximally
+        // alarming and the wrong fix is maximally plausible.
+        None => Some(format!(
+            "no estate store resolvable (set --db or {GATE_DB_ENV}) — refusing to evaluate against \
              a default/empty store (fail-closed)"
-                .to_string(),
-        ),
+        )),
         Some(s) if s.starts_with("postgres://") || s.starts_with("postgresql://") => Some(
             "governance-in-run is SQLite-only; the hook cannot open a postgres:// store (core#30)"
                 .to_string(),

@@ -274,7 +274,7 @@ fn attach_pinned_validators(
 /// idempotent. Pointing an operator at the generic author→approve pair for it would send them down a
 /// path that cannot produce the pin they need.
 ///
-/// Every arm carries [`VAULT_IS_PER_DB`], because naming a command is only half a remedy: the vault
+/// Every arm carries [`vault_is_per_db`], because naming a command is only half a remedy: the vault
 /// lives in whichever database the engine opened, and every one of these commands defaults to a
 /// DIFFERENT database than a long-running engine does (FINDING-066). The coverage arm is now
 /// belt-and-braces — `pre_distribute` seeds that pin on the plan path, so reaching it means the seed
@@ -286,13 +286,15 @@ fn missing_pin_remedy(pin: &str) -> String {
             "This is the coverage validator the shipped `domain-extraction` workflow pins, and the \
              plan path seeds it automatically — so seeing this means the seed did not take. Run \
              `wicked-core seed-domain-validators` to vault + approve it (idempotent, and it yields \
-             exactly this pin). {VAULT_IS_PER_DB}"
+             exactly this pin). {}",
+            vault_is_per_db()
         )
     } else {
         format!(
             "Author + approve it first: `wicked-core provision-validator --criterion \"...\"` then \
              `wicked-core approve-validator --pin <unapproved pin>`, and pin the APPROVED pin \
-             (`{pin}` resolves to nothing today). {VAULT_IS_PER_DB}"
+             (`{pin}` resolves to nothing today). {}",
+            vault_is_per_db()
         )
     }
 }
@@ -303,10 +305,19 @@ fn missing_pin_remedy(pin: &str) -> String {
 /// database. The CLI resolves `--db` ELSE `WICKED_ESTATE_DB` ELSE a cwd-relative default; a daemon
 /// embedding the engine resolves its own state home. Those agree only by accident, and when they
 /// disagree the seed succeeds, prints the right pin, and changes nothing the engine can see.
-const VAULT_IS_PER_DB: &str =
-    "Pass `--db <the database the engine opened>` (ELSE `WICKED_ESTATE_DB`, \
-     ELSE a cwd-relative default): the vault is rows in that store, so seeding any other database \
-     succeeds, prints the right pin, and leaves this refusal exactly as it was.";
+///
+/// The variable name is interpolated from [`crate::gate_hook::ESTATE_DB_ENV`], not typed out: a remedy
+/// that names a variable the CLI no longer reads is the FINDING-066 failure with extra steps. The test
+/// that pins this sentence deliberately hard-codes the literal instead — a test sharing the const
+/// would rename itself alongside a rename and detect nothing.
+fn vault_is_per_db() -> String {
+    format!(
+        "Pass `--db <the database the engine opened>` (ELSE `{}`, \
+         ELSE a cwd-relative default): the vault is rows in that store, so seeding any other database \
+         succeeds, prints the right pin, and leaves this refusal exactly as it was.",
+        crate::gate_hook::ESTATE_DB_ENV
+    )
+}
 
 pub(crate) fn workflow_overlay_dir() -> Option<std::path::PathBuf> {
     if let Some(d) = std::env::var_os("WICKED_WORKFLOWS_DIR") {

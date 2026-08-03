@@ -767,7 +767,7 @@ pub fn run_validator_reporting(
                     .map(|d| d.join(p).to_string_lossy().into_owned())
                     .unwrap_or_else(|_| db.to_string())
             };
-            cmd.env("WICKED_ESTATE_DB", abs);
+            cmd.env(crate::gate_hook::ESTATE_DB_ENV, abs);
         }
     }
 

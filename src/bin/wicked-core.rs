@@ -34,7 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
     HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
-    WrappedCliStepRunner, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
+    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV,
+    GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -68,11 +69,7 @@ fn hook_phase_alias(args: &[String]) -> Option<String> {
 
 fn store_path(args: &[String]) -> String {
     flag(args, "--db")
-        .or_else(|| {
-            std::env::var("WICKED_ESTATE_DB")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| std::env::var(ESTATE_DB_ENV).ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "wicked-estate.db".to_string())
 }
 
