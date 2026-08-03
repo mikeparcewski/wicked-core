@@ -583,7 +583,32 @@ impl WrappedCliStepRunner {
                     };
                 }
             },
-            _ => None,
+            // A governed unit on a CLI with no gate-hook adapter. It still runs — failing it would
+            // take out every `evaluator_distinct` unit, since that router exists to move the
+            // evaluator OFF the creator's CLI and claude is the only governable one — but it must
+            // not run quietly. `governed: false` alone cannot be told apart from a unit that never
+            // asked for governance, which is exactly how this stayed invisible (FINDING-063).
+            //
+            // Only when there is a binary to name. An empty `argv` means no invocation is
+            // configured at all: the unit fails hard below with exactly that message, and
+            // reporting "governed but unenforced" for it would be a false disclosure — nothing
+            // ran, so nothing ran unchecked. An event whose `cli` is `""` also can't be acted on.
+            (Some(_), false) => {
+                if let Some(cli) = argv.first() {
+                    self.emit_event(crate::event::CoreEvent::GovernanceUnenforced {
+                        session: input.run_id.clone(),
+                        ord: input.unit.ord,
+                        attempt: input.attempt,
+                        cli: cli.clone(),
+                        reason: format!(
+                            "unit is governed but '{cli}' has no input-governance adapter \
+                             (gate-hook injection is claude-only); its tool calls are unchecked"
+                        ),
+                    });
+                }
+                None
+            }
+            (None, _) => None,
         };
 
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
@@ -1236,6 +1261,25 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
 mod tests {
     use super::*;
 
+    /// Why the two emptiness guards on this path (`argv.is_empty()` before spawning, and the
+    /// `argv.first()` guard on the FINDING-063 disclosure event) are DEFENSIVE and not live: the
+    /// `!placed` fallback at the end of `build_argv` unconditionally pushes the prompt, so there is
+    /// no invocation string — empty, whitespace, or one whose only token elides — that yields an
+    /// empty argv. Pinned rather than assumed: if that fallback is ever made conditional, an empty
+    /// argv becomes reachable, and both guards start carrying real weight instead of documenting a
+    /// state that cannot occur.
+    #[test]
+    fn build_argv_never_yields_an_empty_argv() {
+        for inv in ["", "   ", "\t", "{SKILLS}", "--allowedTools={SKILLS}"] {
+            let argv = build_argv(inv, "the prompt", &[]);
+            assert!(
+                !argv.is_empty(),
+                "build_argv({inv:?}) returned an empty argv; the emptiness guards on the wrapped \
+                 path are no longer merely defensive"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_bounded_streams_each_stdout_line_live() {
@@ -1256,6 +1300,114 @@ mod tests {
             out.contains("alpha") && out.contains("gamma"),
             "the full output is still accumulated alongside streaming"
         );
+    }
+
+    /// FINDING-063. A governed unit routed to a non-claude CLI cannot be armed — gate-hook
+    /// injection rides `--settings`, which only claude reads — so it runs with its tool calls
+    /// unchecked. That is a deliberate trade (failing it would take out every `evaluator_distinct`
+    /// unit), but it must not be SILENT: `governed: false` is also what an ungoverned-by-design
+    /// unit reports, and the actor keys the ARMED-marker fail-closed fold off exactly that flag
+    /// (actor.rs), so an unenforced unit slips past the erasure check too. The event is the only
+    /// thing that distinguishes "not asked for" from "asked for and not applied".
+    #[cfg(unix)]
+    #[test]
+    fn a_governed_unit_on_a_cli_that_cannot_be_armed_says_so_instead_of_going_quiet() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+
+        let mut u = WorkUnit::pending("s:u4", "s", 4, "verify the work");
+        // Exactly the shape `evaluator_distinct` produces: the unit is governed, and the router has
+        // moved it off claude precisely BECAUSE the creator was claude.
+        u.assigned_cli = Some("agy".to_string());
+        u.assigned_invocation = Some("/bin/echo {PROMPT}".to_string());
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-unenf-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = StepInput {
+            run_id: "run-unenf".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: dir.join("estate.db").to_string_lossy().to_string(),
+            }),
+            prior_outputs: vec![],
+        };
+
+        let out = runner.run_unit(&input);
+
+        let unenforced = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                crate::command::Command::EmitEvent(
+                    crate::event::CoreEvent::GovernanceUnenforced {
+                        cli, reason, ord, ..
+                    },
+                ) => Some((cli, reason, ord)),
+                _ => None,
+            })
+            .next()
+            .expect("a governed unit that could not be armed must announce it");
+        assert_eq!(
+            unenforced.0, "/bin/echo",
+            "names the binary, not the seat key"
+        );
+        assert_eq!(unenforced.2, 4);
+        assert!(
+            unenforced.1.contains("claude-only"),
+            "the reason must say WHY it could not be armed: {}",
+            unenforced.1
+        );
+        // The unit still runs — this is a disclosure, not a fallback or a failure.
+        assert_eq!(out.status, StepStatus::Ok);
+        assert!(!out.governed, "and it is honestly reported as ungoverned");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The converse, so the event cannot degrade into noise on every ungoverned internal call:
+    /// a unit that never asked for governance says nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_unit_that_never_asked_for_governance_stays_silent() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "just run");
+        u.assigned_cli = Some("agy".to_string());
+        u.assigned_invocation = Some("/bin/echo {PROMPT}".to_string());
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-nogov-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = StepInput {
+            run_id: "run-nogov".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+        };
+        let _ = runner.run_unit(&input);
+        assert!(
+            !rx.try_iter().any(|c| matches!(
+                c,
+                crate::command::Command::EmitEvent(
+                    crate::event::CoreEvent::GovernanceUnenforced { .. }
+                )
+            )),
+            "ungoverned-by-design must not be reported as unenforced governance"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
