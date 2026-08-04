@@ -98,6 +98,61 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
         .collect()
 }
 
+/// Bind a run's repo into the placeholders its Tool phases declare.
+///
+/// A Tool phase's argv is DATA from the workflow def, which is shared by every run of that id. The
+/// paths a run actually needs are not: they belong to the repo the run targets. Crew used to close
+/// that gap by rewriting the def with one repo's absolute paths and writing it to a single shared
+/// overlay file per launch — so three concurrent registrations raced on one file and two of them
+/// indexed a third repo's tree into a third repo's database, reported under their own names
+/// (FINDING-075, wicked-crew#196). The lock contention that exposed it was luck; the general case is
+/// a run that silently does another run's work.
+///
+/// Substituting here removes the shared artifact entirely. The def stays constant and shared; the
+/// per-run values reach the unit, which is already per-run and already persisted.
+///
+/// Unresolved tokens are an ERROR, never a passthrough. A command carrying a literal `{repo_root}`
+/// would be handed to a shell as a path that cannot exist — a confusing failure at best, and at
+/// worst (for a tool that treats an unknown path as "index the cwd") the FINDING-067 shape.
+pub fn bind_repo_paths(units: &mut [WorkUnit], repo: &crate::repo::RepoEntry) {
+    for unit in units.iter_mut() {
+        let Some(cmd) = unit.tool_cmd.as_mut() else {
+            continue;
+        };
+        for arg in cmd.iter_mut() {
+            if arg == crate::workflow::REPO_ROOT_TOKEN {
+                *arg = repo.root_path.clone();
+            } else if arg == crate::workflow::CODE_GRAPH_DB_TOKEN {
+                *arg = repo.code_graph_db.clone();
+            }
+        }
+    }
+}
+
+/// Every placeholder a Tool phase may declare — the set [`bind_repo_paths`] can satisfy.
+const REPO_TOKENS: &[&str] = &[
+    crate::workflow::REPO_ROOT_TOKEN,
+    crate::workflow::CODE_GRAPH_DB_TOKEN,
+];
+
+/// The `<phase>: <token>` pairs a def declares that no repo was bound for.
+///
+/// Separate from [`bind_repo_paths`] so the caller can refuse the launch BEFORE anything is
+/// persisted: a run whose def wants a repo but was launched without one must fail at the door, not
+/// dispatch a command with a brace-wrapped literal in it.
+pub fn unbound_repo_tokens(units: &[WorkUnit]) -> Vec<String> {
+    let mut out = Vec::new();
+    for unit in units {
+        let Some(cmd) = &unit.tool_cmd else { continue };
+        for arg in cmd {
+            if REPO_TOKENS.contains(&arg.as_str()) {
+                out.push(format!("{}: {arg}", unit.id));
+            }
+        }
+    }
+    out
+}
+
 /// Split on newlines, sentence terminators (`.`/`!`/`?` followed by whitespace), or semicolons.
 fn split_problem(problem: &str) -> Vec<String> {
     let mut pieces = Vec::new();
@@ -326,5 +381,94 @@ mod tests {
         // Falls back to the bare phase id — never an empty description (gate needs work context).
         assert_eq!(units[0].description, feature_def().phases[0].id);
         assert!(units.iter().all(|u| !u.description.is_empty()));
+    }
+
+    fn repo_at(id: &str, root: &str) -> crate::repo::RepoEntry {
+        crate::repo::RepoEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path: root.to_string(),
+            default_branch: "main".to_string(),
+            registered_at: 0,
+            code_graph_db: format!("{root}/.codegraph/estate.db"),
+        }
+    }
+
+    /// FINDING-075 (wicked-crew#196): the run's OWN repo reaches its units.
+    ///
+    /// Two runs planned from the SAME shared def must end up with different argv. That is the whole
+    /// property: crew rewrote one shared overlay file per launch instead, so three concurrent
+    /// registrations resolved whichever write landed last and two of them indexed a third repo.
+    #[test]
+    fn two_runs_of_one_def_bind_their_own_repos() {
+        let def = crate::workflow::onboarding_def();
+        let mut a = plan_from_def(&def, "onboard a", "sa");
+        let mut b = plan_from_def(&def, "onboard b", "sb");
+        bind_repo_paths(&mut a, &repo_at("alpha", "/repos/alpha"));
+        bind_repo_paths(&mut b, &repo_at("beta", "/repos/beta"));
+
+        let index_a = a[0].tool_cmd.as_ref().expect("index is a tool phase");
+        let index_b = b[0].tool_cmd.as_ref().expect("index is a tool phase");
+        assert!(index_a.contains(&"/repos/alpha".to_string()), "{index_a:?}");
+        assert!(index_b.contains(&"/repos/beta".to_string()), "{index_b:?}");
+        assert!(
+            !index_a.iter().any(|s| s.contains("beta")),
+            "run `sa` carries run `sb`'s repo — the cross-repo contamination this guards: {index_a:?}"
+        );
+        assert!(
+            !index_b.iter().any(|s| s.contains("alpha")),
+            "run `sb` carries run `sa`'s repo: {index_b:?}"
+        );
+
+        // Both phases target the graph the ENGINE resolved, never a re-derived spelling (FINDING-069).
+        for units in [&a, &b] {
+            for u in units.iter() {
+                let cmd = u
+                    .tool_cmd
+                    .as_ref()
+                    .expect("onboarding phases are tool phases");
+                let db =
+                    cmd[cmd.iter().position(|s| s == "--db").expect("carries --db") + 1].clone();
+                assert!(db.ends_with("/.codegraph/estate.db"), "{db}");
+            }
+        }
+    }
+
+    #[test]
+    fn binding_leaves_no_placeholder_behind() {
+        let def = crate::workflow::onboarding_def();
+        let mut units = plan_from_def(&def, "onboard", "s1");
+        assert!(
+            !unbound_repo_tokens(&units).is_empty(),
+            "the def must DECLARE placeholders, or this guard is vacuous"
+        );
+        bind_repo_paths(&mut units, &repo_at("alpha", "/repos/alpha"));
+        assert_eq!(
+            unbound_repo_tokens(&units),
+            Vec::<String>::new(),
+            "a bound run must carry no `{{...}}` literal into a spawned command"
+        );
+    }
+
+    /// A phase with no repo placeholders is untouched — binding is not a blanket rewrite.
+    #[test]
+    fn binding_does_not_touch_commands_that_declare_nothing() {
+        let mut units = plan_from_def(&crate::workflow::onboarding_def(), "x", "s1");
+        units[0].tool_cmd = Some(vec![
+            "wicked-estate".into(),
+            "index".into(),
+            "/literal".into(),
+        ]);
+        bind_repo_paths(&mut units, &repo_at("alpha", "/repos/alpha"));
+        assert_eq!(
+            units[0].tool_cmd.as_deref(),
+            Some(
+                &[
+                    "wicked-estate".to_string(),
+                    "index".to_string(),
+                    "/literal".to_string()
+                ][..]
+            )
+        );
     }
 }
