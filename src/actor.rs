@@ -369,6 +369,10 @@ pub(crate) fn run(
         },
         None => Vec::new(),
     };
+    // Whatever the mode, anything still persisted `Executing` at this point has no worker in THIS
+    // process. Armed mode has already redriven what it could; everything left is a zombie and must
+    // say so rather than sitting silently (core#124).
+    report_orphaned_executing_sessions(&store, &mut subscribers);
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -2321,6 +2325,57 @@ pub(crate) fn resume_run_inner(
 /// `task.dispatched` is emitted (a same-keyed re-emit would dedup to the terminal row the cli-runner's
 /// cursor is already past → no re-run → wedge). Armed-mode ONLY — the default in-process path has no
 /// cross-restart durability and must stay byte-for-byte unchanged, so it is never re-driven.
+/// Surface sessions the store says are `Executing` that this process is NOT going to drive.
+///
+/// `redrive_executing_sessions` runs ONLY in armed exec mode — deliberately, since the in-process
+/// path has no cross-restart durability to redrive against. But the SESSION STATUS is durable either
+/// way, so on the default path a restart leaves a run claiming to execute with no worker behind it.
+/// Observed live: run `9da47603` sat `executing` / unit `distributed` with zero ACP processes for
+/// 35+ minutes. `POST /runs/:id/resume` fixed it instantly, so the recovery path was sound — nothing
+/// had told anyone it was needed (core#124).
+///
+/// This does not resume them: re-dispatching an in-process run across a restart is the durability
+/// this path does not claim to have, and doing it silently would be a guess about work that may have
+/// half-completed. It makes the state VISIBLE and names the remedy, which is what was missing —
+/// "status says executing, reality is no worker" was invisible precisely because nothing said it.
+fn report_orphaned_executing_sessions(
+    store: &dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+) {
+    let sessions = match crate::domain::all_sessions(store) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("wicked-core: could not scan for orphaned runs: {e}");
+            return;
+        }
+    };
+    for s in sessions {
+        if s.status != SessionStatus::Executing {
+            continue;
+        }
+        let units = crate::domain::session_units(store, &s.id).unwrap_or_default();
+        let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
+        eprintln!(
+            "wicked-core: run {} is persisted `executing` at unit {} but this process did not \
+             restore a worker for it — the daemon restarted mid-run. Resume it with \
+             `POST /api/v1/runs/{}/resume` (core#124).",
+            s.id, ord, s.id
+        );
+        emit(
+            subscribers,
+            CoreEvent::WorkerStalled {
+                session: s.id.clone(),
+                ord,
+                // Not a terminal: there is no live worker to attribute output to. The empty id is
+                // the distinguishing mark of "no worker at all" versus a worker gone quiet, which is
+                // what `WICKED_STALL_SECS` covers and what this case falls outside of.
+                terminal_id: String::new(),
+                stalled_secs: 0,
+            },
+        );
+    }
+}
+
 fn redrive_executing_sessions(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -4113,6 +4168,7 @@ mod terminal_gate_tests {
 #[cfg(test)]
 mod worker_code_graph_tests {
     use super::*;
+    use crate::domain::HumanConfirm;
     use crate::repo::{RepoEntry, REPO_ENTRY};
     use wicked_apps_core::{open_store, ToNode};
 
@@ -4129,6 +4185,75 @@ mod worker_code_graph_tests {
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
+    }
+
+    /// core#124: a run the store calls `executing` with no worker behind it must SAY so.
+    ///
+    /// The redrive runs ONLY in armed exec mode, so on the default path a restart leaves the status
+    /// claiming execution forever. Observed live as 35+ minutes of silence that a manual resume
+    /// fixed instantly — the recovery worked; nothing announced it was needed.
+    fn session_at(id: &str, status: SessionStatus) -> AgentSession {
+        crate::domain::AgentSession {
+            id: id.into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        }
+    }
+
+    /// Drain the events a call emits into a Vec, via the sink's mpsc `push`.
+    fn emitted(store: &dyn wicked_apps_core::GraphStore) -> Vec<CoreEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = crate::event_log::EventSink::default();
+        sink.push(tx);
+        report_orphaned_executing_sessions(store, &mut sink);
+        drop(sink);
+        rx.try_iter().collect()
+    }
+
+    #[test]
+    fn an_executing_run_with_no_worker_is_announced() {
+        let dir = scratch("orphan");
+        let mut store = open_store(Some(dir.join("o.db").to_str().unwrap())).unwrap();
+        crate::domain::put_node(
+            &mut store,
+            session_at("orphan-run", SessionStatus::Executing).to_node(),
+        )
+        .unwrap();
+
+        let events = emitted(&store);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                CoreEvent::WorkerStalled { session, .. } if session == "orphan-run"
+            )),
+            "an orphaned `executing` run emitted nothing: {events:?}"
+        );
+    }
+
+    /// A COMPLETED run must not be announced. A reporter that fires on everything is noise, and
+    /// noise about healthy runs teaches operators to ignore the signal that matters.
+    #[test]
+    fn a_completed_run_is_not_announced() {
+        let dir = scratch("orphan_done");
+        let mut store = open_store(Some(dir.join("o.db").to_str().unwrap())).unwrap();
+        crate::domain::put_node(
+            &mut store,
+            session_at("done-run", SessionStatus::Completed).to_node(),
+        )
+        .unwrap();
+        assert!(
+            emitted(&store).is_empty(),
+            "a completed run was reported as orphaned"
+        );
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
