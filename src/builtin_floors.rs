@@ -324,4 +324,100 @@ mod tests {
              list grows, those workflows are shipping ungated and need their own floor"
         );
     }
+
+    /// The same invariant, for the workflows shipped as DROP-IN JSON rather than compiled in.
+    ///
+    /// The test above reads `WorkflowRegistry::with_defaults()` — the COMPILED defs. `workflows/`
+    /// ships JSON, and a same-id file replaces the compiled def wholesale (`load_dir` runs after
+    /// `with_defaults`), so those files are what actually reach the engine. Some are copies of a
+    /// compiled built-in (`feature`, `bug`, `migration`); the rest exist only as JSON (`chat`,
+    /// `survey-repo`, `domain-extraction`, `domain-graph-slice`, `memories`) and the compiled test
+    /// never saw any of them. An Evaluator could ship there with no floor and nothing would notice
+    /// (FINDING-074, #176).
+    ///
+    /// The rule differs from the built-in one in the negative branch. A built-in Evaluator with no
+    /// code-writing Creator upstream must carry NO pin, because the only floor those have is the
+    /// worktree-DIFF one and pinning it would deny every run. A drop-in may legitimately carry its
+    /// OWN floor instead — `domain-extraction/coverage` does, `COVERAGE_VALIDATOR_PIN` over a
+    /// `coverage-report.json` deliverable. So the assertion here is "must not carry the DIFF floor",
+    /// plus an exact classification of which drop-in Evaluators are floored and which are not.
+    ///
+    /// `ungated` is pinned rather than asserted empty. `domain-graph-slice/validate` genuinely has
+    /// no floor today, and inventing one here would be worse than naming it: the slice workflow
+    /// declares no deliverables at all, so a floor would have nothing to read, and #131 (coverage
+    /// accepts content-free requirement claims — 46 distinct strings across 34,897 nodes, every gate
+    /// green) is the open design work that says what "substance" has to mean before any such floor
+    /// is written. Pinning the list keeps the hole from GROWING while that is settled: a second
+    /// ungated Evaluator fails here.
+    #[test]
+    fn no_shipped_drop_in_ships_an_evaluator_nobody_checked() {
+        let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+        let (mut diff_floored, mut own_floored, mut ungated) = (Vec::new(), Vec::new(), Vec::new());
+        let mut files = 0;
+
+        for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            files += 1;
+            let def = WorkflowRegistry::def_from_file(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            for (i, phase) in def.phases.iter().enumerate() {
+                if phase.role != PhaseRole::Evaluator {
+                    continue;
+                }
+                let writes_code_upstream = def.phases[..i]
+                    .iter()
+                    .any(|p| p.executes_code && p.role == PhaseRole::Creator);
+                let target = format!("{}/{}", def.id, phase.id);
+                match phase.validator_pin.as_deref() {
+                    Some(EVIDENCE_FLOOR_PIN) => {
+                        assert!(
+                            writes_code_upstream,
+                            "`{target}` pins the worktree-DIFF floor but no code-writing Creator \
+                             runs before it, so the floor would deny every run of `{}`",
+                            def.id
+                        );
+                        diff_floored.push(target);
+                    }
+                    Some(_) => own_floored.push(target),
+                    None => ungated.push(target),
+                }
+            }
+        }
+
+        // Guards against the whole test passing vacuously if the directory moves or empties — the
+        // failure mode the sibling drop-in test in `workflow.rs` also had to close (#175).
+        assert!(files > 0, "workflows/ shipped no drop-in defs to check");
+
+        diff_floored.sort();
+        own_floored.sort();
+        ungated.sort();
+
+        assert_eq!(
+            diff_floored,
+            vec![
+                "bug/verify",
+                "feature/adversarial-review",
+                "migration/verify"
+            ],
+            "the shipped copies of the code-writing workflows must carry the DIFF floor, exactly as \
+             their compiled counterparts do — if a JSON here lost the pin it would silently replace \
+             a floored built-in with an unfloored one (FINDING-049's shape)"
+        );
+        assert_eq!(
+            own_floored,
+            vec!["domain-extraction/coverage"],
+            "the drop-in Evaluators that carry a floor suited to their own evidence"
+        );
+        assert_eq!(
+            ungated,
+            vec!["domain-graph-slice/validate"],
+            "KNOWN GAP, pinned so it cannot grow: an Evaluator with no floor, no deliverable and an \
+             `auto` gate has nothing it can deny on. Tracked by #176; the substance rule it needs is \
+             #131. If this list grew, a new workflow just shipped an unfalsifiable review step — \
+             give it a floor rather than adding it here."
+        );
+    }
 }
