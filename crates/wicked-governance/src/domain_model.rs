@@ -354,15 +354,17 @@ fn classify_node(
     store: &dyn GraphRead,
     node: &wicked_apps_core::Node,
     threshold: f64,
+    // Passed in, not re-read. The caller needs the same record to tally requirement reuse, and on a
+    // DB-backed store a second `node_semantics` per node is a second round trip across the whole
+    // graph — 34,897 of them on the run that motivated the tally.
+    semantics: Option<&wicked_estate_core::NodeSemantics>,
 ) -> anyhow::Result<Bucket> {
-    let semantics = store.node_semantics(&node.symbol)?;
     // A requirement counts as present ONLY when non-blank — an empty/whitespace `requirement` is NOT
     // real accounting (coverage.py truthy-checks `req`); counting it would be a vacuous-gate fail-open.
     let has_requirement = semantics
-        .as_ref()
         .and_then(|s| s.requirement.as_deref())
         .is_some_and(|r| !r.trim().is_empty());
-    let requirement_validated = semantics.as_ref().is_some_and(|s| s.requirement_validated);
+    let requirement_validated = semantics.is_some_and(|s| s.requirement_validated);
     let annotations = store.annotations(&node.symbol)?;
 
     // business_rule annotations — confidence rides through (fail-closed if out of range, never clamped).
@@ -459,20 +461,22 @@ pub fn recompute_front_half_coverage_with(
             continue;
         }
         behavior_bearing += 1;
+        // ONE read, used twice: the reuse tally and the bucket classification below.
+        let semantics = store.node_semantics(&node.symbol)?;
         // Counted on the same non-blank rule `classify_node` uses, so the signal describes exactly
         // the strings that can carry a node to ACCOUNTED.
-        if let Some(req) = store
-            .node_semantics(&node.symbol)?
-            .and_then(|sem| sem.requirement)
-            .map(|r| r.trim().to_string())
+        if let Some(req) = semantics
+            .as_ref()
+            .and_then(|sem| sem.requirement.as_deref())
+            .map(str::trim)
             .filter(|r| !r.is_empty())
         {
-            *requirement_counts.entry(req).or_insert(0) += 1;
+            *requirement_counts.entry(req.to_string()).or_insert(0) += 1;
         }
         let app = package_dir(&node.location.file);
         let acc = apps.entry(app.clone()).or_default();
         acc.behavior_bearing += 1;
-        match classify_node(store, node, cfg.resolve_threshold)? {
+        match classify_node(store, node, cfg.resolve_threshold, semantics.as_ref())? {
             Bucket::Resolved(conf) => {
                 resolved += 1;
                 acc.resolved += 1;
@@ -549,18 +553,22 @@ pub fn recompute_front_half_coverage_with(
     // `max_by_key` on a BTreeMap iterates in key order and keeps the LAST maximum, so ties resolve to
     // the lexicographically greatest string — deterministic, which this report is required to be.
     let top = requirement_counts.iter().max_by_key(|(_, n)| **n);
-    let requirement_reuse = Some(RequirementReuse {
+    // Absent entirely when no node carries a requirement, rather than an object of zeroes with no
+    // string in it. That keeps `most_reused_requirement` REQUIRED whenever the object is present,
+    // so a consumer never has to handle a half-populated reuse record.
+    let requirement_reuse = top.map(|_| RequirementReuse {
         nodes_with_requirement: requirement_counts.values().sum(),
         distinct_requirements: requirement_counts.len() as u64,
         max_nodes_per_requirement: top.map(|(_, n)| *n).unwrap_or(0),
         most_reused_requirement: top.map(|(r, _)| {
             // Bounded: a requirement may legitimately be a paragraph, and this rides in a report that
             // ends up in denial messages and logs.
+            // 120 INCLUDING the ellipsis, so the schema's `maxLength: 120` is exactly true.
             const MAX: usize = 120;
             if r.chars().count() <= MAX {
                 r.clone()
             } else {
-                format!("{}…", r.chars().take(MAX).collect::<String>())
+                format!("{}…", r.chars().take(MAX - 1).collect::<String>())
             }
         }),
     });
@@ -1242,6 +1250,42 @@ mod tests {
                 .expect("carries the signal");
             assert_eq!(reuse.distinct_requirements, 5);
             assert_eq!(reuse.max_nodes_per_requirement, 1);
+        }
+
+        /// The truncation must honour the number the schema enforces (`maxLength: 120`), ellipsis
+        /// included — the first version took 120 chars and then appended one more.
+        #[test]
+        fn a_long_requirement_is_truncated_to_the_length_the_schema_allows() {
+            let mut st = store();
+            let long = "R".repeat(400);
+            let n = node(&mut st, "L", NodeKind::Function, "a.rs");
+            st.set_node_semantics(&n.symbol, None, Some(&long), Some(true))
+                .unwrap();
+            let reuse = recompute_front_half_coverage(&st)
+                .unwrap()
+                .requirement_reuse
+                .expect("carries the signal");
+            let shown = reuse
+                .most_reused_requirement
+                .expect("present when the object is");
+            assert_eq!(
+                shown.chars().count(),
+                120,
+                "schema pins maxLength 120: {shown}"
+            );
+            assert!(shown.ends_with('…'));
+        }
+
+        /// Absent, not a record of zeroes — so `most_reused_requirement` can be REQUIRED whenever
+        /// the object is present and a consumer never meets a half-populated one.
+        #[test]
+        fn no_requirements_at_all_omits_the_reuse_record() {
+            let mut st = store();
+            let n = node(&mut st, "Bare", NodeKind::Function, "a.rs");
+            st.annotate(&n.symbol, Annotation::new("risk", "r", "unreviewed"))
+                .unwrap();
+            let r = recompute_front_half_coverage(&st).unwrap();
+            assert!(r.requirement_reuse.is_none(), "{:?}", r.requirement_reuse);
         }
 
         #[test]
