@@ -383,10 +383,17 @@ pub(crate) fn pre_distribute(
     // that treats an unknown path as "use the cwd" the FINDING-067 shape.
     let unbound = plan::unbound_repo_tokens(&units);
     if !unbound.is_empty() {
+        // The RESOLVED id, not the caller's argument. A run can reach a def without naming one, and
+        // an error reading "workflow `<none>` declares placeholders" tells an operator nothing about
+        // which def to go look at.
+        let named = selected_def
+            .as_ref()
+            .map(|d| d.id.as_str())
+            .or(workflow)
+            .unwrap_or("<none>");
         anyhow::bail!(
-            "workflow `{}` declares repo placeholders that this run cannot fill ({}); it must be \
-             launched against a registered repo — pass `repoRef`",
-            workflow.unwrap_or("<none>"),
+            "workflow `{named}` declares repo placeholders that this run cannot fill ({}); it must \
+             be launched against a registered repo — pass `repoRef`",
             unbound.join(", ")
         );
     }

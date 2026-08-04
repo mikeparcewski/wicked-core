@@ -146,7 +146,10 @@ pub fn unbound_repo_tokens(units: &[WorkUnit]) -> Vec<String> {
         let Some(cmd) = &unit.tool_cmd else { continue };
         for arg in cmd {
             if REPO_TOKENS.contains(&arg.as_str()) {
-                out.push(format!("{}: {arg}", unit.id));
+                // `phase_id()` and not `unit.id`: the id is `<session>:<phase>`, so naming the unit
+                // repeats the session on every line of a message that is already about one run.
+                // Falls back to the full id for a hand-built unit that carries no session prefix.
+                out.push(format!("{}: {arg}", unit.phase_id().unwrap_or(&unit.id)));
             }
         }
     }
