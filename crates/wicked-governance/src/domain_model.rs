@@ -177,6 +177,49 @@ pub struct CoverageReport {
     pub per_app: Vec<PerApp>,
     /// The bare behavior-bearing nodes, sorted by SymbolId. Empty iff `coverage == 1.0`.
     pub unaccounted_nodes: Vec<UnaccountedNode>,
+    /// How many DISTINCT non-blank `requirement` strings back the behavior-bearing set.
+    ///
+    /// Reported, never gated — see [`RequirementReuse`]. Optional on the wire so a report written
+    /// before this field existed still deserializes (`deny_unknown_fields` rejects unknown keys, it
+    /// does not require known ones).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requirement_reuse: Option<RequirementReuse>,
+}
+
+/// How concentrated the `requirement` strings are across the nodes claiming them.
+///
+/// # Why this is here
+///
+/// `coverage == 1.0` says every behavior-bearing node is ACCOUNTED. It does not say the accounting
+/// means anything. Observed live (#131): an agent wrote 46 distinct strings — `NFR-76`, `NFR-77`, … —
+/// as the requirement of **34,897** nodes, all `requirement_validated=1`. Coverage computed 1.0
+/// legitimately, the pinned validator passed, `domain-graph` translated, and the resulting
+/// "requirements" were file-name titles over reference lists. Every gate green, zero rule content.
+///
+/// The RESOLVED predicate cannot catch that: it truthy-checks a string. Concentration can — 758 nodes
+/// per requirement is bulk-mapping, not extraction.
+///
+/// # Why it does NOT gate
+///
+/// Deliberately a signal, not a denial. A real system does have cross-cutting requirements covering
+/// many symbols, so the honest threshold is an empirical question, and inventing one now would either
+/// miss the observed case or deny legitimate reuse. (The observed case averages 2.2% of nodes per
+/// string — an intuitive "5% of the graph" rule would have sailed past it.) Emitting the numbers makes
+/// bulk-mapping visible immediately and gives a basis for choosing the bar from measurement instead of
+/// taste. Gating on it is tracked in #131.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequirementReuse {
+    /// Behavior-bearing nodes carrying a non-blank `requirement`.
+    pub nodes_with_requirement: u64,
+    /// Distinct non-blank `requirement` strings among them.
+    pub distinct_requirements: u64,
+    /// Nodes sharing the single most-reused `requirement` string.
+    pub max_nodes_per_requirement: u64,
+    /// The most-reused string itself, truncated — so a reader sees WHAT was bulk-mapped, not just
+    /// that something was. Truncated because a requirement may legitimately be a paragraph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub most_reused_requirement: Option<String>,
 }
 
 /// Per-app coverage breakdown (`coverage.schema.json` `perApp`; NO `db`/`total` — the schema forbids
@@ -311,15 +354,17 @@ fn classify_node(
     store: &dyn GraphRead,
     node: &wicked_apps_core::Node,
     threshold: f64,
+    // Passed in, not re-read. The caller needs the same record to tally requirement reuse, and on a
+    // DB-backed store a second `node_semantics` per node is a second round trip across the whole
+    // graph — 34,897 of them on the run that motivated the tally.
+    semantics: Option<&wicked_estate_core::NodeSemantics>,
 ) -> anyhow::Result<Bucket> {
-    let semantics = store.node_semantics(&node.symbol)?;
     // A requirement counts as present ONLY when non-blank — an empty/whitespace `requirement` is NOT
     // real accounting (coverage.py truthy-checks `req`); counting it would be a vacuous-gate fail-open.
     let has_requirement = semantics
-        .as_ref()
         .and_then(|s| s.requirement.as_deref())
         .is_some_and(|r| !r.trim().is_empty());
-    let requirement_validated = semantics.as_ref().is_some_and(|s| s.requirement_validated);
+    let requirement_validated = semantics.is_some_and(|s| s.requirement_validated);
     let annotations = store.annotations(&node.symbol)?;
 
     // business_rule annotations — confidence rides through (fail-closed if out of range, never clamped).
@@ -407,16 +452,31 @@ pub fn recompute_front_half_coverage_with(
     let mut unaccounted: u64 = 0;
     let mut confidences: Vec<f64> = Vec::new();
     let mut unaccounted_nodes: Vec<UnaccountedNode> = Vec::new();
+    // requirement string → how many behavior-bearing nodes claim it (the #131 bulk-mapping signal).
+    let mut requirement_counts: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
 
     for node in &nodes {
         if !is_behavior_bearing(node, &has_behavior_out, cfg, &mut unknown_other) {
             continue;
         }
         behavior_bearing += 1;
+        // ONE read, used twice: the reuse tally and the bucket classification below.
+        let semantics = store.node_semantics(&node.symbol)?;
+        // Counted on the same non-blank rule `classify_node` uses, so the signal describes exactly
+        // the strings that can carry a node to ACCOUNTED.
+        if let Some(req) = semantics
+            .as_ref()
+            .and_then(|sem| sem.requirement.as_deref())
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            *requirement_counts.entry(req.to_string()).or_insert(0) += 1;
+        }
         let app = package_dir(&node.location.file);
         let acc = apps.entry(app.clone()).or_default();
         acc.behavior_bearing += 1;
-        match classify_node(store, node, cfg.resolve_threshold)? {
+        match classify_node(store, node, cfg.resolve_threshold, semantics.as_ref())? {
             Bucket::Resolved(conf) => {
                 resolved += 1;
                 acc.resolved += 1;
@@ -490,6 +550,29 @@ pub fn recompute_front_half_coverage_with(
         })
         .collect();
 
+    // `max_by_key` on a BTreeMap iterates in key order and keeps the LAST maximum, so ties resolve to
+    // the lexicographically greatest string — deterministic, which this report is required to be.
+    let top = requirement_counts.iter().max_by_key(|(_, n)| **n);
+    // Absent entirely when no node carries a requirement, rather than an object of zeroes with no
+    // string in it. That keeps `most_reused_requirement` REQUIRED whenever the object is present,
+    // so a consumer never has to handle a half-populated reuse record.
+    let requirement_reuse = top.map(|_| RequirementReuse {
+        nodes_with_requirement: requirement_counts.values().sum(),
+        distinct_requirements: requirement_counts.len() as u64,
+        max_nodes_per_requirement: top.map(|(_, n)| *n).unwrap_or(0),
+        most_reused_requirement: top.map(|(r, _)| {
+            // Bounded: a requirement may legitimately be a paragraph, and this rides in a report that
+            // ends up in denial messages and logs.
+            // 120 INCLUDING the ellipsis, so the schema's `maxLength: 120` is exactly true.
+            const MAX: usize = 120;
+            if r.chars().count() <= MAX {
+                r.clone()
+            } else {
+                format!("{}…", r.chars().take(MAX - 1).collect::<String>())
+            }
+        }),
+    });
+
     Ok(CoverageReport {
         total,
         behavior_bearing,
@@ -502,6 +585,7 @@ pub fn recompute_front_half_coverage_with(
         resolve_threshold: cfg.resolve_threshold,
         per_app,
         unaccounted_nodes,
+        requirement_reuse,
     })
 }
 
@@ -1112,6 +1196,96 @@ mod tests {
             let r = cov(&s);
             assert_eq!(r.behavior_bearing, 0);
             assert_eq!(r.coverage, 1.0, "vacuous 1.0 on no behavior nodes");
+        }
+
+        /// #131, in miniature: coverage 1.0 with the accounting carrying no content.
+        ///
+        /// Live, this was 46 distinct strings across 34,897 nodes, every one
+        /// `requirement_validated=1`. The gate passed, `domain-graph` translated, and the output was
+        /// file-name titles over reference lists. Nothing in the RESOLVED predicate can see that — it
+        /// truthy-checks a string — so the report has to carry the concentration for a reader to.
+        #[test]
+        fn bulk_mapped_requirements_reach_full_coverage_but_are_visible_in_the_report() {
+            let mut st = store();
+            for i in 0..12 {
+                let n = node(&mut st, &format!("N{i}"), NodeKind::Function, "a.rs");
+                // Two strings over twelve nodes — the same shape as 46 over 34,897.
+                let req = if i % 2 == 0 { "NFR-76" } else { "NFR-77" };
+                st.set_node_semantics(&n.symbol, None, Some(req), Some(true))
+                    .unwrap();
+            }
+            let r = recompute_front_half_coverage(&st).unwrap();
+
+            // The gate is satisfied. That is the finding, not a bug in this test.
+            assert_eq!(r.unaccounted, 0);
+            assert_eq!(r.coverage, 1.0);
+            assert_eq!(r.resolved, 12);
+            assert!(
+                assert_front_half_coverage(&r).is_ok(),
+                "content-free accounting still passes the gate — #131 is a REPORTING fix, not a gate change"
+            );
+
+            // …and the report now says so out loud.
+            let reuse = r
+                .requirement_reuse
+                .expect("report carries the reuse signal");
+            assert_eq!(reuse.nodes_with_requirement, 12);
+            assert_eq!(reuse.distinct_requirements, 2);
+            assert_eq!(reuse.max_nodes_per_requirement, 6);
+            assert_eq!(reuse.most_reused_requirement.as_deref(), Some("NFR-77"));
+        }
+
+        /// The signal must not fire on ordinary extraction, or it is noise nobody reads.
+        #[test]
+        fn one_requirement_per_node_reports_no_concentration() {
+            let mut st = store();
+            for i in 0..5 {
+                let n = node(&mut st, &format!("M{i}"), NodeKind::Function, "a.rs");
+                st.set_node_semantics(&n.symbol, None, Some(&format!("REQ-{i}")), Some(true))
+                    .unwrap();
+            }
+            let reuse = recompute_front_half_coverage(&st)
+                .unwrap()
+                .requirement_reuse
+                .expect("carries the signal");
+            assert_eq!(reuse.distinct_requirements, 5);
+            assert_eq!(reuse.max_nodes_per_requirement, 1);
+        }
+
+        /// The truncation must honour the number the schema enforces (`maxLength: 120`), ellipsis
+        /// included — the first version took 120 chars and then appended one more.
+        #[test]
+        fn a_long_requirement_is_truncated_to_the_length_the_schema_allows() {
+            let mut st = store();
+            let long = "R".repeat(400);
+            let n = node(&mut st, "L", NodeKind::Function, "a.rs");
+            st.set_node_semantics(&n.symbol, None, Some(&long), Some(true))
+                .unwrap();
+            let reuse = recompute_front_half_coverage(&st)
+                .unwrap()
+                .requirement_reuse
+                .expect("carries the signal");
+            let shown = reuse
+                .most_reused_requirement
+                .expect("present when the object is");
+            assert_eq!(
+                shown.chars().count(),
+                120,
+                "schema pins maxLength 120: {shown}"
+            );
+            assert!(shown.ends_with('…'));
+        }
+
+        /// Absent, not a record of zeroes — so `most_reused_requirement` can be REQUIRED whenever
+        /// the object is present and a consumer never meets a half-populated one.
+        #[test]
+        fn no_requirements_at_all_omits_the_reuse_record() {
+            let mut st = store();
+            let n = node(&mut st, "Bare", NodeKind::Function, "a.rs");
+            st.annotate(&n.symbol, Annotation::new("risk", "r", "unreviewed"))
+                .unwrap();
+            let r = recompute_front_half_coverage(&st).unwrap();
+            assert!(r.requirement_reuse.is_none(), "{:?}", r.requirement_reuse);
         }
 
         #[test]
