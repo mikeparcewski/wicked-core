@@ -899,12 +899,23 @@ pub fn migration_def() -> WorkflowDef {
 /// The gate is not the defect and must not be relaxed to make this pass: refusing to translate a
 /// partially-annotated graph is the design (DES-OUTGOV-001/005), and a domain model built from a
 /// 0%-covered graph is a file full of confident nonsense.
+/// Placeholder for the run's repo root, substituted per run by [`crate::plan::bind_repo_paths`].
+pub const REPO_ROOT_TOKEN: &str = "{repo_root}";
+/// Placeholder for the run's engine-resolved code graph, substituted per run.
+pub const CODE_GRAPH_DB_TOKEN: &str = "{code_graph_db}";
+
 pub fn onboarding_def() -> WorkflowDef {
     WorkflowDef {
         id: "onboarding".to_string(),
         phases: vec![
             PhaseDef::new("index", StageKind::Recon).executor(PhaseExecutor::Tool {
-                cmd: vec!["wicked-estate".to_string(), "index".to_string()],
+                cmd: vec![
+                    "wicked-estate".to_string(),
+                    "index".to_string(),
+                    REPO_ROOT_TOKEN.to_string(),
+                    "--db".to_string(),
+                    CODE_GRAPH_DB_TOKEN.to_string(),
+                ],
             }),
             PhaseDef::new("annotate", StageKind::Recon)
                 .executor(PhaseExecutor::Tool {
@@ -912,6 +923,8 @@ pub fn onboarding_def() -> WorkflowDef {
                         "wicked-estate".to_string(),
                         "clusters".to_string(),
                         "--annotate".to_string(),
+                        "--db".to_string(),
+                        CODE_GRAPH_DB_TOKEN.to_string(),
                     ],
                 })
                 .after("index"),

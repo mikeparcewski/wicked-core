@@ -368,6 +368,35 @@ pub(crate) fn pre_distribute(
         Some(def) => plan::plan_from_def(def, problem, session_id),
         None => plan::plan_units(problem, session_id),
     };
+    // Bind THIS run's repo into the placeholders its Tool phases declare, before anything is
+    // persisted. The def is shared by every run of its id; the paths are not. Rewriting a shared def
+    // per launch instead is what made three concurrent registrations index one repo's tree into one
+    // repo's database under three different names (FINDING-075, wicked-crew#196).
+    if let Some(repo_id) = repo_ref.as_deref() {
+        if let Some(repo) = crate::repo::get_repo(store, repo_id)? {
+            plan::bind_repo_paths(&mut units, &repo);
+        }
+    }
+    // Refuse rather than dispatch a command carrying a literal `{repo_root}`. Reached when a def
+    // declaring repo placeholders is launched with no `repo_ref`, or with one that no longer
+    // resolves — both of which would otherwise hand a tool a path that cannot exist, and hand a tool
+    // that treats an unknown path as "use the cwd" the FINDING-067 shape.
+    let unbound = plan::unbound_repo_tokens(&units);
+    if !unbound.is_empty() {
+        // The RESOLVED id, not the caller's argument. A run can reach a def without naming one, and
+        // an error reading "workflow `<none>` declares placeholders" tells an operator nothing about
+        // which def to go look at.
+        let named = selected_def
+            .as_ref()
+            .map(|d| d.id.as_str())
+            .or(workflow)
+            .unwrap_or("<none>");
+        anyhow::bail!(
+            "workflow `{named}` declares repo placeholders that this run cannot fill ({}); it must \
+             be launched against a registered repo — pass `repoRef`",
+            unbound.join(", ")
+        );
+    }
     if units.len() as u32 > crate::actor::DENY_PHASE_SPAN {
         anyhow::bail!(
             "run has {} units, exceeding the {}-unit governed limit; split the problem into smaller runs",
