@@ -1431,20 +1431,37 @@ mod workflow_def_tests {
         );
     }
 
+    /// Every shipped drop-in parses, validates, and carries the id its filename claims.
+    ///
+    /// Enumerates the directory rather than listing names. The list version had to be edited in
+    /// lockstep with `workflows/` and nothing failed when it was not: a new drop-in was simply never
+    /// validated, and a deleted one broke the test for the wrong reason. Same shape as the defect
+    /// this test now guards against — two artifacts that must agree, with only diligence between
+    /// them.
     #[test]
-    fn shipped_onboarding_drop_in_workflows_load_and_validate() {
+    fn shipped_drop_in_workflows_load_and_validate() {
         let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
-        for name in [
-            "chat",
-            "survey-repo",
-            "repo-graph",
-            "domain-graph-slice",
-            "memories",
-        ] {
-            let path = workflows_dir.join(format!("{name}.json"));
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("utf-8 filename")
+                .to_string();
             let def = WorkflowRegistry::def_from_file(&path)
-                .unwrap_or_else(|e| panic!("{name}.json must parse + validate: {e}"));
-            assert_eq!(def.id, name, "{name}.json id field must match filename");
+                .unwrap_or_else(|e| panic!("{stem}.json must parse + validate: {e}"));
+            assert_eq!(def.id, stem, "{stem}.json id field must match filename");
+            seen += 1;
         }
+        // Without this the test passes vacuously if the directory moves or empties — validating
+        // nothing while reporting success.
+        assert!(
+            seen > 0,
+            "workflows/ shipped no drop-in defs; the directory moved or emptied"
+        );
     }
 }
