@@ -34,8 +34,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use wicked_core::{
     registry_roster, run_gate_hook, run_output_gate_hook, Core, CoreEvent, EntityMode,
     HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, WorkflowRegistry,
-    WrappedCliStepRunner, ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV,
-    GATE_SCOPE_ENV,
+    WrappedCliStepRunner, COVERAGE_DB_ENV, ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV,
+    GATE_PHASE_ID_ENV, GATE_SCOPE_ENV,
 };
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -69,6 +69,14 @@ fn hook_phase_alias(args: &[String]) -> Option<String> {
 
 fn store_path(args: &[String]) -> String {
     flag(args, "--db")
+        // `WICKED_COVERAGE_DB` first: it is what a validator script is given, and it is the only
+        // store such a script is entitled to. `WICKED_ESTATE_DB` remains for ordinary CLI use, where
+        // the operator IS the one choosing the store (core#166).
+        .or_else(|| {
+            std::env::var(COVERAGE_DB_ENV)
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or_else(|| std::env::var(ESTATE_DB_ENV).ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "wicked-estate.db".to_string())
 }
