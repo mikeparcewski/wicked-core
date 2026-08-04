@@ -99,6 +99,12 @@ fn main() {
     // (it never writes the store — it only reads policies and appends decisions.ndjson), so handle
     // it before `Core::spawn` and exit with the gate's code (2 = deny ⇒ claude aborts the call).
     if args.get(1).map(String::as_str) == Some("gate-hook") {
+        // The handshake the launcher probes BEFORE arming a run. Answered before anything else so it
+        // stays cheap and cannot be affected by store/policy state (core#167).
+        if args.iter().any(|a| a == "--protocol-version") {
+            println!("{}", wicked_core::protocol_version_line());
+            std::process::exit(0);
+        }
         // Resolve scope/phase/db from argv (standalone) ELSE the env the launcher sets. The injected
         // command carries NONE of these in the shell string (only the trusted exe) — scope/phase/db all
         // travel via env, so caller-controlled ids can't inject shell metacharacters (security fix).

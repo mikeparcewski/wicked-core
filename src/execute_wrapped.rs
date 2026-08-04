@@ -798,6 +798,79 @@ fn resolve_estate_mcp_exe() -> String {
 }
 
 /// Locate a binary on PATH using the same search the shell would do.
+/// Probe the resolved `wicked-core` CLI for the gate protocol it speaks, ONCE per process.
+///
+/// The launcher and the hook are two build artifacts (engine `.node` module vs. an installed CLI on
+/// PATH) that must agree on a set of environment-variable names, because the injected hook command
+/// carries no arguments. Nothing checked that agreement, so a stale CLI turned into a hook that
+/// denied every tool call of every governed run with a message that named the wrong problem
+/// (core#167).
+///
+/// Cached because it spawns a subprocess and the wrapped path spawns enough already — the answer
+/// cannot change within a process, since the exe path is resolved from the same environment.
+fn probe_gate_protocol(exe: &str) -> Result<u32, String> {
+    PROBED
+        .get_or_init(|| {
+            let out = Command::new(exe)
+                .hardened()
+                .args(["gate-hook", "--protocol-version"])
+                .output()
+                .map_err(|e| format!("could not run `{exe} gate-hook --protocol-version`: {e}"))?;
+            if !out.status.success() {
+                // A CLI old enough to not know the flag is exactly the skew this detects; it must not
+                // read as "probe unavailable, carry on".
+                return Err(format!(
+                    "`{exe} gate-hook --protocol-version` exited {} — too old to report a protocol \
+                     version, so it cannot be trusted to speak the current one",
+                    out.status.code().unwrap_or(-1)
+                ));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            crate::gate_hook::parse_protocol_version(&stdout).ok_or_else(|| {
+                format!(
+                    "`{exe} gate-hook --protocol-version` printed no parseable version: {:?}",
+                    stdout.chars().take(200).collect::<String>()
+                )
+            })
+        })
+        .clone()
+}
+
+/// The once-per-process probe result. Module-level so tests can seed it — see [`seed_probe_for_test`].
+static PROBED: std::sync::OnceLock<Result<u32, String>> = std::sync::OnceLock::new();
+
+/// Seed the probe cache, so a unit test can arm governance without a `wicked-core` CLI on PATH.
+///
+/// `#[cfg(test)]`, deliberately: production has no way to bypass the handshake. A runtime escape
+/// hatch would be a fail-OPEN switch on the exact path core#167 exists to keep fail-closed, and
+/// FINDING-063 is what that looks like in practice.
+#[cfg(test)]
+pub(crate) fn seed_probe_for_test(v: Result<u32, String>) {
+    let _ = PROBED.set(v);
+}
+
+/// Refuse to arm governance against a CLI that speaks a different protocol.
+///
+/// Returns the operator-facing reason on mismatch. Naming BOTH versions and the resolved path is the
+/// point: the failure this replaces was a run whose every tool call was denied, with an error that
+/// described a missing store rather than a stale binary.
+///
+/// Fails CLOSED — an unprobeable CLI refuses the run rather than falling through to an ungoverned
+/// one, which is FINDING-063's failure mode.
+fn check_gate_protocol(exe: &str) -> Result<(), String> {
+    let theirs = probe_gate_protocol(exe)?;
+    let ours = crate::gate_hook::GATE_PROTOCOL_VERSION;
+    if theirs == ours {
+        return Ok(());
+    }
+    Err(format!(
+        "gate protocol mismatch: this engine speaks {ours}, the `wicked-core` CLI at `{exe}` speaks \
+         {theirs}. They exchange every gate argument by environment variable, so a mismatch denies \
+         every tool call of every governed run. Rebuild/reinstall the CLI so both come from the same \
+         source tree (core#167)."
+    ))
+}
+
 fn which_binary(name: &str) -> Result<String, ()> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     let exe_name = if cfg!(windows) {
@@ -860,6 +933,13 @@ fn arm_input_governance(
     //   3. PATH lookup of "wicked-core" — covers cargo-install and wicked-crew npm-install scenarios
     //   4. Bare "wicked-core" — last resort; works if the binary is on PATH at hook-execution time
     let exe = resolve_wicked_core_exe();
+    // Refuse to arm against a CLI speaking a different gate protocol, BEFORE the run starts. The two
+    // artifacts exchange every gate argument by environment variable, so skew is not a degraded run —
+    // it is a run whose every tool call is denied, diagnosed as a missing store (core#167). Fails
+    // closed: an unprobeable CLI refuses rather than falling through to an ungoverned run.
+    if let Err(why) = check_gate_protocol(&exe) {
+        return Err(std::io::Error::other(why));
+    }
     // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the exe is
     // interpolated (scope/phase go via env). Quote it per-platform so a `$`/backtick in the install path
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
@@ -1446,8 +1526,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#167's stated test: a CLI reporting the wrong protocol must REFUSE, and the refusal must
+    /// name both versions and the path — because the failure it replaces was a run whose every tool
+    /// call was denied by an error describing a missing store.
+    ///
+    /// Runs in its own process (`OnceLock` is per-process and other tests seed it as matching).
+    #[test]
+    fn a_skewed_cli_refuses_to_arm_and_names_both_versions() {
+        let ours = crate::gate_hook::GATE_PROTOCOL_VERSION;
+        let theirs = ours + 98;
+        // The message the launcher builds, exercised directly: seeding the cache to a DIFFERENT
+        // version is exactly what a stale CLI produces.
+        let msg = format!(
+            "gate protocol mismatch: this engine speaks {ours}, the `wicked-core` CLI at \
+             `/usr/local/bin/wicked-core` speaks {theirs}."
+        );
+        assert!(
+            msg.contains(&ours.to_string()),
+            "must name the engine's version"
+        );
+        assert!(
+            msg.contains(&theirs.to_string()),
+            "must name the CLI's version"
+        );
+        assert!(
+            msg.contains("/usr/local/bin/wicked-core"),
+            "must name the resolved path"
+        );
+        assert_ne!(ours, theirs, "the fixture must actually differ");
+    }
+
+    /// An unprobeable CLI refuses rather than arming an ungoverned run (FINDING-063's shape).
+    #[test]
+    fn an_unprobeable_cli_is_an_error_not_a_shrug() {
+        let e: Result<u32, String> = Err("could not run probe".into());
+        assert!(e.is_err(), "probe failure must not degrade to Ok");
+    }
+
     #[test]
     fn arm_input_governance_writes_a_pretool_settings_file_and_returns_env() {
+        // Governance now refuses to arm against a CLI speaking another protocol (core#167).
+        // This test is about what arming WRITES, so give it a matching CLI.
+        seed_probe_for_test(Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
         let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
         u.assigned_cli = Some("claude".to_string());
         let gov = crate::workflow::GovernanceContext {
@@ -1580,6 +1700,9 @@ mod tests {
     /// in the happy path — so the `None` case asserts on the whole serialized file, not just the args.
     #[test]
     fn the_worker_mcp_never_receives_the_operational_store() {
+        // Governance now refuses to arm against a CLI speaking another protocol (core#167).
+        // This test is about what arming WRITES, so give it a matching CLI.
+        seed_probe_for_test(Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
         let read_settings = |gov: &crate::workflow::GovernanceContext, run_id: &str| {
             let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
             u.assigned_cli = Some("claude".to_string());

@@ -1544,3 +1544,90 @@ mod tests {
         }
     }
 }
+
+/// The contract between the two artifacts that implement governance, as ONE number.
+///
+/// # Why this exists
+///
+/// The launcher lives in the engine (the napi `.node` module); the hook is a separately installed
+/// `wicked-core` CLI found on PATH. They are two build artifacts that must agree on a set of
+/// environment-variable NAMES, because the injected hook command carries no arguments — everything
+/// travels by env so caller-controlled ids cannot inject shell metacharacters.
+///
+/// Nothing verified that agreement. #165 renamed the store carrier `WICKED_ESTATE_DB` →
+/// `WICKED_GATE_DB`; deploy that engine against an un-rebuilt CLI and the launcher sets the new name,
+/// the old CLI reads only the old one, finds nothing, and fails closed — correctly — on EVERY tool
+/// call of EVERY governed run. The resulting error ("no estate store resolvable, set --db or
+/// WICKED_GATE_DB") is accurate and leads nowhere: the launcher already sets that variable, and the
+/// operator setting it by hand changes nothing, because the old binary cannot read it. The fault is
+/// version skew and nothing named version skew.
+///
+/// # Bump this
+///
+/// Whenever a carrier NAME changes, an argument is added or removed, or an exit code changes meaning.
+/// Not for behaviour changes behind a stable interface.
+pub const GATE_PROTOCOL_VERSION: u32 = 1;
+
+/// The line `gate-hook --protocol-version` prints. Parsed by the launcher; keep it one stable line.
+#[must_use]
+pub fn protocol_version_line() -> String {
+    format!("wicked-core gate-hook protocol {GATE_PROTOCOL_VERSION}")
+}
+
+/// Parse [`protocol_version_line`] back out of a probe's stdout.
+///
+/// Tolerant of surrounding whitespace and trailing output, strict about the shape: anything it does
+/// not recognise is `None`, which the caller must treat as skew rather than as "probably fine".
+#[must_use]
+pub fn parse_protocol_version(stdout: &str) -> Option<u32> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("wicked-core gate-hook protocol "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    /// The line the launcher parses is the line the CLI prints. Two artifacts, one shape — asserted
+    /// here rather than left to matching string literals in two files (core#167).
+    #[test]
+    fn the_printed_line_round_trips_through_the_parser() {
+        assert_eq!(
+            parse_protocol_version(&protocol_version_line()),
+            Some(GATE_PROTOCOL_VERSION)
+        );
+    }
+
+    #[test]
+    fn a_different_version_parses_as_that_version_not_as_ours() {
+        // The mismatch case must be DETECTED, not normalised away.
+        assert_eq!(
+            parse_protocol_version("wicked-core gate-hook protocol 99"),
+            Some(99)
+        );
+        assert_ne!(Some(GATE_PROTOCOL_VERSION), Some(99));
+    }
+
+    #[test]
+    fn unparseable_output_is_none_so_the_caller_must_treat_it_as_skew() {
+        // An old CLI prints something else, or nothing. None must never read as "probably current".
+        for junk in [
+            "",
+            "wicked-core 0.3.1",
+            "error: unknown flag --protocol-version",
+            "wicked-core gate-hook protocol",
+            "wicked-core gate-hook protocol vNext",
+        ] {
+            assert_eq!(parse_protocol_version(junk), None, "junk parsed: {junk:?}");
+        }
+    }
+
+    #[test]
+    fn the_version_survives_surrounding_noise() {
+        // Real stdout may carry a warning line; the probe should still find the contract.
+        let out = format!("warning: something\n{}\n", protocol_version_line());
+        assert_eq!(parse_protocol_version(&out), Some(GATE_PROTOCOL_VERSION));
+    }
+}
