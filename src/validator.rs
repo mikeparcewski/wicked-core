@@ -1265,6 +1265,11 @@ pub fn gate_phase(
 #[cfg(test)]
 mod tests {
 
+    /// Serializes tests that mutate process-global env. Cargo runs tests in one process, in
+    /// parallel, so an unguarded `set_var` here is visible to every other test that reads it —
+    /// including the sibling below. Same pattern as `execute_wrapped.rs`'s `ENV_LOCK`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// core#166, both halves — the same shape as
     /// `execute_wrapped::tests::no_worker_inherits_an_estate_store_through_the_environment`.
     ///
@@ -1274,6 +1279,7 @@ mod tests {
     /// `$WICKED_ESTATE_DB` (FINDING-067).
     #[test]
     fn a_validator_script_cannot_see_the_operational_store() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("val_env_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         // The parent HAS it set — the point is that the child does not inherit it.
@@ -1282,7 +1288,9 @@ mod tests {
         let v = DeterministicValidator {
             criterion: "the operational store is not reachable".to_string(),
             // Passes ONLY when the variable is unset/empty in the child.
-            script: "test -z \"${WICKED_ESTATE_DB}\"".to_string(),
+            // Built from the const: a hardcoded name would keep passing after a rename while
+            // testing a variable nothing sets any more.
+            script: format!("test -z \"${{{}}}\"", crate::gate_hook::ESTATE_DB_ENV),
             approved: true,
         };
         let (outcome, _) =
@@ -1301,11 +1309,12 @@ mod tests {
     /// without this would break a working gate to harden a path — the trade the issue declined.
     #[test]
     fn a_validator_script_receives_the_store_under_its_own_carrier() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("val_env2_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let v = DeterministicValidator {
             criterion: "the coverage carrier is populated".to_string(),
-            script: "test -n \"${WICKED_COVERAGE_DB}\"".to_string(),
+            script: format!("test -n \"${{{}}}\"", crate::gate_hook::COVERAGE_DB_ENV),
             approved: true,
         };
         let (outcome, _) =
