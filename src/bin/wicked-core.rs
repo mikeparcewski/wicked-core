@@ -67,6 +67,18 @@ fn hook_phase_alias(args: &[String]) -> Option<String> {
         .or_else(|| env_nonempty(GATE_PHASE_ID_ENV))
 }
 
+/// The authoritative subcommand list. Printed BOTH by `--help` (stdout, exit 0) and by the
+/// unknown-subcommand arm (stderr, exit 2). One string: a second hand-written list beside it is how
+/// a documented command set drifts from the real one.
+const ROOT_USAGE: &str = "usage: wicked-core <status | repos | register-repo --path <dir> | \
+     run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
+     resume --session <id> | reattach --session <id> | cancel --session <id> | \
+     launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
+     provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
+     seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
+     gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
+     (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]";
+
 /// Per-subcommand usage, consulted by ONE `--help` chokepoint.
 ///
 /// `--help` used to be handled (or not) inside each subcommand. `domain-graph` guarded it because it
@@ -124,6 +136,16 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          the handshake the engine checks before arming a run.",
     ),
 ];
+
+/// Top-level usage. The subcommand list is DERIVED from `SUBCOMMAND_USAGE`, so documenting a new
+/// subcommand in one place is enough — a hand-maintained second list is how these drift.
+fn print_root_usage() {
+    println!("{ROOT_USAGE}");
+    println!("\nDetailed help is available per subcommand:");
+    for (name, _) in SUBCOMMAND_USAGE {
+        println!("  wicked-core {name} --help");
+    }
+}
 
 /// Print usage for `sub` if `args` asks for help. Returns true when it handled the call.
 fn handled_help(sub: &str, args: &[String]) -> bool {
@@ -236,10 +258,18 @@ fn main() {
     // actor too would put a second writer on the same SQLite file, breaking the single-writer invariant).
     // ONE `--help` chokepoint, before any subcommand runs. Asking what a command does must never be
     // the same as telling it to do it (core#132).
-    if let Some(sub) = args.get(1).map(String::as_str) {
-        if handled_help(sub, &args) {
+    //
+    // `--help` with no subcommand is the ROOT request, not a subcommand named `--help`; routing it
+    // through the table would answer "no usage recorded" for the one form users try first.
+    match args.get(1).map(String::as_str) {
+        // NOT `None`: bare `wicked-core` STARTS THE ENGINE (spawns the actor, serves the API).
+        // Intercepting it here would turn the daemon's own launch command into a help screen.
+        Some("--help") | Some("-h") | Some("help") => {
+            print_root_usage();
             return;
         }
+        Some(sub) if handled_help(sub, &args) => return,
+        _ => {}
     }
 
     match args.get(1).map(String::as_str) {
@@ -364,16 +394,7 @@ fn main() {
             drain_events(&events, None);
         }
         _ => {
-            eprintln!(
-                "usage: wicked-core <status | repos | register-repo --path <dir> | \
-                 run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
-                 resume --session <id> | reattach --session <id> | cancel --session <id> | \
-                 launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
-                 provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
-                 seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
-                 gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
-                 (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]"
-            );
+            eprintln!("{ROOT_USAGE}");
             std::process::exit(2);
         }
     }

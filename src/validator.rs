@@ -123,8 +123,11 @@ pub fn author_deterministic_validator(
     unit.skill_ref = Some("wicked-testing-acceptance-test-writer".to_string());
     // Ad-hoc claude invocation so the caller needs no council registry entry.
     unit.assigned_invocation = Some("claude -p {PROMPT}".to_string());
+    // Same per-call id + teardown discipline as `agent_validate`: a constant id would share one
+    // ACP session across every authoring call, so each author would see the last one's context.
+    let run_id = validator_run_id();
     let input = StepInput {
-        run_id: "validator".to_string(),
+        run_id: run_id.clone(),
         unit_ix: 0,
         attempt: 0,
         unit,
@@ -137,6 +140,7 @@ pub fn author_deterministic_validator(
         prior_outputs: vec![],
     };
     let out = runner.run_unit(&input);
+    runner.on_run_complete(&run_id);
     if out.status != StepStatus::Ok {
         anyhow::bail!(
             "validator authoring failed ({:?}): {}",
@@ -895,6 +899,24 @@ fn eligible_agent_seats<'a>(
     }
 }
 
+/// A run id unique to ONE `agent_validate` call.
+///
+/// ACP sessions are keyed by `(run_id, cli_key)` and a session is a live CLI process holding
+/// conversation state. A CONSTANT id — this was `"validator"` — means every validation in the
+/// process shares one session per seat, so each judge sees the accumulated context of every
+/// validation before it. That directly falsifies the evidence-only isolation this function claims:
+/// the judge is supposed to read the cold `work` and nothing else.
+///
+/// The pid keeps ids distinct across processes sharing a runner; the counter, within one.
+fn validator_run_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "validator-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 /// Run the agent validator: a reviewer judges `work` against `criterion` and returns PASS/REJECT + a
 /// reason, reading only the cold `work` (evidence-only isolation). Uses a CONTROLLED reviewer prompt —
 /// NOT a Tier-2 skill — because a skill imposes its own output contract (e.g. the semantic-reviewer's
@@ -909,6 +931,22 @@ fn eligible_agent_seats<'a>(
 /// likely to hijack the verdict; combined with fail-closed parsing ([`parse_agent_verdict`]) and the
 /// combine rule (a lone model can never approve), a hijack degrades toward REJECT, not toward approval.
 pub fn agent_validate(
+    criterion: &str,
+    work: &str,
+    excluded_seats: &[&str],
+    roster: &[AgenticCli],
+    runner: &dyn StepRunner,
+) -> anyhow::Result<AgentVerdict> {
+    // Teardown must happen on EVERY exit — verdict, rotation-exhausted bail, cancellation. Compute
+    // first, release after, so no `?` or `bail!` can skip it and leak a CLI process.
+    let run_id = validator_run_id();
+    let out = agent_validate_in(&run_id, criterion, work, excluded_seats, roster, runner);
+    runner.on_run_complete(&run_id);
+    out
+}
+
+fn agent_validate_in(
+    run_id: &str,
     criterion: &str,
     work: &str,
     excluded_seats: &[&str],
@@ -939,7 +977,7 @@ pub fn agent_validate(
         let mut unit = base_unit.clone();
         unit.assigned_cli = Some(seat.key.clone());
         unit.assigned_invocation = Some(seat.headless_invocation.clone());
-        let out = runner.run_unit(&build_validator_input(unit));
+        let out = runner.run_unit(&build_validator_input(run_id, unit));
         match out.status {
             // The seat answered. Whatever it said is the verdict — including unreadable output,
             // which `parse_agent_verdict` fails closed to REJECT. Rotating past an answer would be
@@ -985,7 +1023,7 @@ pub fn agent_validate(
             .unwrap_or_else(|| "claude -p {PROMPT}".to_string());
         unit.assigned_invocation = Some(invocation);
     }
-    let out = runner.run_unit(&build_validator_input(unit));
+    let out = runner.run_unit(&build_validator_input(run_id, unit));
     if out.status != StepStatus::Ok {
         anyhow::bail!("agent validation failed ({:?}): {}", out.status, out.output);
     }
@@ -995,9 +1033,9 @@ pub fn agent_validate(
 /// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
 /// fallback cannot drift apart — notably `governance: None`, without which the engine's own judge
 /// would self-govern against an empty scope.
-fn build_validator_input(unit: WorkUnit) -> StepInput {
+fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
     StepInput {
-        run_id: "validator".to_string(),
+        run_id: run_id.to_string(),
         unit_ix: 0,
         attempt: 0,
         unit,
@@ -2174,6 +2212,69 @@ mod tests {
                 .key,
             "agy",
             "a different-binary seat is a valid distinct judge"
+        );
+    }
+
+    /// Review finding: ACP sessions are keyed by `(run_id, cli_key)`, and the run id was the
+    /// constant `"validator"`. Every validation in the process therefore shared one live CLI process
+    /// per seat, so each judge inherited the accumulated context of every validation before it —
+    /// which makes the documented evidence-only isolation false. Nothing tore the sessions down
+    /// either, so they leaked for the life of the process.
+    #[test]
+    fn each_validation_gets_its_own_run_id_and_releases_it() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            dispatched: Mutex<Vec<String>>,
+            released: Mutex<Vec<String>>,
+        }
+        impl StepRunner for Recorder {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.dispatched.lock().unwrap().push(input.run_id.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS fine".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    governed: false,
+                }
+            }
+            fn on_run_complete(&self, run_id: &str) {
+                self.released.lock().unwrap().push(run_id.to_string());
+            }
+        }
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+        ];
+        let rec = Recorder::default();
+        for _ in 0..2 {
+            agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &rec).expect("ok");
+        }
+
+        let dispatched = rec.dispatched.lock().unwrap().clone();
+        let released = rec.released.lock().unwrap().clone();
+        assert_eq!(dispatched.len(), 2, "expected one dispatch per validation");
+        assert_ne!(
+            dispatched[0], dispatched[1],
+            "both validations ran under the SAME run id ({}), so they share an ACP session and the \
+             second judge sees the first's context",
+            dispatched[0]
+        );
+        assert!(
+            dispatched.iter().all(|r| r != "validator"),
+            "the constant run id is back: {dispatched:?}"
+        );
+        // Every id dispatched must also be released, or the CLI process outlives the validation.
+        assert_eq!(
+            released, dispatched,
+            "run ids were not released 1:1 — sessions leak"
         );
     }
 
