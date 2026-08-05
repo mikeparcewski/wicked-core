@@ -661,6 +661,15 @@ impl WorkflowRegistry {
         }
         def
     }
+    /// Drop a registered def by id, returning it.
+    ///
+    /// Used to retract an INSTALLED def that disagrees with this binary about a validator pin: a
+    /// stale gate must not dispatch, and falling back to the compiled built-in is a known gate where
+    /// the installed copy is an unknown one (wicked-core#186).
+    pub fn remove(&mut self, id: &str) -> Option<WorkflowDef> {
+        self.defs.remove(id)
+    }
+
     pub fn get(&self, id: &str) -> Option<&WorkflowDef> {
         self.defs.get(id)
     }

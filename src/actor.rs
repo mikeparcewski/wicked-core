@@ -276,6 +276,19 @@ pub(crate) fn run(
                 dir.display()
             );
         }
+        // The def that DISPATCHES is the installed one, and it drifts from this binary the moment a
+        // pin changes without a re-install. A stale pin means the run is gated by a validator this
+        // engine no longer stands behind — and it reports success either way (FINDING-080/081,
+        // wicked-core#186). Drop the stale def rather than dispatch it: falling back to the compiled
+        // built-in is a KNOWN gate, where the installed copy is an unknown one.
+        for m in crate::domain_extraction::installed_pin_mismatches(&registry) {
+            eprintln!("wicked-core: {m}");
+            registry.remove(&m.workflow);
+            eprintln!(
+                "wicked-core: dropped the stale installed `{}`; the compiled built-in is in effect",
+                m.workflow
+            );
+        }
     }
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
     // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC
