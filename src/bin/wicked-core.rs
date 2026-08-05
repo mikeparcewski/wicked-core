@@ -198,6 +198,15 @@ fn now_secs() -> i64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // `--version` before ANY dispatch: an installer must be able to ask which build it just placed
+    // without that answer depending on store state, policy, or a subcommand succeeding. The
+    // installed CLI previously had no way to report this at all, so `install-local.py` could verify
+    // the validator PIN but not the BUILD — half of FINDING-081's family, one level up.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("wicked-core {}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     // gate-hook runs as a SUBPROCESS that claude spawns per tool-call. It must NOT spawn the actor
     // (it never writes the store — it only reads policies and appends decisions.ndjson), so handle
     // it before `Core::spawn` and exit with the gate's code (2 = deny ⇒ claude aborts the call).
