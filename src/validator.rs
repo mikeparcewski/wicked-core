@@ -714,6 +714,36 @@ impl ValidatorOutcome {
     }
 }
 
+/// What to do about `$WICKED_CORE_EXE` for one script on one host (FINDING-093).
+///
+/// A pure decision, split out from [`run_validator_reporting`] so all three arms are directly
+/// testable. The alternative — asserting on the env of a spawned child — means mutating process
+/// env, which is shared across Rust's parallel test threads and makes the test that proves this
+/// contract the flakiest thing in the suite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoreExeDecision<'a> {
+    /// A real binary was located; hand it to the script.
+    Inject(&'a str),
+    /// The script needs the engine CLI and this host has none. Deny WITHOUT judging the work.
+    RefuseUnmeasurable,
+    /// No CLI, but this script never asked for one.
+    LeaveUnset,
+}
+
+/// Decide from the host resolution result and the script text alone.
+fn decide_core_exe<'a>(resolved: Option<&'a str>, script: &str) -> CoreExeDecision<'a> {
+    match resolved {
+        Some(exe) => CoreExeDecision::Inject(exe),
+        // Substring, not a parse: a script may reach the variable through `${VAR:-default}`,
+        // `$VAR`, or `env | grep`. Over-matching here costs a clear denial on a host with no
+        // wicked-core; under-matching costs the silent inert floor this finding is about.
+        None if script.contains(crate::gate_hook::WICKED_CORE_EXE_ENV) => {
+            CoreExeDecision::RefuseUnmeasurable
+        }
+        None => CoreExeDecision::LeaveUnset,
+    }
+}
+
 /// Like [`run_validator`], but ALSO reports the [`SandboxLevel`] the child actually ran under — the
 /// honest "was a real OS sandbox applied?" disclosure. Same fail-closed refusals (unapproved / denylist).
 ///
@@ -756,10 +786,54 @@ pub fn run_validator_reporting(
     cmd.args(&argv[1..]).current_dir(cwd);
     apply_minimal_env(&mut cmd);
     // Inject WICKED_CORE_EXE so scripts can call `${WICKED_CORE_EXE:-wicked-core} coverage` without
-    // relying on PATH — essential in CI where the binary is invoked by absolute path and the sandbox
-    // strips PATH to the bare minimum. Falls back gracefully when current_exe() is unavailable.
-    if let Ok(exe) = std::env::current_exe() {
-        cmd.env("WICKED_CORE_EXE", exe);
+    // relying on PATH — essential in CI where the binary is invoked by absolute path.
+    //
+    // FINDING-093. This was `std::env::current_exe()`, which is the NODE binary whenever the engine
+    // runs as a napi addon inside wicked-crew's daemon — i.e. in production, always. The script then
+    // ran `node coverage`, node looked for a module named `coverage`, and the gate denied with
+    // "no coverage report was produced". The deterministic half of the dual gate never executed on
+    // any real run.
+    //
+    // Note the shape: the script ALREADY had the correct fallback (`${WICKED_CORE_EXE:-wicked-core}`,
+    // and PATH survives `apply_minimal_env`). Injecting a wrong value is what defeated it. A bad
+    // value is worse than no value — this is the same lesson as the resolver in crew's test support,
+    // where an explicit override that silently fell through answered about the wrong artifact.
+    //
+    // `resolve_wicked_core_exe_opt` is the resolver the GATE-HOOK path has used all along
+    // (`execute_wrapped.rs`), written precisely because `current_exe()` is node under napi. It was
+    // never applied here — the third instance this campaign has found of a fix landing on one path
+    // and not its sibling (FINDING-069/091, 071/089).
+    match decide_core_exe(
+        crate::execute_wrapped::resolve_wicked_core_exe_opt().as_deref(),
+        &v.script,
+    ) {
+        CoreExeDecision::Inject(exe) => {
+            cmd.env(crate::gate_hook::WICKED_CORE_EXE_ENV, exe);
+        }
+        CoreExeDecision::RefuseUnmeasurable => {
+            // The script asks for the engine CLI and this host has none: not on PATH, not
+            // `current_exe()`, no override. Running it anyway produces a denial whose stated cause
+            // ("no coverage report was produced") describes a symptom and blames the work.
+            //
+            // Refuse instead, and say so. A floor that cannot run must not be silently inert —
+            // Unrunnable already means "no verdict on the criterion", which is exactly true here.
+            let env = crate::gate_hook::WICKED_CORE_EXE_ENV;
+            return Ok((
+                ValidatorOutcome::Unrunnable(format!(
+                    "the validator script uses ${env} but no wicked-core binary \
+                     could be located on this host: ${env} is unset, current_exe() \
+                     is not wicked-core (it is the node interpreter when the engine runs as a napi \
+                     addon), and `wicked-core` is not on PATH. The deterministic floor cannot be \
+                     measured, so this gate denies without judging the work. Install wicked-core \
+                     (see scripts/install-local.py) or set ${env}."
+                )),
+                launcher.level,
+            ));
+        }
+        CoreExeDecision::LeaveUnset => {
+            // No CLI, but this script never asked for one. Leave the variable unset rather than
+            // denying a validator that has no use for it.
+        }
     }
     // Carry the store a validator script may reach under ITS OWN name, and strip the operational
     // one. The three controls on validator scripts (approval-gated, denylist-screened, minimal env)
@@ -2591,6 +2665,116 @@ mod tests {
             "fallback uses the single default runner"
         );
     }
+}
+
+#[cfg(test)]
+mod core_exe_tests {
+    use super::{decide_core_exe, CoreExeDecision};
+    use crate::domain_extraction::COVERAGE_SCRIPT;
+
+    // ── FINDING-093: the deterministic floor must never be silently inert ────────────────
+    //
+    // The bug: `WICKED_CORE_EXE` was injected from `std::env::current_exe()`, which is the NODE
+    // binary whenever the engine runs as a napi addon inside crew's daemon — i.e. every production
+    // run. The script then ran `node coverage` and the gate denied with "no coverage report was
+    // produced", blaming the work for the engine's own misconfiguration.
+
+    #[test]
+    fn a_resolved_binary_is_injected() {
+        assert_eq!(
+            decide_core_exe(Some("/usr/local/bin/wicked-core"), COVERAGE_SCRIPT),
+            CoreExeDecision::Inject("/usr/local/bin/wicked-core")
+        );
+    }
+
+    /// THE regression. The shipped coverage script needs the CLI; a host without one must produce a
+    /// denial that names the cause, not a run that cannot possibly succeed.
+    #[test]
+    fn the_shipped_coverage_script_refuses_when_no_binary_exists() {
+        assert_eq!(
+            decide_core_exe(None, COVERAGE_SCRIPT),
+            CoreExeDecision::RefuseUnmeasurable,
+            "the coverage floor must refuse to run rather than deny with a symptom"
+        );
+    }
+
+    /// A validator with no interest in the CLI is not collateral damage.
+    #[test]
+    fn a_script_that_never_asks_for_the_cli_still_runs() {
+        assert_eq!(
+            decide_core_exe(None, "test -f README.md"),
+            CoreExeDecision::LeaveUnset
+        );
+    }
+
+    /// Every spelling a shell script can use to reach the variable.
+    #[test]
+    fn the_need_is_detected_however_the_script_spells_it() {
+        for script in [
+            "\"${WICKED_CORE_EXE:-wicked-core}\" coverage",
+            "$WICKED_CORE_EXE coverage",
+            "exec ${WICKED_CORE_EXE} coverage",
+        ] {
+            assert_eq!(
+                decide_core_exe(None, script),
+                CoreExeDecision::RefuseUnmeasurable,
+                "{script} reaches the variable and must be detected"
+            );
+        }
+    }
+
+    /// The node predicate — the reason `current_exe()` cannot be trusted here.
+    #[test]
+    fn the_node_interpreter_is_never_mistaken_for_wicked_core() {
+        use crate::execute_wrapped::is_node_interpreter;
+        // Bare names, not a Windows path: `Path::file_name` splits on `/` off Windows, so a
+        // backslash path would arrive here as one long filename and test the wrong thing.
+        for node in ["/opt/homebrew/bin/node", "Node.exe", "NODE.EXE", "node"] {
+            assert!(
+                is_node_interpreter(std::path::Path::new(node)),
+                "{node} is the interpreter, not the engine"
+            );
+        }
+        for real in ["/usr/local/bin/wicked-core", "target/release/wicked-core", "wicked-core.exe"] {
+            assert!(
+                !is_node_interpreter(std::path::Path::new(real)),
+                "{real} is a real wicked-core binary"
+            );
+        }
+    }
+
+    /// CALL-SITE AUDIT. The three tests above all still pass if someone reverts the injection to
+    /// `std::env::current_exe()`, because they only exercise the helper. Review caught exactly that
+    /// gap on FINDING-091's first guard, so assert the property that actually broke: this module
+    /// does not ask the OS what binary it is.
+    #[test]
+    fn the_validator_never_injects_current_exe() {
+        // Strip full-line comments first: this file DOCUMENTS the defect at length, and an audit
+        // that trips over its own explanation is one the next person deletes rather than fixes.
+        let code: String = include_str!("validator.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Match the CALL spelling, not the word: the denial message above deliberately names
+        // `current_exe()` to tell an operator what went wrong, and an audit that cannot tell an
+        // explanation from a call is not measuring the thing it claims to.
+        // Needle built by concatenation so this assertion's own message cannot satisfy it.
+        let call = format!("env::{}", "current_exe");
+        assert!(
+            !code.contains(&call),
+            "validator.rs calls the OS for its own path — under napi that is the node binary, \
+             which is FINDING-093 exactly. Resolve through \
+             execute_wrapped::resolve_wicked_core_exe_opt()."
+        );
+        // The aliasing escape hatch: `use std::env::current_exe;` would let a bare `current_exe()`
+        // slip past the check above.
+        assert!(
+            !code.contains(&format!("use std::{call}")),
+            "validator.rs imports that function directly, which defeats the check above"
+        );
+    }
+
 }
 
 #[cfg(test)]

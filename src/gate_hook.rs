@@ -98,6 +98,14 @@ pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 /// the environment rather than merely not-used.
 pub const COVERAGE_DB_ENV: &str = "WICKED_COVERAGE_DB";
 
+/// The name a validator script uses to reach the engine's own CLI: `${WICKED_CORE_EXE:-wicked-core}`.
+///
+/// Named here rather than spelled at each site because three places have to agree on it — the
+/// injection in [`crate::validator`], the shipped `COVERAGE_SCRIPT` in [`crate::domain_extraction`],
+/// and the diagnostic that fires when no binary can be located (FINDING-093). It is also read as an
+/// operator override by `resolve_wicked_core_exe_opt`.
+pub const WICKED_CORE_EXE_ENV: &str = "WICKED_CORE_EXE";
+
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
 ///
 /// `scope`/`phase` are resolved by the caller (`bin/wicked-core`) from argv (standalone) ELSE the
