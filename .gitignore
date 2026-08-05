@@ -10,3 +10,7 @@ coverage-report.json
 
 # SQLite sidecar litter from pre-fix `:memory:` estate runs (invalid on Windows)
 :memory:*
+
+# Python bytecode from scripts/ (install-local.py). Committed once by accident.
+__pycache__/
+*.py[cod]
