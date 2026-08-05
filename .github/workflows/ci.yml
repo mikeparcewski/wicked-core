@@ -3,8 +3,16 @@
 # wicked-core resolves wicked-estate via RELATIVE PATH deps (../wicked-estate/...), and three of them
 # (wicked-estate-memory, -memory-core, -knowledge) are `publish = false` — there is no crates.io
 # fallback. So, exactly like napi-release.yml, CI MUST check out wicked-estate as a SIBLING of
-# wicked-core so the path deps resolve from source. Pinned to the estate release tag the addon is built
-# against; bump in lockstep with napi-release.yml's WICKED_ESTATE_REF on each estate release.
+# wicked-core so the path deps resolve from source. Bump in lockstep with napi-release.yml's
+# WICKED_ESTATE_REF (asserted equal by `lockstep.rs`).
+#
+# This pin is a COMMIT, not a tag, and that is deliberate rather than sloppy. `set_node_semantics`
+# now takes a `ValidationClaim` (estate#81) — a validated requirement must name who validated it —
+# and NO estate release tag contains it yet (v0.14.2 is the newest, and predates the merge). Pinning
+# the last tag instead would mean CI compiles a different estate API than the one the source is
+# written against, so local builds and CI would disagree about whether the tree even compiles. A
+# pinned commit is immutable and reproducible — the thing to avoid is a FLOATING ref like `main`.
+# Replace with the tag at the next estate release.
 #
 # Until this workflow existed, wicked-core had NO build/test on PRs — merges rode on locally-run tests
 # only. This is the gate: fmt + clippy(-D warnings) + build + test, all on the estate rustls graph.
@@ -24,8 +32,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Keep in lockstep with napi-release.yml's WICKED_ESTATE_REF.
-  WICKED_ESTATE_REF: v0.13.2
+  # Keep in lockstep with napi-release.yml's WICKED_ESTATE_REF (asserted by `lockstep.rs`).
+  WICKED_ESTATE_REF: c7763495743fb16ee6f6696e2163f976feb89e99
   # Offline embedder — the memory engine must not download a model in CI (matches the tests' own default).
   WICKED_MEMORY_EMBEDDER: hash
   CARGO_TERM_COLOR: always

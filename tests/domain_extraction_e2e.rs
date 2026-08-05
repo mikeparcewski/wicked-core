@@ -26,6 +26,7 @@ use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 use wicked_estate_core::query::SymbolQuery;
 use wicked_estate_core::Annotation;
+use wicked_estate_core::ValidationClaim;
 use wicked_governance::{
     register_policy, register_rule, ConfSeverity, ConformanceRule, Effect, Policy, RuleProvenance,
     RuleType, Severity, Targets, Trigger,
@@ -155,7 +156,12 @@ fn seed(db: &str, accounted: bool) {
     store.commit_batch().unwrap();
     if accounted {
         store
-            .set_node_semantics(&n.symbol, None, Some("REQ-1"), Some(true))
+            .set_node_semantics(
+                &n.symbol,
+                None,
+                Some("REQ-1"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
             .unwrap();
         store
             .annotate(

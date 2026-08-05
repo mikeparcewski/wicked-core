@@ -831,6 +831,7 @@ pub fn build_domain_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wicked_estate_core::ValidationClaim;
 
     #[test]
     fn domain_model_round_trips_in_the_wire_shape() {
@@ -978,7 +979,7 @@ mod tests {
                 &charge.symbol,
                 None,
                 Some("process a payment charge"),
-                Some(true),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
             )
             .unwrap();
         store
@@ -1211,8 +1212,13 @@ mod tests {
                 let n = node(&mut st, &format!("N{i}"), NodeKind::Function, "a.rs");
                 // Two strings over twelve nodes — the same shape as 46 over 34,897.
                 let req = if i % 2 == 0 { "NFR-76" } else { "NFR-77" };
-                st.set_node_semantics(&n.symbol, None, Some(req), Some(true))
-                    .unwrap();
+                st.set_node_semantics(
+                    &n.symbol,
+                    None,
+                    Some(req),
+                    Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+                )
+                .unwrap();
             }
             let r = recompute_front_half_coverage(&st).unwrap();
 
@@ -1241,8 +1247,13 @@ mod tests {
             let mut st = store();
             for i in 0..5 {
                 let n = node(&mut st, &format!("M{i}"), NodeKind::Function, "a.rs");
-                st.set_node_semantics(&n.symbol, None, Some(&format!("REQ-{i}")), Some(true))
-                    .unwrap();
+                st.set_node_semantics(
+                    &n.symbol,
+                    None,
+                    Some(&format!("REQ-{i}")),
+                    Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+                )
+                .unwrap();
             }
             let reuse = recompute_front_half_coverage(&st)
                 .unwrap()
@@ -1259,8 +1270,13 @@ mod tests {
             let mut st = store();
             let long = "R".repeat(400);
             let n = node(&mut st, "L", NodeKind::Function, "a.rs");
-            st.set_node_semantics(&n.symbol, None, Some(&long), Some(true))
-                .unwrap();
+            st.set_node_semantics(
+                &n.symbol,
+                None,
+                Some(&long),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
             let reuse = recompute_front_half_coverage(&st)
                 .unwrap()
                 .requirement_reuse
@@ -1293,8 +1309,13 @@ mod tests {
             let mut s = store();
             // resolved via a validated requirement (no annotation confidence).
             let a = node(&mut s, "A", NodeKind::Function, "a.rs");
-            s.set_node_semantics(&a.symbol, None, Some("REQ-1"), Some(true))
-                .unwrap();
+            s.set_node_semantics(
+                &a.symbol,
+                None,
+                Some("REQ-1"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
             // resolved via a business_rule ≥ threshold (contributes 0.9 to mean_confidence).
             let b = node(&mut s, "B", NodeKind::Function, "a.rs");
             s.annotate(
@@ -1346,8 +1367,13 @@ mod tests {
             for req in ["", "   "] {
                 let mut s = store();
                 let n = node(&mut s, "widget", NodeKind::Function, "a.rs");
-                s.set_node_semantics(&n.symbol, None, Some(req), Some(true))
-                    .unwrap();
+                s.set_node_semantics(
+                    &n.symbol,
+                    None,
+                    Some(req),
+                    Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+                )
+                .unwrap();
                 let r = cov(&s);
                 assert_eq!(r.unaccounted, 1, "blank requirement {req:?} is a hole");
                 assert!(r.coverage < 1.0);
@@ -1390,11 +1416,21 @@ mod tests {
         fn per_app_groups_by_package_dir_root_sentinel() {
             let mut s = store();
             let a = node(&mut s, "A", NodeKind::Function, "billing/x.rs");
-            s.set_node_semantics(&a.symbol, None, Some("REQ"), Some(true))
-                .unwrap();
+            s.set_node_semantics(
+                &a.symbol,
+                None,
+                Some("REQ"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
             let b = node(&mut s, "B", NodeKind::Function, "top.rs"); // repo root
-            s.set_node_semantics(&b.symbol, None, Some("REQ"), Some(true))
-                .unwrap();
+            s.set_node_semantics(
+                &b.symbol,
+                None,
+                Some("REQ"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
             let r = cov(&s);
             let apps: Vec<&str> = r.per_app.iter().map(|p| p.app.as_str()).collect();
             assert_eq!(

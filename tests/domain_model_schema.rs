@@ -13,6 +13,7 @@ use wicked_apps_core::{
     SYMBOL_SCHEME,
 };
 use wicked_estate_core::Annotation;
+use wicked_estate_core::ValidationClaim;
 use wicked_governance::{build_domain_model, CoverageReport};
 
 const SCHEMA: &str = include_str!("domain-model.schema.json");
@@ -45,7 +46,7 @@ fn built_domain_model_validates_against_the_kept_schema() {
             &charge.symbol,
             None,
             Some("process a payment charge"),
-            Some(true),
+            Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
         )
         .unwrap();
     store
@@ -60,7 +61,7 @@ fn built_domain_model_validates_against_the_kept_schema() {
             &audit.symbol,
             None,
             Some("record an audit trail"),
-            Some(false),
+            Some(&ValidationClaim::new(false, "test-fixture").unwrap()),
         )
         .unwrap();
     // refund: risk-flagged only → kept as a review requirement with a synthesized rule.
