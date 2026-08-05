@@ -4227,10 +4227,19 @@ mod worker_code_graph_tests {
 
     /// Drain the events a call emits into a Vec, via the sink's mpsc `push`.
     fn emitted(store: &dyn wicked_apps_core::GraphStore) -> Vec<CoreEvent> {
+        emitted_with_in_flight(store, &HashSet::new())
+    }
+
+    /// The same drain, but naming what armed mode restored — the set the reporter must stay quiet
+    /// about.
+    fn emitted_with_in_flight(
+        store: &dyn wicked_apps_core::GraphStore,
+        in_flight: &HashSet<String>,
+    ) -> Vec<CoreEvent> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut sink = crate::event_log::EventSink::default();
         sink.push(tx);
-        report_orphaned_executing_sessions(store, &mut sink);
+        report_orphaned_executing_sessions(store, &mut sink, in_flight);
         drop(sink);
         rx.try_iter().collect()
     }
@@ -4249,9 +4258,67 @@ mod worker_code_graph_tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                CoreEvent::WorkerStalled { session, .. } if session == "orphan-run"
+                CoreEvent::RunOrphaned { session, .. } if session == "orphan-run"
             )),
             "an orphaned `executing` run emitted nothing: {events:?}"
+        );
+    }
+
+    /// The review defect: `redrive_executing_sessions` re-dispatches a session and records it in
+    /// `in_flight`, but leaves its status `Executing` — only the attempt is bumped. So a scan over
+    /// "everything still `executing`" announces every run armed mode JUST RECOVERED, and the
+    /// reporter is loudest precisely when recovery worked.
+    #[test]
+    fn a_run_armed_mode_already_recovered_is_not_announced() {
+        let dir = scratch("orphan_redriven");
+        let mut store = open_store(Some(dir.join("o.db").to_str().unwrap())).unwrap();
+        crate::domain::put_node(
+            &mut store,
+            session_at("redriven-run", SessionStatus::Executing).to_node(),
+        )
+        .unwrap();
+
+        // Same store, same `Executing` status — the ONLY difference is that recovery holds it.
+        let restored: HashSet<String> = ["redriven-run".to_string()].into_iter().collect();
+        assert!(
+            emitted_with_in_flight(&store, &restored).is_empty(),
+            "a run armed mode had already redriven was reported as an orphan"
+        );
+        // And the same run with nothing restored still IS an orphan, so the test above cannot pass
+        // by the reporter having simply gone silent.
+        assert!(
+            !emitted(&store).is_empty(),
+            "the reporter emitted nothing even with an empty in-flight set — the exclusion test \
+             above proves nothing"
+        );
+    }
+
+    /// `ord` is 1-based, so 0 is an ordinal no unit can hold. A run whose units cannot be read must
+    /// report its cursor position rather than a value that reads as a real unit.
+    #[test]
+    fn a_run_with_unreadable_units_reports_a_1_based_ordinal() {
+        let dir = scratch("orphan_ord");
+        let mut store = open_store(Some(dir.join("o.db").to_str().unwrap())).unwrap();
+        // No units are ever written, so the lookup finds nothing — the fallback path.
+        crate::domain::put_node(
+            &mut store,
+            session_at("ordless-run", SessionStatus::Executing).to_node(),
+        )
+        .unwrap();
+
+        let events = emitted(&store);
+        let ord = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::RunOrphaned { session, ord, .. } if session == "ordless-run" => {
+                    Some(*ord)
+                }
+                _ => None,
+            })
+            .expect("no RunOrphaned for the unit-less run");
+        assert_eq!(
+            ord, 1,
+            "unit_ix 0 must report as the 1-based ordinal 1, not 0"
         );
     }
 
