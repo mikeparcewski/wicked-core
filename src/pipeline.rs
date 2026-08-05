@@ -931,7 +931,7 @@ fn pinned_validator_denial(
         ));
     };
     match crate::validator::run_validator_reporting(v, cwd, db_path) {
-        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion),
+        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion, cwd),
         Err(e) => Some(format!("pinned validator error: {e}")),
     }
 }
@@ -944,14 +944,58 @@ fn pinned_validator_denial(
 ///
 /// Split out from [`pinned_validator_denial`] so the wording of each arm is directly testable without
 /// having to provoke a real 120s timeout or a real missing shell.
+/// The measurement a failed validator left behind, rendered compactly — or `None`.
+///
+/// FINDING-092: a criterion is a CONJUNCTION ("at least one behavior-bearing node, AND
+/// resolved-or-flagged coverage == 1.0 over them"), and restating it says nothing about which
+/// conjunct failed. Two runs produced byte-identical denials while measuring completely different
+/// things:
+///
+///     behavior_bearing 0    coverage 1.0     <- the gate read the WRONG STORE (FINDING-091)
+///     behavior_bearing 766  coverage 0.171   <- the gate read the right one, 17% covered
+///
+/// The first is "your extraction produced nothing"; the second is "your extraction covered 17%".
+/// Different problems, different next actions, same message — and the CRITICAL defect behind the
+/// first hid in that ambiguity for three runs.
+///
+/// The numbers are already on disk when the denial is rendered. This reads them rather than
+/// recomputing, so the message reports what the validator ACTUALLY gated on.
+fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(cwd.join(".wicked/domain/coverage-report.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
+    let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
+    // Only the fields the criterion actually turns on. A dump of the whole report would bury the
+    // one number the operator needs.
+    Some(format!(
+        "measured: behavior_bearing={}, resolved={}, risk_flagged={}, unaccounted={}, coverage={}",
+        n("behavior_bearing")?,
+        n("resolved")?,
+        n("risk_flagged")?,
+        n("unaccounted")?,
+        f("coverage")?
+    ))
+}
+
 fn denial_for_outcome(
     outcome: &crate::validator::ValidatorOutcome,
     criterion: &str,
+    cwd: &std::path::Path,
 ) -> Option<String> {
     use crate::validator::ValidatorOutcome as O;
     match outcome {
         O::Passed => None,
-        O::Failed => Some(format!("pinned validator failed: {criterion}")),
+        O::Failed => Some(match failing_measurement(cwd) {
+            // Naming the measurement is the point: without it a wrong-store read and a genuine
+            // shortfall are indistinguishable (FINDING-092).
+            Some(m) => format!("pinned validator failed: {criterion} — {m}"),
+            // No report means the script denied before producing one; say so rather than implying
+            // a measurement happened.
+            None => format!(
+                "pinned validator failed: {criterion} (no coverage report was produced, so the \
+                 criterion could not be measured — the script denied before writing one)"
+            ),
+        }),
         O::TimedOut => Some(format!(
             "pinned validator TIMED OUT before reaching a verdict (fail-closed — a phase that cannot \
              be re-verified is treated as NOT-passed, so this is a DENY, not a criterion failure). \
@@ -1051,25 +1095,75 @@ mod denial_message_tests {
     /// FINDING-050. A distinguishable enum is worth nothing if the operator still reads one sentence.
     /// Asserts the property, not the prose: a no-verdict outcome must never be phrased as the criterion
     /// having failed, must say the criterion went unevaluated, and must name its own cause.
+    /// FINDING-092: a criterion is a CONJUNCTION, so restating it cannot say which conjunct
+    /// failed. Two campaign runs produced BYTE-IDENTICAL denials while measuring completely
+    /// different things — one had read the wrong database entirely (FINDING-091), and that
+    /// CRITICAL defect hid in the ambiguity for three runs.
+    ///
+    /// The invariant is DISTINGUISHABILITY, not wording: an operator must be able to tell "your
+    /// extraction produced nothing" from "your extraction covered 17%".
+    #[test]
+    fn a_failed_denial_distinguishes_no_data_from_a_real_shortfall() {
+        fn denial_for(report: &str) -> String {
+            let dir =
+                std::env::temp_dir().join(format!("den_{}_{}", std::process::id(), report.len()));
+            std::fs::create_dir_all(dir.join(".wicked/domain")).unwrap();
+            std::fs::write(dir.join(".wicked/domain/coverage-report.json"), report).unwrap();
+            let msg = denial_for_outcome(&O::Failed, CRITERION, &dir).expect("denies");
+            let _ = std::fs::remove_dir_all(&dir);
+            msg
+        }
+
+        // The two states the old message could not tell apart.
+        let wrong_store = denial_for(
+            r#"{"behavior_bearing":0,"resolved":0,"risk_flagged":0,"unaccounted":0,"coverage":1.0}"#,
+        );
+        let real_shortfall = denial_for(
+            r#"{"behavior_bearing":766,"resolved":0,"risk_flagged":131,"unaccounted":635,"coverage":0.171}"#,
+        );
+
+        assert_ne!(
+            wrong_store, real_shortfall,
+            "a nothing-measured denial and a 17%-covered denial must not read identically — this \
+             is FINDING-092, and it is how FINDING-091 stayed hidden"
+        );
+        assert!(
+            wrong_store.contains("behavior_bearing=0"),
+            "must name the measurement: {wrong_store}"
+        );
+        assert!(
+            real_shortfall.contains("behavior_bearing=766")
+                && real_shortfall.contains("coverage=0.171"),
+            "must name the measurement: {real_shortfall}"
+        );
+    }
+
     #[test]
     fn a_no_verdict_outcome_is_never_worded_as_a_criterion_failure() {
         assert_eq!(
-            denial_for_outcome(&O::Passed, CRITERION),
+            denial_for_outcome(&O::Passed, CRITERION, std::path::Path::new("/nonexistent")),
             None,
             "pass ⇒ no denial"
         );
 
-        let failed = denial_for_outcome(&O::Failed, CRITERION).expect("denies");
-        assert_eq!(
-            failed,
-            format!("pinned validator failed: {CRITERION}"),
-            "the genuine criterion failure keeps its established wording"
+        let failed =
+            denial_for_outcome(&O::Failed, CRITERION, std::path::Path::new("/nonexistent"))
+                .expect("denies");
+        assert!(
+            failed.starts_with(&format!("pinned validator failed: {CRITERION}")),
+            "the genuine criterion failure keeps its established wording: {failed}"
         );
 
-        let timed_out = denial_for_outcome(&O::TimedOut, CRITERION).expect("denies");
+        let timed_out = denial_for_outcome(
+            &O::TimedOut,
+            CRITERION,
+            std::path::Path::new("/nonexistent"),
+        )
+        .expect("denies");
         let unrunnable = denial_for_outcome(
             &O::Unrunnable("No such file or directory (os error 2)".into()),
             CRITERION,
+            std::path::Path::new("/nonexistent"),
         )
         .expect("denies");
 
