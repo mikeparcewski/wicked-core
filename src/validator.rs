@@ -2735,7 +2735,11 @@ mod core_exe_tests {
                 "{node} is the interpreter, not the engine"
             );
         }
-        for real in ["/usr/local/bin/wicked-core", "target/release/wicked-core", "wicked-core.exe"] {
+        for real in [
+            "/usr/local/bin/wicked-core",
+            "target/release/wicked-core",
+            "wicked-core.exe",
+        ] {
             assert!(
                 !is_node_interpreter(std::path::Path::new(real)),
                 "{real} is a real wicked-core binary"
@@ -2774,7 +2778,6 @@ mod core_exe_tests {
             "validator.rs imports that function directly, which defeats the check above"
         );
     }
-
 }
 
 #[cfg(test)]
