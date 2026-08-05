@@ -205,6 +205,57 @@ mod tests {
         );
     }
 
+    /// Review of the first version of this fix caught that `remove()` cannot "fall back to the
+    /// compiled built-in": `register` overwrites by id, so nothing is left behind — and
+    /// `domain-extraction` has no compiled form at all, being a drop-in. Removal traded a wrong gate
+    /// for an unknown-workflow failure.
+    ///
+    /// So the repair must leave the workflow AVAILABLE and correctly pinned. Both halves are
+    /// asserted, because fixing the pin while losing the workflow is not a fix.
+    #[test]
+    fn repairing_a_stale_pin_corrects_it_and_keeps_the_workflow_dispatchable() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
+        let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
+        reg.load_dir(&dir).expect("overlay loads");
+
+        let mut def = reg.get("domain-extraction").expect("registered").clone();
+        def.phases
+            .iter_mut()
+            .find(|p| p.id == "coverage")
+            .expect("coverage phase")
+            .validator_pin = Some("4a4b10bf4277bd34".to_string());
+        reg.register(def).expect("install the stale def");
+        assert_eq!(
+            installed_pin_mismatches(&reg).len(),
+            1,
+            "stale def should be flagged"
+        );
+
+        for m in installed_pin_mismatches(&reg) {
+            assert!(
+                reg.repin(&m.workflow, &m.phase, m.expected),
+                "repin should succeed"
+            );
+        }
+
+        assert!(
+            installed_pin_mismatches(&reg).is_empty(),
+            "the pin was not corrected"
+        );
+        // The half `remove()` got wrong: the workflow must still be there to dispatch.
+        let after = reg.get("domain-extraction").expect(
+            "the workflow must remain registered — removing it trades a wrong gate for an unknown one",
+        );
+        assert_eq!(
+            after
+                .phases
+                .iter()
+                .find(|p| p.id == "coverage")
+                .and_then(|p| p.validator_pin.as_deref()),
+            Some(COVERAGE_VALIDATOR_PIN)
+        );
+    }
+
     /// The sibling case — a replacement that DROPS the pin — turns out to be unreachable through
     /// the registry: `carry_shadowed_pins` carries a shadowed pin forward and announces the
     /// substitution, precisely so a hand-copied def cannot take a gate back out silently.

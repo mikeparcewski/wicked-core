@@ -277,17 +277,29 @@ pub(crate) fn run(
             );
         }
         // The def that DISPATCHES is the installed one, and it drifts from this binary the moment a
-        // pin changes without a re-install. A stale pin means the run is gated by a validator this
-        // engine no longer stands behind — and it reports success either way (FINDING-080/081,
-        // wicked-core#186). Drop the stale def rather than dispatch it: falling back to the compiled
-        // built-in is a KNOWN gate, where the installed copy is an unknown one.
+        // pin changes without a re-install — worse, crew REWRITES it from a hardcoded copy, so the
+        // stale pin restores itself (FINDING-080/084). A stale pin means the run is gated by a
+        // validator this engine no longer stands behind, and it reports success either way.
+        //
+        // REPAIR rather than remove. Removing was the first attempt and it is wrong: `register`
+        // overwrites by id, so there is no shadowed built-in left to fall back to — and
+        // `domain-extraction` ships only as a drop-in, so removal makes the id UNKNOWN and dispatch
+        // fails with "no such workflow", trading a wrong gate for a confusing one. The binary owns
+        // this pin (it is the value the vault was seeded with), so writing it into the loaded def is
+        // the correction, and the workflow stays available and correctly gated.
         for m in crate::domain_extraction::installed_pin_mismatches(&registry) {
             eprintln!("wicked-core: {m}");
-            registry.remove(&m.workflow);
-            eprintln!(
-                "wicked-core: dropped the stale installed `{}`; the compiled built-in is in effect",
-                m.workflow
-            );
+            match registry.repin(&m.workflow, &m.phase, m.expected) {
+                true => eprintln!(
+                    "wicked-core: repaired installed `{}` phase `{}` to {} for this process; the \
+                     file on disk is still stale and will be read again on the next start",
+                    m.workflow, m.phase, m.expected
+                ),
+                false => eprintln!(
+                    "wicked-core: could NOT repair `{}` phase `{}`; refusing to serve it",
+                    m.workflow, m.phase
+                ),
+            }
         }
     }
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when

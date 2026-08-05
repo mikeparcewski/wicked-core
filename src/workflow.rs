@@ -661,13 +661,23 @@ impl WorkflowRegistry {
         }
         def
     }
-    /// Drop a registered def by id, returning it.
+    /// Overwrite one phase's `validator_pin` on a registered def. Returns false when the workflow or
+    /// phase is absent.
     ///
-    /// Used to retract an INSTALLED def that disagrees with this binary about a validator pin: a
-    /// stale gate must not dispatch, and falling back to the compiled built-in is a known gate where
-    /// the installed copy is an unknown one (wicked-core#186).
-    pub fn remove(&mut self, id: &str) -> Option<WorkflowDef> {
-        self.defs.remove(id)
+    /// This corrects an INSTALLED def that disagrees with the binary about a pin the binary owns
+    /// (wicked-core#186). Repair rather than removal is deliberate: `register` overwrites by id, so
+    /// removing leaves NO def behind — there is no shadowed built-in to fall back to, and a drop-in
+    /// like `domain-extraction` has no compiled form at all. Removal would trade a wrong gate for an
+    /// unknown-workflow failure.
+    pub fn repin(&mut self, id: &str, phase_id: &str, pin: &str) -> bool {
+        let Some(def) = self.defs.get_mut(id) else {
+            return false;
+        };
+        let Some(phase) = def.phases.iter_mut().find(|p| p.id == phase_id) else {
+            return false;
+        };
+        phase.validator_pin = Some(pin.to_string());
+        true
     }
 
     pub fn get(&self, id: &str) -> Option<&WorkflowDef> {
