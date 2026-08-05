@@ -21,6 +21,7 @@ mod campaign;
 mod cli_runner;
 mod code_graph;
 mod command;
+mod diagnostic;
 mod distribute;
 mod docs;
 mod domain;
