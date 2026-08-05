@@ -35,6 +35,7 @@ mod knowledge;
 #[cfg(test)]
 mod lockstep;
 mod memory;
+pub mod path_policy;
 mod pipeline;
 mod plan;
 mod repo;
