@@ -71,7 +71,7 @@
       "role": "evaluator",
       "skill_ref": "wicked-garden-domain-coverage",
       "allowed_skills": [],
-      "validator_pin": "e7f84b91d030fdcc"
+      "validator_pin": "adaf3e9b6d088f1a"
     },
     {
       "id": "domain-graph",
