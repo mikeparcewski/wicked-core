@@ -995,7 +995,6 @@ pub(crate) fn run(
                     &self_tx,
                     output,
                     agent_verdict,
-                    &path,
                 ) {
                     // Run reached a TERMINAL state → drop from in_flight + remember the outcome.
                     Ok(StepApplied::Finished) => {
@@ -2553,7 +2552,6 @@ fn apply_step_result(
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
     agent_verdict: Option<(bool, String)>,
-    db_path: &str,
 ) -> anyhow::Result<StepApplied> {
     let run_id = output.run_id.clone();
     let mut session = crate::domain::get_session(store, &run_id)?
@@ -2917,6 +2915,21 @@ fn apply_step_result(
     let cli_keys = session.clis.clone();
     let entity_mode = session.entity_mode;
     let workflow_id = session.workflow_id.clone();
+    // FINDING-091: the coverage validator must measure the REPO's code graph, not the actor's own
+    // store. The actor's own store is ~/.wicked-crew/core.db — the platform's operational graph, holding
+    // `agent_session` and `conformance_claim` nodes and NO repository code. Handing it to
+    // `wicked-core coverage` yields behavior_bearing=0 by construction, so the pinned criterion
+    // "at least one behavior-bearing node" can never be satisfied and a phase that extracted 766
+    // behavior-bearing nodes is denied as if it had done nothing. Both campaign runs failed exactly
+    // that way while their repo stores held real annotations.
+    //
+    // `repo_code_graph_db` already exists — FINDING-069 built it so the governed WORKER's estate MCP
+    // opens the repo-local graph. The EVALUATOR's path was never wired to it, which is how this
+    // survived a finding specifically about repo-graph spellings.
+    //
+    // No fallback to the actor's store: without a repo there is no graph to measure, and the validator
+    // script fails closed on a missing carrier, which is the correct outcome for a pinned phase.
+    let coverage_db = repo_code_graph_db(store, session.repo_ref.as_deref());
     let outcome = pipeline::apply_and_finish_unit(
         store,
         unit,
@@ -2932,7 +2945,7 @@ fn apply_step_result(
         &cli_keys,
         agent_verdict.as_ref(),
         &mut |ev| emit(subscribers, ev),
-        Some(db_path),
+        coverage_db.as_deref(),
     )?;
 
     // RUN-LEVEL DENY CONTRACT: a governance-DENIED unit halts the run as `Failed` — never advancing
@@ -4705,5 +4718,97 @@ mod prior_context_tests {
 
         prior.assigned_cli = Some("codex".into());
         assert!(prior_context_label(&current, &prior, "claude").is_some());
+    }
+}
+
+#[cfg(test)]
+mod coverage_store_tests {
+    //! FINDING-091: the coverage validator must measure the REPO's code graph, not the actor's.
+    //!
+    //! The campaign denied two runs on "at least one behavior-bearing node" while their repo stores
+    //! held real `business_rule` annotations over 766 and 12805 nodes. The validator was handed
+    //! `~/.wicked-crew/core.db` — the platform's own graph of `agent_session` and
+    //! `conformance_claim` nodes — where `behavior_bearing` is 0 BY CONSTRUCTION, so that criterion
+    //! could never be satisfied for any repo.
+    //!
+    //! The bug was invisible because every artifact was individually correct: a real store, a real
+    //! validator, a real criterion, a real denial. Only the PAIRING was wrong.
+    use super::*;
+
+    /// Fail-CLOSED, not fall-back. This is the property that matters: when there is no repo graph
+    /// to measure, `apply_and_finish_unit` must receive `None` so the validator script finds no
+    /// carrier and denies — rather than silently measuring the actor's store and denying for a
+    /// reason that is false. The old code passed `Some(db_path)` unconditionally, which is exactly
+    /// how a phase that extracted 766 nodes was told it had extracted none.
+    #[test]
+    fn no_repo_graph_yields_none_never_the_actors_store() {
+        let dir = std::env::temp_dir().join(format!("cov_none_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store =
+            wicked_apps_core::open_store(Some(dir.join("core.db").to_str().unwrap())).unwrap();
+
+        assert_eq!(
+            repo_code_graph_db(&store, None),
+            None,
+            "a run with no repo must get NO coverage store, not the actor's"
+        );
+        assert_eq!(
+            repo_code_graph_db(&store, Some("no-such-repo")),
+            None,
+            "an unresolvable repo must get NO coverage store, not the actor's"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The resolver points at the REPO-LOCAL graph. `existing_code_graph` is what
+    /// `repo_code_graph_db` uses once it has the repo, so this pins the half that decides WHICH
+    /// database the criterion is evaluated against.
+    #[test]
+    fn the_repo_local_graph_is_what_resolves() {
+        let dir = std::env::temp_dir().join(format!("cov_repo_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".codegraph")).unwrap();
+        std::fs::write(dir.join(".codegraph").join("estate.db"), b"x").unwrap();
+
+        let want = dir.join(".codegraph").join("estate.db");
+        let got = crate::code_graph::existing_code_graph(&dir)
+            .expect("a repo root with .codegraph/estate.db must resolve one");
+
+        // EXACT path, not a substring. `contains(".codegraph")` would also pass if the resolver
+        // returned the DIRECTORY, or any other file under it — neither of which
+        // `wicked-core coverage` can open. Flagged in review: a guard that accepts a near-miss
+        // is not a guard.
+        assert_eq!(got, want, "must resolve the repo's estate.db exactly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE call-site guard, and the one that actually matters.
+    ///
+    /// The two tests above exercise the RESOLVER. Reverting the call site to the old unconditional
+    /// `Some(db_path)` leaves both of them GREEN — so they do not guard the fix at all. Review
+    /// caught that, and it was a fair catch: my earlier falsification checked only that the revert
+    /// COMPILES, which it does.
+    ///
+    /// A source audit is the honest instrument (same shape as `spawn_audit`): the wiring is one
+    /// argument at one call site, and what must hold is that the argument is derived from the REPO
+    /// and never from the actor's own store handle.
+    #[test]
+    fn the_call_site_passes_the_repo_derived_store_not_the_actors() {
+        let src = include_str!("actor.rs");
+        let call = src
+            .split("pipeline::apply_and_finish_unit(")
+            .nth(1)
+            .expect("the pipeline call must exist");
+        let args = &call[..call.find(")?;").unwrap_or(call.len())];
+
+        assert!(
+            args.contains("coverage_db.as_deref()"),
+            "the coverage-store argument is no longer repo-derived — FINDING-091 regressed"
+        );
+        assert!(
+            !args.contains("Some(db_path)"),
+            "the actor's own store is being handed to the coverage validator again: FINDING-091"
+        );
     }
 }
