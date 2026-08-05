@@ -11,8 +11,8 @@ use wicked_apps_core::{
     synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
     SYMBOL_SCHEME,
 };
-use wicked_estate_core::semantics::ValidationClaim;
 use wicked_estate_core::Annotation;
+use wicked_estate_core::ValidationClaim;
 use wicked_governance::recompute_front_half_coverage;
 
 const SCHEMA: &str = include_str!("coverage.schema.json");

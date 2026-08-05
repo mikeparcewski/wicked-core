@@ -25,8 +25,8 @@ use wicked_apps_core::{
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 use wicked_estate_core::query::SymbolQuery;
-use wicked_estate_core::semantics::ValidationClaim;
 use wicked_estate_core::Annotation;
+use wicked_estate_core::ValidationClaim;
 use wicked_governance::{
     register_policy, register_rule, ConfSeverity, ConformanceRule, Effect, Policy, RuleProvenance,
     RuleType, Severity, Targets, Trigger,

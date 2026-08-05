@@ -831,7 +831,7 @@ pub fn build_domain_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wicked_estate_core::semantics::ValidationClaim;
+    use wicked_estate_core::ValidationClaim;
 
     #[test]
     fn domain_model_round_trips_in_the_wire_shape() {

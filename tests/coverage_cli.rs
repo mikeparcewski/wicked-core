@@ -8,8 +8,8 @@ use wicked_apps_core::{
     open_store, synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span,
     SYMBOL_SCHEME,
 };
-use wicked_estate_core::semantics::ValidationClaim;
 use wicked_estate_core::Annotation;
+use wicked_estate_core::ValidationClaim;
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 

@@ -12,8 +12,8 @@ use wicked_apps_core::{
     synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
     SYMBOL_SCHEME,
 };
-use wicked_estate_core::semantics::ValidationClaim;
 use wicked_estate_core::Annotation;
+use wicked_estate_core::ValidationClaim;
 use wicked_governance::{build_domain_model, CoverageReport};
 
 const SCHEMA: &str = include_str!("domain-model.schema.json");
