@@ -28,7 +28,7 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 /// The acceptance criterion of the coverage gate — anti-legacy GATE_3 / `coverage.py` DoD
 /// (CONTRACT-3 §2: "resolved-or-flagged coverage == 1.0 (zero unaccounted behavior-bearing nodes)").
 pub const COVERAGE_CRITERION: &str =
-    "resolved-or-flagged coverage == 1.0 (zero unaccounted behavior-bearing nodes)";
+    "at least one behavior-bearing node, and resolved-or-flagged coverage == 1.0 over them (zero unaccounted)";
 
 /// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF the phase worktree's
 /// `coverage-report.json` reports FULL coverage EVERYWHERE. If `coverage-report.json` is absent AND
@@ -54,7 +54,7 @@ pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "f8efe773ea4b61db";
+pub const COVERAGE_VALIDATOR_PIN: &str = "adaf3e9b6d088f1a";
 
 /// Phases whose `validator_pin` the BINARY has an opinion about, as `(workflow, phase, pin)`.
 ///
@@ -461,6 +461,28 @@ mod tests {
         );
         assert_eq!(v.criterion, COVERAGE_CRITERION);
         assert_eq!(v.script, COVERAGE_SCRIPT);
+    }
+
+    /// The criterion is what an operator READS when a gate denies; the script is what actually
+    /// decides. They are two descriptions of one rule, and they drifted the moment the script gained
+    /// a requirement the prose did not mention — a vacuous report would deny while the stated
+    /// criterion looked satisfied (`coverage: 1.0`, `unaccounted: 0`). Caught in review.
+    ///
+    /// That is FINDING-050's shape: a denial whose stated reason does not match its cause. Both
+    /// strings are inputs to the content-address, so they cannot drift silently in the pin — but
+    /// they can drift in MEANING, which is what this asserts.
+    #[test]
+    fn the_criterion_describes_the_requirement_the_script_enforces() {
+        let script_checks_non_vacuity =
+            COVERAGE_SCRIPT.contains(r#""behavior_bearing":[[:space:]]*[1-9]"#);
+        let criterion_says_so = COVERAGE_CRITERION.contains("at least one behavior-bearing");
+        assert_eq!(
+            script_checks_non_vacuity, criterion_says_so,
+            "the predicate and the criterion disagree about non-vacuity.\n  script enforces it: \
+             {script_checks_non_vacuity}\n  criterion states it: {criterion_says_so}\nAn operator \
+             reads the criterion to understand a denial; if it omits a requirement the script \
+             enforces, the denial is unexplainable (FINDING-050)."
+        );
     }
 
     #[test]
