@@ -806,17 +806,42 @@ fn resolve_estate_mcp_exe() -> String {
 /// denied every tool call of every governed run with a message that named the wrong problem
 /// (core#167).
 ///
-/// Cached because it spawns a subprocess and the wrapped path spawns enough already — the answer
-/// cannot change within a process, since the exe path is resolved from the same environment.
+/// Cached because it spawns a subprocess and the wrapped path spawns enough already.
+///
+/// Keyed on the binary's IDENTITY, not its path (FINDING-083). The previous comment here claimed
+/// "the answer cannot change within a process, since the exe path is resolved from the same
+/// environment" — true of the path, false of the binary. `cargo install` replaces the file AT THE
+/// SAME PATH, so a cache keyed on the path alone keeps answering for the artifact it probed first.
+///
+/// That is not a stale-data nicety, it is a remedy that does not work: on a protocol mismatch the
+/// operator is told to upgrade the CLI, upgrades it, and the daemon goes on denying every tool call
+/// from its cached answer until someone restarts it. FINDING-066's shape — a prescribed remedy that
+/// is inert — sitting on top of FINDING-081's — the artifact that runs is not the one that was
+/// built.
+///
+/// A `stat` per lookup is the cost, against the subprocess spawn it avoids. If the metadata cannot
+/// be read the binary is not cacheable AT ALL — see the guard in the body; an empty fingerprint is
+/// still a stable key, so caching under it would reintroduce exactly the staleness this removes.
+/// Fail toward doing the work, never toward trusting a stale answer.
 fn probe_gate_protocol(exe: &str) -> Result<u32, String> {
+    let key = probe_key(exe);
+    // An unfingerprintable binary is NOT cacheable. `fingerprint: None` is a perfectly stable map
+    // key, so storing under it would make every unreadable-metadata probe hit that one entry
+    // forever — the exact staleness this change exists to remove, reintroduced through the
+    // degenerate case. Review on #194 caught that my comment claimed "misses the cache and
+    // re-probes" while the code cached under it. Neither read nor write when we cannot tell the
+    // binary apart: pay the spawn, stay correct.
+    if key.fingerprint.is_none() {
+        return probe_gate_protocol_uncached(exe);
+    }
     if let Ok(mut guard) = PROBED.lock() {
-        if let Some(hit) = guard.as_ref().and_then(|m| m.get(exe)).cloned() {
+        if let Some(hit) = guard.as_ref().and_then(|m| m.get(&key)).cloned() {
             return hit;
         }
         let fresh = probe_gate_protocol_uncached(exe);
         guard
             .get_or_insert_with(std::collections::HashMap::new)
-            .insert(exe.to_string(), fresh.clone());
+            .insert(key, fresh.clone());
         return fresh;
     }
     // A poisoned lock must not silently skip the handshake.
@@ -848,12 +873,41 @@ fn probe_gate_protocol_uncached(exe: &str) -> Result<u32, String> {
     })
 }
 
-/// Probe results, keyed BY EXE PATH.
+/// What makes one probe result apply to another lookup: the path AND the file's identity.
 ///
-/// Not a single slot: `resolve_wicked_core_exe()` reads `$WICKED_CORE_EXE` every call, so a process
-/// that changes it would otherwise keep answering for the binary it probed first — caching the
-/// answer to a question nobody asked again.
-static PROBED: std::sync::Mutex<Option<std::collections::HashMap<String, Result<u32, String>>>> =
+/// The path alone is not enough (see `probe_gate_protocol`), and identity alone is not either —
+/// `resolve_wicked_core_exe()` reads `$WICKED_CORE_EXE` every call, so a process that changes it
+/// must not keep answering for the binary it probed first.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct ProbeKey {
+    path: String,
+    /// `None` when the metadata could not be read — an unreadable file simply misses the cache.
+    fingerprint: Option<(u64, i64)>,
+}
+
+/// `(len, mtime-secs)` for `exe`. Cheap enough to pay per lookup; the alternative is trusting a
+/// stale answer.
+fn probe_key(exe: &str) -> ProbeKey {
+    let fingerprint = std::fs::metadata(exe).ok().and_then(|m| {
+        // Signed seconds, so a pre-epoch mtime stays distinct. `unwrap_or(0)` collapsed every
+        // pre-epoch timestamp onto the same value, which would make two such files with equal
+        // length share a key (review on #194). Rare, but the whole point here is telling binaries
+        // apart.
+        let t = m.modified().ok()?;
+        let mtime = match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs() as i64),
+        };
+        Some((m.len(), mtime))
+    });
+    ProbeKey {
+        path: exe.to_string(),
+        fingerprint,
+    }
+}
+
+/// Probe results, keyed by [`ProbeKey`].
+static PROBED: std::sync::Mutex<Option<std::collections::HashMap<ProbeKey, Result<u32, String>>>> =
     std::sync::Mutex::new(None);
 
 /// Seed the probe cache, so a unit test can arm governance without a `wicked-core` CLI on PATH.
@@ -865,7 +919,7 @@ static PROBED: std::sync::Mutex<Option<std::collections::HashMap<String, Result<
 pub(crate) fn seed_probe_for_test(exe: &str, v: Result<u32, String>) {
     if let Ok(mut g) = PROBED.lock() {
         g.get_or_insert_with(std::collections::HashMap::new)
-            .insert(exe.to_string(), v);
+            .insert(probe_key(exe), v);
     }
 }
 
@@ -1548,6 +1602,21 @@ mod tests {
 
     /// core#167's stated test — through `check_gate_protocol`, not a hand-built string.
     ///
+    /// A REAL file to stand in for an installed CLI.
+    ///
+    /// The probe cache is keyed on the binary's identity (FINDING-083), and an unfingerprintable
+    /// path is deliberately never served from cache — so a fictional `/fixture/...` literal cannot
+    /// be seeded any more. That is the guard working, not a test inconvenience: seeding an answer
+    /// for a path with no file was always pretending. These fixtures are real files, which also
+    /// makes the tests faithful to what `check_gate_protocol` actually receives.
+    fn fixture_exe(tag: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("wc_fixture_{}_{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("wicked-core");
+        std::fs::write(&p, tag.as_bytes()).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
     /// The earlier version formatted its own message and asserted on that, so it could not fail if
     /// the real refusal stopped naming the versions, or if the comparison logic broke. It tested the
     /// fixture. This seeds the cache for a specific exe and calls the function the launcher calls.
@@ -1555,10 +1624,10 @@ mod tests {
     fn a_skewed_cli_refuses_to_arm_and_names_both_versions() {
         let ours = crate::gate_hook::GATE_PROTOCOL_VERSION;
         let theirs = ours + 98;
-        let exe = "/fixture/skewed/wicked-core";
-        seed_probe_for_test(exe, Ok(theirs));
+        let exe = fixture_exe("skewed");
+        seed_probe_for_test(&exe, Ok(theirs));
 
-        let err = check_gate_protocol(exe).expect_err("a skewed CLI must refuse to arm");
+        let err = check_gate_protocol(&exe).expect_err("a skewed CLI must refuse to arm");
         assert!(
             err.contains(&ours.to_string()),
             "must name the engine's version: {err}"
@@ -1567,15 +1636,15 @@ mod tests {
             err.contains(&theirs.to_string()),
             "must name the CLI's version: {err}"
         );
-        assert!(err.contains(exe), "must name the resolved path: {err}");
+        assert!(err.contains(&exe), "must name the resolved path: {err}");
     }
 
     /// A matching CLI arms. Without this the test above passes for a `check` that refuses everything.
     #[test]
     fn a_matching_cli_is_allowed_to_arm() {
-        let exe = "/fixture/matching/wicked-core";
-        seed_probe_for_test(exe, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
-        assert!(check_gate_protocol(exe).is_ok());
+        let exe = fixture_exe("matching");
+        seed_probe_for_test(&exe, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+        assert!(check_gate_protocol(&exe).is_ok());
     }
 
     /// A CLI that cannot be probed refuses the run rather than arming an ungoverned one — the
@@ -1583,27 +1652,118 @@ mod tests {
     /// every `Err` ever constructed and told us nothing about `check_gate_protocol`.
     #[test]
     fn an_unprobeable_cli_refuses_rather_than_arming_ungoverned() {
-        let exe = "/fixture/unprobeable/wicked-core";
-        seed_probe_for_test(exe, Err("could not run `wicked-core`: not found".into()));
+        let exe = fixture_exe("unprobeable");
+        seed_probe_for_test(&exe, Err("could not run `wicked-core`: not found".into()));
 
-        let err = check_gate_protocol(exe).expect_err("an unprobeable CLI must not arm");
+        let err = check_gate_protocol(&exe).expect_err("an unprobeable CLI must not arm");
         assert!(
             err.contains("could not run"),
             "the cause must survive: {err}"
         );
     }
 
+    /// FINDING-083: the probe cache used to be keyed on the exe PATH alone, and its comment
+    /// asserted "the answer cannot change within a process". True of the path, false of the
+    /// binary: `cargo install` replaces the file in place. The operator is told to upgrade the
+    /// CLI, does, and the daemon keeps denying from its cached answer until a restart.
+    #[test]
+    fn replacing_the_binary_in_place_invalidates_the_probe() {
+        let dir = std::env::temp_dir().join(format!("probe_id_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("wicked-core-probe-fixture");
+        std::fs::write(&exe, b"v1").unwrap();
+        let path = exe.to_str().unwrap();
+
+        let before = probe_key(path);
+
+        // The stale answer an operator would be stuck behind.
+        seed_probe_for_test(path, Err("too old to report a protocol version".into()));
+        assert!(
+            probe_gate_protocol(path).is_err(),
+            "precondition: the cache should be serving the stale answer"
+        );
+
+        // The upgrade: same path, different bytes. `len` alone moves here, and mtime backs it up
+        // for a same-size replacement.
+        std::fs::write(&exe, b"v2-upgraded-binary").unwrap();
+
+        assert_ne!(
+            probe_key(path),
+            before,
+            "the key must move when the file at that path is replaced"
+        );
+        // The cache must now MISS rather than return the seeded staleness. It re-probes, and the
+        // fixture is not a real CLI, so the error names the spawn — not the seeded message.
+        let after = probe_gate_protocol(path);
+        assert!(
+            after.is_err(),
+            "a non-executable fixture cannot report a version"
+        );
+        assert!(
+            !format!("{after:?}").contains("too old to report"),
+            "still serving the pre-upgrade answer after the binary changed: {after:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unfingerprintable path must never be SERVED from the cache. `fingerprint: None` is a
+    /// stable map key, so a seeded answer under it would be returned forever — the staleness this
+    /// change removes, reintroduced through the degenerate case. Review on #194 caught the code
+    /// doing exactly that while the comment claimed otherwise.
+    #[test]
+    fn a_binary_whose_metadata_cannot_be_read_is_never_served_from_cache() {
+        let missing = std::env::temp_dir()
+            .join(format!("probe_absent_{}", std::process::id()))
+            .join("wicked-core-does-not-exist");
+        let path = missing.to_str().unwrap();
+        assert!(
+            probe_key(path).fingerprint.is_none(),
+            "precondition: this path must not be stattable"
+        );
+
+        // Seed a PASS under the degenerate key. If the cache is consulted, this is what comes back.
+        seed_probe_for_test(path, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+
+        let got = probe_gate_protocol(path);
+        assert!(
+            got.is_err(),
+            "a nonexistent binary cannot report a protocol version, so the cached PASS must not be \
+             served: {got:?}"
+        );
+    }
+
+    /// The other half: an UNCHANGED binary must still hit the cache, or the fix trades a stale
+    /// answer for a subprocess spawn on every tool call of every governed run.
+    #[test]
+    fn an_unchanged_binary_still_hits_the_cache() {
+        let dir = std::env::temp_dir().join(format!("probe_hit_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("wicked-core-probe-stable");
+        std::fs::write(&exe, b"stable").unwrap();
+        let path = exe.to_str().unwrap();
+
+        seed_probe_for_test(path, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+        assert_eq!(
+            probe_gate_protocol(path),
+            Ok(crate::gate_hook::GATE_PROTOCOL_VERSION),
+            "an untouched binary must not be re-probed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The cache is keyed by PATH. `resolve_wicked_core_exe()` re-reads `$WICKED_CORE_EXE` on every
     /// call, so one global slot would keep answering for whichever binary was probed first.
     #[test]
     fn two_exes_get_two_answers() {
-        let good = "/fixture/two/good";
-        let bad = "/fixture/two/bad";
-        seed_probe_for_test(good, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
-        seed_probe_for_test(bad, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION + 7));
-        assert!(check_gate_protocol(good).is_ok());
+        let good = fixture_exe("two_good");
+        let bad = fixture_exe("two_bad");
+        seed_probe_for_test(&good, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+        seed_probe_for_test(&bad, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION + 7));
+        assert!(check_gate_protocol(&good).is_ok());
         assert!(
-            check_gate_protocol(bad).is_err(),
+            check_gate_protocol(&bad).is_err(),
             "the second exe reused the first's answer"
         );
     }
