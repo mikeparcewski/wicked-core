@@ -71,7 +71,13 @@ def source_pin() -> str:
     Read out of the source rather than restated here: a second copy of a constant that must agree is
     the defect this script exists to catch, and writing one into the checker would be absurd.
     """
-    src = (REPO / "src" / "domain_extraction.rs").read_text(encoding="utf-8")
+    path = REPO / "src" / "domain_extraction.rs"
+    try:
+        src = path.read_text(encoding="utf-8")
+    except OSError as e:
+        # A traceback is not a diagnosis. This script's entire job is to fail in a way the reader
+        # can act on, so it must not make an exception of its own failures (review).
+        sys.exit(f"could not read {path}: {e}")
     m = re.search(r'COVERAGE_VALIDATOR_PIN:\s*&str\s*=\s*"([0-9a-f]+)"', src)
     if not m:
         sys.exit(
@@ -99,6 +105,14 @@ def installed_pin(binary: Path) -> str:
         except (OSError, subprocess.SubprocessError) as e:
             sys.exit(f"could not run `{binary} seed-domain-validators`: {e}")
         blob = f"{out.stdout}\n{out.stderr}"
+        # EXIT CODE FIRST. Parsing output from a command that failed is a presence-shaped check —
+        # a `pin:` line in a failure message would "verify" a broken install, which is the exact
+        # class of defect this script exists to catch. Flagged in review.
+        if out.returncode != 0:
+            sys.exit(
+                f"`{binary} seed-domain-validators` exited {out.returncode}, so its output cannot "
+                f"be trusted to describe this binary. Output:\n{blob[:400]}"
+            )
         m = re.search(r"pin:\s*([0-9a-f]{16})", blob)
         if not m:
             sys.exit(
