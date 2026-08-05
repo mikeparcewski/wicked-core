@@ -4771,18 +4771,44 @@ mod coverage_store_tests {
         std::fs::create_dir_all(dir.join(".codegraph")).unwrap();
         std::fs::write(dir.join(".codegraph").join("estate.db"), b"x").unwrap();
 
+        let want = dir.join(".codegraph").join("estate.db");
         let got = crate::code_graph::existing_code_graph(&dir)
             .expect("a repo root with .codegraph/estate.db must resolve one");
-        let got = got.to_string_lossy().into_owned();
+
+        // EXACT path, not a substring. `contains(".codegraph")` would also pass if the resolver
+        // returned the DIRECTORY, or any other file under it — neither of which
+        // `wicked-core coverage` can open. Flagged in review: a guard that accepts a near-miss
+        // is not a guard.
+        assert_eq!(got, want, "must resolve the repo's estate.db exactly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE call-site guard, and the one that actually matters.
+    ///
+    /// The two tests above exercise the RESOLVER. Reverting the call site to the old unconditional
+    /// `Some(db_path)` leaves both of them GREEN — so they do not guard the fix at all. Review
+    /// caught that, and it was a fair catch: my earlier falsification checked only that the revert
+    /// COMPILES, which it does.
+    ///
+    /// A source audit is the honest instrument (same shape as `spawn_audit`): the wiring is one
+    /// argument at one call site, and what must hold is that the argument is derived from the REPO
+    /// and never from the actor's own store handle.
+    #[test]
+    fn the_call_site_passes_the_repo_derived_store_not_the_actors() {
+        let src = include_str!("actor.rs");
+        let call = src
+            .split("pipeline::apply_and_finish_unit(")
+            .nth(1)
+            .expect("the pipeline call must exist");
+        let args = &call[..call.find(")?;").unwrap_or(call.len())];
 
         assert!(
-            got.contains(".codegraph"),
-            "not the repo-local graph: {got}"
+            args.contains("coverage_db.as_deref()"),
+            "the coverage-store argument is no longer repo-derived — FINDING-091 regressed"
         );
         assert!(
-            !got.ends_with("core.db"),
-            "resolved the ACTOR's store — this is FINDING-091: {got}"
+            !args.contains("Some(db_path)"),
+            "the actor's own store is being handed to the coverage validator again: FINDING-091"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
