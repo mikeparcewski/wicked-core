@@ -372,7 +372,11 @@ pub(crate) fn run(
     // Whatever the mode, anything still persisted `Executing` at this point has no worker in THIS
     // process. Armed mode has already redriven what it could; everything left is a zombie and must
     // say so rather than sitting silently (core#124).
-    report_orphaned_executing_sessions(&store, &mut subscribers);
+    // `in_flight` is what armed mode actually restored. A redriven session KEEPS status
+    // `Executing` (only its attempt is bumped), so without this it would be reported as an orphan
+    // on every restart that recovered work — the reporter would be loudest exactly when recovery
+    // worked.
+    report_orphaned_executing_sessions(&store, &mut subscribers, &in_flight);
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -2341,6 +2345,7 @@ pub(crate) fn resume_run_inner(
 fn report_orphaned_executing_sessions(
     store: &dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
+    in_flight: &HashSet<String>,
 ) {
     let sessions = match crate::domain::all_sessions(store) {
         Ok(s) => s,
@@ -2350,11 +2355,26 @@ fn report_orphaned_executing_sessions(
         }
     };
     for s in sessions {
-        if s.status != SessionStatus::Executing {
+        if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
             continue;
         }
-        let units = crate::domain::session_units(store, &s.id).unwrap_or_default();
-        let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
+        // `ord` is 1-based. Falling back to 0 would emit an ordinal no unit can have, so a reader
+        // cannot tell "unit unknown" from a real position — and the operator line would name it as
+        // if it were one. Derive from the cursor instead, and say when the units could not be read.
+        let ord = match crate::domain::session_units(store, &s.id) {
+            Ok(units) => units
+                .get(s.unit_ix)
+                .map(|u| u.ord)
+                .unwrap_or_else(|| s.unit_ix as u32 + 1),
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not read units for orphaned run {} ({e}); reporting the \
+                     cursor position instead of a unit ordinal",
+                    s.id
+                );
+                s.unit_ix as u32 + 1
+            }
+        };
         eprintln!(
             "wicked-core: run {} is persisted `executing` at unit {} but this process did not \
              restore a worker for it — the daemon restarted mid-run. Resume it with \
@@ -2363,14 +2383,10 @@ fn report_orphaned_executing_sessions(
         );
         emit(
             subscribers,
-            CoreEvent::WorkerStalled {
+            CoreEvent::RunOrphaned {
                 session: s.id.clone(),
                 ord,
-                // Not a terminal: there is no live worker to attribute output to. The empty id is
-                // the distinguishing mark of "no worker at all" versus a worker gone quiet, which is
-                // what `WICKED_STALL_SECS` covers and what this case falls outside of.
-                terminal_id: String::new(),
-                stalled_secs: 0,
+                detail: format!("POST /api/v1/runs/{}/resume", s.id),
             },
         );
     }
