@@ -1287,10 +1287,11 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
             .filter(|l| !l.is_empty())
             .skip(ix + 1)
             .any(|l| {
-                let t: Vec<String> = l.split_whitespace().map(&norm).collect();
-                let lead = t.first().map(String::as_str).unwrap_or("");
                 // Only a line that LEADS with the opposite keyword counts. Prose that merely
                 // mentions the word ("the criterion would reject X") must not flip a verdict.
+                // Just the first token — normalizing the whole line allocates per line scanned for
+                // a decision that never looks past position 0 (review).
+                let lead = l.split_whitespace().next().map(&norm).unwrap_or_default();
                 (lead == "PASS" && first == "REJECT") || (lead == "REJECT" && first == "PASS")
             });
         if contradicted_later {
