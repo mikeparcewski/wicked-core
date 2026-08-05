@@ -821,9 +821,9 @@ pub fn run_validator_reporting(
             return Ok((
                 ValidatorOutcome::Unrunnable(format!(
                     "the validator script uses ${env} but no wicked-core binary \
-                     could be located on this host: ${env} is unset, current_exe() \
-                     is not wicked-core (it is the node interpreter when the engine runs as a napi \
-                     addon), and `wicked-core` is not on PATH. The deterministic floor cannot be \
+                     could be located on this host: ${env} is unset, the engine's own \
+                     executable is not wicked-core (it is the node interpreter whenever the engine \
+                     runs as a napi addon), and `wicked-core` is not on PATH. The deterministic floor cannot be \
                      measured, so this gate denies without judging the work. Install wicked-core \
                      (see scripts/install-local.py) or set ${env}."
                 )),
@@ -2747,35 +2747,38 @@ mod core_exe_tests {
         }
     }
 
-    /// CALL-SITE AUDIT. The three tests above all still pass if someone reverts the injection to
-    /// `std::env::current_exe()`, because they only exercise the helper. Review caught exactly that
-    /// gap on FINDING-091's first guard, so assert the property that actually broke: this module
-    /// does not ask the OS what binary it is.
+    /// CALL-SITE AUDIT.
+    ///
+    /// The decision tests above all still pass if someone reverts the injection to ask the OS for
+    /// this process's own path, because they only exercise the helper. Review caught exactly that
+    /// gap on FINDING-091's first guard, so assert the property that actually broke.
+    ///
+    /// Scope is the PRODUCTION half of this file — everything before the first `#[cfg(test)]`. That
+    /// makes the check TOTAL rather than a list of spellings: an earlier version matched only
+    /// `env::current_exe` and `use std::env::current_exe`, which review pointed out lets
+    /// `use std::env::{current_exe};` and `... as alias` straight through. A rule that enumerates
+    /// syntaxes is a rule you have to keep extending; "this token does not appear in production
+    /// code" is one you do not. It is affordable only because the denial message was written to
+    /// name the CONDITION rather than the Rust function, which reads better for an operator anyway.
     #[test]
     fn the_validator_never_injects_current_exe() {
-        // Strip full-line comments first: this file DOCUMENTS the defect at length, and an audit
+        let src = include_str!("validator.rs");
+        let production = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        // Full-line comments are stripped: this file documents the defect at length, and an audit
         // that trips over its own explanation is one the next person deletes rather than fixes.
-        let code: String = include_str!("validator.rs")
+        let code: String = production
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        // Match the CALL spelling, not the word: the denial message above deliberately names
-        // `current_exe()` to tell an operator what went wrong, and an audit that cannot tell an
-        // explanation from a call is not measuring the thing it claims to.
-        // Needle built by concatenation so this assertion's own message cannot satisfy it.
-        let call = format!("env::{}", "current_exe");
+        // Needle built by concatenation so this assertion cannot satisfy itself.
+        let token = format!("current{}exe", "_");
         assert!(
-            !code.contains(&call),
-            "validator.rs calls the OS for its own path — under napi that is the node binary, \
-             which is FINDING-093 exactly. Resolve through \
-             execute_wrapped::resolve_wicked_core_exe_opt()."
-        );
-        // The aliasing escape hatch: `use std::env::current_exe;` would let a bare `current_exe()`
-        // slip past the check above.
-        assert!(
-            !code.contains(&format!("use std::{call}")),
-            "validator.rs imports that function directly, which defeats the check above"
+            !code.contains(&token),
+            "production code in validator.rs asks the OS for this process's own path. Under napi \
+             that is the node binary, which is FINDING-093 exactly — the deterministic coverage \
+             floor then never runs. Resolve through \
+             execute_wrapped::resolve_wicked_core_exe_opt(), which exists for this reason."
         );
     }
 }

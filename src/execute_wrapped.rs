@@ -754,7 +754,7 @@ pub(crate) fn resolve_wicked_core_exe() -> String {
 /// on rather than paper over with a name that will fail later and elsewhere.
 pub(crate) fn resolve_wicked_core_exe_opt() -> Option<String> {
     // 1. Operator override — trim so trailing whitespace/newlines don't break the hook command.
-    if let Ok(v) = std::env::var("WICKED_CORE_EXE") {
+    if let Ok(v) = std::env::var(crate::gate_hook::WICKED_CORE_EXE_ENV) {
         let trimmed = v.trim().to_string();
         if !trimmed.is_empty() {
             return Some(trimmed);
