@@ -67,6 +67,101 @@ fn hook_phase_alias(args: &[String]) -> Option<String> {
         .or_else(|| env_nonempty(GATE_PHASE_ID_ENV))
 }
 
+/// The authoritative subcommand list. Printed BOTH by `--help` (stdout, exit 0) and by the
+/// unknown-subcommand arm (stderr, exit 2). One string: a second hand-written list beside it is how
+/// a documented command set drifts from the real one.
+const ROOT_USAGE: &str = "usage: wicked-core <status | repos | register-repo --path <dir> | \
+     run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
+     resume --session <id> | reattach --session <id> | cancel --session <id> | \
+     launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
+     provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
+     seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
+     gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
+     (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]";
+
+/// Per-subcommand usage, consulted by ONE `--help` chokepoint.
+///
+/// `--help` used to be handled (or not) inside each subcommand. `domain-graph` guarded it because it
+/// writes a file; `seed-domain-validators` did not, so `--help` SEEDED AND APPROVED a validator, and
+/// `coverage --help` ran a full coverage pass over the store. Asking a tool what it does should never
+/// be the same as telling it to do it (core#132).
+///
+/// A table plus one guard, not a guard per subcommand: the per-subcommand form is what left most of
+/// them unguarded, and a new subcommand added tomorrow inherits this by default instead of having to
+/// remember. Same reason every spawn goes through one hardened helper.
+const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
+    (
+        "domain-graph",
+        "wicked-core domain-graph [--db <path>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
+         Translate the ANNOTATED estate graph into requirements_graph.json (default out: \
+         .wicked-estate/requirements/requirements_graph.json, cwd-relative). Fails closed when the \
+         domain-extraction front-half has not annotated the graph.",
+    ),
+    (
+        "coverage",
+        "wicked-core coverage [--db <path>] [--json]\n  \
+         Recompute front-half coverage from the store and print the report. Reads only.",
+    ),
+    (
+        "seed-domain-validators",
+        "wicked-core seed-domain-validators [--db <path>]\n  \
+         Vault and APPROVE the domain-extraction coverage validator. WRITES to the store.",
+    ),
+    (
+        "provision-validator",
+        "wicked-core provision-validator --criterion <TEXT> [--db <path>]\n  \
+         Author a deterministic validator UNAPPROVED. Approval is a separate, audited step \
+         (`approve-validator`) — authoring never authorizes running.",
+    ),
+    (
+        "approve-validator",
+        "wicked-core approve-validator --pin <PIN> [--db <path>]\n  \
+         Approve a vaulted validator so a phase may pin it.",
+    ),
+    (
+        "gate-phase",
+        "wicked-core gate-phase --scope <S> --phase <P> [--db <path>]\n  \
+         Evaluate the governance gate for one phase and print the decision.",
+    ),
+    (
+        "output-gate-hook",
+        "wicked-core output-gate-hook [--scope <S>] [--phase <P>] [--db <path>]\n  \
+         The per-OUTPUT sibling of `gate-hook`: governs generated output text on stdin. Same \
+         read-only-then-append discipline; exits with the gate's code (2 = deny).",
+    ),
+    (
+        "gate-hook",
+        "wicked-core gate-hook [--protocol-version]\n  \
+         The PreToolUse hook. Arguments travel by environment variable; `--protocol-version` prints \
+         the handshake the engine checks before arming a run.",
+    ),
+];
+
+/// Top-level usage. The subcommand list is DERIVED from `SUBCOMMAND_USAGE`, so documenting a new
+/// subcommand in one place is enough — a hand-maintained second list is how these drift.
+fn print_root_usage() {
+    println!("{ROOT_USAGE}");
+    println!("\nDetailed help is available per subcommand:");
+    for (name, _) in SUBCOMMAND_USAGE {
+        println!("  wicked-core {name} --help");
+    }
+}
+
+/// Print usage for `sub` if `args` asks for help. Returns true when it handled the call.
+fn handled_help(sub: &str, args: &[String]) -> bool {
+    if !args.iter().any(|a| a == "--help" || a == "-h") {
+        return false;
+    }
+    match SUBCOMMAND_USAGE.iter().find(|(name, _)| *name == sub) {
+        Some((_, usage)) => println!("{usage}"),
+        // An undocumented subcommand still must not EXECUTE on `--help`.
+        None => println!(
+            "wicked-core {sub} — no usage recorded; see `wicked-core` for the command list"
+        ),
+    }
+    true
+}
+
 fn store_path(args: &[String]) -> String {
     flag(args, "--db")
         // `WICKED_COVERAGE_DB` first: it is what a validator script is given, and it is the only
@@ -107,6 +202,13 @@ fn main() {
     // (it never writes the store — it only reads policies and appends decisions.ndjson), so handle
     // it before `Core::spawn` and exit with the gate's code (2 = deny ⇒ claude aborts the call).
     if args.get(1).map(String::as_str) == Some("gate-hook") {
+        // `--help` must DOCUMENT, never execute: this hook opens a store and appends a decision.
+        // It is dispatched ahead of the general chokepoint below (it must never spawn the actor),
+        // so it carries the guard itself (core#132). Checked FIRST — a question about what a
+        // command does has to be answerable without doing any of it.
+        if handled_help("gate-hook", &args) {
+            return;
+        }
         // The handshake the launcher probes BEFORE arming a run. Answered before anything else so it
         // stays cheap and cannot be affected by store/policy state (core#167).
         if args.iter().any(|a| a == "--protocol-version") {
@@ -132,6 +234,12 @@ fn main() {
     // governs the generated OUTPUT text (on stdin) instead of a proposed tool input. Also exits with
     // the gate's code (2 = deny) and must run before `Core::spawn`.
     if args.get(1).map(String::as_str) == Some("output-gate-hook") {
+        // `--help` must DOCUMENT, never execute: this hook opens a store and appends a
+        // decision. It is dispatched ahead of the general chokepoint below (it must not
+        // spawn the actor), so it carries the guard itself (core#132).
+        if handled_help("output-gate-hook", &args) {
+            return;
+        }
         let scope = resolve_hook_arg(&args, "--scope", GATE_SCOPE_ENV);
         let phase = resolve_hook_arg(&args, "--phase", GATE_PHASE_ENV);
         let phase_id = hook_phase_alias(&args);
@@ -148,6 +256,22 @@ fn main() {
     // store (author→approve→vault). Like gate-hook they must NOT spawn the actor — they open the store as
     // its SOLE writer for a brief command and exit — so handle them before `Core::spawn` (spawning the
     // actor too would put a second writer on the same SQLite file, breaking the single-writer invariant).
+    // ONE `--help` chokepoint, before any subcommand runs. Asking what a command does must never be
+    // the same as telling it to do it (core#132).
+    //
+    // `--help` with no subcommand is the ROOT request, not a subcommand named `--help`; routing it
+    // through the table would answer "no usage recorded" for the one form users try first.
+    match args.get(1).map(String::as_str) {
+        // NOT `None`: bare `wicked-core` STARTS THE ENGINE (spawns the actor, serves the API).
+        // Intercepting it here would turn the daemon's own launch command into a help screen.
+        Some("--help") | Some("-h") | Some("help") => {
+            print_root_usage();
+            return;
+        }
+        Some(sub) if handled_help(sub, &args) => return,
+        _ => {}
+    }
+
     match args.get(1).map(String::as_str) {
         Some("provision-validator") => return provision_validator_cmd(&args),
         Some("approve-validator") => return approve_validator_cmd(&args),
@@ -270,16 +394,7 @@ fn main() {
             drain_events(&events, None);
         }
         _ => {
-            eprintln!(
-                "usage: wicked-core <status | repos | register-repo --path <dir> | \
-                 run --problem \"...\" [--repo <id>] [--confirm none|all|before:N] [--workflow <id>] [--clis <csv>] | \
-                 resume --session <id> | reattach --session <id> | cancel --session <id> | \
-                 launch --problem \"...\" [--workflow <id>] (STUB self-test — deterministic, no real CLI, no gates) | \
-                 provision-validator --criterion \"...\" | approve-validator --pin <pin> | \
-                 seed-domain-validators (seed the coverage validator for domain-extraction.json) | \
-                 gate-phase --workflow <base-id> --phase <phase-id> --criterion \"...\" [--out <dir>] \
-                 (author+approve+pin a validator onto a phase → a gated drop-in workflow)> [--db <path>]"
-            );
+            eprintln!("{ROOT_USAGE}");
             std::process::exit(2);
         }
     }
@@ -680,16 +795,6 @@ fn print_status(core: &Core) {
 /// trust-boundary hole (a stale report can no longer green-light a different graph) that the prior
 /// increment left as a follow-on.
 fn domain_graph_cmd(args: &[String]) {
-    // `--help` must document, never execute — this subcommand writes a file.
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "wicked-core domain-graph [--db <path>] [--coverage <F>] [--out <F>] [--schema-version <V>]\n  \
-             Translate the ANNOTATED estate graph into requirements_graph.json (default out: \
-             .wicked-estate/requirements/requirements_graph.json, cwd-relative). Fails closed when \
-             the domain-extraction front-half has not annotated the graph."
-        );
-        return;
-    }
     let out_path = flag(args, "--out")
         .unwrap_or_else(|| ".wicked-estate/requirements/requirements_graph.json".to_string());
     // The schema pins metadata.schema_version to const "1.0.0" — a consumer rejects a version it has

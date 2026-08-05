@@ -123,8 +123,11 @@ pub fn author_deterministic_validator(
     unit.skill_ref = Some("wicked-testing-acceptance-test-writer".to_string());
     // Ad-hoc claude invocation so the caller needs no council registry entry.
     unit.assigned_invocation = Some("claude -p {PROMPT}".to_string());
+    // Same per-call id + teardown discipline as `agent_validate`: a constant id would share one
+    // ACP session across every authoring call, so each author would see the last one's context.
+    let run_id = validator_run_id();
     let input = StepInput {
-        run_id: "validator".to_string(),
+        run_id: run_id.clone(),
         unit_ix: 0,
         attempt: 0,
         unit,
@@ -137,6 +140,7 @@ pub fn author_deterministic_validator(
         prior_outputs: vec![],
     };
     let out = runner.run_unit(&input);
+    runner.on_run_complete(&run_id);
     if out.status != StepStatus::Ok {
         anyhow::bail!(
             "validator authoring failed ({:?}): {}",
@@ -857,6 +861,21 @@ fn select_agent_seat<'a>(
     excluded_keys: &[&str],
     roster: &'a [AgenticCli],
 ) -> Option<&'a AgenticCli> {
+    eligible_agent_seats(excluded_keys, roster)
+        .into_iter()
+        .next()
+}
+
+/// EVERY identity-distinct seat, in the order [`select_agent_seat`] would prefer them.
+///
+/// The single-pick version is just the head of this list, and exists as a thin wrapper so the walk
+/// lives in ONE place. `agent_validate` needs the whole ordering: a seat whose CLI cannot run at all
+/// is an infrastructure failure, not a judgment, and the judge should move to the next eligible seat
+/// rather than failing the run (core#132).
+fn eligible_agent_seats<'a>(
+    excluded_keys: &[&str],
+    roster: &'a [AgenticCli],
+) -> Vec<&'a AgenticCli> {
     let usable = |c: &AgenticCli| !c.headless_invocation.trim().is_empty();
     let excluded_ids: std::collections::HashSet<String> = excluded_keys
         .iter()
@@ -868,14 +887,34 @@ fn select_agent_seat<'a>(
     let anchor = excluded_keys
         .iter()
         .find_map(|k| roster.iter().position(|c| c.key == *k));
-    if let Some(i) = anchor {
-        let n = roster.len();
-        (1..n)
-            .map(|step| &roster[(i + step) % n])
-            .find(|c| distinct(c))
-    } else {
-        roster.iter().find(|c| distinct(c))
+    match anchor {
+        Some(i) => {
+            let n = roster.len();
+            (1..n)
+                .map(|step| &roster[(i + step) % n])
+                .filter(|c| distinct(c))
+                .collect()
+        }
+        None => roster.iter().filter(|c| distinct(c)).collect(),
     }
+}
+
+/// A run id unique to ONE `agent_validate` call.
+///
+/// ACP sessions are keyed by `(run_id, cli_key)` and a session is a live CLI process holding
+/// conversation state. A CONSTANT id — this was `"validator"` — means every validation in the
+/// process shares one session per seat, so each judge sees the accumulated context of every
+/// validation before it. That directly falsifies the evidence-only isolation this function claims:
+/// the judge is supposed to read the cold `work` and nothing else.
+///
+/// The pid keeps ids distinct across processes sharing a runner; the counter, within one.
+fn validator_run_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "validator-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 /// Run the agent validator: a reviewer judges `work` against `criterion` and returns PASS/REJECT + a
@@ -898,6 +937,22 @@ pub fn agent_validate(
     roster: &[AgenticCli],
     runner: &dyn StepRunner,
 ) -> anyhow::Result<AgentVerdict> {
+    // Teardown must happen on EVERY exit — verdict, rotation-exhausted bail, cancellation. Compute
+    // first, release after, so no `?` or `bail!` can skip it and leak a CLI process.
+    let run_id = validator_run_id();
+    let out = agent_validate_in(&run_id, criterion, work, excluded_seats, roster, runner);
+    runner.on_run_complete(&run_id);
+    out
+}
+
+fn agent_validate_in(
+    run_id: &str,
+    criterion: &str,
+    work: &str,
+    excluded_seats: &[&str],
+    roster: &[AgenticCli],
+    runner: &dyn StepRunner,
+) -> anyhow::Result<AgentVerdict> {
     let prompt = format!(
         "You are a strict reviewer. Decide whether the WORK satisfies the CRITERION. The FIRST line of \
          your reply MUST be exactly one word — `PASS` or `REJECT` — and nothing else on that line; then \
@@ -908,27 +963,79 @@ pub fn agent_validate(
     // No skill_ref: an authored prompt with a fully controlled verdict format. The SEAT is chosen to be
     // distinct from the deterministic author when the roster allows (a real second identity); otherwise
     // it falls back to the single default runner (`claude -p`) — distinct prompt, same runner.
-    let mut unit = WorkUnit::pending("validator-agent", "validator", 1, prompt);
-    match select_agent_seat(excluded_seats, roster) {
-        Some(seat) => {
-            unit.assigned_cli = Some(seat.key.clone());
-            unit.assigned_invocation = Some(seat.headless_invocation.clone());
-        }
-        None => {
-            // C7: the single-runner FALLBACK is the deterministic validator's OWN runner — derive its
-            // invocation from the [`DETERMINISTIC_VALIDATOR_SEAT`] seat when the roster lists it, else the
-            // documented `claude -p {PROMPT}` default (that seat authors via `claude -p`). This keeps the
-            // fallback consistent with the author instead of hardcoding `claude` regardless of it.
-            let invocation = roster
-                .iter()
-                .find(|c| c.key == DETERMINISTIC_VALIDATOR_SEAT)
-                .map(|c| c.headless_invocation.clone())
-                .unwrap_or_else(|| "claude -p {PROMPT}".to_string());
-            unit.assigned_invocation = Some(invocation);
+    let base_unit = WorkUnit::pending("validator-agent", "validator", 1, prompt);
+
+    // ROTATION (core#132): try each identity-distinct seat in preference order. A seat whose CLI
+    // cannot RUN — not on PATH, refuses to start, dies before producing output — is an
+    // infrastructure failure, and failing the whole validation on it lets one missing binary decide
+    // a governance outcome. Rotation is strictly about reachability: a seat that DOES run and
+    // returns something unreadable has rendered a judgment, and `parse_agent_verdict` fails that
+    // closed to REJECT. Deny-dominates is untouched — only a real PASS passes, and rotation never
+    // invents one.
+    let mut refusals: Vec<String> = Vec::new();
+    for seat in eligible_agent_seats(excluded_seats, roster) {
+        let mut unit = base_unit.clone();
+        unit.assigned_cli = Some(seat.key.clone());
+        unit.assigned_invocation = Some(seat.headless_invocation.clone());
+        let out = runner.run_unit(&build_validator_input(run_id, unit));
+        match out.status {
+            // The seat answered. Whatever it said is the verdict — including unreadable output,
+            // which `parse_agent_verdict` fails closed to REJECT. Rotating past an answer would be
+            // shopping for a better one.
+            StepStatus::Ok => return Ok(parse_agent_verdict(&out.output)),
+            // An operator (or a timeout) stopped this run. Rotating would defy the stop.
+            StepStatus::Cancelled => {
+                anyhow::bail!(
+                    "agent validation cancelled on seat {}: {}",
+                    seat.key,
+                    out.output
+                )
+            }
+            // `StepStatus` cannot distinguish "binary not on PATH" from "ran and exited non-zero",
+            // so this arm covers both. That is the safe side: a seat that produced no parseable
+            // output rendered no judgment, and the combine rule still means only a real PASS passes.
+            StepStatus::Failed => {
+                refusals.push(format!("{} ({})", seat.key, out.output.trim()));
+            }
         }
     }
-    let input = StepInput {
-        run_id: "validator".to_string(),
+    // Every eligible seat refused to run. Fail CLOSED, naming each one — the operator needs to know
+    // this was an environment problem, not a rejected verdict.
+    if !refusals.is_empty() {
+        anyhow::bail!(
+            "agent validation could not run: no eligible seat produced a verdict ({})",
+            refusals.join("; ")
+        );
+    }
+
+    // No eligible seat existed at all (an empty or fully-excluded roster) — distinct from "seats
+    // existed and all refused", handled above.
+    let mut unit = base_unit;
+    {
+        // C7: the single-runner FALLBACK is the deterministic validator's OWN runner — derive its
+        // invocation from the [`DETERMINISTIC_VALIDATOR_SEAT`] seat when the roster lists it, else
+        // the documented `claude -p {PROMPT}` default (that seat authors via `claude -p`). This
+        // keeps the fallback consistent with the author instead of hardcoding `claude`.
+        let invocation = roster
+            .iter()
+            .find(|c| c.key == DETERMINISTIC_VALIDATOR_SEAT)
+            .map(|c| c.headless_invocation.clone())
+            .unwrap_or_else(|| "claude -p {PROMPT}".to_string());
+        unit.assigned_invocation = Some(invocation);
+    }
+    let out = runner.run_unit(&build_validator_input(run_id, unit));
+    if out.status != StepStatus::Ok {
+        anyhow::bail!("agent validation failed ({:?}): {}", out.status, out.output);
+    }
+    Ok(parse_agent_verdict(&out.output))
+}
+
+/// The `StepInput` every validator-judge call uses. Extracted so the rotation and the single-runner
+/// fallback cannot drift apart — notably `governance: None`, without which the engine's own judge
+/// would self-govern against an empty scope.
+fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
+    StepInput {
+        run_id: run_id.to_string(),
         unit_ix: 0,
         attempt: 0,
         unit,
@@ -939,12 +1046,7 @@ pub fn agent_validate(
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
         prior_outputs: vec![],
-    };
-    let out = runner.run_unit(&input);
-    if out.status != StepStatus::Ok {
-        anyhow::bail!("agent validation failed ({:?}): {}", out.status, out.output);
     }
-    Ok(parse_agent_verdict(&out.output))
 }
 
 /// The triage judge's decision for an UNRECOGNIZED worker failure (agent-reviewed error
@@ -2110,6 +2212,219 @@ mod tests {
                 .key,
             "agy",
             "a different-binary seat is a valid distinct judge"
+        );
+    }
+
+    /// Review finding: ACP sessions are keyed by `(run_id, cli_key)`, and the run id was the
+    /// constant `"validator"`. Every validation in the process therefore shared one live CLI process
+    /// per seat, so each judge inherited the accumulated context of every validation before it —
+    /// which makes the documented evidence-only isolation false. Nothing tore the sessions down
+    /// either, so they leaked for the life of the process.
+    #[test]
+    fn each_validation_gets_its_own_run_id_and_releases_it() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            dispatched: Mutex<Vec<String>>,
+            released: Mutex<Vec<String>>,
+        }
+        impl StepRunner for Recorder {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.dispatched.lock().unwrap().push(input.run_id.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS fine".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    governed: false,
+                }
+            }
+            fn on_run_complete(&self, run_id: &str) {
+                self.released.lock().unwrap().push(run_id.to_string());
+            }
+        }
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+        ];
+        let rec = Recorder::default();
+        for _ in 0..2 {
+            agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &rec).expect("ok");
+        }
+
+        let dispatched = rec.dispatched.lock().unwrap().clone();
+        let released = rec.released.lock().unwrap().clone();
+        assert_eq!(dispatched.len(), 2, "expected one dispatch per validation");
+        assert_ne!(
+            dispatched[0], dispatched[1],
+            "both validations ran under the SAME run id ({}), so they share an ACP session and the \
+             second judge sees the first's context",
+            dispatched[0]
+        );
+        assert!(
+            dispatched.iter().all(|r| r != "validator"),
+            "the constant run id is back: {dispatched:?}"
+        );
+        // Every id dispatched must also be released, or the CLI process outlives the validation.
+        assert_eq!(
+            released, dispatched,
+            "run ids were not released 1:1 — sessions leak"
+        );
+    }
+
+    /// core#132: a seat whose CLI cannot RUN is an infrastructure failure, not a verdict. Letting it
+    /// end the validation lets one missing binary decide a governance outcome.
+    #[test]
+    fn a_seat_whose_cli_cannot_run_rotates_to_the_next_eligible_seat() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        /// Refuses to start for every seat in `unreachable`; anything else answers PASS.
+        struct FlakyRoster {
+            unreachable: Vec<String>,
+            tried: Mutex<Vec<String>>,
+        }
+        impl StepRunner for FlakyRoster {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let cli = input.unit.assigned_cli.clone().unwrap_or_default();
+                self.tried.lock().unwrap().push(cli.clone());
+                let dead = self.unreachable.contains(&cli);
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: if dead {
+                        format!("{cli}: command not found")
+                    } else {
+                        "PASS looks right".into()
+                    },
+                    status: if dead {
+                        StepStatus::Failed
+                    } else {
+                        StepStatus::Ok
+                    },
+                    usage: None,
+                    files: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        // `agy` is the seat the selector prefers; make it unreachable so rotation must occur.
+        let r = FlakyRoster {
+            unreachable: vec!["agy".to_string()],
+            tried: Mutex::new(Vec::new()),
+        };
+        let v = agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &r)
+            .expect("rotation should reach a runnable seat");
+        assert!(v.pass, "the reachable seat's PASS must be the verdict");
+
+        let tried = r.tried.lock().unwrap().clone();
+        assert_eq!(
+            tried,
+            vec!["agy".to_string(), "codex".to_string()],
+            "expected the dead seat first, then rotation to the next eligible one"
+        );
+        // The author seat must never be tried, rotation or not — that is evaluator≠creator.
+        assert!(
+            !tried.contains(&"claude".to_string()),
+            "rotation reached the EXCLUDED author seat: {tried:?}"
+        );
+    }
+
+    /// Rotation must not become a way to keep asking until someone says yes. When no eligible seat
+    /// can run, the validation fails CLOSED and names each refusal, so an environment problem never
+    /// reads as a rejected verdict.
+    #[test]
+    fn when_no_eligible_seat_can_run_it_fails_closed_naming_them() {
+        use crate::workflow::{StepOutput, StepRunner};
+
+        struct AllDead;
+        impl StepRunner for AllDead {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "command not found".into(),
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let err = agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &AllDead)
+            .expect_err("all seats unreachable must be an error, never a verdict");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agy") && msg.contains("codex"),
+            "the error must name every seat that refused, got: {msg}"
+        );
+        assert!(
+            !msg.contains("REJECT"),
+            "an unreachable environment must not be reported as a rejection: {msg}"
+        );
+    }
+
+    /// The boundary rotation must NOT cross: a seat that RUNS and returns something unreadable has
+    /// rendered a judgment. That fails closed to REJECT — asking a different seat would be shopping
+    /// for a verdict.
+    #[test]
+    fn a_seat_that_runs_but_answers_garbage_is_a_reject_not_a_rotation() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::sync::Mutex;
+
+        struct Garbage {
+            calls: Mutex<usize>,
+        }
+        impl StepRunner for Garbage {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                *self.calls.lock().unwrap() += 1;
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "I'm not sure, it depends".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy run {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let g = Garbage {
+            calls: Mutex::new(0),
+        };
+        let v = agent_validate("c", "w", &[DETERMINISTIC_VALIDATOR_SEAT], &roster, &g).expect("ok");
+        assert!(!v.pass, "unparseable output must fail closed to REJECT");
+        assert_eq!(
+            *g.calls.lock().unwrap(),
+            1,
+            "a seat that answered must end the validation; rotating here is verdict-shopping"
         );
     }
 
