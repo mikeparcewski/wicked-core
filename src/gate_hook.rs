@@ -42,8 +42,6 @@ use wicked_orchestration::{apply_gate, get_phase, Phase};
 use crate::domain::put_node;
 use crate::execute::advance_to_gate_running;
 
-/// Fixed evaluation-timestamp base for hook-minted claims — deterministic (no wall clock on the
-/// decision path), matching `execute.rs`'s convention so a re-derived claim is byte-identical.
 /// Environment variable holding the **absolute** path of the run's append-only decisions log. The
 /// worker that launches the wrapped CLI sets it; making it absolute (not cwd-relative) is what fixes
 /// the old `inject.rs:547` fragility — Claude may change cwd, but the hook still writes the right

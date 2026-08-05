@@ -50,17 +50,21 @@ mod tests {
 
     /// The invariant, stated as a bound rather than a value — which is what makes it a real test
     /// of "a clock was read" instead of "a constant was returned".
+    /// Bounds are taken the SAME saturating way `eval_now` takes its value. Using `.unwrap()`
+    /// here would panic on a pre-epoch clock — the one case the production path deliberately
+    /// survives — so the test would fail on the host it is meant to describe (review on #192).
+    fn now_saturating() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
     #[test]
     fn a_claim_is_stamped_from_the_wall_clock() {
-        let before = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let before = now_saturating();
         let stamped = eval_now();
-        let after = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let after = now_saturating();
         assert!(
             before <= stamped && stamped <= after,
             "eval_now() returned {stamped}, outside [{before}, {after}] — not a real clock read"
