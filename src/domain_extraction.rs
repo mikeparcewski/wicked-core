@@ -47,14 +47,14 @@ pub const COVERAGE_CRITERION: &str =
 /// destructive/network token; `${VAR}`/`${VAR:-default}` expansion and `!`/`||` are allowed).
 /// The binary is invoked as `${WICKED_CORE_EXE:-wicked-core}` — the validator runner injects
 /// `WICKED_CORE_EXE = current_exe()` so CI finds the right binary without relying on PATH.
-pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage)) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json"#;
+pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage)) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The APPROVED content-address pin the `coverage` phase carries in `workflows/domain-extraction.json`.
 /// Content-hash over `(COVERAGE_CRITERION, COVERAGE_SCRIPT, approved=true)` — see
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "e7f84b91d030fdcc";
+pub const COVERAGE_VALIDATOR_PIN: &str = "f8efe773ea4b61db";
 
 /// Phases whose `validator_pin` the BINARY has an opinion about, as `(workflow, phase, pin)`.
 ///
@@ -497,6 +497,61 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING-009: "fully covered" and "nothing measured" must not be the same answer.
+    ///
+    /// `coverage` is `(resolved + risk_flagged) / behavior_bearing`, defined as 1.0 when the
+    /// denominator is zero. Fine as arithmetic. As a GATE it meant a repo where nothing was
+    /// annotated satisfied "zero unaccounted behavior-bearing nodes" trivially — there were none to
+    /// account for.
+    ///
+    /// Verified against the real thing before this fix: `GET /governance/coverage` returned
+    /// `{"total":691,"behavior_bearing":0,"coverage":1,"unaccounted":0}` — 691 being the daemon's
+    /// own sessions and units, not any repo's code — and that payload PASSED the shipped predicate.
+    ///
+    /// This is FINDING-131's accounting-without-substance one level up: not in the annotations, but
+    /// in the gate that checks them.
+    #[test]
+    fn a_report_over_zero_behavior_bearing_nodes_does_not_pass() {
+        let dir = std::env::temp_dir().join(format!("cov_vacuous_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The exact shape observed live.
+        let vacuous = r#"{"total":691,"behavior_bearing":0,"resolved":0,"risk_flagged":0,"unaccounted":0,"coverage":1}"#;
+        std::fs::write(dir.join("coverage-report.json"), vacuous).unwrap();
+        assert!(
+            !run_predicate(&dir),
+            "a report over ZERO behavior-bearing nodes passed the gate — 100% of nothing is not \
+             coverage (FINDING-009)"
+        );
+
+        // And the property this must not break: a genuinely complete report still passes.
+        let real = r#"{"total":900,"behavior_bearing":42,"resolved":42,"risk_flagged":0,"unaccounted":0,"coverage":1}"#;
+        std::fs::write(dir.join("coverage-report.json"), real).unwrap();
+        assert!(
+            run_predicate(&dir),
+            "a real, fully-accounted report must still pass, or the gate denies every honest run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Run the SHIPPED predicate, not a paraphrase of it — a re-typed copy would drift from the
+    /// string the validator is content-addressed over, and then this test would guard a fiction.
+    fn run_predicate(dir: &std::path::Path) -> bool {
+        use wicked_apps_core::HardenedCommand;
+        std::process::Command::new("sh")
+            // The rule has no exceptions, not even here: `spawn.rs` argues that an allowlist is a
+            // standing invitation, and a test spawning a shell is exactly where someone would argue
+            // for one. The audit caught this site the moment it appeared, which is the point.
+            .hardened()
+            .arg("-c")
+            .arg(COVERAGE_SCRIPT)
+            .current_dir(dir)
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false)
     }
 
     #[test]
