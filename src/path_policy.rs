@@ -192,7 +192,11 @@ mod tests {
     #[test]
     fn a_path_outside_every_root_is_denied_and_names_the_resolved_path() {
         let wt = scratch("outside");
-        let home = PathBuf::from("/Users/someone");
+        // A REAL directory, not a hand-written "/Users/someone": on Windows a path beginning with
+        // `/` carries no drive and is therefore NOT absolute, so `normalize` correctly joins it to
+        // cwd and this assertion became meaningless. The bug was in this test, not the policy —
+        // CI on windows-latest is what caught it.
+        let home = scratch("outside_home");
         let d = check(
             "~/.wicked-brain/projects/x/brain.json",
             &roots(&wt),
