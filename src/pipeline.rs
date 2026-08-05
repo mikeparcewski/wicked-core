@@ -733,7 +733,8 @@ pub(crate) fn apply_and_finish_unit(
         .unwrap_or_else(|| "claude".to_string());
     let collection_scope = resolve_scope(entity_mode, session_id, &unit.id);
     let evaluator_cli = next_cli_in_roster(&assigned_cli, cli_keys);
-    let eval_at = execute::EVAL_AT_BASE + unit.ord as i64 + 1_000_000;
+    // Was EVAL_AT_BASE + ord + 1_000_000 — a timestamp field used as a namespace (FINDING-017).
+    let eval_at = crate::clock::eval_now();
     let review_output = if unit.role == crate::workflow::PhaseRole::Evaluator {
         creator_output_for(store, session_id, unit.ord).unwrap_or_else(|| output.to_string())
     } else {

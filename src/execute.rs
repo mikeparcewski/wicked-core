@@ -17,9 +17,6 @@ use crate::scope::{resolve_scope, EntityMode};
 /// Node-kind for a unit's recorded work output. Written ONLY when the gate approves.
 pub const WORK_OUTPUT: &str = "work_output";
 
-/// Fixed evaluation-timestamp base for harness-minted claims (deterministic per unit by `ord`).
-pub const EVAL_AT_BASE: i64 = 1_750_000_000;
-
 /// The outcome of executing one unit — recorded back onto the unit node.
 #[derive(Debug, Clone, Serialize)]
 pub struct UnitOutcome {
@@ -113,7 +110,9 @@ pub(crate) fn apply_unit(
     // AND the workflow phase id (FINDING-021); the claim keeps the canonical `unit-<ord>`.
     let phases = crate::scope::phase_aliases(&phase_name, unit.phase_id());
     let selected = select_any(store, &collection_scope, &phases, &context)?;
-    let evaluated_at = EVAL_AT_BASE + unit.ord as i64;
+    // Real wall-clock, not a base + unit index (FINDING-017): an audit record that cannot say
+    // WHEN a decision was taken is not an audit record.
+    let evaluated_at = crate::clock::eval_now();
     let mut claim: ConformanceClaim = decide(
         &selected,
         &collection_scope,

@@ -44,8 +44,6 @@ use crate::execute::advance_to_gate_running;
 
 /// Fixed evaluation-timestamp base for hook-minted claims — deterministic (no wall clock on the
 /// decision path), matching `execute.rs`'s convention so a re-derived claim is byte-identical.
-const EVAL_AT_BASE: i64 = 1_750_000_000;
-
 /// Environment variable holding the **absolute** path of the run's append-only decisions log. The
 /// worker that launches the wrapped CLI sets it; making it absolute (not cwd-relative) is what fixes
 /// the old `inject.rs:547` fragility — Claude may change cwd, but the hook still writes the right
@@ -209,7 +207,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
             return 2;
         }
     };
-    let claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
+    let claim = decide(&selected, scope, phase, &context, crate::clock::eval_now());
 
     // Write the tool-call annotation AND the claim as a SINGLE buffer under the advisory lock.
     // Using one buffer means that even if `with_append_lock` degrades to running without the lock
@@ -501,7 +499,7 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
         evaluated_context_ref: "sha256:infra".to_string(),
         criteria: format!("governance infra failure: {reason}"),
         evaluator_identity: "wicked-governance-infra".to_string(),
-        evaluated_at: EVAL_AT_BASE,
+        evaluated_at: crate::clock::eval_now(),
     };
     let _ = append_decision(Path::new(decisions_path), &claim);
 }
@@ -995,7 +993,7 @@ pub fn run_output_gate_hook(
             return 2;
         }
     };
-    let mut claim = decide(&selected, scope, phase, &context, EVAL_AT_BASE);
+    let mut claim = decide(&selected, scope, phase, &context, crate::clock::eval_now());
 
     // Wire recall INTO the output gate (M6/M7): the conformance rules applicable to the output's
     // facets become obligations on the claim. A recall failure is a governance failure (fail
@@ -1119,7 +1117,7 @@ mod tests {
             evaluated_context_ref: "sha256:x".into(),
             criteria: String::new(),
             evaluator_identity: "wicked-governance".into(),
-            evaluated_at: EVAL_AT_BASE,
+            evaluated_at: crate::clock::eval_now(),
         };
         append_decision(&path, &claim("a")).unwrap();
         append_decision(&path, &claim("b")).unwrap();
@@ -1176,7 +1174,7 @@ mod tests {
             evaluated_context_ref: "sha256:x".into(),
             criteria: String::new(),
             evaluator_identity: "wicked-governance".into(),
-            evaluated_at: EVAL_AT_BASE,
+            evaluated_at: crate::clock::eval_now(),
         };
         // A wildcard query (no facets) recalls the applicable rule and attaches it as an obligation.
         attach_recalled_rules(&store, &RuleQuery::default(), &mut claim).unwrap();
@@ -1570,7 +1568,7 @@ mod tests {
             evaluated_context_ref: format!("sha256:{id}"),
             criteria: String::new(),
             evaluator_identity: "wicked-governance".into(),
-            evaluated_at: EVAL_AT_BASE,
+            evaluated_at: crate::clock::eval_now(),
         }
     }
 }

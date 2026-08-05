@@ -19,6 +19,7 @@ mod builtin_floors;
 mod bus;
 mod campaign;
 mod cli_runner;
+mod clock;
 mod code_graph;
 mod command;
 mod diagnostic;
