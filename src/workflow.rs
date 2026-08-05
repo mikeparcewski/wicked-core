@@ -725,9 +725,14 @@ impl WorkflowRegistry {
             match outcome {
                 Ok(id) => loaded.push(id),
                 // Skip the offending file, keep the rest — but loudly (named), never silently.
+                // The CAUSE is the whole point: `{e}` renders only anyhow's outermost context,
+                // so this line used to print the path twice and no reason. See `diagnostic`.
                 Err(e) => eprintln!(
-                    "wicked-core: skipping workflow file {} ({e})",
-                    path.display()
+                    "wicked-core: {}",
+                    crate::diagnostic::with_cause(
+                        &format!("skipping workflow file {}", path.display()),
+                        &e
+                    )
                 ),
             }
         }

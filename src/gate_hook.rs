@@ -183,9 +183,12 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
                 &decisions_path,
                 scope,
                 phase,
-                &format!("store open failed: {e}"),
+                &crate::diagnostic::with_cause("store open failed", &e),
             );
-            eprintln!("wicked-governance: DENY (open store failed: {e})");
+            eprintln!(
+                "wicked-governance: DENY ({})",
+                crate::diagnostic::with_cause("open store failed", &e)
+            );
             return 2;
         }
     };
@@ -197,9 +200,12 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
                 &decisions_path,
                 scope,
                 phase,
-                &format!("policy select failed: {e}"),
+                &crate::diagnostic::with_cause("policy select failed", &e),
             );
-            eprintln!("wicked-governance: DENY (policy select failed: {e})");
+            eprintln!(
+                "wicked-governance: DENY ({})",
+                crate::diagnostic::with_cause("policy select failed", &e)
+            );
             return 2;
         }
     };
@@ -971,7 +977,10 @@ pub fn run_output_gate_hook(
     let store = match open_store_ro(db.filter(|s| !s.is_empty())) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wicked-governance: DENY (open store failed: {e})");
+            eprintln!(
+                "wicked-governance: DENY ({})",
+                crate::diagnostic::with_cause("open store failed", &e)
+            );
             return 2;
         }
     };
@@ -979,7 +988,10 @@ pub fn run_output_gate_hook(
     let selected = match select_any(&store, scope, &phases, &context) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("wicked-governance: DENY (policy select failed: {e})");
+            eprintln!(
+                "wicked-governance: DENY ({})",
+                crate::diagnostic::with_cause("policy select failed", &e)
+            );
             return 2;
         }
     };
@@ -989,7 +1001,10 @@ pub fn run_output_gate_hook(
     // facets become obligations on the claim. A recall failure is a governance failure (fail
     // closed) — never silently drop the ruleset.
     if let Err(e) = attach_recalled_rules(&store, &output_rule_query(), &mut claim) {
-        eprintln!("wicked-governance: DENY (conformance-rule recall failed: {e})");
+        eprintln!(
+            "wicked-governance: DENY ({})",
+            crate::diagnostic::with_cause("conformance-rule recall failed", &e)
+        );
         return 2;
     }
 
