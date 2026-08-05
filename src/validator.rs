@@ -1262,6 +1262,48 @@ fn parse_agent_verdict(raw: &str) -> AgentVerdict {
         } else {
             format!("{line} — {reason_below}")
         };
+        // VERDICT DRIFT (FINDING-085). A model may commit to a token and then reason its way to the
+        // opposite conclusion in the same breath — observed live:
+        //
+        //     "PASS — ... it explicitly states 766 unaccounted nodes and no completion.
+        //      Wait — correcting myself: the first line must reflect the actual ..."
+        //
+        // The decision line named only PASS, so `mentions_reject` never fired and the abandoned
+        // token won. First-token parsing assumes the model commits BEFORE it reasons; a model that
+        // reasons then revises violates that, and the parse captures the answer it walked away from.
+        //
+        // Two independent reviewers (codex, opencode), asked blind, both rejected detecting
+        // self-correction PHRASES — "an endless blacklist", "a cat-and-mouse trap". They are right,
+        // and it is the same argument this codebase already makes about denylists elsewhere: a list
+        // of bad words is one rephrasing from useless.
+        //
+        // So do not guess at drift, DETECT it: if anything AFTER the decision line states the
+        // opposite verdict as its own contract line, the output contradicts itself and fails closed.
+        // No phrase list, mechanically testable, and silent on compliant output (a model that obeys
+        // "one word, then a reason" emits no second contract line at all).
+        let contradicted_later = raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .skip(ix + 1)
+            .any(|l| {
+                // Only a line that LEADS with the opposite keyword counts. Prose that merely
+                // mentions the word ("the criterion would reject X") must not flip a verdict.
+                // Just the first token — normalizing the whole line allocates per line scanned for
+                // a decision that never looks past position 0 (review).
+                let lead = l.split_whitespace().next().map(&norm).unwrap_or_default();
+                (lead == "PASS" && first == "REJECT") || (lead == "REJECT" && first == "PASS")
+            });
+        if contradicted_later {
+            return AgentVerdict {
+                pass: false,
+                reasoning: format!(
+                    "{reasoning} [verdict drift: the decision line said {first}, a later line said \
+                     the opposite — failing closed (FINDING-085)]"
+                ),
+            };
+        }
+
         match first {
             "PASS" if decisive && !mentions_reject => {
                 return AgentVerdict {
@@ -1473,6 +1515,51 @@ mod tests {
         // bloat every persisted gate record.
         let v = parse_agent_verdict(&format!("REJECT\n{}", "x".repeat(900)));
         assert!(v.reasoning.len() < 500, "capped: {}", v.reasoning.len());
+    }
+
+    /// FINDING-085: a model that commits to a token then reasons to the opposite conclusion.
+    ///
+    /// Captured live. The engine was saved by the deterministic validator denying independently —
+    /// deny-dominates — but on a criterion only an LLM can judge there is no second opinion, and the
+    /// abandoned token would have shipped.
+    #[test]
+    fn a_later_line_stating_the_opposite_verdict_fails_closed() {
+        // The shape that matters: commit PASS, then correct to REJECT on its own line.
+        let drifted = "PASS looks fine at first glance\n\
+                       Actually the criterion is not met — 766 unaccounted nodes.\n\
+                       REJECT";
+        let v = parse_agent_verdict(drifted);
+        assert!(
+            !v.pass,
+            "a self-contradicting verdict must fail closed: {}",
+            v.reasoning
+        );
+        assert!(
+            v.reasoning.contains("verdict drift"),
+            "the drift must be NAMED: {}",
+            v.reasoning
+        );
+
+        // And the mirror: commit REJECT, later say PASS. Same rule, no favouritism toward denial.
+        let other = "REJECT missing evidence\nOn reflection it is fine.\nPASS";
+        assert!(
+            !parse_agent_verdict(other).pass,
+            "REJECT->PASS drift must also fail closed"
+        );
+    }
+
+    /// The rule must be SILENT on compliant output, or it is a false-REJECT machine. A model that
+    /// obeys the contract ("one word, then a reason") emits no second contract line at all.
+    #[test]
+    fn drift_detection_does_not_disturb_a_compliant_verdict() {
+        assert!(parse_agent_verdict("PASS\nThe deliverable is present and matches.").pass);
+        assert!(parse_agent_verdict("PASS meets the criterion\nEvidence: file exists.").pass);
+        // Prose that merely NAMES the other keyword must not flip it — only a line that LEADS with
+        // the opposite verdict counts. Otherwise every explanatory sentence becomes a veto.
+        assert!(
+            parse_agent_verdict("PASS\nI would reject this only if the file were missing.").pass,
+            "prose mentioning the opposite keyword must not be read as a verdict"
+        );
     }
 
     #[test]
