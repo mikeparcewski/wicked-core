@@ -65,6 +65,36 @@ def default_dest() -> Path:
     return Path.home() / ".local" / "bin"
 
 
+def source_version() -> str:
+    """The version THIS CHECKOUT declares, read from Cargo.toml."""
+    path = REPO / "Cargo.toml"
+    try:
+        src = path.read_text(encoding="utf-8")
+    except OSError as e:
+        sys.exit(f"could not read {path}: {e}")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', src, re.M)
+    if not m:
+        sys.exit(f"no version in {path} — update this check rather than deleting it.")
+    return m.group(1)
+
+
+def installed_version(binary: Path) -> str:
+    """What the BINARY reports. Asked of the binary, never inferred from its mtime."""
+    try:
+        out = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        sys.exit(f"could not run `{binary} --version`: {e}")
+    if out.returncode != 0:
+        sys.exit(
+            f"`{binary} --version` exited {out.returncode}. A binary too old to report its version "
+            f"cannot be verified, so this is a failure, not a skip.\n{out.stdout}{out.stderr}"[:400]
+        )
+    m = re.search(r"([0-9]+\.[0-9]+\.[0-9]+\S*)", out.stdout)
+    if not m:
+        sys.exit(f"`{binary} --version` printed no version: {out.stdout[:200]!r}")
+    return m.group(1)
+
+
 def source_pin() -> str:
     """The coverage validator pin the SOURCE declares.
 
@@ -126,6 +156,20 @@ def installed_pin(binary: Path) -> str:
 
 def verify(binary: Path) -> int:
     """Does the installed binary agree with the source it should have been built from?"""
+    # VERSION first: a version mismatch explains a pin mismatch, and reporting them in the other
+    # order makes the operator debug the symptom.
+    vwant, vgot = source_version(), installed_version(binary)
+    print(f"  source version  : {vwant}")
+    print(f"  installed       : {vgot}")
+    if vwant != vgot:
+        sys.stdout.flush()
+        print(
+            f"\nSKEW: {binary} reports {vgot} but this checkout declares {vwant}. The installed "
+            f"binary is not this build.\n  Fix: re-run this script without --check.",
+            file=sys.stderr,
+        )
+        return 1
+
     want, got = source_pin(), installed_pin(binary)
     print(f"  source declares : {want}")
     print(f"  {binary.name} seeds : {got}")
