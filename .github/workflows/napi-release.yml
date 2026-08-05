@@ -41,7 +41,7 @@ concurrency:
 # NOTE: the addon published from this workflow therefore bundles an UNRELEASED estate. Move this to
 # the tag at the next estate release.
 env:
-  WICKED_ESTATE_REF: eaa51fec0aae4763cbf0412830ef4760d2d91ad8
+  WICKED_ESTATE_REF: c7763495743fb16ee6f6696e2163f976feb89e99
 
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────
