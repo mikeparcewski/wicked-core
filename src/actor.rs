@@ -276,6 +276,31 @@ pub(crate) fn run(
                 dir.display()
             );
         }
+        // The def that DISPATCHES is the installed one, and it drifts from this binary the moment a
+        // pin changes without a re-install — worse, crew REWRITES it from a hardcoded copy, so the
+        // stale pin restores itself (FINDING-080/084). A stale pin means the run is gated by a
+        // validator this engine no longer stands behind, and it reports success either way.
+        //
+        // REPAIR rather than remove. Removing was the first attempt and it is wrong: `register`
+        // overwrites by id, so there is no shadowed built-in left to fall back to — and
+        // `domain-extraction` ships only as a drop-in, so removal makes the id UNKNOWN and dispatch
+        // fails with "no such workflow", trading a wrong gate for a confusing one. The binary owns
+        // this pin (it is the value the vault was seeded with), so writing it into the loaded def is
+        // the correction, and the workflow stays available and correctly gated.
+        for m in crate::domain_extraction::installed_pin_mismatches(&registry) {
+            eprintln!("wicked-core: {m}");
+            match registry.repin(&m.workflow, &m.phase, m.expected) {
+                true => eprintln!(
+                    "wicked-core: repaired installed `{}` phase `{}` to {} for this process; the \
+                     file on disk is still stale and will be read again on the next start",
+                    m.workflow, m.phase, m.expected
+                ),
+                false => eprintln!(
+                    "wicked-core: could NOT repair `{}` phase `{}`; refusing to serve it",
+                    m.workflow, m.phase
+                ),
+            }
+        }
     }
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
     // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC
