@@ -739,32 +739,51 @@ fn quote_exe_command(exe: &str) -> String {
 /// 2. `current_exe()` if its filename is not `node` or `node.exe` (native non-addon launch).
 /// 3. PATH lookup of `wicked-core` — fallback for installs that put the binary on PATH.
 /// 4. Bare `"wicked-core"` string — last resort; will fail at hook time if not on PATH.
-fn resolve_wicked_core_exe() -> String {
+///
+/// The fallible half is [`resolve_wicked_core_exe_opt`]; this wrapper adds step 4. The split exists
+/// because tolerance for "not found" is a per-caller decision and resolution is not: the gate-hook
+/// can emit a bare name and let PATH sort it out at hook time, while the validator (FINDING-093)
+/// must NOT — see the call site in `validator.rs` for why a wrong value there is worse than none.
+pub(crate) fn resolve_wicked_core_exe() -> String {
+    resolve_wicked_core_exe_opt().unwrap_or_else(|| "wicked-core".to_string())
+}
+
+/// Steps 1–3 of [`resolve_wicked_core_exe`]: a path we actually found, or `None`.
+///
+/// `None` means "this host has no locatable wicked-core", which is a fact a caller may need to act
+/// on rather than paper over with a name that will fail later and elsewhere.
+pub(crate) fn resolve_wicked_core_exe_opt() -> Option<String> {
     // 1. Operator override — trim so trailing whitespace/newlines don't break the hook command.
-    if let Ok(v) = std::env::var("WICKED_CORE_EXE") {
+    if let Ok(v) = std::env::var(crate::gate_hook::WICKED_CORE_EXE_ENV) {
         let trimmed = v.trim().to_string();
         if !trimmed.is_empty() {
-            return trimmed;
+            return Some(trimmed);
         }
     }
     // 2. current_exe() — valid unless it is the Node.js interpreter.
     if let Ok(path) = std::env::current_exe() {
-        let is_node = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            // Case-insensitive: Windows may report Node.exe / NODE.EXE.
-            .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
-            .unwrap_or(false);
-        if !is_node {
-            return path.to_string_lossy().into_owned();
+        if !is_node_interpreter(&path) {
+            return Some(path.to_string_lossy().into_owned());
         }
     }
     // 3. PATH lookup.
     if let Ok(found) = which_binary("wicked-core") {
-        return found;
+        return Some(found);
     }
-    // 4. Bare name — last resort; works if wicked-core is on PATH at hook-execution time.
-    "wicked-core".to_string()
+    None
+}
+
+/// Is this path the Node.js interpreter rather than a wicked-core binary?
+///
+/// The whole reason `current_exe()` cannot be trusted: under napi-rs the host process IS node, so
+/// `current_exe()` answers a different question than the one being asked. Extracted from the two
+/// resolvers that each spelled this check out, so the predicate has one definition and a test.
+pub(crate) fn is_node_interpreter(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        // Case-insensitive: Windows may report Node.exe / NODE.EXE.
+        .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
+        .unwrap_or(false)
 }
 
 /// Locate `wicked-estate-mcp` binary for injecting estate tools into governed workers.
@@ -772,12 +791,7 @@ fn resolve_wicked_core_exe() -> String {
 fn resolve_estate_mcp_exe() -> String {
     // 1. Sibling of the wicked-core binary (monorepo dev: target/release/).
     if let Ok(path) = std::env::current_exe() {
-        let is_node = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.eq_ignore_ascii_case("node") || n.eq_ignore_ascii_case("node.exe"))
-            .unwrap_or(false);
-        if !is_node {
+        if !is_node_interpreter(&path) {
             if let Some(parent) = path.parent() {
                 let sibling = parent.join(if cfg!(windows) {
                     "wicked-estate-mcp.exe"
