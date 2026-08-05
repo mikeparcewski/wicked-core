@@ -3629,7 +3629,7 @@ pub(crate) fn confirm_gate(
                     scope,
                     &phase_name,
                     &context,
-                    crate::execute::EVAL_AT_BASE,
+                    crate::clock::eval_now(),
                 );
                 if matches!(claim.decision, Decision::Deny) {
                     conform(store, &claim)?;
