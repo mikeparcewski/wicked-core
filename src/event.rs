@@ -255,6 +255,25 @@ pub enum CoreEvent {
         terminal_id: String,
         stalled_secs: u64,
     },
+    /// A run is persisted `executing` but THIS process holds no worker for it — the daemon
+    /// restarted mid-run and nothing recovered it. Emitted once per orphaned run at startup.
+    ///
+    /// Deliberately NOT `WorkerStalled`. That event means a live PTY has gone quiet, and its
+    /// `terminal_id` maps to a real terminal stream a consumer can open. This case has no worker and
+    /// no terminal, and the first version of it said so by sending `WorkerStalled` with an empty
+    /// `terminal_id` and `stalled_secs: 0` — leaving consumers to infer the cause from a blank
+    /// string. Studio's renderer took that at face value and told the operator "no output for 0s —
+    /// may be waiting at an interactive prompt (open Term or inject)": an instruction to open a
+    /// terminal that does not exist and inject into a worker that is not there.
+    ///
+    /// One event, two causes, distinguished by a sentinel value is the shape this codebase keeps
+    /// paying for (FINDING-050). A separate variant makes the two answerable apart.
+    RunOrphaned {
+        session: String,
+        ord: u32,
+        /// What the operator should do about it — resume is a real, specific endpoint.
+        detail: String,
+    },
     /// A structured assumption parsed from a completed unit's output — currently the
     /// external-transform convention: a third-party library/service transforms a payload.
     /// `known=false` marks a needs-research placeholder a human should review.
@@ -979,6 +998,16 @@ impl CoreEvent {
                 "ord": ord,
                 "terminalId": terminal_id,
                 "stalledSecs": stalled_secs,
+            }),
+            CoreEvent::RunOrphaned {
+                session,
+                ord,
+                detail,
+            } => json!({
+                "type": "runOrphaned",
+                "session": session,
+                "ord": ord,
+                "detail": detail,
             }),
             CoreEvent::AssumptionRecorded {
                 session,
