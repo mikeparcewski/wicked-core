@@ -757,8 +757,13 @@ pub fn run_validator_reporting(
     if let Ok(exe) = std::env::current_exe() {
         cmd.env("WICKED_CORE_EXE", exe);
     }
-    // Inject the estate db path so scripts that invoke `wicked-core coverage` resolve the correct store.
-    // This is an explicit injection (not a passthrough), so it never leaks other env secrets.
+    // Carry the store a validator script may reach under ITS OWN name, and strip the operational
+    // one. The three controls on validator scripts (approval-gated, denylist-screened, minimal env)
+    // are all AUTHORIZATION controls — none constrains what an approved script does with a handle it
+    // already holds, and FINDING-067 needed no malice, just a tool defaulting to $WICKED_ESTATE_DB.
+    // Removing the name is what closes the channel; not-using it is not the same thing (core#166).
+    cmd.env_remove(crate::gate_hook::ESTATE_DB_ENV);
+    // Explicit injection (not a passthrough), so it never leaks other env secrets.
     // Skip :memory: and URL-based backends — wicked-core coverage can't use them.
     // Make relative paths absolute before injecting: the child's cwd is the worktree,
     // so a relative path like "wicked-estate.db" would mis-resolve there.
@@ -773,7 +778,7 @@ pub fn run_validator_reporting(
                     .map(|d| d.join(p).to_string_lossy().into_owned())
                     .unwrap_or_else(|_| db.to_string())
             };
-            cmd.env(crate::gate_hook::ESTATE_DB_ENV, abs);
+            cmd.env(crate::gate_hook::COVERAGE_DB_ENV, abs);
         }
     }
 
@@ -1259,6 +1264,68 @@ pub fn gate_phase(
 
 #[cfg(test)]
 mod tests {
+
+    /// Serializes tests that mutate process-global env. Cargo runs tests in one process, in
+    /// parallel, so an unguarded `set_var` here is visible to every other test that reads it —
+    /// including the sibling below. Same pattern as `execute_wrapped.rs`'s `ENV_LOCK`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// core#166, both halves — the same shape as
+    /// `execute_wrapped::tests::no_worker_inherits_an_estate_store_through_the_environment`.
+    ///
+    /// Half one: an approved script must NOT be able to see the operational store's name. Removing
+    /// the variable is what closes the channel; a script merely not referencing it is not the same
+    /// thing, because the failure mode needs no malice — only a tool that defaults to
+    /// `$WICKED_ESTATE_DB` (FINDING-067).
+    #[test]
+    fn a_validator_script_cannot_see_the_operational_store() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("val_env_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        // The parent HAS it set — the point is that the child does not inherit it.
+        std::env::set_var(crate::gate_hook::ESTATE_DB_ENV, "/operational/store.db");
+
+        let v = DeterministicValidator {
+            criterion: "the operational store is not reachable".to_string(),
+            // Passes ONLY when the variable is unset/empty in the child.
+            // Built from the const: a hardcoded name would keep passing after a rename while
+            // testing a variable nothing sets any more.
+            script: format!("test -z \"${{{}}}\"", crate::gate_hook::ESTATE_DB_ENV),
+            approved: true,
+        };
+        let (outcome, _) =
+            run_validator_reporting(&v, &dir, Some("/some/run/graph.db")).expect("validator runs");
+
+        std::env::remove_var(crate::gate_hook::ESTATE_DB_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            outcome,
+            ValidatorOutcome::Passed,
+            "the validator child inherited WICKED_ESTATE_DB — the channel core#166 closes"
+        );
+    }
+
+    /// Half two: the store it IS entitled to still arrives, under its own name. Closing the channel
+    /// without this would break a working gate to harden a path — the trade the issue declined.
+    #[test]
+    fn a_validator_script_receives_the_store_under_its_own_carrier() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("val_env2_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let v = DeterministicValidator {
+            criterion: "the coverage carrier is populated".to_string(),
+            script: format!("test -n \"${{{}}}\"", crate::gate_hook::COVERAGE_DB_ENV),
+            approved: true,
+        };
+        let (outcome, _) =
+            run_validator_reporting(&v, &dir, Some("/some/run/graph.db")).expect("validator runs");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            outcome,
+            ValidatorOutcome::Passed,
+            "the run's own store did not reach the script under WICKED_COVERAGE_DB"
+        );
+    }
     use super::*;
 
     /// FINDING-064. The judge prompt asks for the verdict alone on line 1 and "a brief reason on the

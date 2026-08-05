@@ -87,6 +87,21 @@ pub const GATE_DB_ENV: &str = "WICKED_GATE_DB";
 /// the engine ever setting a thing.
 pub const ESTATE_DB_ENV: &str = "WICKED_ESTATE_DB";
 
+/// The store a VALIDATOR script may reach, carried under its own name.
+///
+/// Validator scripts used to be handed `WICKED_ESTATE_DB` — the OPERATIONAL store — so that
+/// `COVERAGE_SCRIPT` could shell out to `wicked-core coverage`. Those scripts are approval-gated,
+/// denylist-screened and run with a minimal env, which is a genuinely different threat model from a
+/// worker CLI running agent-authored Bash. But all three are AUTHORIZATION controls: none of them
+/// constrain what an approved script does with the handle once it holds it, and FINDING-067 showed
+/// the failure needs no malice — just a tool that defaults to `$WICKED_ESTATE_DB`. An approved
+/// script shelling out to any estate tool without `--db` inherits the operational store exactly as
+/// the worker did (core#166).
+///
+/// Same remedy the hook got in #165: a dedicated name, so the operational one can be removed from
+/// the environment rather than merely not-used.
+pub const COVERAGE_DB_ENV: &str = "WICKED_COVERAGE_DB";
+
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
 ///
 /// `scope`/`phase` are resolved by the caller (`bin/wicked-core`) from argv (standalone) ELSE the
