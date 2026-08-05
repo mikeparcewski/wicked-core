@@ -951,8 +951,10 @@ fn pinned_validator_denial(
 /// conjunct failed. Two runs produced byte-identical denials while measuring completely different
 /// things:
 ///
-///     behavior_bearing 0    coverage 1.0     <- the gate read the WRONG STORE (FINDING-091)
-///     behavior_bearing 766  coverage 0.171   <- the gate read the right one, 17% covered
+/// ```text
+/// behavior_bearing 0    coverage 1.0     <- the gate read the WRONG STORE (FINDING-091)
+/// behavior_bearing 766  coverage 0.171   <- the gate read the right one, 17% covered
+/// ```
 ///
 /// The first is "your extraction produced nothing"; the second is "your extraction covered 17%".
 /// Different problems, different next actions, same message — and the CRITICAL defect behind the
