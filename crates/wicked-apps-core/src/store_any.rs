@@ -85,6 +85,9 @@ impl GraphRead for AnyStore {
     fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
         on_backend!(self, s => s.unresolved_refs_for_name(name))
     }
+    fn indexed_files(&self) -> Result<Vec<String>> {
+        on_backend!(self, s => s.indexed_files())
+    }
     fn file_digest(&self, file: &str) -> Result<Option<String>> {
         on_backend!(self, s => s.file_digest(file))
     }
@@ -168,9 +171,9 @@ impl GraphWrite for AnyStore {
         symbol: &SymbolId,
         description: Option<&str>,
         requirement: Option<&str>,
-        requirement_validated: Option<bool>,
+        validation: Option<&wicked_estate_core::ValidationClaim>,
     ) -> Result<()> {
-        on_backend!(self, s => s.set_node_semantics(symbol, description, requirement, requirement_validated))
+        on_backend!(self, s => s.set_node_semantics(symbol, description, requirement, validation))
     }
     fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
         on_backend!(self, s => s.annotate(symbol, annotation))

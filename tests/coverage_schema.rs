@@ -11,6 +11,7 @@ use wicked_apps_core::{
     synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
     SYMBOL_SCHEME,
 };
+use wicked_estate_core::semantics::ValidationClaim;
 use wicked_estate_core::Annotation;
 use wicked_governance::recompute_front_half_coverage;
 
@@ -55,8 +56,13 @@ fn recomputed_coverage_validates_against_the_kept_schema() {
     // two package-dir groups so per_app is a non-trivial array.
     let mut s = SqliteStore::in_memory().unwrap();
     let charge = node(&mut s, "charge", NodeKind::Function, "billing/charge.rs");
-    s.set_node_semantics(&charge.symbol, None, Some("REQ-1"), Some(true))
-        .unwrap();
+    s.set_node_semantics(
+        &charge.symbol,
+        None,
+        Some("REQ-1"),
+        Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+    )
+    .unwrap();
     s.annotate(
         &charge.symbol,
         Annotation::new("business_rule", "r", "amount > 0").with_confidence(0.9),
@@ -76,8 +82,13 @@ fn recomputed_coverage_validates_against_the_kept_schema() {
         NodeKind::Other("cics_program".into()),
         "mf/a.cbl",
     );
-    s.set_node_semantics(&pgm.symbol, None, Some("REQ-2"), Some(true))
-        .unwrap();
+    s.set_node_semantics(
+        &pgm.symbol,
+        None,
+        Some("REQ-2"),
+        Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+    )
+    .unwrap();
     node(&mut s, "field", NodeKind::Field, "billing/x.rs"); // structural — excluded
 
     let report = recompute_front_half_coverage(&s).unwrap();
@@ -106,8 +117,13 @@ fn empty_and_full_reports_are_schema_valid() {
     // Full 1.0 (every behavior node accounted) — schema-valid, empty unaccounted_nodes.
     let mut s2 = SqliteStore::in_memory().unwrap();
     let a = node(&mut s2, "A", NodeKind::Function, "a.rs");
-    s2.set_node_semantics(&a.symbol, None, Some("REQ"), Some(true))
-        .unwrap();
+    s2.set_node_semantics(
+        &a.symbol,
+        None,
+        Some("REQ"),
+        Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+    )
+    .unwrap();
     let full = recompute_front_half_coverage(&s2).unwrap();
     assert_eq!(full.coverage, 1.0);
     assert!(full.unaccounted_nodes.is_empty());

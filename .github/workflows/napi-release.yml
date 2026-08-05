@@ -33,10 +33,15 @@ concurrency:
 # crates.io, so there is no version-dep fallback. The build MUST check out wicked-estate as a SIBLING
 # of wicked-core so the path deps resolve from source (the .node statically bundles the bytes). Pin the
 # estate ref here; bump on each estate release that changes what the addon bundles.
-# Pinned to the estate v0.13.2 release tag — published to crates.io, with rustls-observe (drops
-# openssl-sys so aarch64-linux cross-compiles). A stable tag, not a floating SHA.
+# Pinned to an estate COMMIT rather than a release tag: `set_node_semantics` takes a
+# `ValidationClaim` (estate#81) and no tag carries it yet. Immutable and reproducible — the hazard
+# is a floating ref like `main`, not a pinned SHA. Verified no worse than v0.13.2 on the property
+# this pin was originally chosen for (no openssl-sys, so aarch64-linux cross-compiles).
+#
+# NOTE: the addon published from this workflow therefore bundles an UNRELEASED estate. Move this to
+# the tag at the next estate release.
 env:
-  WICKED_ESTATE_REF: v0.13.2
+  WICKED_ESTATE_REF: eaa51fec0aae4763cbf0412830ef4760d2d91ad8
 
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────

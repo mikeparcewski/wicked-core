@@ -8,6 +8,7 @@ use wicked_apps_core::{
     open_store, synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span,
     SYMBOL_SCHEME,
 };
+use wicked_estate_core::semantics::ValidationClaim;
 use wicked_estate_core::Annotation;
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
@@ -34,7 +35,12 @@ fn seed(db: &str, accounted: bool) {
     if accounted {
         // a validated requirement → resolved → coverage 1.0.
         store
-            .set_node_semantics(&n.symbol, None, Some("REQ-1"), Some(true))
+            .set_node_semantics(
+                &n.symbol,
+                None,
+                Some("REQ-1"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
             .unwrap();
         store
             .annotate(
