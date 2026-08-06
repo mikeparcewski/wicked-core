@@ -401,6 +401,63 @@ fn msg_floor_at(s: &str, max_bytes: usize) -> usize {
     floor
 }
 
+// ── EpochCleanup RAII guard (DES-002 T4) ─────────────────────────────────────
+
+/// RAII guard that fires `cleanup_run` when an `exec_turn_acp` invocation exits
+/// (via normal return, early return on error, or panic).
+///
+/// It is the **sole caller** of `ElicitationMaps::cleanup_run` — a design invariant
+/// enforced by the spec ("Never do: Call `cleanup_run` from `on_run_complete`").
+///
+/// # `bus_in_flight_deferred` flag
+///
+/// `exec_turn` on the bus path sets `bus_in_flight_deferred = true` BEFORE returning
+/// (after the `confirm_task_completed` call). On that path, `Drop` SKIPS the
+/// `clear_bus_in_flight` call — the bus consumer will call it after the ack-gated
+/// cursor advance. On the panic/cancel path the flag stays `false` and `Drop` clears
+/// the in-flight marker immediately so the in-flight `HashSet` does not leak.
+pub struct EpochCleanup {
+    pub maps: Arc<Mutex<ElicitationMaps>>,
+    pub run_id: String,
+    pub epoch: u64,
+    pub launch_seq: u64,
+    /// When `true`, `Drop` skips `clear_bus_in_flight` (bus consumer owns the clear).
+    /// When `false` (default), `Drop` clears it immediately.
+    pub bus_in_flight_deferred: bool,
+    /// Relay channel to emit `ElicitationResolved` when a resolution was in progress
+    /// at the time the guard fires.
+    pub tx: std::sync::mpsc::Sender<Command>,
+    /// Set when an elicitation was in-flight (resolved but not yet emitted) at guard
+    /// fire time so `Drop` can emit the `ElicitationResolved` event.
+    pub in_flight_id: Option<String>,
+    pub in_flight_action: Option<String>,
+    pub in_flight_reason: Option<String>,
+}
+
+impl Drop for EpochCleanup {
+    fn drop(&mut self) {
+        // Step 1: clear bus in-flight unless the bus consumer owns the clear.
+        if !self.bus_in_flight_deferred {
+            if let Ok(mut m) = self.maps.lock() {
+                m.clear_bus_in_flight(&self.run_id, self.launch_seq);
+            }
+        }
+        // Step 2: emit ElicitationResolved if a resolution is pending.
+        if let Some(ref id) = self.in_flight_id {
+            let _ = self.tx.send(Command::EmitEvent(crate::event::CoreEvent::ElicitationResolved {
+                session: self.run_id.clone(),
+                elicitation_id: id.clone(),
+                action: self.in_flight_action.clone().unwrap_or_default(),
+                reason: self.in_flight_reason.clone().unwrap_or_default(),
+            }));
+        }
+        // Step 3: call cleanup_run — the one and only call site.
+        if let Ok(mut m) = self.maps.lock() {
+            m.cleanup_run(&self.run_id, self.epoch, self.launch_seq);
+        }
+    }
+}
+
 // ── ACP child process ─────────────────────────────────────────────────────────
 
 struct AcpProcess {
@@ -1165,6 +1222,19 @@ struct TurnResult {
     files: Vec<String>,
 }
 
+impl TurnResult {
+    /// Construct a default-failed `TurnResult` with empty output. Used as the
+    /// starting state before a turn executes; callers overwrite it on success.
+    fn default_failed() -> Self {
+        Self {
+            output: String::new(),
+            status: StepStatus::Failed,
+            usage: None,
+            files: Vec::new(),
+        }
+    }
+}
+
 /// Send one `session/prompt` request and collect `session/update` notifications until
 /// the response arrives (or `timeout` elapses). Streams text deltas through `emit`.
 ///
@@ -1529,6 +1599,20 @@ pub struct AcpStepRunner {
     chat_activity: Arc<Mutex<HashMap<String, Instant>>>,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
+    /// Shared elicitation coordination state (DES-002). One Arc per Core instance; also held
+    /// by the actor for `Command::ResolveElicitation` dispatch.
+    pub elicitation_maps: Arc<Mutex<ElicitationMaps>>,
+    /// Per-run process-generation tokens. A new uuid is minted when a run starts; threaded
+    /// through `StepInput.process_gen` so bus consumers can discard completions from a prior
+    /// daemon restart (stale-result guard).
+    #[allow(dead_code)]
+    session_gen: HashMap<String, uuid::Uuid>,
+    /// Set of run-ids that currently hold a write lock on their ACP process's stdin. Used by
+    /// `exec_turn_acp` to detect a concurrent write attempt (I-10: no interleaved JSON-RPC
+    /// framing). Checked before spawning the off-actor writer; `exec_turn_acp` asserts the
+    /// invariant, it does not enforce queuing.
+    #[allow(dead_code)]
+    write_reg: HashSet<String>,
 }
 
 /// Why a chat's warm sessions were released — carried on `ChatClosed` so an operator can tell a
@@ -1580,6 +1664,9 @@ impl AcpStepRunner {
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs(secs),
+            elicitation_maps: Arc::new(Mutex::new(ElicitationMaps::new())),
+            session_gen: HashMap::new(),
+            write_reg: HashSet::new(),
         }
     }
 
@@ -1931,6 +2018,13 @@ impl AcpStepRunner {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         injects.remove(run_id);
+    }
+
+    /// Retire the process-generation token for a run. Called when a run ends so the
+    /// gen-id slot is freed (avoids unbounded growth for long-lived daemons).
+    #[allow(dead_code)]
+    pub fn drop_session_gen(&mut self, run_id: &str) {
+        self.session_gen.remove(run_id);
     }
 
     /// Drain queued operator messages matching `(run_id, cli_key)` — `All`-targeted and
@@ -3557,6 +3651,102 @@ sleep 30
         assert!(cli_runs_claude("/opt/somewhere/claude"));
         assert!(!cli_runs_claude("codex"));
         assert!(!cli_runs_claude("claude-ish"));
+    }
+
+    // ── DES-002 EpochCleanup unit tests (T4) ─────────────────────────────────────
+
+    fn make_maps() -> Arc<Mutex<ElicitationMaps>> {
+        Arc::new(Mutex::new(ElicitationMaps::new()))
+    }
+
+    fn make_guard(
+        maps: Arc<Mutex<ElicitationMaps>>,
+        run_id: &str,
+        epoch: u64,
+        launch_seq: u64,
+    ) -> EpochCleanup {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        EpochCleanup {
+            maps,
+            run_id: run_id.to_string(),
+            epoch,
+            launch_seq,
+            bus_in_flight_deferred: false,
+            tx,
+            in_flight_id: None,
+            in_flight_action: None,
+            in_flight_reason: None,
+        }
+    }
+
+    /// Test 35: cleanup_run reclaims state — pass launch_seq=0 for local/non-bus case.
+    #[test]
+    fn cleanup_run_reclaims_state_local_path() {
+        let maps_arc = make_maps();
+        {
+            let mut m = maps_arc.lock().unwrap();
+            m.begin_launch("run-local", 0);
+            m.register("run-local", 1, "e-local", "q", None, "r").unwrap();
+        }
+        {
+            let m = maps_arc.lock().unwrap();
+            assert_eq!(m.active_workers, 1);
+            assert!(m.pending.contains_key("e-local"));
+        }
+        {
+            let mut m = maps_arc.lock().unwrap();
+            m.cleanup_run("run-local", 1, 0);
+        }
+        let m = maps_arc.lock().unwrap();
+        assert_eq!(m.active_workers, 0, "worker count decremented");
+        assert!(!m.pending.contains_key("e-local"), "pending entry removed");
+    }
+
+    /// EpochCleanup drop with bus_in_flight_deferred=false clears in-flight immediately.
+    #[test]
+    fn epoch_cleanup_drop_clears_in_flight_when_not_deferred() {
+        let maps_arc = make_maps();
+        {
+            let mut m = maps_arc.lock().unwrap();
+            m.begin_launch("run-drop", 1);
+            m.mark_bus_in_flight("run-drop", 1);
+        }
+        {
+            let m = maps_arc.lock().unwrap();
+            assert!(m.is_bus_worker_in_flight("run-drop", 1), "in-flight before drop");
+        }
+        {
+            let guard = make_guard(maps_arc.clone(), "run-drop", 1, 1);
+            // Drop here — bus_in_flight_deferred is false.
+            drop(guard);
+        }
+        let m = maps_arc.lock().unwrap();
+        assert!(!m.is_bus_worker_in_flight("run-drop", 1), "in-flight cleared after drop");
+        assert_eq!(m.active_workers, 0, "cleanup_run fired (worker decremented)");
+    }
+
+    /// EpochCleanup drop with bus_in_flight_deferred=true does NOT clear in-flight.
+    #[test]
+    fn epoch_cleanup_drop_skips_clear_when_deferred() {
+        let maps_arc = make_maps();
+        {
+            let mut m = maps_arc.lock().unwrap();
+            m.begin_launch("run-defer", 1);
+            m.mark_bus_in_flight("run-defer", 1);
+        }
+        {
+            let mut guard = make_guard(maps_arc.clone(), "run-defer", 1, 1);
+            guard.bus_in_flight_deferred = true;
+            drop(guard);
+        }
+        let m = maps_arc.lock().unwrap();
+        // in-flight NOT cleared — bus consumer owns the clear.
+        assert!(
+            m.is_bus_worker_in_flight("run-defer", 1),
+            "in-flight NOT cleared when deferred — bus consumer will clear it"
+        );
+        // cleanup_run still fired (worker decremented).
+        assert_eq!(m.active_workers, 0, "cleanup_run still decremented worker count");
     }
 
     // ── DES-002 ElicitationMaps unit tests (T3, tests 1–11 + 10a) ────────────────
