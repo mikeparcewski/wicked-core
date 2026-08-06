@@ -219,6 +219,51 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
         }
     };
 
+    // Everything from here on is CARRIER-INDEPENDENT: the sentinel, the policy evaluation, the
+    // durable claim, and the allow/deny answer. Only the step above — turning a wire payload into
+    // `(context, tool)` — differs between carriers. Split out so the ACP path can enforce the SAME
+    // policy and write the SAME audit trail instead of running ungoverned (FINDING-062).
+    evaluate_tool_call(
+        scope,
+        phase,
+        phase_alias,
+        db,
+        &decisions_path,
+        &context,
+        &tool,
+    )
+}
+
+/// Evaluate one tool call against the run's policies, record it durably, and answer allow/deny.
+///
+/// Returns the gate-hook exit convention: `0` = allow, `2` = deny.
+///
+/// # Why this is separate from [`run_gate_hook`]
+///
+/// Two carriers reach the same gate. Claude's wrapped path invokes `wicked-core gate-hook` as a
+/// PreToolUse hook and hands it a `{tool_name, tool_input}` payload on stdin. The ACP path has no
+/// subprocess to hook — the bridge drives the agent SDK in-process and asks the CLIENT for
+/// permission over `session/request_permission`. Before this split there was no way for that path
+/// to reach the policy, so governed units were rerouted to single-shot execution instead
+/// (FINDING-060/062), which is what made `domain-extraction` unable to finish on a real repo
+/// (FINDING-100).
+///
+/// The audit trail is not incidental to the answer. `fold_input_denial` requires the hook-fired
+/// sentinel for the phase; a carrier that returned allow/deny WITHOUT writing it would be denied
+/// downstream for looking bypassed. Sharing this function is what makes the two carriers
+/// indistinguishable to the fold, which is the property that matters.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_tool_call(
+    scope: &str,
+    phase: &str,
+    phase_alias: Option<&str>,
+    db: Option<&str>,
+    decisions_path: &str,
+    context: &serde_json::Value,
+    tool: &str,
+) -> i32 {
+    // No clones: this runs once per tool call on both carriers, and `context` carries the tool's
+    // whole input — file contents included (review).
     // Write the hook-fired liveness sentinel for `phase` BEFORE any policy evaluation or early-returns
     // below. This proves the hook BINARY was invoked for this phase (not just that the launcher
     // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
@@ -239,7 +284,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&decisions_path)?;
+                .open(decisions_path)?;
             f.write_all(sentinel_line.as_bytes())
         }) {
             eprintln!("wicked-governance: DENY (could not write hook-fired sentinel: {e})");
@@ -257,7 +302,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
         Ok(s) => s,
         Err(e) => {
             append_infra_deny(
-                &decisions_path,
+                decisions_path,
                 scope,
                 phase,
                 &crate::diagnostic::with_cause("store open failed", &e),
@@ -272,18 +317,18 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
     // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
-    if let Some(reason) = boundary_denial(&context, &tool) {
-        append_boundary_deny(&decisions_path, scope, phase, &reason);
+    if let Some(reason) = boundary_denial(context, tool) {
+        append_boundary_deny(decisions_path, scope, phase, &reason);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
 
     let phases = crate::scope::phase_aliases(phase, phase_alias);
-    let selected = match select_any(&store, scope, &phases, &context) {
+    let selected = match select_any(&store, scope, &phases, context) {
         Ok(s) => s,
         Err(e) => {
             append_infra_deny(
-                &decisions_path,
+                decisions_path,
                 scope,
                 phase,
                 &crate::diagnostic::with_cause("policy select failed", &e),
@@ -295,7 +340,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
             return 2;
         }
     };
-    let claim = decide(&selected, scope, phase, &context, crate::clock::eval_now());
+    let claim = decide(&selected, scope, phase, context, crate::clock::eval_now());
 
     // Write the tool-call annotation AND the claim as a SINGLE buffer under the advisory lock.
     // Using one buffer means that even if `with_append_lock` degrades to running without the lock
@@ -304,7 +349,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
     // subprocess can interleave between the annotation and the claim (Copilot).
     {
         let annotation_json = serde_json::json!({
-            TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool.as_str() },
+            TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
             TOOL_CALL_PHASE_KEY: phase,
         })
         .to_string()
@@ -325,7 +370,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&decisions_path)?;
+                .open(decisions_path)?;
             f.write_all(combined.as_bytes())
         }) {
             eprintln!("wicked-governance: DENY (could not append decision: {e})");
@@ -335,11 +380,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
 
     match claim.decision {
         Decision::Deny => {
-            let t = if tool.is_empty() {
-                "tool-call"
-            } else {
-                tool.as_str()
-            };
+            let t = if tool.is_empty() { "tool-call" } else { tool };
             eprintln!("wicked-governance: DENY `{t}` (claim {})", claim.claim_id);
             2
         }
@@ -991,7 +1032,11 @@ pub fn count_claims(store: &dyn GraphRead, claim_id: &str) -> anyhow::Result<usi
 /// Parse Claude's PreToolUse event `{ "tool_name", "tool_input": { … } }` into the governance
 /// evaluation context (ported from `wicked-agent/src/inject.rs`). `tool_input` keys vary by tool:
 /// `Bash{command}`, `Write{file_path,content}`, `Edit{file_path,new_string}`, `Read{file_path}`, …
-fn claude_pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::Value, String) {
+pub(crate) fn claude_pretool_context(
+    raw: &str,
+    scope: &str,
+    phase: &str,
+) -> (serde_json::Value, String) {
     let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
     let tool = v
         .get("tool_name")
