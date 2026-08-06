@@ -211,6 +211,8 @@ fn status_to_str(s: StepStatus) -> &'static str {
         StepStatus::Ok => "ok",
         StepStatus::Failed => "failed",
         StepStatus::Cancelled => "cancelled",
+        // ACP elicitation terminal: non-retriable; bypasses FailureTriageReady (DES-002 I-7).
+        StepStatus::ElicitationFailed => "elicitation_failed",
     }
 }
 
@@ -218,6 +220,9 @@ fn status_from_str(s: &str) -> StepStatus {
     match s {
         "failed" => StepStatus::Failed,
         "cancelled" => StepStatus::Cancelled,
+        // ACP elicitation terminal — explicit arm required; the wildcard default `Ok` is WRONG here
+        // (DES-002-tests.md §StepStatus exhaustive match sites).
+        "elicitation_failed" => StepStatus::ElicitationFailed,
         _ => StepStatus::Ok,
     }
 }
@@ -720,6 +725,9 @@ fn run_cli_runner(
                             output: p.output,
                         })
                         .collect(),
+                    elicitation_epoch: 0,
+                    process_gen: None,
+                    launch_seq: 0,
                 };
                 // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does. The
@@ -735,6 +743,8 @@ fn run_cli_runner(
                             run_id: delta_run_id.clone(),
                             ord: delta_ord,
                             chunk: chunk.to_string(),
+                            process_gen: None, // bus consumer path sets these in T7
+                            launch_seq: 0,
                         });
                     }
                 };
@@ -850,6 +860,9 @@ fn run_task_completed_poller(
                     .send(Command::ApplyStepResult {
                         output,
                         agent_verdict,
+                        process_gen: None, // set by bus consumer predecessor/degraded paths (DES-002)
+                        launch_seq: 0,
+                        ack: None,
                     })
                     .is_err()
                 {
@@ -908,6 +921,9 @@ mod tests {
             workdir: None,
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
 
         // Arm the publisher on THIS thread, publish, then disarm (thread-local is per-thread).
@@ -969,6 +985,9 @@ mod tests {
                 code_graph_db: Some("/abs/repo/.codegraph/estate.db".into()),
             }),
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
 
         assert!(arm_exec_publisher(&bus_path), "arm publisher");
@@ -1073,6 +1092,9 @@ mod tests {
             workdir: Some(dir.clone()),
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let noop: &DeltaSink = &|_: &str| {};
 

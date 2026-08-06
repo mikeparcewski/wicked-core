@@ -138,6 +138,9 @@ pub fn author_deterministic_validator(
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
         prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     };
     let out = runner.run_unit(&input);
     runner.on_run_complete(&run_id);
@@ -1128,6 +1131,9 @@ fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
         prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     }
 }
 
@@ -1208,6 +1214,9 @@ pub fn triage_failure(
         // Engine-internal judge call — ungoverned, like agent_validate.
         governance: None,
         prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     };
     let out = runner.run_unit(&input);
     // Drop any session the judge's runner opened under the triage run id.

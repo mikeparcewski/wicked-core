@@ -995,6 +995,9 @@ pub(crate) fn run(
             Command::ApplyStepResult {
                 output,
                 agent_verdict,
+                process_gen: _,  // stale-result guard — consumed by bus consumer; ignored here
+                launch_seq: _,
+                ack,
             } => {
                 let run_id = output.run_id.clone();
                 match apply_step_result(
@@ -1046,6 +1049,11 @@ pub(crate) fn run(
                         }
                         in_flight.remove(&run_id);
                     }
+                }
+                // ACP elicitation bus consumer ack (DES-002): signal AFTER store commit so the
+                // consumer's cursor advance is durable. `None` on all non-bus paths.
+                if let Some(ack_tx) = ack {
+                    let _ = ack_tx.send(());
                 }
             }
             Command::ConfirmGate {
@@ -1115,7 +1123,7 @@ pub(crate) fn run(
             Command::RetireConformanceRule { id, reply } => {
                 let _ = reply.send(wicked_governance::retire_rule(&mut store, &id));
             }
-            Command::CliOutputDelta { run_id, ord, chunk } => {
+            Command::CliOutputDelta { run_id, ord, chunk, process_gen: _, launch_seq: _ } => {
                 // The single emit point fans a worker's live output chunk out to subscribers.
                 emit(
                     &mut subscribers,
@@ -1126,6 +1134,11 @@ pub(crate) fn run(
                     },
                 );
             }
+            Command::ResolveElicitation { reply, .. } => {
+                // Full implementation in T6 once ElicitationMaps is implemented (T3).
+                let _ = reply.send(Err(anyhow::anyhow!("elicitation not found")));
+            }
+
             Command::EmitEvent(ev) => {
                 // Maintain the run → [(cli_key, terminal_id)] index used by InjectWorkerMessage
                 // and ReassignUnit. Only PTY-backed sessions appear here; ACP sessions emit no
@@ -1836,6 +1849,8 @@ pub(crate) fn run(
                 decision,
                 analysis: judge_analysis,
                 failure_excerpt,
+                process_gen: _, // stale-triage guard — consumed by bus consumer in T7
+                launch_seq: _,
             } => {
                 use crate::validator::TriageDecision;
                 // Stale guards mirror apply_step_result: only the live cursor attempt of
@@ -2666,6 +2681,8 @@ fn apply_step_result(
                 crate::workflow::StepStatus::Cancelled => "cancelled",
                 crate::workflow::StepStatus::Failed => "failed",
                 crate::workflow::StepStatus::Ok => "ok",
+                // ACP elicitation terminal — routes to run-terminal path, not triage (DES-002 I-7).
+                crate::workflow::StepStatus::ElicitationFailed => "elicitation_failed",
             }
             .to_string(),
             governed: output.governed,
@@ -2869,6 +2886,8 @@ fn apply_step_result(
                         decision,
                         analysis,
                         failure_excerpt,
+                        process_gen: None, // set when bus-dispatched in T7
+                        launch_seq: 0,
                     });
                 });
                 return Ok(StepApplied::Continuing);
@@ -3511,6 +3530,9 @@ fn dispatch_unit(
             ..g
         }),
         prior_outputs,
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     };
 
     // TOOL EXECUTOR: if the unit carries a tool_cmd, bypass the CLI runner entirely.
@@ -3542,6 +3564,8 @@ fn dispatch_unit(
                 run_id: run_id2.clone(),
                 ord,
                 chunk: output_str.clone(),
+                process_gen: None, // PTY tool-cmd path — not bus-dispatched
+                launch_seq: 0,
             });
             let _ = tx.send(crate::command::Command::ApplyStepResult {
                 output: crate::workflow::StepOutput {
@@ -3555,6 +3579,9 @@ fn dispatch_unit(
                     governed: false,
                 },
                 agent_verdict: None,
+                process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
+                launch_seq: 0,
+                ack: None,
             });
         });
         return Ok(true);
@@ -3589,6 +3616,8 @@ fn dispatch_unit(
                     run_id: run_id.clone(),
                     ord,
                     chunk: chunk.to_string(),
+                    process_gen: None, // local-path worker; bus consumer sets in T7
+                    launch_seq: 0,
                 });
             }
         };
@@ -3610,6 +3639,9 @@ fn dispatch_unit(
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,
+            process_gen: None, // local-path worker; bus consumer sets these in T7
+            launch_seq: 0,
+            ack: None,
         });
     });
     Ok(true)
