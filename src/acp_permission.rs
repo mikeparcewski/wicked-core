@@ -176,6 +176,100 @@ mod tests {
         ])
     }
 
+    /// THE END-TO-END PROOF, and the reason this module exists.
+    ///
+    /// Everything else here is structural — the handler is wired, the capability advertised, the
+    /// marker written. Structural wiring is exactly what "looks governed" means. This asserts the
+    /// claim itself: a governed ACP permission request for a tool a policy DENIES comes back as a
+    /// refusal AND leaves a durable ConformanceClaim, using the same store, the same policy engine
+    /// and the same append-only log as the wrapped path's hook.
+    ///
+    /// Without this the reroute should not have been removed.
+    #[test]
+    fn a_governed_acp_request_is_denied_by_policy_and_recorded() {
+        use wicked_apps_core::open_store;
+        use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
+
+        let dir = std::env::temp_dir().join(format!("wicked-acpgate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("gov.db");
+        let decisions = dir.join("decisions.jsonl");
+
+        let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+        // Fires on the tool name, which `claude_pretool_context` puts into the evaluated context.
+        register_policy(
+            &mut store,
+            &Policy {
+                id: "pol-deny-bash".to_string(),
+                kind: "test".to_string(),
+                applies_to: vec!["unit-1".to_string()],
+                effect: Effect::Deny,
+                trigger: Trigger {
+                    contains: Some("rm -rf".to_string()),
+                },
+                obligations: vec![],
+                criteria: "no destructive shell".to_string(),
+                severity: Severity::High,
+                rule: "Deny destructive shell commands.".to_string(),
+                retired: false,
+            },
+        )
+        .unwrap();
+        drop(store);
+
+        let gate = AcpGate {
+            scope: "unit",
+            phase: "unit-1",
+            phase_alias: None,
+            db: Some(db.to_str().unwrap()),
+            decisions_path: decisions.to_str().unwrap(),
+        };
+        let params = json!({
+            "sessionId": "s1",
+            "toolName": "Bash",
+            "toolCall": {"toolCallId": "t1", "rawInput": {"command": "rm -rf /"}},
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "reject", "kind": "reject_once"},
+            ],
+        });
+
+        let (result, allowed) = permission_result(&gate, &params);
+
+        assert!(!allowed, "a policy-denied tool call must not be permitted");
+        assert_eq!(
+            result["outcome"]["optionId"], "reject",
+            "the agent must be told to refuse, not merely told nothing: {result}"
+        );
+
+        // …and it is DURABLE. A refusal the audit cannot see is a refusal the fold cannot verify.
+        let log = std::fs::read_to_string(&decisions).expect("the decisions log must exist");
+        // Assert the SPECIFIC claim, not a substring that any prose could satisfy: the decision
+        // is a deny AND it names the policy that produced it. A log containing the word somewhere
+        // would prove nothing about what was recorded.
+        assert!(
+            log.contains(r#""decision":"deny""#),
+            "no Deny claim was appended: {log}"
+        );
+        assert!(
+            log.contains("pol-deny-bash"),
+            "the claim does not name the policy that denied, so the record cannot be audited: {log}"
+        );
+        assert!(
+            log.contains(r#""_wicked_tool_call":"Bash""#),
+            "the tool-call annotation is missing, so the claim cannot be tied to a call: {log}"
+        );
+        // The liveness sentinel proves the gate RAN for this phase. `fold_input_denial` denies a
+        // unit whose claims exist without it, so a carrier that skipped this would be rejected
+        // downstream even when it answered correctly.
+        assert!(
+            log.contains("unit-1"),
+            "the hook-fired sentinel for the phase is missing: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn options_are_chosen_by_kind_not_by_id() {
         assert_eq!(choose_option(&opts(), true).as_deref(), Some("allow"));
