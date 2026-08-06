@@ -1,6 +1,6 @@
 # Spec: DES-002 ACP Elicitation Maps
 
-- **Status:** Implementing
+- **Status:** Shipped
 - **Owner:** eugenelim
 - **Plan:** [`plan.md`](plan.md)
 - **Constrained by:** DES-002-acp-session-elicitation (full feature brief; TS half in wicked-crew)
