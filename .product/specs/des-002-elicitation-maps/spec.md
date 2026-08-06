@@ -170,11 +170,13 @@ to the 36-case DES-002-tests.md baseline.
 - [x] `resolveElicitation` NAPI binding compiles with `"serde-json"` napi feature;
       crew TS wrapper unpacks `result.content?.response ?? null` before calling. (EC — NAPI wiring)
       — verified: T8 compile passed; `crates/wicked-core-ts/Cargo.toml` has `features = ["napi8", "serde-json"]`.
-- [ ] **[Blocking pre-merge — OPEN]** Studio `ElicitationPrompt` escapes `message` before
+- [x] **[Blocking pre-merge — RESOLVED]** Studio `ElicitationPrompt` escapes `message` before
       render — this is the sole XSS/injection control (no Rust-side sanitization);
       the Rust PR must not merge until the wicked-crew TS PR with this control is
       reviewed and approved. Tracked as a PR pre-condition, not an advisory. (EC-5)
-      — STATUS: requires a wicked-crew TS PR; link must appear in the wicked-core PR description before merge.
+      — RESOLVED: mikeparcewski/wicked-crew#209 (`feat(studio): operator surface for MCP elicitations
+      (DES-002 Studio half)`) merged 2026-08-05. `ElicitationPrompt.tsx:93` renders `{e.message}` as
+      a React JSX text interpolation — React escapes HTML automatically; no `dangerouslySetInnerHTML`.
 - [x] `chat_turn` elicitation guard in place (`elicitation_enabled=false`) until OQ-R-7
       is resolved with a verifiable artifact (e.g., passing integration test run or
       source-code audit cited in the PR description). Self-assertion alone is
