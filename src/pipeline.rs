@@ -963,7 +963,12 @@ fn pinned_validator_denial(
 /// The numbers are already on disk when the denial is rendered. This reads them rather than
 /// recomputing, so the message reports what the validator ACTUALLY gated on.
 fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
-    let raw = std::fs::read_to_string(cwd.join(".wicked/domain/coverage-report.json")).ok()?;
+    // FINDING-099: this read `.wicked/domain/coverage-report.json`, a path nothing else in the
+    // system writes. It therefore never found the report, and every legitimate coverage denial was
+    // reported as "no coverage report was produced" — the floor blamed for not measuring when it
+    // had measured and the number was bad. Read the one name all four artifacts agree on.
+    let raw =
+        std::fs::read_to_string(cwd.join(crate::domain_extraction::COVERAGE_REPORT_FILE)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
     let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
@@ -1109,8 +1114,16 @@ mod denial_message_tests {
         fn denial_for(report: &str) -> String {
             let dir =
                 std::env::temp_dir().join(format!("den_{}_{}", std::process::id(), report.len()));
-            std::fs::create_dir_all(dir.join(".wicked/domain")).unwrap();
-            std::fs::write(dir.join(".wicked/domain/coverage-report.json"), report).unwrap();
+            // FINDING-099: this fixture used to write `.wicked/domain/coverage-report.json` — the
+            // SAME wrong path the implementation read. Test and code shared one mistake, so the
+            // test passed while the behaviour it asserted never occurred in production. Writing
+            // through the shared constant is what stops a fixture from agreeing with a defect.
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(crate::domain_extraction::COVERAGE_REPORT_FILE),
+                report,
+            )
+            .unwrap();
             let msg = denial_for_outcome(&O::Failed, CRITERION, &dir).expect("denies");
             let _ = std::fs::remove_dir_all(&dir);
             msg
@@ -1285,6 +1298,66 @@ mod resolve_tests {
         // UNAPPROVED ⇒ run_validator refuses ⇒ denial (fail-closed).
         unit.validator = Some(mk("test -f ok.txt", false));
         assert!(pinned_validator_denial(&unit, Some(&dir), None).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── FINDING-099: the denial must name the number it measured ────────────────────────────
+    //
+    // `failing_measurement` read `.wicked/domain/coverage-report.json`, a path nothing else in this
+    // system writes. It never found the report, so every LEGITIMATE coverage denial claimed the
+    // floor "could not measure" — blaming the engine for a bad number it had measured correctly,
+    // and making the denial indistinguishable from FINDING-093's genuinely inert floor.
+
+    /// P1 rule, applied without touching the content-addressed script: the reader and the script
+    /// must agree on the filename, and this asserts BOTH artifacts rather than restating either.
+    #[test]
+    fn the_script_and_the_diagnostic_agree_on_the_report_filename() {
+        assert!(
+            crate::domain_extraction::COVERAGE_SCRIPT
+                .contains(crate::domain_extraction::COVERAGE_REPORT_FILE),
+            "the shipped coverage script does not mention {} — the diagnostic would read a file \
+             the script never produces",
+            crate::domain_extraction::COVERAGE_REPORT_FILE
+        );
+    }
+
+    /// The behaviour that actually broke. Falsified by restoring the nested path: this fails.
+    #[test]
+    fn a_failing_report_is_read_from_the_worktree_root() {
+        let dir = std::env::temp_dir().join(format!("wicked-cov-{}-root", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join(crate::domain_extraction::COVERAGE_REPORT_FILE),
+            r#"{"behavior_bearing":5769,"resolved":128,"risk_flagged":0,"unaccounted":5641,"coverage":0.0222}"#,
+        )
+        .expect("write report");
+
+        let m = failing_measurement(&dir).expect("the report at the worktree root must be read");
+        assert!(m.contains("behavior_bearing=5769"), "{m}");
+        assert!(m.contains("unaccounted=5641"), "{m}");
+        assert!(m.contains("coverage=0.0222"), "{m}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half: a report ONLY at the old nested path must NOT be found, so a future edit
+    /// cannot quietly satisfy the test above by reading both locations. Reading two paths would
+    /// reintroduce the ambiguity this fix removes.
+    #[test]
+    fn the_abandoned_nested_path_is_not_consulted() {
+        let dir = std::env::temp_dir().join(format!("wicked-cov-{}-nested", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".wicked/domain")).expect("temp dir");
+        std::fs::write(
+            dir.join(".wicked/domain").join(crate::domain_extraction::COVERAGE_REPORT_FILE),
+            r#"{"behavior_bearing":1,"resolved":1,"risk_flagged":0,"unaccounted":0,"coverage":1.0}"#,
+        )
+        .expect("write report");
+
+        assert!(
+            failing_measurement(&dir).is_none(),
+            "the nested path is not where anything writes; consulting it invites two spellings again"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -45,9 +45,37 @@ pub const COVERAGE_CRITERION: &str =
 /// is non-zero anywhere. Built only from `test`/`grep`/`!`/`${VAR:-fallback}` so it passes the
 /// [`looks_dangerous`](crate::validator) denylist (no redirection, command substitution `$(`, or
 /// destructive/network token; `${VAR}`/`${VAR:-default}` expansion and `!`/`||` are allowed).
-/// The binary is invoked as `${WICKED_CORE_EXE:-wicked-core}` — the validator runner injects
-/// `WICKED_CORE_EXE = current_exe()` so CI finds the right binary without relying on PATH.
+/// The binary is invoked as `${WICKED_CORE_EXE:-wicked-core}`. The validator runner resolves and
+/// injects that path (`execute_wrapped::resolve_wicked_core_exe_opt`) so the script finds the right
+/// binary without relying on PATH. It used to inject `current_exe()`, which is the NODE binary when
+/// the engine runs as a napi addon — so the script ran `node coverage` and the floor never executed
+/// on a real run (FINDING-093).
 pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage)) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
+
+/// The coverage report's filename, relative to the run's worktree.
+///
+/// Named once because three things have to agree on it AT RUNTIME: [`COVERAGE_SCRIPT`] (which reads
+/// it and, on the fallback branch, causes it to be written), `wicked-core coverage` (which writes it
+/// into its cwd), and the denial diagnostic that reads it back to report what was measured.
+///
+/// `workflows/domain-extraction.json` also lists the file in the `coverage` phase's
+/// `required_deliverables`, but that field is deserialized into
+/// [`PhaseDef`](crate::workflow::PhaseDef) and never read by anything — it documents an intent the
+/// engine does not enforce, so it is NOT a fourth agreeing artifact (review; filed as FINDING-101).
+///
+/// The fourth disagreed. `failing_measurement` looked in `.wicked/domain/coverage-report.json` — a
+/// path nothing else in the system uses — so it never found the report, and every LEGITIMATE
+/// coverage denial was reported as "no coverage report was produced, so the criterion could not be
+/// measured" (FINDING-099). That is a false cause: the floor had measured, and the number was
+/// simply bad. It is precisely the mis-attribution FINDING-092 was written to end, and it made the
+/// denial indistinguishable from FINDING-093's genuinely-inert floor.
+///
+/// This constant does not appear inside [`COVERAGE_SCRIPT`] by interpolation — that string is
+/// content-addressed by [`COVERAGE_VALIDATOR_PIN`] and changing its bytes would cascade across the
+/// pin, the shipped drop-in, crew's mirror and crew's test. The guard in this module's tests
+/// asserts the script CONTAINS this name instead, which is the same P1 rule applied without
+/// disturbing the hash.
+pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 
 /// The APPROVED content-address pin the `coverage` phase carries in `workflows/domain-extraction.json`.
 /// Content-hash over `(COVERAGE_CRITERION, COVERAGE_SCRIPT, approved=true)` — see
