@@ -91,6 +91,7 @@ mod tests {
             gate: GateSpec::default(),
             role: PhaseRole::default(),
             validator: None,
+            required_deliverables: Vec::new(),
             tool_cmd: None,
             depends_on: Vec::new(),
             status: UnitStatus::Pending,
