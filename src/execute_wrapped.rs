@@ -691,11 +691,14 @@ impl WrappedCliStepRunner {
                     // as "measured mid-write" rather than "the work was bad".
                     if settled.left_work_running() {
                         // stderr, not just the unit output: an operator tailing the daemon needs
-                        // to see that a completion claim was made over unfinished work, without
-                        // having to open the unit afterwards.
+                        // to see that a completion claim was made over work we could not confirm
+                        // finished, without having to open the unit afterwards. "still running OR
+                        // unreadable" — the Unknown case (process table could not be read) is not
+                        // "still running", and saying so would be the same over-claiming this fix
+                        // removes.
                         eprintln!(
                             "wicked-core: unit {} reported done with its own background work still \
-                             running (FINDING-100)",
+                             running or unconfirmed (FINDING-100)",
                             input.unit.id
                         );
                     }
