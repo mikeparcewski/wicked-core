@@ -94,6 +94,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 binary: "claude-agent-acp".into(),
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
+                auth_method: None,
             }),
             capabilities: Some(
                 "broad reasoning, architecture design, TypeScript/React/web, \
@@ -121,6 +122,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 binary: "agy-acp".into(),
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
+                auth_method: None,
             }),
             capabilities: Some(
                 "fast iteration, multi-language code generation, open-source models, \
@@ -148,6 +150,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 binary: "codex-acp".into(),
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
+                auth_method: None,
             }),
             capabilities: Some(
                 "algorithm implementation, Python/JavaScript code generation, \
@@ -172,6 +175,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 binary: "pi-acp".into(),
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
+                auth_method: None,
             }),
             capabilities: Some(
                 "conversational reasoning, nuanced analysis, cross-language tasks, \
@@ -197,6 +201,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 binary: "copilot".into(),
                 start_args: vec!["--acp".into()],
                 transport: AcpTransport::Stdio,
+                auth_method: None,
             }),
             capabilities: Some(
                 "GitHub context, pull request review, commit-level changes, \
@@ -221,6 +226,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 binary: "opencode".into(),
                 start_args: vec!["acp".into()],
                 transport: AcpTransport::Stdio,
+                auth_method: None,
             }),
             capabilities: Some(
                 "open-source models, local/private code, broad language support, \
@@ -369,6 +375,7 @@ headless_invocation = "claude -p \"{PROMPT}\""
 binary = "my-claude-acp"
 start_args = ["--flag"]
 transport = "stdio"
+auth_method = "gateway"
 
 [[cli]]
 key = "codex"
@@ -387,6 +394,14 @@ headless_invocation = "codex exec \"{PROMPT}\""
         assert_eq!(acp.binary, "my-claude-acp");
         assert_eq!(acp.start_args, vec!["--flag".to_string()]);
         assert_eq!(acp.transport, AcpTransport::Stdio);
+        // FINDING-015: an operator can pin the `authenticate` methodId per ACP server.
+        assert_eq!(acp.auth_method.as_deref(), Some("gateway"));
+        // …and the built-ins ship WITHOUT one — the default is the agent's own first
+        // advertised method, not a hardcoded guess about someone else's auth surface.
+        assert!(builtin()
+            .iter()
+            .filter_map(|c| c.acp.as_ref())
+            .all(|a| a.auth_method.is_none()));
 
         // An override without [cli.acp] replaces the built-in wholesale — ACP stripped.
         let codex = merged.iter().find(|c| c.key == "codex").unwrap();
