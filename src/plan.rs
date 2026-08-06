@@ -89,6 +89,10 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // onto the unit is what lets the dispatch site inject the right priors — and keeps the
             // bound author-controlled rather than a guessed "last N units".
             unit.depends_on = phase.depends_on.clone();
+            // Carry the phase's DECLARED deliverables (FINDING-101). PhaseDef parsed this and
+            // nothing read it, so a workflow could list required outputs the engine never verified.
+            // The completion path checks them, mirroring how validator/gate/role flow from def to unit.
+            unit.required_deliverables = phase.required_deliverables.clone();
             // Carry the tool command for Tool-executor phases so the actor can run it directly.
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());

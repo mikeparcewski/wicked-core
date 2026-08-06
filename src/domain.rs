@@ -187,6 +187,13 @@ pub struct WorkUnit {
     /// behavior). `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub validator: Option<crate::validator::DeterministicValidator>,
+    /// Files this unit's phase DECLARED it must produce, relative to the worktree (FINDING-101).
+    /// Carried from `PhaseDef::required_deliverables`, which was parsed and never read — so every
+    /// workflow could promise artifacts nothing checked. The completion path verifies these exist
+    /// before the unit may report Ok, which is the same rule the rest of the engine applies: done
+    /// is re-derived from evidence, not asserted.
+    #[serde(default)]
+    pub required_deliverables: Vec<String>,
     /// The exact command this unit runs when `PhaseExecutor::Tool` (carried from the phase def).
     /// `None` for Agent-executor units. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -352,6 +359,7 @@ impl WorkUnit {
             gate: crate::workflow::GateSpec::default(),
             role: crate::workflow::PhaseRole::default(),
             validator: None,
+            required_deliverables: Vec::new(),
             tool_cmd: None,
             depends_on: Vec::new(),
             status: UnitStatus::Pending,

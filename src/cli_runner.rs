@@ -1042,7 +1042,7 @@ mod tests {
                     run_id: input.run_id.clone(),
                     unit_ix: input.unit_ix,
                     attempt: input.attempt,
-                    output: "PASS recorded".into(),
+                    output: "PASS\nrecorded\nPASS".into(),
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),

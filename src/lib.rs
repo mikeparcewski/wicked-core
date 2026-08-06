@@ -38,6 +38,7 @@ mod knowledge;
 #[cfg(test)]
 mod lockstep;
 mod memory;
+mod outstanding_work;
 pub mod path_policy;
 mod pipeline;
 mod plan;
