@@ -412,7 +412,12 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         "initialize",
         json!({
             "protocolVersion": 1,
-            "clientCapabilities": {"fs": {}, "terminal": false},
+            // `permission: true` says this client ANSWERS session/request_permission. Without it the
+            // bridge never asks, which is exactly why the ACP path ran ungoverned (FINDING-060/062).
+            // We answer on every turn — policy when the unit is governed, an explicit allow when it
+            // is not — so advertising it per-session stays correct even though sessions are shared
+            // across units while governance is per-unit.
+            "clientCapabilities": {"fs": {}, "terminal": false, "permission": true},
             "clientInfo": {"name": "wicked-core", "version": env!("CARGO_PKG_VERSION")}
         }),
     ) {
@@ -476,6 +481,18 @@ fn rpc_send(
 /// Wait for the JSON-RPC response whose `"id"` matches `id`, skipping both
 /// notifications and non-JSON startup banners/logs. Returns `Err` on timeout,
 /// channel disconnect, or a server-side `"error"` field.
+/// Answer an inbound JSON-RPC REQUEST from the agent.
+///
+/// Distinct from [`rpc_send`], which originates requests: this carries `result` for an `id` the
+/// AGENT chose. Getting the two confused would leave the agent waiting on a frame that never
+/// answers its question.
+fn rpc_respond(stdin: &mut BufWriter<ChildStdin>, id: u64, result: Value) -> anyhow::Result<()> {
+    let msg = json!({"jsonrpc":"2.0","id":id,"result":result});
+    writeln!(stdin, "{msg}")?;
+    stdin.flush()?;
+    Ok(())
+}
+
 fn rpc_expect(
     rx: &std::sync::mpsc::Receiver<String>,
     id: u64,
@@ -536,6 +553,7 @@ fn exec_turn_acp(
     prior_outputs: &[PriorUnitOutput],
     emit: &DeltaSink,
     timeout: Duration,
+    gate: Option<&crate::acp_permission::AcpGate<'_>>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
@@ -629,6 +647,25 @@ prior output you are reviewing, testing, or revising."
 
                 if v.get("method").and_then(Value::as_str) == Some("session/update") {
                     handle_update(&v, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+                }
+
+                // The agent asking permission for a tool call. This is a REQUEST, not a
+                // notification: it carries an `id` and blocks the agent until answered. Before
+                // this, the loop handled only notifications, so an unanswered request would have
+                // hung the turn — which is why the capability above had to stay off.
+                if v.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+                    if let Some(req_id) = v.get("id").and_then(Value::as_u64) {
+                        let params = v.get("params").cloned().unwrap_or(Value::Null);
+                        let result = match gate {
+                            // Governed: the SAME policy and the SAME audit records as the wrapped
+                            // path's PreToolUse hook.
+                            Some(g) => crate::acp_permission::permission_result(g, &params).0,
+                            // Ungoverned: permitted, as it has always been on this path — but said
+                            // out loud rather than left to a capability we quietly withheld.
+                            None => crate::acp_permission::allow_result(&params),
+                        };
+                        let _ = rpc_respond(&mut proc.stdin, req_id, result);
+                    }
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -1185,7 +1222,7 @@ impl AcpStepRunner {
         });
         let result = {
             let mut proc = arc.lock().unwrap_or_else(|p| p.into_inner());
-            exec_turn_acp(&mut proc, text, &[], &emit, Self::chat_timeout())
+            exec_turn_acp(&mut proc, text, &[], &emit, Self::chat_timeout(), None)
         };
         // Touch again on the way out. `chat_ensure` touched on the way in, but a long turn would
         // then be counted as idle for its whole duration — a 40-minute agent turn would be reaped
@@ -1371,22 +1408,45 @@ impl AcpStepRunner {
         //
         // Non-claude CLIs are unaffected: input arming was always claude-only, so their governed
         // units keep the shared ACP session path below exactly as before.
-        if input.governance.is_some() && cli_runs_claude(&cli_key) {
-            // Warned, not just evented. A governed unit that quietly loses multi-turn looks
-            // identical in `StepOutput.output` to one that never had it, and an unobserved path
-            // change is precisely how the ungoverned ACP path survived this long.
-            let reason = format!(
-                "[wicked-core] governed unit for '{cli_key}' runs single-shot: the ACP bridge \
-                 does not apply the input-governance settings it is given"
-            );
-            self.emit_event(CoreEvent::AcpFallback {
-                session: run_id.clone(),
-                cli_key: cli_key.clone(),
-                reason: reason.clone(),
-                fallback_kind: fallback_kind::GOVERNANCE_REQUIRES_WRAPPED.to_string(),
-            });
-            return fallback_with_warning(reason, input, emit, &self.fallback);
-        }
+        // GOVERNED UNITS RUN HERE NOW. This used to reroute to the wrapped path — single-shot —
+        // because the ACP bridge discards `--settings` and there was no other way to carry input
+        // governance. There is: the bridge asks the CLIENT for permission on every tool call, and
+        // we now answer with the same policy and the same audit records as the hook
+        // (`acp_permission`, FINDING-060/062). The cost that reroute paid — a governed unit gets
+        // one turn — is what made domain-extraction unable to finish on a real repo (FINDING-100).
+        let gate_ctx = match (&input.governance, cli_runs_claude(&cli_key)) {
+            (Some(g), true) => {
+                let scope =
+                    crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
+                let phase = crate::scope::unit_phase(input.unit.ord);
+                let decisions_path =
+                    crate::gate_hook::decisions_path_for(&input.run_id, input.attempt);
+                let decisions_path = decisions_path.to_string_lossy().into_owned();
+                // The ARMED marker before the first tool call, exactly as the wrapped path writes
+                // it: the fold uses its presence to tell a governed unit that legitimately made no
+                // tool calls from one whose hook never fired. Without it, a clean governed ACP run
+                // would be denied for looking bypassed.
+                if let Err(e) = crate::gate_hook::write_armed_marker(
+                    std::path::Path::new(&decisions_path),
+                    &phase,
+                ) {
+                    // Fail CLOSED: unable to arm means unable to prove the gate ran.
+                    let reason = crate::diagnostic::with_cause(
+                        "[wicked-core] could not arm governance for this ACP unit",
+                        &e,
+                    );
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::GOVERNANCE_REQUIRES_WRAPPED.to_string(),
+                    });
+                    return fallback_with_warning(reason, input, emit, &self.fallback);
+                }
+                Some((scope, phase, decisions_path, g.db_path.clone()))
+            }
+            _ => None,
+        };
 
         // SHARED ACP SESSION PATH — ungoverned units of every CLI, plus governed units of
         // non-claude CLIs (input arming is claude-only; their output-side gates still run).
@@ -1477,7 +1537,23 @@ impl AcpStepRunner {
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
         let prompt = unit_prompt(input);
 
-        match exec_turn_acp(&mut proc, &prompt, prior_outputs, emit, self.timeout) {
+        let gate = gate_ctx.as_ref().map(|(scope, phase, decisions_path, db)| {
+            crate::acp_permission::AcpGate {
+                scope,
+                phase,
+                phase_alias: None,
+                db: Some(db.as_str()),
+                decisions_path,
+            }
+        });
+        match exec_turn_acp(
+            &mut proc,
+            &prompt,
+            prior_outputs,
+            emit,
+            self.timeout,
+            gate.as_ref(),
+        ) {
             Ok(result) if result.status == StepStatus::Ok => StepOutput {
                 run_id: input.run_id.clone(),
                 unit_ix: input.unit_ix,
@@ -2316,131 +2392,45 @@ sleep 30
     /// command separators to `cmd`. So Windows names a binary that cannot exist: the spawn fails
     /// fast, without a shell, and every assertion below except the execution proof still holds,
     /// because `fallback_with_warning` prepends its warning whether or not the child runs.
-    #[cfg(unix)]
-    const CHEAP_OK: &str = "/bin/echo wicked-fallback-ran";
-    #[cfg(not(unix))]
-    const CHEAP_OK: &str = "wicked-no-such-binary-fallback-probe";
-
-    /// A unit assigned to `claude` — the routing predicate reads `assigned_cli` — whose actual
-    /// invocation is [`CHEAP_OK`], so the wrapped fallback this must reach executes something cheap
-    /// instead of a real CLI. The two are deliberately different: the ACP branch classifies by the
-    /// assigned key, the wrapped runner by argv[0].
-    fn claude_unit_running_echo() -> crate::domain::WorkUnit {
-        crate::domain::WorkUnit {
-            id: "u-gov".to_string(),
-            session_id: "run-gov".to_string(),
-            ord: 1,
-            description: "a governed unit".to_string(),
-            stage: Default::default(),
-            assigned_cli: Some("claude".to_string()),
-            assigned_invocation: Some(CHEAP_OK.to_string()),
-            council_task_ref: None,
-            routing: None,
-            denial_reason: None,
-            phase_ref: None,
-            conformance_ref: None,
-            phase_status: None,
-            collection_scope: None,
-            skill_ref: None,
-            allowed_skills: Vec::new(),
-            gate: Default::default(),
-            role: Default::default(),
-            validator: None,
-            tool_cmd: None,
-            depends_on: Vec::new(),
-            status: crate::domain::UnitStatus::Pending,
-        }
-    }
-
-    fn governed_input(dir: &std::path::Path) -> StepInput {
-        StepInput {
-            run_id: "run-gov".to_string(),
-            unit_ix: 0,
-            attempt: 0,
-            unit: claude_unit_running_echo(),
-            workflow_id: "wf-test".to_string(),
-            entity_mode: crate::scope::EntityMode::Shared,
-            workdir: Some(dir.to_path_buf()),
-            governance: Some(crate::workflow::GovernanceContext {
-                db_path: dir.join("estate.db").to_string_lossy().to_string(),
-                code_graph_db: None,
-            }),
-            prior_outputs: Vec::new(),
-        }
-    }
-
-    /// The regression this exists for: the ACP path armed governance the bridge never applied, so a
-    /// governed unit ran with every tool call ungoverned while the engine reported `governed: true`
-    /// (FINDING-060). The fix routes governed claude units to the wrapped path — the only one where
-    /// the gate-hook is measured to fire — and it has to hold *before* any ACP session is opened,
-    /// which is what the absence of an ACP-session event below pins.
+    /// FINDING-060's regression, now asserted the other way round.
+    ///
+    /// The ACP path once armed governance the bridge never applied, so a governed unit ran with
+    /// every tool call ungoverned while the engine reported `governed: true`. The interim fix
+    /// rerouted governed claude units to the wrapped path, and this test pinned that reroute.
+    ///
+    /// The reroute cost a governed unit its multi-turn session — one attempt at a task that needs
+    /// many — which is why `domain-extraction` could not finish on a real repo (FINDING-100). Now
+    /// that the client answers `session/request_permission` with the same policy and the same
+    /// audit records as the hook, the reroute is gone and this pins its ABSENCE: a governed claude
+    /// unit must stay on the ACP path.
+    ///
+    /// Pinned by source, because the alternative — driving a real bridge — needs a network and a
+    /// live agent, and a test that cannot run is a test that stops being true quietly.
     #[test]
-    fn a_governed_claude_unit_leaves_the_acp_path_before_a_session_is_opened() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let r = AcpStepRunner::new(tx);
-        let dir = std::env::temp_dir().join(format!(
-            "wicked-acpgov-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let noop = |_: &str| {};
-        let out = r.run_unit_streaming(&governed_input(&dir), &noop);
-
-        let events: Vec<CoreEvent> = rx
-            .try_iter()
-            .filter_map(|c| match c {
-                Command::EmitEvent(e) => Some(e),
-                _ => None,
-            })
-            .collect();
-
-        let fallback = events
-            .iter()
-            .find_map(|e| match e {
-                CoreEvent::AcpFallback {
-                    cli_key,
-                    fallback_kind,
-                    reason,
-                    ..
-                } => Some((cli_key.clone(), fallback_kind.clone(), reason.clone())),
-                _ => None,
-            })
-            .expect("the reroute must be announced, not silent — an unobserved path change is how the ungoverned ACP path went unnoticed");
-        assert_eq!(fallback.0, "claude");
-        assert_eq!(fallback.1, fallback_kind::GOVERNANCE_REQUIRES_WRAPPED);
-        assert!(fallback.2.contains("does not apply"), "{}", fallback.2);
-
-        // No ACP session was opened for this run: the branch returns before `start_acp_process`.
+    fn a_governed_claude_unit_is_no_longer_rerouted_off_the_acp_path() {
+        let src = include_str!("acp_runner.rs");
         assert!(
-            r.sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty(),
-            "a governed unit must not reach the ACP session pool at all"
+            !src.contains(&format!("runs single{}shot: the ACP bridge", "-")),
+            "the governance reroute is back: governed units are single-shot again, and \
+             domain-extraction cannot finish on a real repo while it is (FINDING-062/100)"
         );
-        // The downgrade has to be legible where a human reads the run, not only in the event
-        // stream: every other ACP fallback prepends its `[wicked-core] …` warning to the output,
-        // and a governed unit silently losing multi-turn is the one that most needs to say so.
+        // …and the replacement is actually wired, not merely the old branch deleted.
         assert!(
-            out.output.contains("[wicked-core]") && out.output.contains("does not apply"),
-            "the reroute warning must be prepended to StepOutput.output: {}",
-            out.output
+            src.contains("crate::acp_permission::permission_result"),
+            "governed turns no longer consult the permission gate — deleting the reroute without \
+             answering session/request_permission is the ungoverned ACP path all over again \
+             (FINDING-060)"
         );
-
-        // Execution proof — the reroute reached a runner that ran the invocation, rather than
-        // short-circuiting into a synthetic result. Needs a real echo, so unix only ([`CHEAP_OK`]).
-        #[cfg(unix)]
-        {
-            assert_eq!(out.status, StepStatus::Ok, "output: {}", out.output);
-            assert!(
-                out.output.contains("wicked-fallback-ran"),
-                "the wrapped runner must have actually run the invocation: {}",
-                out.output
-            );
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            src.contains("\"permission\": true"),
+            "the client no longer advertises the permission capability, so the bridge never asks \
+             and the handler above is unreachable"
+        );
+        assert!(
+            src.contains("write_armed_marker"),
+            "the ACP path no longer writes the armed marker, so the fold cannot tell a clean \
+             governed run from a bypassed one and will deny it"
+        );
     }
 
     /// The predicate the branch turns on, at its boundary. `cli_runs_claude` classifies by the

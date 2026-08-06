@@ -143,6 +143,22 @@ pub(crate) fn permission_result(gate: &AcpGate<'_>, params: &Value) -> (Value, b
     }
 }
 
+/// The answer for an UNGOVERNED turn: permitted.
+///
+/// Ungoverned units have always been allowed to call tools on this path — there was no gate. What
+/// changes is that the permission is now stated rather than obtained by withholding the client
+/// capability so the agent never asked. Saying it explicitly is what lets the governed case exist
+/// at all: the capability has to be advertised per-session, and sessions are shared across units.
+///
+/// Still fail-closed on a malformed request: an ungoverned unit is not a licence to answer a
+/// question we could not read.
+pub(crate) fn allow_result(params: &Value) -> Value {
+    match choose_option(params.get("options").unwrap_or(&Value::Null), true) {
+        Some(option_id) => json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
+        None => cancelled("no allow option offered"),
+    }
+}
+
 fn cancelled(_why: &str) -> Value {
     json!({"outcome": {"outcome": "cancelled"}})
 }
