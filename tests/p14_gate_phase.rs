@@ -121,14 +121,17 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         base.phases.iter().map(|p| &p.id).collect::<Vec<_>>(),
         "gate-phase must reproduce the base phase list exactly — same phases, same order"
     );
-    // Compared against the base rather than against `None`, because the built-ins are no longer
-    // uniformly unpinned: `feature`'s `adversarial-review` ships the evidence floor (FINDING-025
-    // item 1). Asserting `None` here would have quietly turned this into "gate-phase must be the
-    // only source of pins", which was never the property under test.
+    // Compared against the REGISTERED built-in rather than against `None` or the raw builder,
+    // because pins are no longer uniformly authored: `feature`'s `adversarial-review` ships the
+    // evidence floor in the builder (FINDING-025 item 1), and registration itself arms `test`'s
+    // `verified_evidence` declaration with the floor (FINDING-055). Both defs here crossed the
+    // same `register` normalization, so this stays a like-for-like "gate-phase changed ONE pin"
+    // comparison; the raw builder would make normalization look like gate-phase's doing.
+    let registered_base = reg.get(&base.id).expect("the built-in is registered");
     for (got, want) in resolved
         .phases
         .iter()
-        .zip(base.phases.iter())
+        .zip(registered_base.phases.iter())
         .filter(|(p, _)| p.id != PHASE)
     {
         assert_eq!(

@@ -1450,6 +1450,22 @@ const MIN_USEFUL_LAYOUT: usize = 40;
 pub(crate) fn pty_unit_prompt(input: &StepInput) -> Result<String, String> {
     // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
     let plain = skill_prompt(&input.unit, None);
+    // FINDING-011: a pty turn is submitted line-based — the runner appends one `\n` to end the turn,
+    // so ANY newline the prompt itself carries submits the turn EARLY. The worker then gets only the
+    // text up to that byte and the remainder lands as a stray follow-up that desyncs the reused
+    // session's result sentinel. The layout map and the conventions appendix are single-line by
+    // contract, and the planner folds phase instructions with a single-line separator; the one part
+    // def/intent DATA can still push a newline into is the description. Refuse it here — fail closed
+    // with a named error — rather than let the terminal split the turn in silence.
+    if plain.contains('\n') {
+        return Err(format!(
+            "unit {}'s prompt carries an embedded newline; a pty turn is submitted line-based, so \
+             the terminal would end the turn at the first newline and strand the rest (which \
+             desyncs the reused session). Keep the unit description single-line, or route this \
+             unit to a non-interactive CLI.",
+            input.unit.ord,
+        ));
+    }
     let overhead = plain.len() + 1;
     if overhead > PTY_PROMPT_LIMIT {
         return Err(format!(
@@ -2324,6 +2340,52 @@ mod tests {
         assert_eq!(pty_unit_prompt(&input).unwrap(), unit_prompt(&input));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-011 (remediation), the call-site guard: a pty turn is submitted line-based, so a
+    /// prompt carrying an embedded newline would end the turn EARLY — the worker sees only the head
+    /// and the remainder desyncs the reused session's result sentinel. The planner folds phase
+    /// instructions single-line, but intent text or a hand-authored `instructions` field can still
+    /// carry a `\n`, and the failure is silent (an early turn, then a stray line), so `pty_unit_prompt`
+    /// fails CLOSED with a named error rather than letting the terminal split the turn.
+    ///
+    /// Falsifier: delete the `plain.contains('\n')` refusal in `pty_unit_prompt` — the multi-line
+    /// description is short, so it sails past the length cap and returns `Ok`, and this `expect_err`
+    /// panics.
+    #[test]
+    fn pty_unit_prompt_refuses_an_embedded_newline() {
+        let mut input = StepInput {
+            run_id: "pty-newline".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            // A description with an interior newline — well under the length cap, so ONLY the
+            // newline can be what makes this fail.
+            unit: WorkUnit::pending("s:build", "s", 1, "map the layout\nthen the stack"),
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+        };
+        let err = pty_unit_prompt(&input)
+            .expect_err("a multi-line prompt must be refused, not submitted to the terminal");
+        assert!(
+            err.contains("newline"),
+            "the failure must name the newline as the cause: {err}"
+        );
+        assert!(
+            !err.contains("cannot exceed"),
+            "the refusal is about the newline, not the length cap: {err}"
+        );
+
+        // The SAME content on one line is accepted — the guard rejects the newline, not the text or
+        // its length. This keeps the guard from passing vacuously (e.g. if everything errored).
+        input.unit.description = "map the layout then the stack".to_string();
+        let ok = pty_unit_prompt(&input).expect("a single-line prompt of the same content is fine");
+        assert!(
+            !ok.contains('\n'),
+            "the accepted prompt is single-line: {ok}"
+        );
     }
 
     #[test]
