@@ -297,6 +297,69 @@ fn stderr_context(tail: &StderrTail) -> String {
 
 // ── Session startup ───────────────────────────────────────────────────────────
 
+/// The env var claude's CLI and Agent SDK resolve their per-user configuration directory from —
+/// user-scope settings, hooks, plugins, memory. The ACP bridge hands its own environment to the
+/// SDK it drives in-process (`CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? homedir()`),
+/// so this variable decides WHOSE configuration a worker runs under. It is the carrier the
+/// bridge honours where argv is not: flags the bridge does not parse are discarded, which is how
+/// FINDING-060 happened.
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// Decide the [`CLAUDE_CONFIG_DIR_ENV`] override for an ACP worker spawn — `None` means inherit
+/// the operator's own configuration (the explicit escape hatch only).
+///
+/// FINDING-061: FINDING-047 (a worker that inherits the operator's CLI configuration changes
+/// what it does — their hooks fire, their permission defaults apply, an operator on `dontAsk`
+/// gets workers whose every file write reroutes through Bash) was fixed on the wrapped path
+/// only, because `inject_isolation_flags` rides argv and the ACP bridge does not read argv. The
+/// bridge DOES honour [`CLAUDE_CONFIG_DIR_ENV`], so the ACP spawn points it at an engine-minted
+/// directory instead — the same boundary, carried on the seam this path actually has.
+///
+/// `inherit_operator` is [`crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`]'s presence,
+/// read at the call site: the SAME opt-in escape hatch as the wrapped path, because two
+/// opt-outs for one boundary is how one of them silently stops working. Parameterised so both
+/// branches are testable without mutating the test process's environment.
+fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std::path::PathBuf>> {
+    if inherit_operator {
+        return None;
+    }
+    Some(mint_worker_config_dir())
+}
+
+/// Mint a fresh, engine-owned config directory for ONE ACP spawn.
+///
+/// Per-spawn rather than shared: the directory IS the worker's user scope, so a shared one
+/// would be a user scope every worker can mutate for every later worker — drop a
+/// `settings.json` there and the next spawn inherits it, which is FINDING-047's leak pointed at
+/// a different victim. The directories are a few files each under the OS temp dir; per-spawn
+/// leakage is bounded by session count and reclaimed with the temp dir.
+///
+/// The minted dir is seeded with a `settings.json` carrying `permissions.deny` — the same deny
+/// fence the wrapped path passes as `--disallowedTools` (operator credentials, agent-tooling
+/// state, the operational store; see `execute_wrapped::deny_rules`), read here as user-scope
+/// settings by the CLI the bridge spawns.
+///
+/// Deliberately NO `permissions.defaultMode`: the wrapped path pins `acceptEdits` because its
+/// governance rides a PreToolUse hook that fires regardless of mode, but on ACP governance
+/// rides `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
+/// resolve them before our policy is ever asked. The bridge's own default keeps the permission
+/// requests flowing to the client, where both the governed and the ungoverned answer live.
+fn mint_worker_config_dir() -> anyhow::Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-acp-worker-config-{}-{seq}",
+        std::process::id()
+    ));
+    crate::gate_hook::create_dir_all_private(&dir)?;
+    let settings = json!({
+        "permissions": { "deny": crate::execute_wrapped::deny_rules() }
+    });
+    std::fs::write(dir.join("settings.json"), serde_json::to_vec(&settings)?)?;
+    Ok(dir)
+}
+
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an
 /// `authenticate` step between the two whenever `initialize` advertises `authMethods`
 /// (FINDING-015; methodId from [`AcpConfig::auth_method`], else the agent's first advertised).
@@ -309,6 +372,23 @@ fn stderr_context(tail: &StderrTail) -> String {
 /// not parse it), so the hook had everything it needed except the instruction to run. Governed units
 /// take the wrapped path now — see the fail-closed return in `run_unit_streaming` and FINDING-060.
 fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Result<AcpProcess> {
+    // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
+    // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
+    // that proceeded without the override would run under the operator's own configuration,
+    // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
+    // carries its own isolation.
+    let worker_config_dir = match worker_claude_config_dir(
+        std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some(),
+    ) {
+        None => None,
+        Some(Ok(dir)) => Some(dir),
+        Some(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+                 under the operator's own CLI configuration (FINDING-061)"
+            ))
+        }
+    };
     let build_cmd = |binary: &str| {
         let mut cmd = std::process::Command::new(binary);
         // The engine's internal environment is stripped through the one chokepoint (FINDING-067): an
@@ -317,6 +397,13 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         // wrapped path, FINDING-060), but an ungoverned worker in a repo runs the same
         // `wicked-estate index .`. Harden FIRST — anything set below is set deliberately.
         cmd.hardened();
+        // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
+        // to a known slate, then set exactly what this path intends. This also overrides any
+        // CLAUDE_CONFIG_DIR the daemon itself inherited — the operator's live config dir is
+        // frequently exactly that variable.
+        if let Some(dir) = &worker_config_dir {
+            cmd.env(CLAUDE_CONFIG_DIR_ENV, dir);
+        }
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);
         cmd.stdin(Stdio::piped());
@@ -1517,12 +1604,15 @@ impl AcpStepRunner {
         // engine recorded `governed: true` for them.
         //
         // The bridge also hardcodes `settingSources: ["user", "project", "local"]` and resolves the
-        // permission mode from `permissions.defaultMode` in those settings, so an ACP worker inherits
-        // the operator's user scope — the leak FINDING-047 exists to close, still open here because
-        // `inject_isolation_flags` only runs on the wrapped path. An operator whose settings say
-        // `dontAsk` gets workers with Read/Edit/Write denied; observed consequence was every file
-        // mutation rerouted through Bash, which no file-tool deny rule can see, and one unit that
-        // silently applied nothing and still reported done.
+        // permission mode from `permissions.defaultMode` in those settings, so an ACP worker used to
+        // inherit the operator's user scope — the leak FINDING-047 closed on the wrapped path only
+        // (`inject_isolation_flags` rides argv, which the bridge does not read). An operator whose
+        // settings said `dontAsk` got workers with Read/Edit/Write denied; observed consequence was
+        // every file mutation rerouted through Bash, which no file-tool deny rule can see, and one
+        // unit that silently applied nothing and still reported done. Closed here as FINDING-061:
+        // `start_acp_process` now points CLAUDE_CONFIG_DIR at an engine-minted per-spawn directory
+        // (see `worker_claude_config_dir`), so the worker's user scope is engine-owned, not the
+        // operator's.
         //
         // Falling back is the same decision the HTTP-transport branch below already makes for the
         // same reason ("--settings cannot be injected"). The stdio branch assumed injection worked
@@ -2345,6 +2435,147 @@ sleep 30
             .expect("a rejected authenticate must not fail a start the agent is willing to grant");
         assert_eq!(proc.session_id, "already-authed");
         drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── FINDING-061: an ACP worker must not run under the operator's CLI config ─
+
+    /// End-to-end through the real `start_acp_process`: the child the spawn actually produces
+    /// must see an engine-minted CLAUDE_CONFIG_DIR, not the daemon's inherited one and not the
+    /// implicit `~/.claude`. The stub echoes the variable it received, so deleting the
+    /// `cmd.env(...)` line in `start_acp_process` — the reachability this test exists to prove —
+    /// fails the prefix assertion below.
+    #[test]
+    #[cfg(unix)]
+    fn an_acp_worker_does_not_inherit_the_operators_claude_config_dir() {
+        // The escape hatch is a supported configuration: a host that sets it runs workers under
+        // the operator's config ON PURPOSE, and must not fail a test about the default boundary
+        // (same convention as the budget tests asserting on `parse_secs(None, ..)`).
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("config-iso");
+        let ledger = dir.join("seen-config-dir.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"iso"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+
+        let proc = start_acp_process(&stub_config(&script, None), &dir).expect("start");
+        let seen = std::fs::read_to_string(&ledger).unwrap().trim().to_string();
+        assert_ne!(
+            seen, "UNSET",
+            "the spawn must SET the config dir: merely not-inheriting one leaves the bridge on \
+             its homedir() fallback, which is the operator's ~/.claude"
+        );
+        let seen_dir = std::path::PathBuf::from(&seen);
+        assert!(
+            seen_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wicked-acp-worker-config-")),
+            "the worker's config dir must be engine-minted, not inherited: {seen}"
+        );
+        // Substance, not presence: the minted scope actually carries the deny fence.
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(seen_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            !settings["permissions"]["deny"]
+                .as_array()
+                .expect("seeded settings carry permissions.deny")
+                .is_empty(),
+            "the seeded user scope must fence the worker, not just exist: {settings}"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&seen_dir);
+    }
+
+    /// The escape hatch: `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` set means NO override — the one
+    /// legitimate case is an operator deliberately testing their own hooks/skills through a run.
+    /// Tested on the decision function (both branches) because mutating the process environment
+    /// races every other test; the call site passing the REAL env presence is pinned by the
+    /// source audit below.
+    #[test]
+    fn the_inherit_escape_hatch_disables_acp_config_isolation() {
+        assert!(worker_claude_config_dir(true).is_none());
+        let minted = worker_claude_config_dir(false)
+            .expect("isolation is the default")
+            .expect("minting succeeds");
+        assert!(minted.is_dir());
+        let _ = std::fs::remove_dir_all(&minted);
+    }
+
+    /// The call site must consult the SAME escape-hatch variable as the wrapped path, read from
+    /// the real environment — a hardcoded `false` would pass the behavioural test above while
+    /// silently deleting the operator's opt-out. Needle built by concatenation and matched on
+    /// whitespace-stripped source so neither this test nor rustfmt can satisfy or break it.
+    #[test]
+    fn the_acp_spawn_consults_the_same_inherit_escape_hatch_as_the_wrapped_path() {
+        let src: String = include_str!("acp_runner.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = format!(
+            "worker_claude_config_dir(std::env::var_os(crate::execute_wrapped::{}).is_some()",
+            "INHERIT_OPERATOR_CONFIG_ENV"
+        );
+        assert!(
+            src.contains(&needle),
+            "start_acp_process no longer decides config isolation from the wrapped path's \
+             escape-hatch variable"
+        );
+    }
+
+    /// Each spawn gets its OWN directory. The minted dir is the worker's user scope, so a shared
+    /// one would be a user scope any worker can mutate for every later worker — FINDING-047's
+    /// leak with the operator swapped out for a previous worker.
+    #[test]
+    fn each_acp_spawn_gets_its_own_config_dir_never_a_shared_one() {
+        let a = mint_worker_config_dir().expect("mint a");
+        let b = mint_worker_config_dir().expect("mint b");
+        assert_ne!(a, b);
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// What the minted user scope says. The deny list must be the SAME fence the wrapped path
+    /// ships (not a diverging copy), and no `defaultMode` may be pinned: on ACP, governance rides
+    /// `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
+    /// resolve them before our policy is ever asked.
+    #[test]
+    fn the_minted_config_dir_seeds_the_deny_fence_and_pins_no_permission_mode() {
+        let dir = mint_worker_config_dir().expect("mint");
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        let deny: Vec<String> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            deny,
+            crate::execute_wrapped::deny_rules(),
+            "the ACP fence must be the wrapped path's fence, not a copy that can drift"
+        );
+        assert!(
+            settings["permissions"].get("defaultMode").is_none(),
+            "a pinned mode that auto-approves would answer session/request_permission before \
+             the governance gate sees it: {settings}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
