@@ -405,13 +405,15 @@ pub(crate) fn run(
     // step fails, exec mode stays OFF and the default in-process path stands.
     let exec_stop = Arc::new(AtomicBool::new(false));
     let exec_handles: Vec<std::thread::JoinHandle<()>> = match &exec_bus_db {
-        Some(bus_db) => match crate::cli_runner::init_exec_consumers(bus_db) {
+        Some(bus_db) => match crate::cli_runner::init_exec_consumers(bus_db, bus_db, process_gen) {
             Some(consumers) if crate::cli_runner::arm_exec_publisher(bus_db) => {
                 let interval = std::time::Duration::from_millis(100);
                 let handles = crate::cli_runner::spawn_exec_consumers(
                     consumers,
                     runner.clone(),
                     self_tx.clone(),
+                    lifecycle_maps.clone(),
+                    process_gen,
                     interval,
                     exec_stop.clone(),
                 );
@@ -3783,7 +3785,7 @@ fn dispatch_unit(
     // judge sees the right artifact. A publish failure returns `false` → we fall through to the in-process
     // worker so the run still makes progress rather than wedging with no worker. See `cli_runner.rs`.
     if crate::cli_runner::is_exec_enabled()
-        && crate::cli_runner::try_publish_dispatched(&input, agent_review_target.as_deref())
+        && crate::cli_runner::try_publish_dispatched(&input, agent_review_target.as_deref(), is_acp)
     {
         return Ok(true);
     }
