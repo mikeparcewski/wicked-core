@@ -32,7 +32,7 @@
 //! JSON-RPC 2.0 ndjson over stdin/stdout. Non-JSON startup banners and log lines
 //! are silently skipped during both handshake and turn execution.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,358 @@ use crate::workflow::{
 };
 use wicked_apps_core::HardenedCommand;
 use wicked_council::types::{AcpConfig, AcpTransport};
+
+// ── ElicitationMaps (DES-002) ─────────────────────────────────────────────────
+
+/// A human response delivered via `resolveElicitation` — the value that
+/// unblocks the `'elicit` dual-poll loop inside `exec_turn_acp`.
+#[derive(Debug, Clone)]
+pub struct ElicitationResult {
+    pub action: String,
+    pub response: Option<serde_json::Value>,
+}
+
+/// One in-flight elicitation registration; lives in `ElicitationMaps::pending`
+/// until `remove` (normal), `deliver` (resolved), or `cancel_epoch` (terminal).
+struct ElicitationEntry {
+    run_id: String,
+    epoch: u64,
+    /// Rendezvous channel to `exec_turn_acp`'s dual-poll loop. `SyncSender<_>` with
+    /// capacity 1 so the actor never blocks on send (I-8: no Tokio runtime in wicked-core).
+    tx: std::sync::mpsc::SyncSender<ElicitationResult>,
+}
+
+/// The single shared coordination point for all ACP elicitation state.
+///
+/// One `Arc<Mutex<ElicitationMaps>>` lives in `AcpStepRunner` and is threaded
+/// through to every `exec_turn_acp` invocation and to the actor's
+/// `Command::ResolveElicitation` handler. Every mutation must acquire this lock
+/// (O(1) hold time — only HashMap ops); the dual-poll loop in `exec_turn_acp`
+/// releases it before sleeping.
+///
+/// # Bus-consumer coordination fields
+///
+/// Several fields coordinate the actor with the off-actor CLI bus consumer
+/// (T7 / `cli_runner.rs`):
+///
+/// - `bus_dispatched_runs`: the actor-side set of run-ids that have been sent to
+///   the bus. The bus consumer checks this before publishing `task.dispatched`
+///   events to avoid a double-dispatch.
+/// - `bus_in_flight_workers`: `HashSet<(run_id, launch_seq)>` — one entry per
+///   live bus-dispatched worker. Tracked independently so a reassigned run
+///   (two workers alive simultaneously) doesn't lose the older entry.
+/// - `bus_activated_seqs`: maps `run_id → highest launch_seq` that crossed the
+///   ack-gated path; used for the degraded-mode bus dispatch check.
+/// - `run_launch_seq`: monotonic per-run counter incremented at every
+///   `begin_launch`; forms the second coordinate of the stale-completion guard.
+pub struct ElicitationMaps {
+    /// `elicitation_id → ElicitationEntry` for in-flight registrations.
+    pending: HashMap<String, ElicitationEntry>,
+    /// `run_id → [(elicitation_id, epoch)]` for bulk cancel/cleanup.
+    run_index: HashMap<String, Vec<(String, u64)>>,
+    /// Count of workers (`exec_turn_acp` invocations) currently alive. Used by
+    /// `EpochCleanup` to know when the last worker exits (shutdown drain).
+    active_workers: u32,
+    /// `(run_id, epoch)` pairs marked as cancelled; `register` checks this before
+    /// adding to `pending` (creation suppression for late-arriving registrations).
+    cancelled_epochs: Vec<(String, u64)>,
+    /// Elicitation ids whose `ElicitationCreated` event was already emitted; the
+    /// `exec_turn_acp` creation-announcement guard checks this so a retry does not
+    /// re-emit the event.
+    suppressed_creations: HashSet<String>,
+    /// Run ids that have been dispatched to the bus (actor → bus-publisher path).
+    bus_dispatched_runs: HashSet<String>,
+    /// `(run_id, launch_seq)` for every live bus-dispatched worker (see module doc).
+    bus_in_flight_workers: HashSet<(String, u64)>,
+    /// `run_id → highest launch_seq` that reached the ack-gated cursor-advance
+    /// path; used for the degraded-mode dispatch check in the bus consumer.
+    bus_activated_seqs: HashMap<String, u64>,
+    /// Per-run monotonic launch counter. Incremented at every `begin_launch`.
+    run_launch_seq: HashMap<String, u64>,
+    /// Set to `true` when the actor enters shutdown; workers poll this so they
+    /// can exit early rather than block on a unit that will never finish.
+    shutdown_flag: bool,
+}
+
+impl ElicitationMaps {
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            run_index: HashMap::new(),
+            active_workers: 0,
+            cancelled_epochs: Vec::new(),
+            suppressed_creations: HashSet::new(),
+            bus_dispatched_runs: HashSet::new(),
+            bus_in_flight_workers: HashSet::new(),
+            bus_activated_seqs: HashMap::new(),
+            run_launch_seq: HashMap::new(),
+            shutdown_flag: false,
+        }
+    }
+
+    /// Register a new elicitation and return the receiver end of the reply channel.
+    ///
+    /// Fails (returns `None`) when the epoch was already cancelled via
+    /// `cancel_epoch` (creation-suppression guard). On success, `pending` and
+    /// `run_index` are updated atomically under the caller's lock.
+    ///
+    /// The message is byte-capped at 8 KB (truncated); individual `options` entries
+    /// > 512 bytes are dropped; `options` list is capped at 100 entries; empty-string
+    /// options entries are dropped.
+    pub fn register(
+        &mut self,
+        run_id: &str,
+        epoch: u64,
+        elicitation_id: &str,
+        message: &str,
+        options: Option<Vec<String>>,
+        prop_key: &str,
+    ) -> Option<(std::sync::mpsc::Receiver<ElicitationResult>, String, Option<Vec<String>>, String)> {
+        // Creation-suppression guard: if the epoch was already cancelled, refuse.
+        if self.cancelled_epochs.iter().any(|(r, e)| r == run_id && *e == epoch) {
+            return None;
+        }
+
+        // Cap message at 8 KB byte-length (not character count).
+        const MSG_CAP: usize = 8 * 1024;
+        let message = if message.len() > MSG_CAP {
+            // Truncate on a UTF-8 boundary and append marker.
+            let mut truncated = message[..msg_floor_at(message, MSG_CAP)].to_string();
+            truncated.push_str("[truncated]");
+            truncated
+        } else {
+            message.to_string()
+        };
+
+        // Filter options: drop entries > 512 bytes or empty string; cap list at 100.
+        let options = options.map(|opts| {
+            const OPT_CAP: usize = 512;
+            const LIST_CAP: usize = 100;
+            let mut filtered: Vec<String> = opts
+                .into_iter()
+                .filter(|o| {
+                    if o.is_empty() {
+                        return false;
+                    }
+                    if o.len() > OPT_CAP {
+                        tracing::warn!(
+                            elicitation_id,
+                            "options entry exceeds {} bytes — dropped",
+                            OPT_CAP
+                        );
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            filtered.truncate(LIST_CAP);
+            filtered
+        });
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let entry = ElicitationEntry {
+            run_id: run_id.to_string(),
+            epoch,
+            tx,
+        };
+        self.pending.insert(elicitation_id.to_string(), entry);
+        self.run_index
+            .entry(run_id.to_string())
+            .or_default()
+            .push((elicitation_id.to_string(), epoch));
+        Some((rx, message, options, prop_key.to_string()))
+    }
+
+    /// Remove a registration from `pending` and `run_index`.
+    ///
+    /// Called AFTER `ElicitationResolved` has been emitted (happy path) or
+    /// immediately when a terminal path fires. Idempotent: a missing id is a no-op.
+    pub fn remove(&mut self, run_id: &str, elicitation_id: &str) {
+        self.pending.remove(elicitation_id);
+        if let Some(v) = self.run_index.get_mut(run_id) {
+            v.retain(|(id, _)| id != elicitation_id);
+        }
+    }
+
+    /// Deliver a human response to a waiting `exec_turn_acp` dual-poll loop.
+    ///
+    /// Returns `Err` if `elicitation_id` is unknown or the `run_id` does not match
+    /// the registered entry (cross-run delivery guard).
+    pub fn deliver(
+        &self,
+        run_id: &str,
+        elicitation_id: &str,
+        action: String,
+        response: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let entry = self
+            .pending
+            .get(elicitation_id)
+            .ok_or_else(|| anyhow::anyhow!("elicitation not found: {}", elicitation_id))?;
+        if entry.run_id != run_id {
+            anyhow::bail!(
+                "elicitation {} belongs to run {}, not {}",
+                elicitation_id,
+                entry.run_id,
+                run_id
+            );
+        }
+        let _ = entry.tx.send(ElicitationResult { action, response });
+        Ok(())
+    }
+
+    /// Cancel all pending elicitations for `(run_id, epoch)`.
+    ///
+    /// Records the cancelled epoch (creation-suppression) and sends a synthetic
+    /// `action:"cancel"` on every matching entry's channel. Idempotent.
+    pub fn cancel_epoch(&mut self, run_id: &str, epoch: u64) {
+        // Record for creation-suppression guard.
+        if !self.cancelled_epochs.iter().any(|(r, e)| r == run_id && *e == epoch) {
+            self.cancelled_epochs.push((run_id.to_string(), epoch));
+        }
+        // Cancel all in-flight elicitations for this (run, epoch).
+        let ids_to_cancel: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, e)| e.run_id == run_id && e.epoch == epoch)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids_to_cancel {
+            if let Some(entry) = self.pending.get(&id) {
+                let _ = entry.tx.send(ElicitationResult {
+                    action: "cancel".to_string(),
+                    response: None,
+                });
+            }
+        }
+    }
+
+    /// Increment `active_workers` for this run/launch_seq pair.
+    ///
+    /// Does NOT clear `bus_in_flight_workers` — each worker manages its own
+    /// `(run_id, launch_seq)` entry independently (re-assignment invariant).
+    pub fn begin_launch(&mut self, run_id: &str, launch_seq: u64) {
+        self.active_workers += 1;
+        // Ensure the run has a launch_seq entry so `advance_launch_seq` starts from
+        // the right baseline.
+        self.run_launch_seq.entry(run_id.to_string()).or_insert(launch_seq);
+    }
+
+    /// Record that a run has been dispatched to the bus (actor → bus-publisher path).
+    pub fn mark_bus_dispatch(&mut self, run_id: &str) {
+        self.bus_dispatched_runs.insert(run_id.to_string());
+    }
+
+    /// Record that a bus-dispatched worker for `(run_id, launch_seq)` is now in-flight.
+    pub fn mark_bus_in_flight(&mut self, run_id: &str, launch_seq: u64) {
+        self.bus_in_flight_workers.insert((run_id.to_string(), launch_seq));
+    }
+
+    /// Check whether a specific `(run_id, launch_seq)` worker is still in-flight.
+    pub fn is_bus_worker_in_flight(&self, run_id: &str, launch_seq: u64) -> bool {
+        self.bus_in_flight_workers.contains(&(run_id.to_string(), launch_seq))
+    }
+
+    /// Remove the in-flight marker for `(run_id, launch_seq)`.
+    ///
+    /// Called by the bus consumer's ack-gated cursor advance AFTER the actor has
+    /// committed `ApplyStepResult` (normal completion), or immediately by
+    /// `EpochCleanup::drop` on panic/cancel.
+    pub fn clear_bus_in_flight(&mut self, run_id: &str, launch_seq: u64) {
+        self.bus_in_flight_workers.remove(&(run_id.to_string(), launch_seq));
+    }
+
+    /// Returns `true` if ANY bus-dispatched worker is still in-flight (across all runs).
+    pub fn any_bus_worker_in_flight(&self) -> bool {
+        !self.bus_in_flight_workers.is_empty()
+    }
+
+    /// Remove and return whether `elicitation_id` was in the creation-suppressed set.
+    pub fn take_suppressed_creation(&mut self, elicitation_id: &str) -> bool {
+        self.suppressed_creations.remove(elicitation_id)
+    }
+
+    /// Advance the per-run launch sequence counter and return the NEW value.
+    ///
+    /// Starts from 1 on first call for a run (0 is reserved for "no launch_seq").
+    pub fn advance_launch_seq(&mut self, run_id: &str) -> u64 {
+        let seq = self.run_launch_seq.entry(run_id.to_string()).or_insert(0);
+        *seq += 1;
+        *seq
+    }
+
+    /// Restore the per-run launch sequence counter to `seq` (rollback on dispatch failure).
+    pub fn restore_launch_seq(&mut self, run_id: &str, seq: u64) {
+        self.run_launch_seq.insert(run_id.to_string(), seq);
+    }
+
+    /// Returns `true` if `run_id` has any live registrations in `run_index`.
+    pub fn has_active_run(&self, run_id: &str) -> bool {
+        self.run_index.get(run_id).is_some_and(|v| !v.is_empty())
+    }
+
+    /// Returns `true` if `run_id` has ever crossed the ack-gated path
+    /// (i.e. has an entry in `bus_activated_seqs`).
+    pub fn has_activated_seq(&self, run_id: &str) -> bool {
+        self.bus_activated_seqs.contains_key(run_id)
+    }
+
+    /// Set the shutdown flag. Workers poll this and exit early.
+    pub fn set_shutdown_flag(&mut self) {
+        self.shutdown_flag = true;
+    }
+
+    /// Whether the shutdown flag has been set.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown_flag
+    }
+
+    /// Decrement `active_workers` and prune all registrations for `(run_id, epoch)`.
+    ///
+    /// Called ONLY by `EpochCleanup::drop` — the sole call site ensures no
+    /// double-decrement of `active_workers` (spec Never do).
+    ///
+    /// Does NOT clear `bus_in_flight_workers` — the `bus_in_flight_deferred` flag
+    /// on `EpochCleanup` decides that; on panic/cancel it's cleared before this call;
+    /// on normal bus completion the bus consumer clears it after the cursor advance.
+    pub fn cleanup_run(&mut self, run_id: &str, epoch: u64, _launch_seq: u64) {
+        if self.active_workers > 0 {
+            self.active_workers -= 1;
+        }
+        // Remove all pending registrations for this (run_id, epoch).
+        if let Some(ids) = self.run_index.get(run_id) {
+            let to_remove: Vec<String> = ids
+                .iter()
+                .filter(|(_, e)| *e == epoch)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &to_remove {
+                self.pending.remove(id);
+            }
+        }
+        if let Some(v) = self.run_index.get_mut(run_id) {
+            v.retain(|(_, e)| *e != epoch);
+            if v.is_empty() {
+                self.run_index.remove(run_id);
+            }
+        }
+        // Prune the cancelled_epochs list for this (run_id, epoch).
+        self.cancelled_epochs.retain(|(r, e)| !(r == run_id && *e == epoch));
+    }
+}
+
+/// Compute the largest byte offset ≤ `max_bytes` that is still a valid UTF-8
+/// boundary. Avoids splitting multi-byte codepoints.
+fn msg_floor_at(s: &str, max_bytes: usize) -> usize {
+    if s.len() <= max_bytes {
+        return s.len();
+    }
+    let mut floor = max_bytes;
+    while floor > 0 && !s.is_char_boundary(floor) {
+        floor -= 1;
+    }
+    floor
+}
 
 // ── ACP child process ─────────────────────────────────────────────────────────
 
@@ -3205,5 +3557,183 @@ sleep 30
         assert!(cli_runs_claude("/opt/somewhere/claude"));
         assert!(!cli_runs_claude("codex"));
         assert!(!cli_runs_claude("claude-ish"));
+    }
+
+    // ── DES-002 ElicitationMaps unit tests (T3, tests 1–11 + 10a) ────────────────
+
+    fn maps() -> ElicitationMaps {
+        ElicitationMaps::new()
+    }
+
+    /// Test 1: register + remove round-trip — pending and run_index are cleaned up.
+    #[test]
+    fn register_and_remove_round_trip() {
+        let mut m = maps();
+        let result = m.register("run-1", 1, "elic-a", "What colour?", None, "response");
+        assert!(result.is_some(), "register succeeded");
+        assert!(m.pending.contains_key("elic-a"));
+        assert!(m.run_index.contains_key("run-1"));
+
+        m.remove("run-1", "elic-a");
+        assert!(!m.pending.contains_key("elic-a"), "pending cleared");
+        assert!(
+            m.run_index.get("run-1").is_none_or(|v| v.is_empty()),
+            "run_index entry cleared"
+        );
+    }
+
+    /// Test 2: register on a cancelled epoch returns None.
+    #[test]
+    fn register_after_cancel_epoch_is_suppressed() {
+        let mut m = maps();
+        m.cancel_epoch("run-2", 5);
+        let result = m.register("run-2", 5, "elic-b", "msg", None, "response");
+        assert!(result.is_none(), "creation suppressed when epoch cancelled");
+        assert!(!m.pending.contains_key("elic-b"));
+    }
+
+    /// Test 3: cancel_epoch is scoped to (run_id, epoch) — other runs unaffected.
+    #[test]
+    fn cancel_epoch_cross_run_isolation() {
+        let mut m = maps();
+        // Register two elicitations: one for run-3/epoch-1, one for run-4/epoch-1.
+        let r3 = m.register("run-3", 1, "e3", "q3", None, "r");
+        let r4 = m.register("run-4", 1, "e4", "q4", None, "r");
+        assert!(r3.is_some());
+        assert!(r4.is_some());
+        let (rx3, ..) = r3.unwrap();
+        let (rx4, ..) = r4.unwrap();
+
+        // Cancel only run-3/epoch-1.
+        m.cancel_epoch("run-3", 1);
+
+        // run-3's elicitation receives a cancel.
+        let res3 = rx3.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(res3.is_ok(), "run-3 received cancel");
+        assert_eq!(res3.unwrap().action, "cancel");
+
+        // run-4's elicitation is unaffected (no message).
+        let res4 = rx4.recv_timeout(std::time::Duration::from_millis(50));
+        assert!(res4.is_err(), "run-4 not cancelled — channel empty");
+    }
+
+    /// Test 4: deliver resolves the receiver.
+    #[test]
+    fn deliver_resolves_receiver() {
+        let mut m = maps();
+        let (rx, ..) = m.register("run-5", 1, "e5", "confirm?", None, "response").unwrap();
+        m.deliver("run-5", "e5", "confirm".to_string(), Some(serde_json::json!("yes"))).unwrap();
+        let res = rx.recv_timeout(std::time::Duration::from_millis(200)).unwrap();
+        assert_eq!(res.action, "confirm");
+        assert_eq!(res.response, Some(serde_json::json!("yes")));
+    }
+
+    /// Test 5: deliver with wrong run_id returns Err.
+    #[test]
+    fn deliver_wrong_run_id_returns_err() {
+        let mut m = maps();
+        m.register("run-6", 1, "e6", "q", None, "r").unwrap();
+        let result = m.deliver("WRONG-RUN", "e6", "confirm".to_string(), None);
+        assert!(result.is_err(), "cross-run deliver must fail");
+        assert!(result.unwrap_err().to_string().contains("belongs to run run-6"));
+    }
+
+    /// Test 6: deliver after cancel_epoch is a no-op (channel already closed).
+    #[test]
+    fn deliver_after_cancel_epoch_is_noop() {
+        let mut m = maps();
+        let (rx, ..) = m.register("run-7", 1, "e7", "q", None, "r").unwrap();
+        m.cancel_epoch("run-7", 1);
+        // cancel_epoch already sent "cancel" on the channel; channel has capacity 1.
+        // A second send (deliver) would either block or return SendError — both are fine.
+        let _ = rx.recv_timeout(std::time::Duration::from_millis(100));
+        // Deliver after cancel: entry still in pending (cancel_epoch doesn't remove it).
+        // The important thing is deliver does not panic.
+        let _ = m.deliver("run-7", "e7", "confirm".to_string(), None);
+    }
+
+    /// Test 7: 8 KB byte-length message cap — a 4-byte-per-codepoint string of 2,049
+    /// codepoints (8,196 bytes) is truncated to ≤ 8 KB + "[truncated]".
+    #[test]
+    fn message_truncation_8kb_byte_length_cap() {
+        // U+1F600 is 4 bytes in UTF-8; 2049 codepoints = 8196 bytes > 8192.
+        let long_msg: String = std::iter::repeat('😀').take(2049).collect();
+        assert_eq!(long_msg.len(), 2049 * 4, "each codepoint is 4 bytes");
+        let mut m = maps();
+        let result = m.register("run-8", 1, "e8", &long_msg, None, "response");
+        let (_, stored_msg, ..) = result.unwrap();
+        assert!(stored_msg.ends_with("[truncated]"), "truncation marker appended");
+        // The total byte length is ≤ 8192 (truncated part) + len("[truncated]").
+        let truncated_part_len = stored_msg.len() - "[truncated]".len();
+        assert!(
+            truncated_part_len <= 8192,
+            "truncated part is ≤ 8 KB: {} bytes",
+            truncated_part_len
+        );
+        // The truncation boundary is a valid UTF-8 char boundary.
+        let _ = stored_msg.chars().count(); // panics if not valid UTF-8
+    }
+
+    /// Test 8: options entry > 512 bytes (byte-length) is dropped; entry < 512 bytes is kept.
+    #[test]
+    fn options_entry_over_512_bytes_dropped() {
+        // 129 U+1F600 (4 bytes each) = 516 bytes > 512.
+        let over_cap: String = std::iter::repeat('😀').take(129).collect();
+        assert!(over_cap.len() > 512, "over-cap entry is {} bytes", over_cap.len());
+        let under_cap = "short option".to_string();
+        let mut m = maps();
+        let result = m.register("run-9", 1, "e9", "q", Some(vec![over_cap, under_cap.clone()]), "r");
+        let (_, _, opts, _) = result.unwrap();
+        let opts = opts.unwrap();
+        assert_eq!(opts.len(), 1, "over-cap entry dropped; only under-cap remains");
+        assert_eq!(opts[0], under_cap);
+    }
+
+    /// Test 9: empty-string options entry is dropped; non-empty entry retained.
+    #[test]
+    fn empty_options_entry_dropped() {
+        let mut m = maps();
+        let result = m.register("run-10", 1, "e10", "q", Some(vec!["".to_string(), "valid".to_string()]), "r");
+        let (_, _, opts, _) = result.unwrap();
+        let opts = opts.unwrap();
+        assert_eq!(opts, vec!["valid".to_string()], "empty entry dropped");
+    }
+
+    /// Test 10: prop_key is preserved from the schema, not hardcoded to "response".
+    #[test]
+    fn prop_key_preserved_from_schema() {
+        let mut m = maps();
+        let result = m.register("run-11", 1, "e11", "q", None, "myField");
+        let (_, _, _, prop_key) = result.unwrap();
+        assert_eq!(prop_key, "myField", "prop_key preserved verbatim");
+    }
+
+    /// Test 10a: null constraint fields treated as absent (register proceeds normally).
+    #[test]
+    fn null_constraint_fields_treated_as_absent() {
+        // The caller normalises null schema constraints to None before calling register;
+        // verify that register with None options and default prop_key works.
+        let mut m = maps();
+        let result = m.register("run-12", 1, "e12", "q", None, "response");
+        assert!(result.is_some(), "null/absent constraints do not break registration");
+        let (_, _, opts, prop_key) = result.unwrap();
+        assert!(opts.is_none(), "options is None");
+        assert_eq!(prop_key, "response");
+    }
+
+    /// Test 11: cleanup_run decrements active_workers and clears pending/run_index.
+    #[test]
+    fn cleanup_run_decrements_workers_and_clears_pending() {
+        let mut m = maps();
+        m.begin_launch("run-13", 1);
+        assert_eq!(m.active_workers, 1);
+        m.register("run-13", 1, "e13a", "q", None, "r").unwrap();
+        m.register("run-13", 2, "e13b", "q2", None, "r").unwrap(); // different epoch
+
+        // cleanup for epoch 1 only.
+        m.cleanup_run("run-13", 1, 1);
+        assert_eq!(m.active_workers, 0, "worker decremented");
+        assert!(!m.pending.contains_key("e13a"), "epoch-1 registration removed");
+        assert!(m.pending.contains_key("e13b"), "epoch-2 registration survives");
     }
 }
