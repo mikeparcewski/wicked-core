@@ -588,6 +588,17 @@ linked from the PR description. EC-5 is a hard block — no merge without it.
 
 ## Changelog
 
+- 2026-08-06: post-rebase compile fixes — rebased onto origin/main; resolved merge
+  conflicts from FINDING-062 (`governed` flag on ACP StepOutput, `session/request_permission`
+  handler, permission capability in `client_caps`) and FINDING-015 (`auth_method` field on
+  `AcpConfig`, auth handshake in `exec_session_acp`). Compile errors fixed after rebase:
+  `rpc_respond` call used `u64` req_id instead of `&Value`; `required_deliverables`/`auth_method`
+  missing in test helpers; five `exec_turn_acp` test call sites missing `gate: None`; `governed:
+  false` hardcoded in `ElicitationFailed` arm (caught by source-audit test — now
+  `gate.is_some()`); `advance_or_pause`/`resume_run_inner` test calls missing 4 new params;
+  `StepStatus::ElicitationFailed` not handled in `validator.rs` match; `StepInput` literal in
+  `execute_wrapped.rs` missing `elicitation_epoch`/`process_gen`/`launch_seq`. All 463+ tests
+  pass post-rebase.
 - 2026-08-06: initial plan — derived from DES-002 design docs (gates 1–83).
 - 2026-08-06: rev 2 — second adversarial + security re-review findings applied:
   spec EC-4 count updated to 39; T9 step 5 adds positive-path assertion for test 38;
