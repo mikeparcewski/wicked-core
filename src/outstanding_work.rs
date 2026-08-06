@@ -110,30 +110,46 @@ pub fn outstanding_in(worktree: &Path) -> Option<usize> {
     if needle.is_empty() {
         return Some(0);
     }
-    // `ps -Ao args=` is available on macOS and Linux alike. Deliberately NOT `pgrep -f`: its exact
-    // matching semantics differ between the two, and this campaign already lost time to `pgrep -c`
-    // and `pgrep -fl | wc -l` disagreeing on the same machine.
-    // .hardened() is not optional here even though `ps` reads no engine state: the chokepoint rule
-    // has no allowlist on purpose (FINDING-067), and spawn_audit enforces it — it caught this very
-    // line when I first wrote it without the call.
-    let mut cmd = std::process::Command::new("ps");
-    cmd.hardened();
-    let out = cmd.args(["-Ao", "args="]).output().ok()?;
-    if !out.status.success() {
-        return None;
+    // The background work this detects is a Unix-shell construct: the extract agent writes a
+    // `run_worker.sh` fan-out into the worktree (FINDING-100). Windows has no such process to
+    // outrun a completion claim, so Some(0) there is the true answer, not a fail-open — there is
+    // nothing of this kind that could be running. The crew daemon that drives these runs is
+    // unix-first anyway (its release matrix excludes Windows).
+    #[cfg(not(unix))]
+    {
+        // Tail expression, not `return`: exactly one cfg block survives per platform, so each
+        // compiles to a single well-typed function body — no reliance on divergence analysis I
+        // cannot exercise on a Windows host.
+        let _ = needle;
+        Some(0)
     }
-    let table = String::from_utf8_lossy(&out.stdout);
-    let me = std::process::id().to_string();
-    Some(
-        table
-            .lines()
-            .filter(|l| l.contains(needle.as_ref()))
-            // The engine itself runs with the worktree on its command line; counting ourselves
-            // would make every unit wait for its own budget and then report failure.
-            .filter(|l| !l.contains(&format!("ps -Ao args={me}")))
-            .filter(|l| !l.contains("ps -Ao args="))
-            .count(),
-    )
+    #[cfg(unix)]
+    {
+        // `ps -Ao args=` is available on macOS and Linux alike. Deliberately NOT `pgrep -f`: its exact
+        // matching semantics differ between the two, and this campaign already lost time to `pgrep -c`
+        // and `pgrep -fl | wc -l` disagreeing on the same machine.
+        // .hardened() is not optional here even though `ps` reads no engine state: the chokepoint rule
+        // has no allowlist on purpose (FINDING-067), and spawn_audit enforces it — it caught this very
+        // line when I first wrote it without the call.
+        let mut cmd = std::process::Command::new("ps");
+        cmd.hardened();
+        let out = cmd.args(["-Ao", "args="]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let table = String::from_utf8_lossy(&out.stdout);
+        let me = std::process::id().to_string();
+        Some(
+            table
+                .lines()
+                .filter(|l| l.contains(needle.as_ref()))
+                // The engine itself runs with the worktree on its command line; counting ourselves
+                // would make every unit wait for its own budget and then report failure.
+                .filter(|l| !l.contains(&format!("ps -Ao args={me}")))
+                .filter(|l| !l.contains("ps -Ao args="))
+                .count(),
+        )
+    }
 }
 
 /// Wait for work this unit started to finish, up to [`OUTSTANDING_WORK_BUDGET`].
@@ -306,6 +322,22 @@ mod tests {
 
     /// The counter must not count the engine's own `ps` invocation, or every unit would wait out
     /// its entire budget and then report failure on a worktree with no workers at all.
+    /// On non-Unix the worker script (`run_worker.sh`) cannot exist, so the counter reports zero
+    /// rather than failing to read a process table that has no `ps`. Asserted, not left implicit —
+    /// a silent None here would panic the caller's expect and read as a broken build.
+    #[cfg(not(unix))]
+    #[test]
+    fn on_non_unix_there_is_no_shell_worker_to_detect() {
+        let dir = std::env::temp_dir();
+        assert_eq!(
+            outstanding_in(&dir),
+            Some(0),
+            "background-worker detection is a Unix-shell feature; non-Unix must report zero, \
+             not an unreadable table"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn the_counter_does_not_count_itself() {
         let dir = std::env::temp_dir().join(format!("wicked-outstanding-{}", std::process::id()));
