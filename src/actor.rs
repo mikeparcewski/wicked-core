@@ -2986,6 +2986,7 @@ fn apply_step_result(
                         .unwrap_or_else(|| "verdict not pass".to_string()),
                 },
             );
+            let note = unsuppressed_gate_note(session.human_confirm);
             pause_for_human(
                 store,
                 subscribers,
@@ -2996,9 +2997,7 @@ fn apply_step_result(
                 // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
                 // reviewed unit coincide here.
                 Some(ord),
-                format!(
-                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run"
-                ),
+                format!("Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run{note}"),
             )?;
             return Ok(StepApplied::Paused);
         }
@@ -3117,6 +3116,7 @@ fn advance_or_pause(
         // not-pass terminal verdict already paused at finish (finding #3), and a pass needs no gate.
         if let Some(term) = unit_ix.checked_sub(1).and_then(|i| units.get(i)) {
             if matches!(term.gate, crate::workflow::GateSpec::HumanConfirm { .. }) {
+                let note = unsuppressed_gate_note(session.human_confirm);
                 pause_for_human(
                     store,
                     subscribers,
@@ -3127,8 +3127,8 @@ fn advance_or_pause(
                     // this branch matched on — so it is attributable, and to itself.
                     Some(term.ord),
                     format!(
-                        "Approve completion after the final phase (unit {}): {}",
-                        term.ord, term.description
+                        "Approve completion after the final phase (unit {}): {}{}",
+                        term.ord, term.description, note
                     ),
                 )?;
                 return Ok(Progress::Paused);
@@ -3151,8 +3151,12 @@ fn advance_or_pause(
                 (
                     Some(reviewing_ord),
                     format!(
-                        "Approve the output of unit {} ({}) before unit {} runs: {}",
-                        reviewing_ord, done, unit.ord, unit.description
+                        "Approve the output of unit {} ({}) before unit {} runs: {}{}",
+                        reviewing_ord,
+                        done,
+                        unit.ord,
+                        unit.description,
+                        unsuppressed_gate_note(session.human_confirm)
                     ),
                 )
             }
@@ -3262,6 +3266,18 @@ enum PauseReason {
 ///     run-level flag. `HumanConfirm` always pauses; `HumanConfirmIf(VerdictNotPass)` pauses when the
 ///     preceding unit is not a clean pass (`status != Done`); `Auto` defers to the run-level policy.
 ///
+/// PRECEDENCE (FINDING-023) — a DEF-declared gate fires REGARDLESS of the run-level policy:
+/// `human_confirm: none` silences only source 1 and never suppresses a workflow-authored gate.
+/// That is deliberate, not an oversight. `HumanConfirm::None` is simultaneously the enum DEFAULT
+/// (an absent wire field lands here) and the typo FALLBACK (`parse_human_confirm` maps every
+/// unrecognized token to `None` — FINDING-019), so reading it as "suppress the workflow's own
+/// gates" would let an omitted field or a misspelled one silently strip the review seams the
+/// workflow author declared — fail-open on the primary human-review control. A genuinely
+/// unattended run needs an explicit, non-default signal end-to-end (wire token + parsers + here);
+/// until that exists, the def gate wins and the pause DISCLOSES the precedence in its prompt
+/// ([`unsuppressed_gate_note`]) so an operator who sent `none` learns why the run still paused at
+/// the moment it pauses, not from a wedged overnight batch.
+///
 /// `DefGate` wins when both fire. It is the more specific statement — a workflow author named this
 /// exact seam — and it is the one carrying an ord to attribute the pause to, so preferring it never
 /// discards information `RunLevel` would have supplied. Whether to pause is unchanged either way.
@@ -3290,6 +3306,25 @@ fn should_pause(
             reviewing_ord: prev.ord,
         });
     def_gate.or(run_level.then_some(PauseReason::RunLevel))
+}
+
+/// The disclosure appended to a DEF-declared gate's pause prompt when the run was launched with
+/// `human_confirm: none` (FINDING-023). The precedence itself — a workflow-authored gate is never
+/// suppressed by the run-level policy — is deliberate (see [`should_pause`]), but before this note
+/// NOTHING surfaced it: the launch accepted `none`, the session reported `human_confirm: none`, and
+/// the run still sat `awaiting_human`, which reads as a contradiction and cost an operator a stalled
+/// overnight batch before they learned the rule. The pause prompt is the one surface the operator is
+/// guaranteed to read at the exact moment the precedence bites, so the pause explains itself there.
+/// Empty for every attended policy — those operators asked to be paused, and the note would be noise.
+fn unsuppressed_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'static str {
+    match human_confirm {
+        crate::domain::HumanConfirm::None => {
+            " [workflow-declared gate: this pause is authored by the workflow definition itself; \
+             run-level human_confirm=none silences only run-level pauses, never a \
+             workflow-authored gate]"
+        }
+        _ => "",
+    }
 }
 
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
@@ -4030,6 +4065,13 @@ mod gate_pause_tests {
     fn a_def_humanconfirm_gate_pauses_even_when_run_level_is_none() {
         // The DEF drives the pause: run-level --confirm is None, yet the preceding phase's
         // HumanConfirm gate must still pause the run before the next unit.
+        //
+        // This is the INTENTIONAL precedence (FINDING-023), not the defect: `None` is both the
+        // enum default and the typo fallback (FINDING-019), so letting it suppress a
+        // workflow-authored gate would strip declared review seams on every default or misspelled
+        // launch — fail-open. The pause instead disclosing itself is pinned by
+        // `def_gate_disclosure_tests`. Anyone changing this behavior must first give "unattended"
+        // an explicit, non-default wire signal.
         let s = sess(HumanConfirm::None);
         let units = vec![
             unit(
@@ -4214,6 +4256,156 @@ mod terminal_gate_tests {
         assert!(
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
+        );
+    }
+}
+
+/// FINDING-023 — the precedence "a workflow-authored gate is never suppressed by run-level
+/// `human_confirm: none`" is deliberate, so the pause must DISCLOSE it to the operator who asked
+/// for `none` (nothing else does: the launch accepts it and the session then reports
+/// `human_confirm: none` while sitting `awaiting_human`). These drive `advance_or_pause` — the real
+/// call site that builds the prompt — not the note helper in isolation.
+#[cfg(test)]
+mod def_gate_disclosure_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// A run whose FIRST unit finished under a def-declared HumanConfirm gate, cursor on unit 2 —
+    /// the exact state FINDING-023 observed (`feature`'s clarify gate under `human_confirm: none`).
+    fn seed(store: &mut dyn GraphStore, hc: HumanConfirm) {
+        let session = AgentSession {
+            id: "d".into(),
+            workflow_id: "wf-d".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: hc,
+            unit_ix: 1,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
+        u1.gate = GateSpec::HumanConfirm {
+            unconditional: false,
+        };
+        u1.status = UnitStatus::Done;
+        put_node(store, u1.to_node()).unwrap();
+        let u2 = WorkUnit::pending("d:u2", "d", 2, "design the approach");
+        put_node(store, u2.to_node()).unwrap();
+    }
+
+    /// Drive `advance_or_pause` at `unit_ix` and return the emitted `AwaitingHuman` prompt.
+    fn pause_prompt(store: &mut dyn GraphStore, unit_ix: usize) -> String {
+        let mut subs = crate::event_log::EventSink::default();
+        let (evtx, evrx) = channel::<CoreEvent>();
+        subs.push(evtx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(store, &mut subs, &runner, &tx, "d", unit_ix).unwrap();
+        assert!(
+            matches!(progress, Progress::Paused),
+            "precondition: the def gate pauses"
+        );
+        evrx.try_iter()
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman { prompt, .. } => Some(prompt),
+                _ => None,
+            })
+            .expect("a pause emits AwaitingHuman with its prompt")
+    }
+
+    #[test]
+    fn a_def_gate_pause_under_none_discloses_the_precedence_in_its_prompt() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, HumanConfirm::None);
+        let prompt = pause_prompt(&mut store, 1);
+        // The pause still names the work under review first — the disclosure is appended, not a
+        // replacement of the attribution FINDING-032 fixed.
+        assert!(
+            prompt.starts_with("Approve the output of unit 1"),
+            "attribution must survive the disclosure: {prompt}"
+        );
+        assert!(
+            prompt.contains("workflow-declared gate") && prompt.contains("human_confirm=none"),
+            "an operator who launched with none must be told, at the pause itself, that the gate \
+             is workflow-authored and none does not suppress it: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_same_pause_under_an_attended_policy_carries_no_disclosure() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, HumanConfirm::All);
+        let prompt = pause_prompt(&mut store, 1);
+        assert!(
+            !prompt.contains("workflow-declared gate"),
+            "an operator who asked to be paused needs no precedence lecture — the note must be \
+             conditional on none, not boilerplate: {prompt}"
+        );
+    }
+
+    /// The terminal-gate pause (seam finding #4) is a def-authored gate too, reached through a
+    /// DIFFERENT branch of `advance_or_pause` — it must disclose under `none` as well, or the one
+    /// workflow ending on a human gate (`collab`) stalls its unattended runs unexplained.
+    #[test]
+    fn a_terminal_def_gate_under_none_discloses_too() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let session = AgentSession {
+            id: "d".into(),
+            workflow_id: "wf-d".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 1, // past the single terminal unit
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
+        u.gate = GateSpec::HumanConfirm {
+            unconditional: false,
+        };
+        u.status = UnitStatus::Done;
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let prompt = pause_prompt(&mut store, 1);
+        assert!(
+            prompt.starts_with("Approve completion after the final phase"),
+            "the terminal pause keeps its own framing: {prompt}"
+        );
+        assert!(
+            prompt.contains("workflow-declared gate") && prompt.contains("human_confirm=none"),
+            "the terminal def gate must disclose under none exactly like a mid-run one: {prompt}"
         );
     }
 }
