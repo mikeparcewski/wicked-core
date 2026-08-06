@@ -1890,7 +1890,7 @@ prior output you are reviewing, testing, or revising."
                 // this, the loop handled only notifications, so an unanswered request would have
                 // hung the turn — which is why the capability above had to stay off.
                 if v.get("method").and_then(Value::as_str) == Some("session/request_permission") {
-                    if let Some(req_id) = v.get("id").and_then(Value::as_u64) {
+                    if let Some(req_id) = v.get("id").cloned() {
                         let params = v.get("params").cloned().unwrap_or(Value::Null);
                         let result = match gate {
                             // Governed: the SAME policy and the SAME audit records as the wrapped
@@ -1903,7 +1903,7 @@ prior output you are reviewing, testing, or revising."
                         // NOT `let _ =`. A failed write leaves the agent blocked until the turn
                         // times out, and the reason is the only thing that explains the stall —
                         // dropping it turns a broken pipe into "the model was slow" (review).
-                        if let Err(e) = rpc_respond(&mut proc.stdin, req_id, result) {
+                        if let Err(e) = rpc_respond(&mut proc.stdin, &req_id, result) {
                             let note = format!(
                                 "\n[wicked-core] could not answer a permission request: {e}. The \
                                  agent is blocked on it and this turn will time out."
@@ -2905,7 +2905,7 @@ impl AcpStepRunner {
                     status: StepStatus::ElicitationFailed,
                     usage: result.usage,
                     files: result.files,
-                    governed: false,
+                    governed: gate.is_some(),
                 }
             }
             Ok(_) => {
@@ -4166,6 +4166,7 @@ sleep 30
             validator: None,
             tool_cmd: None,
             depends_on: Vec::new(),
+            required_deliverables: Vec::new(),
             status: crate::domain::UnitStatus::Pending,
         }
     }
@@ -4837,6 +4838,7 @@ else:
             binary: py_path.to_string_lossy().to_string(),
             start_args: vec![behavior.to_string()],
             transport: AcpTransport::default(),
+            auth_method: None,
         };
         start_acp_process(&config, dir)
             .unwrap_or_else(|e| panic!("mock ACP start failed for behavior={behavior}: {e}"))
@@ -4868,6 +4870,7 @@ else:
             0, // epoch=0 → disabled
             "claude-agent-acp",
             &tx,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4909,6 +4912,7 @@ else:
                 1,
                 "claude-agent-acp",
                 &tx,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -4960,6 +4964,7 @@ else:
             1,
             "claude-agent-acp",
             &tx,
+            None,
         )
         .unwrap();
         deliver_thread.join().unwrap();
@@ -5005,6 +5010,7 @@ else:
             1,
             "claude-agent-acp",
             &tx,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -5056,6 +5062,7 @@ else:
             1,
             "claude-agent-acp",
             &tx,
+            None,
         )
         .unwrap();
         deliver_thread.join().unwrap();

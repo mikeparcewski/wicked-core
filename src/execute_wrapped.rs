@@ -2390,6 +2390,9 @@ mod tests {
             workdir: None,
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let err = pty_unit_prompt(&input)
             .expect_err("a multi-line prompt must be refused, not submitted to the terminal");

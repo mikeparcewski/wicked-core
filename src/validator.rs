@@ -1082,6 +1082,11 @@ fn agent_validate_in(
             StepStatus::Failed => {
                 refusals.push(format!("{} ({})", seat.key, out.output.trim()));
             }
+            // Elicitation is not expected on a validator seat (no interactive human path exists);
+            // treat as a seat failure and rotate to the next.
+            StepStatus::ElicitationFailed => {
+                refusals.push(format!("{} (elicitation failed)", seat.key));
+            }
         }
     }
     // Every eligible seat refused to run. Fail CLOSED, naming each one — the operator needs to know

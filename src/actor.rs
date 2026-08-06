@@ -4747,7 +4747,7 @@ mod def_gate_disclosure_tests {
         subs.push(evtx);
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
-        let progress = advance_or_pause(store, &mut subs, &runner, &tx, "d", unit_ix).unwrap();
+        let progress = advance_or_pause(store, &mut subs, &runner, &tx, "d", unit_ix, &None, &None, uuid::Uuid::nil(), false).unwrap();
         assert!(
             matches!(progress, Progress::Paused),
             "precondition: the def gate pauses"
@@ -5154,6 +5154,10 @@ mod terminal_worktree_reap_tests {
             &tx,
             &mut in_flight,
             "r-resume",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
         )
         .unwrap();
         assert_eq!(
