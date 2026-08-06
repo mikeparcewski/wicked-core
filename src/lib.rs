@@ -11,6 +11,7 @@
 //! execute backend (real subprocess + gate-hook), migrating the GUI onto `Core`, and deleting the
 //! `wicked-agent` crate.
 
+mod acp_permission;
 mod acp_runner;
 mod actor;
 mod applications;

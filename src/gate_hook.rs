@@ -146,6 +146,52 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
         }
     };
 
+    // Everything from here on is CARRIER-INDEPENDENT: the sentinel, the policy evaluation, the
+    // durable claim, and the allow/deny answer. Only the step above — turning a wire payload into
+    // `(context, tool)` — differs between carriers. Split out so the ACP path can enforce the SAME
+    // policy and write the SAME audit trail instead of running ungoverned (FINDING-062).
+    evaluate_tool_call(
+        scope,
+        phase,
+        phase_alias,
+        db,
+        &decisions_path,
+        &context,
+        &tool,
+    )
+}
+
+/// Evaluate one tool call against the run's policies, record it durably, and answer allow/deny.
+///
+/// Returns the gate-hook exit convention: `0` = allow, `2` = deny.
+///
+/// # Why this is separate from [`run_gate_hook`]
+///
+/// Two carriers reach the same gate. Claude's wrapped path invokes `wicked-core gate-hook` as a
+/// PreToolUse hook and hands it a `{tool_name, tool_input}` payload on stdin. The ACP path has no
+/// subprocess to hook — the bridge drives the agent SDK in-process and asks the CLIENT for
+/// permission over `session/request_permission`. Before this split there was no way for that path
+/// to reach the policy, so governed units were rerouted to single-shot execution instead
+/// (FINDING-060/062), which is what made `domain-extraction` unable to finish on a real repo
+/// (FINDING-100).
+///
+/// The audit trail is not incidental to the answer. `fold_input_denial` requires the hook-fired
+/// sentinel for the phase; a carrier that returned allow/deny WITHOUT writing it would be denied
+/// downstream for looking bypassed. Sharing this function is what makes the two carriers
+/// indistinguishable to the fold, which is the property that matters.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_tool_call(
+    scope: &str,
+    phase: &str,
+    phase_alias: Option<&str>,
+    db: Option<&str>,
+    decisions_path: &str,
+    context: &serde_json::Value,
+    tool: &str,
+) -> i32 {
+    let decisions_path = decisions_path.to_string();
+    let context = context.clone();
+    let tool = tool.to_string();
     // Write the hook-fired liveness sentinel for `phase` BEFORE any policy evaluation or early-returns
     // below. This proves the hook BINARY was invoked for this phase (not just that the launcher
     // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
@@ -885,7 +931,11 @@ pub fn count_claims(store: &dyn GraphRead, claim_id: &str) -> anyhow::Result<usi
 /// Parse Claude's PreToolUse event `{ "tool_name", "tool_input": { … } }` into the governance
 /// evaluation context (ported from `wicked-agent/src/inject.rs`). `tool_input` keys vary by tool:
 /// `Bash{command}`, `Write{file_path,content}`, `Edit{file_path,new_string}`, `Read{file_path}`, …
-fn claude_pretool_context(raw: &str, scope: &str, phase: &str) -> (serde_json::Value, String) {
+pub(crate) fn claude_pretool_context(
+    raw: &str,
+    scope: &str,
+    phase: &str,
+) -> (serde_json::Value, String) {
     let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
     let tool = v
         .get("tool_name")
