@@ -606,7 +606,7 @@ fn round4(x: f64) -> f64 {
 /// Below this many requirement-bearing nodes, concentration is NOT judged: a small graph cannot be
 /// told apart from a small-but-legitimate catalog, so denying it would be guesswork. Operator-tunable
 /// via `WICKED_COVERAGE_MIN_JUDGEABLE`.
-const COVERAGE_MIN_JUDGEABLE_REQS: u64 = 100;
+const COVERAGE_MIN_JUDGEABLE_NODES: u64 = 100;
 /// Average behavior-bearing nodes per distinct `requirement` string above which the accounting reads
 /// as bulk-mapping rather than extraction (#131). The observed abuse averaged ~758 nodes/string (46
 /// strings over 34,897 nodes); a real catalog for a graph that size runs to hundreds/thousands of
@@ -672,7 +672,10 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
     // denied here — this is why the 12-node miniature test still passes). Both bounds are
     // operator-tunable so a genuinely broad-but-real catalog can raise them rather than be blocked.
     if let Some(reuse) = &report.requirement_reuse {
-        let min_judgeable = env_u64("WICKED_COVERAGE_MIN_JUDGEABLE", COVERAGE_MIN_JUDGEABLE_REQS);
+        let min_judgeable = env_u64(
+            "WICKED_COVERAGE_MIN_JUDGEABLE",
+            COVERAGE_MIN_JUDGEABLE_NODES,
+        );
         let max_avg = env_f64(
             "WICKED_COVERAGE_MAX_AVG_NODES_PER_REQ",
             COVERAGE_MAX_AVG_NODES_PER_REQ,
@@ -1290,7 +1293,7 @@ mod tests {
             }
             let r = recompute_front_half_coverage(&st).unwrap();
 
-            // The gate is satisfied AT THIS SCALE. 12 nodes is below COVERAGE_MIN_JUDGEABLE_REQS
+            // The gate is satisfied AT THIS SCALE. 12 nodes is below COVERAGE_MIN_JUDGEABLE_NODES
             // (100): a graph this small cannot be told apart from a small-but-legitimate catalog, so
             // the concentration gate deliberately does not fire here. The enforcement at real scale is
             // proved by `bulk_mapping_is_denied_at_scale` below; this test now only asserts that the
@@ -1315,8 +1318,8 @@ mod tests {
 
         /// #131 ENFORCEMENT. The live abuse at scale: many nodes, a handful of requirement strings.
         /// coverage is a legitimate 1.0, but the accounting is content-free — and now the gate DENIES
-        /// it instead of merely reporting it. 300 nodes over 3 strings = 100... just over the bar, so
-        /// use 2 strings (avg 150) to be unambiguously past it.
+        /// it instead of merely reporting it. 300 nodes over 2 strings = avg 150, unambiguously past
+        /// the default bar of 100 (the check is `avg > max_avg`, so avg exactly 100 would NOT deny).
         #[test]
         fn bulk_mapping_is_denied_at_scale() {
             let mut st = store();
