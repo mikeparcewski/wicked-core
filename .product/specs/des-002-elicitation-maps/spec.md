@@ -155,22 +155,32 @@ to the 36-case DES-002-tests.md baseline.
 - [ ] Concurrent reassignment workers track independently: `bus_in_flight_workers`
       keyed by `(run_id, launch_seq)` pairs. (Gate-83 race fix — type canonical
       definition is in plan Constraints)
-- [ ] OQ-R-4 resolved: `clientCapabilities.elicitation.form` emitted as `{"form":{}}`. (EC-1)
-- [ ] OQ-R-5 resolved: `params.message` and `params.requestedSchema.properties` paths
+- [x] OQ-R-4 resolved: `clientCapabilities.elicitation.form` emitted as `{"form":{}}`. (EC-1)
+      — verified: `src/acp_runner.rs:1044` emits `json!({"fs": {}, "terminal": false, "elicitation": {"form": {}}})`.
+- [x] OQ-R-5 resolved: `params.message` and `params.requestedSchema.properties` paths
       confirmed against SDK v1.3.0 `types.gen.ts`; extraction code matches. (EC-2)
-- [ ] OQ-R-6 resolved or guard in place: elicitation enabled only for verified adapters
+      — verified: `@agentclientprotocol/sdk` v1.3.0 `types.gen.d.ts` confirms `message` is a required
+      top-level field on `CreateElicitationRequest` (path: `params.message`) and `requestedSchema` is
+      a top-level field on `ElicitationFormMode` (path: `params.requestedSchema.properties`).
+      Code at `acp_runner.rs:1356–1357` matches.
+- [x] OQ-R-6 resolved or guard in place: elicitation enabled only for verified adapters
       in `ELICITATION_VERIFIED_ADAPTERS`; enablement for any new adapter requires an
       explicit verification artifact in the PR. (EC-3)
-- [ ] `resolveElicitation` NAPI binding compiles with `"serde-json"` napi feature;
+      — verified: `src/acp_runner.rs:1042–1046` and `:1148`; allowlist = `["claude-agent-acp", "codex-acp"]`.
+- [x] `resolveElicitation` NAPI binding compiles with `"serde-json"` napi feature;
       crew TS wrapper unpacks `result.content?.response ?? null` before calling. (EC — NAPI wiring)
-- [ ] **[Blocking pre-merge]** Studio `ElicitationPrompt` escapes `message` before
+      — verified: T8 compile passed; `crates/wicked-core-ts/Cargo.toml` has `features = ["napi8", "serde-json"]`.
+- [ ] **[Blocking pre-merge — OPEN]** Studio `ElicitationPrompt` escapes `message` before
       render — this is the sole XSS/injection control (no Rust-side sanitization);
       the Rust PR must not merge until the wicked-crew TS PR with this control is
       reviewed and approved. Tracked as a PR pre-condition, not an advisory. (EC-5)
-- [ ] `chat_turn` elicitation guard in place (`elicitation_enabled=false`) until OQ-R-7
+      — STATUS: requires a wicked-crew TS PR; link must appear in the wicked-core PR description before merge.
+- [x] `chat_turn` elicitation guard in place (`elicitation_enabled=false`) until OQ-R-7
       is resolved with a verifiable artifact (e.g., passing integration test run or
       source-code audit cited in the PR description). Self-assertion alone is
       insufficient. (EC-6)
+      — verified: `src/acp_runner.rs:2204,2212` passes `epoch=0` to `exec_turn_acp` for all chat turns;
+      guard at line 1281–1282 (`epoch > 0 && ...`) ensures `elicitation_enabled=false`.
 
 ## Assumptions
 
