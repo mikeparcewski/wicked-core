@@ -284,7 +284,7 @@ pub(crate) fn evaluate_tool_call(
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&decisions_path)?;
+                .open(decisions_path)?;
             f.write_all(sentinel_line.as_bytes())
         }) {
             eprintln!("wicked-governance: DENY (could not write hook-fired sentinel: {e})");
@@ -302,7 +302,7 @@ pub(crate) fn evaluate_tool_call(
         Ok(s) => s,
         Err(e) => {
             append_infra_deny(
-                &decisions_path,
+                decisions_path,
                 scope,
                 phase,
                 &crate::diagnostic::with_cause("store open failed", &e),
@@ -317,18 +317,18 @@ pub(crate) fn evaluate_tool_call(
     // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
-    if let Some(reason) = boundary_denial(&context, &tool) {
-        append_boundary_deny(&decisions_path, scope, phase, &reason);
+    if let Some(reason) = boundary_denial(context, tool) {
+        append_boundary_deny(decisions_path, scope, phase, &reason);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
 
     let phases = crate::scope::phase_aliases(phase, phase_alias);
-    let selected = match select_any(&store, scope, &phases, &context) {
+    let selected = match select_any(&store, scope, &phases, context) {
         Ok(s) => s,
         Err(e) => {
             append_infra_deny(
-                &decisions_path,
+                decisions_path,
                 scope,
                 phase,
                 &crate::diagnostic::with_cause("policy select failed", &e),
@@ -340,7 +340,7 @@ pub(crate) fn evaluate_tool_call(
             return 2;
         }
     };
-    let claim = decide(&selected, scope, phase, &context, crate::clock::eval_now());
+    let claim = decide(&selected, scope, phase, context, crate::clock::eval_now());
 
     // Write the tool-call annotation AND the claim as a SINGLE buffer under the advisory lock.
     // Using one buffer means that even if `with_append_lock` degrades to running without the lock
@@ -370,7 +370,7 @@ pub(crate) fn evaluate_tool_call(
             let mut f = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&decisions_path)?;
+                .open(decisions_path)?;
             f.write_all(combined.as_bytes())
         }) {
             eprintln!("wicked-governance: DENY (could not append decision: {e})");
