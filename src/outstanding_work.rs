@@ -44,7 +44,6 @@
 
 use std::path::Path;
 use std::time::{Duration, Instant};
-use wicked_apps_core::spawn::HardenedCommand;
 
 /// How long a unit's own background work may keep the phase open before the engine stops waiting.
 ///
@@ -131,6 +130,7 @@ pub fn outstanding_in(worktree: &Path) -> Option<usize> {
         // .hardened() is not optional here even though `ps` reads no engine state: the chokepoint rule
         // has no allowlist on purpose (FINDING-067), and spawn_audit enforces it — it caught this very
         // line when I first wrote it without the call.
+        use wicked_apps_core::spawn::HardenedCommand;
         let mut cmd = std::process::Command::new("ps");
         cmd.hardened();
         let out = cmd.args(["-Ao", "args="]).output().ok()?;
