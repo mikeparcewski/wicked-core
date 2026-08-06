@@ -664,6 +664,12 @@ impl WrappedCliStepRunner {
                 if !g.phase_id.is_empty() {
                     cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
                 }
+                // Arm the unit's filesystem boundary (FINDING-045/098). The worktree is the write
+                // root; nothing else is writable, which is what stops a governed worker from
+                // editing the pin that gates its own work. Read roots stay empty for now: the
+                // policy layer treats "outside every root" as a denial either way, and widening
+                // reads is an evidence-driven change, not a guess (see crate::path_policy).
+                cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, cwd.as_os_str());
             }
             match run_bounded(cmd, self.timeout, emit, adapter) {
                 Ok((0, out, _, usage, files)) => (StepStatus::Ok, out, usage, files),

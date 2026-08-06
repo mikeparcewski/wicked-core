@@ -106,6 +106,76 @@ pub const COVERAGE_DB_ENV: &str = "WICKED_COVERAGE_DB";
 /// operator override by `resolve_wicked_core_exe_opt`.
 pub const WICKED_CORE_EXE_ENV: &str = "WICKED_CORE_EXE";
 
+/// Absolute roots this unit may WRITE inside, `PATH`-separator joined. In practice its worktree.
+///
+/// The boundary travels by env for the same reason [`DECISIONS_PATH_ENV`] does: the hook runs as a
+/// subprocess of an agent that may have changed directory, so `cwd` is not a trustworthy statement
+/// of where the unit was scoped.
+pub const WRITE_ROOTS_ENV: &str = "WICKED_WRITE_ROOTS";
+
+/// Absolute roots this unit may READ but not write, `PATH`-separator joined. Evidence-derived (skill
+/// definitions, language runtimes, package caches) — see [`crate::path_policy`]. A boundary that
+/// breaks every real run gets switched off, and one that is off is worse than none because it is
+/// believed.
+pub const READ_ROOTS_ENV: &str = "WICKED_READ_ROOTS";
+
+/// The unit's filesystem boundary, or `None` when the launcher armed no roots.
+///
+/// `None` is NOT "allow everything" — it is "no boundary was configured", which is the honest state
+/// for a standalone or ungoverned invocation. [`crate::path_policy::check`] itself allows nothing
+/// against an empty root set, so the two cases stay distinguishable rather than collapsing into a
+/// silent fail-open.
+fn allowed_roots_from_env() -> Option<crate::path_policy::AllowedRoots> {
+    let split = |k: &str| -> Vec<std::path::PathBuf> {
+        std::env::var(k)
+            .ok()
+            .map(|v| {
+                std::env::split_paths(&v)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let write = split(WRITE_ROOTS_ENV);
+    let read = split(READ_ROOTS_ENV);
+    (!write.is_empty() || !read.is_empty())
+        .then_some(crate::path_policy::AllowedRoots { write, read })
+}
+
+/// Tools whose call WRITES through its path argument. Anything else carrying a path is checked as a
+/// read, which is the conservative direction: mislabelling a write as a read would test it against
+/// the wider root set and let it through.
+const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
+
+/// Refuse a path-bearing tool call that reaches outside the unit's boundary (FINDING-045/098).
+///
+/// The motivating case is not a generic escape. A governed worker in the campaign located
+/// `~/.config/wicked-core/workflows/domain-extraction.json` — the pin binding its OWN gate — and
+/// began authoring a replacement, including vaulting and approving it. Nothing objected; an
+/// unrelated network failure stopped it. `evaluator != creator` is this platform's headline
+/// structural claim, and it was enforced by a file the creator could rewrite.
+///
+/// Returns the denial reason, or `None` when the call is inside the boundary, carries no path, or
+/// no boundary was configured.
+fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<String> {
+    let roots = allowed_roots_from_env()?;
+    let path = context
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty())?;
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    crate::path_policy::check(
+        path,
+        &roots,
+        WRITE_TOOLS.contains(&tool),
+        &cwd,
+        home.as_deref(),
+    )
+    .err()
+    .map(|d| d.to_string())
+}
+
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
 ///
 /// `scope`/`phase` are resolved by the caller (`bin/wicked-core`) from argv (standalone) ELSE the
@@ -196,6 +266,15 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
             return 2;
         }
     };
+    // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
+    // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
+    // already left here. Checking it second would let a permissive rule authorise an escape.
+    if let Some(reason) = boundary_denial(&context, &tool) {
+        append_infra_deny(&decisions_path, scope, phase, &reason);
+        eprintln!("wicked-governance: DENY ({reason})");
+        return 2;
+    }
+
     let phases = crate::scope::phase_aliases(phase, phase_alias);
     let selected = match select_any(&store, scope, &phases, &context) {
         Ok(s) => s,
@@ -1663,5 +1742,147 @@ mod protocol_tests {
         // Real stdout may carry a warning line; the probe should still find the contract.
         let out = format!("warning: something\n{}\n", protocol_version_line());
         assert_eq!(parse_protocol_version(&out), Some(GATE_PROTOCOL_VERSION));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Env is process-global and Rust runs tests in threads, so these serialize on one mutex.
+    /// Without it, two tests setting WICKED_WRITE_ROOTS race and the failure looks like a logic bug.
+    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        match write {
+            Some(w) => std::env::set_var(WRITE_ROOTS_ENV, w),
+            None => std::env::remove_var(WRITE_ROOTS_ENV),
+        }
+        std::env::remove_var(READ_ROOTS_ENV);
+        let out = f();
+        std::env::remove_var(WRITE_ROOTS_ENV);
+        out
+    }
+
+    fn ctx(path: &str) -> serde_json::Value {
+        json!({ "path": path })
+    }
+
+    /// THE case. A governed worker located the pin binding its own gate and began authoring a
+    /// replacement. With the worktree armed as the only write root, that write is refused.
+    #[test]
+    fn the_governance_pin_is_outside_the_boundary() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let pin = dirs_config_workflow();
+        with_roots(Some(wt.to_str().unwrap()), || {
+            let denial = boundary_denial(&ctx(&pin), "Write")
+                .expect("writing the gate's own pin must be refused");
+            assert!(
+                denial.contains(&wt.to_string_lossy().to_string()),
+                "the denial must name where the call WOULD have been allowed, or the agent \
+                 retries blind: {denial}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_write_inside_the_worktree_is_allowed() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt2");
+        std::fs::create_dir_all(&wt).unwrap();
+        let inside = wt.join("src").join("main.rs");
+        with_roots(Some(wt.to_str().unwrap()), || {
+            assert!(boundary_denial(&ctx(inside.to_str().unwrap()), "Write").is_none());
+        });
+    }
+
+    /// `..` must not walk out. The policy normalizes before comparing, so a traversal resolves to
+    /// its real target and is judged there.
+    #[test]
+    fn traversal_out_of_the_worktree_is_refused() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt3");
+        std::fs::create_dir_all(&wt).unwrap();
+        let escape = wt.join("..").join("elsewhere.json");
+        with_roots(Some(wt.to_str().unwrap()), || {
+            assert!(boundary_denial(&ctx(escape.to_str().unwrap()), "Write").is_some());
+        });
+    }
+
+    /// A read of the operational store is still outside the boundary. FINDING-067 was a worker that
+    /// reached the platform's own state; reads of it are reconnaissance for exactly that.
+    #[test]
+    fn reads_outside_the_boundary_are_refused_too() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt4");
+        std::fs::create_dir_all(&wt).unwrap();
+        with_roots(Some(wt.to_str().unwrap()), || {
+            assert!(boundary_denial(&ctx("/etc/passwd"), "Read").is_some());
+        });
+    }
+
+    /// No roots armed means no boundary was CONFIGURED — the honest state for a standalone or
+    /// ungoverned invocation. It must not silently become "deny everything" and break those, nor
+    /// be mistaken for a boundary that passed.
+    #[test]
+    fn an_unarmed_boundary_is_absent_not_permissive_and_not_denying() {
+        with_roots(None, || {
+            assert!(boundary_denial(&ctx("/etc/passwd"), "Write").is_none());
+        });
+    }
+
+    /// A call with no path argument is not a boundary question. Bash is the residual this layer
+    /// deliberately does not claim to cover (see crate::path_policy's module docs).
+    #[test]
+    fn a_call_without_a_path_is_not_judged_here() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt5");
+        std::fs::create_dir_all(&wt).unwrap();
+        with_roots(Some(wt.to_str().unwrap()), || {
+            assert!(boundary_denial(&json!({"command": "ls /"}), "Bash").is_none());
+        });
+    }
+
+    /// CALL-SITE AUDIT. Every test above calls `boundary_denial` DIRECTLY, so all of them stay
+    /// green if someone deletes the call from `run_gate_hook` — I verified that by deleting it, and
+    /// nothing failed. That is the third time this campaign has hit the same gap (FINDING-091's
+    /// first guard, FINDING-093's), so assert the wiring, not just the helper.
+    #[test]
+    fn run_gate_hook_actually_consults_the_boundary() {
+        let src = include_str!("gate_hook.rs");
+        let body = src
+            .split("pub fn run_gate_hook")
+            .nth(1)
+            .and_then(|b| b.split("\npub ").next())
+            .expect("run_gate_hook is still a top-level fn");
+        assert!(
+            body.contains("boundary_denial("),
+            "run_gate_hook no longer consults the filesystem boundary — the helper is live and \
+             unreachable, which is indistinguishable from having no boundary at all (FINDING-098)"
+        );
+    }
+
+    /// The other half nothing detected: the launcher must ARM the roots. Without this the boundary
+    /// is configured nowhere, `allowed_roots_from_env` returns None, and every path is unjudged —
+    /// silently, because "no boundary configured" is a legitimate state for standalone runs.
+    #[test]
+    fn the_launcher_arms_the_write_root() {
+        let launcher = include_str!("execute_wrapped.rs");
+        assert!(
+            launcher.contains("WRITE_ROOTS_ENV"),
+            "execute_wrapped no longer sets {WRITE_ROOTS_ENV} on the governed child, so no \
+             governed unit has a filesystem boundary (FINDING-045/098)"
+        );
+        // Armed from the WORKTREE specifically. Pointing it anywhere wider — the repo root, the
+        // home dir — would satisfy the check above while permitting the escape it exists to stop.
+        assert!(
+            launcher.contains("WRITE_ROOTS_ENV, cwd.as_os_str()"),
+            "the write root must be the unit's worktree; a wider root passes the presence check \
+             and still allows the governance pin to be rewritten"
+        );
+    }
+
+    fn dirs_config_workflow() -> String {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        format!("{home}/.config/wicked-core/workflows/domain-extraction.json")
     }
 }
