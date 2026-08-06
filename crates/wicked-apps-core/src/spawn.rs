@@ -74,6 +74,11 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
     "WICKED_GATE_SCOPE",
     "WICKED_GATE_PHASE",
     "WICKED_GATE_PHASE_ID",
+    // The unit's filesystem boundary. Inherited at an unrelated spawn site these silently re-scope
+    // one unit's worktree onto another child, and a child that can merely OBSERVE them learns
+    // exactly where the fence is. The launcher sets them deliberately on the governed child.
+    "WICKED_WRITE_ROOTS",
+    "WICKED_READ_ROOTS",
 ];
 
 /// Chainable environment hardening for [`Command`].

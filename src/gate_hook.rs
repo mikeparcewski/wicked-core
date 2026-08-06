@@ -126,9 +126,12 @@ pub const READ_ROOTS_ENV: &str = "WICKED_READ_ROOTS";
 /// against an empty root set, so the two cases stay distinguishable rather than collapsing into a
 /// silent fail-open.
 fn allowed_roots_from_env() -> Option<crate::path_policy::AllowedRoots> {
+    // `var_os`, NOT `var`: a non-UTF-8 worktree path comes back as `VarError::NotUnicode` from
+    // `var`, which would make the boundary look UNCONFIGURED and apply to nothing — a fail-OPEN in
+    // the one control that must fail closed. `execute_wrapped` sets this from an `OsStr`, so the
+    // round trip has to stay OsString-clean end to end (review).
     let split = |k: &str| -> Vec<std::path::PathBuf> {
-        std::env::var(k)
-            .ok()
+        std::env::var_os(k)
             .map(|v| {
                 std::env::split_paths(&v)
                     .filter(|p| !p.as_os_str().is_empty())
@@ -270,7 +273,7 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
     if let Some(reason) = boundary_denial(&context, &tool) {
-        append_infra_deny(&decisions_path, scope, phase, &reason);
+        append_boundary_deny(&decisions_path, scope, phase, &reason);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -584,6 +587,30 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
         evaluated_context_ref: "sha256:infra".to_string(),
         criteria: format!("governance infra failure: {reason}"),
         evaluator_identity: "wicked-governance-infra".to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    let _ = append_decision(Path::new(decisions_path), &claim);
+}
+
+/// Record a BOUNDARY refusal — a tool call that reached outside the unit's worktree.
+///
+/// Deliberately not [`append_infra_deny`]. An infra deny says "governance could not be evaluated";
+/// a boundary deny says "governance evaluated this and the call left its scope". Filing the second
+/// under the first mislabels the evaluator and criteria in the append-only log — the record audits
+/// and alerts read — so a real escape would surface as an infrastructure wobble (review).
+fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
+    let claim = ConformanceClaim {
+        // Keyed on `phase` only, for the same reason `append_infra_deny` is: `scope` embeds `/`
+        // and would make an unbounded claim symbol.
+        claim_id: format!("boundary-deny:{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec![],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string()],
+        evaluated_context_ref: "sha256:boundary".to_string(),
+        criteria: format!("filesystem boundary: {reason}"),
+        evaluator_identity: "wicked-governance-boundary".to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
     let _ = append_decision(Path::new(decisions_path), &claim);
@@ -1878,6 +1905,31 @@ mod boundary_tests {
             launcher.contains("WRITE_ROOTS_ENV, cwd.as_os_str()"),
             "the write root must be the unit's worktree; a wider root passes the presence check \
              and still allows the governance pin to be rewritten"
+        );
+    }
+
+    /// Review caught a FAIL-OPEN here: `std::env::var` returns `NotUnicode` for a non-UTF-8 path,
+    /// which made `allowed_roots_from_env` answer "no boundary configured" — so the control silently
+    /// applied to nothing on exactly the paths an attacker would choose. The launcher sets the root
+    /// from an `OsStr`, so the round trip has to be OsString-clean.
+    ///
+    /// Falsified by restoring `var`: on unix this fails, because the non-UTF-8 root vanishes and the
+    /// escape is then permitted.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_worktree_still_has_a_boundary() {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/wicked-\xff-wt");
+        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(WRITE_ROOTS_ENV, raw);
+        std::env::remove_var(READ_ROOTS_ENV);
+        let roots = allowed_roots_from_env();
+        std::env::remove_var(WRITE_ROOTS_ENV);
+        let roots = roots.expect("a non-UTF-8 root must still configure a boundary, not vanish");
+        assert_eq!(roots.write.len(), 1, "the root must survive the round trip");
+        assert_eq!(
+            roots.write[0].as_os_str().as_bytes(),
+            b"/tmp/wicked-\xff-wt"
         );
     }
 
