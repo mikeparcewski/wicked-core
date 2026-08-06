@@ -5204,6 +5204,68 @@ else:
         assert!(!m.is_epoch_cancelled("run-27", 2), "epoch 2 not tombstoned");
     }
 
+    /// Test 30: Present-but-empty schema (zero properties) → validate_elicitation_schema returns None
+    /// → immediate cancel (F16); absent requestedSchema → Null value → same result.
+    ///
+    /// Both empty-properties and absent schema are non-representable in form mode.
+    #[test]
+    fn empty_or_absent_schema_is_cancelled() {
+        // Schema A: present but zero properties.
+        let schema_a = serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        });
+        assert!(
+            validate_elicitation_schema(&schema_a).is_none(),
+            "zero-properties schema must return None → cancel"
+        );
+
+        // Schema B: absent requestedSchema → JSON Null.
+        let schema_b = serde_json::Value::Null;
+        assert!(
+            validate_elicitation_schema(&schema_b).is_none(),
+            "absent (Null) requestedSchema must return None → cancel"
+        );
+
+        // Schema C: requestedSchema present but no 'properties' key at all.
+        let schema_c = serde_json::json!({"type": "object"});
+        assert!(
+            validate_elicitation_schema(&schema_c).is_none(),
+            "schema without 'properties' key must return None → cancel"
+        );
+    }
+
+    /// Test 31: Stale worker epoch stays cancelled after `next_epoch` bumps.
+    ///
+    /// A worker holding a reference to epoch 1 that has been tombstoned must still
+    /// receive None from `register` even after `next_epoch` allocates epoch 2.
+    #[test]
+    fn stale_worker_epoch_stays_cancelled_after_bump() {
+        let mut m = maps();
+
+        // Allocate and tombstone epoch 1.
+        let ep1 = m.next_epoch("run-31");
+        assert_eq!(ep1, 1);
+        m.cancel_epoch("run-31", ep1);
+        assert!(m.is_epoch_cancelled("run-31", 1), "epoch 1 tombstoned");
+
+        // Bump to epoch 2 — stale worker still holds ep1.
+        let ep2 = m.next_epoch("run-31");
+        assert_eq!(ep2, 2);
+
+        // A fresh epoch-2 worker succeeds.
+        let r2 = m.register("run-31", 2, "eid-31b", "q", None, "r");
+        assert!(r2.is_some(), "epoch 2 must be accepted");
+
+        // A stale epoch-1 worker is still rejected (tombstone persists).
+        let r1_stale = m.register("run-31", 1, "eid-31c", "q2", None, "r");
+        assert!(r1_stale.is_none(), "stale epoch-1 registration must still return None");
+        assert!(m.is_epoch_cancelled("run-31", 1), "epoch 1 tombstone persists after next_epoch");
+        // Epoch 2 registration did not disturb epoch 1's tombstone or epoch 2.
+        assert!(!m.is_epoch_cancelled("run-31", 2), "epoch 2 must not be tombstoned");
+    }
+
     /// Test 29d: EpochCleanup RAII guard emits ElicitationResolved with reason="teardown"
     /// when the epoch is tombstoned (channel Disconnected path).
     #[test]

@@ -1912,65 +1912,65 @@ mod tests {
         use crate::acp_runner::ElicitationMaps;
         use std::sync::{Arc, Mutex};
 
-        let bus_path = tmp_bus("t38");
-        let bus = BusDb::open(&bus_path).unwrap();
-        let actor_gen = uuid::Uuid::new_v4();
-        let c_name = consumer_name(actor_gen);
-        let cc_name = completed_consumer_name(actor_gen);
-
-        // Set up ElicitationMaps in degraded state: task activated but not in-flight.
-        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
-        {
-            let mut m = maps.lock().unwrap();
-            // begin_launch registers the run and returns launch_seq=1
-            let seq = m.begin_launch("run-t38", false);
-            assert_eq!(seq, 1);
-            // Mark as activated (simulates try_next_epoch_bus having been called)
-            // We use try_next_epoch_bus to activate it (is_acp=false, so epoch=0)
-            m.try_next_epoch_bus("run-t38", seq, false);
-            // Now mark in-flight, then clear it to simulate worker gone
-            m.mark_bus_in_flight("run-t38", seq);
-            m.clear_bus_in_flight("run-t38", seq);
-            // Verify the degraded state preconditions.
-            assert!(m.has_activated_seq("run-t38", seq), "should be activated");
-            assert!(!m.is_bus_worker_in_flight("run-t38", seq), "should NOT be in-flight");
+        // Stub runner that must never be called in degraded mode.
+        struct NeverRunner;
+        impl StepRunner for NeverRunner {
+            fn run_unit(&self, _: &StepInput) -> StepOutput {
+                panic!("NeverRunner.run_unit called — should not execute in degraded mode");
+            }
         }
 
-        // Publish a dispatched task with actor_gen + launch_seq=1
-        let payload = serde_json::json!({
-            "run_id": "run-t38", "unit_ix": 0, "attempt": 0,
-            "workflow_id": "wf", "entity_mode": "shared",
-            "workdir": null,
-            "unit": {
-                "id": "u1", "session_id": "run-t38", "ord": 1, "description": "d",
-                "stage": "build", "assigned_cli": null, "assigned_invocation": null,
-                "council_task_ref": null, "routing": null, "denial_reason": null,
-                "phase_ref": null, "conformance_ref": null, "phase_status": null,
-                "collection_scope": null, "skill_ref": null, "allowed_skills": [],
-                "gate": {"kind": "none"}, "role": "implementer", "validator": null,
-                "tool_cmd": null, "depends_on": [], "status": "pending"
-            },
-            "agent_review_target": null, "cli": null,
-            "process_gen": actor_gen.to_string(),
-            "launch_seq": 1_u64,
-            "is_acp": false
-        });
-        bus.emit(&BusEmit::new(TASK_DISPATCHED, CORE_DOMAIN, "test", payload)).unwrap();
+        // ── sub-case (a): actor acks → cursor must advance ────────────────────────────
 
-        // Sub-case (a): actor acks — cursor must advance.
+        let bus_path_a = tmp_bus("t38a");
+        let actor_gen_a = uuid::Uuid::new_v4();
+        let c_name_a = consumer_name(actor_gen_a);
+        let cc_name_a = completed_consumer_name(actor_gen_a);
+
+        let maps_a = Arc::new(Mutex::new(ElicitationMaps::new()));
         {
-            let db_a = BusDb::open(&bus_path).unwrap();
-            db_a.save_cursor(&c_name, 0).unwrap();
+            let mut m = maps_a.lock().unwrap();
+            let seq = m.begin_launch("run-t38a", false);
+            assert_eq!(seq, 1);
+            m.try_next_epoch_bus("run-t38a", seq, false);
+            m.mark_bus_in_flight("run-t38a", seq);
+            m.clear_bus_in_flight("run-t38a", seq);
+            assert!(m.has_activated_seq("run-t38a", seq), "should be activated");
+            assert!(!m.is_bus_worker_in_flight("run-t38a", seq), "should NOT be in-flight");
+        }
 
+        // Publish a properly-serialized task.dispatched so serde can parse it (GateSpec::Auto
+        // serializes as the string "auto", not {"kind":"none"} — hand-crafted JSON would be a
+        // poison payload and the cursor would advance for the wrong reason).
+        let unit_a = crate::domain::WorkUnit::pending("run-t38a:u1", "run-t38a", 1, "degraded-mode test");
+        let input_a = StepInput {
+            run_id: "run-t38a".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: unit_a,
+            workflow_id: "wf".into(),
+            entity_mode: EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: Some(actor_gen_a),
+            launch_seq: 1,
+        };
+        assert!(arm_exec_publisher(&bus_path_a), "arm publisher t38a");
+        assert!(try_publish_dispatched(&input_a, None, false), "publish t38a");
+        disarm_exec_publisher();
+
+        {
+            let bus_a = BusDb::open(&bus_path_a).unwrap();
+            bus_a.save_cursor(&c_name_a, 0).unwrap();
             let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
             let stop_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop_a2 = stop_a.clone();
 
-            // Actor thread: receive the command and send the ack.
             let ack_thread = std::thread::spawn(move || {
                 if let Ok(cmd) = cmd_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                     if let Command::ApplyStepResult { ack, .. } = cmd {
-                        // Verify ElicitationFailed was emitted
                         if let Some(ack_tx) = ack {
                             let _ = ack_tx.send(());
                         }
@@ -1978,52 +1978,130 @@ mod tests {
                 }
             });
 
-            let maps_a = maps.clone();
-            let c_name_a = c_name.clone();
-            let cc_name_a = cc_name.clone();
-            let bus_path_a = bus_path.clone();
-            // Use a stub runner (never called in degraded mode)
-            struct NeverRunner;
-            impl StepRunner for NeverRunner {
-                fn run_unit(&self, _: &StepInput) -> StepOutput {
-                    panic!("NeverRunner.run_unit called — should not execute in degraded mode");
-                }
-            }
-            let runner_a: Arc<dyn StepRunner> = Arc::new(NeverRunner);
-
-            let handle_a = std::thread::spawn(move || {
+            let maps_clone = maps_a.clone();
+            let bus_path_clone = bus_path_a.clone();
+            let c_name_clone = c_name_a.clone();
+            let cc_name_clone = cc_name_a.clone();
+            let runner: Arc<dyn StepRunner> = Arc::new(NeverRunner);
+            let handle = std::thread::spawn(move || {
                 run_cli_runner(
-                    db_a,
-                    bus_path_a,
+                    BusDb::open(&bus_path_clone).unwrap(),
+                    bus_path_clone,
                     0,
-                    runner_a,
+                    runner,
                     cmd_tx,
-                    Some(maps_a),
-                    actor_gen,
+                    Some(maps_clone),
+                    actor_gen_a,
                     None,
-                    c_name_a,
-                    cc_name_a,
+                    c_name_clone,
+                    cc_name_clone,
                     std::time::Duration::from_millis(50),
                     stop_a2,
                 )
             });
-            let inner_a = handle_a.join().unwrap();
-
+            let inner = handle.join().unwrap();
             ack_thread.join().unwrap();
-            // Stop the consumer after the ack
             stop_a.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = inner_a.join();
+            let _ = inner.join();
 
-            let bus_check = BusDb::open(&bus_path).unwrap();
-            let pos = bus_check.load_cursor(&c_name).unwrap();
+            let pos = BusDb::open(&bus_path_a).unwrap().load_cursor(&c_name_a).unwrap();
             assert!(
                 pos.unwrap_or(0) > 0,
                 "cursor must advance after ack in degraded mode (sub-case a)"
             );
         }
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path_a).parent().unwrap());
 
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new(&bus_path).parent().unwrap(),
-        );
+        // ── sub-case (b): actor drops ack → cursor must NOT advance ──────────────────
+
+        let bus_path_b = tmp_bus("t38b");
+        let actor_gen_b = uuid::Uuid::new_v4();
+        let c_name_b = consumer_name(actor_gen_b);
+        let cc_name_b = completed_consumer_name(actor_gen_b);
+
+        let maps_b = Arc::new(Mutex::new(ElicitationMaps::new()));
+        {
+            let mut m = maps_b.lock().unwrap();
+            let seq = m.begin_launch("run-t38b", false);
+            assert_eq!(seq, 1);
+            m.try_next_epoch_bus("run-t38b", seq, false);
+            m.mark_bus_in_flight("run-t38b", seq);
+            m.clear_bus_in_flight("run-t38b", seq);
+            assert!(m.has_activated_seq("run-t38b", seq), "should be activated");
+            assert!(!m.is_bus_worker_in_flight("run-t38b", seq), "should NOT be in-flight");
+        }
+
+        // Same publish pattern as sub-case (a): use a real StepInput so GateSpec serializes
+        // correctly as "auto", not {"kind":"none"}.
+        let unit_b = crate::domain::WorkUnit::pending("run-t38b:u1", "run-t38b", 1, "degraded-mode test");
+        let input_b = StepInput {
+            run_id: "run-t38b".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: unit_b,
+            workflow_id: "wf".into(),
+            entity_mode: EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: Some(actor_gen_b),
+            launch_seq: 1,
+        };
+        assert!(arm_exec_publisher(&bus_path_b), "arm publisher t38b");
+        assert!(try_publish_dispatched(&input_b, None, false), "publish t38b");
+        disarm_exec_publisher();
+
+        {
+            let bus_b = BusDb::open(&bus_path_b).unwrap();
+            bus_b.save_cursor(&c_name_b, 0).unwrap();
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+            let stop_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_b2 = stop_b.clone();
+
+            // Actor: receive command, DROP ack without sending (simulates actor crash), then stop consumer.
+            let stop_b3 = stop_b.clone();
+            let ack_drop_thread = std::thread::spawn(move || {
+                if let Ok(cmd) = cmd_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    if let Command::ApplyStepResult { ack, .. } = cmd {
+                        drop(ack); // drop without sending → ack_rx.recv() returns Err
+                    }
+                }
+                // Signal the consumer to stop so it doesn't loop indefinitely.
+                stop_b3.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+            let maps_clone = maps_b.clone();
+            let bus_path_clone = bus_path_b.clone();
+            let c_name_clone = c_name_b.clone();
+            let cc_name_clone = cc_name_b.clone();
+            let runner: Arc<dyn StepRunner> = Arc::new(NeverRunner);
+            let handle = std::thread::spawn(move || {
+                run_cli_runner(
+                    BusDb::open(&bus_path_clone).unwrap(),
+                    bus_path_clone,
+                    0,
+                    runner,
+                    cmd_tx,
+                    Some(maps_clone),
+                    actor_gen_b,
+                    None,
+                    c_name_clone,
+                    cc_name_clone,
+                    std::time::Duration::from_millis(50),
+                    stop_b2,
+                )
+            });
+            let inner = handle.join().unwrap();
+            ack_drop_thread.join().unwrap();
+            let _ = inner.join();
+
+            let pos = BusDb::open(&bus_path_b).unwrap().load_cursor(&c_name_b).unwrap();
+            assert_eq!(
+                pos.unwrap_or(0), 0,
+                "cursor must NOT advance when actor drops ack (sub-case b)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path_b).parent().unwrap());
     }
 }
