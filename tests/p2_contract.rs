@@ -300,8 +300,13 @@ fn governance_deny_through_the_engine_halts_run_as_failed() {
 #[test]
 fn a_deny_policy_registered_through_the_engine_api_actually_halts_a_run() {
     // Regression: the governance tab registers via `Core::register_deny_policy`. Governance matches
-    // `applies_to` EXACTLY against the per-unit phase (`unit-N`), so the policy must target those —
+    // `applies_to` EXACTLY against the per-unit phase (`unit-N`), so the policy must target one —
     // otherwise the tab would silently never deny. This proves it denies for real.
+    //
+    // FINDING-028: `phase` now SCOPES the deny (and is validated), so this registers against the
+    // exact execution phase of the unit whose output carries the trigger — the old abstract label
+    // (`"exec"`) named no real phase and is now rejected at the write boundary instead of being
+    // silently fanned out across every unit.
     let ran: Ran = Arc::new(Mutex::new(Vec::new()));
     let core = Core::spawn_with_engine(
         db_path("ui-deny"),
@@ -311,7 +316,7 @@ fn a_deny_policy_registered_through_the_engine_api_actually_halts_a_run() {
             ran: ran.clone(),
         }),
     );
-    core.register_deny_policy("exec", "DEPLOY").unwrap();
+    core.register_deny_policy("unit-1", "DEPLOY").unwrap();
     core.launch_run(spec("r", "task one. task two")).unwrap();
     wait_status(&core, "r", SessionStatus::Failed, "a deny policy registered via the engine API halts the run (it targets the real unit phases)");
     let views = core.sessions_detail().unwrap();
@@ -391,8 +396,12 @@ fn a_retired_policy_stops_denying_and_the_same_run_then_completes() {
 
 #[test]
 fn deny_policy_fires_on_a_unit_beyond_the_64th() {
-    // Regression for the deny-phase span: a UI deny policy must cover units PAST unit-64 (the old
-    // hard cap silently let them run ungoverned). 65 units; only the 65th (ix 64) trips the deny.
+    // Regression for the deny-phase span: a UI deny policy must be able to reach units PAST
+    // unit-64 (the old hard cap silently let them run ungoverned). 65 units; only the 65th (ix 64)
+    // trips the deny.
+    //
+    // FINDING-028: the policy is now SCOPED, so it registers on `unit-65` itself rather than
+    // relying on a fan-out spanning it — the assertion is unchanged: governance reaches that unit.
     let ran: Ran = Arc::new(Mutex::new(Vec::new()));
     let core = Core::spawn_with_engine(
         db_path("deny-65"),
@@ -403,7 +412,7 @@ fn deny_policy_fires_on_a_unit_beyond_the_64th() {
             ran: ran.clone(),
         }),
     );
-    core.register_deny_policy("exec", "BLOCKED").unwrap();
+    core.register_deny_policy("unit-65", "BLOCKED").unwrap();
     let problem = (1..=65)
         .map(|i| format!("step {i}"))
         .collect::<Vec<_>>()

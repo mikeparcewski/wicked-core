@@ -1080,7 +1080,9 @@ pub(crate) fn run(
                 trigger,
                 reply,
             } => {
-                let _ = reply.send(register_deny_policy(&mut store, &phase, &trigger));
+                let _ = reply.send(register_deny_policy(
+                    &mut store, &registry, &phase, &trigger,
+                ));
             }
             Command::UpsertPolicy { policy_json, reply } => {
                 let _ = reply.send((|| -> anyhow::Result<()> {
@@ -3816,17 +3818,19 @@ pub(crate) fn cancel_run(
     Ok(SessionStatus::Cancelled)
 }
 
-/// Number of per-unit execution phases a UI deny policy is registered against (`unit-1..=unit-N`).
-/// Governance matches `applies_to` by EQUALITY against each candidate token (`engine.rs`:
-/// `select_any`), and a run's units execute under phases `unit-{ord}` — so a policy must enumerate
-/// those phases to fire on every unit. A run with MORE units than this is REJECTED at launch
-/// (`pipeline::MAX_UNITS`) rather than allowed to silently run units past the policy's coverage —
-/// governance must never fail open.
+/// The governed unit-count ceiling: the highest `unit-<ord>` execution phase a policy can name, and
+/// the launch-time limit (`pipeline::MAX_UNITS`) that rejects runs with more units than that —
+/// governance must never fail open by letting units run past a policy's possible coverage.
 ///
-/// NOTE (FINDING-028): the gate now ALSO matches the workflow phase id, so this fan-out is no longer
-/// the only way to make a deny fire. It is retained deliberately: narrowing to the caller's single
-/// `phase` would make an unrecognized phase string yield an INERT policy (fail-open), which needs
-/// registration-time phase validation first. Over-matching is the fail-closed direction.
+/// HISTORY (FINDING-028): [`register_deny_policy`] used to fan a policy out across
+/// `unit-1..=unit-256` regardless of the `phase` the caller passed, because an unvalidated phase
+/// string narrowed to `applies_to: [phase]` could be inert (fail-open) — over-matching was the
+/// fail-closed workaround, and this constant sized it. The fan-out is GONE: `phase` is now
+/// validated at registration and `applies_to` is exactly `[phase]`. The constant remains as (a)
+/// the launch cap above, still needed because policies persisted BEFORE the fix enumerate only
+/// `unit-1..=unit-256` and a longer run would outrun them, and (b) the bound on the synthetic
+/// `unit-<N>`/`u<N>` forms [`is_synthetic_unit_phase`] accepts — an ord past the launch cap can
+/// never execute, so a policy on it could never fire.
 pub(crate) const DENY_PHASE_SPAN: u32 = 256;
 
 /// Capture a TERMINAL run's outcome into memory (best-effort). Names the run + its result (and, for a
@@ -3874,21 +3878,51 @@ fn capture_run_outcome(
     }
 }
 
-/// Register a deny policy on the store (single-writer). The UI's `trigger` is a literal string, so we
-/// regex-escape it (governance matches `Trigger.contains` as a regex over the call context). The
-/// policy is registered against EVERY unit-execution phase (`unit-1..=unit-N`), not the abstract
-/// `phase` label — see [`DENY_PHASE_SPAN`] for why this stays broad.
+/// Register a deny policy on the store (single-writer), scoped to exactly the `phase` the caller
+/// named (FINDING-028). The UI's `trigger` is a literal string, so we regex-escape it (governance
+/// matches `Trigger.contains` as a regex over the call context).
 ///
-/// CONTRACT MISMATCH (FINDING-028): `Core::register_deny_policy` documents "blocks any tool-call in
-/// `phase`", but the fan-out means the deny fires in EVERY phase — `phase` only shapes the policy id
-/// and its human-readable `criteria`/`rule`. Callers get a broader block than they asked for.
+/// `phase` is VALIDATED before anything lands: it must name a phase of some registered workflow
+/// (the token the gate matches via `scope::phase_aliases`), or a synthetic execution form
+/// (`unit-<N>` / ad-hoc `u<N>`, 1..=[`DENY_PHASE_SPAN`]). An unrecognized string is REJECTED with
+/// the valid tokens — registering it would produce a policy that never fires, and an inert deny is
+/// the silent fail-open FINDING-021 was (a policy the operator believes is standing guard, matching
+/// nothing). This validation is what made narrowing safe: the previous `unit-1..=unit-256` fan-out
+/// existed precisely because an unvalidated `phase` could be anything, and over-matching was the
+/// fail-closed direction. With the tokens checked at the write boundary, `applies_to = [phase]`
+/// makes the documented contract ("blocks any tool-call in `phase`") actually true.
 fn register_deny_policy(
     store: &mut dyn GraphStore,
+    registry: &crate::workflow::WorkflowRegistry,
     phase: &str,
     trigger: &str,
 ) -> anyhow::Result<()> {
     use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
-    let applies_to: Vec<String> = (1..=DENY_PHASE_SPAN).map(|n| format!("unit-{n}")).collect();
+    let phase = phase.trim();
+    let known_workflow_phase = registry
+        .ids()
+        .iter()
+        .filter_map(|id| registry.get(id))
+        .flat_map(|def| def.phases.iter())
+        .any(|p| p.id == phase);
+    if !known_workflow_phase && !is_synthetic_unit_phase(phase) {
+        let mut known: Vec<String> = registry
+            .ids()
+            .iter()
+            .filter_map(|id| registry.get(id))
+            .flat_map(|def| def.phases.iter().map(|p| p.id.clone()))
+            .collect();
+        known.sort();
+        known.dedup();
+        anyhow::bail!(
+            "phase `{phase}` names no phase of any registered workflow and no synthetic unit form \
+             (`unit-<N>` or `u<N>`, 1..={DENY_PHASE_SPAN}) — refusing to register: a deny scoped \
+             to a phase that never executes would never fire, and an inert policy fails open. \
+             Registered workflow phases: {}",
+            known.join(", ")
+        );
+    }
+    let applies_to = vec![phase.to_string()];
     let policy = Policy {
         id: format!(
             "ui-deny-{phase}-{}",
@@ -3907,6 +3941,29 @@ fn register_deny_policy(
         retired: false,
     };
     register_policy(store, &policy)
+}
+
+/// Is `phase` a synthetic execution-phase token in its CANONICAL spelling — `unit-<N>` (the
+/// engine-derived phase every unit executes under, `scope::unit_phase`) or `u<N>` (the phase id an
+/// AD-HOC unit carries, the `u<ord>` suffix of `<session>:u<ord>`), with 1 <= N <= [`DENY_PHASE_SPAN`]?
+///
+/// The round-trip (`format!` back and compare) is load-bearing, not pedantry: `"007".parse::<u32>()`
+/// and `"+7".parse::<u32>()` both yield 7, so accepting any parseable digits would register
+/// `unit-007` — a policy the gate's EQUALITY match (`select_any`) can never select. That is the
+/// inert-policy fail-open this function exists to refuse. The span bound refuses ords past the
+/// launch cap for the same reason: a unit beyond it can never execute, so a policy on it never fires.
+fn is_synthetic_unit_phase(phase: &str) -> bool {
+    let (prefix, digits) = match phase.strip_prefix("unit-") {
+        Some(d) => ("unit-", d),
+        None => match phase.strip_prefix('u') {
+            Some(d) => ("u", d),
+            None => return false,
+        },
+    };
+    match digits.parse::<u32>() {
+        Ok(n) if (1..=DENY_PHASE_SPAN).contains(&n) => format!("{prefix}{n}") == phase,
+        _ => false,
+    }
 }
 
 /// Escape regex metacharacters so a literal operator-typed trigger matches literally.
@@ -4407,6 +4464,96 @@ mod def_gate_disclosure_tests {
             prompt.contains("workflow-declared gate") && prompt.contains("human_confirm=none"),
             "the terminal def gate must disclose under none exactly like a mid-run one: {prompt}"
         );
+    }
+}
+
+/// FINDING-028 — `register_deny_policy`'s `phase` argument must SCOPE the deny. Before this fix it
+/// was decorative: `applies_to` was a `unit-1..=unit-256` fan-out regardless of the caller's phase,
+/// so a deny an operator scoped to `review` also fired on `clarify`, `design`, and every other unit
+/// of every run. These assert against `select_any` — the SAME selection funnel the live gate uses
+/// (`execute.rs`), so what selects here is what fires there.
+#[cfg(test)]
+mod deny_policy_tests {
+    use super::*;
+    use wicked_apps_core::open_store;
+
+    fn ctx() -> serde_json::Value {
+        serde_json::json!({ "work": "about to rm -rf the prod volume" })
+    }
+
+    #[test]
+    fn a_deny_scoped_to_a_phase_fires_there_and_nowhere_else() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        // `build` is a real phase of the built-in `feature` workflow.
+        register_deny_policy(&mut store, &registry, "build", "rm -rf").unwrap();
+
+        let at_build = select_any(&store, "s", &["unit-3", "build"], &ctx()).unwrap();
+        assert_eq!(at_build.len(), 1, "the deny selects at its own phase");
+        assert_eq!(
+            at_build[0].applies_to,
+            vec!["build".to_string()],
+            "applies_to is the caller's phase ALONE — the documented contract, not a superset"
+        );
+
+        // The defect itself: the same policy must NOT select at any other phase.
+        let elsewhere = select_any(&store, "s", &["unit-1", "clarify"], &ctx()).unwrap();
+        assert!(
+            elsewhere.is_empty(),
+            "a deny scoped to `build` selected at `clarify` — the fan-out is back: {:?}",
+            elsewhere.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unknown_phase_is_rejected_and_nothing_lands_on_the_store() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        // A typo of `review`. Narrowing WITHOUT this rejection would register an inert policy —
+        // the operator believes a guard is standing and nothing ever fires (FINDING-021's shape).
+        let err = register_deny_policy(&mut store, &registry, "reviw", "DENYME")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`reviw`") && err.contains("never fire"),
+            "the rejection names the bad token and the consequence: {err}"
+        );
+        assert!(
+            err.contains("build") && err.contains("clarify") && err.contains("cutover"),
+            "the rejection lists the registered workflow phases so the operator can correct: {err}"
+        );
+        // Fail-closed on the WRITE: had anything landed, it would select at the very phase it
+        // claimed — so an empty selection there proves the store took nothing.
+        let landed = select_any(&store, "s", &["reviw"], &ctx()).unwrap();
+        assert!(
+            landed.is_empty(),
+            "a rejected registration must not persist"
+        );
+    }
+
+    #[test]
+    fn synthetic_unit_forms_are_accepted_only_in_canonical_spelling_within_the_span() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        // Canonical synthetic forms: the engine-derived `unit-<ord>` and the ad-hoc `u<ord>`.
+        register_deny_policy(&mut store, &registry, "unit-65", "X").unwrap();
+        register_deny_policy(&mut store, &registry, "u7", "X").unwrap();
+        assert_eq!(
+            select_any(&store, "s", &["unit-65"], &ctx()).unwrap().len(),
+            1,
+            "a synthetic-phase deny is selectable at that exact token"
+        );
+        // Every one of these parses-or-looks like a unit form but can never EQUAL a gate token
+        // (`select_any` matches by equality), so accepting it would mint an inert policy:
+        // non-canonical digits (unit-007, u+7), out-of-span ords (0, 257), and bare prefixes.
+        for bad in [
+            "unit-0", "u0", "unit-257", "u257", "unit-007", "u+7", "unit-", "u",
+        ] {
+            assert!(
+                register_deny_policy(&mut store, &registry, bad, "X").is_err(),
+                "`{bad}` can never match a gate token and must be rejected, not registered inert"
+            );
+        }
     }
 }
 
