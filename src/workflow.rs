@@ -799,8 +799,17 @@ impl WorkflowRegistry {
 /// so the pin always resolves and `attach_pinned_validators` engages). Loudly, like every other
 /// registration-time substitution. An author who wants a phase-specific criterion pins their own
 /// validator — never overridden here (and `carry_shadowed_pins` runs first, so a shadowed
-/// phase-specific pin is restored before this could floor it); an author who wants no
-/// re-verification drops the flag.
+/// phase-specific pin is restored before this could floor it).
+///
+/// Opting OUT of re-verification is scoped: dropping the flag runs the phase unverified only on a
+/// FRESH id — one with no already-registered def to shadow it. Once a phase has been floored, a
+/// SAME-id re-registration that drops the flag does NOT ungate it: `carry_shadowed_pins` runs first
+/// and carries the floor forward, because a replacement may change a gate but never silently remove
+/// one (the same rule that keeps a hand-transcribed mirror from stripping a shipped gate). The floor
+/// is a pin like any other by the time this runs, so it is indistinguishable from an author's pin
+/// and inherits that protection. The escape hatch is therefore a new id — exactly the one
+/// `carry_shadowed_pins` already documents — not a re-registration.
+/// Guarded by `dropping_verified_evidence_keeps_the_floor_on_reregistration_but_a_fresh_id_runs_unverified`.
 fn enforce_verified_evidence(mut def: WorkflowDef) -> WorkflowDef {
     for phase in def.phases.iter_mut() {
         if !phase.verified_evidence || phase.validator_pin.is_some() {
@@ -809,8 +818,9 @@ fn enforce_verified_evidence(mut def: WorkflowDef) -> WorkflowDef {
         eprintln!(
             "wicked-core: workflow `{}` phase `{}` declares verified_evidence but pins no \
              validator; PINNING the built-in evidence floor so the declaration is enforced rather \
-             than silently inert (FINDING-055). Pin a phase-specific validator to replace it, or \
-             drop `verified_evidence` to run the phase unverified.",
+             than silently inert (FINDING-055). Pin a phase-specific validator to replace it; to \
+             run the phase unverified, drop `verified_evidence` on a FRESH workflow id — a same-id \
+             re-registration keeps this floor (carry_shadowed_pins will not silently ungate it).",
             def.id, phase.id
         );
         phase.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
@@ -1672,6 +1682,78 @@ mod workflow_def_tests {
         assert!(
             declared >= 4,
             "expected the shipped defs to declare verified_evidence somewhere; found {declared}"
+        );
+    }
+
+    /// FINDING-055 (remediation): the "drop the flag to run unverified" escape hatch is scoped to a
+    /// FRESH id, and this pins exactly that so the doc on `enforce_verified_evidence` cannot drift
+    /// from the code.
+    ///
+    /// Once a phase is floored, `carry_shadowed_pins` runs BEFORE `enforce_verified_evidence` on the
+    /// next `register`, so a same-id re-registration that drops the flag has the floor carried
+    /// forward — a replacement may change a gate but never silently remove one. Dropping the flag
+    /// therefore runs the phase unverified only under a NEW id, which has no shadow to inherit.
+    ///
+    /// Falsifiers (both compiling): teach `carry_shadowed_pins` to skip the floor
+    /// (`if pin == EVIDENCE_FLOOR_PIN { continue; }`) and the re-registration assert fails — that
+    /// mutation is precisely the silent-ungating hole the pin exists to close; or make
+    /// `enforce_verified_evidence` floor unflagged phases and the fresh-id assert fails.
+    #[test]
+    fn dropping_verified_evidence_keeps_the_floor_on_reregistration_but_a_fresh_id_runs_unverified()
+    {
+        let pin_of = |reg: &WorkflowRegistry, id: &str, phase: &str| {
+            reg.get(id)
+                .unwrap()
+                .phases
+                .iter()
+                .find(|p| p.id == phase)
+                .unwrap()
+                .validator_pin
+                .clone()
+        };
+        let flagged = |id: &str| WorkflowDef {
+            id: id.to_string(),
+            phases: vec![
+                PhaseDef::new("work", StageKind::Build).codes(),
+                PhaseDef::new("check", StageKind::Test)
+                    .verified()
+                    .after("work"),
+            ],
+        };
+        let unflagged = |id: &str| WorkflowDef {
+            id: id.to_string(),
+            phases: vec![
+                PhaseDef::new("work", StageKind::Build).codes(),
+                PhaseDef::new("check", StageKind::Test).after("work"),
+            ],
+        };
+
+        let mut reg = WorkflowRegistry::default();
+        // First registration arms the floor (no shadow to carry).
+        reg.register(flagged("wf")).unwrap();
+        assert_eq!(
+            pin_of(&reg, "wf", "check").as_deref(),
+            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
+            "first registration of a flagged, unpinned phase must arm it with the floor"
+        );
+
+        // Same-id re-registration that DROPS the flag does NOT run the phase unverified: the floor
+        // is a gate, so `carry_shadowed_pins` keeps it. The "drop the flag" remedy is inert here —
+        // by design, not by accident, which is the narrowed claim under test.
+        reg.register(unflagged("wf")).unwrap();
+        assert_eq!(
+            pin_of(&reg, "wf", "check").as_deref(),
+            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
+            "dropping the flag on the SAME id must keep the floor — carry_shadowed_pins forbids \
+             silently ungating a replacement (FINDING-055 remedy is scoped to a fresh id)"
+        );
+
+        // A FRESH id with no flag and no pin is the actual escape hatch — no shadow, nothing carried.
+        reg.register(unflagged("wf-unverified")).unwrap();
+        assert_eq!(
+            pin_of(&reg, "wf-unverified", "check"),
+            None,
+            "a fresh unflagged id runs unverified — the documented way to opt out of re-verification"
         );
     }
 

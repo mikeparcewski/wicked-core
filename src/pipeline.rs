@@ -228,11 +228,15 @@ fn attach_pinned_validators(
     units: &mut [crate::domain::WorkUnit],
     def: &crate::workflow::WorkflowDef,
 ) -> anyhow::Result<()> {
-    // NOTE (docs wave): the shipped built-in defs all carry `validator_pin = null`, so
-    // this loop is a no-op for them and the dual-validator gate stays INERT until an operator provisions
-    // + pins a validator. The author→approve→vault→pin path is exposed as `wicked-core
-    // provision-validator --criterion "..."` then `wicked-core approve-validator --pin <pin>`; the
-    // approved pin goes into a workflow def's `validator_pin`. (Documented in the docs wave.)
+    // NOTE: several shipped built-in phases now carry a real `validator_pin`, so this loop is NOT a
+    // no-op for them — it loads + attaches the pinned validator (the built-in evidence floor,
+    // `EVIDENCE_FLOOR_PIN`, which `pre_distribute` seeds so the load resolves). `feature`'s
+    // `adversarial-review` pins it directly (FINDING-025 item 1), and registration arms every
+    // `verified_evidence` phase that names no pin of its own with the same floor (FINDING-055:
+    // `feature`/`test`, `bug`/`verify`, `migration`/`verify`, `domain-extraction`/`coverage`).
+    // A phase with no pin still leaves the unit's validator `None` (ungated). Operators author
+    // phase-specific criteria via `wicked-core provision-validator --criterion "..."` then
+    // `wicked-core approve-validator --pin <pin>`, and put the approved pin in a def's `validator_pin`.
     for (unit, phase) in units.iter_mut().zip(def.phases.iter()) {
         let Some(pin) = phase.validator_pin.as_deref() else {
             continue;
