@@ -3071,15 +3071,19 @@ fn fail_run(
     StepApplied::Finished
 }
 
-/// FINDING-003 — a run reaching a TERMINAL status reaps its git worktree, off the actor thread
+/// FINDING-003 — the terminal transitions that OWN a worktree reap it here, off the actor thread
 /// (`git worktree remove` can be slow and must never stall NAPI callers waiting on the actor),
 /// through [`crate::repo::reap_worktree_if_clean`]: a clean tree goes, a dirty one (unlanded work)
 /// is kept and logged, and the `wicked/<run_id>` branch survives either way. Wired into
 /// `finalize_run` (Completed), `fail_run` (Failed, which `fail_run_by_id` also routes through),
-/// and resume's crash-during-planning guard. `cancel_run` deliberately keeps its own FORCE
-/// removal — Cancel is the operator explicitly discarding the work. The startup reaper
-/// ([`crate::repo::reap_orphan_worktrees`]) re-applies the same rule to anything a crash left
-/// behind, so this call being missed once is a leak until next boot, not forever.
+/// and resume's crash-during-planning guard. This is NOT every terminal transition — two reach a
+/// terminal status without calling this, on purpose: operator `cancel_run` FORCE-removes instead
+/// (Cancel is the operator discarding the work), and the WORKER-originated Cancelled path
+/// (`apply_step_result`, `StepStatus::Cancelled` — e.g. a P4a subprocess kill) reaps nowhere
+/// inline. That last leftover is not lost: the startup reaper
+/// ([`crate::repo::reap_orphan_worktrees`]) classifies Cancelled as terminal and re-applies the
+/// same clean-only rule to it (and to anything a crash left behind), so a missed reap is a leak
+/// until next boot, not forever.
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let Some(repo_id) = session.repo_ref.as_ref() else {
         return;
@@ -3880,8 +3884,10 @@ pub(crate) fn cancel_run(
 }
 
 /// The governed unit-count ceiling: the highest `unit-<ord>` execution phase a policy can name, and
-/// the launch-time limit (`pipeline::MAX_UNITS`) that rejects runs with more units than that —
-/// governance must never fail open by letting units run past a policy's possible coverage.
+/// the launch-time limit `pipeline::pre_distribute` enforces against THIS constant — it rejects any
+/// run whose unit count exceeds it (there is no separate `MAX_UNITS`; the plan path reads
+/// `DENY_PHASE_SPAN` directly). Governance must never fail open by letting units run past a policy's
+/// possible coverage.
 ///
 /// HISTORY (FINDING-028): [`register_deny_policy`] used to fan a policy out across
 /// `unit-1..=unit-256` regardless of the `phase` the caller passed, because an unvalidated phase
@@ -4526,6 +4532,39 @@ mod def_gate_disclosure_tests {
             "the terminal def gate must disclose under none exactly like a mid-run one: {prompt}"
         );
     }
+
+    /// The THIRD def-authored pause site (FINDING-023): the `HumanConfirmIf(VerdictNotPass)` verdict
+    /// escalation in `apply_step_result`. The tests above drive `advance_or_pause` and never reach
+    /// this branch, so deleting the disclosure HERE leaves every one of them green (verified by
+    /// deleting it). Driving it functionally needs a full governance not-pass verdict; this campaign's
+    /// own lesson is that guards miss CALL SITES, so this audits the wiring at the site, bounded to
+    /// `apply_step_result`'s body (2..=`fail_run`) so neither of the other two sites can satisfy it.
+    #[test]
+    fn the_verdict_escalation_pause_discloses_the_precedence_too() {
+        let src = include_str!("actor.rs");
+        let body = src
+            .split("fn apply_step_result")
+            .nth(1)
+            .and_then(|b| b.split("\nfn fail_run").next())
+            .expect("apply_step_result is still a top-level fn ending before fail_run");
+        // Needles built by concatenation so this assertion cannot satisfy itself out of its own text.
+        let note_call = concat!("unsuppressed_gate_note", "(session.human_confirm)");
+        assert!(
+            body.contains(note_call),
+            "the verdict-escalation pause no longer derives the disclosure from the run's own \
+             human_confirm — an operator who launched unattended is escalated to human review with \
+             nothing telling them the run-level policy did not suppress the gate (FINDING-023's \
+             third, previously unguarded site)"
+        );
+        // Substance: computing the note is worthless unless it reaches the operator — it must be
+        // interpolated into the escalation prompt this branch builds, not merely bound.
+        let interpolated = concat!("{", "note}");
+        assert!(
+            body.contains(interpolated),
+            "the escalation disclosure is computed but never appended to the prompt — dead code \
+             reads identically to no disclosure at all"
+        );
+    }
 }
 
 /// FINDING-028 — `register_deny_policy`'s `phase` argument must SCOPE the deny. Before this fix it
@@ -4685,6 +4724,17 @@ mod terminal_worktree_reap_tests {
         name: &str,
         run_id: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
+        seeded_with_status(store, name, run_id, SessionStatus::Executing)
+    }
+
+    /// As [`seeded`], but at an arbitrary status — the resume guard needs a PRE-EXECUTION status
+    /// (`Planning`) to exercise its crash-during-planning branch.
+    fn seeded_with_status(
+        store: &mut dyn GraphStore,
+        name: &str,
+        run_id: &str,
+        status: SessionStatus,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let root = git_repo(name);
         let entry = crate::repo::register_repo(
             store,
@@ -4703,7 +4753,7 @@ mod terminal_worktree_reap_tests {
             entity_mode: EntityMode::Shared,
             collection_scope: None,
             clis: vec![],
-            status: SessionStatus::Executing,
+            status,
             human_confirm: HumanConfirm::None,
             unit_ix: 0,
             attempt: 0,
@@ -4783,6 +4833,110 @@ mod terminal_worktree_reap_tests {
             "failure keeps the branch as the record of what was attempted"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-003, the RESUME half. `resume_run_inner`'s crash-during-planning guard fails a run
+    /// stuck in a pre-execution status AND reaps its worktree (src/actor.rs). The finding-time tests
+    /// only drove `finalize_run`/`fail_run`, so deleting that one reap call left the run correctly
+    /// `Failed` with its checkout leaked until next boot and NOTHING failing. This drives the real
+    /// resume entry point and pins the effect: falsified by deleting the reap call — the run is still
+    /// `Failed`, but `wait_gone` then times out because the checkout never leaves.
+    #[test]
+    fn a_resumed_never_planned_run_reaps_its_worktree_and_keeps_the_branch() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) =
+            seeded_with_status(&mut store, "resume", "r-resume", SessionStatus::Planning);
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+
+        let status = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r-resume",
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            SessionStatus::Failed,
+            "a run that never completed planning resumes to Failed, never auto-completes"
+        );
+        wait_gone(&wt);
+        assert!(
+            branch_exists(&root, "wicked/r-resume"),
+            "the branch outlives the reap here too"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tuple contract the boot call site leans on: `partition_sessions_for_reap` returns
+    /// (LIVE, TERMINAL) in that order. The startup-wiring audit below asserts the boot site binds
+    /// `let (live, terminal) = ...`; this pins that `live` is in fact the KEEP set and `terminal`
+    /// the REAP set, so the two together close the swap. Falsified by swapping the two `.insert`
+    /// targets in `partition_sessions_for_reap`.
+    #[test]
+    fn partition_returns_live_first_then_terminal() {
+        let live_session = AgentSession {
+            id: "s-live".into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        let term_session = AgentSession {
+            id: "s-term".into(),
+            status: SessionStatus::Failed,
+            ..live_session.clone()
+        };
+        let (live, terminal) = partition_sessions_for_reap(&[live_session.clone(), term_session]);
+        assert!(
+            live.contains("s-live") && !live.contains("s-term"),
+            "the FIRST returned set is LIVE (kept, may resume) — the boot site binds it to `live`"
+        );
+        assert!(
+            terminal.contains("s-term") && !terminal.contains("s-live"),
+            "the SECOND returned set is TERMINAL (reaped clean-only)"
+        );
+    }
+
+    /// FINDING-003 boot call site (`run()`). `reap_orphan_worktrees(repos, live, terminal)` KEEPS
+    /// `live` and REAPS `terminal`; both are `&HashSet<String>`, so swapping them at the boot site
+    /// COMPILES and silently inverts the meaning — resumable runs' checkouts reaped, terminal
+    /// leftovers kept — while the repo-level test (which calls the fn with named sets) stays green.
+    /// Booting the whole actor to exercise this is disproportionate for one two-line wiring, so this
+    /// audits the wiring at the site (the same instrument the FINDING-091 call-site guard uses).
+    /// Falsified by swapping to `reap_orphan_worktrees(&repos, &terminal, &live)` (or the destructure
+    /// to `let (terminal, live) = ...`): the concatenated needle no longer appears and this fails.
+    #[test]
+    fn the_startup_reaper_wires_live_to_keep_and_terminal_to_reap() {
+        let src = include_str!("actor.rs");
+        // Needles built by concatenation so this assertion cannot satisfy itself out of its own text.
+        let destructure = concat!(
+            "let (live, terminal) = ",
+            "partition_sessions_for_reap(&sessions)"
+        );
+        assert!(
+            src.contains(destructure),
+            "the startup reaper no longer binds partition's (live, terminal) tuple in order — a \
+             swapped destructure would feed the live set to the reap position (FINDING-003)"
+        );
+        let call = concat!("reap_orphan_worktrees(&repos, ", "&live, &terminal)");
+        assert!(
+            src.contains(call),
+            "the startup reap call's argument order changed — live must be the KEEP arg and terminal \
+             the REAP arg; a swap compiles and reaps resumable checkouts (FINDING-003)"
+        );
     }
 }
 
