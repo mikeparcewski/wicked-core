@@ -615,6 +615,34 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// Resolve a pending ACP elicitation for `run_id`. The `action` must be one of `"accept"`,
+    /// `"decline"`, or `"cancel"`; `response` carries the human's typed/selected value when
+    /// `action == "accept"`, and is `None` otherwise.
+    ///
+    /// Returns `Ok(())` when the elicitation was found and the resolution was delivered to the
+    /// waiting turn, or an error when no matching elicitation exists (already resolved, unknown
+    /// run, or elicitation not supported for this runner).
+    pub fn resolve_elicitation(
+        &self,
+        run_id: &str,
+        elicitation_id: &str,
+        action: String,
+        response: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let (reply, rx) = std::sync::mpsc::sync_channel(0);
+        self.tx
+            .send(Command::ResolveElicitation {
+                run_id: run_id.to_string(),
+                elicitation_id: elicitation_id.to_string(),
+                action,
+                response,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// Register a git repository the orchestrator can run within. Validates it is a git repo with at
     /// least one commit; returns the persisted [`RepoEntry`] (with its resolved id + default branch).
     pub fn register_repo(&self, spec: RepoSpec) -> anyhow::Result<RepoEntry> {

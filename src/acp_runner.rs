@@ -1194,18 +1194,24 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         }};
     }
 
+    // Advertise elicitation/form support only to adapters in the verified allow-list
+    // (ELICITATION_VERIFIED_ADAPTERS). Other adapters receive no elicitation capability so
+    // they cannot suspend turns waiting for a human response that will never arrive.
+    let form_enabled = ELICITATION_VERIFIED_ADAPTERS.contains(&config.binary.as_str());
+    // `permission: true` says this client ANSWERS session/request_permission. Without it the
+    // bridge never asks, which is exactly why the ACP path ran ungoverned (FINDING-060/062).
+    let client_caps = if form_enabled {
+        json!({"fs": {}, "terminal": false, "permission": true, "elicitation": {"form": {}}})
+    } else {
+        json!({"fs": {}, "terminal": false, "permission": true})
+    };
     if let Err(e) = rpc_send(
         &mut stdin,
         1,
         "initialize",
         json!({
             "protocolVersion": 1,
-            // `permission: true` says this client ANSWERS session/request_permission. Without it the
-            // bridge never asks, which is exactly why the ACP path ran ungoverned (FINDING-060/062).
-            // We answer on every turn — policy when the unit is governed, an explicit allow when it
-            // is not — so advertising it per-session stays correct even though sessions are shared
-            // across units while governance is per-unit.
-            "clientCapabilities": {"fs": {}, "terminal": false, "permission": true},
+            "clientCapabilities": client_caps,
             "clientInfo": {"name": "wicked-core", "version": env!("CARGO_PKG_VERSION")}
         }),
     ) {
