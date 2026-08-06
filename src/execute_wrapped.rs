@@ -672,7 +672,35 @@ impl WrappedCliStepRunner {
                 cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, cwd.as_os_str());
             }
             match run_bounded(cmd, self.timeout, emit, adapter) {
-                Ok((0, out, _, usage, files)) => (StepStatus::Ok, out, usage, files),
+                // FINDING-100. A unit may background work and return — domain-extraction's extract
+                // phase writes a resumable worker script into its worktree, starts N copies, and
+                // exits. Reporting done here let the NEXT phase measure a code graph that was still
+                // being written: the gate saw coverage=0.0224 while the same store reached 0.0892
+                // half an hour later, still climbing. The gate was right; the completion claim was
+                // not. `done` is re-derived from evidence everywhere else in this platform, and a
+                // process still writing inside this unit's own worktree is exactly that evidence.
+                Ok((0, out, _, usage, files)) => {
+                    let settled = crate::outstanding_work::settle(&cwd);
+                    let out = match settled.note() {
+                        Some(note) => format!("{out}\n{note}"),
+                        None => out,
+                    };
+                    // Still-running work does not fail the unit: the worker may legitimately need
+                    // longer than any budget, and killing it would produce the half-written store
+                    // this exists to prevent. It is REPORTED, so a downstream denial can be read
+                    // as "measured mid-write" rather than "the work was bad".
+                    if settled.left_work_running() {
+                        // stderr, not just the unit output: an operator tailing the daemon needs
+                        // to see that a completion claim was made over unfinished work, without
+                        // having to open the unit afterwards.
+                        eprintln!(
+                            "wicked-core: unit {} reported done with its own background work still \
+                             running (FINDING-100)",
+                            input.unit.id
+                        );
+                    }
+                    (StepStatus::Ok, out, usage, files)
+                }
                 Ok((-1, _, err, _, _)) if err == TIMED_OUT => (
                     StepStatus::Cancelled,
                     format!("(cli `{cli_key}` exceeded the timeout and was killed)"),
