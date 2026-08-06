@@ -483,9 +483,9 @@ fn rpc_send(
 /// channel disconnect, or a server-side `"error"` field.
 /// Answer an inbound JSON-RPC REQUEST from the agent.
 ///
-/// Distinct from [`rpc_send`], which originates requests: this carries `result` for an `id` the
-/// AGENT chose. Getting the two confused would leave the agent waiting on a frame that never
-/// answers its question.
+/// Distinct from [`rpc_send`], which ORIGINATES a request under an id we choose: this carries a
+/// `result` for an id the AGENT chose. Confusing the two leaves the agent waiting on a frame that
+/// never answers its question, and it waits until the turn's timeout.
 fn rpc_respond(stdin: &mut BufWriter<ChildStdin>, id: u64, result: Value) -> anyhow::Result<()> {
     let msg = json!({"jsonrpc":"2.0","id":id,"result":result});
     writeln!(stdin, "{msg}")?;
@@ -664,7 +664,16 @@ prior output you are reviewing, testing, or revising."
                             // out loud rather than left to a capability we quietly withheld.
                             None => crate::acp_permission::allow_result(&params),
                         };
-                        let _ = rpc_respond(&mut proc.stdin, req_id, result);
+                        // NOT `let _ =`. A failed write leaves the agent blocked until the turn
+                        // times out, and the reason is the only thing that explains the stall —
+                        // dropping it turns a broken pipe into "the model was slow" (review).
+                        if let Err(e) = rpc_respond(&mut proc.stdin, req_id, result) {
+                            let note = format!(
+                                "\n[wicked-core] could not answer a permission request: {e}. The \
+                                 agent is blocked on it and this turn will time out."
+                            );
+                            append_within_cap(&mut output, &note, MAX_OUT);
+                        }
                     }
                 }
             }
@@ -1562,7 +1571,7 @@ impl AcpStepRunner {
                 status: StepStatus::Ok,
                 usage: result.usage,
                 files: result.files,
-                governed: false,
+                governed: gate.is_some(),
             },
             Ok(result) if result.status == StepStatus::Cancelled => {
                 // Timeout — drop the session: the reader thread may wedge on a full pipe
@@ -1577,7 +1586,7 @@ impl AcpStepRunner {
                     status: StepStatus::Cancelled,
                     usage: result.usage,
                     files: result.files,
-                    governed: false,
+                    governed: gate.is_some(),
                 }
             }
             Ok(_) => {
@@ -2406,6 +2415,38 @@ sleep 30
     ///
     /// Pinned by source, because the alternative — driving a real bridge — needs a network and a
     /// live agent, and a test that cannot run is a test that stops being true quietly.
+    /// The hole review caught, which my end-to-end permission test could not see.
+    ///
+    /// `StepOutput.governed` is the runner's ASSERTION to the actor that this unit was gated — the
+    /// fold uses it as authority to read and verify the decisions log. The ACP path armed
+    /// governance, wrote the marker, and evaluated every tool call, then reported `governed: false`
+    /// — so hook denies and evidence-integrity checks would have been skipped for exactly the units
+    /// that had them. A unit that is gated and says it is not is the same defect as one that says
+    /// it is gated and is not; both make the fold read the wrong evidence.
+    ///
+    /// My own proof missed it because it exercises `permission_result` directly and never looks at
+    /// the StepOutput the runner returns. Fourth instance of that gap in this campaign — hence a
+    /// source audit rather than another test of the helper.
+    #[test]
+    fn a_governed_acp_unit_reports_itself_governed() {
+        let src = include_str!("acp_runner.rs");
+        // Needles built by concatenation: this assertion's own message names the very strings it
+        // searches for, and a source audit that matches itself is the fifth such self-match I have
+        // written in this campaign.
+        let bad = format!("governed:{}false,", " ");
+        let good = format!("governed:{}gate.is_some(),", " ");
+        assert!(
+            !src.contains(&bad),
+            "an ACP StepOutput still hardcodes `governed: false`. If the unit was gated, the fold \
+             must be told so — otherwise it skips the hook-deny and evidence-integrity checks for \
+             the units that actually have them (FINDING-062)"
+        );
+        assert!(
+            src.contains(&good),
+            "the governed flag must follow whether a gate was armed for THIS turn, not a constant"
+        );
+    }
+
     #[test]
     fn a_governed_claude_unit_is_no_longer_rerouted_off_the_acp_path() {
         let src = include_str!("acp_runner.rs");

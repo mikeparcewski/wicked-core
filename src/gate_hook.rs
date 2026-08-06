@@ -262,9 +262,8 @@ pub(crate) fn evaluate_tool_call(
     context: &serde_json::Value,
     tool: &str,
 ) -> i32 {
-    let decisions_path = decisions_path.to_string();
-    let context = context.clone();
-    let tool = tool.to_string();
+    // No clones: this runs once per tool call on both carriers, and `context` carries the tool's
+    // whole input — file contents included (review).
     // Write the hook-fired liveness sentinel for `phase` BEFORE any policy evaluation or early-returns
     // below. This proves the hook BINARY was invoked for this phase (not just that the launcher
     // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
@@ -350,7 +349,7 @@ pub(crate) fn evaluate_tool_call(
     // subprocess can interleave between the annotation and the claim (Copilot).
     {
         let annotation_json = serde_json::json!({
-            TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool.as_str() },
+            TOOL_CALL_KEY: if tool.is_empty() { "tool-call" } else { tool },
             TOOL_CALL_PHASE_KEY: phase,
         })
         .to_string()
@@ -381,11 +380,7 @@ pub(crate) fn evaluate_tool_call(
 
     match claim.decision {
         Decision::Deny => {
-            let t = if tool.is_empty() {
-                "tool-call"
-            } else {
-                tool.as_str()
-            };
+            let t = if tool.is_empty() { "tool-call" } else { tool };
             eprintln!("wicked-governance: DENY `{t}` (claim {})", claim.claim_id);
             2
         }
