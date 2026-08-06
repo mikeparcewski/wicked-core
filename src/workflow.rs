@@ -370,6 +370,16 @@ pub struct PhaseDef {
     /// The methodology badge (demoted from the classifier — declared, not guessed). Default: `build`.
     #[serde(default)]
     pub kind: StageKind,
+    /// Per-phase INSTRUCTIONS the planner folds into this phase's unit description — i.e. into the
+    /// worker's prompt (FINDING-011). Without this a multi-phase workflow's prompts differ only by
+    /// the phase-id token (`plan_from_def` builds `<phase> — <intent>`), so N recon phases run N
+    /// near-identical surveys with nothing telling each one what ITS slice of the work is.
+    /// `None` (the default) keeps the historical prompt shape. Authored as data, like every other
+    /// field here — the reducer never branches on the phase id to special-case a prompt.
+    /// `skip_serializing_if`: an absent option stays absent on the wire, so defs authored before
+    /// this field serialize back byte-identical (the shipped mirrors don't gain `null`s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Where this phase's gate sits in the ladder (`None` = ungated).
     #[serde(default)]
     pub gate_type: Option<GateType>,
@@ -418,11 +428,13 @@ pub struct PhaseDef {
 }
 
 impl PhaseDef {
-    /// A minimal phase: id + kind, no gate, no code, neutral role.
-    fn new(id: &str, kind: StageKind) -> Self {
+    /// A minimal phase: id + kind, no gate, no code, neutral role. `pub(crate)` so sibling modules'
+    /// tests (e.g. the planner's) can author fixture phases without a JSON detour.
+    pub(crate) fn new(id: &str, kind: StageKind) -> Self {
         PhaseDef {
             id: id.to_string(),
             kind,
+            instructions: None,
             gate_type: None,
             gate: GateSpec::Auto,
             executes_code: false,
@@ -1500,5 +1512,76 @@ mod workflow_def_tests {
             seen > 0,
             "workflows/ shipped no drop-in defs; the directory moved or emptied"
         );
+    }
+
+    /// FINDING-011, asserted against the SHIPPED `survey-repo` drop-in (the workflow the finding
+    /// billed: $3.09 / 1.74M tokens for three near-identical surveys and no answer).
+    ///
+    /// Substance, not presence: the property is that the PLANNED PROMPTS stop being interchangeable
+    /// and that something downstream consumes the recon phases. So this plans the def and asserts
+    /// the prompt BODIES (after the `<phase> — ` prefix, the only part that ever differed) are
+    /// pairwise distinct, and that the final phase declares a dependency on EVERY earlier phase —
+    /// the declared-handoff edge (FINDING-024) is what makes the actor inject their outputs as
+    /// prior context, so synthesis reads the surveys instead of re-running one.
+    #[test]
+    fn shipped_survey_repo_plans_distinct_prompts_and_a_synthesis_over_all_recon() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows/survey-repo.json");
+        let def = WorkflowRegistry::def_from_file(&path).expect("shipped survey-repo parses");
+
+        // The last phase consumes every phase before it — a synthesis, not another survey.
+        let last = def.phases.last().expect("non-empty");
+        let earlier: Vec<&str> = def.phases[..def.phases.len() - 1]
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert!(
+            earlier.len() >= 3,
+            "survey-repo must still fan out over multiple recon phases, found {earlier:?}"
+        );
+        for id in &earlier {
+            assert!(
+                last.depends_on.iter().any(|d| d == id),
+                "final phase `{}` must depend on `{id}` so that phase's output is injected as \
+                 prior context — without the edge the synthesis runs blind (FINDING-024/011)",
+                last.id
+            );
+        }
+
+        // Every phase states its own slice of the work, and no two slices are the same text.
+        for p in &def.phases {
+            let instr = p.instructions.as_deref().map(str::trim).unwrap_or("");
+            assert!(
+                !instr.is_empty(),
+                "phase `{}` carries no instructions — its prompt collapses back to \
+                 `<phase> — <intent>`, the near-identical shape this finding is about",
+                p.id
+            );
+        }
+
+        // The planned prompt bodies are pairwise distinct beyond the phase-id token. Strip the
+        // `<phase.id> — ` prefix so the comparison cannot be satisfied by the id alone (which is
+        // exactly how the defective prompts "differed").
+        let units =
+            crate::plan::plan_from_def(&def, "what is this repo and how do I work in it", "s");
+        let bodies: Vec<String> = units
+            .iter()
+            .zip(def.phases.iter())
+            .map(|(u, p)| {
+                u.description
+                    .strip_prefix(&format!("{} — ", p.id))
+                    .unwrap_or(&u.description)
+                    .to_string()
+            })
+            .collect();
+        for i in 0..bodies.len() {
+            for j in (i + 1)..bodies.len() {
+                assert_ne!(
+                    bodies[i], bodies[j],
+                    "phases `{}` and `{}` plan the same prompt body — near-identical prompts again",
+                    def.phases[i].id, def.phases[j].id
+                );
+            }
+        }
     }
 }

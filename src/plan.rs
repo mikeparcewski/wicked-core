@@ -58,11 +58,26 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
         .enumerate()
         .map(|(i, phase)| {
             let ord = (i + 1) as u32;
-            let description = if intent.is_empty() {
+            let mut description = if intent.is_empty() {
                 phase.id.clone()
             } else {
                 format!("{} — {intent}", phase.id)
             };
+            // FINDING-011: fold the phase's own INSTRUCTIONS into the description. The description
+            // IS the worker's prompt (`execute_wrapped::skill_prompt` sends it bare on the authored
+            // path), so without this every phase of a multi-phase workflow gets a prompt that
+            // differs only by the phase-id token — N recon phases each re-survey the whole intent.
+            // Appended after the intent so the shared goal still leads and the phase's slice of it
+            // follows; a phase with no instructions keeps the historical prompt byte-exact.
+            if let Some(instr) = phase
+                .instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                description.push_str("\n\n");
+                description.push_str(instr);
+            }
             let mut unit = WorkUnit::pending(
                 format!("{session_id}:{}", phase.id),
                 session_id,
@@ -384,6 +399,88 @@ mod tests {
         // Falls back to the bare phase id — never an empty description (gate needs work context).
         assert_eq!(units[0].description, feature_def().phases[0].id);
         assert!(units.iter().all(|u| !u.description.is_empty()));
+    }
+
+    /// FINDING-011: a phase's own `instructions` reach ITS unit's description — the worker prompt —
+    /// and no other unit's. Without the threading, every unit of an N-phase workflow carries a
+    /// prompt that differs only by the phase-id token, so N recon phases run N near-identical
+    /// surveys (survey-repo: $3.09 / 1.74M tokens to answer one question three times).
+    #[test]
+    fn plan_from_def_threads_each_phases_instructions_into_its_own_unit_only() {
+        use crate::domain::StageKind;
+        use crate::workflow::PhaseDef;
+        let instr_a = "map the directory layout and nothing else";
+        let instr_b = "identify the language stack and nothing else";
+        let def = WorkflowDef {
+            id: "instructed".to_string(),
+            phases: vec![
+                PhaseDef {
+                    instructions: Some(instr_a.to_string()),
+                    ..PhaseDef::new("a", StageKind::Recon)
+                },
+                PhaseDef {
+                    instructions: Some(instr_b.to_string()),
+                    depends_on: vec!["a".to_string()],
+                    ..PhaseDef::new("b", StageKind::Recon)
+                },
+                PhaseDef::new("c", StageKind::Recon),
+            ],
+        };
+        let units = plan_from_def(&def, "survey the repo", "s");
+
+        // Each unit carries the shared intent AND its own phase's instructions…
+        assert!(units[0].description.contains("survey the repo"));
+        assert!(
+            units[0].description.contains(instr_a),
+            "{}",
+            units[0].description
+        );
+        assert!(
+            units[1].description.contains(instr_b),
+            "{}",
+            units[1].description
+        );
+        // …and never a sibling's (the whole point is that the prompts stop being interchangeable).
+        assert!(
+            !units[0].description.contains(instr_b),
+            "unit a leaked unit b's instructions: {}",
+            units[0].description
+        );
+        assert!(
+            !units[1].description.contains(instr_a),
+            "unit b leaked unit a's instructions: {}",
+            units[1].description
+        );
+        // A phase with no instructions keeps the historical prompt byte-exact (no trailing junk).
+        assert_eq!(units[2].description, "c — survey the repo");
+    }
+
+    /// The degenerate authoring cases: an empty intent still gets the instructions (bare phase id
+    /// first), and whitespace-only instructions are treated as absent rather than appending blank
+    /// lines to the prompt.
+    #[test]
+    fn instructions_survive_an_empty_intent_and_blank_instructions_are_ignored() {
+        use crate::domain::StageKind;
+        use crate::workflow::PhaseDef;
+        let def = WorkflowDef {
+            id: "instructed".to_string(),
+            phases: vec![
+                PhaseDef {
+                    instructions: Some("do the one thing".to_string()),
+                    ..PhaseDef::new("a", StageKind::Recon)
+                },
+                PhaseDef {
+                    instructions: Some("   \n ".to_string()),
+                    ..PhaseDef::new("b", StageKind::Recon)
+                },
+            ],
+        };
+        let units = plan_from_def(&def, "  ", "s");
+        assert_eq!(units[0].description, "a\n\ndo the one thing");
+        assert_eq!(
+            units[1].description, "b",
+            "blank instructions must not append"
+        );
     }
 
     fn repo_at(id: &str, root: &str) -> crate::repo::RepoEntry {

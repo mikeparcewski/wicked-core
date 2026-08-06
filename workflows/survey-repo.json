@@ -4,6 +4,7 @@
     {
       "id": "structure",
       "kind": "recon",
+      "instructions": "Map the repository layout only: top-level directories, entry points, and where source, tests, config, and docs live. Do not analyze languages, dependencies, or conventions — later phases cover those.",
       "gate_type": "value",
       "gate": "auto",
       "executes_code": false,
@@ -18,6 +19,7 @@
     {
       "id": "stack",
       "kind": "recon",
+      "instructions": "Identify the technology stack from the manifests (package.json, Cargo.toml, pyproject.toml, ...): languages, frameworks, build tools, key dependencies. Build on the structure summary provided as prior context; do not re-map the layout.",
       "gate_type": "value",
       "gate": "auto",
       "executes_code": false,
@@ -34,6 +36,7 @@
     {
       "id": "conventions",
       "kind": "recon",
+      "instructions": "Identify the working conventions: naming, module boundaries, test placement and style, lint/format configuration, CI expectations. Build on the prior phases' outputs provided as context; do not re-survey structure or stack.",
       "gate_type": "value",
       "gate": "auto",
       "executes_code": false,
@@ -41,6 +44,25 @@
       "required_deliverables": [],
       "depends_on": [
         "stack"
+      ],
+      "role": "neutral",
+      "skill_ref": null,
+      "allowed_skills": [],
+      "validator_pin": null
+    },
+    {
+      "id": "synthesize",
+      "kind": "recon",
+      "instructions": "Do not re-survey the repository. Merge the three prior phase outputs provided as context into one coherent survey — structure, then stack, then conventions — resolving overlaps and flagging any contradictions between them.",
+      "gate_type": "value",
+      "gate": "auto",
+      "executes_code": false,
+      "verified_evidence": false,
+      "required_deliverables": [],
+      "depends_on": [
+        "structure",
+        "stack",
+        "conventions"
       ],
       "role": "neutral",
       "skill_ref": null,
