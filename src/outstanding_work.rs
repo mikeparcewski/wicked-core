@@ -32,9 +32,13 @@
 //!
 //! # What counts as outstanding
 //!
-//! A live process whose working directory or command line is inside this unit's worktree. That is
-//! deliberately narrow: it is the unit's OWN work, not "the machine is busy". A worker the unit
-//! backgrounded is by construction still inside the worktree it was pointed at.
+//! A live process with this unit's worktree path on its command line. That is deliberately narrow:
+//! it is the unit's OWN work, not "the machine is busy". A worker the unit backgrounds is launched
+//! with paths into the worktree it was pointed at — that path is how it finds its database and its
+//! scripts — so the command line is the honest signal that the process belongs to this unit. We do
+//! NOT inspect working directories: reading another process's cwd is not portable across macOS and
+//! Linux from a single `ps` invocation, and the command-line signal already covers the workers this
+//! detects.
 //!
 //! # What this does NOT do
 //!
@@ -67,6 +71,14 @@ pub enum WaitOutcome {
     /// Still running when the budget ran out. NOT an error on its own: the caller decides, and the
     /// count is what makes the decision reportable rather than a shrug.
     StillRunning { remaining: usize, waited: Duration },
+    /// The process table could not be read, so whether the unit left work behind is UNKNOWN.
+    ///
+    /// This is distinct from `NothingOutstanding` on purpose (Copilot review on #204): the old code
+    /// collapsed an unreadable first read into "nothing outstanding", which is a fail-open — the
+    /// exact shape this module exists to refuse. `outstanding_in` returns `None` for unknown and
+    /// `Some(0)` for a genuine empty table; a caller must never turn the first into the second.
+    /// Carries how long we waited so the note reads honestly.
+    Unknown { waited: Duration },
 }
 
 impl WaitOutcome {
@@ -86,13 +98,20 @@ impl WaitOutcome {
                  its output next may read a partial result. This is the FINDING-100 condition.",
                 waited.as_secs()
             )),
+            Self::Unknown { waited } => Some(format!(
+                "[wicked-core] could not read the process table after {}s, so whether this unit \
+                 left background workers running is UNKNOWN. The phase is being reported done, and \
+                 anything measuring its output next may read a partial result.",
+                waited.as_secs()
+            )),
         }
     }
 
     /// Did the unit leave work behind? The caller uses this to decide whether the completion claim
-    /// is trustworthy.
+    /// is trustworthy. `Unknown` counts: an unreadable table is not evidence of a clean finish, and
+    /// treating it as one would be the fail-open this module refuses.
     pub fn left_work_running(&self) -> bool {
-        matches!(self, Self::StillRunning { .. })
+        matches!(self, Self::StillRunning { .. } | Self::Unknown { .. })
     }
 }
 
@@ -124,32 +143,54 @@ pub fn outstanding_in(worktree: &Path) -> Option<usize> {
     }
     #[cfg(unix)]
     {
-        // `ps -Ao args=` is available on macOS and Linux alike. Deliberately NOT `pgrep -f`: its exact
-        // matching semantics differ between the two, and this campaign already lost time to `pgrep -c`
-        // and `pgrep -fl | wc -l` disagreeing on the same machine.
-        // .hardened() is not optional here even though `ps` reads no engine state: the chokepoint rule
-        // has no allowlist on purpose (FINDING-067), and spawn_audit enforces it — it caught this very
-        // line when I first wrote it without the call.
+        // `ps -Ao pid=,args=` is available on macOS and Linux alike. Deliberately NOT `pgrep -f`:
+        // its exact matching semantics differ between the two, and this campaign already lost time
+        // to `pgrep -c` and `pgrep -fl | wc -l` disagreeing on the same machine.
+        //
+        // pid=,args= (not args= alone): review (Copilot on #204) caught that the old self-exclusion
+        // filtered for the literal `ps -Ao args={pid}`, which never appears in the output — so the
+        // ENGINE'S OWN process, which carries the worktree on its command line, was counted, and a
+        // unit could wait out its whole budget on itself. Reading the pid column lets us drop our
+        // own line by identity rather than by a string that never matches.
+        //
+        // .hardened() is not optional even though `ps` reads no engine state: the chokepoint rule
+        // has no allowlist on purpose (FINDING-067), and spawn_audit caught this very line when I
+        // first wrote it without the call.
         use wicked_apps_core::spawn::HardenedCommand;
         let mut cmd = std::process::Command::new("ps");
         cmd.hardened();
-        let out = cmd.args(["-Ao", "args="]).output().ok()?;
+        let out = cmd.args(["-Ao", "pid=,args="]).output().ok()?;
         if !out.status.success() {
             return None;
         }
         let table = String::from_utf8_lossy(&out.stdout);
-        let me = std::process::id().to_string();
-        Some(
-            table
-                .lines()
-                .filter(|l| l.contains(needle.as_ref()))
-                // The engine itself runs with the worktree on its command line; counting ourselves
-                // would make every unit wait for its own budget and then report failure.
-                .filter(|l| !l.contains(&format!("ps -Ao args={me}")))
-                .filter(|l| !l.contains("ps -Ao args="))
-                .count(),
-        )
+        Some(count_worktree_procs(
+            &table,
+            needle.as_ref(),
+            std::process::id(),
+        ))
     }
+}
+
+/// Count lines of a `ps -Ao pid=,args=` table whose argv contains `needle`, excluding pid `me`.
+///
+/// Pure so the pid self-exclusion is falsifiable without a process whose command line we control:
+/// a synthetic table can put `needle` on a line whose pid IS `me`, which no real child of a test
+/// could reproduce. Split off the leading pid, keep the rest as argv, drop our own line by identity
+/// — a string filter (the pre-review bug) could never tell the engine's own process from a worker.
+#[cfg(unix)]
+fn count_worktree_procs(table: &str, needle: &str, me: u32) -> usize {
+    table
+        .lines()
+        .filter_map(|l| {
+            let t = l.trim_start();
+            let sp = t.find(char::is_whitespace)?;
+            let pid: u32 = t[..sp].parse().ok()?;
+            Some((pid, &t[sp + 1..]))
+        })
+        .filter(|(pid, _)| *pid != me)
+        .filter(|(_, argv)| argv.contains(needle))
+        .count()
 }
 
 /// Wait for work this unit started to finish, up to [`OUTSTANDING_WORK_BUDGET`].
@@ -162,9 +203,16 @@ where
 {
     let start = Instant::now();
     let peak = match count() {
-        // Unknown is NOT zero. If the process table cannot be read, say nothing was outstanding
-        // rather than inventing a number — but do not claim to have verified anything either.
-        None => return WaitOutcome::NothingOutstanding,
+        // Unknown is NOT zero. An unreadable process table on the FIRST read means we never got to
+        // verify the unit's own work finished — so we say UNKNOWN, not "nothing outstanding". The
+        // old code returned NothingOutstanding here (Copilot review on #204); that is a fail-open,
+        // the exact shape this module exists to refuse. `left_work_running()` is true for Unknown,
+        // so the completion site records the doubt instead of certifying a clean finish.
+        None => {
+            return WaitOutcome::Unknown {
+                waited: Duration::ZERO,
+            }
+        }
         Some(0) => return WaitOutcome::NothingOutstanding,
         Some(n) => n,
     };
@@ -177,14 +225,13 @@ where
                     return WaitOutcome::StillRunning { remaining, waited };
                 }
             }
-            // The table became unreadable mid-wait. Treat it as still-outstanding rather than
-            // settled: the failure direction that matters is claiming completion we cannot see.
+            // The table became unreadable mid-wait, after we had seen `peak` outstanding. We can no
+            // longer see whether they finished, so at budget we report UNKNOWN rather than a
+            // `remaining` count we can no longer observe — both keep `left_work_running()` true, so
+            // the caller proceeds-with-note either way, but Unknown does not invent a number.
             None => {
                 if waited >= budget {
-                    return WaitOutcome::StillRunning {
-                        remaining: peak,
-                        waited,
-                    };
+                    return WaitOutcome::Unknown { waited };
                 }
             }
         }
@@ -256,23 +303,38 @@ mod tests {
 
     fn out_waited(o: &WaitOutcome) -> Duration {
         match o {
-            WaitOutcome::StillRunning { waited, .. } | WaitOutcome::Settled { waited, .. } => {
-                *waited
-            }
+            WaitOutcome::StillRunning { waited, .. }
+            | WaitOutcome::Settled { waited, .. }
+            | WaitOutcome::Unknown { waited } => *waited,
             WaitOutcome::NothingOutstanding => Duration::ZERO,
         }
     }
 
-    /// An unreadable process table must never read as "settled". Claiming completion we cannot
-    /// verify is the exact failure this module exists to prevent, so the unknown case at the
-    /// budget reports still-running rather than success.
+    /// An unreadable process table must never read as "settled" OR as "nothing outstanding".
+    /// Claiming completion we cannot verify is the exact failure this module exists to prevent, so
+    /// the unknown case — first read or mid-wait — reports Unknown, and Unknown counts as
+    /// work-left-running so the caller records the doubt.
     #[test]
     fn an_unreadable_process_table_never_becomes_a_completion_claim() {
-        // Unknown from the very first read: nothing to wait for, and nothing claimed either.
+        // Unknown from the VERY FIRST read. Pre-review this returned NothingOutstanding — a
+        // fail-open. It must be Unknown, and Unknown must NOT read as a clean finish.
         let first = wait_for_settled(|| None, Duration::from_secs(60), Duration::ZERO);
-        assert_eq!(first, WaitOutcome::NothingOutstanding);
+        assert_eq!(
+            first,
+            WaitOutcome::Unknown {
+                waited: Duration::ZERO
+            }
+        );
+        assert!(
+            first.left_work_running(),
+            "an unreadable first read is not proof of a clean finish: {first:?}"
+        );
+        assert!(
+            first.note().unwrap().contains("UNKNOWN"),
+            "the doubt must be stated in the note: {first:?}"
+        );
 
-        // Unknown AFTER work was seen: must not silently become Settled.
+        // Unknown AFTER work was seen: must not silently become Settled either.
         let mut calls = 0;
         let mid = wait_for_settled(
             || {
@@ -287,9 +349,11 @@ mod tests {
             Duration::ZERO,
         );
         assert!(
-            mid.left_work_running(),
-            "losing sight of the workers is not the same as them finishing: {mid:?}"
+            matches!(mid, WaitOutcome::Unknown { .. }),
+            "losing sight of workers we had counted is Unknown, not a number we can no longer \
+             observe: {mid:?}"
         );
+        assert!(mid.left_work_running());
     }
 
     /// CALL-SITE AUDIT. Every test above drives `wait_for_settled` directly, so all of them stay
@@ -348,5 +412,40 @@ mod tests {
             "an idle worktree must show no outstanding work, saw {n}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FALSIFIABLE self-exclusion. Copilot (review on #204) caught that the old exclusion filtered
+    /// for the literal `ps -Ao args={pid}`, which never appears in ps output — so the engine's own
+    /// process, which carries the worktree path, was counted, and a unit waited out its whole
+    /// budget on ITSELF. A real child of a test can never have our pid, so drive the pure counter
+    /// with a synthetic table: the excluded pid must be dropped, a different pid kept. Flip the
+    /// `*pid != me` filter in production and this fails.
+    #[cfg(unix)]
+    #[test]
+    fn the_counter_excludes_our_own_pid_by_identity() {
+        let needle = "/tmp/wt-abc";
+        let me = 4242;
+        let table = format!(
+            // engine's own line: our pid, worktree on argv → must be dropped
+            "  {me} /usr/bin/wicked-core run {needle}/plan.json\n\
+             // a real worker: different pid, worktree on argv → must be counted\n\
+             {other} /bin/sh {needle}/run_worker.sh\n\
+             // unrelated process, no worktree → ignored\n\
+             {noise} /usr/bin/some-daemon --serve\n",
+            other = me + 1,
+            noise = me + 2,
+        );
+        assert_eq!(
+            count_worktree_procs(&table, needle, me),
+            1,
+            "our own pid ({me}) must be excluded and the one real worker counted"
+        );
+        // And with a DIFFERENT `me`, our former line is now a real worker: the count rises to 2.
+        // This proves the exclusion is by pid identity, not by matching the argv text.
+        assert_eq!(
+            count_worktree_procs(&table, needle, 9999),
+            2,
+            "when neither pid is ours, both worktree lines count"
+        );
     }
 }
