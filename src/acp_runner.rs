@@ -358,7 +358,7 @@ fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std
 ///  - EXCLUSIVE create: `DirBuilder` with `recursive(false)` FAILS if the leaf already exists, so a
 ///    pre-existing dir (attacker-planted or stale) is refused rather than adopted. Fail closed.
 fn mint_worker_config_dir() -> anyhow::Result<std::path::PathBuf> {
-    let name = format!("wicked-acp-worker-config-{}", worker_config_token());
+    let name = format!("wicked-acp-worker-config-{}", worker_config_token()?);
     let dir = std::env::temp_dir().join(name);
     create_exclusive_private(&dir)?;
     let settings = json!({
@@ -382,33 +382,50 @@ fn create_exclusive_private(dir: &std::path::Path) -> anyhow::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(dir).map_err(|e| {
-        anyhow::anyhow!("refusing to reuse or adopt an existing worker config dir {dir:?}: {e}")
+    // with_context, not a formatted anyhow!: this preserves the underlying io::Error (its ErrorKind
+    // — AlreadyExists vs PermissionDenied — and any backtrace) as the source of the chain. Folding
+    // it into the message string, as this did before (Copilot review on #206), discards exactly the
+    // signal an operator needs to tell "someone planted this dir" from "the temp dir is unwritable".
+    use anyhow::Context;
+    b.create(dir).with_context(|| {
+        format!("refusing to reuse or adopt an existing worker config dir {dir:?}")
     })
 }
 
-/// A per-worker directory-name token. Non-guessable on unix (16 bytes of `/dev/urandom`, hex); a
-/// monotonic counter elsewhere. The counter alone is guessable, which is why the exclusive create
-/// in [`mint_worker_config_dir`] — not this token — is what actually refuses a planted or stale
-/// leaf; the entropy removes the guess that makes planting worth attempting.
-fn worker_config_token() -> String {
+/// A per-worker directory-name token.
+///
+/// On unix: 16 bytes of `/dev/urandom`, hex — and if that device cannot be read, this FAILS rather
+/// than falling back to the guessable counter (Copilot review on #206). The old code silently
+/// downgraded to `pid-seq` on unix, which made the doc's "non-guessable on unix" a claim the code
+/// did not keep. `/dev/urandom` being unreadable on a unix host is a sign something is badly wrong;
+/// the honest move is to fail closed — the caller's fallback is the wrapped path, which is safe.
+///
+/// On non-unix: a monotonic counter, the only option there. The counter alone is guessable, which
+/// is why the exclusive create in [`mint_worker_config_dir`] — not this token — is what actually
+/// refuses a planted or stale leaf; the entropy only removes the guess that makes planting worth
+/// attempting.
+fn worker_config_token() -> anyhow::Result<String> {
     #[cfg(unix)]
     {
+        use anyhow::Context;
         use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let mut buf = [0u8; 16];
-            if f.read_exact(&mut buf).is_ok() {
-                return buf.iter().map(|b| format!("{b:02x}")).collect();
-            }
-        }
+        let mut f = std::fs::File::open("/dev/urandom")
+            .context("cannot open /dev/urandom for a non-guessable worker config token")?;
+        let mut buf = [0u8; 16];
+        f.read_exact(&mut buf)
+            .context("cannot read 16 bytes of entropy from /dev/urandom")?;
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "{}-{}",
-        std::process::id(),
-        SPAWN_SEQ.fetch_add(1, Ordering::Relaxed)
-    )
+    #[cfg(not(unix))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
+        Ok(format!(
+            "{}-{}",
+            std::process::id(),
+            SPAWN_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 }
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an
