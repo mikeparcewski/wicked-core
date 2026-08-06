@@ -344,20 +344,88 @@ fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std
 /// rides `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
 /// resolve them before our policy is ever asked. The bridge's own default keeps the permission
 /// requests flowing to the client, where both the governed and the ungoverned answer live.
+/// A fresh, non-guessable, EXCLUSIVELY-created config dir for one worker's isolated CLI settings.
+///
+/// The first cut named this `/tmp/wicked-acp-worker-config-<pid>-<seq>` and used
+/// `create_dir_all_private`, which succeeds on an already-existing leaf. Review (Copilot on #205)
+/// caught that this undermines the very isolation boundary FINDING-061 establishes: a predictable
+/// path lets a local attacker pre-create the leaf to steer where `settings.json` lands, and PID
+/// reuse across daemon restarts silently reuses a stale dir. Two fixes, both load-bearing:
+///
+///  - NON-GUESSABLE name: 16 bytes of `/dev/urandom` on unix, hex-encoded. A guessed path is the
+///    precondition for the pre-creation attack; entropy removes it. (Non-unix keeps the counter —
+///    the ACP worker path is unix-first, and exclusive-create below still closes reuse there.)
+///  - EXCLUSIVE create: `DirBuilder` with `recursive(false)` FAILS if the leaf already exists, so a
+///    pre-existing dir (attacker-planted or stale) is refused rather than adopted. Fail closed.
 fn mint_worker_config_dir() -> anyhow::Result<std::path::PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "wicked-acp-worker-config-{}-{seq}",
-        std::process::id()
-    ));
-    crate::gate_hook::create_dir_all_private(&dir)?;
+    let name = format!("wicked-acp-worker-config-{}", worker_config_token()?);
+    let dir = std::env::temp_dir().join(name);
+    create_exclusive_private(&dir)?;
     let settings = json!({
         "permissions": { "deny": crate::execute_wrapped::deny_rules() }
     });
     std::fs::write(dir.join("settings.json"), serde_json::to_vec(&settings)?)?;
     Ok(dir)
+}
+
+/// Create `dir` EXCLUSIVELY (error if it already exists) with private perms.
+///
+/// `recursive(false)` is the refuse-reuse property: a pre-existing leaf — an attacker's plant or a
+/// stale dir from a prior run — makes this error rather than silently adopt it, which is what
+/// `create_dir_all` did and what review flagged as undermining the FINDING-061 isolation boundary.
+/// Fails closed.
+fn create_exclusive_private(dir: &std::path::Path) -> anyhow::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    // with_context, not a formatted anyhow!: this preserves the underlying io::Error (its ErrorKind
+    // — AlreadyExists vs PermissionDenied — and any backtrace) as the source of the chain. Folding
+    // it into the message string, as this did before (Copilot review on #206), discards exactly the
+    // signal an operator needs to tell "someone planted this dir" from "the temp dir is unwritable".
+    use anyhow::Context;
+    b.create(dir).with_context(|| {
+        format!("refusing to reuse or adopt an existing worker config dir {dir:?}")
+    })
+}
+
+/// A per-worker directory-name token.
+///
+/// On unix: 16 bytes of `/dev/urandom`, hex — and if that device cannot be read, this FAILS rather
+/// than falling back to the guessable counter (Copilot review on #206). The old code silently
+/// downgraded to `pid-seq` on unix, which made the doc's "non-guessable on unix" a claim the code
+/// did not keep. `/dev/urandom` being unreadable on a unix host is a sign something is badly wrong;
+/// the honest move is to fail closed — the caller's fallback is the wrapped path, which is safe.
+///
+/// On non-unix: a monotonic counter, the only option there. The counter alone is guessable, which
+/// is why the exclusive create in [`mint_worker_config_dir`] — not this token — is what actually
+/// refuses a planted or stale leaf; the entropy only removes the guess that makes planting worth
+/// attempting.
+fn worker_config_token() -> anyhow::Result<String> {
+    #[cfg(unix)]
+    {
+        use anyhow::Context;
+        use std::io::Read;
+        let mut f = std::fs::File::open("/dev/urandom")
+            .context("cannot open /dev/urandom for a non-guessable worker config token")?;
+        let mut buf = [0u8; 16];
+        f.read_exact(&mut buf)
+            .context("cannot read 16 bytes of entropy from /dev/urandom")?;
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+    }
+    #[cfg(not(unix))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
+        Ok(format!(
+            "{}-{}",
+            std::process::id(),
+            SPAWN_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 }
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an
@@ -1937,6 +2005,53 @@ fn cli_runs_claude(cli_key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_worker_config_dir_is_fresh_non_guessable_and_refuses_reuse() {
+        // Two mints never collide and neither is the old predictable pid-seq shape.
+        let a = mint_worker_config_dir().expect("first mint");
+        let b = mint_worker_config_dir().expect("second mint");
+        assert_ne!(a, b, "each worker must get its own dir");
+        #[cfg(unix)]
+        {
+            let name = a.file_name().unwrap().to_string_lossy().to_string();
+            let token = name.trim_start_matches("wicked-acp-worker-config-");
+            assert_eq!(
+                token.len(),
+                32,
+                "unix token must be 16 random bytes hex-encoded, got {token:?}"
+            );
+            assert!(
+                token.chars().all(|c| c.is_ascii_hexdigit()),
+                "token not hex: {token:?}"
+            );
+        }
+        // Refuse-reuse: create_exclusive_private (the ACTUAL helper mint calls) must ERROR on a
+        // path that already exists — attacker-planted or stale — not adopt it. Exercising the real
+        // function, not a re-implementation, so flipping mint to recursive(true) fails this.
+        let planted = std::env::temp_dir().join(format!(
+            "wicked-acp-planted-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&planted);
+        std::fs::create_dir_all(&planted).unwrap();
+        assert!(
+            create_exclusive_private(&planted).is_err(),
+            "the exclusive create must REFUSE a pre-existing leaf, not adopt it"
+        );
+        let fresh = std::env::temp_dir().join(format!(
+            "wicked-acp-fresh-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&fresh);
+        assert!(
+            create_exclusive_private(&fresh).is_ok(),
+            "a fresh path must succeed"
+        );
+        for d in [a, b, planted, fresh] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
     use super::*;
     use crate::command::InjectTarget;
 
