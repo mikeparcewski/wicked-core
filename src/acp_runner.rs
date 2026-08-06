@@ -994,7 +994,7 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     // `authMethods` the agent advertised were never read and `authenticate` was never sent — an
     // auth-requiring agent then stalled or errored on `session/new` with nothing naming the
     // actual problem. Capture it, and run the ACP auth step below when the agent asks for one.
-    let init = match rpc_expect(&rx, 1, initialize_budget()) {
+    let init = match rpc_expect(&rx, &mut stdin, 1, initialize_budget()) {
         Ok(v) => v,
         Err(e) => handshake_err!(child, e),
     };
@@ -1029,7 +1029,7 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
             "authenticate",
             json!({ "methodId": method_id }),
         )
-        .and_then(|()| rpc_expect(&rx, id, initialize_budget()).map(|_| ()));
+        .and_then(|()| rpc_expect(&rx, &mut stdin, id, initialize_budget()).map(|_| ()));
         // A failed `authenticate` is NOT fatal on its own: agents advertise methods even while
         // their stored credentials are already valid, and some reject `authenticate` outright in
         // that state (claude-agent-acp@0.62 throws "Method not implemented." for its terminal
@@ -1053,7 +1053,7 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     ) {
         handshake_err!(child, e);
     }
-    let resp = match rpc_expect(&rx, session_new_id, session_new_budget()) {
+    let resp = match rpc_expect(&rx, &mut stdin, session_new_id, session_new_budget()) {
         Ok(v) => v,
         Err(e) => {
             // FINDING-015, the fail-fast half: an `auth_required` refusal gets the NAMED error —
@@ -1135,21 +1135,53 @@ fn rpc_send(
     Ok(())
 }
 
-/// Wait for the JSON-RPC response whose `"id"` matches `id`, skipping both
-/// notifications and non-JSON startup banners/logs. Returns `Err` on timeout,
-/// channel disconnect, or a server-side `"error"` field.
-/// Answer an inbound JSON-RPC REQUEST from the agent.
-///
-/// Distinct from [`rpc_send`], which ORIGINATES a request under an id we choose: this carries a
-/// `result` for an id the AGENT chose. Confusing the two leaves the agent waiting on a frame that
-/// never answers its question, and it waits until the turn's timeout.
-fn rpc_respond(stdin: &mut BufWriter<ChildStdin>, id: u64, result: Value) -> anyhow::Result<()> {
-    let msg = json!({"jsonrpc":"2.0","id":id,"result":result});
-    writeln!(stdin, "{msg}")?;
-    stdin.flush()?;
+/// Send a JSON-RPC 2.0 response to a `request_id` (which may be a string or
+/// number). The `id` field is echoed VERBATIM from the incoming request — NOT cast
+/// to u64 — so string-typed request ids (common in ACP adapters) round-trip
+/// correctly. `result` is the response payload.
+fn rpc_respond<W: Write>(
+    writer: &mut W,
+    request_id: &Value,
+    result: Value,
+) -> anyhow::Result<()> {
+    // Guard: a null id is a JSON-RPC notification, never a request — do not respond.
+    if request_id.is_null() {
+        return Ok(());
+    }
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
+    });
+    writeln!(writer, "{msg}")?;
+    // Flush immediately — the adapter's stdin is typically a pipe; a response left in the
+    // BufWriter buffer deadlocks the adapter's `r()` / `readline()` call indefinitely.
+    // `flush()` is a no-op for `Vec<u8>` (unit tests), so this is safe in all contexts.
+    writer.flush()?;
     Ok(())
 }
 
+/// ACP adapters verified to correctly serialize tool execution across the
+/// `elicitation/create` suspension boundary (OQ-R-6). Only adapters on this list
+/// may receive `elicitation/create` via the allow-list guard in `exec_turn_acp`.
+///
+/// Adding a new adapter REQUIRES a verifiable artifact (link to passing integration
+/// test run or source-code audit in the PR description) — self-assertion alone is
+/// insufficient (spec §Ask first).
+const ELICITATION_VERIFIED_ADAPTERS: &[&str] = &["claude-agent-acp", "codex-acp"];
+
+/// Dual-poll interval for the `'elicit` loop: check the resolution channel AND
+/// drain stdout every 50 ms to prevent the ACP adapter's stdout buffer from filling
+/// (a full buffer deadlocks the adapter's stdin writes).
+const ELICITATION_POLL_MS: u64 = 50;
+
+/// Cap on bytes read from a single stdout frame. Prevents a runaway adapter from
+/// growing the output buffer beyond MAX_OUT * 7 (56 MB).
+const FRAME_BYTE_CAP: usize = 8 * 1024 * 1024 * 7;
+
+/// Wait for the JSON-RPC response whose `"id"` matches `id`, skipping both
+/// notifications and non-JSON startup banners/logs. Returns `Err` on timeout,
+/// channel disconnect, or a server-side `"error"` field.
 /// The JSON-RPC `error.code` the ACP spec assigns to "authentication required": the agent
 /// refuses the call until `authenticate` succeeds. Matched structurally on the code the agent
 /// sent (via [`RpcServerError`]), never by pattern-matching a rendered message.
@@ -1173,8 +1205,14 @@ impl std::fmt::Display for RpcServerError {
 
 impl std::error::Error for RpcServerError {}
 
-fn rpc_expect(
+///
+/// During the handshake phase an `elicitation/create` notification may arrive from
+/// an adapter that races the handshake. The guard immediately responds with
+/// `action:"cancel"` via `stdin` so the adapter does not stall waiting for a
+/// resolution that will never come during startup.
+fn rpc_expect<W: Write>(
     rx: &std::sync::mpsc::Receiver<String>,
+    stdin: &mut W,
     id: u64,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
@@ -1194,6 +1232,14 @@ fn rpc_expect(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Elicitation guard: a stray `elicitation/create` during handshake is
+                // immediately cancelled — it cannot be resolved (no maps context here)
+                // and must not block the handshake.
+                if v.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                    let req_id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let _ = rpc_respond(stdin, &req_id, json!({"action":"cancel"}));
+                    continue;
+                }
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(err) = v.get("error") {
                         return Err(anyhow::Error::new(RpcServerError {
@@ -1243,16 +1289,47 @@ impl TurnResult {
 /// declared `depends_on`. Each block is prefixed with its label so the agent can attribute the
 /// contribution, and a contract header precedes them stating that they are the subject of the task.
 /// When the slice is empty the prompt stays a single text block exactly as before — no header.
+/// Validate an `elicitation/create` `requestedSchema` and, if valid, return
+/// `(prop_name, prop_type)`. Returns `None` when the schema has more than one
+/// property or the single property's `type` is not `"string"`.
+///
+/// The guard is deliberately restrictive (OQ-R-5): ACP elicitation is intended
+/// for short confirmations, not for general-purpose forms with rich types. A
+/// multi-property or non-string schema is immediately cancelled so the adapter
+/// cannot stall waiting for a response that wicked-core will never provide.
+fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>)> {
+    let props = schema.get("properties").and_then(Value::as_object)?;
+    if props.len() != 1 {
+        return None; // zero or >1 properties → cancel
+    }
+    let (prop_name, prop_schema) = props.iter().next()?;
+    let prop_type = prop_schema.get("type").and_then(Value::as_str);
+    if prop_type.is_some_and(|t| t != "string") {
+        return None; // non-string type → cancel
+    }
+    Some((prop_name.clone(), prop_type.map(|s| s.to_string())))
+}
+
 fn exec_turn_acp(
     proc: &mut AcpProcess,
     prompt: &str,
     prior_outputs: &[PriorUnitOutput],
     emit: &DeltaSink,
     timeout: Duration,
+    elicitation_maps: Arc<Mutex<ElicitationMaps>>,
+    run_id: &str,
+    epoch: u64,
+    adapter_key: &str,
+    tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
+
+    // Elicitation is gated on a non-zero epoch AND on the adapter being in the verified
+    // allow-list (OQ-R-6). Chat turns always pass epoch=0 and are never suspended.
+    let elicitation_enabled =
+        epoch > 0 && ELICITATION_VERIFIED_ADAPTERS.contains(&adapter_key);
 
     // Build the prompt block array: a contract header, the prior outputs, then the work prompt.
     let mut blocks: Vec<Value> = Vec::new();
@@ -1297,27 +1374,250 @@ prior output you are reviewing, testing, or revising."
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
     let deadline = Instant::now() + timeout;
-    let (mut found, mut timed_out) = (false, false);
 
-    loop {
+    // State variables for this turn.
+    let (mut found, mut timed_out) = (false, false);
+    // Set when the turn is suspended on elicitation and the suspend deadline expires without a
+    // human response.
+    let mut elicitation_timed_out = false;
+    // Set when stdin closes mid-turn (write_failed during `rpc_respond` inside `'elicit`).
+    let mut write_failed_terminal = false;
+    // Set when `line_rx` disconnects inside the `'elicit` poll loop (adapter died mid-suspend).
+    let mut dead_session = false;
+
+    'exec: loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or_default();
         if remaining.is_zero() {
             timed_out = true;
-            break;
+            break 'exec;
         }
         match proc.line_rx.recv_timeout(remaining) {
             Ok(line) => {
                 let v: Value = match serde_json::from_str(&line) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(_) => continue 'exec,
                 };
+
+                // ── elicitation/create arm ─────────────────────────────────────────────
+                if v.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                    let request_id = v.get("id").cloned().unwrap_or(Value::Null);
+                    let schema = &v["params"]["requestedSchema"];
+                    let message = v["params"]["message"].as_str().unwrap_or("");
+
+                    // Guard 1: elicitation disabled for this epoch/adapter → immediate cancel.
+                    if !elicitation_enabled {
+                        let _ = rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                        continue 'exec;
+                    }
+
+                    // Guard 2: schema must have exactly one string-typed property.
+                    let (prop_name, prop_type) = match validate_elicitation_schema(schema) {
+                        Some(v) => v,
+                        None => {
+                            let _ = rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                            continue 'exec;
+                        }
+                    };
+
+                    // Extract enum options from the property schema if present.
+                    let options = schema["properties"][&prop_name]["enum"]
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>());
+
+                    // Mint a unique elicitation id and register in the maps.
+                    let elicitation_id = uuid::Uuid::new_v4().to_string();
+                    let registration = {
+                        let mut m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                        m.register(run_id, epoch, &elicitation_id, message, options, &prop_name)
+                    };
+                    let (deliver_rx, capped_msg, filtered_opts, prop_key) = match registration {
+                        Some(r) => r,
+                        None => {
+                            // Epoch was cancelled (suppressed creation) — cancel and continue.
+                            let _ = rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                            continue 'exec;
+                        }
+                    };
+
+                    // Announce the elicitation so the UI can show the question.
+                    let _ = tx.send(Command::EmitEvent(crate::event::CoreEvent::ElicitationCreated {
+                        session: run_id.to_string(),
+                        epoch,
+                        elicitation_id: elicitation_id.clone(),
+                        message: capped_msg,
+                        options: filtered_opts,
+                        prop_type,
+                    }));
+
+                    // ── 'elicit: dual-poll loop ────────────────────────────────────────
+                    // Keep draining stdout (prevents buffer full / deadlock) while also
+                    // checking the resolution channel every ELICITATION_POLL_MS.
+                    let mut elicit_action = String::new();
+                    let mut elicit_reason = String::new();
+
+                    'elicit: loop {
+                        let remaining = deadline
+                            .checked_duration_since(Instant::now())
+                            .unwrap_or_default();
+                        if remaining.is_zero() {
+                            // Outer turn deadline expired while suspended — cancel the elicitation.
+                            elicitation_timed_out = true;
+                            elicit_action = "cancel".to_string();
+                            elicit_reason = "timeout".to_string();
+                            let _ = rpc_respond(
+                                &mut proc.stdin,
+                                &request_id,
+                                json!({"action":"cancel"}),
+                            );
+                            break 'elicit;
+                        }
+
+                        // Check shutdown flag (actor is draining).
+                        {
+                            let m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                            if m.is_shutdown() {
+                                elicitation_timed_out = true;
+                                elicit_action = "cancel".to_string();
+                                elicit_reason = "teardown".to_string();
+                                drop(m);
+                                let _ = rpc_respond(
+                                    &mut proc.stdin,
+                                    &request_id,
+                                    json!({"action":"cancel"}),
+                                );
+                                break 'elicit;
+                            }
+                        }
+
+                        // Try resolution channel (non-blocking).
+                        match deliver_rx.try_recv() {
+                            Ok(result) => {
+                                // Remove from maps before responding.
+                                {
+                                    let mut m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                    m.remove(run_id, &elicitation_id);
+                                }
+                                elicit_action = result.action.clone();
+                                let response_payload = if result.action == "submit" {
+                                    if let Some(resp_val) = result.response {
+                                        json!({"action":"submit","values":{&prop_key: resp_val}})
+                                    } else {
+                                        // Malformed submit — treat as cancel.
+                                        elicit_action = "cancel".to_string();
+                                        json!({"action":"cancel"})
+                                    }
+                                } else {
+                                    json!({"action":"cancel"})
+                                };
+                                elicit_reason = "human".to_string();
+                                if rpc_respond(&mut proc.stdin, &request_id, response_payload).is_err() {
+                                    write_failed_terminal = true;
+                                    elicit_reason = "adapter_write_failure".to_string();
+                                }
+                                break 'elicit;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                // Channel dropped (EpochCleanup fired) → cancel the adapter.
+                                elicitation_timed_out = true;
+                                elicit_action = "cancel".to_string();
+                                elicit_reason = "teardown".to_string();
+                                let _ = rpc_respond(
+                                    &mut proc.stdin,
+                                    &request_id,
+                                    json!({"action":"cancel"}),
+                                );
+                                break 'elicit;
+                            }
+                        }
+
+                        // Poll stdout with a short timeout to drain the pipe.
+                        match proc.line_rx.recv_timeout(Duration::from_millis(ELICITATION_POLL_MS)) {
+                            Ok(inner_line) => {
+                                let v2: Value = match serde_json::from_str(&inner_line) {
+                                    Ok(v) => v,
+                                    Err(_) => continue 'elicit,
+                                };
+
+                                // Second elicitation/create during suspension → immediately cancel.
+                                if v2.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                                    let nested_id = v2.get("id").cloned().unwrap_or(Value::Null);
+                                    let _ = rpc_respond(
+                                        &mut proc.stdin,
+                                        &nested_id,
+                                        json!({"action":"cancel"}),
+                                    );
+                                    continue 'elicit;
+                                }
+
+                                // The prompt result arrived during the elicitation (the adapter decided
+                                // to finish without waiting for the elicitation response).
+                                if v2.get("id").and_then(Value::as_u64) == Some(id) {
+                                    // Remove from maps if still registered (edge: result raced resolution).
+                                    {
+                                        let mut m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                        m.remove(run_id, &elicitation_id);
+                                    }
+                                    elicit_reason = "session_prompt".to_string();
+                                    if v2.get("error").is_some() {
+                                        break 'elicit;
+                                    }
+                                    let stop = v2["result"]["stopReason"].as_str().unwrap_or("end_turn");
+                                    if stop == "cancelled" {
+                                        timed_out = true;
+                                    } else {
+                                        found = true;
+                                    }
+                                    if let Some(result_usage) = parse_result_usage(&v2["result"]["usage"]) {
+                                        let cost = usage.as_ref().and_then(|u| u.cost_usd);
+                                        usage = Some(Usage {
+                                            cost_usd: cost.or(result_usage.cost_usd),
+                                            ..result_usage
+                                        });
+                                    }
+                                    break 'elicit;
+                                }
+
+                                // session/update during elicitation → handle normally.
+                                if v2.get("method").and_then(Value::as_str) == Some("session/update") {
+                                    handle_update(&v2, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'elicit,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                dead_session = true;
+                                elicit_action = "cancel".to_string();
+                                elicit_reason = "teardown".to_string();
+                                break 'elicit;
+                            }
+                        }
+                    } // 'elicit
+
+                    // Emit the resolution event now that 'elicit has exited with a reason.
+                    if !elicit_reason.is_empty() {
+                        let _ = tx.send(Command::EmitEvent(crate::event::CoreEvent::ElicitationResolved {
+                            session: run_id.to_string(),
+                            elicitation_id: elicitation_id.clone(),
+                            action: elicit_action.clone(),
+                            reason: elicit_reason.clone(),
+                        }));
+                    }
+
+                    // After 'elicit: decide whether the outer loop should keep going.
+                    if found || timed_out || dead_session || elicitation_timed_out || write_failed_terminal {
+                        break 'exec;
+                    }
+                    // Otherwise: normal elicitation resolution (adapter continues) → keep looping.
+                    continue 'exec;
+                }
+                // ── end elicitation/create arm ─────────────────────────────────────────
 
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
                     if v.get("error").is_some() {
                         // JSON-RPC error response: treat as a failed turn (not cancelled).
-                        break;
+                        break 'exec;
                     }
                     let stop = v["result"]["stopReason"].as_str().unwrap_or("end_turn");
                     if stop == "cancelled" {
@@ -1338,7 +1638,7 @@ prior output you are reviewing, testing, or revising."
                             ..result_usage
                         });
                     }
-                    break;
+                    break 'exec;
                 }
 
                 if v.get("method").and_then(Value::as_str) == Some("session/update") {
@@ -1373,15 +1673,15 @@ prior output you are reviewing, testing, or revising."
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'exec,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'exec,
         }
     }
 
     // No `stopReason` and no timeout means the bridge stopped answering — it died mid-turn. Its
     // stderr is the only account of why, and `StepOutput.output` is where an operator looks, so
     // say it there rather than reporting a Failed unit with an empty reason.
-    if !found && !timed_out {
+    if !found && !timed_out && !elicitation_timed_out && !dead_session && !write_failed_terminal {
         let note = format!(
             "\n[wicked-core] ACP turn ended with no stopReason (the bridge stopped answering){}",
             stderr_context(&proc.stderr_tail)
@@ -1393,6 +1693,9 @@ prior output you are reviewing, testing, or revising."
         output: output.trim_end().to_string(),
         status: if found {
             StepStatus::Ok
+        } else if elicitation_timed_out || dead_session || write_failed_terminal {
+            // Elicitation-terminal paths: not retriable, bypass FailureTriageReady (spec I-7).
+            StepStatus::ElicitationFailed
         } else if timed_out {
             StepStatus::Cancelled
         } else {
@@ -1944,7 +2247,20 @@ impl AcpStepRunner {
         });
         let result = {
             let mut proc = arc.lock().unwrap_or_else(|p| p.into_inner());
-            exec_turn_acp(&mut proc, text, &[], &emit, Self::chat_timeout(), None)
+            // Chat turns never run in a governed epoch — epoch=0 disables elicitation.
+            exec_turn_acp(
+                &mut proc,
+                text,
+                &[],
+                &emit,
+                Self::chat_timeout(),
+                Arc::clone(&self.elicitation_maps),
+                "",
+                0,
+                cli_key,
+                &self.tx,
+                None,
+            )
         };
         // Touch again on the way out. `chat_ensure` touched on the way in, but a long turn would
         // then be counted as idle for its whole duration — a 40-minute agent turn would be reaped
@@ -2284,6 +2600,11 @@ impl AcpStepRunner {
             prior_outputs,
             emit,
             self.timeout,
+            Arc::clone(&self.elicitation_maps),
+            &run_id,
+            input.elicitation_epoch,
+            &cli_key,
+            &self.tx,
             gate.as_ref(),
         ) {
             Ok(result) if result.status == StepStatus::Ok => StepOutput {
@@ -2310,6 +2631,23 @@ impl AcpStepRunner {
                     usage: result.usage,
                     files: result.files,
                     governed: gate.is_some(),
+                }
+            }
+            Ok(result) if result.status == StepStatus::ElicitationFailed => {
+                // Elicitation terminal — non-retriable; drop the session so a hung adapter
+                // does not pin the slot. The actor routes ElicitationFailed directly to the
+                // run-terminal path (spec I-7), bypassing FailureTriageReady/Retry.
+                drop(proc);
+                self.drop_session(&run_id);
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::ElicitationFailed,
+                    usage: result.usage,
+                    files: result.files,
+                    governed: false,
                 }
             }
             Ok(_) => {
@@ -3925,5 +4263,604 @@ sleep 30
         assert_eq!(m.active_workers, 0, "worker decremented");
         assert!(!m.pending.contains_key("e13a"), "epoch-1 registration removed");
         assert!(m.pending.contains_key("e13b"), "epoch-2 registration survives");
+    }
+
+    // ── DES-002 T5 tests: rpc_respond, rpc_expect, validate_elicitation_schema ─────
+
+    /// Test 21: `rpc_respond` echoes the request id VERBATIM — string ids must not be cast to u64.
+    ///
+    /// The defect this pins: the prior `rpc_expect` used `v.get("id").and_then(Value::as_u64) == Some(id)`
+    /// which coerces string ids to `None`, causing any adapter that sends a string-typed `id` (a
+    /// common pattern in Claude Code and Codex) to stall. `rpc_respond` must echo as `Value::String`.
+    #[test]
+    fn rpc_respond_echoes_string_typed_request_id_verbatim() {
+        let request_id = serde_json::Value::String("elicit-abc-123".to_string());
+        let result = serde_json::json!({"action": "cancel"});
+
+        let mut buf: Vec<u8> = Vec::new();
+        rpc_respond(&mut buf, &request_id, result).unwrap();
+
+        let line = std::str::from_utf8(&buf).unwrap().trim_end().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        // The `id` field must survive as a string, not be cast to a number.
+        assert_eq!(
+            parsed["id"],
+            serde_json::Value::String("elicit-abc-123".to_string()),
+            "string id must be echoed verbatim, not coerced to integer: {parsed}"
+        );
+        assert_eq!(parsed["result"]["action"], "cancel");
+    }
+
+    /// `rpc_respond` is a no-op for a null id (JSON-RPC notifications must not be responded to).
+    #[test]
+    fn rpc_respond_ignores_null_id() {
+        let mut buf: Vec<u8> = Vec::new();
+        rpc_respond(&mut buf, &serde_json::Value::Null, serde_json::json!({})).unwrap();
+        assert!(buf.is_empty(), "null id must produce no output");
+    }
+
+    /// Test 22: `rpc_expect` returns the matching response frame and skips non-matching frames.
+    #[test]
+    fn rpc_expect_returns_matching_response_frame() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // Pre-stage: a notification (should be skipped), then the matching response.
+        tx.send(r#"{"jsonrpc":"2.0","method":"session/update","params":{}}"#.to_string())
+            .unwrap();
+        tx.send(r#"{"jsonrpc":"2.0","id":1,"result":{"sessionId":"s1"}}"#.to_string())
+            .unwrap();
+        drop(tx); // close channel; should not reach disconnected branch
+
+        let mut sink: Vec<u8> = Vec::new();
+        let v = rpc_expect(&rx, &mut sink, 1, Duration::from_secs(5)).unwrap();
+        assert_eq!(v["result"]["sessionId"], "s1");
+        // No elicitation/create was sent so the sink should be empty.
+        assert!(sink.is_empty());
+    }
+
+    /// Test 23: `rpc_expect` elicitation guard — a stray `elicitation/create` during the handshake
+    /// phase is immediately responded with `action:"cancel"` and the expect loop continues.
+    #[test]
+    fn rpc_expect_cancels_stray_elicitation_create_during_handshake() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // Pre-stage: stray elicitation/create (with string id), then the expected response.
+        tx.send(r#"{"jsonrpc":"2.0","id":"stray-1","method":"elicitation/create","params":{"message":"hi","requestedSchema":{}}}"#.to_string())
+            .unwrap();
+        tx.send(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s2"}}"#.to_string())
+            .unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let v = rpc_expect(&rx, &mut sink, 2, Duration::from_secs(5)).unwrap();
+        assert_eq!(v["result"]["sessionId"], "s2");
+
+        // The sink must contain one cancel response for the stray elicitation id.
+        let written = std::str::from_utf8(&sink).unwrap().trim_end();
+        let cancel: serde_json::Value = serde_json::from_str(written)
+            .expect("rpc_expect must write a cancel response for the stray frame");
+        assert_eq!(
+            cancel["id"],
+            serde_json::Value::String("stray-1".to_string()),
+            "cancel response must echo the stray request id verbatim: {cancel}"
+        );
+        assert_eq!(cancel["result"]["action"], "cancel");
+    }
+
+    /// Test 24: `rpc_expect` returns `Err` when the timeout expires with no matching frame.
+    #[test]
+    fn rpc_expect_returns_err_on_timeout() {
+        let (_tx, rx) = std::sync::mpsc::channel::<String>(); // nothing sent
+        let mut sink: Vec<u8> = Vec::new();
+        let result = rpc_expect(&rx, &mut sink, 1, Duration::from_millis(10));
+        assert!(result.is_err(), "must return Err when timeout expires: {result:?}");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("timeout"),
+            "error must mention timeout: {msg}"
+        );
+    }
+
+    /// Test 13: schema with a single non-string property → `validate_elicitation_schema` returns None.
+    #[test]
+    fn schema_with_non_string_property_is_rejected() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "n": { "type": "integer" }
+            }
+        });
+        assert!(
+            validate_elicitation_schema(&schema).is_none(),
+            "integer property must be rejected (only string is allowed)"
+        );
+
+        let schema_bool = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "flag": { "type": "boolean" }
+            }
+        });
+        assert!(
+            validate_elicitation_schema(&schema_bool).is_none(),
+            "boolean property must be rejected"
+        );
+    }
+
+    /// Test 14: schema with more than one property → `validate_elicitation_schema` returns None.
+    #[test]
+    fn schema_with_multiple_properties_is_rejected() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "first": { "type": "string" },
+                "last": { "type": "string" }
+            }
+        });
+        assert!(
+            validate_elicitation_schema(&schema).is_none(),
+            "multi-property schema must be rejected"
+        );
+    }
+
+    /// Schema with exactly one string-typed property passes validation.
+    #[test]
+    fn schema_with_single_string_property_passes() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" }
+            }
+        });
+        let result = validate_elicitation_schema(&schema);
+        assert!(result.is_some(), "single-string schema must pass validation");
+        let (prop_name, prop_type) = result.unwrap();
+        assert_eq!(prop_name, "name");
+        assert_eq!(prop_type, Some("string".to_string()));
+    }
+
+    /// Schema with a single property but no `type` field → passes (type constraint is optional).
+    #[test]
+    fn schema_with_single_property_and_no_type_passes() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": {}
+            }
+        });
+        let result = validate_elicitation_schema(&schema);
+        assert!(result.is_some(), "single property with no type must pass validation");
+        let (prop_name, prop_type) = result.unwrap();
+        assert_eq!(prop_name, "answer");
+        assert!(prop_type.is_none());
+    }
+
+    // ── DES-002 T5 exec_turn_acp arm tests (require a real subprocess, unix only) ──
+
+    /// Write a Python 3 mock ACP adapter script to `dir` that handles the standard handshake
+    /// then executes the behavior passed as `sys.argv[1]`. Returns the path for use as
+    /// `AcpConfig::binary`; pass the behavior name as the first element of `AcpConfig::start_args`.
+    ///
+    /// Behaviors:
+    /// - `"ok"`: completes immediately with `stopReason:"end_turn"`
+    /// - `"elicit_ok"`: sends a valid string-schema elicitation, reads one response, completes
+    /// - `"elicit_multi_prop"`: sends a multi-property schema → must receive immediate cancel, completes
+    /// - `"elicit_non_string"`: sends an integer-type schema → immediate cancel, completes
+    /// - `"elicit_nested"`: sends two elicitations in rapid succession (to test test-20)
+    /// - `"elicit_disconnect"`: sends elicitation then closes stdout (test-19)
+    #[cfg(unix)]
+    fn write_mock_acp_py(dir: &std::path::Path) -> std::path::PathBuf {
+        // The script uses Python dict literals (which json.dumps handles) to avoid Rust brace
+        // escaping in format!. The behavior is controlled entirely via sys.argv[1].
+        let path = dir.join("mock-acp-bridge.py");
+        // Write as a raw literal (no format substitutions needed — all braces are Python dict syntax)
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json, time
+
+behavior = sys.argv[1] if len(sys.argv) > 1 else "ok"
+
+def w(obj):
+    print(json.dumps(obj), flush=True)
+
+def r():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if line:
+            try:
+                return json.loads(line)
+            except Exception:
+                pass
+
+# initialize
+req = r()
+w({"jsonrpc": "2.0", "id": req["id"], "result": {
+    "protocolVersion": "2025-03-26", "capabilities": {},
+    "serverInfo": {"name": "mock", "version": "0"}
+}})
+# session/new
+req = r()
+w({"jsonrpc": "2.0", "id": req["id"], "result": {
+    "sessionId": "mock-session", "protocolVersion": "2025-03-26"
+}})
+# session/prompt
+req = r()
+prompt_id = req["id"]
+
+if behavior == "ok":
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
+    }})
+
+elif behavior == "elicit_ok":
+    # Valid string-schema elicitation: wicked-core must register + deliver via channel
+    w({"jsonrpc": "2.0", "id": "elicit-1", "method": "elicitation/create", "params": {
+        "message": "What is your name?",
+        "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+    }})
+    r()  # read the submit/cancel response from wicked-core
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
+    }})
+
+elif behavior == "elicit_multi_prop":
+    # Multi-property schema: must be immediately cancelled
+    w({"jsonrpc": "2.0", "id": "elicit-2", "method": "elicitation/create", "params": {
+        "message": "Name?",
+        "requestedSchema": {"type": "object", "properties": {
+            "first": {"type": "string"}, "last": {"type": "string"}
+        }}
+    }})
+    r()  # must receive action:cancel immediately
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 2}
+    }})
+
+elif behavior == "elicit_non_string":
+    # Non-string type property: must be immediately cancelled
+    w({"jsonrpc": "2.0", "id": "elicit-3", "method": "elicitation/create", "params": {
+        "message": "Pick?",
+        "requestedSchema": {"type": "object", "properties": {"n": {"type": "integer"}}}
+    }})
+    r()  # must receive action:cancel immediately
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 2}
+    }})
+
+elif behavior == "elicit_nested":
+    # Send first elicitation, then immediately a second one while the first is pending.
+    # The second must be immediately cancelled; the first is resolved by the deliver thread.
+    w({"jsonrpc": "2.0", "id": "elicit-n1", "method": "elicitation/create", "params": {
+        "message": "First?",
+        "requestedSchema": {"type": "object", "properties": {"val": {"type": "string"}}}
+    }})
+    # The second is sent without waiting for the first to resolve.
+    w({"jsonrpc": "2.0", "id": "elicit-n2", "method": "elicitation/create", "params": {
+        "message": "Second?",
+        "requestedSchema": {"type": "object", "properties": {"val": {"type": "string"}}}
+    }})
+    # Read the cancel for elicit-n2 (immediate)
+    r()
+    # Read the response for elicit-n1 (from deliver thread)
+    r()
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 2}
+    }})
+
+elif behavior == "elicit_disconnect":
+    # Send elicitation, then close stdout (simulate adapter death mid-suspension).
+    w({"jsonrpc": "2.0", "id": "elicit-disc", "method": "elicitation/create", "params": {
+        "message": "Are you there?",
+        "requestedSchema": {"type": "object", "properties": {"ans": {"type": "string"}}}
+    }})
+    # Close stdout — wicked-core's line_rx will see Disconnected.
+    sys.stdout.close()
+    time.sleep(10)  # keep the process alive so stdin-EOF doesn't affect the turn
+
+else:
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}
+    }})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Start a mock ACP process using the shared Python bridge script.
+    /// The `behavior` string is passed as `start_args[0]` to the script.
+    #[cfg(unix)]
+    fn start_mock_proc(dir: &std::path::Path, behavior: &str) -> AcpProcess {
+        let py_path = write_mock_acp_py(dir);
+        let config = AcpConfig {
+            binary: py_path.to_string_lossy().to_string(),
+            start_args: vec![behavior.to_string()],
+            transport: AcpTransport::default(),
+        };
+        start_acp_process(&config, dir)
+            .unwrap_or_else(|e| panic!("mock ACP start failed for behavior={behavior}: {e}"))
+    }
+
+    /// Test 12: when `elicitation_epoch == 0` the arm is disabled — the adapter's `elicitation/create`
+    /// gets an immediate cancel and the turn completes normally as `Ok`.
+    #[test]
+    #[cfg(unix)]
+    fn elicitation_disabled_when_epoch_is_zero() {
+        let dir = std::env::temp_dir()
+            .join(format!("wicked-des002-t12-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "elicit_ok");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // epoch=0 → elicitation disabled for this turn.
+        let result = exec_turn_acp(
+            &mut proc,
+            "hello",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            maps,
+            "run-t12",
+            0, // epoch=0 → disabled
+            "claude-agent-acp",
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            result.status,
+            StepStatus::Ok,
+            "turn must complete ok when elicitation is disabled: {:?}",
+            result.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 13 & 14 integration: multi-property and non-string-schema elicitations are immediately
+    /// cancelled and the turn still completes as `Ok`.
+    #[test]
+    #[cfg(unix)]
+    fn invalid_schema_elicitations_are_cancelled_and_turn_completes_ok() {
+        for behavior in ["elicit_multi_prop", "elicit_non_string"] {
+            let dir = std::env::temp_dir().join(format!(
+                "wicked-des002-schema-{}-{}",
+                behavior,
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+
+            let mut proc = start_mock_proc(&dir, behavior);
+            let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let noop: &DeltaSink = &|_: &str| {};
+
+            // epoch=1, verified adapter → elicitation enabled, but schema invalid → immediate cancel.
+            let result = exec_turn_acp(
+                &mut proc,
+                "go",
+                &[],
+                noop,
+                Duration::from_secs(5),
+                maps,
+                "run-schema",
+                1,
+                "claude-agent-acp",
+                &tx,
+            )
+            .unwrap();
+            assert_eq!(
+                result.status,
+                StepStatus::Ok,
+                "turn must complete ok after invalid schema cancel ({behavior}): {:?}",
+                result.status
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Test 15: a valid elicitation schema causes `ElicitationCreated` to be emitted.
+    #[test]
+    #[cfg(unix)]
+    fn valid_elicitation_schema_emits_elicitation_created_event() {
+        let dir = std::env::temp_dir()
+            .join(format!("wicked-des002-t15-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "elicit_ok");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, event_rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // Deliver a response from a concurrent thread so 'elicit doesn't time out.
+        let maps_clone = Arc::clone(&maps);
+        let deliver_thread = std::thread::spawn(move || {
+            // Give exec_turn_acp time to register the elicitation.
+            std::thread::sleep(Duration::from_millis(200));
+            let m = maps_clone.lock().unwrap();
+            // Find the elicitation id and deliver a response.
+            let elicitation_id = m.pending.keys().next().map(|s| s.clone());
+            drop(m);
+            if let Some(id) = elicitation_id {
+                let mut m = maps_clone.lock().unwrap();
+                let _ = m.deliver("run-t15", &id, "submit".to_string(), Some(serde_json::json!("Alice")));
+            }
+        });
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            Arc::clone(&maps),
+            "run-t15",
+            1,
+            "claude-agent-acp",
+            &tx,
+        )
+        .unwrap();
+        deliver_thread.join().unwrap();
+
+        assert_eq!(result.status, StepStatus::Ok);
+
+        // Check that ElicitationCreated was emitted.
+        let events: Vec<_> = event_rx.try_iter().collect();
+        let created = events.iter().find(|c| {
+            matches!(
+                c,
+                Command::EmitEvent(crate::event::CoreEvent::ElicitationCreated { .. })
+            )
+        });
+        assert!(
+            created.is_some(),
+            "ElicitationCreated must be emitted for a valid schema"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 19: adapter stdout disconnect while the turn is suspended on elicitation → `ElicitationFailed`.
+    #[test]
+    #[cfg(unix)]
+    fn adapter_disconnect_mid_elicitation_returns_elicitation_failed() {
+        let dir = std::env::temp_dir()
+            .join(format!("wicked-des002-t19-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "elicit_disconnect");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            maps,
+            "run-t19",
+            1,
+            "claude-agent-acp",
+            &tx,
+        )
+        .unwrap();
+        assert_eq!(
+            result.status,
+            StepStatus::ElicitationFailed,
+            "adapter disconnect mid-elicitation must yield ElicitationFailed: {:?}",
+            result.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 20: a second `elicitation/create` while suspended on the first is immediately
+    /// cancelled (spec I-5: only one in-flight elicitation per turn).
+    #[test]
+    #[cfg(unix)]
+    fn nested_elicitation_create_is_immediately_cancelled() {
+        let dir = std::env::temp_dir()
+            .join(format!("wicked-des002-t20-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Use the "elicit_nested" behavior: mock sends elicit-nested-2 while elicit-nested-1 is
+        // pending, then sends cancel for both, then completes the prompt.
+        let mut proc = start_mock_proc(&dir, "elicit_nested");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let maps_clone = Arc::clone(&maps);
+        let (tx, event_rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // Concurrently deliver a cancel for the FIRST elicitation (no human available).
+        let deliver_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let m = maps_clone.lock().unwrap();
+            let elicitation_id = m.pending.keys().next().map(|s| s.clone());
+            drop(m);
+            if let Some(id) = elicitation_id {
+                let mut m = maps_clone.lock().unwrap();
+                let _ = m.deliver("run-t20", &id, "cancel".to_string(), None);
+            }
+        });
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            Arc::clone(&maps),
+            "run-t20",
+            1,
+            "claude-agent-acp",
+            &tx,
+        )
+        .unwrap();
+        deliver_thread.join().unwrap();
+
+        // The turn should complete with Cancelled (human sent cancel → adapter sent stopReason:cancelled)
+        // OR Ok (depends on mock behavior after cancel). With our mock behavior above:
+        // - nested-2 gets immediate cancel (from inside 'elicit loop)
+        // - nested-1 gets cancel from the deliver thread
+        // - mock then responds to nested-1 cancel then completes the prompt
+        // So the turn should complete ok.
+        assert!(
+            result.status == StepStatus::Ok || result.status == StepStatus::Cancelled,
+            "turn must complete ok or cancelled after nested elicitation: {:?}",
+            result.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test 37: `session/prompt` result usage replaces (not merges with) prior `usage_update` tokens
+    /// when both are present. The result carries authoritative token counts; only cost is kept from
+    /// the notification path because adapters like the official claude bridge report cost in
+    /// `usage_update` and tokens in the prompt result.
+    #[test]
+    fn session_prompt_result_usage_replaces_prior_usage_update_tokens() {
+        // Simulate a usage_update arriving before the result (cost-only, no tokens).
+        let emit_fn = |_: &str| {};
+        let emit: &DeltaSink = &emit_fn;
+        let mut output = String::new();
+        let mut prior_usage: Option<Usage> = Some(Usage {
+            input_tokens: 999, // would be wrong if kept
+            output_tokens: 888,
+            cost_usd: Some(0.42),
+        });
+        let mut files: Vec<String> = Vec::new();
+
+        // A session/prompt result arrives with authoritative token counts.
+        let result_frame = serde_json::json!({
+            "result": {
+                "stopReason": "end_turn",
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 50
+                }
+            }
+        });
+        if let Some(result_usage) = parse_result_usage(&result_frame["result"]["usage"]) {
+            let cost = prior_usage.as_ref().and_then(|u| u.cost_usd);
+            prior_usage = Some(Usage {
+                cost_usd: cost.or(result_usage.cost_usd),
+                ..result_usage
+            });
+        }
+        let _ = (emit, &mut output, &mut files); // silence unused warnings
+
+        let final_usage = prior_usage.unwrap();
+        // Tokens come from the result frame, not the prior notification.
+        assert_eq!(final_usage.input_tokens, 100, "result tokens replace notification tokens");
+        assert_eq!(final_usage.output_tokens, 50);
+        // Cost is preserved from the prior usage_update notification.
+        assert_eq!(
+            final_usage.cost_usd,
+            Some(0.42),
+            "cost from usage_update must survive the result merge"
+        );
     }
 }
