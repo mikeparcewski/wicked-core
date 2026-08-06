@@ -3092,6 +3092,61 @@ sleep 30
     /// My own proof missed it because it exercises `permission_result` directly and never looks at
     /// the StepOutput the runner returns. Fourth instance of that gap in this campaign — hence a
     /// source audit rather than another test of the helper.
+    #[cfg(unix)]
+    const CHEAP_OK: &str = "/bin/echo wicked-fallback-ran";
+    #[cfg(not(unix))]
+    const CHEAP_OK: &str = "wicked-no-such-binary-fallback-probe";
+
+    /// A unit assigned to `claude` — the routing predicate reads `assigned_cli` — whose actual
+    /// invocation is [`CHEAP_OK`], so the wrapped fallback this must reach executes something cheap
+    /// instead of a real CLI. The two are deliberately different: the ACP branch classifies by the
+    /// assigned key, the wrapped runner by argv[0].
+    fn claude_unit_running_echo() -> crate::domain::WorkUnit {
+        crate::domain::WorkUnit {
+            id: "u-gov".to_string(),
+            session_id: "run-gov".to_string(),
+            ord: 1,
+            description: "a governed unit".to_string(),
+            stage: Default::default(),
+            assigned_cli: Some("claude".to_string()),
+            assigned_invocation: Some(CHEAP_OK.to_string()),
+            council_task_ref: None,
+            routing: None,
+            denial_reason: None,
+            phase_ref: None,
+            conformance_ref: None,
+            phase_status: None,
+            collection_scope: None,
+            skill_ref: None,
+            allowed_skills: Vec::new(),
+            gate: Default::default(),
+            role: Default::default(),
+            validator: None,
+            tool_cmd: None,
+            depends_on: Vec::new(),
+            status: crate::domain::UnitStatus::Pending,
+        }
+    }
+
+    fn governed_input(dir: &std::path::Path) -> StepInput {
+        StepInput {
+            run_id: "run-gov".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: claude_unit_running_echo(),
+            workflow_id: "wf-test".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.to_path_buf()),
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: dir.join("estate.db").to_string_lossy().to_string(),
+                code_graph_db: None,
+            }),
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+        }
+    }
     #[test]
     fn a_governed_acp_unit_reports_itself_governed() {
         let src = include_str!("acp_runner.rs");
