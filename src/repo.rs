@@ -5,8 +5,13 @@
 //! A [`RepoEntry`] is a `Node(Other("repo_entry"))` on the shared estate store (mirrors the
 //! `AgentSession` projection in [`crate::domain`]). A run that targets a registered repo gets its own
 //! worktree at `<repo>/.wicked/worktrees/<run_id>` on branch `wicked/<run_id>`; the worker runs there
-//! (augment mode — see `ORCHESTRATOR.md` §4). Worktrees are cleaned up on a terminal run status, and
-//! an orphan reaper prunes stale ones on actor startup.
+//! (augment mode — see `ORCHESTRATOR.md` §4). Worktrees are reaped on a terminal run status — but
+//! only when CLEAN ([`reap_worktree_if_clean`]): a tree holding uncommitted work is kept and logged,
+//! never force-deleted, because those bytes may be the only copy of the work. The startup orphan
+//! reaper ([`reap_orphan_worktrees`]) applies the same rule to terminal runs' leftovers and
+//! force-removes only worktrees whose run id no longer exists on the store at all. The
+//! `wicked/<run_id>` BRANCH is never deleted by any of this — the branch is the durable record of a
+//! run's landed work; the worktree is scaffolding.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -271,7 +276,11 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
     Ok(wt)
 }
 
-/// Remove a run's worktree (best-effort — a failure to clean up is logged, not fatal).
+/// Remove a run's worktree unconditionally (best-effort — a failure to clean up is logged, not
+/// fatal). This is the DESTRUCTIVE form: `--force` deletes uncommitted work. It is reserved for the
+/// two cases where discarding is the point — an operator's explicit Cancel (abandonment), and a
+/// startup leftover whose run id no longer exists on the store (no record, nothing to preserve).
+/// A run that merely FINISHED goes through [`reap_worktree_if_clean`] instead (FINDING-003).
 pub fn remove_worktree(repo_root: &str, run_id: &str) {
     let wt = worktrees_root(repo_root).join(run_id);
     let wt_str = wt.to_string_lossy().to_string();
@@ -282,9 +291,57 @@ pub fn remove_worktree(repo_root: &str, run_id: &str) {
     }
 }
 
-/// Prune worktrees whose run is no longer live: any `<repo>/.wicked/worktrees/<id>` whose `<id>` is
-/// not in `live_run_ids`. Called on actor startup so a crashed run doesn't leak its worktree.
-pub fn reap_orphan_worktrees(repos: &[RepoEntry], live_run_ids: &HashSet<String>) {
+/// FINDING-003 — reap a TERMINAL run's worktree, but only when it is CLEAN. Returns whether the
+/// path is gone.
+///
+/// Deliberately NOT `--force` and NO `remove_dir_all` fallback: git's non-forced `worktree remove`
+/// refuses a tree with modified or untracked files, and that refusal is the safety property this
+/// function is built on. A terminal run's uncommitted files are work that never landed on the
+/// `wicked/<run_id>` branch (the known artifact-landing gap — 3 of the finding's 14 orphans carried
+/// exactly that), so force-deleting them here would make the REAPER the thing that destroys the
+/// only copy of the work. A kept tree is announced on stderr each time, so it is a visible,
+/// named leftover rather than a silent leak; a clean tree adds nothing the branch doesn't already
+/// carry, and goes. The branch itself is never touched either way.
+pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
+    let wt = worktrees_root(repo_root).join(run_id);
+    if !wt.is_dir() {
+        // Nothing on disk. Drop any dangling admin entry so the path is re-usable.
+        let _ = git(repo_root, &["worktree", "prune"]);
+        return true;
+    }
+    let wt_str = wt.to_string_lossy().to_string();
+    match git(repo_root, &["worktree", "remove", &wt_str]) {
+        Ok((true, _, _)) => true,
+        Ok((false, _, err)) => {
+            eprintln!(
+                "wicked-core: keeping worktree {} — git refused a non-forced remove ({}); it \
+                 likely holds uncommitted work the wicked/{run_id} branch does not carry",
+                wt.display(),
+                err.trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!("wicked-core: could not reap worktree {}: {e}", wt.display());
+            false
+        }
+    }
+}
+
+/// Prune worktrees whose run is not live, on actor startup. For each
+/// `<repo>/.wicked/worktrees/<id>`:
+///  - `<id>` in `live_run_ids` (a session in a NON-terminal status) → kept, it may resume;
+///  - `<id>` in `terminal_run_ids` (a session that finished) → [`reap_worktree_if_clean`] — the
+///    same rule the terminal-status reap applies, re-run here so a crash between a run going
+///    terminal and its reap (or a run predating the reap) converges on the next start instead of
+///    surviving restarts forever (FINDING-003: 14 did);
+///  - unknown to the store → [`remove_worktree`] (force): no session record exists, so there is no
+///    run to resume and no outcome the leftover documents.
+pub fn reap_orphan_worktrees(
+    repos: &[RepoEntry],
+    live_run_ids: &HashSet<String>,
+    terminal_run_ids: &HashSet<String>,
+) {
     for repo in repos {
         let root = worktrees_root(&repo.root_path);
         let Ok(entries) = std::fs::read_dir(&root) else {
@@ -292,7 +349,12 @@ pub fn reap_orphan_worktrees(repos: &[RepoEntry], live_run_ids: &HashSet<String>
         };
         for e in entries.flatten() {
             if let Some(name) = e.file_name().to_str() {
-                if !live_run_ids.contains(name) {
+                if live_run_ids.contains(name) {
+                    continue;
+                }
+                if terminal_run_ids.contains(name) {
+                    let _ = reap_worktree_if_clean(&repo.root_path, name);
+                } else {
                     remove_worktree(&repo.root_path, name);
                 }
             }
@@ -858,6 +920,97 @@ mod tests {
         assert!(err.contains("is not a git worktree"), "{err}");
         // A refusal must not double as a delete.
         assert!(wt.join("someone-elses-work.txt").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-003, the common case: a terminal run whose tree is clean loses the CHECKOUT but
+    /// keeps the BRANCH — the branch is the durable record an operator reviews/merges; the
+    /// worktree was scaffolding.
+    #[test]
+    fn reap_if_clean_removes_a_clean_worktree_but_never_its_branch() {
+        let root = git_repo("reap-clean");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "run-1").unwrap();
+        assert!(is_live_worktree(&wt), "precondition: a real checkout");
+
+        assert!(reap_worktree_if_clean(p, "run-1"), "a clean tree reaps");
+        assert!(!wt.exists(), "the checkout is gone");
+        let (ok, branches, _) = git(p, &["branch", "--list", "wicked/run-1"]).unwrap();
+        assert!(
+            ok && branches.contains("wicked/run-1"),
+            "the wicked/run-1 branch must survive the reap — it is the record, got: {branches}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-003, the safety property the whole design leans on: a tree holding uncommitted
+    /// work (3 of the finding's 14 orphans did — the artifact-landing gap) is KEPT, bytes intact.
+    /// If this fails, the reaper has become the thing that destroys the only copy of the work.
+    #[test]
+    fn reap_if_clean_keeps_a_dirty_worktree_and_its_unlanded_bytes() {
+        let root = git_repo("reap-dirty");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "run-1").unwrap();
+        std::fs::write(wt.join("unlanded-artifact.txt"), "never committed\n").unwrap();
+
+        assert!(
+            !reap_worktree_if_clean(p, "run-1"),
+            "a dirty tree must be reported KEPT"
+        );
+        assert!(
+            is_live_worktree(&wt),
+            "the dirty tree stays a live checkout, not a half-removed shell"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("unlanded-artifact.txt")).unwrap(),
+            "never committed\n",
+            "the uncommitted bytes are untouched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-003's restart half: the startup reaper must converge terminal runs' leftovers
+    /// (14 survived restarts) while never touching a live run's checkout, and still force-clear
+    /// worktrees whose run id the store has never heard of.
+    #[test]
+    fn startup_reaper_reaps_terminal_keeps_live_and_forces_unknown() {
+        let root = git_repo("reap-startup");
+        let p = root.to_str().unwrap();
+        let wt_live = create_worktree(p, "run-live").unwrap();
+        let wt_done = create_worktree(p, "run-done").unwrap();
+        let wt_dirty = create_worktree(p, "run-dirty").unwrap();
+        std::fs::write(wt_dirty.join("unlanded.txt"), "keep me\n").unwrap();
+        let wt_gone = create_worktree(p, "run-unknown").unwrap();
+        // The unknown-id worktree is dirty TOO — force removal is exactly the point there.
+        std::fs::write(wt_gone.join("scratch.txt"), "no session owns this\n").unwrap();
+
+        let repo = RepoEntry {
+            id: "r".into(),
+            name: "r".into(),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+        };
+        let live: HashSet<String> = ["run-live".to_string()].into_iter().collect();
+        let terminal: HashSet<String> = ["run-done".to_string(), "run-dirty".to_string()]
+            .into_iter()
+            .collect();
+        reap_orphan_worktrees(std::slice::from_ref(&repo), &live, &terminal);
+
+        assert!(
+            is_live_worktree(&wt_live),
+            "a non-terminal run keeps its checkout across restarts (resume)"
+        );
+        assert!(!wt_done.exists(), "a clean terminal leftover converges");
+        assert!(
+            is_live_worktree(&wt_dirty) && wt_dirty.join("unlanded.txt").is_file(),
+            "a dirty terminal leftover is kept — same rule as the terminal-status reap"
+        );
+        assert!(
+            !wt_gone.exists(),
+            "a worktree no session owns is force-removed, dirty or not"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

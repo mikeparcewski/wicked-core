@@ -308,14 +308,23 @@ pub(crate) fn run(
     // leaked them — the exact failure DES R1 forbids). Holds its own `pty_map` clone.
     let _pty_reaper = terminal::PtyReaper::new(pty_map.clone());
 
-    // Startup orphan reaper: prune worktrees whose run no longer exists on the store (e.g. a crashed
-    // run cleaned out of the registry). Runs whose session still exists keep their worktree (resume).
+    // Startup orphan reaper (FINDING-003): worktrees of runs in a TERMINAL status are reaped when
+    // clean (the same rule the terminal-status reap applies — so a crash between a run finishing
+    // and its reap, or a run predating the reap, converges here instead of surviving restarts);
+    // worktrees of LIVE runs are kept (resume); worktrees whose run id the store has never heard
+    // of are force-removed. A sessions read failure SKIPS the reap: with liveness unknown, any
+    // removal could take a resumable run's checkout, and leaking for one boot is the cheaper error.
     if let Ok(repos) = crate::repo::list_repos(&store) {
         if !repos.is_empty() {
-            let live: HashSet<String> = crate::domain::all_sessions(&store)
-                .map(|ss| ss.into_iter().map(|s| s.id).collect())
-                .unwrap_or_default();
-            crate::repo::reap_orphan_worktrees(&repos, &live);
+            match crate::domain::all_sessions(&store) {
+                Ok(sessions) => {
+                    let (live, terminal) = partition_sessions_for_reap(&sessions);
+                    crate::repo::reap_orphan_worktrees(&repos, &live, &terminal);
+                }
+                Err(e) => eprintln!(
+                    "wicked-core: skipping the startup worktree reap — cannot read sessions ({e})"
+                ),
+            }
         }
     }
 
@@ -2314,6 +2323,7 @@ pub(crate) fn resume_run_inner(
         let mut session = session;
         session.status = SessionStatus::Failed;
         put_node(store, session.to_node())?;
+        reap_terminal_worktree(&*store, &session);
         emit(
             subscribers,
             CoreEvent::SessionFailed {
@@ -3048,6 +3058,7 @@ fn fail_run(
 ) -> StepApplied {
     session.status = SessionStatus::Failed;
     let _ = put_node(store, session.to_node());
+    reap_terminal_worktree(&*store, session);
     emit(
         subscribers,
         CoreEvent::SessionFailed {
@@ -3058,6 +3069,54 @@ fn fail_run(
     notify_campaign(self_tx, &session.id, crate::campaign::NodeOutcome::Failed);
     runner.on_run_complete(&session.id);
     StepApplied::Finished
+}
+
+/// FINDING-003 — a run reaching a TERMINAL status reaps its git worktree, off the actor thread
+/// (`git worktree remove` can be slow and must never stall NAPI callers waiting on the actor),
+/// through [`crate::repo::reap_worktree_if_clean`]: a clean tree goes, a dirty one (unlanded work)
+/// is kept and logged, and the `wicked/<run_id>` branch survives either way. Wired into
+/// `finalize_run` (Completed), `fail_run` (Failed, which `fail_run_by_id` also routes through),
+/// and resume's crash-during-planning guard. `cancel_run` deliberately keeps its own FORCE
+/// removal — Cancel is the operator explicitly discarding the work. The startup reaper
+/// ([`crate::repo::reap_orphan_worktrees`]) re-applies the same rule to anything a crash left
+/// behind, so this call being missed once is a leak until next boot, not forever.
+fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
+    let Some(repo_id) = session.repo_ref.as_ref() else {
+        return;
+    };
+    let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) else {
+        return;
+    };
+    let rid = session.id.clone();
+    std::thread::spawn(move || {
+        let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
+    });
+}
+
+/// Split every session on the store into LIVE (non-terminal — may resume, keeps its worktree) and
+/// TERMINAL (finished — its leftover worktree reaps when clean) id sets for the startup orphan
+/// reaper (FINDING-003). Statuses are matched exhaustively so a new variant must choose a side;
+/// defaulting a new status to LIVE would silently re-grow the leak this fixed, and defaulting to
+/// TERMINAL would reap resumable runs.
+fn partition_sessions_for_reap(
+    sessions: &[crate::domain::AgentSession],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut live = HashSet::new();
+    let mut terminal = HashSet::new();
+    for s in sessions {
+        match s.status {
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => {
+                terminal.insert(s.id.clone());
+            }
+            SessionStatus::Planning
+            | SessionStatus::Distributing
+            | SessionStatus::Executing
+            | SessionStatus::AwaitingHuman => {
+                live.insert(s.id.clone());
+            }
+        }
+    }
+    (live, terminal)
 }
 
 /// Pause a run for human confirmation: persist `AwaitingHuman`, emit `AwaitingHuman`, and free a
@@ -3610,6 +3669,7 @@ fn finalize_run(
     if let Some(mut session) = crate::domain::get_session(store, run_id)? {
         session.status = SessionStatus::Completed;
         put_node(store, session.to_node())?;
+        reap_terminal_worktree(&*store, &session);
     }
     emit(
         subscribers,
@@ -3800,8 +3860,9 @@ pub(crate) fn cancel_run(
     }
     session.status = SessionStatus::Cancelled;
     put_node(store, session.to_node())?;
-    // Discard the worktree — the work is being abandoned. (A COMPLETED run keeps its worktree so the
-    // operator can review/merge the branch; only cancellation throws it away.)
+    // FORCE-discard the worktree — Cancel is the operator explicitly abandoning the work, the one
+    // terminal status where uncommitted bytes are discarded on purpose. Completed/Failed runs reap
+    // through `reap_terminal_worktree` instead (FINDING-003): a clean tree goes, unlanded work stays.
     if let Some(repo_id) = &session.repo_ref {
         if let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) {
             crate::repo::remove_worktree(&repo.root_path, run_id);
@@ -4554,6 +4615,174 @@ mod deny_policy_tests {
                 "`{bad}` can never match a gate token and must be rejected, not registered inert"
             );
         }
+    }
+}
+
+/// FINDING-003 — a run reaching a terminal status must reap its worktree (14 orphans survived
+/// restarts; the retest reproduced one orphan from one failed run). These drive `finalize_run` and
+/// `fail_run` — the REAL terminal transitions — against a real git repo, not the reap helper in
+/// isolation: the finding's root cause was precisely a documented cleanup no terminal path reached.
+#[cfg(test)]
+mod terminal_worktree_reap_tests {
+    use super::*;
+    use crate::domain::{put_node, AgentSession, HumanConfirm, SessionStatus};
+    use crate::repo::RepoSpec;
+    use crate::scope::EntityMode;
+    use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+    use std::path::Path;
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, HardenedCommand, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// A git repo with one commit at a scratch path (mirrors `repo::tests::git_repo`, which is
+    /// private to that module). Per-process and per-thread so concurrent test binaries never collide.
+    fn git_repo(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wicked-reap-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.invalid"]);
+        run(&["config", "user.name", "wicked-test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+        root
+    }
+
+    /// Register the repo, create the run's worktree, seed an Executing session bound to it.
+    /// Returns (repo root, worktree path).
+    fn seeded(
+        store: &mut dyn GraphStore,
+        name: &str,
+        run_id: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = git_repo(name);
+        let entry = crate::repo::register_repo(
+            store,
+            RepoSpec {
+                name: format!("reap-{name}"),
+                root_path: root.to_string_lossy().to_string(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let wt = crate::repo::create_worktree(&entry.root_path, run_id).unwrap();
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: Some(wt.to_string_lossy().to_string()),
+            repo_ref: Some(entry.id),
+        };
+        put_node(store, session.to_node()).unwrap();
+        (root, wt)
+    }
+
+    /// The reap runs on its own thread; wait for the checkout to vanish. The generous bound is
+    /// deliberate (the FINDING-029/030 lesson: a tight wall-clock deadline accuses the feature of
+    /// a scheduling shortfall) — the loop returns the moment the path is gone.
+    fn wait_gone(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree still present after 60s — the terminal reap never ran for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn branch_exists(root: &Path, branch: &str) -> bool {
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(["branch", "--list", branch])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(branch)
+    }
+
+    #[test]
+    fn a_completed_run_reaps_its_clean_worktree_and_keeps_the_branch() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "done", "r-done");
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+
+        finalize_run(&mut store, &mut subs, &runner, &tx, "r-done").unwrap();
+
+        let session = crate::domain::get_session(&store, "r-done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+        wait_gone(&wt);
+        assert!(
+            branch_exists(&root, "wicked/r-done"),
+            "the branch is the run's record and must outlive the checkout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_run_reaps_its_clean_worktree_too() {
+        // The finding's retest: ONE failed run left ONE orphan on a fresh clone. `fail_run` is the
+        // funnel every failure path (including `fail_run_by_id`'s async faults) routes through.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "failed", "r-fail");
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut session = crate::domain::get_session(&store, "r-fail")
+            .unwrap()
+            .unwrap();
+
+        let applied = fail_run(&mut store, &mut subs, &runner, &tx, &mut session, 1);
+        assert!(matches!(applied, StepApplied::Finished));
+
+        wait_gone(&wt);
+        assert!(
+            branch_exists(&root, "wicked/r-fail"),
+            "failure keeps the branch as the record of what was attempted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
