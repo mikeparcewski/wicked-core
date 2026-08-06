@@ -26,6 +26,7 @@ use wicked_council::types::Dispatcher;
 use wicked_estate_core::SymbolQuery;
 use wicked_governance::{conform, decide, select_any};
 
+use crate::acp_runner::{ElicitationMaps, KillHandle, WriteReg};
 use crate::command::Command;
 use crate::domain::{put_node, AgentSession, SessionStatus};
 use crate::event::CoreEvent;
@@ -183,6 +184,11 @@ pub(crate) fn sidecar_base(path: &str) -> String {
 /// released. `dispatcher`/`runner` are the injectable council + step-execution seams (real in prod,
 /// stubbed in tests).
 #[allow(clippy::too_many_arguments)]
+/// Lock ordering: `write_reg` must always be acquired BEFORE `elicitation_maps`.
+/// Never hold both simultaneously; acquire `write_reg`, read/snapshot state, release,
+/// then acquire `elicitation_maps` if needed. Violating this ordering risks ABBA deadlock
+/// between `shared_run_terminal` (holds `write_reg`, then acquires `maps`) and
+/// session-start helpers (acquire `maps` alone).
 pub(crate) fn run(
     path: String,
     rx: Receiver<Command>,
@@ -191,6 +197,9 @@ pub(crate) fn run(
     runner: Arc<dyn StepRunner>,
     pty_map: PtyMap,
     exec_bus: Option<String>,
+    is_acp: bool,
+    elicitation_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    write_reg: WriteReg,
 ) {
     // Backend-agnostic: `path` may be a filesystem path (SQLite, the default) OR a `postgres://`
     // spec (selects estate's Postgres backend under the `postgres` feature). `AnyStore` is one
@@ -302,6 +311,28 @@ pub(crate) fn run(
             }
         }
     }
+    // ── DES-002 T6: ACP elicitation lifecycle ──────────────────────────────────
+    //
+    // `lifecycle_maps` — unconditional arc for begin_launch / tombstone_bus_run / cleanup_run.
+    //   Always `Some` for real spawn paths (spawn_with_acp_sessions, spawn_with_pty_sessions,
+    //   spawn_inner). `None` only in unit tests that do not use the elicitation machinery.
+    //
+    // `actor_maps` — ACP-delivery arc (deliver, cancel_epoch, EmitEvent suppression, epoch ops).
+    //   `Some` for ACP runners (is_acp=true, shares the same Arc as lifecycle_maps).
+    //   `None` for PTY and injected runners.
+    //
+    // Lock ordering: `write_reg` BEFORE `elicitation_maps` (see module-level doc on `run`).
+    let lifecycle_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>> = elicitation_maps.clone();
+    let actor_maps: Option<Arc<std::sync::Mutex<ElicitationMaps>>> = if is_acp {
+        elicitation_maps.clone()
+    } else {
+        None
+    };
+    // `process_gen` — unique UUID minted once per actor lifetime. Threads into `StepInput`
+    // so bus consumers can discard completions from a prior daemon restart (stale-result guard).
+    // NOT a global singleton: each actor lifetime gets a fresh token.
+    let process_gen: uuid::Uuid = uuid::Uuid::new_v4();
+
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
     // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC
     // (which unwinds past the loop; the old end-of-`run` drain ran only on a NORMAL exit, so a panic
@@ -396,6 +427,10 @@ pub(crate) fn run(
                     &runner,
                     &self_tx,
                     &mut in_flight,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
                 );
                 handles
             }
@@ -932,6 +967,10 @@ pub(crate) fn run(
                                 &self_tx,
                                 &run_id,
                                 0,
+                                &lifecycle_maps,
+                                &actor_maps,
+                                process_gen,
+                                is_acp,
                             ) {
                                 Ok(Progress::Dispatched) => { /* in_flight set in LaunchRun */ }
                                 Ok(Progress::Paused) => {
@@ -989,6 +1028,10 @@ pub(crate) fn run(
                     &self_tx,
                     &mut in_flight,
                     &run_id,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
                 );
                 let _ = reply.send(res);
             }
@@ -1007,6 +1050,11 @@ pub(crate) fn run(
                     &self_tx,
                     output,
                     agent_verdict,
+                    &path,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
                 ) {
                     // Run reached a TERMINAL state → drop from in_flight + remember the outcome.
                     Ok(StepApplied::Finished) => {
@@ -1069,11 +1117,28 @@ pub(crate) fn run(
                     &mut in_flight,
                     &run_id,
                     decision,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
                 );
                 let _ = reply.send(res);
             }
             Command::CancelRun { run_id, reply } => {
+                // ACP teardown: cancel epoch, signal kill handles (no-op for PTY).
+                shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                // Universal tombstone + sequence advance (invalidates any in-flight bus tasks).
+                if let Some(ref m) = lifecycle_maps {
+                    let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
+                    maps.tombstone_run(&run_id);
+                    maps.advance_launch_seq(&run_id);
+                }
                 let res = cancel_run(&mut store, &mut subscribers, &runner, &self_tx, &run_id);
+                // Retire launch state now that the sequence has been advanced.
+                if let Some(ref m) = lifecycle_maps {
+                    let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
+                    maps.retire_launch_state(&run_id);
+                }
                 in_flight.remove(&run_id);
                 let _ = reply.send(res);
             }
@@ -1134,12 +1199,62 @@ pub(crate) fn run(
                     },
                 );
             }
-            Command::ResolveElicitation { reply, .. } => {
-                // Full implementation in T6 once ElicitationMaps is implemented (T3).
-                let _ = reply.send(Err(anyhow::anyhow!("elicitation not found")));
+            Command::ResolveElicitation { run_id, elicitation_id, action, response, reply } => {
+                // Deliver the human response to the waiting exec_turn_acp dual-poll loop.
+                // actor_maps is Some only for ACP runners; PTY/injected runners return Err.
+                let res = match &actor_maps {
+                    None => Err(anyhow::anyhow!("elicitation not supported for this runner")),
+                    Some(maps) => {
+                        maps.lock().unwrap_or_else(|e| e.into_inner())
+                            .deliver(&run_id, &elicitation_id, action, response)
+                    }
+                };
+                let _ = reply.send(res);
             }
 
             Command::EmitEvent(ev) => {
+                // ── ElicitationCreated suppression (DES-002 T6) ──────────────────────────
+                // Suppress a stale ElicitationCreated when cancel_epoch ran before the actor
+                // processed this queued event. Use suppressed_creations + creation_announced.
+                if let CoreEvent::ElicitationCreated { ref elicitation_id, .. } = ev {
+                    if let Some(ref maps) = actor_maps {
+                        let mut maps = maps.lock().unwrap_or_else(|e| e.into_inner());
+                        // take_suppressed_creation removes the marker if present.
+                        let was_suppressed = maps.take_suppressed_creation(elicitation_id);
+                        // Three suppression conditions:
+                        // 1. shutdown_flag: actor shutting down; cancel all pending creations.
+                        // 2. was_suppressed: cancel_epoch ran before this event was drained.
+                        // 3. !is_pending: worker resolved before actor processed the event.
+                        let already_resolved = !maps.is_pending(elicitation_id);
+                        if maps.shutdown_flag() || was_suppressed || already_resolved {
+                            maps.mark_resolution_suppressed(elicitation_id);
+                            tracing::warn!(
+                                elicitation_id = %elicitation_id,
+                                "elicitation: suppressing stale ElicitationCreated; \
+                                 paired resolved will also be suppressed"
+                            );
+                            continue; // skip run_sessions update and fan-out
+                        }
+                        // Not suppressed: mark as announced BEFORE releasing lock.
+                        maps.mark_creation_announced(elicitation_id);
+                    }
+                }
+                // ── ElicitationResolved suppression (DES-002 T6) ─────────────────────────
+                // If the paired ElicitationCreated was suppressed, suppress the resolved event.
+                // Subscribers must not receive a terminal event for an elicitation they never saw.
+                if let CoreEvent::ElicitationResolved { ref elicitation_id, .. } = ev {
+                    if let Some(ref maps) = actor_maps {
+                        let mut maps = maps.lock().unwrap_or_else(|e| e.into_inner());
+                        if maps.take_suppressed_resolution(elicitation_id) {
+                            tracing::warn!(
+                                elicitation_id = %elicitation_id,
+                                "elicitation: suppressing ElicitationResolved \
+                                 (paired creation was suppressed)"
+                            );
+                            continue; // skip fan-out — no subscriber saw the creation
+                        }
+                    }
+                }
                 // Maintain the run → [(cli_key, terminal_id)] index used by InjectWorkerMessage
                 // and ReassignUnit. Only PTY-backed sessions appear here; ACP sessions emit no
                 // WorkerSessionStarted events (they have no terminal_id).
@@ -1666,6 +1781,10 @@ pub(crate) fn run(
                             &self_tx,
                             &run_id,
                             session.unit_ix,
+                            &lifecycle_maps,
+                            &actor_maps,
+                            process_gen,
+                            is_acp,
                         ) {
                             Ok(_) => {
                                 let _ = reply.send(Ok(()));
@@ -1823,6 +1942,10 @@ pub(crate) fn run(
                     &self_tx,
                     &run_id,
                     session.unit_ix,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
                 ) {
                     Ok(_) => {
                         let _ = reply.send(Ok(()));
@@ -1959,6 +2082,10 @@ pub(crate) fn run(
                                     &self_tx,
                                     &run_id,
                                     unit_ix,
+                                    &lifecycle_maps,
+                                    &actor_maps,
+                                    process_gen,
+                                    is_acp,
                                 ) {
                                     emit_run_error(&mut subscribers, &run_id, e);
                                 }
@@ -2010,6 +2137,10 @@ pub(crate) fn run(
                             &self_tx,
                             &run_id,
                             unit_ix,
+                            &lifecycle_maps,
+                            &actor_maps,
+                            process_gen,
+                            is_acp,
                         ) {
                             emit_run_error(&mut subscribers, &run_id, e);
                         }
@@ -2235,6 +2366,10 @@ pub(crate) fn launch_run_inner(
     in_flight: &mut HashSet<String>,
     spec: LaunchSpec,
     registry: &crate::workflow::WorkflowRegistry,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) -> anyhow::Result<String> {
     let run_id = spec.session_id.clone();
     validate_session_id(&run_id)?;
@@ -2272,7 +2407,10 @@ pub(crate) fn launch_run_inner(
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
     )?;
-    match advance_or_pause(store, subscribers, runner, self_tx, &run_id, 0) {
+    match advance_or_pause(
+        store, subscribers, runner, self_tx, &run_id, 0,
+        lifecycle_maps, actor_maps, process_gen, is_acp,
+    ) {
         Ok(Progress::Dispatched) => {
             in_flight.insert(run_id.clone());
         }
@@ -2306,6 +2444,10 @@ pub(crate) fn resume_run_inner(
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
     run_id: &str,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) -> anyhow::Result<SessionStatus> {
     if in_flight.contains(run_id) {
         return Err(RunBusy(run_id.to_string()).into());
@@ -2360,7 +2502,10 @@ pub(crate) fn resume_run_inner(
         s.attempt = s.attempt.saturating_add(1);
         put_node(store, s.to_node())?;
     }
-    match advance_or_pause(store, subscribers, runner, self_tx, run_id, session.unit_ix)? {
+    match advance_or_pause(
+        store, subscribers, runner, self_tx, run_id, session.unit_ix,
+        lifecycle_maps, actor_maps, process_gen, is_acp,
+    )? {
         Progress::Dispatched => {
             in_flight.insert(run_id.to_string());
             Ok(SessionStatus::Executing)
@@ -2449,6 +2594,10 @@ fn redrive_executing_sessions(
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
     in_flight: &mut HashSet<String>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) {
     let sessions = match crate::domain::all_sessions(store) {
         Ok(s) => s,
@@ -2494,7 +2643,10 @@ fn redrive_executing_sessions(
                 },
             );
         }
-        match dispatch_unit(store, subscribers, runner, self_tx, &run_id, sess.unit_ix) {
+        match dispatch_unit(
+            store, subscribers, runner, self_tx, &run_id, sess.unit_ix,
+            lifecycle_maps, actor_maps, process_gen, is_acp,
+        ) {
             Ok(true) => {
                 in_flight.insert(run_id);
             }
@@ -2579,6 +2731,11 @@ fn apply_step_result(
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
     agent_verdict: Option<(bool, String)>,
+    db_path: &str,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) -> anyhow::Result<StepApplied> {
     let run_id = output.run_id.clone();
     let mut session = crate::domain::get_session(store, &run_id)?
@@ -2781,7 +2938,10 @@ fn apply_step_result(
                     // drops any late output from the refused worker.
                     session.attempt = session.attempt.saturating_add(1);
                     put_node(store, session.to_node())?;
-                    dispatch_unit(store, subscribers, runner, self_tx, &run_id, output.unit_ix)?;
+                    dispatch_unit(
+                        store, subscribers, runner, self_tx, &run_id, output.unit_ix,
+                        lifecycle_maps, actor_maps, process_gen, is_acp,
+                    )?;
                     return Ok(StepApplied::Continuing);
                 }
                 // Bubble up: the operator decides. Approve retries the unit (their
@@ -3055,6 +3215,10 @@ fn apply_step_result(
         self_tx,
         &run_id,
         session.unit_ix,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
     )? {
         Progress::Dispatched => Ok(StepApplied::Continuing),
         Progress::Paused => Ok(StepApplied::Paused),
@@ -3185,6 +3349,10 @@ fn advance_or_pause(
     self_tx: &Sender<Command>,
     run_id: &str,
     unit_ix: usize,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) -> anyhow::Result<Progress> {
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
@@ -3265,7 +3433,10 @@ fn advance_or_pause(
         return Ok(Progress::Paused);
     }
 
-    dispatch_unit(store, subscribers, runner, self_tx, run_id, unit_ix)?;
+    dispatch_unit(
+        store, subscribers, runner, self_tx, run_id, unit_ix,
+        lifecycle_maps, actor_maps, process_gen, is_acp,
+    )?;
     Ok(Progress::Dispatched)
 }
 
@@ -3421,7 +3592,23 @@ fn dispatch_unit(
     self_tx: &Sender<Command>,
     run_id: &str,
     unit_ix: usize,
+    elicitation_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    _actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) -> anyhow::Result<bool> {
+    // Allocate launch sequence + ACP epoch under a single lock acquisition.
+    // For ACP actors `elicitation_maps` and `_actor_maps` point to the same Mutex, so
+    // a single lock covers both begin_launch and next_epoch — no double-lock needed.
+    let (elicitation_epoch, launch_seq) = if let Some(ref m) = elicitation_maps {
+        let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
+        let seq = maps.begin_launch(run_id, is_acp);
+        // epoch=0 acts as the sentinel for non-ACP units; try_next_epoch_bus activates bus consumers.
+        let ep = if is_acp { maps.next_epoch(run_id) } else { 0 };
+        (ep, seq)
+    } else {
+        (0, 0)
+    };
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
@@ -3530,9 +3717,9 @@ fn dispatch_unit(
             ..g
         }),
         prior_outputs,
-        elicitation_epoch: 0,
-        process_gen: None,
-        launch_seq: 0,
+        elicitation_epoch,
+        process_gen: Some(process_gen),
+        launch_seq,
     };
 
     // TOOL EXECUTOR: if the unit carries a tool_cmd, bypass the CLI runner entirely.
@@ -3730,6 +3917,10 @@ pub(crate) fn confirm_gate(
     in_flight: &mut HashSet<String>,
     run_id: &str,
     decision: crate::workflow::HumanDecision,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
 ) -> anyhow::Result<SessionStatus> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
@@ -3859,7 +4050,10 @@ pub(crate) fn confirm_gate(
                 },
             );
             in_flight.insert(run_id.to_string());
-            match dispatch_unit(store, subscribers, runner, self_tx, run_id, s.unit_ix) {
+            match dispatch_unit(
+                store, subscribers, runner, self_tx, run_id, s.unit_ix,
+                lifecycle_maps, actor_maps, process_gen, is_acp,
+            ) {
                 Ok(true) => Ok(SessionStatus::Executing),
                 Ok(false) => {
                     in_flight.remove(run_id);
@@ -3872,6 +4066,74 @@ pub(crate) fn confirm_gate(
                 }
             }
         }
+    }
+}
+
+/// Ordered ACP teardown helper shared by CancelRun, FailureTriageReady, and Shutdown.
+///
+/// Performs steps 1–3 + 6 of the spec:
+/// 1. Snapshot sessions for `run_id` from the write-lock registry.
+/// 2. Per-session: try_lock the write_lock; tombstone the epoch; signal kill.
+/// 3. Tombstone under maps lock (catches pre-registration workers).
+/// 6. Second registry sweep (catches sessions inserted between step 1 and now).
+///
+/// Steps 4+5 (emit RunCancelled / call on_run_complete) are the caller's responsibility.
+///
+/// Lock ordering: `write_reg` BEFORE `maps` — never hold both simultaneously.
+/// For CancelRun the second sweep uses run_id only; for ReassignUnit it filters
+/// by `(run_id, previous_cli, gen <= old_max_gen)`.
+fn shared_run_terminal(
+    run_id: &str,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    write_reg: &WriteReg,
+) {
+    let Some(maps_arc) = lifecycle_maps else { return };
+
+    // Step 1: snapshot (run_id, session_key, gen) → (write_lock, kill_handle).
+    let sessions: Vec<(Arc<std::sync::Mutex<()>>, Arc<KillHandle>)> = {
+        let reg = write_reg.lock().unwrap_or_else(|p| p.into_inner());
+        reg.iter()
+            .filter(|((r, _, _), _)| r.as_str() == run_id)
+            .map(|(_, (wl, kh))| (Arc::clone(wl), Arc::clone(kh)))
+            .collect()
+    };
+
+    // Step 2: per-session tombstone + kill.
+    for (wl, kh) in &sessions {
+        {
+            // Acquire write_lock to serialise with an in-flight write; then tombstone.
+            // If try_lock fails the write is in-flight — tombstone under maps, then signal.
+            // Either way, the epoch is tombstoned before kh.signal().
+            let _maybe_guard = wl.try_lock();
+            let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
+            if maps.has_active_run(run_id) {
+                let epoch = maps.current_epoch(run_id);
+                maps.cancel_epoch(run_id, epoch);
+            }
+        }
+        kh.signal(); // unconditional — covers rpc_expect suspensions
+    }
+
+    // Step 3: tombstone under maps lock (covers pre-registration workers not yet in write_reg).
+    {
+        let mut maps = maps_arc.lock().unwrap_or_else(|p| p.into_inner());
+        maps.tombstone_bus_run(run_id);
+        if maps.has_active_run(run_id) {
+            let epoch = maps.current_epoch(run_id);
+            maps.cancel_epoch(run_id, epoch);
+        }
+    }
+
+    // Step 6: second sweep — catches sessions inserted between step 1 and now.
+    let late_sessions: Vec<Arc<KillHandle>> = {
+        let reg = write_reg.lock().unwrap_or_else(|p| p.into_inner());
+        reg.iter()
+            .filter(|((r, _, _), _)| r.as_str() == run_id)
+            .map(|(_, (_, kh))| Arc::clone(kh))
+            .collect()
+    };
+    for kh in late_sessions {
+        kh.signal();
     }
 }
 
@@ -4389,7 +4651,7 @@ mod terminal_gate_tests {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
 
-        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1).unwrap();
+        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1, &None, &None, uuid::Uuid::nil(), false).unwrap();
         assert!(
             matches!(progress, Progress::Paused),
             "the terminal unit's own HumanConfirm gate must pause before finalize, got a Done finalize"
@@ -4408,7 +4670,7 @@ mod terminal_gate_tests {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
 
-        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1).unwrap();
+        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1, &None, &None, uuid::Uuid::nil(), false).unwrap();
         assert!(
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
@@ -5269,6 +5531,10 @@ mod phase_boundary_governance_tests {
             &mut in_flight,
             "r",
             crate::workflow::HumanDecision::Approve { amend: None },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
         )
         .unwrap();
         // No deny policy → Executing (the noop NullRunner returns immediately so the run
@@ -5320,6 +5586,10 @@ mod phase_boundary_governance_tests {
             &mut in_flight,
             "r",
             crate::workflow::HumanDecision::Approve { amend: None },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
         )
         .unwrap();
 

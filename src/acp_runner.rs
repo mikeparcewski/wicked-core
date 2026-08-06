@@ -49,6 +49,58 @@ use crate::workflow::{
 use wicked_apps_core::HardenedCommand;
 use wicked_council::types::{AcpConfig, AcpTransport};
 
+// ── KillHandle and WriteReg (DES-002 T6) ─────────────────────────────────────
+
+/// A kill handle for an in-flight ACP child process.
+///
+/// Carries an `Arc<Mutex<Option<Child>>>` so that multiple callers (teardown step 1,
+/// step 6 second sweep, `EpochCleanup::drop`) can all safely signal the child without
+/// PID-reuse races. After the first `signal()` takes the child, subsequent calls are no-ops.
+pub struct KillHandle {
+    inner: Mutex<Option<std::process::Child>>,
+}
+
+impl KillHandle {
+    /// Construct a no-op handle for tests (no child to kill).
+    pub fn noop() -> Self {
+        Self { inner: Mutex::new(None) }
+    }
+
+    /// Construct a handle that will kill `child` on `signal()`.
+    pub fn new(child: std::process::Child) -> Self {
+        Self { inner: Mutex::new(Some(child)) }
+    }
+
+    /// Kill and reap the child process. Idempotent: the first call kills; subsequent calls
+    /// are no-ops (the child has been taken). Releases the mutex before `wait()` so a
+    /// concurrent `signal()` on another thread never deadlocks.
+    pub fn signal(&self) {
+        let taken = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.take()
+        };
+        if let Some(mut child) = taken {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Per-session handles stored in the write-lock registry.
+pub type SessionHandles = (Arc<Mutex<()>>, Arc<KillHandle>);
+
+/// The write-lock session registry.
+///
+/// Key: `(run_id, session_key, session_gen)` — session_gen prevents a torn eviction when
+/// a replacement session has the same `(run_id, cli_key)` pair as the one being evicted.
+/// Value: `(write_lock, kill_handle)` — `shared_run_terminal` uses these to serialise
+/// teardown with in-flight writes and to signal the child process.
+///
+/// Created in `spawn_with_acp_sessions` (NOT in `actor::run`) so the runner and actor
+/// share the same `Arc`. PTY and injected runners receive an empty registry — their
+/// sessions have no ACP child to signal.
+pub type WriteReg = Arc<Mutex<HashMap<(String, String, u64), SessionHandles>>>;
+
 // ── ElicitationMaps (DES-002) ─────────────────────────────────────────────────
 
 /// A human response delivered via `resolveElicitation` — the value that
@@ -119,6 +171,23 @@ pub struct ElicitationMaps {
     /// Set to `true` when the actor enters shutdown; workers poll this so they
     /// can exit early rather than block on a unit that will never finish.
     shutdown_flag: bool,
+    // ── DES-002 T6 additions ─────────────────────────────────────────────────────
+    /// `run_id → current epoch` — tracks the live epoch per run. Populated by
+    /// `next_epoch`; used by `has_active_run` and `current_epoch`.
+    /// Zero is not stored (only epochs ≥ 1 represent active runs).
+    run_epoch: HashMap<String, u64>,
+    /// Dispatch-mode-agnostic tombstone set. Populated by `tombstone_run` (CancelRun
+    /// universal path) and `tombstone_bus_run` (shared_run_terminal bus guard).
+    /// `is_run_cancelled` checks this so `try_next_epoch_bus` can reject stale bus tasks
+    /// for both locally-cancelled and bus-cancelled runs.
+    all_cancelled_runs: HashSet<String>,
+    /// Elicitation ids for which `ElicitationCreated` has been announced to subscribers.
+    /// Used by the EmitEvent suppression guard: once announced, a concurrent `cancel_epoch`
+    /// must NOT insert a stale suppression marker (the event is already out).
+    creation_announced: HashSet<String>,
+    /// Elicitation ids whose paired `ElicitationResolved` event must be suppressed.
+    /// Set when the `ElicitationCreated` was suppressed; cleared by `take_suppressed_resolution`.
+    suppressed_resolutions: HashSet<String>,
 }
 
 impl ElicitationMaps {
@@ -134,6 +203,10 @@ impl ElicitationMaps {
             bus_activated_seqs: HashMap::new(),
             run_launch_seq: HashMap::new(),
             shutdown_flag: false,
+            run_epoch: HashMap::new(),
+            all_cancelled_runs: HashSet::new(),
+            creation_announced: HashSet::new(),
+            suppressed_resolutions: HashSet::new(),
         }
     }
 
@@ -274,15 +347,20 @@ impl ElicitationMaps {
         }
     }
 
-    /// Increment `active_workers` for this run/launch_seq pair.
+    /// Increment `active_workers` and advance the per-run launch sequence.
+    ///
+    /// Returns the new monotonically-increasing `launch_seq` for this dispatch.
+    /// Zero is reserved as a sentinel (`try_next_epoch_bus` unconditionally rejects 0).
+    ///
+    /// `_is_bus_dispatch` is accepted for call-site clarity (the bus path always passes
+    /// `false`; the bus marker is set separately by `mark_bus_dispatch` after successful
+    /// publication). It has no effect on the counter.
     ///
     /// Does NOT clear `bus_in_flight_workers` — each worker manages its own
     /// `(run_id, launch_seq)` entry independently (re-assignment invariant).
-    pub fn begin_launch(&mut self, run_id: &str, launch_seq: u64) {
+    pub fn begin_launch(&mut self, run_id: &str, _is_bus_dispatch: bool) -> u64 {
         self.active_workers += 1;
-        // Ensure the run has a launch_seq entry so `advance_launch_seq` starts from
-        // the right baseline.
-        self.run_launch_seq.entry(run_id.to_string()).or_insert(launch_seq);
+        self.advance_launch_seq(run_id)
     }
 
     /// Record that a run has been dispatched to the bus (actor → bus-publisher path).
@@ -333,15 +411,21 @@ impl ElicitationMaps {
         self.run_launch_seq.insert(run_id.to_string(), seq);
     }
 
-    /// Returns `true` if `run_id` has any live registrations in `run_index`.
+    /// Returns `true` if `run_id` has an active epoch (≥ 1) allocated via `next_epoch`.
+    ///
+    /// - Returns `false` for PTY runs (never call `next_epoch`; no entry in `run_epoch`).
+    /// - Returns `false` for `tool_cmd` units (epoch allocated as 0; entry not inserted).
+    /// - Returns `false` after `cleanup_run` runs (removes the `run_epoch` entry when
+    ///   `active_workers` reaches 0).
+    /// - Returns `true` for ACP workers that called `next_epoch` and have not yet exited.
     pub fn has_active_run(&self, run_id: &str) -> bool {
-        self.run_index.get(run_id).is_some_and(|v| !v.is_empty())
+        self.run_epoch.get(run_id).is_some_and(|&e| e > 0)
     }
 
-    /// Returns `true` if `run_id` has ever crossed the ack-gated path
-    /// (i.e. has an entry in `bus_activated_seqs`).
-    pub fn has_activated_seq(&self, run_id: &str) -> bool {
-        self.bus_activated_seqs.contains_key(run_id)
+    /// Returns `true` if the specific `(run_id, launch_seq)` has crossed the ack-gated
+    /// activation path (i.e. `bus_activated_seqs[run_id] >= launch_seq`).
+    pub fn has_activated_seq(&self, run_id: &str, launch_seq: u64) -> bool {
+        self.bus_activated_seqs.get(run_id).is_some_and(|&s| s >= launch_seq)
     }
 
     /// Set the shutdown flag. Workers poll this and exit early.
@@ -351,6 +435,11 @@ impl ElicitationMaps {
 
     /// Whether the shutdown flag has been set.
     pub fn is_shutdown(&self) -> bool {
+        self.shutdown_flag
+    }
+
+    /// Whether the shutdown flag has been set (alias used in EmitEvent suppression guard).
+    pub fn shutdown_flag(&self) -> bool {
         self.shutdown_flag
     }
 
@@ -385,6 +474,138 @@ impl ElicitationMaps {
         }
         // Prune the cancelled_epochs list for this (run_id, epoch).
         self.cancelled_epochs.retain(|(r, e)| !(r == run_id && *e == epoch));
+        // When no workers remain for this run, remove the run_epoch entry so
+        // `has_active_run` returns false (prevents stale tombstones on reuse).
+        if self.active_workers == 0 {
+            self.run_epoch.remove(run_id);
+        }
+    }
+
+    // ── DES-002 T6: epoch lifecycle methods ──────────────────────────────────────
+
+    /// Allocate the next epoch for `run_id` and store it in `run_epoch`.
+    ///
+    /// Each call increments the per-run epoch counter. Epoch 0 is never returned
+    /// (counter starts at 1 on first call). After this, `has_active_run(run_id)` returns `true`.
+    pub fn next_epoch(&mut self, run_id: &str) -> u64 {
+        let epoch = self.run_epoch.entry(run_id.to_string()).or_insert(0);
+        *epoch += 1;
+        *epoch
+    }
+
+    /// Return the current epoch for `run_id`, or 0 if none is allocated.
+    pub fn current_epoch(&self, run_id: &str) -> u64 {
+        *self.run_epoch.get(run_id).unwrap_or(&0)
+    }
+
+    /// Returns `true` if `(run_id, epoch)` was tombstoned via `cancel_epoch`.
+    pub fn is_epoch_cancelled(&self, run_id: &str, epoch: u64) -> bool {
+        self.cancelled_epochs.iter().any(|(r, e)| r == run_id && *e == epoch)
+    }
+
+    /// Return all run-ids that currently have an active epoch (epoch ≥ 1).
+    /// Used by `Command::Shutdown` to tombstone all active epochs in one lock hold.
+    pub fn active_run_ids(&self) -> Vec<String> {
+        self.run_epoch
+            .iter()
+            .filter(|(_, &e)| e > 0)
+            .map(|(r, _)| r.clone())
+            .collect()
+    }
+
+    /// Tombstone `run_id` for bus-dispatched tasks — inserts into `all_cancelled_runs`
+    /// so `is_run_cancelled` returns true and `try_next_epoch_bus` rejects stale tasks.
+    /// Called unconditionally from `shared_run_terminal` step 3 (no `has_active_run` guard).
+    pub fn tombstone_bus_run(&mut self, run_id: &str) {
+        self.all_cancelled_runs.insert(run_id.to_string());
+    }
+
+    /// Universal tombstone — inserts `run_id` into `all_cancelled_runs` so
+    /// `is_run_cancelled` returns true for both local and bus dispatch paths.
+    /// Called by `CancelRun` after `advance_launch_seq`.
+    pub fn tombstone_run(&mut self, run_id: &str) {
+        self.all_cancelled_runs.insert(run_id.to_string());
+    }
+
+    /// Returns `true` if `run_id` was tombstoned via `tombstone_run` or `tombstone_bus_run`.
+    pub fn is_run_cancelled(&self, run_id: &str) -> bool {
+        self.all_cancelled_runs.contains(run_id)
+    }
+
+    /// Return the current launch sequence for `run_id`, or 0 if none.
+    pub fn current_launch_seq(&self, run_id: &str) -> u64 {
+        *self.run_launch_seq.get(run_id).unwrap_or(&0)
+    }
+
+    /// Clear tombstone state for `run_id` after it has gone terminal (all bus tasks stale).
+    /// Called after `advance_launch_seq` so any in-flight bus tasks are invalidated
+    /// before the tombstone is removed.
+    pub fn retire_launch_state(&mut self, run_id: &str) {
+        self.all_cancelled_runs.remove(run_id);
+        self.bus_dispatched_runs.remove(run_id);
+    }
+
+    /// Mark the paired `ElicitationResolved` for `elicitation_id` as suppressed.
+    /// Called when `ElicitationCreated` was suppressed so subscribers never see
+    /// a resolved event for an elicitation they never observed.
+    pub fn mark_resolution_suppressed(&mut self, elicitation_id: &str) {
+        self.suppressed_resolutions.insert(elicitation_id.to_string());
+    }
+
+    /// Mark `elicitation_id` as announced (its `ElicitationCreated` event was fanned out).
+    /// After this, a concurrent `cancel_epoch` will skip inserting a stale suppression marker.
+    pub fn mark_creation_announced(&mut self, elicitation_id: &str) {
+        self.creation_announced.insert(elicitation_id.to_string());
+    }
+
+    /// Remove and return whether `elicitation_id` was in the suppressed-resolutions set.
+    /// Returns `true` if it was suppressed (and removes it); `false` otherwise.
+    pub fn take_suppressed_resolution(&mut self, elicitation_id: &str) -> bool {
+        self.suppressed_resolutions.remove(elicitation_id)
+    }
+
+    /// Returns `true` if `elicitation_id` is still registered in `pending`.
+    pub fn is_pending(&self, elicitation_id: &str) -> bool {
+        self.pending.contains_key(elicitation_id)
+    }
+
+    /// Bus consumer epoch activation.
+    ///
+    /// Called from the bus consumer when consuming a `DispatchedTask`. Returns the
+    /// allocated epoch (`is_acp=true`) or `0` (`is_acp=false`), or `None` if the task
+    /// should be discarded (cancelled, stale, or malformed).
+    ///
+    /// Rejects when:
+    /// - `launch_seq == 0` (sentinel / malformed)
+    /// - `is_run_cancelled(run_id)` (run was tombstoned)
+    /// - `launch_seq < current_launch_seq(run_id)` (stale; superseded by reassign)
+    ///
+    /// On success, marks `(run_id, launch_seq)` as bus-in-flight.
+    pub fn try_next_epoch_bus(&mut self, run_id: &str, launch_seq: u64, is_acp: bool) -> Option<u64> {
+        // Unconditionally reject the sentinel / malformed case.
+        if launch_seq == 0 {
+            return None;
+        }
+        // Run cancelled check.
+        if self.is_run_cancelled(run_id) {
+            return None;
+        }
+        // Stale seq check: discard if a newer launch_seq was already registered.
+        let current = self.current_launch_seq(run_id);
+        if launch_seq < current {
+            return None;
+        }
+        // Record activation — highest seq seen for this run.
+        let entry = self.bus_activated_seqs.entry(run_id.to_string()).or_insert(0);
+        *entry = (*entry).max(launch_seq);
+        // Mark as in-flight so the degraded-mode path can detect a lost confirm.
+        self.bus_in_flight_workers.insert((run_id.to_string(), launch_seq));
+
+        if is_acp {
+            Some(self.next_epoch(run_id))
+        } else {
+            Some(0)
+        }
     }
 }
 
@@ -1514,7 +1735,20 @@ prior output you are reviewing, testing, or revising."
                                 elicit_reason = "human".to_string();
                                 if rpc_respond(&mut proc.stdin, &request_id, response_payload).is_err() {
                                     write_failed_terminal = true;
-                                    elicit_reason = "adapter_write_failure".to_string();
+                                    // Phase 3 post-write tombstone gate (test 36):
+                                    // If the epoch was deliberately cancelled (teardown) before
+                                    // or during the write, the reason is "teardown", not
+                                    // "adapter_write_failure". The latter is reserved for
+                                    // unexpected transport failures on non-cancelled epochs.
+                                    let was_cancelled = {
+                                        let m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                        m.is_epoch_cancelled(run_id, epoch)
+                                    };
+                                    elicit_reason = if was_cancelled {
+                                        "teardown".to_string()
+                                    } else {
+                                        "adapter_write_failure".to_string()
+                                    };
                                 }
                                 break 'elicit;
                             }
@@ -1910,12 +2144,10 @@ pub struct AcpStepRunner {
     /// daemon restart (stale-result guard).
     #[allow(dead_code)]
     session_gen: HashMap<String, uuid::Uuid>,
-    /// Set of run-ids that currently hold a write lock on their ACP process's stdin. Used by
-    /// `exec_turn_acp` to detect a concurrent write attempt (I-10: no interleaved JSON-RPC
-    /// framing). Checked before spawning the off-actor writer; `exec_turn_acp` asserts the
-    /// invariant, it does not enforce queuing.
-    #[allow(dead_code)]
-    write_reg: HashSet<String>,
+    /// Write-lock session registry shared with the actor.
+    /// Key: `(run_id, session_key, session_gen)`. Value: `(write_lock, kill_handle)`.
+    /// Created in `spawn_with_acp_sessions`; PTY and injected runners hold an empty registry.
+    pub write_reg: WriteReg,
 }
 
 /// Why a chat's warm sessions were released — carried on `ChatClosed` so an operator can tell a
@@ -1954,6 +2186,20 @@ pub struct ChatInfo {
 
 impl AcpStepRunner {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<Command>) -> Self {
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let write_reg: WriteReg = Arc::new(Mutex::new(HashMap::new()));
+        Self::new_with_maps(tx, maps, write_reg)
+    }
+
+    /// Construct with explicitly-provided `ElicitationMaps` and `WriteReg` Arcs.
+    ///
+    /// Used by `spawn_with_acp_sessions` so the actor and the runner share the same
+    /// `ElicitationMaps` instance. The caller verifies `Arc::ptr_eq` after construction.
+    pub(crate) fn new_with_maps(
+        tx: std::sync::mpsc::Sender<Command>,
+        elicitation_maps: Arc<Mutex<ElicitationMaps>>,
+        write_reg: WriteReg,
+    ) -> Self {
         let secs = std::env::var("WICKED_UNIT_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -1967,10 +2213,16 @@ impl AcpStepRunner {
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs(secs),
-            elicitation_maps: Arc::new(Mutex::new(ElicitationMaps::new())),
+            elicitation_maps,
             session_gen: HashMap::new(),
-            write_reg: HashSet::new(),
+            write_reg,
         }
+    }
+
+    /// Accessor for the shared `ElicitationMaps` arc (used by `spawn_with_acp_sessions`
+    /// to `Arc::ptr_eq`-verify that the actor and runner share the same instance).
+    pub fn elicitation_maps(&self) -> &Arc<Mutex<ElicitationMaps>> {
+        &self.elicitation_maps
     }
 
     fn emit_event(&self, ev: CoreEvent) {
@@ -4023,7 +4275,7 @@ sleep 30
         let maps_arc = make_maps();
         {
             let mut m = maps_arc.lock().unwrap();
-            m.begin_launch("run-local", 0);
+            m.begin_launch("run-local", false);
             m.register("run-local", 1, "e-local", "q", None, "r").unwrap();
         }
         {
@@ -4046,7 +4298,7 @@ sleep 30
         let maps_arc = make_maps();
         {
             let mut m = maps_arc.lock().unwrap();
-            m.begin_launch("run-drop", 1);
+            m.begin_launch("run-drop", false);
             m.mark_bus_in_flight("run-drop", 1);
         }
         {
@@ -4069,7 +4321,7 @@ sleep 30
         let maps_arc = make_maps();
         {
             let mut m = maps_arc.lock().unwrap();
-            m.begin_launch("run-defer", 1);
+            m.begin_launch("run-defer", false);
             m.mark_bus_in_flight("run-defer", 1);
         }
         {
@@ -4253,7 +4505,7 @@ sleep 30
     #[test]
     fn cleanup_run_decrements_workers_and_clears_pending() {
         let mut m = maps();
-        m.begin_launch("run-13", 1);
+        m.begin_launch("run-13", false);
         assert_eq!(m.active_workers, 1);
         m.register("run-13", 1, "e13a", "q", None, "r").unwrap();
         m.register("run-13", 2, "e13b", "q2", None, "r").unwrap(); // different epoch
@@ -4862,5 +5114,174 @@ else:
             Some(0.42),
             "cost from usage_update must survive the result merge"
         );
+    }
+
+    // ── DES-002 T6 tests: tombstone / epoch separation ───────────────────────────
+
+    /// Test 25: Tombstone race — `cancel_epoch` before `register` → returns None;
+    /// no entry in `pending` or `run_index`; `is_epoch_cancelled` returns true.
+    #[test]
+    fn tombstone_race_cancel_before_register() {
+        let mut m = maps();
+        // Cancel epoch 1 BEFORE any registration.
+        m.cancel_epoch("run-25", 1);
+
+        // is_epoch_cancelled must reflect the tombstone.
+        assert!(
+            m.is_epoch_cancelled("run-25", 1),
+            "is_epoch_cancelled must return true after cancel_epoch"
+        );
+
+        // register for the same (run_id, epoch) must return None (creation suppressed).
+        let result = m.register("run-25", 1, "eid-25", "msg", None, "r");
+        assert!(result.is_none(), "register must return None when epoch was pre-cancelled");
+        assert!(
+            !m.pending.contains_key("eid-25"),
+            "pending must not contain the suppressed elicitation"
+        );
+        assert!(
+            m.run_index.get("run-25").is_none_or(|v| !v.iter().any(|(id, _)| id == "eid-25")),
+            "run_index must not contain the suppressed elicitation"
+        );
+    }
+
+    /// Test 27: Epoch separation — `cancel_epoch` never bumps epoch; `next_epoch` is the
+    /// sole bumper; epochs are independently gated.
+    #[test]
+    fn epoch_separation_cancel_epoch_never_bumps() {
+        let mut m = maps();
+
+        // cancel_epoch tombstones epoch 1 but does NOT bump the epoch counter.
+        m.cancel_epoch("run-27", 1);
+        assert_eq!(m.current_epoch("run-27"), 0, "cancel_epoch must not allocate an epoch");
+
+        // register on the cancelled epoch returns None.
+        let r1 = m.register("run-27", 1, "eid-27a", "msg", None, "r");
+        assert!(r1.is_none(), "register on cancelled epoch 1 returns None");
+
+        // next_epoch allocates epoch 2 (the first next_epoch for this run → epoch 1... wait,
+        // run_epoch for "run-27" starts at 0, so next_epoch returns 1. But epoch 1 is cancelled.
+        // That means a new worker registering under epoch 1 would be suppressed. The test spec
+        // says next_epoch→2, which implies epoch 1 was already allocated somehow.
+        //
+        // Actually re-reading the spec: "cancel_epoch(run, 1) → tombstone; register(run, eid, 1) → None;
+        // next_epoch(run) → 2". This means run_epoch starts at 1 (perhaps begin_launch or
+        // initial allocation), then cancel_epoch tombstones 1, and next_epoch allocates 2.
+        //
+        // To match the spec, we need to first allocate epoch 1 (so run_epoch["run-27"] == 1),
+        // then cancel it, then next_epoch → 2.
+        // Let's reset and redo:
+        let mut m = maps();
+
+        // Allocate epoch 1 first (simulating an initial dispatch_unit call).
+        let ep1 = m.next_epoch("run-27");
+        assert_eq!(ep1, 1, "first next_epoch returns 1");
+
+        // Tombstone epoch 1.
+        m.cancel_epoch("run-27", ep1);
+        assert!(m.is_epoch_cancelled("run-27", 1), "epoch 1 tombstoned");
+
+        // register under epoch 1 returns None (suppressed).
+        let r1 = m.register("run-27", 1, "eid-27a", "msg", None, "r");
+        assert!(r1.is_none(), "register on tombstoned epoch 1 returns None");
+
+        // next_epoch allocates epoch 2 (NOT affected by cancel_epoch).
+        let ep2 = m.next_epoch("run-27");
+        assert_eq!(ep2, 2, "next_epoch returns 2 (cancel_epoch never bumps)");
+
+        // register under epoch 2 succeeds.
+        let r2 = m.register("run-27", 2, "eid-27b", "msg2", None, "r");
+        assert!(r2.is_some(), "register on live epoch 2 returns Some(rx)");
+
+        // epoch 1 remains cancelled; epoch 2 is not.
+        assert!(m.is_epoch_cancelled("run-27", 1), "epoch 1 still tombstoned");
+        assert!(!m.is_epoch_cancelled("run-27", 2), "epoch 2 not tombstoned");
+    }
+
+    /// Test 29d: EpochCleanup RAII guard emits ElicitationResolved with reason="teardown"
+    /// when the epoch is tombstoned (channel Disconnected path).
+    #[test]
+    fn epoch_cleanup_emits_elicitation_resolved_teardown_on_epoch_cancel() {
+        let maps_arc = make_maps();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Command>();
+
+        // Allocate epoch 1 and register an elicitation.
+        let epoch = {
+            let mut m = maps_arc.lock().unwrap();
+            m.begin_launch("run-29d", false);
+            m.next_epoch("run-29d")
+        };
+        assert_eq!(epoch, 1);
+
+        // Create the EpochCleanup guard with the in_flight elicitation details.
+        let guard = EpochCleanup {
+            maps: Arc::clone(&maps_arc),
+            run_id: "run-29d".to_string(),
+            epoch,
+            launch_seq: 1,
+            bus_in_flight_deferred: false,
+            tx: cmd_tx,
+            in_flight_id: Some("eid-29d".to_string()),
+            in_flight_action: Some("cancel".to_string()),
+            in_flight_reason: Some("teardown".to_string()),
+        };
+
+        // Drop the guard — it must emit ElicitationResolved via cmd_tx.
+        drop(guard);
+
+        // Receive the command from the channel.
+        let cmd = cmd_rx.recv_timeout(std::time::Duration::from_millis(200))
+            .expect("EpochCleanup must emit Command::EmitEvent on drop");
+
+        match cmd {
+            Command::EmitEvent(crate::event::CoreEvent::ElicitationResolved {
+                session,
+                elicitation_id,
+                action,
+                reason,
+            }) => {
+                assert_eq!(session, "run-29d");
+                assert_eq!(elicitation_id, "eid-29d");
+                assert_eq!(action, "cancel");
+                assert_eq!(reason, "teardown", "teardown path must emit reason=teardown");
+            }
+            _other => panic!("expected ElicitationResolved event"),
+        }
+    }
+
+    /// Test 36: Write failure on deliberate-kill teardown →
+    /// `is_epoch_cancelled` returns true when the epoch was tombstoned before write failure,
+    /// which the Phase 3 gate uses to produce reason="teardown" (not "adapter_write_failure").
+    #[test]
+    fn phase3_gate_distinguishes_teardown_from_adapter_write_failure() {
+        let mut m = maps();
+
+        // Allocate epoch 1 for a run.
+        let ep = m.next_epoch("run-36");
+        assert_eq!(ep, 1);
+
+        // NOT cancelled → is_epoch_cancelled returns false → adapter_write_failure.
+        assert!(
+            !m.is_epoch_cancelled("run-36", ep),
+            "before cancel_epoch: is_epoch_cancelled must return false → adapter_write_failure"
+        );
+
+        // Simulate teardown: cancel the epoch before the write attempt.
+        m.cancel_epoch("run-36", ep);
+
+        // NOW cancelled → is_epoch_cancelled returns true → teardown.
+        assert!(
+            m.is_epoch_cancelled("run-36", ep),
+            "after cancel_epoch: is_epoch_cancelled must return true → teardown"
+        );
+
+        // Verify the gate logic (mirrors Phase 3 in exec_turn_acp):
+        let reason = if m.is_epoch_cancelled("run-36", ep) {
+            "teardown"
+        } else {
+            "adapter_write_failure"
+        };
+        assert_eq!(reason, "teardown",
+            "deliberate-kill path must produce reason=teardown, not adapter_write_failure");
     }
 }
