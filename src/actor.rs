@@ -308,14 +308,23 @@ pub(crate) fn run(
     // leaked them — the exact failure DES R1 forbids). Holds its own `pty_map` clone.
     let _pty_reaper = terminal::PtyReaper::new(pty_map.clone());
 
-    // Startup orphan reaper: prune worktrees whose run no longer exists on the store (e.g. a crashed
-    // run cleaned out of the registry). Runs whose session still exists keep their worktree (resume).
+    // Startup orphan reaper (FINDING-003): worktrees of runs in a TERMINAL status are reaped when
+    // clean (the same rule the terminal-status reap applies — so a crash between a run finishing
+    // and its reap, or a run predating the reap, converges here instead of surviving restarts);
+    // worktrees of LIVE runs are kept (resume); worktrees whose run id the store has never heard
+    // of are force-removed. A sessions read failure SKIPS the reap: with liveness unknown, any
+    // removal could take a resumable run's checkout, and leaking for one boot is the cheaper error.
     if let Ok(repos) = crate::repo::list_repos(&store) {
         if !repos.is_empty() {
-            let live: HashSet<String> = crate::domain::all_sessions(&store)
-                .map(|ss| ss.into_iter().map(|s| s.id).collect())
-                .unwrap_or_default();
-            crate::repo::reap_orphan_worktrees(&repos, &live);
+            match crate::domain::all_sessions(&store) {
+                Ok(sessions) => {
+                    let (live, terminal) = partition_sessions_for_reap(&sessions);
+                    crate::repo::reap_orphan_worktrees(&repos, &live, &terminal);
+                }
+                Err(e) => eprintln!(
+                    "wicked-core: skipping the startup worktree reap — cannot read sessions ({e})"
+                ),
+            }
         }
     }
 
@@ -1080,7 +1089,9 @@ pub(crate) fn run(
                 trigger,
                 reply,
             } => {
-                let _ = reply.send(register_deny_policy(&mut store, &phase, &trigger));
+                let _ = reply.send(register_deny_policy(
+                    &mut store, &registry, &phase, &trigger,
+                ));
             }
             Command::UpsertPolicy { policy_json, reply } => {
                 let _ = reply.send((|| -> anyhow::Result<()> {
@@ -2312,6 +2323,7 @@ pub(crate) fn resume_run_inner(
         let mut session = session;
         session.status = SessionStatus::Failed;
         put_node(store, session.to_node())?;
+        reap_terminal_worktree(&*store, &session);
         emit(
             subscribers,
             CoreEvent::SessionFailed {
@@ -2986,6 +2998,7 @@ fn apply_step_result(
                         .unwrap_or_else(|| "verdict not pass".to_string()),
                 },
             );
+            let note = unsuppressed_gate_note(session.human_confirm);
             pause_for_human(
                 store,
                 subscribers,
@@ -2996,9 +3009,7 @@ fn apply_step_result(
                 // AFTER its work — unlike a mid-run `HumanConfirm`, the gating unit and the
                 // reviewed unit coincide here.
                 Some(ord),
-                format!(
-                    "Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run"
-                ),
+                format!("Unit {ord} verdict is NOT PASS — confirm to retry the phase, or reject to cancel the run{note}"),
             )?;
             return Ok(StepApplied::Paused);
         }
@@ -3047,6 +3058,7 @@ fn fail_run(
 ) -> StepApplied {
     session.status = SessionStatus::Failed;
     let _ = put_node(store, session.to_node());
+    reap_terminal_worktree(&*store, session);
     emit(
         subscribers,
         CoreEvent::SessionFailed {
@@ -3057,6 +3069,58 @@ fn fail_run(
     notify_campaign(self_tx, &session.id, crate::campaign::NodeOutcome::Failed);
     runner.on_run_complete(&session.id);
     StepApplied::Finished
+}
+
+/// FINDING-003 — the terminal transitions that OWN a worktree reap it here, off the actor thread
+/// (`git worktree remove` can be slow and must never stall NAPI callers waiting on the actor),
+/// through [`crate::repo::reap_worktree_if_clean`]: a clean tree goes, a dirty one (unlanded work)
+/// is kept and logged, and the `wicked/<run_id>` branch survives either way. Wired into
+/// `finalize_run` (Completed), `fail_run` (Failed, which `fail_run_by_id` also routes through),
+/// and resume's crash-during-planning guard. This is NOT every terminal transition — two reach a
+/// terminal status without calling this, on purpose: operator `cancel_run` FORCE-removes instead
+/// (Cancel is the operator discarding the work), and the WORKER-originated Cancelled path
+/// (`apply_step_result`, `StepStatus::Cancelled` — e.g. a P4a subprocess kill) reaps nowhere
+/// inline. That last leftover is not lost: the startup reaper
+/// ([`crate::repo::reap_orphan_worktrees`]) classifies Cancelled as terminal and re-applies the
+/// same clean-only rule to it (and to anything a crash left behind), so a missed reap is a leak
+/// until next boot, not forever.
+fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
+    let Some(repo_id) = session.repo_ref.as_ref() else {
+        return;
+    };
+    let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) else {
+        return;
+    };
+    let rid = session.id.clone();
+    std::thread::spawn(move || {
+        let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
+    });
+}
+
+/// Split every session on the store into LIVE (non-terminal — may resume, keeps its worktree) and
+/// TERMINAL (finished — its leftover worktree reaps when clean) id sets for the startup orphan
+/// reaper (FINDING-003). Statuses are matched exhaustively so a new variant must choose a side;
+/// defaulting a new status to LIVE would silently re-grow the leak this fixed, and defaulting to
+/// TERMINAL would reap resumable runs.
+fn partition_sessions_for_reap(
+    sessions: &[crate::domain::AgentSession],
+) -> (HashSet<String>, HashSet<String>) {
+    let mut live = HashSet::new();
+    let mut terminal = HashSet::new();
+    for s in sessions {
+        match s.status {
+            SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => {
+                terminal.insert(s.id.clone());
+            }
+            SessionStatus::Planning
+            | SessionStatus::Distributing
+            | SessionStatus::Executing
+            | SessionStatus::AwaitingHuman => {
+                live.insert(s.id.clone());
+            }
+        }
+    }
+    (live, terminal)
 }
 
 /// Pause a run for human confirmation: persist `AwaitingHuman`, emit `AwaitingHuman`, and free a
@@ -3117,6 +3181,7 @@ fn advance_or_pause(
         // not-pass terminal verdict already paused at finish (finding #3), and a pass needs no gate.
         if let Some(term) = unit_ix.checked_sub(1).and_then(|i| units.get(i)) {
             if matches!(term.gate, crate::workflow::GateSpec::HumanConfirm { .. }) {
+                let note = unsuppressed_gate_note(session.human_confirm);
                 pause_for_human(
                     store,
                     subscribers,
@@ -3127,8 +3192,8 @@ fn advance_or_pause(
                     // this branch matched on — so it is attributable, and to itself.
                     Some(term.ord),
                     format!(
-                        "Approve completion after the final phase (unit {}): {}",
-                        term.ord, term.description
+                        "Approve completion after the final phase (unit {}): {}{}",
+                        term.ord, term.description, note
                     ),
                 )?;
                 return Ok(Progress::Paused);
@@ -3151,8 +3216,12 @@ fn advance_or_pause(
                 (
                     Some(reviewing_ord),
                     format!(
-                        "Approve the output of unit {} ({}) before unit {} runs: {}",
-                        reviewing_ord, done, unit.ord, unit.description
+                        "Approve the output of unit {} ({}) before unit {} runs: {}{}",
+                        reviewing_ord,
+                        done,
+                        unit.ord,
+                        unit.description,
+                        unsuppressed_gate_note(session.human_confirm)
                     ),
                 )
             }
@@ -3262,6 +3331,18 @@ enum PauseReason {
 ///     run-level flag. `HumanConfirm` always pauses; `HumanConfirmIf(VerdictNotPass)` pauses when the
 ///     preceding unit is not a clean pass (`status != Done`); `Auto` defers to the run-level policy.
 ///
+/// PRECEDENCE (FINDING-023) — a DEF-declared gate fires REGARDLESS of the run-level policy:
+/// `human_confirm: none` silences only source 1 and never suppresses a workflow-authored gate.
+/// That is deliberate, not an oversight. `HumanConfirm::None` is simultaneously the enum DEFAULT
+/// (an absent wire field lands here) and the typo FALLBACK (`parse_human_confirm` maps every
+/// unrecognized token to `None` — FINDING-019), so reading it as "suppress the workflow's own
+/// gates" would let an omitted field or a misspelled one silently strip the review seams the
+/// workflow author declared — fail-open on the primary human-review control. A genuinely
+/// unattended run needs an explicit, non-default signal end-to-end (wire token + parsers + here);
+/// until that exists, the def gate wins and the pause DISCLOSES the precedence in its prompt
+/// ([`unsuppressed_gate_note`]) so an operator who sent `none` learns why the run still paused at
+/// the moment it pauses, not from a wedged overnight batch.
+///
 /// `DefGate` wins when both fire. It is the more specific statement — a workflow author named this
 /// exact seam — and it is the one carrying an ord to attribute the pause to, so preferring it never
 /// discards information `RunLevel` would have supplied. Whether to pause is unchanged either way.
@@ -3290,6 +3371,25 @@ fn should_pause(
             reviewing_ord: prev.ord,
         });
     def_gate.or(run_level.then_some(PauseReason::RunLevel))
+}
+
+/// The disclosure appended to a DEF-declared gate's pause prompt when the run was launched with
+/// `human_confirm: none` (FINDING-023). The precedence itself — a workflow-authored gate is never
+/// suppressed by the run-level policy — is deliberate (see [`should_pause`]), but before this note
+/// NOTHING surfaced it: the launch accepted `none`, the session reported `human_confirm: none`, and
+/// the run still sat `awaiting_human`, which reads as a contradiction and cost an operator a stalled
+/// overnight batch before they learned the rule. The pause prompt is the one surface the operator is
+/// guaranteed to read at the exact moment the precedence bites, so the pause explains itself there.
+/// Empty for every attended policy — those operators asked to be paused, and the note would be noise.
+fn unsuppressed_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'static str {
+    match human_confirm {
+        crate::domain::HumanConfirm::None => {
+            " [workflow-declared gate: this pause is authored by the workflow definition itself; \
+             run-level human_confirm=none silences only run-level pauses, never a \
+             workflow-authored gate]"
+        }
+        _ => "",
+    }
 }
 
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
@@ -3573,6 +3673,7 @@ fn finalize_run(
     if let Some(mut session) = crate::domain::get_session(store, run_id)? {
         session.status = SessionStatus::Completed;
         put_node(store, session.to_node())?;
+        reap_terminal_worktree(&*store, &session);
     }
     emit(
         subscribers,
@@ -3763,8 +3864,9 @@ pub(crate) fn cancel_run(
     }
     session.status = SessionStatus::Cancelled;
     put_node(store, session.to_node())?;
-    // Discard the worktree — the work is being abandoned. (A COMPLETED run keeps its worktree so the
-    // operator can review/merge the branch; only cancellation throws it away.)
+    // FORCE-discard the worktree — Cancel is the operator explicitly abandoning the work, the one
+    // terminal status where uncommitted bytes are discarded on purpose. Completed/Failed runs reap
+    // through `reap_terminal_worktree` instead (FINDING-003): a clean tree goes, unlanded work stays.
     if let Some(repo_id) = &session.repo_ref {
         if let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) {
             crate::repo::remove_worktree(&repo.root_path, run_id);
@@ -3781,17 +3883,21 @@ pub(crate) fn cancel_run(
     Ok(SessionStatus::Cancelled)
 }
 
-/// Number of per-unit execution phases a UI deny policy is registered against (`unit-1..=unit-N`).
-/// Governance matches `applies_to` by EQUALITY against each candidate token (`engine.rs`:
-/// `select_any`), and a run's units execute under phases `unit-{ord}` — so a policy must enumerate
-/// those phases to fire on every unit. A run with MORE units than this is REJECTED at launch
-/// (`pipeline::MAX_UNITS`) rather than allowed to silently run units past the policy's coverage —
-/// governance must never fail open.
+/// The governed unit-count ceiling: the highest `unit-<ord>` execution phase a policy can name, and
+/// the launch-time limit `pipeline::pre_distribute` enforces against THIS constant — it rejects any
+/// run whose unit count exceeds it (there is no separate `MAX_UNITS`; the plan path reads
+/// `DENY_PHASE_SPAN` directly). Governance must never fail open by letting units run past a policy's
+/// possible coverage.
 ///
-/// NOTE (FINDING-028): the gate now ALSO matches the workflow phase id, so this fan-out is no longer
-/// the only way to make a deny fire. It is retained deliberately: narrowing to the caller's single
-/// `phase` would make an unrecognized phase string yield an INERT policy (fail-open), which needs
-/// registration-time phase validation first. Over-matching is the fail-closed direction.
+/// HISTORY (FINDING-028): [`register_deny_policy`] used to fan a policy out across
+/// `unit-1..=unit-256` regardless of the `phase` the caller passed, because an unvalidated phase
+/// string narrowed to `applies_to: [phase]` could be inert (fail-open) — over-matching was the
+/// fail-closed workaround, and this constant sized it. The fan-out is GONE: `phase` is now
+/// validated at registration and `applies_to` is exactly `[phase]`. The constant remains as (a)
+/// the launch cap above, still needed because policies persisted BEFORE the fix enumerate only
+/// `unit-1..=unit-256` and a longer run would outrun them, and (b) the bound on the synthetic
+/// `unit-<N>`/`u<N>` forms [`is_synthetic_unit_phase`] accepts — an ord past the launch cap can
+/// never execute, so a policy on it could never fire.
 pub(crate) const DENY_PHASE_SPAN: u32 = 256;
 
 /// Capture a TERMINAL run's outcome into memory (best-effort). Names the run + its result (and, for a
@@ -3839,21 +3945,51 @@ fn capture_run_outcome(
     }
 }
 
-/// Register a deny policy on the store (single-writer). The UI's `trigger` is a literal string, so we
-/// regex-escape it (governance matches `Trigger.contains` as a regex over the call context). The
-/// policy is registered against EVERY unit-execution phase (`unit-1..=unit-N`), not the abstract
-/// `phase` label — see [`DENY_PHASE_SPAN`] for why this stays broad.
+/// Register a deny policy on the store (single-writer), scoped to exactly the `phase` the caller
+/// named (FINDING-028). The UI's `trigger` is a literal string, so we regex-escape it (governance
+/// matches `Trigger.contains` as a regex over the call context).
 ///
-/// CONTRACT MISMATCH (FINDING-028): `Core::register_deny_policy` documents "blocks any tool-call in
-/// `phase`", but the fan-out means the deny fires in EVERY phase — `phase` only shapes the policy id
-/// and its human-readable `criteria`/`rule`. Callers get a broader block than they asked for.
+/// `phase` is VALIDATED before anything lands: it must name a phase of some registered workflow
+/// (the token the gate matches via `scope::phase_aliases`), or a synthetic execution form
+/// (`unit-<N>` / ad-hoc `u<N>`, 1..=[`DENY_PHASE_SPAN`]). An unrecognized string is REJECTED with
+/// the valid tokens — registering it would produce a policy that never fires, and an inert deny is
+/// the silent fail-open FINDING-021 was (a policy the operator believes is standing guard, matching
+/// nothing). This validation is what made narrowing safe: the previous `unit-1..=unit-256` fan-out
+/// existed precisely because an unvalidated `phase` could be anything, and over-matching was the
+/// fail-closed direction. With the tokens checked at the write boundary, `applies_to = [phase]`
+/// makes the documented contract ("blocks any tool-call in `phase`") actually true.
 fn register_deny_policy(
     store: &mut dyn GraphStore,
+    registry: &crate::workflow::WorkflowRegistry,
     phase: &str,
     trigger: &str,
 ) -> anyhow::Result<()> {
     use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
-    let applies_to: Vec<String> = (1..=DENY_PHASE_SPAN).map(|n| format!("unit-{n}")).collect();
+    let phase = phase.trim();
+    let known_workflow_phase = registry
+        .ids()
+        .iter()
+        .filter_map(|id| registry.get(id))
+        .flat_map(|def| def.phases.iter())
+        .any(|p| p.id == phase);
+    if !known_workflow_phase && !is_synthetic_unit_phase(phase) {
+        let mut known: Vec<String> = registry
+            .ids()
+            .iter()
+            .filter_map(|id| registry.get(id))
+            .flat_map(|def| def.phases.iter().map(|p| p.id.clone()))
+            .collect();
+        known.sort();
+        known.dedup();
+        anyhow::bail!(
+            "phase `{phase}` names no phase of any registered workflow and no synthetic unit form \
+             (`unit-<N>` or `u<N>`, 1..={DENY_PHASE_SPAN}) — refusing to register: a deny scoped \
+             to a phase that never executes would never fire, and an inert policy fails open. \
+             Registered workflow phases: {}",
+            known.join(", ")
+        );
+    }
+    let applies_to = vec![phase.to_string()];
     let policy = Policy {
         id: format!(
             "ui-deny-{phase}-{}",
@@ -3872,6 +4008,29 @@ fn register_deny_policy(
         retired: false,
     };
     register_policy(store, &policy)
+}
+
+/// Is `phase` a synthetic execution-phase token in its CANONICAL spelling — `unit-<N>` (the
+/// engine-derived phase every unit executes under, `scope::unit_phase`) or `u<N>` (the phase id an
+/// AD-HOC unit carries, the `u<ord>` suffix of `<session>:u<ord>`), with 1 <= N <= [`DENY_PHASE_SPAN`]?
+///
+/// The round-trip (`format!` back and compare) is load-bearing, not pedantry: `"007".parse::<u32>()`
+/// and `"+7".parse::<u32>()` both yield 7, so accepting any parseable digits would register
+/// `unit-007` — a policy the gate's EQUALITY match (`select_any`) can never select. That is the
+/// inert-policy fail-open this function exists to refuse. The span bound refuses ords past the
+/// launch cap for the same reason: a unit beyond it can never execute, so a policy on it never fires.
+fn is_synthetic_unit_phase(phase: &str) -> bool {
+    let (prefix, digits) = match phase.strip_prefix("unit-") {
+        Some(d) => ("unit-", d),
+        None => match phase.strip_prefix('u') {
+            Some(d) => ("u", d),
+            None => return false,
+        },
+    };
+    match digits.parse::<u32>() {
+        Ok(n) if (1..=DENY_PHASE_SPAN).contains(&n) => format!("{prefix}{n}") == phase,
+        _ => false,
+    }
 }
 
 /// Escape regex metacharacters so a literal operator-typed trigger matches literally.
@@ -4030,6 +4189,13 @@ mod gate_pause_tests {
     fn a_def_humanconfirm_gate_pauses_even_when_run_level_is_none() {
         // The DEF drives the pause: run-level --confirm is None, yet the preceding phase's
         // HumanConfirm gate must still pause the run before the next unit.
+        //
+        // This is the INTENTIONAL precedence (FINDING-023), not the defect: `None` is both the
+        // enum default and the typo fallback (FINDING-019), so letting it suppress a
+        // workflow-authored gate would strip declared review seams on every default or misspelled
+        // launch — fail-open. The pause instead disclosing itself is pinned by
+        // `def_gate_disclosure_tests`. Anyone changing this behavior must first give "unattended"
+        // an explicit, non-default wire signal.
         let s = sess(HumanConfirm::None);
         let units = vec![
             unit(
@@ -4214,6 +4380,562 @@ mod terminal_gate_tests {
         assert!(
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
+        );
+    }
+}
+
+/// FINDING-023 — the precedence "a workflow-authored gate is never suppressed by run-level
+/// `human_confirm: none`" is deliberate, so the pause must DISCLOSE it to the operator who asked
+/// for `none` (nothing else does: the launch accepts it and the session then reports
+/// `human_confirm: none` while sitting `awaiting_human`). These drive `advance_or_pause` — the real
+/// call site that builds the prompt — not the note helper in isolation.
+#[cfg(test)]
+mod def_gate_disclosure_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{GateSpec, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// A run whose FIRST unit finished under a def-declared HumanConfirm gate, cursor on unit 2 —
+    /// the exact state FINDING-023 observed (`feature`'s clarify gate under `human_confirm: none`).
+    fn seed(store: &mut dyn GraphStore, hc: HumanConfirm) {
+        let session = AgentSession {
+            id: "d".into(),
+            workflow_id: "wf-d".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: hc,
+            unit_ix: 1,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
+        u1.gate = GateSpec::HumanConfirm {
+            unconditional: false,
+        };
+        u1.status = UnitStatus::Done;
+        put_node(store, u1.to_node()).unwrap();
+        let u2 = WorkUnit::pending("d:u2", "d", 2, "design the approach");
+        put_node(store, u2.to_node()).unwrap();
+    }
+
+    /// Drive `advance_or_pause` at `unit_ix` and return the emitted `AwaitingHuman` prompt.
+    fn pause_prompt(store: &mut dyn GraphStore, unit_ix: usize) -> String {
+        let mut subs = crate::event_log::EventSink::default();
+        let (evtx, evrx) = channel::<CoreEvent>();
+        subs.push(evtx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(store, &mut subs, &runner, &tx, "d", unit_ix).unwrap();
+        assert!(
+            matches!(progress, Progress::Paused),
+            "precondition: the def gate pauses"
+        );
+        evrx.try_iter()
+            .find_map(|ev| match ev {
+                CoreEvent::AwaitingHuman { prompt, .. } => Some(prompt),
+                _ => None,
+            })
+            .expect("a pause emits AwaitingHuman with its prompt")
+    }
+
+    #[test]
+    fn a_def_gate_pause_under_none_discloses_the_precedence_in_its_prompt() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, HumanConfirm::None);
+        let prompt = pause_prompt(&mut store, 1);
+        // The pause still names the work under review first — the disclosure is appended, not a
+        // replacement of the attribution FINDING-032 fixed.
+        assert!(
+            prompt.starts_with("Approve the output of unit 1"),
+            "attribution must survive the disclosure: {prompt}"
+        );
+        assert!(
+            prompt.contains("workflow-declared gate") && prompt.contains("human_confirm=none"),
+            "an operator who launched with none must be told, at the pause itself, that the gate \
+             is workflow-authored and none does not suppress it: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_same_pause_under_an_attended_policy_carries_no_disclosure() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, HumanConfirm::All);
+        let prompt = pause_prompt(&mut store, 1);
+        assert!(
+            !prompt.contains("workflow-declared gate"),
+            "an operator who asked to be paused needs no precedence lecture — the note must be \
+             conditional on none, not boilerplate: {prompt}"
+        );
+    }
+
+    /// The terminal-gate pause (seam finding #4) is a def-authored gate too, reached through a
+    /// DIFFERENT branch of `advance_or_pause` — it must disclose under `none` as well, or the one
+    /// workflow ending on a human gate (`collab`) stalls its unattended runs unexplained.
+    #[test]
+    fn a_terminal_def_gate_under_none_discloses_too() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let session = AgentSession {
+            id: "d".into(),
+            workflow_id: "wf-d".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 1, // past the single terminal unit
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
+        u.gate = GateSpec::HumanConfirm {
+            unconditional: false,
+        };
+        u.status = UnitStatus::Done;
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let prompt = pause_prompt(&mut store, 1);
+        assert!(
+            prompt.starts_with("Approve completion after the final phase"),
+            "the terminal pause keeps its own framing: {prompt}"
+        );
+        assert!(
+            prompt.contains("workflow-declared gate") && prompt.contains("human_confirm=none"),
+            "the terminal def gate must disclose under none exactly like a mid-run one: {prompt}"
+        );
+    }
+
+    /// The THIRD def-authored pause site (FINDING-023): the `HumanConfirmIf(VerdictNotPass)` verdict
+    /// escalation in `apply_step_result`. The tests above drive `advance_or_pause` and never reach
+    /// this branch, so deleting the disclosure HERE leaves every one of them green (verified by
+    /// deleting it). Driving it functionally needs a full governance not-pass verdict; this campaign's
+    /// own lesson is that guards miss CALL SITES, so this audits the wiring at the site, bounded to
+    /// `apply_step_result`'s body (2..=`fail_run`) so neither of the other two sites can satisfy it.
+    #[test]
+    fn the_verdict_escalation_pause_discloses_the_precedence_too() {
+        let src = include_str!("actor.rs");
+        let body = src
+            .split("fn apply_step_result")
+            .nth(1)
+            .and_then(|b| b.split("\nfn fail_run").next())
+            .expect("apply_step_result is still a top-level fn ending before fail_run");
+        // Needles built by concatenation so this assertion cannot satisfy itself out of its own text.
+        let note_call = concat!("unsuppressed_gate_note", "(session.human_confirm)");
+        assert!(
+            body.contains(note_call),
+            "the verdict-escalation pause no longer derives the disclosure from the run's own \
+             human_confirm — an operator who launched unattended is escalated to human review with \
+             nothing telling them the run-level policy did not suppress the gate (FINDING-023's \
+             third, previously unguarded site)"
+        );
+        // Substance: computing the note is worthless unless it reaches the operator — it must be
+        // interpolated into the escalation prompt this branch builds, not merely bound.
+        let interpolated = concat!("{", "note}");
+        assert!(
+            body.contains(interpolated),
+            "the escalation disclosure is computed but never appended to the prompt — dead code \
+             reads identically to no disclosure at all"
+        );
+    }
+}
+
+/// FINDING-028 — `register_deny_policy`'s `phase` argument must SCOPE the deny. Before this fix it
+/// was decorative: `applies_to` was a `unit-1..=unit-256` fan-out regardless of the caller's phase,
+/// so a deny an operator scoped to `review` also fired on `clarify`, `design`, and every other unit
+/// of every run. These assert against `select_any` — the SAME selection funnel the live gate uses
+/// (`execute.rs`), so what selects here is what fires there.
+#[cfg(test)]
+mod deny_policy_tests {
+    use super::*;
+    use wicked_apps_core::open_store;
+
+    fn ctx() -> serde_json::Value {
+        serde_json::json!({ "work": "about to rm -rf the prod volume" })
+    }
+
+    #[test]
+    fn a_deny_scoped_to_a_phase_fires_there_and_nowhere_else() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        // `build` is a real phase of the built-in `feature` workflow.
+        register_deny_policy(&mut store, &registry, "build", "rm -rf").unwrap();
+
+        let at_build = select_any(&store, "s", &["unit-3", "build"], &ctx()).unwrap();
+        assert_eq!(at_build.len(), 1, "the deny selects at its own phase");
+        assert_eq!(
+            at_build[0].applies_to,
+            vec!["build".to_string()],
+            "applies_to is the caller's phase ALONE — the documented contract, not a superset"
+        );
+
+        // The defect itself: the same policy must NOT select at any other phase.
+        let elsewhere = select_any(&store, "s", &["unit-1", "clarify"], &ctx()).unwrap();
+        assert!(
+            elsewhere.is_empty(),
+            "a deny scoped to `build` selected at `clarify` — the fan-out is back: {:?}",
+            elsewhere.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unknown_phase_is_rejected_and_nothing_lands_on_the_store() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        // A typo of `review`. Narrowing WITHOUT this rejection would register an inert policy —
+        // the operator believes a guard is standing and nothing ever fires (FINDING-021's shape).
+        let err = register_deny_policy(&mut store, &registry, "reviw", "DENYME")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`reviw`") && err.contains("never fire"),
+            "the rejection names the bad token and the consequence: {err}"
+        );
+        assert!(
+            err.contains("build") && err.contains("clarify") && err.contains("cutover"),
+            "the rejection lists the registered workflow phases so the operator can correct: {err}"
+        );
+        // Fail-closed on the WRITE: had anything landed, it would select at the very phase it
+        // claimed — so an empty selection there proves the store took nothing.
+        let landed = select_any(&store, "s", &["reviw"], &ctx()).unwrap();
+        assert!(
+            landed.is_empty(),
+            "a rejected registration must not persist"
+        );
+    }
+
+    #[test]
+    fn synthetic_unit_forms_are_accepted_only_in_canonical_spelling_within_the_span() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        // Canonical synthetic forms: the engine-derived `unit-<ord>` and the ad-hoc `u<ord>`.
+        register_deny_policy(&mut store, &registry, "unit-65", "X").unwrap();
+        register_deny_policy(&mut store, &registry, "u7", "X").unwrap();
+        assert_eq!(
+            select_any(&store, "s", &["unit-65"], &ctx()).unwrap().len(),
+            1,
+            "a synthetic-phase deny is selectable at that exact token"
+        );
+        // Every one of these parses-or-looks like a unit form but can never EQUAL a gate token
+        // (`select_any` matches by equality), so accepting it would mint an inert policy:
+        // non-canonical digits (unit-007, u+7), out-of-span ords (0, 257), and bare prefixes.
+        for bad in [
+            "unit-0", "u0", "unit-257", "u257", "unit-007", "u+7", "unit-", "u",
+        ] {
+            assert!(
+                register_deny_policy(&mut store, &registry, bad, "X").is_err(),
+                "`{bad}` can never match a gate token and must be rejected, not registered inert"
+            );
+        }
+    }
+}
+
+/// FINDING-003 — a run reaching a terminal status must reap its worktree (14 orphans survived
+/// restarts; the retest reproduced one orphan from one failed run). These drive `finalize_run` and
+/// `fail_run` — the REAL terminal transitions — against a real git repo, not the reap helper in
+/// isolation: the finding's root cause was precisely a documented cleanup no terminal path reached.
+#[cfg(test)]
+mod terminal_worktree_reap_tests {
+    use super::*;
+    use crate::domain::{put_node, AgentSession, HumanConfirm, SessionStatus};
+    use crate::repo::RepoSpec;
+    use crate::scope::EntityMode;
+    use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+    use std::path::Path;
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, HardenedCommand, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// A git repo with one commit at a scratch path (mirrors `repo::tests::git_repo`, which is
+    /// private to that module). Per-process and per-thread so concurrent test binaries never collide.
+    fn git_repo(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "wicked-reap-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.invalid"]);
+        run(&["config", "user.name", "wicked-test"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("README.md"), "base\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+        root
+    }
+
+    /// Register the repo, create the run's worktree, seed an Executing session bound to it.
+    /// Returns (repo root, worktree path).
+    fn seeded(
+        store: &mut dyn GraphStore,
+        name: &str,
+        run_id: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        seeded_with_status(store, name, run_id, SessionStatus::Executing)
+    }
+
+    /// As [`seeded`], but at an arbitrary status — the resume guard needs a PRE-EXECUTION status
+    /// (`Planning`) to exercise its crash-during-planning branch.
+    fn seeded_with_status(
+        store: &mut dyn GraphStore,
+        name: &str,
+        run_id: &str,
+        status: SessionStatus,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = git_repo(name);
+        let entry = crate::repo::register_repo(
+            store,
+            RepoSpec {
+                name: format!("reap-{name}"),
+                root_path: root.to_string_lossy().to_string(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let wt = crate::repo::create_worktree(&entry.root_path, run_id).unwrap();
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: Some(wt.to_string_lossy().to_string()),
+            repo_ref: Some(entry.id),
+        };
+        put_node(store, session.to_node()).unwrap();
+        (root, wt)
+    }
+
+    /// The reap runs on its own thread; wait for the checkout to vanish. The generous bound is
+    /// deliberate (the FINDING-029/030 lesson: a tight wall-clock deadline accuses the feature of
+    /// a scheduling shortfall) — the loop returns the moment the path is gone.
+    fn wait_gone(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worktree still present after 60s — the terminal reap never ran for {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    fn branch_exists(root: &Path, branch: &str) -> bool {
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(["branch", "--list", branch])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains(branch)
+    }
+
+    #[test]
+    fn a_completed_run_reaps_its_clean_worktree_and_keeps_the_branch() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "done", "r-done");
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+
+        finalize_run(&mut store, &mut subs, &runner, &tx, "r-done").unwrap();
+
+        let session = crate::domain::get_session(&store, "r-done")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+        wait_gone(&wt);
+        assert!(
+            branch_exists(&root, "wicked/r-done"),
+            "the branch is the run's record and must outlive the checkout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_run_reaps_its_clean_worktree_too() {
+        // The finding's retest: ONE failed run left ONE orphan on a fresh clone. `fail_run` is the
+        // funnel every failure path (including `fail_run_by_id`'s async faults) routes through.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "failed", "r-fail");
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut session = crate::domain::get_session(&store, "r-fail")
+            .unwrap()
+            .unwrap();
+
+        let applied = fail_run(&mut store, &mut subs, &runner, &tx, &mut session, 1);
+        assert!(matches!(applied, StepApplied::Finished));
+
+        wait_gone(&wt);
+        assert!(
+            branch_exists(&root, "wicked/r-fail"),
+            "failure keeps the branch as the record of what was attempted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// FINDING-003, the RESUME half. `resume_run_inner`'s crash-during-planning guard fails a run
+    /// stuck in a pre-execution status AND reaps its worktree (src/actor.rs). The finding-time tests
+    /// only drove `finalize_run`/`fail_run`, so deleting that one reap call left the run correctly
+    /// `Failed` with its checkout leaked until next boot and NOTHING failing. This drives the real
+    /// resume entry point and pins the effect: falsified by deleting the reap call — the run is still
+    /// `Failed`, but `wait_gone` then times out because the checkout never leaves.
+    #[test]
+    fn a_resumed_never_planned_run_reaps_its_worktree_and_keeps_the_branch() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) =
+            seeded_with_status(&mut store, "resume", "r-resume", SessionStatus::Planning);
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+
+        let status = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r-resume",
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            SessionStatus::Failed,
+            "a run that never completed planning resumes to Failed, never auto-completes"
+        );
+        wait_gone(&wt);
+        assert!(
+            branch_exists(&root, "wicked/r-resume"),
+            "the branch outlives the reap here too"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tuple contract the boot call site leans on: `partition_sessions_for_reap` returns
+    /// (LIVE, TERMINAL) in that order. The startup-wiring audit below asserts the boot site binds
+    /// `let (live, terminal) = ...`; this pins that `live` is in fact the KEEP set and `terminal`
+    /// the REAP set, so the two together close the swap. Falsified by swapping the two `.insert`
+    /// targets in `partition_sessions_for_reap`.
+    #[test]
+    fn partition_returns_live_first_then_terminal() {
+        let live_session = AgentSession {
+            id: "s-live".into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+        };
+        let term_session = AgentSession {
+            id: "s-term".into(),
+            status: SessionStatus::Failed,
+            ..live_session.clone()
+        };
+        let (live, terminal) = partition_sessions_for_reap(&[live_session.clone(), term_session]);
+        assert!(
+            live.contains("s-live") && !live.contains("s-term"),
+            "the FIRST returned set is LIVE (kept, may resume) — the boot site binds it to `live`"
+        );
+        assert!(
+            terminal.contains("s-term") && !terminal.contains("s-live"),
+            "the SECOND returned set is TERMINAL (reaped clean-only)"
+        );
+    }
+
+    /// FINDING-003 boot call site (`run()`). `reap_orphan_worktrees(repos, live, terminal)` KEEPS
+    /// `live` and REAPS `terminal`; both are `&HashSet<String>`, so swapping them at the boot site
+    /// COMPILES and silently inverts the meaning — resumable runs' checkouts reaped, terminal
+    /// leftovers kept — while the repo-level test (which calls the fn with named sets) stays green.
+    /// Booting the whole actor to exercise this is disproportionate for one two-line wiring, so this
+    /// audits the wiring at the site (the same instrument the FINDING-091 call-site guard uses).
+    /// Falsified by swapping to `reap_orphan_worktrees(&repos, &terminal, &live)` (or the destructure
+    /// to `let (terminal, live) = ...`): the concatenated needle no longer appears and this fails.
+    #[test]
+    fn the_startup_reaper_wires_live_to_keep_and_terminal_to_reap() {
+        let src = include_str!("actor.rs");
+        // Needles built by concatenation so this assertion cannot satisfy itself out of its own text.
+        let destructure = concat!(
+            "let (live, terminal) = ",
+            "partition_sessions_for_reap(&sessions)"
+        );
+        assert!(
+            src.contains(destructure),
+            "the startup reaper no longer binds partition's (live, terminal) tuple in order — a \
+             swapped destructure would feed the live set to the reap position (FINDING-003)"
+        );
+        let call = concat!("reap_orphan_worktrees(&repos, ", "&live, &terminal)");
+        assert!(
+            src.contains(call),
+            "the startup reap call's argument order changed — live must be the KEEP arg and terminal \
+             the REAP arg; a swap compiles and reaps resumable checkouts (FINDING-003)"
         );
     }
 }
