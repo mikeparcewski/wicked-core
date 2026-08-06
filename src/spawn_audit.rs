@@ -221,6 +221,10 @@ mod tests {
             crate::gate_hook::GATE_SCOPE_ENV,
             crate::gate_hook::GATE_PHASE_ENV,
             crate::gate_hook::GATE_PHASE_ID_ENV,
+            // The unit's filesystem boundary (FINDING-098). Inheriting these re-scopes one unit's
+            // worktree onto an unrelated child; observing them tells a worker where the fence is.
+            crate::gate_hook::WRITE_ROOTS_ENV,
+            crate::gate_hook::READ_ROOTS_ENV,
         ] {
             assert!(
                 ENGINE_INTERNAL_ENV.contains(&name),
