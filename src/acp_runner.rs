@@ -297,15 +297,98 @@ fn stderr_context(tail: &StderrTail) -> String {
 
 // ── Session startup ───────────────────────────────────────────────────────────
 
-/// Spawn the ACP binary and complete the `initialize` + `session/new` handshake.
-/// Returns `Err` if the binary is not on PATH, the process fails to start, or either
-/// handshake call exceeds its budget (see [`initialize_budget`] / [`session_new_budget`]).
+/// The env var claude's CLI and Agent SDK resolve their per-user configuration directory from —
+/// user-scope settings, hooks, plugins, memory. The ACP bridge hands its own environment to the
+/// SDK it drives in-process (`CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? homedir()`),
+/// so this variable decides WHOSE configuration a worker runs under. It is the carrier the
+/// bridge honours where argv is not: flags the bridge does not parse are discarded, which is how
+/// FINDING-060 happened.
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// Decide the [`CLAUDE_CONFIG_DIR_ENV`] override for an ACP worker spawn — `None` means inherit
+/// the operator's own configuration (the explicit escape hatch only).
+///
+/// FINDING-061: FINDING-047 (a worker that inherits the operator's CLI configuration changes
+/// what it does — their hooks fire, their permission defaults apply, an operator on `dontAsk`
+/// gets workers whose every file write reroutes through Bash) was fixed on the wrapped path
+/// only, because `inject_isolation_flags` rides argv and the ACP bridge does not read argv. The
+/// bridge DOES honour [`CLAUDE_CONFIG_DIR_ENV`], so the ACP spawn points it at an engine-minted
+/// directory instead — the same boundary, carried on the seam this path actually has.
+///
+/// `inherit_operator` is [`crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`]'s presence,
+/// read at the call site: the SAME opt-in escape hatch as the wrapped path, because two
+/// opt-outs for one boundary is how one of them silently stops working. Parameterised so both
+/// branches are testable without mutating the test process's environment.
+fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std::path::PathBuf>> {
+    if inherit_operator {
+        return None;
+    }
+    Some(mint_worker_config_dir())
+}
+
+/// Mint a fresh, engine-owned config directory for ONE ACP spawn.
+///
+/// Per-spawn rather than shared: the directory IS the worker's user scope, so a shared one
+/// would be a user scope every worker can mutate for every later worker — drop a
+/// `settings.json` there and the next spawn inherits it, which is FINDING-047's leak pointed at
+/// a different victim. The directories are a few files each under the OS temp dir; per-spawn
+/// leakage is bounded by session count and reclaimed with the temp dir.
+///
+/// The minted dir is seeded with a `settings.json` carrying `permissions.deny` — the same deny
+/// fence the wrapped path passes as `--disallowedTools` (operator credentials, agent-tooling
+/// state, the operational store; see `execute_wrapped::deny_rules`), read here as user-scope
+/// settings by the CLI the bridge spawns.
+///
+/// Deliberately NO `permissions.defaultMode`: the wrapped path pins `acceptEdits` because its
+/// governance rides a PreToolUse hook that fires regardless of mode, but on ACP governance
+/// rides `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
+/// resolve them before our policy is ever asked. The bridge's own default keeps the permission
+/// requests flowing to the client, where both the governed and the ungoverned answer live.
+fn mint_worker_config_dir() -> anyhow::Result<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SPAWN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-acp-worker-config-{}-{seq}",
+        std::process::id()
+    ));
+    crate::gate_hook::create_dir_all_private(&dir)?;
+    let settings = json!({
+        "permissions": { "deny": crate::execute_wrapped::deny_rules() }
+    });
+    std::fs::write(dir.join("settings.json"), serde_json::to_vec(&settings)?)?;
+    Ok(dir)
+}
+
+/// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an
+/// `authenticate` step between the two whenever `initialize` advertises `authMethods`
+/// (FINDING-015; methodId from [`AcpConfig::auth_method`], else the agent's first advertised).
+/// Returns `Err` if the binary is not on PATH, the process fails to start, a handshake call
+/// exceeds its budget (see [`initialize_budget`] / [`session_new_budget`]), or the agent still
+/// refuses `session/new` as unauthenticated (the named error from [`unauthenticated_error`]).
 ///
 /// This takes no governance argument. It used to accept one and translate it into `--settings
 /// <path>` plus the gate-hook's env vars; the env vars arrived, the flag did not (the bridge does
 /// not parse it), so the hook had everything it needed except the instruction to run. Governed units
 /// take the wrapped path now — see the fail-closed return in `run_unit_streaming` and FINDING-060.
 fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Result<AcpProcess> {
+    // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
+    // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
+    // that proceeded without the override would run under the operator's own configuration,
+    // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
+    // carries its own isolation.
+    let worker_config_dir = match worker_claude_config_dir(
+        std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some(),
+    ) {
+        None => None,
+        Some(Ok(dir)) => Some(dir),
+        Some(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+                 under the operator's own CLI configuration (FINDING-061)"
+            ))
+        }
+    };
     let build_cmd = |binary: &str| {
         let mut cmd = std::process::Command::new(binary);
         // The engine's internal environment is stripped through the one chokepoint (FINDING-067): an
@@ -314,6 +397,13 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         // wrapped path, FINDING-060), but an ungoverned worker in a repo runs the same
         // `wicked-estate index .`. Harden FIRST — anything set below is set deliberately.
         cmd.hardened();
+        // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
+        // to a known slate, then set exactly what this path intends. This also overrides any
+        // CLAUDE_CONFIG_DIR the daemon itself inherited — the operator's live config dir is
+        // frequently exactly that variable.
+        if let Some(dir) = &worker_config_dir {
+            cmd.env(CLAUDE_CONFIG_DIR_ENV, dir);
+        }
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);
         cmd.stdin(Stdio::piped());
@@ -423,15 +513,61 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     ) {
         handshake_err!(child, e);
     }
-    if let Err(e) = rpc_expect(&rx, 1, initialize_budget()) {
-        handshake_err!(child, e);
+    // FINDING-015: this result used to be discarded (`if let Err(e) = rpc_expect(...)`), so the
+    // `authMethods` the agent advertised were never read and `authenticate` was never sent — an
+    // auth-requiring agent then stalled or errored on `session/new` with nothing naming the
+    // actual problem. Capture it, and run the ACP auth step below when the agent asks for one.
+    let init = match rpc_expect(&rx, 1, initialize_budget()) {
+        Ok(v) => v,
+        Err(e) => handshake_err!(child, e),
+    };
+    let auth_methods: Vec<String> = init["result"]["authMethods"]
+        .as_array()
+        .map(|methods| {
+            methods
+                .iter()
+                .filter_map(|m| m.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut next_id: u64 = 2;
+    // `(methodId sent, authenticate's own failure if it had one)` — carried into the named error
+    // below so a refused session tells the operator what was already tried.
+    let mut auth_attempt: Option<(String, Option<anyhow::Error>)> = None;
+    if !auth_methods.is_empty() {
+        // The operator's explicit choice wins; otherwise the FIRST advertised method — the ACP
+        // contract puts the agent's preferred method first, and guessing differently here would
+        // encode one agent's auth surface into every agent's startup.
+        let method_id = config
+            .auth_method
+            .clone()
+            .unwrap_or_else(|| auth_methods[0].clone());
+        let id = next_id;
+        next_id += 1;
+        let outcome = rpc_send(
+            &mut stdin,
+            id,
+            "authenticate",
+            json!({ "methodId": method_id }),
+        )
+        .and_then(|()| rpc_expect(&rx, id, initialize_budget()).map(|_| ()));
+        // A failed `authenticate` is NOT fatal on its own: agents advertise methods even while
+        // their stored credentials are already valid, and some reject `authenticate` outright in
+        // that state (claude-agent-acp@0.62 throws "Method not implemented." for its terminal
+        // methods). The authority on whether auth is satisfied is `session/new` below; the
+        // failure is kept so the named error can carry it if it turns out to matter.
+        auth_attempt = Some((method_id, outcome.err()));
     }
 
     // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp)
     // reject session/new with -32602 when it is absent; bridges ignore it.
+    let session_new_id = next_id;
+    next_id += 1;
     if let Err(e) = rpc_send(
         &mut stdin,
-        2,
+        session_new_id,
         "session/new",
         json!({
             "cwd": cwd.to_string_lossy().as_ref(),
@@ -440,9 +576,24 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     ) {
         handshake_err!(child, e);
     }
-    let resp = match rpc_expect(&rx, 2, session_new_budget()) {
+    let resp = match rpc_expect(&rx, session_new_id, session_new_budget()) {
         Ok(v) => v,
-        Err(e) => handshake_err!(child, e),
+        Err(e) => {
+            // FINDING-015, the fail-fast half: an `auth_required` refusal gets the NAMED error —
+            // the operator's fix is credentials (or `auth_method` in the registry), not retries,
+            // and a bare "ACP server error: {code:-32000}" says neither. Matched on the code the
+            // agent sent, not on its message text.
+            let still_unauth = e
+                .downcast_ref::<RpcServerError>()
+                .is_some_and(|se| se.code == Some(AUTH_REQUIRED_CODE));
+            if still_unauth {
+                handshake_err!(
+                    child,
+                    unauthenticated_error(&config.binary, &auth_methods, auth_attempt.as_ref(), &e)
+                );
+            }
+            handshake_err!(child, e)
+        }
     };
     let session_id = match resp["result"]["sessionId"].as_str() {
         Some(s) => s.to_string(),
@@ -460,8 +611,37 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         stderr_tail,
         _stderr_reader: stderr_reader,
         session_id,
-        next_id: 3,
+        next_id,
     })
+}
+
+/// The named failure for FINDING-015: `session/new` was refused with [`AUTH_REQUIRED_CODE`].
+/// Which variant fires depends on what the auth step already tried, so the message states what
+/// happened, what was attempted, and what the operator can change — never just the raw code.
+fn unauthenticated_error(
+    binary: &str,
+    advertised: &[String],
+    attempt: Option<&(String, Option<anyhow::Error>)>,
+    refusal: &anyhow::Error,
+) -> anyhow::Error {
+    match attempt {
+        Some((method_id, Some(auth_err))) => anyhow::anyhow!(
+            "ACP agent '{binary}' requires authentication: `authenticate` (methodId \
+             '{method_id}') failed ({auth_err}), then session/new was refused as \
+             unauthenticated ({refusal}). Advertised authMethods: {advertised:?} — set \
+             `auth_method` in this CLI's [cli.acp] registry entry to one of them, or \
+             authenticate the agent out of band"
+        ),
+        Some((method_id, None)) => anyhow::anyhow!(
+            "ACP agent '{binary}' is still unauthenticated after `authenticate` (methodId \
+             '{method_id}') succeeded: session/new was refused ({refusal}). Advertised \
+             authMethods: {advertised:?}"
+        ),
+        None => anyhow::anyhow!(
+            "ACP agent '{binary}' requires authentication but advertised no authMethods at \
+             initialize; session/new was refused ({refusal})"
+        ),
+    }
 }
 
 // ── JSON-RPC helpers ──────────────────────────────────────────────────────────
@@ -493,6 +673,29 @@ fn rpc_respond(stdin: &mut BufWriter<ChildStdin>, id: u64, result: Value) -> any
     Ok(())
 }
 
+/// The JSON-RPC `error.code` the ACP spec assigns to "authentication required": the agent
+/// refuses the call until `authenticate` succeeds. Matched structurally on the code the agent
+/// sent (via [`RpcServerError`]), never by pattern-matching a rendered message.
+const AUTH_REQUIRED_CODE: i64 = -32000;
+
+/// A JSON-RPC error frame from the agent, kept structured so a caller can react to the CODE
+/// (e.g. [`AUTH_REQUIRED_CODE`]) with a `downcast_ref` instead of grepping the display string.
+/// Renders exactly the message [`rpc_expect`] always produced, so nothing operator-visible
+/// changed when this type was introduced.
+#[derive(Debug)]
+struct RpcServerError {
+    code: Option<i64>,
+    raw: String,
+}
+
+impl std::fmt::Display for RpcServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ACP server error: {}", self.raw)
+    }
+}
+
+impl std::error::Error for RpcServerError {}
+
 fn rpc_expect(
     rx: &std::sync::mpsc::Receiver<String>,
     id: u64,
@@ -516,7 +719,10 @@ fn rpc_expect(
                 };
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(err) = v.get("error") {
-                        return Err(anyhow::anyhow!("ACP server error: {err}"));
+                        return Err(anyhow::Error::new(RpcServerError {
+                            code: err.get("code").and_then(Value::as_i64),
+                            raw: err.to_string(),
+                        }));
                     }
                     return Ok(v);
                 }
@@ -1398,12 +1604,15 @@ impl AcpStepRunner {
         // engine recorded `governed: true` for them.
         //
         // The bridge also hardcodes `settingSources: ["user", "project", "local"]` and resolves the
-        // permission mode from `permissions.defaultMode` in those settings, so an ACP worker inherits
-        // the operator's user scope — the leak FINDING-047 exists to close, still open here because
-        // `inject_isolation_flags` only runs on the wrapped path. An operator whose settings say
-        // `dontAsk` gets workers with Read/Edit/Write denied; observed consequence was every file
-        // mutation rerouted through Bash, which no file-tool deny rule can see, and one unit that
-        // silently applied nothing and still reported done.
+        // permission mode from `permissions.defaultMode` in those settings, so an ACP worker used to
+        // inherit the operator's user scope — the leak FINDING-047 closed on the wrapped path only
+        // (`inject_isolation_flags` rides argv, which the bridge does not read). An operator whose
+        // settings said `dontAsk` got workers with Read/Edit/Write denied; observed consequence was
+        // every file mutation rerouted through Bash, which no file-tool deny rule can see, and one
+        // unit that silently applied nothing and still reported done. Closed here as FINDING-061:
+        // `start_acp_process` now points CLAUDE_CONFIG_DIR at an engine-minted per-spawn directory
+        // (see `worker_claude_config_dir`), so the worker's user scope is engine-owned, not the
+        // operator's.
         //
         // Falling back is the same decision the HTTP-transport branch below already makes for the
         // same reason ("--settings cannot be injected"). The stdio branch assumed injection worked
@@ -1889,6 +2098,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn eight_simultaneous_starts_never_exceed_the_gate_in_flight() {
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("wicked-acp-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1900,6 +2110,7 @@ sleep 30
             binary: script.to_string_lossy().to_string(),
             start_args: vec![],
             transport: AcpTransport::default(),
+            auth_method: None,
         };
 
         let handles: Vec<_> = (0..8)
@@ -2027,6 +2238,345 @@ sleep 30
         // bridge rejecting something — so it must be stated, not rendered as an empty string.
         let empty: StderrTail = Arc::new(Mutex::new(std::collections::VecDeque::new()));
         assert!(stderr_context(&empty).contains("silent"));
+    }
+
+    // ── FINDING-015: the ACP client authenticates when the agent asks it to ─────
+
+    /// Every test that drives a REAL `start_acp_process` serialises here.
+    /// `start_acp_process` acquires the process-wide start gate, and
+    /// `eight_simultaneous_starts_never_exceed_the_gate_in_flight` asserts a concurrency peak
+    /// measured against that same gate — a permit held by a concurrent test forces one of its
+    /// 8 starts past `START_WAIT` into a contended start, and the peak assertion becomes a race.
+    #[cfg(unix)]
+    static REAL_STARTS: Mutex<()> = Mutex::new(());
+
+    /// A fresh scratch dir per test — these stubs run concurrently under `cargo test`, so a
+    /// shared dir would interleave ledgers.
+    #[cfg(unix)]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wicked-acp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    fn write_stub(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let script = dir.join("stub-bridge.sh");
+        std::fs::write(&script, body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    fn stub_config(script: &std::path::Path, auth_method: Option<&str>) -> AcpConfig {
+        AcpConfig {
+            binary: script.to_string_lossy().to_string(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: auth_method.map(str::to_string),
+        }
+    }
+
+    /// A stub agent that REQUIRES authentication: `initialize` advertises two authMethods, and
+    /// the next frame decides the outcome — an `authenticate` frame is appended to `ledger` and
+    /// the session is granted; anything else (i.e. an unauthenticated `session/new`) is refused
+    /// with the ACP `auth_required` code, which is exactly what the pre-fix client provoked.
+    #[cfg(unix)]
+    fn stub_auth_requiring_bridge(
+        dir: &std::path::Path,
+        ledger: &std::path::Path,
+    ) -> std::path::PathBuf {
+        write_stub(
+            dir,
+            &format!(
+                r#"#!/bin/sh
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"authMethods":[{{"id":"method-a","name":"A"}},{{"id":"method-b","name":"B"}}]}}}}'
+read second
+case "$second" in
+*'"method":"authenticate"'*)
+  printf '%s\n' "$second" >> "{ledger}"
+  printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":null}}'
+  read _new
+  printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"sessionId":"authed-session"}}}}'
+  ;;
+*)
+  printf '%s\n' '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32000,"message":"auth required"}}}}'
+  ;;
+esac
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        )
+    }
+
+    /// FINDING-015 end-to-end, through the real `start_acp_process`: an agent that advertises
+    /// `authMethods` and refuses unauthenticated sessions gets `authenticate` between
+    /// `initialize` and `session/new`, and the handshake succeeds. The pre-fix client discarded
+    /// the initialize result and never authenticated — against this exact stub that path gets
+    /// the -32000 refusal, so reverting the fix fails this test at the `expect`.
+    #[test]
+    #[cfg(unix)]
+    fn an_auth_requiring_agent_is_authenticated_before_session_new() {
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("auth-default");
+        let ledger = dir.join("auth-frames.txt");
+        std::fs::write(&ledger, "").unwrap();
+        let script = stub_auth_requiring_bridge(&dir, &ledger);
+
+        let proc = start_acp_process(&stub_config(&script, None), &dir)
+            .expect("an auth-requiring agent must start once the client authenticates");
+        assert_eq!(proc.session_id, "authed-session");
+        // initialize=1, authenticate=2, session/new=3 — the first turn must not reuse an id.
+        assert_eq!(proc.next_id, 4);
+
+        let frames = std::fs::read_to_string(&ledger).unwrap();
+        assert!(
+            frames.contains(r#""methodId":"method-a""#),
+            "with no auth_method configured, the FIRST advertised method is used: {frames}"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operator's `auth_method` (the new serde-default field on `AcpConfig`) overrides the
+    /// agent's advertised order — a gateway-authed seat must not be logged in with the agent's
+    /// preferred interactive method just because it is listed first.
+    #[test]
+    #[cfg(unix)]
+    fn a_configured_auth_method_overrides_the_agents_first_advertised() {
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("auth-configured");
+        let ledger = dir.join("auth-frames.txt");
+        std::fs::write(&ledger, "").unwrap();
+        let script = stub_auth_requiring_bridge(&dir, &ledger);
+
+        let proc = start_acp_process(&stub_config(&script, Some("method-b")), &dir)
+            .expect("configured-method authentication must start the session");
+
+        let frames = std::fs::read_to_string(&ledger).unwrap();
+        assert!(
+            frames.contains(r#""methodId":"method-b""#),
+            "the configured method must be the one sent: {frames}"
+        );
+        assert!(
+            !frames.contains(r#""methodId":"method-a""#),
+            "the agent's first method must NOT be sent when the operator chose one: {frames}"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fail-fast half of FINDING-015: `authenticate` is accepted and `session/new` is STILL
+    /// refused as unauthenticated. That must produce the named error — one that says what was
+    /// tried and what the operator can change — not the bare server error, and not a hang.
+    /// Reverting the code-matched branch in `start_acp_process` fails the message assertions.
+    #[test]
+    #[cfg(unix)]
+    fn still_unauthenticated_after_authenticate_fails_with_the_named_error() {
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("auth-never");
+        let script = write_stub(
+            &dir,
+            r#"#!/bin/sh
+read _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"method-a","name":"A"}]}}'
+read _auth
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":null}'
+read _new
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"credentials rejected"}}'
+sleep 30
+"#,
+        );
+
+        let err = match start_acp_process(&stub_config(&script, None), &dir) {
+            Err(e) => e,
+            Ok(_) => panic!("an agent that refuses every session must fail the start"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("still unauthenticated after"),
+            "the refusal must be NAMED as an auth failure, not rendered as a bare server error: {msg}"
+        );
+        assert!(
+            msg.contains("method-a"),
+            "the named error must say which method was already tried: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shape claude-agent-acp@0.62 actually has: it advertises terminal auth methods while
+    /// already logged in, and its `authenticate` throws "Method not implemented." for them. An
+    /// `authenticate` failure therefore must NOT be fatal on its own — `session/new` is the
+    /// authority on whether auth is satisfied. Making the failure fatal breaks the one bridge
+    /// this runner ships as its primary seat.
+    #[test]
+    #[cfg(unix)]
+    fn an_agent_that_rejects_authenticate_but_grants_sessions_still_starts() {
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("auth-already");
+        let script = write_stub(
+            &dir,
+            r#"#!/bin/sh
+read _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"authMethods":[{"id":"method-a","name":"A"}]}}'
+read _auth
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not implemented."}}'
+read _new
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"already-authed"}}'
+sleep 30
+"#,
+        );
+
+        let proc = start_acp_process(&stub_config(&script, None), &dir)
+            .expect("a rejected authenticate must not fail a start the agent is willing to grant");
+        assert_eq!(proc.session_id, "already-authed");
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── FINDING-061: an ACP worker must not run under the operator's CLI config ─
+
+    /// End-to-end through the real `start_acp_process`: the child the spawn actually produces
+    /// must see an engine-minted CLAUDE_CONFIG_DIR, not the daemon's inherited one and not the
+    /// implicit `~/.claude`. The stub echoes the variable it received, so deleting the
+    /// `cmd.env(...)` line in `start_acp_process` — the reachability this test exists to prove —
+    /// fails the prefix assertion below.
+    #[test]
+    #[cfg(unix)]
+    fn an_acp_worker_does_not_inherit_the_operators_claude_config_dir() {
+        // The escape hatch is a supported configuration: a host that sets it runs workers under
+        // the operator's config ON PURPOSE, and must not fail a test about the default boundary
+        // (same convention as the budget tests asserting on `parse_secs(None, ..)`).
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("config-iso");
+        let ledger = dir.join("seen-config-dir.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"iso"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+
+        let proc = start_acp_process(&stub_config(&script, None), &dir).expect("start");
+        let seen = std::fs::read_to_string(&ledger).unwrap().trim().to_string();
+        assert_ne!(
+            seen, "UNSET",
+            "the spawn must SET the config dir: merely not-inheriting one leaves the bridge on \
+             its homedir() fallback, which is the operator's ~/.claude"
+        );
+        let seen_dir = std::path::PathBuf::from(&seen);
+        assert!(
+            seen_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wicked-acp-worker-config-")),
+            "the worker's config dir must be engine-minted, not inherited: {seen}"
+        );
+        // Substance, not presence: the minted scope actually carries the deny fence.
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(seen_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            !settings["permissions"]["deny"]
+                .as_array()
+                .expect("seeded settings carry permissions.deny")
+                .is_empty(),
+            "the seeded user scope must fence the worker, not just exist: {settings}"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&seen_dir);
+    }
+
+    /// The escape hatch: `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` set means NO override — the one
+    /// legitimate case is an operator deliberately testing their own hooks/skills through a run.
+    /// Tested on the decision function (both branches) because mutating the process environment
+    /// races every other test; the call site passing the REAL env presence is pinned by the
+    /// source audit below.
+    #[test]
+    fn the_inherit_escape_hatch_disables_acp_config_isolation() {
+        assert!(worker_claude_config_dir(true).is_none());
+        let minted = worker_claude_config_dir(false)
+            .expect("isolation is the default")
+            .expect("minting succeeds");
+        assert!(minted.is_dir());
+        let _ = std::fs::remove_dir_all(&minted);
+    }
+
+    /// The call site must consult the SAME escape-hatch variable as the wrapped path, read from
+    /// the real environment — a hardcoded `false` would pass the behavioural test above while
+    /// silently deleting the operator's opt-out. Needle built by concatenation and matched on
+    /// whitespace-stripped source so neither this test nor rustfmt can satisfy or break it.
+    #[test]
+    fn the_acp_spawn_consults_the_same_inherit_escape_hatch_as_the_wrapped_path() {
+        let src: String = include_str!("acp_runner.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let needle = format!(
+            "worker_claude_config_dir(std::env::var_os(crate::execute_wrapped::{}).is_some()",
+            "INHERIT_OPERATOR_CONFIG_ENV"
+        );
+        assert!(
+            src.contains(&needle),
+            "start_acp_process no longer decides config isolation from the wrapped path's \
+             escape-hatch variable"
+        );
+    }
+
+    /// Each spawn gets its OWN directory. The minted dir is the worker's user scope, so a shared
+    /// one would be a user scope any worker can mutate for every later worker — FINDING-047's
+    /// leak with the operator swapped out for a previous worker.
+    #[test]
+    fn each_acp_spawn_gets_its_own_config_dir_never_a_shared_one() {
+        let a = mint_worker_config_dir().expect("mint a");
+        let b = mint_worker_config_dir().expect("mint b");
+        assert_ne!(a, b);
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// What the minted user scope says. The deny list must be the SAME fence the wrapped path
+    /// ships (not a diverging copy), and no `defaultMode` may be pinned: on ACP, governance rides
+    /// `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
+    /// resolve them before our policy is ever asked.
+    #[test]
+    fn the_minted_config_dir_seeds_the_deny_fence_and_pins_no_permission_mode() {
+        let dir = mint_worker_config_dir().expect("mint");
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        let deny: Vec<String> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            deny,
+            crate::execute_wrapped::deny_rules(),
+            "the ACP fence must be the wrapped path's fence, not a copy that can drift"
+        );
+        assert!(
+            settings["permissions"].get("defaultMode").is_none(),
+            "a pinned mode that auto-approves would answer session/request_permission before \
+             the governance gate sees it: {settings}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

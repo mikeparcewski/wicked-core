@@ -77,6 +77,12 @@ pub struct AcpConfig {
     /// Wire transport to use when connecting to this ACP server.
     #[serde(default)]
     pub transport: AcpTransport,
+    /// The `methodId` to send in the ACP `authenticate` call when the agent's `initialize`
+    /// response advertises a non-empty `authMethods` list. When unset, the first advertised
+    /// method is used (the agent's own preference order). Ignored when the agent advertises
+    /// no methods — `authenticate` is never sent unsolicited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
 }
 
 /// How the scaffold prompt is delivered to the CLI process.
