@@ -145,13 +145,20 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         "the work output is the real echo stdout (got: {out:?})"
     );
 
-    // The run executed in the repo's isolated worktree.
-    assert!(
-        repo.join(".wicked").join("worktrees").join("run").is_dir(),
-        "the run used the repo's worktree"
-    );
-    assert!(
-        v.session.workdir.is_some(),
-        "the session records its workdir"
+    // The run executed in the repo's isolated worktree. A completed run's CLEAN worktree is now
+    // reaped on the terminal transition (FINDING-003, #208): the `echo` run touches no files, so
+    // its tree is clean and gets removed. Asserting the directory still exists therefore RACES the
+    // reaper — and loses on Linux CI, where the tree is reliably clean (macOS/Windows spared it by
+    // timing/FS metadata, which is exactly the kind of platform-luck a test must not depend on).
+    // Assert instead that the session RECORDED that worktree as its workdir — deterministic, and
+    // the honest evidence that the run used it. `actor.rs` sets workdir to the worktree path on
+    // `WorktreeReady`.
+    let expected_wt = repo.join(".wicked").join("worktrees").join("run");
+    assert_eq!(
+        v.session.workdir.as_deref(),
+        Some(expected_wt.to_string_lossy().as_ref()),
+        "the run recorded the repo's isolated worktree as its workdir (workdir={:?}, expected {:?})",
+        v.session.workdir,
+        expected_wt,
     );
 }
