@@ -54,10 +54,14 @@ pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
-/// Named once because FOUR things have to agree on it: [`COVERAGE_SCRIPT`] (which reads it and, on
-/// the fallback branch, causes it to be written), `wicked-core coverage` (which writes it into its
-/// cwd), the `coverage` phase's `required_deliverables` in `workflows/domain-extraction.json`, and
-/// the denial diagnostic that reads it back to report what was measured.
+/// Named once because three things have to agree on it AT RUNTIME: [`COVERAGE_SCRIPT`] (which reads
+/// it and, on the fallback branch, causes it to be written), `wicked-core coverage` (which writes it
+/// into its cwd), and the denial diagnostic that reads it back to report what was measured.
+///
+/// `workflows/domain-extraction.json` also lists the file in the `coverage` phase's
+/// `required_deliverables`, but that field is deserialized into
+/// [`PhaseDef`](crate::workflow::PhaseDef) and never read by anything — it documents an intent the
+/// engine does not enforce, so it is NOT a fourth agreeing artifact (review; filed as FINDING-101).
 ///
 /// The fourth disagreed. `failing_measurement` looked in `.wicked/domain/coverage-report.json` — a
 /// path nothing else in the system uses — so it never found the report, and every LEGITIMATE
