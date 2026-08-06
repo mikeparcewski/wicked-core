@@ -256,9 +256,9 @@ fn work_output_survives_a_daemon_restart() {
             ids.len()
         );
         for (id, out) in ids.iter().zip(&outs) {
-            let o = out
-                .as_ref()
-                .unwrap_or_else(|| panic!("unit {id} has a work_output in the live process"));
+            let o = out.as_ref().unwrap_or_else(|| {
+                panic!("unit {id} is MISSING its work_output in the live process")
+            });
             assert!(
                 o.contains("stub-output for"),
                 "the transcript is the real output: {o:?}"
