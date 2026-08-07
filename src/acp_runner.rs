@@ -1086,8 +1086,65 @@ fn parse_result_usage(u: &Value) -> Option<Usage> {
 
 // ── Fallback helpers ──────────────────────────────────────────────────────────
 
+/// FINDING #5. A single transient CLI/connection blip must not kill a whole governed run. A
+/// governed unit's single-shot `claude -p` that exits NONZERO has almost always hit an
+/// API/connection error — a task judgment surfaces as exit-0 plus a DOWNSTREAM gate deny, never as a
+/// nonzero CLI exit (a governance tool-deny is handled inside claude, not as a process failure) — so
+/// the nonzero-exit / could-not-run failure is retried a bounded number of times before the unit
+/// fails closed. Governed phases are idempotent (estate annotations upsert; a re-run re-derives), so
+/// a retry is safe. A DETERMINISTIC failure (a missing declared deliverable, FINDING-101) is NOT
+/// retried — a re-run cannot conjure the artifact.
+const MAX_TRANSIENT_RETRIES: u32 = 2;
+
+/// Whether a FAILED single-shot output looks like an infrastructural/transient CLI failure (worth a
+/// retry) rather than a deterministic one. Pure, so the policy is falsifiable without a `StepInput`
+/// fixture. Matches the wrapped runner's own nonzero-exit / could-not-run messages
+/// (`execute_wrapped.rs`) plus the network signatures a `claude -p` prints on an API/connection drop.
+fn is_transient_cli_failure(output: &str) -> bool {
+    // FINDING-101 incompleteness is deterministic — a retry cannot produce the missing deliverable.
+    if output.contains("did not produce its declared deliverable") {
+        return false;
+    }
+    let o = output.to_ascii_lowercase();
+    o.contains("exited") // the wrapped runner's "(cli `x` exited N) …" nonzero-exit message
+        || o.contains("could not run")
+        || o.contains("connection")
+        || o.contains("closed")
+        || o.contains("reset")
+        || o.contains("network")
+        || o.contains("stream error")
+        || o.contains("overloaded")
+        || o.contains("rate limit")
+        || o.contains("502")
+        || o.contains("503")
+}
+
+/// Whether to retry the single-shot worker after an outcome. Pure + exhaustively unit-tested — the
+/// loop in [`fallback_with_warning`] is a trivial application of this policy.
+///
+/// `governed` GATES the retry: only a GOVERNED unit is retried. The idempotency argument (a re-run
+/// re-derives; estate annotations upsert) and the "nonzero exit ⇒ infrastructural" argument are
+/// properties of the governed campaign phases. The engine's OWN ungoverned `claude` calls (the
+/// internal agent-judge / validator-authoring invocations) are NOT retried — they are not campaign
+/// phases and their re-run safety is not established (Copilot review on #216). `retries_done` is how
+/// many retries have already run (0 on the first outcome).
+fn should_retry_worker(
+    governed: bool,
+    status: StepStatus,
+    output: &str,
+    retries_done: u32,
+) -> bool {
+    governed
+        && status == StepStatus::Failed
+        && retries_done < MAX_TRANSIENT_RETRIES
+        && is_transient_cli_failure(output)
+}
+
 /// Run the single-shot fallback, prepending `warning` to the output so it appears in
-/// both the streaming view and the persisted `StepOutput.output` (visible in studio).
+/// both the streaming view and the persisted `StepOutput.output` (visible in studio). Retries a
+/// TRANSIENT worker failure up to [`MAX_TRANSIENT_RETRIES`] times (FINDING #5) so a single API blip
+/// in a long GOVERNED phase does not fail the whole run. The retry notice is folded into the
+/// PERSISTED output (not just streamed) so an operator/Studio can see a unit succeeded after retries.
 fn fallback_with_warning(
     warning: String,
     input: &StepInput,
@@ -1095,7 +1152,34 @@ fn fallback_with_warning(
     fallback: &WrappedCliStepRunner,
 ) -> StepOutput {
     emit(&format!("{warning}\n"));
+    // Only governed campaign units are retried — see `should_retry_worker`.
+    let governed = input.governance.is_some();
     let mut result = fallback.run_unit_streaming(input, emit);
+    // Retry decision reads the RAW runner output (the "(cli … exited N)" message), before the
+    // warning is prepended below.
+    let mut retries_done = 0u32;
+    while should_retry_worker(governed, result.status, &result.output, retries_done) {
+        retries_done += 1;
+        emit(&format!(
+            "[wicked-core] worker hit a transient CLI/connection failure; retrying \
+             ({retries_done}/{MAX_TRANSIENT_RETRIES})\n"
+        ));
+        result = fallback.run_unit_streaming(input, emit);
+    }
+    // Persist the retry notice (not just `emit`, which rides the excluded delta stream): the final
+    // outcome — success or a fail-closed after exhausting retries — must show it in the durable output.
+    let retry_note = if retries_done > 0 {
+        let outcome = if result.status == StepStatus::Failed {
+            "still failed after"
+        } else {
+            "succeeded after"
+        };
+        format!("[wicked-core] worker {outcome} {retries_done} transient-failure retry(ies)\n")
+    } else {
+        String::new()
+    };
+    let warning = format!("{warning}\n{retry_note}");
+    let warning = warning.trim_end().to_string();
     result.output = if result.output.is_empty() {
         warning
     } else {
@@ -2005,6 +2089,83 @@ fn cli_runs_claude(cli_key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{is_transient_cli_failure, should_retry_worker, MAX_TRANSIENT_RETRIES};
+    use crate::workflow::StepStatus;
+
+    // ── FINDING #5: transient single-shot failures are retried; deterministic ones are not ────────
+
+    #[test]
+    fn transient_cli_failures_are_recognized_and_deterministic_ones_are_not() {
+        // The wrapped runner's nonzero-exit + could-not-run messages, and network signatures.
+        for t in [
+            "(cli `claude` exited 1) Connection closed mid-response",
+            "(cli `claude` exited 143)",
+            "(could not run `claude`: No such file or directory)",
+            "stream error: the server reset the connection",
+            "Error: overloaded_error (503)",
+            "rate limit exceeded",
+        ] {
+            assert!(is_transient_cli_failure(t), "should be transient: {t:?}");
+        }
+        // FINDING-101 incompleteness is DETERMINISTIC — a retry cannot conjure the artifact, so it
+        // must NOT be classified transient (else a real gap burns retries and still fails). The
+        // deliverable phrase takes PRECEDENCE even when the message also carries a transient-looking
+        // marker: this string contains "exited", yet the exclusion must still win — drop the
+        // exclusion and this case flips to transient, failing here.
+        assert!(
+            !is_transient_cli_failure(
+                "unit u3 reported done but did not produce its declared deliverable(s): rg.json \
+                 (cli `claude` exited 1)"
+            ),
+            "a missing declared deliverable is deterministic, not transient — even with a marker"
+        );
+        // A plain evaluator-style rejection with no infrastructural marker is not retried.
+        assert!(!is_transient_cli_failure(
+            "the requirement claim is content-free"
+        ));
+    }
+
+    #[test]
+    fn should_retry_only_a_transient_failure_and_only_within_the_bound() {
+        let transient = "(cli `claude` exited 1) connection reset";
+        // Retry a GOVERNED transient FAILED while retries remain…
+        assert!(should_retry_worker(true, StepStatus::Failed, transient, 0));
+        assert!(should_retry_worker(
+            true,
+            StepStatus::Failed,
+            transient,
+            MAX_TRANSIENT_RETRIES - 1
+        ));
+        // …but STOP at the bound (no unbounded retry — a persistent transient still fails closed).
+        assert!(!should_retry_worker(
+            true,
+            StepStatus::Failed,
+            transient,
+            MAX_TRANSIENT_RETRIES
+        ));
+        // NEVER retry an UNGOVERNED unit — the idempotency/infra argument is governed-only (an
+        // engine-internal judge/validator claude call must not be silently re-run).
+        assert!(!should_retry_worker(
+            false,
+            StepStatus::Failed,
+            transient,
+            0
+        ));
+        // Never retry a success, a cancel (our own timeout), or a deterministic/non-transient failure.
+        assert!(!should_retry_worker(true, StepStatus::Ok, transient, 0));
+        assert!(!should_retry_worker(
+            true,
+            StepStatus::Cancelled,
+            transient,
+            0
+        ));
+        assert!(!should_retry_worker(
+            true,
+            StepStatus::Failed,
+            "did not produce its declared deliverable(s): rg.json",
+            0
+        ));
+    }
 
     #[test]
     fn a_worker_config_dir_is_fresh_non_guessable_and_refuses_reuse() {
