@@ -688,26 +688,16 @@ impl WrappedCliStepRunner {
                             .into_os_string(),
                     );
                 }
-                // `<repo>/.codegraph/estate.db` → the repo root is two levels up (the source tree).
-                // `code_graph_db` is populated from `existing_code_graph`, which only ever yields
-                // that exact shape, so a value that is NOT `.../.codegraph/estate.db` signals a bug
-                // upstream — and blindly taking `parent().parent()` off an arbitrary path would hand
-                // the worker an over-broad read root. Validate the shape; on a mismatch, say so and
-                // do NOT widen, rather than widen to the wrong place.
-                if let Some(db) = g.code_graph_db.as_deref() {
-                    let p = std::path::Path::new(db);
-                    let shaped = p.file_name().is_some_and(|n| n == "estate.db")
-                        && p.parent()
-                            .and_then(std::path::Path::file_name)
-                            .is_some_and(|n| n == ".codegraph");
-                    match (shaped, p.parent().and_then(std::path::Path::parent)) {
-                        (true, Some(repo_root)) => {
-                            read_roots.push(repo_root.as_os_str().to_os_string());
-                        }
-                        _ => {
+                // `<repo>/.codegraph/estate.db` → widen the READ boundary to the repo root (two
+                // levels up). `repo_read_root` returns it only for an ABSOLUTE, correctly-shaped
+                // path; a relative or mis-shaped `code_graph_db` is NOT widened (see the helper).
+                match repo_read_root(g.code_graph_db.as_deref()) {
+                    Some(repo_root) => read_roots.push(repo_root),
+                    None => {
+                        if let Some(db) = g.code_graph_db.as_deref() {
                             eprintln!(
-                                "wicked-core: code_graph_db {db:?} is not the expected \
-                                 <repo>/.codegraph/estate.db shape; not widening the read boundary \
+                                "wicked-core: code_graph_db {db:?} is not an absolute \
+                                 <repo>/.codegraph/estate.db path; not widening the read boundary \
                                  to a repo root for unit {}",
                                 input.unit.id
                             );
@@ -1146,6 +1136,33 @@ struct GovLaunch {
     /// annotations ride Bash, which the boundary does not path-judge, so no write-widening is
     /// needed (and widening it would let a worker rewrite its own gate pin). `None` for a repo-less run.
     code_graph_db: Option<String>,
+}
+
+/// The repo-root READ root to add for a governed unit whose repo has a code graph, or `None`.
+///
+/// `code_graph_db` is `<repo>/.codegraph/estate.db`, so the repo root is two levels up. This returns
+/// it ONLY when the path is ABSOLUTE and has exactly that shape. Two rejections, both fail-closed
+/// (no widening):
+///   - Not absolute — `register-repo --path ./repo` stores a relative root, so `existing_code_graph`
+///     yields a relative `code_graph_db`. Pushed as a READ root, the gate's `path_policy` resolves
+///     it against the worker's worktree cwd, widening reads to the WRONG tree (or not at all). The
+///     boundary requires absolute roots (the WRITE root is the absolute worktree cwd for the same
+///     reason), so a relative value is a shape mismatch, not a root.
+///   - Wrong shape — anything not ending `.codegraph/estate.db` is not a code graph; taking
+///     `parent().parent()` off an arbitrary path would hand the worker an over-broad read root.
+fn repo_read_root(code_graph_db: Option<&str>) -> Option<std::ffi::OsString> {
+    let p = std::path::Path::new(code_graph_db?);
+    let shaped = p.is_absolute()
+        && p.file_name().is_some_and(|n| n == "estate.db")
+        && p.parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == ".codegraph");
+    if !shaped {
+        return None;
+    }
+    p.parent()
+        .and_then(std::path::Path::parent)
+        .map(|root| root.as_os_str().to_os_string())
 }
 
 /// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
@@ -1719,6 +1736,44 @@ mod deliverables_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-boundary derivation (#213 review): the repo root is widened ONLY for an absolute,
+    /// `.codegraph/estate.db`-shaped path. A relative `code_graph_db` (a repo registered with a
+    /// relative `--path`) must NOT widen — pushed as a READ root it would resolve against the
+    /// worker's worktree, widening reads to the wrong tree. Built cross-platform off
+    /// `current_dir()` so the "absolute" case is genuinely absolute on Windows too (a leading `/`
+    /// is NOT absolute there — the trap FINDING-069 already caught once).
+    #[test]
+    fn repo_read_root_requires_an_absolute_codegraph_shaped_path() {
+        use std::ffi::OsString;
+        let base = std::env::current_dir().unwrap();
+
+        // absolute + shaped → the repo root, two levels up.
+        let db = base.join("repo").join(".codegraph").join("estate.db");
+        assert_eq!(
+            repo_read_root(db.to_str()),
+            Some(OsString::from(base.join("repo"))),
+            "an absolute <repo>/.codegraph/estate.db widens to <repo>"
+        );
+
+        // relative + shaped → None (would resolve against the worktree cwd).
+        assert_eq!(
+            repo_read_root(Some("repo/.codegraph/estate.db")),
+            None,
+            "a relative code_graph_db must not widen the read boundary"
+        );
+
+        // absolute but wrong shape → None (arbitrary path, over-broad root otherwise).
+        let wrong = base.join("repo").join("build").join("estate.db");
+        assert_eq!(
+            repo_read_root(wrong.to_str()),
+            None,
+            "non-.codegraph parent is not a code graph"
+        );
+
+        // absent → None.
+        assert_eq!(repo_read_root(None), None);
+    }
 
     /// Why the two emptiness guards on this path (`argv.is_empty()` before spawning, and the
     /// `argv.first()` guard on the FINDING-063 disclosure event) are DEFENSIVE and not live: the
