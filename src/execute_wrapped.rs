@@ -689,16 +689,45 @@ impl WrappedCliStepRunner {
                     );
                 }
                 // `<repo>/.codegraph/estate.db` → the repo root is two levels up (the source tree).
-                if let Some(repo_root) = g
-                    .code_graph_db
-                    .as_deref()
-                    .and_then(|db| std::path::Path::new(db).parent())
-                    .and_then(std::path::Path::parent)
-                {
-                    read_roots.push(repo_root.as_os_str().to_os_string());
+                // `code_graph_db` is populated from `existing_code_graph`, which only ever yields
+                // that exact shape, so a value that is NOT `.../.codegraph/estate.db` signals a bug
+                // upstream — and blindly taking `parent().parent()` off an arbitrary path would hand
+                // the worker an over-broad read root. Validate the shape; on a mismatch, say so and
+                // do NOT widen, rather than widen to the wrong place.
+                if let Some(db) = g.code_graph_db.as_deref() {
+                    let p = std::path::Path::new(db);
+                    let shaped = p.file_name().is_some_and(|n| n == "estate.db")
+                        && p.parent()
+                            .and_then(std::path::Path::file_name)
+                            .is_some_and(|n| n == ".codegraph");
+                    match (shaped, p.parent().and_then(std::path::Path::parent)) {
+                        (true, Some(repo_root)) => {
+                            read_roots.push(repo_root.as_os_str().to_os_string());
+                        }
+                        _ => {
+                            eprintln!(
+                                "wicked-core: code_graph_db {db:?} is not the expected \
+                                 <repo>/.codegraph/estate.db shape; not widening the read boundary \
+                                 to a repo root for unit {}",
+                                input.unit.id
+                            );
+                        }
+                    }
                 }
-                if let Ok(joined) = std::env::join_paths(&read_roots) {
-                    cmd.env(crate::gate_hook::READ_ROOTS_ENV, joined);
+                // A `join_paths` failure (e.g. a root containing the platform path separator) must
+                // not silently drop the read roots — that would leave the governed worker unable to
+                // read the repo it was armed for, with no trace of why. Fail loud.
+                match std::env::join_paths(&read_roots) {
+                    Ok(joined) => {
+                        cmd.env(crate::gate_hook::READ_ROOTS_ENV, joined);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "wicked-core: could not assemble READ_ROOTS from {read_roots:?} ({e}); \
+                             the governed worker's read boundary is left unset for unit {}",
+                            input.unit.id
+                        );
+                    }
                 }
             }
             match run_bounded(cmd, self.timeout, emit, adapter) {

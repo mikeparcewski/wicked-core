@@ -1041,8 +1041,14 @@ pub fn persist_domain_model(
         }
     }
 
+    // Atomic: the nodes and their edges land together or not at all. Without the batch, an
+    // `upsert_edges` failure after `upsert_nodes` succeeded would leave the store holding a partial
+    // domain graph even though the command fails closed — a persisted-but-incomplete graph is worse
+    // than none. Matches the `begin_batch`/`commit_batch` write path every other store write uses.
+    store.begin_batch()?;
     store.upsert_nodes(&nodes)?;
     store.upsert_edges(&edges)?;
+    store.commit_batch()?;
     Ok((nodes.len(), edges.len()))
 }
 
