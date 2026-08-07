@@ -217,6 +217,74 @@ fn exec_seam_round_trip_matches_in_process() {
     drop(bus);
 }
 
+/// #133 (DURABLE TRANSCRIPTS): a unit's gate-approved `work_output` must survive a daemon restart —
+/// a run that COMPLETED in a prior process must still return its transcript from a fresh Core on the
+/// same store. The reported symptom was `work_output` returning `null` for every run that finished
+/// before the current daemon started (transcripts treated as process-lifetime state). This is the
+/// falsifiable proof of the fix: complete a run in `core1`, drop it, reopen the SAME estate db in
+/// `core2`, and read the transcript back — `core2` never ran the work, so a non-null answer can only
+/// come from the durable store (`put_node` on approval), not in-memory actor state.
+#[test]
+fn work_output_survives_a_daemon_restart() {
+    let dir = tmp_dir("durable-output");
+    let estate_db = dir.join("estate.db").to_str().unwrap().to_string();
+
+    // ── Process 1: run to completion, capture the per-unit transcripts + their stable unit ids.
+    let (unit_ids, before): (Vec<String>, Vec<Option<String>>) = {
+        let core1 = Core::spawn_with_engine(
+            estate_db.clone(),
+            Arc::new(StubDispatcher),
+            Arc::new(CountingRunner {
+                runs: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let events = core1.subscribe();
+        core1.launch_run(spec("durable-run")).expect("launch");
+        wait_for_completion(&events, "durable-run");
+
+        let detail = core1
+            .sessions_detail()
+            .unwrap()
+            .into_iter()
+            .find(|v| v.session.id == "durable-run")
+            .expect("run present");
+        let ids: Vec<String> = detail.units.iter().map(|u| u.id.clone()).collect();
+        let outs: Vec<Option<String>> = ids.iter().map(|id| core1.work_output(id)).collect();
+        assert!(
+            ids.len() >= 2,
+            "two-sentence problem planned {} units",
+            ids.len()
+        );
+        for (id, out) in ids.iter().zip(&outs) {
+            let o = out.as_ref().unwrap_or_else(|| {
+                panic!("unit {id} is MISSING its work_output in the live process")
+            });
+            assert!(
+                o.contains("stub-output for"),
+                "the transcript is the real output: {o:?}"
+            );
+        }
+        (ids, outs)
+    }; // core1 dropped here — the "daemon" that ran the work is gone.
+
+    // ── Process 2 (restart): a fresh Core on the SAME estate db, with NO launch. The completed run
+    // is terminal, so bootstrap does not re-drive it — any transcript we read is served from the
+    // durable store, exactly the path the reported bug returned null on.
+    let core2 = Core::spawn_with_engine(
+        estate_db,
+        Arc::new(StubDispatcher),
+        Arc::new(CountingRunner {
+            runs: Arc::new(AtomicUsize::new(0)),
+        }),
+    );
+    let after: Vec<Option<String>> = unit_ids.iter().map(|id| core2.work_output(id)).collect();
+    assert_eq!(
+        after, before,
+        "work_output returned the SAME transcript after a restart — transcripts are durable in \
+         core.db, not process-lifetime state (#133). A null here is the reported regression."
+    );
+}
+
 // ── Shared helpers for the seam-finding regression tests below ────────────────────────────────────────
 
 /// Poll the store until `run_id` reaches `want` (or a deadline). Avoids racing the live event stream.
