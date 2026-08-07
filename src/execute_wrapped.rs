@@ -1111,9 +1111,11 @@ struct GovLaunch {
     /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
     phase_id: String,
     /// The repo's code-graph store (`<repo>/.codegraph/estate.db`), when this unit runs against a
-    /// registered repo. Used to widen the filesystem boundary to what a governed extraction unit
-    /// provably needs: READ the repo source (graph paths anchor to the repo root, not the worktree)
-    /// and WRITE the graph store its annotations land in. `None` for a repo-less run.
+    /// registered repo. Used to (a) point the worker's estate MCP at the repo-local graph and
+    /// (b) widen the READ boundary to the repo root (graph paths anchor there, not to the worktree).
+    /// It does NOT widen the WRITE boundary — that stays worktree-only; the extractor's store
+    /// annotations ride Bash, which the boundary does not path-judge, so no write-widening is
+    /// needed (and widening it would let a worker rewrite its own gate pin). `None` for a repo-less run.
     code_graph_db: Option<String>,
 }
 
