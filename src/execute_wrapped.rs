@@ -664,12 +664,42 @@ impl WrappedCliStepRunner {
                 if !g.phase_id.is_empty() {
                     cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
                 }
-                // Arm the unit's filesystem boundary (FINDING-045/098). The worktree is the write
-                // root; nothing else is writable, which is what stops a governed worker from
-                // editing the pin that gates its own work. Read roots stay empty for now: the
-                // policy layer treats "outside every root" as a denial either way, and widening
-                // reads is an evidence-driven change, not a guess (see crate::path_policy).
+                // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE root stays the
+                // worktree and ONLY the worktree — deliberately unchanged, and guarded by
+                // `the_launcher_arms_the_write_root`: a wider write root would let a governed worker
+                // rewrite the pin/workflow that gates its own work (the FINDING-098 escape). The
+                // extractor's own annotation writes do NOT need a wider write root — they go through
+                // `wicked-estate annotate` (a Bash call), which `boundary_denial` does not path-judge;
+                // only Write/Edit/Read tool-calls carrying a `path` are judged.
                 cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, cwd.as_os_str());
+                // READS are the evidence-driven widening (the old "read roots stay empty" comment
+                // invited it). Measured across live domain-extraction runs, the boundary denied the
+                // worker reading, in turn, its own skill docs and then the repo's OWN SOURCE — the
+                // code graph's file paths anchor to the REPO ROOT it was indexed from, not the
+                // worktree, so the worker reads source there. Both are READ-ONLY: the write root is
+                // untouched, so this cannot reopen the pin-rewrite escape. Worktree reads are already
+                // covered by the write root; this ADDS the repo root + the skill/plugin dir.
+                let mut read_roots: Vec<std::ffi::OsString> = Vec::new();
+                if let Some(home) = std::env::var_os("HOME") {
+                    read_roots.push(
+                        std::path::Path::new(&home)
+                            .join(".claude")
+                            .join("plugins")
+                            .into_os_string(),
+                    );
+                }
+                // `<repo>/.codegraph/estate.db` → the repo root is two levels up (the source tree).
+                if let Some(repo_root) = g
+                    .code_graph_db
+                    .as_deref()
+                    .and_then(|db| std::path::Path::new(db).parent())
+                    .and_then(std::path::Path::parent)
+                {
+                    read_roots.push(repo_root.as_os_str().to_os_string());
+                }
+                if let Ok(joined) = std::env::join_paths(&read_roots) {
+                    cmd.env(crate::gate_hook::READ_ROOTS_ENV, joined);
+                }
             }
             match run_bounded(cmd, self.timeout, emit, adapter) {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
@@ -1080,6 +1110,11 @@ struct GovLaunch {
     /// The unit's WORKFLOW phase id (e.g. `review`) — set as `WICKED_GATE_PHASE_ID` so the hook's
     /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
     phase_id: String,
+    /// The repo's code-graph store (`<repo>/.codegraph/estate.db`), when this unit runs against a
+    /// registered repo. Used to widen the filesystem boundary to what a governed extraction unit
+    /// provably needs: READ the repo source (graph paths anchor to the repo root, not the worktree)
+    /// and WRITE the graph store its annotations land in. `None` for a repo-less run.
+    code_graph_db: Option<String>,
 }
 
 /// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
@@ -1209,6 +1244,7 @@ fn arm_input_governance(
         scope,
         phase,
         phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
+        code_graph_db: gov.code_graph_db.clone(),
     })
 }
 
