@@ -664,12 +664,61 @@ impl WrappedCliStepRunner {
                 if !g.phase_id.is_empty() {
                     cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
                 }
-                // Arm the unit's filesystem boundary (FINDING-045/098). The worktree is the write
-                // root; nothing else is writable, which is what stops a governed worker from
-                // editing the pin that gates its own work. Read roots stay empty for now: the
-                // policy layer treats "outside every root" as a denial either way, and widening
-                // reads is an evidence-driven change, not a guess (see crate::path_policy).
+                // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE root stays the
+                // worktree and ONLY the worktree — deliberately unchanged, and guarded by
+                // `the_launcher_arms_the_write_root`: a wider write root would let a governed worker
+                // rewrite the pin/workflow that gates its own work (the FINDING-098 escape). The
+                // extractor's own annotation writes do NOT need a wider write root — they go through
+                // `wicked-estate annotate` (a Bash call), which `boundary_denial` does not path-judge;
+                // only Write/Edit/Read tool-calls carrying a `path` are judged.
                 cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, cwd.as_os_str());
+                // READS are the evidence-driven widening (the old "read roots stay empty" comment
+                // invited it). Measured across live domain-extraction runs, the boundary denied the
+                // worker reading, in turn, its own skill docs and then the repo's OWN SOURCE — the
+                // code graph's file paths anchor to the REPO ROOT it was indexed from, not the
+                // worktree, so the worker reads source there. Both are READ-ONLY: the write root is
+                // untouched, so this cannot reopen the pin-rewrite escape. Worktree reads are already
+                // covered by the write root; this ADDS the repo root + the skill/plugin dir.
+                let mut read_roots: Vec<std::ffi::OsString> = Vec::new();
+                if let Some(home) = std::env::var_os("HOME") {
+                    read_roots.push(
+                        std::path::Path::new(&home)
+                            .join(".claude")
+                            .join("plugins")
+                            .into_os_string(),
+                    );
+                }
+                // `<repo>/.codegraph/estate.db` → widen the READ boundary to the repo root (two
+                // levels up). `repo_read_root` returns it only for an ABSOLUTE, correctly-shaped
+                // path; a relative or mis-shaped `code_graph_db` is NOT widened (see the helper).
+                match repo_read_root(g.code_graph_db.as_deref()) {
+                    Some(repo_root) => read_roots.push(repo_root),
+                    None => {
+                        if let Some(db) = g.code_graph_db.as_deref() {
+                            eprintln!(
+                                "wicked-core: code_graph_db {db:?} is not an absolute \
+                                 <repo>/.codegraph/estate.db path; not widening the read boundary \
+                                 to a repo root for unit {}",
+                                input.unit.id
+                            );
+                        }
+                    }
+                }
+                // A `join_paths` failure (e.g. a root containing the platform path separator) must
+                // not silently drop the read roots — that would leave the governed worker unable to
+                // read the repo it was armed for, with no trace of why. Fail loud.
+                match std::env::join_paths(&read_roots) {
+                    Ok(joined) => {
+                        cmd.env(crate::gate_hook::READ_ROOTS_ENV, joined);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "wicked-core: could not assemble READ_ROOTS from {read_roots:?} ({e}); \
+                             the governed worker's read boundary is left unset for unit {}",
+                            input.unit.id
+                        );
+                    }
+                }
             }
             match run_bounded(cmd, self.timeout, emit, adapter) {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
@@ -1080,6 +1129,40 @@ struct GovLaunch {
     /// The unit's WORKFLOW phase id (e.g. `review`) — set as `WICKED_GATE_PHASE_ID` so the hook's
     /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
     phase_id: String,
+    /// The repo's code-graph store (`<repo>/.codegraph/estate.db`), when this unit runs against a
+    /// registered repo. Used to (a) point the worker's estate MCP at the repo-local graph and
+    /// (b) widen the READ boundary to the repo root (graph paths anchor there, not to the worktree).
+    /// It does NOT widen the WRITE boundary — that stays worktree-only; the extractor's store
+    /// annotations ride Bash, which the boundary does not path-judge, so no write-widening is
+    /// needed (and widening it would let a worker rewrite its own gate pin). `None` for a repo-less run.
+    code_graph_db: Option<String>,
+}
+
+/// The repo-root READ root to add for a governed unit whose repo has a code graph, or `None`.
+///
+/// `code_graph_db` is `<repo>/.codegraph/estate.db`, so the repo root is two levels up. This returns
+/// it ONLY when the path is ABSOLUTE and has exactly that shape. Two rejections, both fail-closed
+/// (no widening):
+///   - Not absolute — `register-repo --path ./repo` stores a relative root, so `existing_code_graph`
+///     yields a relative `code_graph_db`. Pushed as a READ root, the gate's `path_policy` resolves
+///     it against the worker's worktree cwd, widening reads to the WRONG tree (or not at all). The
+///     boundary requires absolute roots (the WRITE root is the absolute worktree cwd for the same
+///     reason), so a relative value is a shape mismatch, not a root.
+///   - Wrong shape — anything not ending `.codegraph/estate.db` is not a code graph; taking
+///     `parent().parent()` off an arbitrary path would hand the worker an over-broad read root.
+fn repo_read_root(code_graph_db: Option<&str>) -> Option<std::ffi::OsString> {
+    let p = std::path::Path::new(code_graph_db?);
+    let shaped = p.is_absolute()
+        && p.file_name().is_some_and(|n| n == "estate.db")
+        && p.parent()
+            .and_then(std::path::Path::file_name)
+            .is_some_and(|n| n == ".codegraph");
+    if !shaped {
+        return None;
+    }
+    p.parent()
+        .and_then(std::path::Path::parent)
+        .map(|root| root.as_os_str().to_os_string())
 }
 
 /// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
@@ -1209,6 +1292,7 @@ fn arm_input_governance(
         scope,
         phase,
         phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
+        code_graph_db: gov.code_graph_db.clone(),
     })
 }
 
@@ -1652,6 +1736,44 @@ mod deliverables_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-boundary derivation (#213 review): the repo root is widened ONLY for an absolute,
+    /// `.codegraph/estate.db`-shaped path. A relative `code_graph_db` (a repo registered with a
+    /// relative `--path`) must NOT widen — pushed as a READ root it would resolve against the
+    /// worker's worktree, widening reads to the wrong tree. Built cross-platform off
+    /// `current_dir()` so the "absolute" case is genuinely absolute on Windows too (a leading `/`
+    /// is NOT absolute there — the trap FINDING-069 already caught once).
+    #[test]
+    fn repo_read_root_requires_an_absolute_codegraph_shaped_path() {
+        use std::ffi::OsString;
+        let base = std::env::current_dir().unwrap();
+
+        // absolute + shaped → the repo root, two levels up.
+        let db = base.join("repo").join(".codegraph").join("estate.db");
+        assert_eq!(
+            repo_read_root(db.to_str()),
+            Some(OsString::from(base.join("repo"))),
+            "an absolute <repo>/.codegraph/estate.db widens to <repo>"
+        );
+
+        // relative + shaped → None (would resolve against the worktree cwd).
+        assert_eq!(
+            repo_read_root(Some("repo/.codegraph/estate.db")),
+            None,
+            "a relative code_graph_db must not widen the read boundary"
+        );
+
+        // absolute but wrong shape → None (arbitrary path, over-broad root otherwise).
+        let wrong = base.join("repo").join("build").join("estate.db");
+        assert_eq!(
+            repo_read_root(wrong.to_str()),
+            None,
+            "non-.codegraph parent is not a code graph"
+        );
+
+        // absent → None.
+        assert_eq!(repo_read_root(None), None);
+    }
 
     /// Why the two emptiness guards on this path (`argv.is_empty()` before spawning, and the
     /// `argv.first()` guard on the FINDING-063 disclosure event) are DEFENSIVE and not live: the

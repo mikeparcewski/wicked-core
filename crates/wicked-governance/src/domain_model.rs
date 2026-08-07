@@ -899,9 +899,300 @@ pub fn build_domain_model(
     })
 }
 
+/// Persist an assembled [`DomainModel`] into the estate graph store as nodes + edges.
+///
+/// The domain/requirements graph belongs IN the estate DB, not as a `requirements_graph.json` file
+/// on disk (operator directive; the locked "domain data lives in estate's graph" direction). The
+/// JSON is retained as an optional export, but THIS is the source of truth: each domain, requirement
+/// and business rule becomes a graph node, wired by `Contains`/`References` edges, so the domain
+/// graph is queryable and composable like the code graph it derives from — and its presence in the
+/// store (not a file's existence) is the phase's real evidence.
+///
+/// Idempotent: stable synthetic SymbolIds (ADR-002 — never content-hash) mean a re-run upserts the
+/// same nodes rather than stacking duplicates. Returns `(nodes_written, edges_written)`.
+///
+/// NOT YET wired: edges from a requirement to the actual code nodes it derives from
+/// (`legacy_components`). Those are carried as node metadata here; resolving each `file#name` to its
+/// code SymbolId and adding `References` edges is the next increment (it needs a store name+file
+/// lookup, kept out of this first cut so the mapping stays pure and testable).
+pub fn persist_domain_model(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    model: &DomainModel,
+) -> anyhow::Result<(usize, usize)> {
+    use wicked_apps_core::{
+        synthetic_symbol, Edge, EdgeKind, Language, Location, Node, NodeKind, ResolutionTier, Span,
+        SYMBOL_SCHEME,
+    };
+
+    let lang = Language::new(SYMBOL_SCHEME);
+    let mut nodes: Vec<Node> = Vec::new();
+    let mut edges: Vec<Edge> = Vec::new();
+
+    let mk = |scheme: &str, id: &str, kind: NodeKind, name: &str| -> Node {
+        Node::new(
+            synthetic_symbol(scheme, id),
+            kind,
+            name.to_string(),
+            lang.clone(),
+            // Synthetic nodes have no source span; the scheme/id IS their address (emit.rs pattern).
+            Location::new(format!("{scheme}/{id}"), Span::ZERO),
+        )
+    };
+    // `Contains` is structural and certain (a domain HAS these requirements); a `dependencies`
+    // reference is an inferred cross-link, so it rides the lower Heuristic tier's confidence.
+    let contains = ResolutionTier::Parsed;
+    let inferred = ResolutionTier::Heuristic;
+
+    for (dname, domain) in &model.domains {
+        let dsym = synthetic_symbol("domain", dname);
+        let mut dnode = mk(
+            "domain",
+            dname,
+            NodeKind::Other("domain".to_string()),
+            dname,
+        );
+        if let Some(desc) = &domain.description {
+            dnode.metadata.insert(
+                "description".to_string(),
+                serde_json::Value::String(desc.clone()),
+            );
+        }
+        nodes.push(dnode);
+
+        for (rkey, req) in &domain.requirements {
+            let rid = format!("{dname}/{rkey}");
+            let rsym = synthetic_symbol("requirement", &rid);
+            let mut rnode = mk(
+                "requirement",
+                &rid,
+                NodeKind::Other("requirement".to_string()),
+                &req.title,
+            );
+            rnode.metadata.insert(
+                "description".to_string(),
+                serde_json::Value::String(req.description.clone()),
+            );
+            if let Some(s) = &req.status {
+                rnode
+                    .metadata
+                    .insert("status".to_string(), serde_json::Value::String(s.clone()));
+            }
+            // The code links are preserved as metadata until the resolve-to-SymbolId increment lands.
+            if !req.legacy_components.is_empty() {
+                rnode.metadata.insert(
+                    "legacy_components".to_string(),
+                    serde_json::json!(req.legacy_components),
+                );
+            }
+            // Dependencies are part of the wire contract and can name external services or
+            // cross-domain keys that have no node here. Preserve the raw list on the node so the
+            // information survives regardless of which entries become `References` edges below.
+            if !req.dependencies.is_empty() {
+                rnode.metadata.insert(
+                    "dependencies".to_string(),
+                    serde_json::json!(req.dependencies),
+                );
+            }
+            nodes.push(rnode);
+
+            // domain CONTAINS requirement
+            edges.push(Edge::new(
+                dsym.clone(),
+                rsym.clone(),
+                EdgeKind::Contains,
+                contains,
+                "domain-graph",
+            ));
+
+            // requirement REFERENCES its IN-DOMAIN dependency requirements. A dependency naming an
+            // external service or a cross-domain key has no requirement node here; an edge to
+            // `{dname}/{dep}` would dangle, so those survive only in the metadata above.
+            for dep in &req.dependencies {
+                if domain.requirements.contains_key(dep) {
+                    edges.push(Edge::new(
+                        rsym.clone(),
+                        synthetic_symbol("requirement", &format!("{dname}/{dep}")),
+                        EdgeKind::References,
+                        inferred,
+                        "domain-graph",
+                    ));
+                }
+            }
+
+            // business rules become Rule nodes; requirement CONTAINS each. Rule ids are unique only
+            // WITHIN a requirement (domain-model schema), so the node id is scoped by its owning
+            // requirement — otherwise two requirements' `RULE-001` collide onto a single node.
+            for rule in &req.business_rules {
+                let ruid = format!("{rid}/{}", rule.id);
+                let bsym = synthetic_symbol("rule", &ruid);
+                let mut bnode = mk("rule", &ruid, NodeKind::Rule, &rule.statement);
+                bnode
+                    .metadata
+                    .insert("confidence".to_string(), serde_json::json!(rule.confidence));
+                nodes.push(bnode);
+                edges.push(Edge::new(
+                    rsym.clone(),
+                    bsym,
+                    EdgeKind::Contains,
+                    contains,
+                    "domain-graph",
+                ));
+            }
+        }
+    }
+
+    // Atomic: the nodes and their edges land together or not at all. Without the batch, an
+    // `upsert_edges` failure after `upsert_nodes` succeeded would leave the store holding a partial
+    // domain graph even though the command fails closed — a persisted-but-incomplete graph is worse
+    // than none. Matches the `begin_batch`/`commit_batch` write path every other store write uses.
+    store.begin_batch()?;
+    store.upsert_nodes(&nodes)?;
+    store.upsert_edges(&edges)?;
+    store.commit_batch()?;
+    Ok((nodes.len(), edges.len()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The domain graph lands IN the estate store as queryable nodes + edges — not a JSON file.
+    /// Falsifiable: delete the `upsert_edges` line in production and the Contains-edge assertion
+    /// fails; delete `upsert_nodes` and the node lookups fail.
+    #[test]
+    fn persist_domain_model_writes_the_graph_into_the_store() {
+        use wicked_apps_core::{synthetic_symbol, EdgeKind, GraphRead, NodeKind, SqliteStore};
+
+        // A rule whose id (`RULE-001`) is only locally unique — the schema allows the SAME id under
+        // a different requirement. Both REQ-001 and REQ-002 carry `RULE-001`, so a persist that keys
+        // the Rule node by `rule.id` alone collapses them onto one node. REQ-001 also depends on
+        // REQ-002 (a real in-domain requirement → a live References edge) and on an EXTERNAL service
+        // (no node → metadata only, never a dangling edge).
+        let rule = |stmt: &str| Rule {
+            id: "RULE-001".to_string(),
+            statement: stmt.to_string(),
+            confidence: 0.9,
+            provenance: Provenance {
+                source: "code-body".to_string(),
+                reference: "a.py#parse".to_string(),
+                source_kinds: vec!["code-body".to_string()],
+            },
+            source_ref: None,
+        };
+        let mut reqs = std::collections::BTreeMap::new();
+        reqs.insert(
+            "REQ-001".to_string(),
+            Requirement {
+                title: "Parse the page into blocks".to_string(),
+                description: "The parser groups spans into ordered blocks".to_string(),
+                dependencies: vec!["REQ-002".to_string(), "stripe-api".to_string()],
+                legacy_components: vec!["a.py#parse".to_string()],
+                business_rules: vec![rule("blocks preserve reading order")],
+                ..Default::default()
+            },
+        );
+        reqs.insert(
+            "REQ-002".to_string(),
+            Requirement {
+                title: "Render blocks to markdown".to_string(),
+                description: "Blocks serialize to a markdown outline".to_string(),
+                business_rules: vec![rule("emphasized empty lines are not sections")],
+                ..Default::default()
+            },
+        );
+        let mut domains = std::collections::BTreeMap::new();
+        domains.insert(
+            "pageindex".to_string(),
+            Domain {
+                description: Some("core".to_string()),
+                requirements: reqs,
+                ..Default::default()
+            },
+        );
+        let model = DomainModel {
+            metadata: Metadata {
+                schema_version: "1.0.0".to_string(),
+                migration_mode: "functional".to_string(),
+                source: None,
+            },
+            domains,
+        };
+
+        let mut st = SqliteStore::in_memory().unwrap();
+        let (n, e) = persist_domain_model(&mut st, &model).unwrap();
+        assert_eq!(
+            n, 5,
+            "one domain + two requirements + two DISTINCT rule nodes (ids scoped by requirement)"
+        );
+        assert_eq!(
+            e, 5,
+            "2 domain→req Contains, 2 req→rule Contains, 1 in-domain req→dep References \
+             (the external `stripe-api` dependency emits NO edge)"
+        );
+
+        let dsym = synthetic_symbol("domain", "pageindex");
+        let rsym = synthetic_symbol("requirement", "pageindex/REQ-001");
+        let rsym2 = synthetic_symbol("requirement", "pageindex/REQ-002");
+        assert_eq!(
+            st.get_node(&dsym)
+                .unwrap()
+                .expect("domain node in store")
+                .kind,
+            NodeKind::Other("domain".to_string())
+        );
+
+        // The collision falsifier: each requirement's `RULE-001` is a DISTINCT node under a
+        // requirement-scoped id. Revert the scoping to `synthetic_symbol("rule", &rule.id)` and
+        // these two lookups resolve to the same node, `n` drops to 4, and this fails.
+        let rule1 = synthetic_symbol("rule", "pageindex/REQ-001/RULE-001");
+        let rule2 = synthetic_symbol("rule", "pageindex/REQ-002/RULE-001");
+        assert_ne!(
+            rule1, rule2,
+            "same local rule id under different requirements must not collide"
+        );
+        for rs in [&rule1, &rule2] {
+            assert_eq!(
+                st.get_node(rs)
+                    .unwrap()
+                    .expect("business-rule node in store")
+                    .kind,
+                NodeKind::Rule
+            );
+        }
+
+        // The raw dependency list is preserved on the node, INCLUDING the external service that
+        // never became an edge (finding: persist must not silently drop the wire-contract field).
+        let deps = st
+            .get_node(&rsym)
+            .unwrap()
+            .expect("requirement node")
+            .metadata
+            .get("dependencies")
+            .cloned()
+            .expect("dependencies preserved in metadata");
+        assert_eq!(deps, serde_json::json!(["REQ-002", "stripe-api"]));
+
+        let all = st.all_edges().unwrap();
+        // The domain→requirement structural edge is queryable in the store.
+        assert!(
+            all.iter().any(|edge| edge.source == dsym
+                && edge.target == rsym
+                && edge.kind == EdgeKind::Contains),
+            "domain Contains requirement edge is in the store, got {all:?}"
+        );
+        // The in-domain dependency became a References edge; the external one did NOT.
+        assert!(
+            all.iter().any(|edge| edge.source == rsym
+                && edge.target == rsym2
+                && edge.kind == EdgeKind::References),
+            "in-domain REQ-001→REQ-002 References edge present, got {all:?}"
+        );
+        assert!(
+            !all.iter().any(|edge| edge.kind == EdgeKind::References
+                && edge.target == synthetic_symbol("requirement", "pageindex/stripe-api")),
+            "external dependency must not emit a dangling References edge, got {all:?}"
+        );
+    }
     use wicked_estate_core::ValidationClaim;
 
     #[test]

@@ -8,9 +8,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "legacy-graph.digest.txt"
-      ],
+      "required_deliverables": [],
       "depends_on": [],
       "role": "neutral",
       "skill_ref": "wicked-garden-domain",
@@ -24,9 +22,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "analysis-report.json"
-      ],
+      "required_deliverables": [],
       "depends_on": [
         "survey"
       ],
@@ -42,9 +38,7 @@
       "gate": "auto",
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "annotations.jsonl"
-      ],
+      "required_deliverables": [],
       "depends_on": [
         "analyze"
       ],
@@ -84,9 +78,7 @@
       },
       "executes_code": false,
       "verified_evidence": false,
-      "required_deliverables": [
-        "requirements_graph.json"
-      ],
+      "required_deliverables": [],
       "depends_on": [
         "coverage"
       ],

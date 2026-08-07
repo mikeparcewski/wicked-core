@@ -810,7 +810,7 @@ fn domain_graph_cmd(args: &[String]) {
     // no validator for, so the emitted document must carry exactly this.
     let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.0.0".to_string());
 
-    let store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("domain-graph: open store failed: {e}"));
@@ -899,6 +899,23 @@ fn domain_graph_cmd(args: &[String]) {
             return;
         }
     };
+
+    // The domain graph belongs IN the estate DB, not only as a JSON file (operator directive; the
+    // locked "domain data lives in estate's graph" direction). Persist the assembled model as
+    // nodes/edges into the SAME store it was built from — this is the source of truth; the JSON
+    // --out below is an optional export. Fail-closed: if the graph cannot be persisted, the phase
+    // has produced no durable evidence, so the command must not report success.
+    match wicked_governance::persist_domain_model(&mut store, &model) {
+        Ok((nodes, edges)) => {
+            eprintln!(
+                "domain-graph: persisted {nodes} node(s) + {edges} edge(s) into the estate store"
+            );
+        }
+        Err(e) => {
+            fail(&format!("domain-graph: persist to store failed: {e}"));
+            return;
+        }
+    }
 
     if let Some(parent) = std::path::Path::new(&out_path).parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
