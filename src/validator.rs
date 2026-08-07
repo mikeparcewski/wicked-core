@@ -469,7 +469,7 @@ fn sbpl_quote(p: &Path) -> String {
 /// the system temp dir, and the std stdio devices; reads/exec stay open (`allow default`). `None` if the
 /// run dir can't be canonicalized (→ caller degrades to the floor). Canonicalization matters on macOS
 /// where `/var/folders/…` is a symlink to `/private/var/folders/…`; SBPL `subpath` needs the real path.
-fn macos_sandbox_profile(cwd: &Path) -> Option<String> {
+fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<String> {
     let rcwd = cwd.canonicalize().ok()?;
     let mut p = String::from("(version 1)\n(allow default)\n(deny network*)\n");
     // C3: explicitly DENY reads of the curated high-value secret dirs (after `allow default`, so the
@@ -485,6 +485,17 @@ fn macos_sandbox_profile(cwd: &Path) -> Option<String> {
         "(allow file-write* (subpath {}))\n",
         sbpl_quote(&rcwd)
     ));
+    // `extra_write`: a directory OUTSIDE the run dir the validator legitimately writes into. Coverage
+    // is the case — its store is `<repo>/.codegraph/estate.db` (repo root, per FINDING-069), and opening
+    // that WAL-mode SQLite db needs to create `-wal`/`-shm`/journal files IN ITS DIRECTORY. Without this
+    // the deny-writes floor blocks the open ("unable to open database file") and the coverage gate can
+    // never pass on the governed daemon path despite a fully-covered store (P8 #9 / core#217).
+    if let Some(ex) = extra_write.and_then(|e| e.canonicalize().ok()) {
+        p.push_str(&format!(
+            "(allow file-write* (subpath {}))\n",
+            sbpl_quote(&ex)
+        ));
+    }
     if let Ok(tmp) = std::env::temp_dir().canonicalize() {
         p.push_str(&format!(
             "(allow file-write* (subpath {}))\n",
@@ -499,13 +510,13 @@ fn macos_sandbox_profile(cwd: &Path) -> Option<String> {
 
 /// Resolve the OS-sandbox wrapper for `cwd`, or the floor (`BestEffort`, empty wrapper) when none is
 /// available/usable. macOS `sandbox-exec` is preferred, then Linux `bwrap`, then `firejail`.
-fn detect_sandbox_launcher(cwd: &Path) -> SandboxLauncher {
+fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLauncher {
     let floor = SandboxLauncher {
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
     };
     if find_on_path("sandbox-exec").is_some() {
-        if let Some(profile) = macos_sandbox_profile(cwd) {
+        if let Some(profile) = macos_sandbox_profile(cwd, extra_write) {
             return SandboxLauncher {
                 wrapper: vec!["sandbox-exec".to_string(), "-p".to_string(), profile],
                 level: SandboxLevel::Sandboxed,
@@ -543,6 +554,15 @@ fn detect_sandbox_launcher(cwd: &Path) -> SandboxLauncher {
             for dir in secret_read_block_dirs() {
                 w.push("--tmpfs".to_string());
                 w.push(dir.to_string_lossy().to_string());
+            }
+            // P8 #9 / core#217: rw-bind the coverage store's dir (outside the run dir) so opening its
+            // WAL-mode SQLite db can create -wal/-shm/journal there. `--ro-bind / /` above makes it
+            // READABLE but not writable; SQLite needs write access to the db's DIRECTORY to open it.
+            if let Some(ex) = extra_write.and_then(|e| e.canonicalize().ok()) {
+                let exs = ex.to_string_lossy().to_string();
+                w.push("--bind".to_string());
+                w.push(exs.clone());
+                w.push(exs);
             }
             // The run dir is bound LAST so it wins over any overlapping tmpfs above (writes land here).
             w.push("--bind".to_string());
@@ -771,7 +791,13 @@ pub fn run_validator_reporting(
     }
     // Build `[<sandbox wrapper…>] sh -c <script>`. When no OS sandbox is available the wrapper is empty,
     // so this is exactly `sh -c <script>` (the prior behavior) plus the always-on env/cwd/timeout floor.
-    let launcher = detect_sandbox_launcher(cwd);
+    // The store's directory (parent of `db_path`) is granted write access in the sandbox so a coverage
+    // validator can OPEN its WAL-mode SQLite store, which lives outside the run dir (P8 #9 / core#217).
+    let store_dir = db_path
+        .filter(|d| !d.is_empty() && *d != ":memory:" && !d.contains("://"))
+        .map(std::path::Path::new)
+        .and_then(std::path::Path::parent);
+    let launcher = detect_sandbox_launcher(cwd, store_dir);
     let mut argv = launcher.wrapper.clone();
     argv.push("sh".to_string());
     argv.push("-c".to_string());
@@ -2254,6 +2280,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P8 #9 / core#217: a coverage validator's store lives OUTSIDE the run dir
+    /// (`<repo>/.codegraph/estate.db`), and opening that WAL-mode SQLite db needs write access to the
+    /// store's DIRECTORY (for `-wal`/`-shm`/journal). The macOS profile must grant it when an
+    /// `extra_write` dir is supplied — else the deny-writes floor blocks the open ("unable to open
+    /// database file") and the coverage gate can never pass on the governed daemon path.
+    #[test]
+    fn macos_profile_grants_write_to_an_extra_dir_only_when_supplied() {
+        let base = std::env::temp_dir();
+        let cwd = base.join(format!("wc-p9-cwd-{}", std::process::id()));
+        let store = base.join(format!("wc-p9-store-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+
+        let rstore = store.canonicalize().unwrap();
+        let grant = format!("(allow file-write* (subpath {}))", sbpl_quote(&rstore));
+
+        // WITH extra_write → the store-dir write grant is present.
+        let with = macos_sandbox_profile(&cwd, Some(&store)).expect("profile builds");
+        assert!(
+            with.contains(&grant),
+            "profile must grant write to the coverage store dir; got:\n{with}"
+        );
+        // WITHOUT it → that specific grant is absent (proves it rides the param, not a default). Drop
+        // the `extra_write` allow-write in `macos_sandbox_profile` and the first assertion fails.
+        let without = macos_sandbox_profile(&cwd, None).expect("profile builds");
+        assert!(
+            !without.contains(&grant),
+            "the store-dir grant must appear ONLY with extra_write; got:\n{without}"
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
     /// The network-deny directive must be present in the built sandbox argv/profile per platform — the
     /// HEADLINE "network is denied" claim, verified structurally (deterministic + hermetic) and, when a
     /// sandbox tool + `bash` are present, ALSO at runtime (an outbound connect must fail).
@@ -2262,7 +2322,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wicked-val-net-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let launcher = detect_sandbox_launcher(&dir);
+        let launcher = detect_sandbox_launcher(&dir, None);
 
         // (a) STRUCTURAL: the network-deny directive is present per platform.
         match sandbox_availability() {
@@ -2326,7 +2386,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wicked-val-secrets-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let launcher = detect_sandbox_launcher(&dir);
+        let launcher = detect_sandbox_launcher(&dir, None);
         let blocked = secret_read_block_dirs();
         assert!(
             !blocked.is_empty(),
@@ -2401,7 +2461,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         if let (SandboxLevel::Sandboxed, Some("bwrap")) = sandbox_availability() {
-            let launcher = detect_sandbox_launcher(&dir);
+            let launcher = detect_sandbox_launcher(&dir, None);
             if let Ok(tmp) = std::env::temp_dir().canonicalize() {
                 let s = tmp.to_string_lossy().to_string();
                 assert!(
