@@ -603,9 +603,43 @@ fn round4(x: f64) -> f64 {
     (x * 10_000.0).round() / 10_000.0
 }
 
+/// Below this many requirement-bearing nodes, concentration is NOT judged: a small graph cannot be
+/// told apart from a small-but-legitimate catalog, so denying it would be guesswork. Operator-tunable
+/// via `WICKED_COVERAGE_MIN_JUDGEABLE`.
+const COVERAGE_MIN_JUDGEABLE_NODES: u64 = 100;
+/// Average behavior-bearing nodes per distinct `requirement` string above which the accounting reads
+/// as bulk-mapping rather than extraction (#131). The observed abuse averaged ~758 nodes/string (46
+/// strings over 34,897 nodes); a real catalog for a graph that size runs to hundreds/thousands of
+/// distinct requirements, i.e. tens of nodes each. 100 sits well above generous-legitimate and far
+/// below the abuse. Operator-tunable via `WICKED_COVERAGE_MAX_AVG_NODES_PER_REQ`.
+const COVERAGE_MAX_AVG_NODES_PER_REQ: f64 = 100.0;
+
+/// Read a `u64` tunable from the environment, falling back to `default` on absent-or-unparseable.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+/// Read an `f64` tunable from the environment, falling back to `default` on absent-or-unparseable.
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|v: &f64| v.is_finite())
+        .unwrap_or(default)
+}
+
 /// Fail-closed front-half precondition (port of `domain_graph.py::assert_front_half_coverage`, §I5):
 /// the builder REFUSES to translate an unannotated graph. Every behavior-bearing node must be resolved
 /// or risk-flagged; otherwise bail, surfacing the unaccounted SymbolIds. Never translates a partial graph.
+///
+/// It ALSO refuses a graph whose accounting is content-free (#131): `coverage == 1.0` says every node
+/// is ACCOUNTED, not that the accounting means anything. A handful of `requirement` strings smeared
+/// across tens of thousands of nodes (observed: 46 over 34,897, all `requirement_validated=1`) reaches
+/// 1.0 legitimately with zero rule content, because the RESOLVED predicate truthy-checks a string.
+/// Concentration catches it where the predicate cannot — this turns the [`RequirementReuse`] SIGNAL
+/// into a gate.
 pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()> {
     // Gate on the EXACT integer `unaccounted`, NOT the 4-dp-rounded `coverage` float. On a large graph a
     // single hole (e.g. 1/20000) rounds up to coverage==1.0, so a float-epsilon test would fail OPEN and
@@ -630,6 +664,43 @@ pub fn assert_front_half_coverage(report: &CoverageReport) -> anyhow::Result<()>
             report.coverage,
             report.unaccounted
         );
+    }
+    // #131: content-free accounting. Gated on the AVERAGE (nodes / distinct), not any single string's
+    // max — a real system can have ONE legitimately broad cross-cutting requirement, but a whole
+    // catalog that thin is bulk-mapping. Only applied once there are enough requirement-bearing nodes
+    // to judge (a small graph is indistinguishable from a small-but-real catalog, so it is never
+    // denied here — this is why the 12-node miniature test still passes). Both bounds are
+    // operator-tunable so a genuinely broad-but-real catalog can raise them rather than be blocked.
+    if let Some(reuse) = &report.requirement_reuse {
+        let min_judgeable = env_u64(
+            "WICKED_COVERAGE_MIN_JUDGEABLE",
+            COVERAGE_MIN_JUDGEABLE_NODES,
+        );
+        let max_avg = env_f64(
+            "WICKED_COVERAGE_MAX_AVG_NODES_PER_REQ",
+            COVERAGE_MAX_AVG_NODES_PER_REQ,
+        );
+        if reuse.nodes_with_requirement >= min_judgeable && reuse.distinct_requirements > 0 {
+            let avg = reuse.nodes_with_requirement as f64 / reuse.distinct_requirements as f64;
+            if avg > max_avg {
+                // FATAL-LAST: the action line is last, because consumers keep the TAIL of long output.
+                anyhow::bail!(
+                    "requirement concentration: {} node(s) over {} distinct string(s) = {:.1} nodes \
+                     per requirement (most-reused backs {} node(s): {:?}); coverage is {:.4} but the \
+                     accounting is content-free (#131) — a catalog this thin is bulk-mapping, not \
+                     extraction. Extract real requirement content, or raise \
+                     WICKED_COVERAGE_MAX_AVG_NODES_PER_REQ (currently {:.0}) if this catalog is \
+                     genuinely this broad.",
+                    reuse.nodes_with_requirement,
+                    reuse.distinct_requirements,
+                    avg,
+                    reuse.max_nodes_per_requirement,
+                    reuse.most_reused_requirement.as_deref().unwrap_or("<none>"),
+                    report.coverage,
+                    max_avg,
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1222,13 +1293,17 @@ mod tests {
             }
             let r = recompute_front_half_coverage(&st).unwrap();
 
-            // The gate is satisfied. That is the finding, not a bug in this test.
+            // The gate is satisfied AT THIS SCALE. 12 nodes is below COVERAGE_MIN_JUDGEABLE_NODES
+            // (100): a graph this small cannot be told apart from a small-but-legitimate catalog, so
+            // the concentration gate deliberately does not fire here. The enforcement at real scale is
+            // proved by `bulk_mapping_is_denied_at_scale` below; this test now only asserts that the
+            // signal is REPORTED and that small graphs are not falsely denied.
             assert_eq!(r.unaccounted, 0);
             assert_eq!(r.coverage, 1.0);
             assert_eq!(r.resolved, 12);
             assert!(
                 assert_front_half_coverage(&r).is_ok(),
-                "content-free accounting still passes the gate — #131 is a REPORTING fix, not a gate change"
+                "a 12-node graph is below the judgeable threshold — concentration is not gated at this scale"
             );
 
             // …and the report now says so out loud.
@@ -1239,6 +1314,94 @@ mod tests {
             assert_eq!(reuse.distinct_requirements, 2);
             assert_eq!(reuse.max_nodes_per_requirement, 6);
             assert_eq!(reuse.most_reused_requirement.as_deref(), Some("NFR-77"));
+        }
+
+        /// #131 ENFORCEMENT. The live abuse at scale: many nodes, a handful of requirement strings.
+        /// coverage is a legitimate 1.0, but the accounting is content-free — and now the gate DENIES
+        /// it instead of merely reporting it. 300 nodes over 2 strings = avg 150, unambiguously past
+        /// the default bar of 100 (the check is `avg > max_avg`, so avg exactly 100 would NOT deny).
+        #[test]
+        fn bulk_mapping_is_denied_at_scale() {
+            let mut st = store();
+            for i in 0..300 {
+                let n = node(&mut st, &format!("B{i}"), NodeKind::Function, "a.rs");
+                let req = if i % 2 == 0 { "NFR-76" } else { "NFR-77" };
+                st.set_node_semantics(
+                    &n.symbol,
+                    None,
+                    Some(req),
+                    Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+                )
+                .unwrap();
+            }
+            let r = recompute_front_half_coverage(&st).unwrap();
+            // coverage is genuinely complete — the point is that completeness is not substance.
+            assert_eq!(r.unaccounted, 0);
+            assert_eq!(r.coverage, 1.0);
+            let err = assert_front_half_coverage(&r).expect_err(
+                "300 nodes over 2 requirement strings is bulk-mapping — must be DENIED",
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("content-free"), "names the condition: {msg}");
+            assert!(
+                msg.contains("150.0 nodes per requirement") || msg.contains("per requirement"),
+                "reports the concentration: {msg}"
+            );
+        }
+
+        /// FALSIFIER for the gate above: the SAME node count with a real, diverse catalog (one distinct
+        /// requirement per node) is NOT denied. Proves the gate keys on concentration, not on graph
+        /// size — flip the `avg > max_avg` comparison in production and this test starts failing.
+        #[test]
+        fn a_diverse_catalog_at_the_same_scale_is_not_denied() {
+            let mut st = store();
+            for i in 0..300 {
+                let n = node(&mut st, &format!("D{i}"), NodeKind::Function, "a.rs");
+                st.set_node_semantics(
+                    &n.symbol,
+                    None,
+                    Some(&format!("REQ-{i}")), // 300 distinct → avg 1.0 node/requirement
+                    Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+                )
+                .unwrap();
+            }
+            let r = recompute_front_half_coverage(&st).unwrap();
+            assert_eq!(r.unaccounted, 0);
+            assert!(
+                assert_front_half_coverage(&r).is_ok(),
+                "a genuine one-requirement-per-node catalog must pass — the gate keys on \
+                 concentration, not on how many nodes there are"
+            );
+        }
+
+        /// The bound is operator-tunable via the environment. Tested against the `env_f64` helper with
+        /// a DEDICATED probe var — NOT by mutating `WICKED_COVERAGE_MAX_AVG_NODES_PER_REQ` at runtime,
+        /// which would race the parallel gate tests above that read it (a set-env test is a classic
+        /// source of flakiness). The gate's use of this helper is a single direct call, so proving the
+        /// helper reads + parses + falls back is what makes the override trustworthy.
+        #[test]
+        fn env_tunables_read_parse_and_fall_back() {
+            // A unique name nothing else reads, so no cross-test interference even in parallel.
+            let key = "WICKED_TEST_COVERAGE_TUNABLE_PROBE";
+            std::env::remove_var(key);
+            assert_eq!(env_f64(key, 100.0), 100.0, "absent → default");
+            assert_eq!(env_u64(key, 7), 7, "absent → default");
+            std::env::set_var(key, "1000");
+            assert_eq!(env_f64(key, 100.0), 1000.0, "present + valid → override");
+            assert_eq!(env_u64(key, 7), 1000, "present + valid → override");
+            std::env::set_var(key, "not-a-number");
+            assert_eq!(
+                env_f64(key, 100.0),
+                100.0,
+                "unparseable → default, not a panic"
+            );
+            std::env::set_var(key, "inf");
+            assert_eq!(
+                env_f64(key, 100.0),
+                100.0,
+                "non-finite → default (a bar of ∞ disables silently)"
+            );
+            std::env::remove_var(key);
         }
 
         /// The signal must not fire on ordinary extraction, or it is noise nobody reads.
