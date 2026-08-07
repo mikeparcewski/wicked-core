@@ -305,10 +305,16 @@ fn is_behavior_bearing(
     use wicked_apps_core::NodeKind::*;
     match &node.kind {
         // Behavior-bearing: the atomic units of logic. Namespace≈Module, Trait≈Interface,
-        // Constructor≈Method; Rule is the atomic unit a rules-engine extractor emits (bare until annotated).
-        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait | Rule => {
-            true
-        }
+        // Constructor≈Method.
+        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait => true,
+        // Rule is behavior-bearing when EXTRACTED — a rules-engine extractor's output, bare until
+        // annotated (extractors mint per-language schemes: `odm`, `dmn`, `drl`, …). But a Rule
+        // persisted by `persist_domain_model` is a `wicked-apps` SYNTHETIC node — the domain graph's
+        // OWN business rule, annotation OUTPUT, not source. Counting it would let a domain-graph
+        // persist pin the NEXT coverage run below 1.0 (its own rules read as unaccounted behavior
+        // nodes) — the measurement polluting the measurand. So a synthetic domain-model Rule is
+        // excluded; an extracted Rule still counts.
+        Rule => !wicked_apps_core::is_apps_synthetic_symbol(&node.symbol),
         // Module counts unless it is a dead shell (a pure container with no outgoing behavior edge).
         Module => has_behavior_out.contains(node.symbol.as_str()),
         // Structural leaves + rule-engine containers/sub-clauses (annotation target is the Rule node).
@@ -1466,7 +1472,7 @@ mod tests {
         use super::*;
         use wicked_apps_core::{
             synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
-            SYMBOL_SCHEME,
+            Symbol, SYMBOL_SCHEME,
         };
         use wicked_estate_core::Annotation;
 
@@ -1474,11 +1480,16 @@ mod tests {
             SqliteStore::in_memory().unwrap()
         }
         fn node(store: &mut SqliteStore, name: &str, kind: NodeKind, file: &str) -> Node {
+            // A SOURCE node carries a source-scheme symbol — real extractors mint per-language schemes
+            // (`odm`, `dmn`, scip, …), NEVER the `wicked-apps` synthetic scheme. It matters here because
+            // coverage now excludes `wicked-apps` synthetic symbols as domain-model artifacts
+            // (persist_domain_model output); faking source with one would drop every fixture below out of
+            // the denominator. `"src"` stands in for any extractor scheme.
             let n = Node::new(
-                synthetic_symbol("code", name),
+                Symbol::synthetic("src", format!("{file}::{name}")).id(),
                 kind,
                 name.to_string(),
-                Language::new(SYMBOL_SCHEME),
+                Language::new("rust"),
                 Location::new(file.to_string(), Span::ZERO),
             );
             store.begin_batch().unwrap();
@@ -1527,6 +1538,55 @@ mod tests {
             let r = cov(&s);
             assert_eq!(r.behavior_bearing, 2, "bare Rules count in the denominator");
             assert!(r.coverage < 1.0, "unextracted rules DENY the gate: {r:?}");
+        }
+
+        #[test]
+        fn persisted_domain_model_rule_is_excluded_from_the_denominator() {
+            // A `persist_domain_model` business-rule node is `NodeKind::Rule` under the WICKED-APPS
+            // synthetic scheme — annotation OUTPUT (the domain graph), not extracted source to be
+            // annotated. It must NOT enter the coverage denominator: it can never be annotated, so
+            // counting it would pin coverage below 1.0 on every run AFTER a domain-graph persist —
+            // the measurement polluting the measurand (surfaced by the P8 governed PageIndex run,
+            // where a single leftover persisted Rule dragged the gate to 0.9987). The sibling
+            // `bare_rule_nodes_fail_the_gate_critical_1` proves EXTRACTED rules (a source scheme)
+            // still count — the exclusion keys on the scheme, not the kind.
+            let mut s = store();
+            // one resolved source function → 1.0 on its own.
+            let f = node(&mut s, "charge", NodeKind::Function, "billing.rs");
+            s.set_node_semantics(
+                &f.symbol,
+                Some("charges a card"),
+                Some("REQ-1"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
+            // a persisted domain-model Rule (wicked-apps synthetic) sharing the same store.
+            let rule = Node::new(
+                synthetic_symbol("rule", "billing/REQ-1/RULE-001"),
+                NodeKind::Rule,
+                "amount must be positive".to_string(),
+                Language::new(SYMBOL_SCHEME),
+                Location::new("rule/billing/REQ-1/RULE-001".to_string(), Span::ZERO),
+            );
+            s.begin_batch().unwrap();
+            s.upsert_nodes(std::slice::from_ref(&rule)).unwrap();
+            s.commit_batch().unwrap();
+
+            let r = cov(&s);
+            // Falsifier: drop the `is_apps_synthetic_symbol` guard in `is_behavior_bearing` and the
+            // persisted Rule counts → behavior_bearing 2, unaccounted 1, coverage 0.5 → these fail.
+            assert_eq!(
+                r.behavior_bearing, 1,
+                "only the source function counts; the persisted domain Rule is excluded: {r:?}"
+            );
+            assert_eq!(
+                r.unaccounted, 0,
+                "the excluded Rule is not an unaccounted hole: {r:?}"
+            );
+            assert!(
+                (r.coverage - 1.0).abs() < 1e-9,
+                "coverage stays 1.0 despite the persisted domain Rule in the store: {r:?}"
+            );
         }
 
         #[test]

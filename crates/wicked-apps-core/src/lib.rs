@@ -377,6 +377,25 @@ pub fn synthetic_symbol(kind: &str, id: &str) -> SymbolId {
     Symbol::synthetic(SYMBOL_SCHEME, format!("{kind}/{id}")).id()
 }
 
+/// Whether `sym` is a wicked-apps synthetic symbol — one minted by [`synthetic_symbol`] (or any
+/// `Symbol::synthetic(SYMBOL_SCHEME, …)`), i.e. a domain-model artifact (domain / requirement /
+/// business-rule node) persisted into the estate store, NOT an extracted source symbol.
+///
+/// The discriminator is the SCHEME. A `Symbol::Synthetic { scheme, id }` renders as
+/// `"<scheme> synthetic <id>:"`, so this matches only the `wicked-apps` scheme. Rules-engine
+/// EXTRACTORS also mint synthetic symbols, but under their own schemes (`odm`, `dmn`, `drl`, …), so
+/// they are correctly NOT matched — their Rule nodes are real extracted source and still count.
+///
+/// Coverage uses this to keep the behavior-bearing denominator to extracted SOURCE: a
+/// `persist_domain_model` Rule node is annotation OUTPUT, and counting it would pin coverage below
+/// 1.0 after any domain-graph persist (the measurement polluting the measurand).
+pub fn is_apps_synthetic_symbol(sym: &SymbolId) -> bool {
+    let s = sym.as_str();
+    // "wicked-apps" followed by the literal " synthetic " marker of the Display form. The prefix
+    // guards against a scheme that merely starts with SYMBOL_SCHEME (e.g. "wicked-apps-x synthetic").
+    s.starts_with(SYMBOL_SCHEME) && s[SYMBOL_SCHEME.len()..].starts_with(" synthetic ")
+}
+
 /// A domain entity that can be projected onto an estate [`Node`].
 ///
 /// The contract: `to_node()` MUST be lossless w.r.t. [`from_node`](FromNode::from_node) — encode
@@ -459,6 +478,38 @@ pub use spawn::HardenedCommand;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_apps_synthetic_symbol_matches_only_the_wicked_apps_scheme() {
+        // A domain-model artifact from `synthetic_symbol` (scheme `wicked-apps`) matches.
+        assert!(is_apps_synthetic_symbol(&synthetic_symbol(
+            "rule",
+            "billing/REQ-1/RULE-001"
+        )));
+        assert!(is_apps_synthetic_symbol(&synthetic_symbol(
+            "domain", "billing"
+        )));
+        assert!(is_apps_synthetic_symbol(&synthetic_symbol(
+            "requirement",
+            "billing/REQ-1"
+        )));
+        // A rules-engine EXTRACTOR mints synthetic symbols under its OWN scheme — those are real
+        // extracted source and must NOT match (else coverage would drop them from the denominator).
+        assert!(!is_apps_synthetic_symbol(
+            &Symbol::synthetic("odm", "a.irl::rule::R1").id()
+        ));
+        assert!(!is_apps_synthetic_symbol(
+            &Symbol::synthetic("dmn", "d.dmn::rule::R1").id()
+        ));
+        // A scheme that merely starts with the SYMBOL_SCHEME prefix is not a false positive.
+        assert!(!is_apps_synthetic_symbol(
+            &Symbol::synthetic("wicked-apps-x", "y").id()
+        ));
+        // A non-synthetic (extracted) SymbolId does not match.
+        assert!(!is_apps_synthetic_symbol(&SymbolId(
+            "scip rust crate `x`/fn().".to_string()
+        )));
+    }
 
     // ── 4. validate_event_type: non-vacuous accept + reject ──────────────────
 
