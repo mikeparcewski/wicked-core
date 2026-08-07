@@ -1119,11 +1119,23 @@ fn is_transient_cli_failure(output: &str) -> bool {
         || o.contains("503")
 }
 
-/// Whether to retry the single-shot worker after an outcome. `retries_done` is how many retries have
-/// already run (0 on the first outcome). Pure + exhaustively unit-tested — the loop in
-/// [`fallback_with_warning`] is a trivial application of this policy.
-fn should_retry_worker(status: StepStatus, output: &str, retries_done: u32) -> bool {
-    status == StepStatus::Failed
+/// Whether to retry the single-shot worker after an outcome. Pure + exhaustively unit-tested — the
+/// loop in [`fallback_with_warning`] is a trivial application of this policy.
+///
+/// `governed` GATES the retry: only a GOVERNED unit is retried. The idempotency argument (a re-run
+/// re-derives; estate annotations upsert) and the "nonzero exit ⇒ infrastructural" argument are
+/// properties of the governed campaign phases. The engine's OWN ungoverned `claude` calls (the
+/// internal agent-judge / validator-authoring invocations) are NOT retried — they are not campaign
+/// phases and their re-run safety is not established (Copilot review on #216). `retries_done` is how
+/// many retries have already run (0 on the first outcome).
+fn should_retry_worker(
+    governed: bool,
+    status: StepStatus,
+    output: &str,
+    retries_done: u32,
+) -> bool {
+    governed
+        && status == StepStatus::Failed
         && retries_done < MAX_TRANSIENT_RETRIES
         && is_transient_cli_failure(output)
 }
@@ -1131,7 +1143,8 @@ fn should_retry_worker(status: StepStatus, output: &str, retries_done: u32) -> b
 /// Run the single-shot fallback, prepending `warning` to the output so it appears in
 /// both the streaming view and the persisted `StepOutput.output` (visible in studio). Retries a
 /// TRANSIENT worker failure up to [`MAX_TRANSIENT_RETRIES`] times (FINDING #5) so a single API blip
-/// in a long governed phase does not fail the whole run.
+/// in a long GOVERNED phase does not fail the whole run. The retry notice is folded into the
+/// PERSISTED output (not just streamed) so an operator/Studio can see a unit succeeded after retries.
 fn fallback_with_warning(
     warning: String,
     input: &StepInput,
@@ -1139,11 +1152,13 @@ fn fallback_with_warning(
     fallback: &WrappedCliStepRunner,
 ) -> StepOutput {
     emit(&format!("{warning}\n"));
+    // Only governed campaign units are retried — see `should_retry_worker`.
+    let governed = input.governance.is_some();
     let mut result = fallback.run_unit_streaming(input, emit);
     // Retry decision reads the RAW runner output (the "(cli … exited N)" message), before the
     // warning is prepended below.
     let mut retries_done = 0u32;
-    while should_retry_worker(result.status, &result.output, retries_done) {
+    while should_retry_worker(governed, result.status, &result.output, retries_done) {
         retries_done += 1;
         emit(&format!(
             "[wicked-core] worker hit a transient CLI/connection failure; retrying \
@@ -1151,6 +1166,20 @@ fn fallback_with_warning(
         ));
         result = fallback.run_unit_streaming(input, emit);
     }
+    // Persist the retry notice (not just `emit`, which rides the excluded delta stream): the final
+    // outcome — success or a fail-closed after exhausting retries — must show it in the durable output.
+    let retry_note = if retries_done > 0 {
+        let outcome = if result.status == StepStatus::Failed {
+            "still failed after"
+        } else {
+            "succeeded after"
+        };
+        format!("[wicked-core] worker {outcome} {retries_done} transient-failure retry(ies)\n")
+    } else {
+        String::new()
+    };
+    let warning = format!("{warning}\n{retry_note}");
+    let warning = warning.trim_end().to_string();
     result.output = if result.output.is_empty() {
         warning
     } else {
@@ -2099,23 +2128,39 @@ mod tests {
     #[test]
     fn should_retry_only_a_transient_failure_and_only_within_the_bound() {
         let transient = "(cli `claude` exited 1) connection reset";
-        // Retry a transient FAILED while retries remain…
-        assert!(should_retry_worker(StepStatus::Failed, transient, 0));
+        // Retry a GOVERNED transient FAILED while retries remain…
+        assert!(should_retry_worker(true, StepStatus::Failed, transient, 0));
         assert!(should_retry_worker(
+            true,
             StepStatus::Failed,
             transient,
             MAX_TRANSIENT_RETRIES - 1
         ));
         // …but STOP at the bound (no unbounded retry — a persistent transient still fails closed).
         assert!(!should_retry_worker(
+            true,
             StepStatus::Failed,
             transient,
             MAX_TRANSIENT_RETRIES
         ));
-        // Never retry a success, a cancel (our own timeout), or a deterministic/non-transient failure.
-        assert!(!should_retry_worker(StepStatus::Ok, transient, 0));
-        assert!(!should_retry_worker(StepStatus::Cancelled, transient, 0));
+        // NEVER retry an UNGOVERNED unit — the idempotency/infra argument is governed-only (an
+        // engine-internal judge/validator claude call must not be silently re-run).
         assert!(!should_retry_worker(
+            false,
+            StepStatus::Failed,
+            transient,
+            0
+        ));
+        // Never retry a success, a cancel (our own timeout), or a deterministic/non-transient failure.
+        assert!(!should_retry_worker(true, StepStatus::Ok, transient, 0));
+        assert!(!should_retry_worker(
+            true,
+            StepStatus::Cancelled,
+            transient,
+            0
+        ));
+        assert!(!should_retry_worker(
+            true,
             StepStatus::Failed,
             "did not produce its declared deliverable(s): rg.json",
             0
