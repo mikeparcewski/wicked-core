@@ -302,24 +302,19 @@ fn is_behavior_bearing(
     cfg: &CoverageConfig,
     unknown_other: &mut std::collections::BTreeSet<String>,
 ) -> bool {
-    // Domain-model artifacts persisted by `persist_domain_model` — domain / requirement / business-
-    // rule nodes under the `wicked-apps` synthetic scheme — are annotation OUTPUT, never extracted
-    // source to be annotated. They must NOT enter the coverage denominator: a persisted `Rule` node
-    // is `NodeKind::Rule` (below, behavior-bearing), so once domain-graph has written into this store
-    // its own rules read as UNACCOUNTED behavior-bearing nodes and pin coverage below 1.0 forever —
-    // the measurement polluting the measurand. Rules-engine EXTRACTORS mint their Rule symbols under
-    // their own schemes (`odm`, `dmn`, `drl`, …), so this excludes only domain-model output, never a
-    // real extracted rule.
-    if wicked_apps_core::is_apps_synthetic_symbol(&node.symbol) {
-        return false;
-    }
     use wicked_apps_core::NodeKind::*;
     match &node.kind {
         // Behavior-bearing: the atomic units of logic. Namespace≈Module, Trait≈Interface,
-        // Constructor≈Method; Rule is the atomic unit a rules-engine extractor emits (bare until annotated).
-        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait | Rule => {
-            true
-        }
+        // Constructor≈Method.
+        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait => true,
+        // Rule is behavior-bearing when EXTRACTED — a rules-engine extractor's output, bare until
+        // annotated (extractors mint per-language schemes: `odm`, `dmn`, `drl`, …). But a Rule
+        // persisted by `persist_domain_model` is a `wicked-apps` SYNTHETIC node — the domain graph's
+        // OWN business rule, annotation OUTPUT, not source. Counting it would let a domain-graph
+        // persist pin the NEXT coverage run below 1.0 (its own rules read as unaccounted behavior
+        // nodes) — the measurement polluting the measurand. So a synthetic domain-model Rule is
+        // excluded; an extracted Rule still counts.
+        Rule => !wicked_apps_core::is_apps_synthetic_symbol(&node.symbol),
         // Module counts unless it is a dead shell (a pure container with no outgoing behavior edge).
         Module => has_behavior_out.contains(node.symbol.as_str()),
         // Structural leaves + rule-engine containers/sub-clauses (annotation target is the Rule node).
