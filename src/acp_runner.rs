@@ -1028,19 +1028,33 @@ fn handle_update(
             // ONLY reported here, so lift it even when the token fields are absent.
             let cost = update["cost"]["amount"].as_f64();
             if input > 0 || out > 0 {
+                // A usage_update notification carries only totals — no cache split (that arrives on
+                // the prompt result, which `parse_result_usage` then supersedes this with). Record 0
+                // for the split rather than a guess (FINDING-012).
                 *usage = Some(Usage {
                     input_tokens: input,
                     output_tokens: out,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
                     cost_usd: cost.or_else(|| usage.as_ref().and_then(|u| u.cost_usd)),
                 });
             } else if let Some(c) = cost {
-                let (i, o) = usage
+                let (i, o, cr, cc) = usage
                     .as_ref()
-                    .map(|u| (u.input_tokens, u.output_tokens))
-                    .unwrap_or((0, 0));
+                    .map(|u| {
+                        (
+                            u.input_tokens,
+                            u.output_tokens,
+                            u.cache_read_tokens,
+                            u.cache_creation_tokens,
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0));
                 *usage = Some(Usage {
                     input_tokens: i,
                     output_tokens: o,
+                    cache_read_tokens: cr,
+                    cache_creation_tokens: cc,
                     cost_usd: Some(c),
                 });
             }
@@ -1070,9 +1084,11 @@ fn parse_result_usage(u: &Value) -> Option<Usage> {
     let field = |k: &str| u[k].as_u64().unwrap_or(0);
     // Saturating: token counters come from an external process — a malformed or
     // hostile frame must clamp, never wrap into a tiny bogus total.
+    let cache_read_tokens = field("cachedReadTokens");
+    let cache_creation_tokens = field("cachedWriteTokens");
     let input = field("inputTokens")
-        .saturating_add(field("cachedReadTokens"))
-        .saturating_add(field("cachedWriteTokens"));
+        .saturating_add(cache_read_tokens)
+        .saturating_add(cache_creation_tokens);
     let output = field("outputTokens");
     if input == 0 && output == 0 {
         return None;
@@ -1080,6 +1096,8 @@ fn parse_result_usage(u: &Value) -> Option<Usage> {
     Some(Usage {
         input_tokens: input,
         output_tokens: output,
+        cache_read_tokens,
+        cache_creation_tokens,
         cost_usd: None,
     })
 }

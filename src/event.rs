@@ -236,6 +236,11 @@ pub enum CoreEvent {
         attempt: u32,
         input_tokens: u64,
         output_tokens: u64,
+        /// Of `input_tokens`, the portion served from cache (read) and spent creating cache. A
+        /// breakdown OF `input_tokens`, not additional tokens; `0` when the adapter reports no split
+        /// (FINDING-012).
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
         cost_usd: Option<f64>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched (from `tool_use` file paths),
@@ -830,6 +835,8 @@ impl CoreEvent {
                 attempt,
                 input_tokens,
                 output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
                 cost_usd,
             } => json!({
                 "type": "cliUsage",
@@ -838,6 +845,8 @@ impl CoreEvent {
                 "attempt": attempt,
                 "inputTokens": input_tokens,
                 "outputTokens": output_tokens,
+                "cacheReadTokens": cache_read_tokens,
+                "cacheCreationTokens": cache_creation_tokens,
                 "costUsd": cost_usd,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B4) The data files a unit's CLI touched.
@@ -1271,5 +1280,41 @@ impl CoreEvent {
                 json!({ "type": "chatClosed", "chat": chat, "reason": reason })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FINDING-012: the `cliUsage` wire frame must expose the cache breakdown, so the studio Burn
+    /// panel can attribute per-unit cost to cache reuse vs fresh work. `inputTokens` stays the TOTAL
+    /// (fresh + cache), and `cacheReadTokens`/`cacheCreationTokens` are the breakdown of it.
+    /// Mutation: drop either key from the to_json arm and the corresponding assertion fails.
+    #[test]
+    fn cli_usage_to_json_exposes_the_cache_breakdown() {
+        let ev = CoreEvent::CliUsage {
+            session: "run-1".into(),
+            ord: 0,
+            attempt: 0,
+            input_tokens: 85_990,
+            output_tokens: 83,
+            cache_read_tokens: 34_098,
+            cache_creation_tokens: 26_103,
+            cost_usd: Some(0.409099),
+        };
+        let j = ev.to_json();
+        assert_eq!(j["type"], "cliUsage");
+        // The total is fresh + cache, unchanged from before (FINDING-058), so cost stays explicable.
+        assert_eq!(j["inputTokens"], 85_990);
+        // The new breakdown — the whole point of the finding.
+        assert_eq!(j["cacheReadTokens"], 34_098);
+        assert_eq!(j["cacheCreationTokens"], 26_103);
+        // A breakdown OF the total, never additional: the two cache parts cannot exceed input.
+        assert!(
+            j["cacheReadTokens"].as_u64().unwrap() + j["cacheCreationTokens"].as_u64().unwrap()
+                <= j["inputTokens"].as_u64().unwrap(),
+            "cache split must be a subset of the input total"
+        );
     }
 }

@@ -123,8 +123,21 @@ pub enum StepStatus {
 /// bus round-trip (`CompletedTask`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
+    /// TOTAL input tokens presented to the model — fresh + cache-read + cache-creation. This is the
+    /// number `cost_usd` is billed against (FINDING-058); the cache split below is a breakdown OF it,
+    /// not additional tokens.
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Of `input_tokens`, how many were served from the prompt cache (a cache READ — the cheap part).
+    /// `0` when the adapter reports no split (e.g. a usage_update notification carries only totals);
+    /// the authoritative split arrives on the prompt result. Broken out so per-unit cost is
+    /// attributable to cache reuse vs fresh work (FINDING-012).
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Of `input_tokens`, how many were spent WRITING the cache this turn (cache creation — billed at
+    /// a premium). `0` when unreported. See [`Usage::cache_read_tokens`].
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     pub cost_usd: Option<f64>,
 }
 

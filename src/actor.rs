@@ -2635,6 +2635,8 @@ fn apply_step_result(
                 attempt: output.attempt,
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
+                cache_read_tokens: u.cache_read_tokens,
+                cache_creation_tokens: u.cache_creation_tokens,
                 cost_usd,
             },
         );
