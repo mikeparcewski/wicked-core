@@ -44,6 +44,34 @@ pub enum HumanConfirm {
     Before(u32),
 }
 
+impl HumanConfirm {
+    /// The ONE parser for a human-confirm wire token (`none` | `all` | `before:<ord>`). Every entry
+    /// point — the bus bridge, the CLI, the napi layer, the HTTP API — must route through this so a
+    /// token cannot mean three different things depending on which door it came through (FINDING-019).
+    ///
+    /// FAILS CLOSED. An absent field is the legitimate unattended default (`Ok(HumanConfirm::None)`),
+    /// but a PRESENT unrecognised token — a typo like `"al"`, or an unparseable `"before:x"` — is an
+    /// `Err`, never a silent downgrade. The old per-door parsers all fell through to `None` on a typo, so
+    /// an operator who asked to pause silently got an UNGATED run (the bus path dropped `before:<ord>`
+    /// entirely). Returning the option to `None` on a typo is a governance bypass; refusing the launch
+    /// is not.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("none") => Ok(Self::None),
+            Some("all") => Ok(Self::All),
+            Some(s) if s.starts_with("before:") => {
+                let ord = &s["before:".len()..];
+                ord.trim().parse::<u32>().map(Self::Before).map_err(|_| {
+                    format!("humanConfirm 'before:{ord}' needs a unit ordinal (a number), e.g. 'before:2'")
+                })
+            }
+            Some(other) => Err(format!(
+                "unrecognised humanConfirm '{other}' (expected 'none', 'all', or 'before:<ord>')"
+            )),
+        }
+    }
+}
+
 /// A session — the owned interactive flow, persisted as `Node(Other(AGENT_SESSION))`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSession {
@@ -487,6 +515,40 @@ pub struct SessionView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FINDING-019: the ONE human-confirm parser accepts the three real tokens (absent = unattended
+    /// default) and FAILS CLOSED on everything else — a typo must not silently downgrade to an
+    /// ungated run. Mutation: change the unknown-token arm to `Ok(Self::None)` and the typo/`before:x`
+    /// assertions flip to Ok, failing here.
+    #[test]
+    fn human_confirm_parse_is_canonical_and_fails_closed() {
+        // The legitimate tokens.
+        assert_eq!(HumanConfirm::parse(None), Ok(HumanConfirm::None));
+        assert_eq!(HumanConfirm::parse(Some("")), Ok(HumanConfirm::None));
+        assert_eq!(HumanConfirm::parse(Some("none")), Ok(HumanConfirm::None));
+        assert_eq!(HumanConfirm::parse(Some("all")), Ok(HumanConfirm::All));
+        assert_eq!(
+            HumanConfirm::parse(Some("before:2")),
+            Ok(HumanConfirm::Before(2))
+        );
+        assert_eq!(
+            HumanConfirm::parse(Some("  before: 3 ")),
+            Ok(HumanConfirm::Before(3)),
+            "surrounding/inner whitespace is tolerated"
+        );
+
+        // FAIL CLOSED — never a silent None. A typo, an unknown word, and a non-numeric ordinal.
+        assert!(
+            HumanConfirm::parse(Some("al")).is_err(),
+            "a typo of 'all' must be rejected, not silently downgraded to None"
+        );
+        assert!(HumanConfirm::parse(Some("yes")).is_err());
+        assert!(
+            HumanConfirm::parse(Some("before:x")).is_err(),
+            "an unparseable ordinal must be rejected, not silently None"
+        );
+        assert!(HumanConfirm::parse(Some("before:")).is_err());
+    }
 
     fn sample_session() -> AgentSession {
         AgentSession {

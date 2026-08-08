@@ -176,16 +176,11 @@ fn store_path(args: &[String]) -> String {
         .unwrap_or_else(|| "wicked-estate.db".to_string())
 }
 
-/// Parse `--confirm none|all|before:N` into a [`HumanConfirm`] policy (default `None`).
-fn parse_confirm(args: &[String]) -> HumanConfirm {
-    match flag(args, "--confirm").as_deref() {
-        Some("all") => HumanConfirm::All,
-        Some(s) if s.starts_with("before:") => s[7..]
-            .parse::<u32>()
-            .map(HumanConfirm::Before)
-            .unwrap_or(HumanConfirm::None),
-        _ => HumanConfirm::None,
-    }
+/// Parse `--confirm none|all|before:N` into a [`HumanConfirm`] policy (default `None` when absent).
+/// Delegates to the ONE canonical parser so the CLI cannot disagree with the bus/napi/HTTP paths, and
+/// FAILS CLOSED: a typo'd `--confirm` is an error, not a silent ungated run (FINDING-019).
+fn parse_confirm(args: &[String]) -> Result<HumanConfirm, String> {
+    HumanConfirm::parse(flag(args, "--confirm").as_deref())
 }
 
 fn now_secs() -> i64 {
@@ -680,13 +675,20 @@ fn run_interactive(core: &Core, args: &[String]) {
     } else {
         registry_roster()
     };
+    let human_confirm = match parse_confirm(args) {
+        Ok(hc) => hc,
+        Err(e) => {
+            fail(&format!("invalid --confirm: {e}"));
+            return;
+        }
+    };
     let events = core.subscribe();
     let run_id = match core.launch_run(LaunchSpec {
         problem,
         clis,
         entity_mode: EntityMode::Shared,
         session_id,
-        human_confirm: parse_confirm(args),
+        human_confirm,
         repo_ref,
         workflow: flag(args, "--workflow"),
     }) {

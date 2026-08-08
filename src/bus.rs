@@ -700,10 +700,12 @@ fn launch_from_event(
         .session_id
         .clone()
         .unwrap_or_else(|| format!("run-{}", ev.event_id));
-    let human_confirm = match req.args.human_confirm.as_deref() {
-        Some("all") => HumanConfirm::All,
-        _ => HumanConfirm::None,
-    };
+    // Route through the ONE canonical parser (FINDING-019). The old inline match dropped
+    // `before:<ord>` ENTIRELY — a bus launch that asked to pause silently ran unattended. A bad token
+    // is a PERMANENT poison (it will never parse), so we refuse the launch and advance past it rather
+    // than fail OPEN into an ungoverned run.
+    let human_confirm = HumanConfirm::parse(req.args.human_confirm.as_deref())
+        .map_err(|e| BridgeError::Permanent(anyhow::anyhow!(e)))?;
     let spec = LaunchSpec {
         problem: req.problem.clone(),
         clis: roster.to_vec(),
