@@ -200,12 +200,86 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
     None
 }
 
+/// Tokenize a Bash command on whitespace AND the control operators `;`, `(`, `)` — but ONLY when those
+/// operators are UNQUOTED and UNESCAPED, i.e. acting as operators rather than as literal path bytes.
+///
+/// Whitespace-only tokenizing captured `> /dev/null; next` as the target `/dev/null;` (trailing `;`
+/// glued), which is not a safe sink, so `is_safe_write_sink` missed it and the governed PageIndex
+/// domain-graph unit was wrongly DENIED (run 4c63ba17). Splitting an operator `;` off fixes that and
+/// keeps a glued second redirect (`>/dev/null;>/outside`) visible as its own token, so real escapes
+/// still surface.
+///
+/// QUOTING/ESCAPING is why this is a real lexer and not a naive `char`-split: in `> foo\;../../etc/evil`
+/// the `\;` is a LITERAL `;`, so the runtime redirect target is the single relative path
+/// `foo;../../etc/evil` — which `../..` resolves to OUTSIDE the worktree. A naive split at that `;`
+/// would truncate the target to `foo\` (resolves INSIDE) and silently drop the traversal, WEAKENING the
+/// boundary versus the old whole-token tokenizer (Copilot review on #228). So a `\`-escaped operator and
+/// any operator inside `'…'`/`"…"` are kept verbatim in the current token — split only the bare ones.
+fn shell_tokens(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = command.chars();
+    let mut in_single = false;
+    let mut in_double = false;
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if !cur.is_empty() {
+            out.push(std::mem::take(cur));
+        }
+    };
+    while let Some(ch) = chars.next() {
+        if in_single {
+            // Single quotes are fully literal — not even `\` escapes; only a closing `'` ends them.
+            cur.push(ch);
+            if ch == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if ch == '\\' {
+            // Backslash escapes the next char: keep BOTH verbatim so an escaped `;`/`(`/`)` stays a
+            // literal path byte, exactly as the pre-split whole-token tokenizer delivered it.
+            cur.push(ch);
+            if let Some(next) = chars.next() {
+                cur.push(next);
+            }
+            continue;
+        }
+        if in_double {
+            // Inside `"…"`, `;`/`(`/`)` are literal; only a closing `"` (handled here) ends the string.
+            cur.push(ch);
+            if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => {
+                in_single = true;
+                cur.push(ch);
+            }
+            '"' => {
+                in_double = true;
+                cur.push(ch);
+            }
+            c if c.is_whitespace() => flush(&mut cur, &mut out),
+            ';' | '(' | ')' => {
+                flush(&mut cur, &mut out);
+                out.push(ch.to_string());
+            }
+            _ => cur.push(ch),
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
 /// Covers the direct escapes: `>`/`>>`/`N>` redirects (spaced or glued), `tee [-a] FILE...`, and the
 /// destination of `cp`/`mv`/`install` (last non-flag arg) and `dd of=FILE`. Deliberately NOT a shell
 /// parser — see the caller's note on why this is defense-in-depth rather than a sandbox.
 fn bash_write_targets(command: &str) -> Vec<String> {
-    let toks: Vec<&str> = command.split_whitespace().collect();
+    let owned = shell_tokens(command);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut targets: Vec<String> = Vec::new();
 
     // Redirection targets. `redirect_glob(tok)` returns Some(glued-filename-or-empty) for a write
@@ -226,7 +300,7 @@ fn bash_write_targets(command: &str) -> Vec<String> {
     // Command-shaped destinations. Split into pipeline/sequence SEGMENTS on shell separators so a
     // write command after a pipe (`echo x | tee FILE`) or `;`/`&&` is checked as its own program —
     // not missed because the first word of the whole line was something else.
-    const SEPS: [&str; 6] = ["|", "||", "&&", ";", "&", "|&"];
+    const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut seg: Vec<&str> = Vec::new();
     for &t in &toks {
@@ -2265,10 +2339,54 @@ mod boundary_tests {
                 "cmd > /dev/null 2>&1",
                 "cmd 2>/dev/stderr",
                 "echo hi | tee /dev/null",
+                // A sequence separator glued to the sink — the real run-4c63ba17 false positive.
+                // Whitespace-only tokenizing captured the target as `/dev/null;`, which is not a safe
+                // sink, so the governed domain-graph unit was denied. `shell_tokens` splits the `;`.
+                "echo x > /dev/null; echo done",
+                "cmd >/dev/null;ls",
+                "cmd 2>/dev/null; true",
+                // Subshell parens glued to a sink.
+                "(echo x > /dev/null)",
             ] {
                 assert!(
                     boundary_denial(&json!({ "command": sink }), "Bash").is_none(),
                     "a Bash write to a standard sink must be allowed: {sink}"
+                );
+            }
+            // NON-MASKING: splitting the glued `;` must not hide a second redirect that DOES escape.
+            // `>/dev/null;>/etc/evil` is a safe sink followed by a glued escape — the escape must win.
+            assert!(
+                boundary_denial(
+                    &json!({"command": "echo x >/dev/null;>/etc/evil-marker"}),
+                    "Bash"
+                )
+                .is_some(),
+                "a glued second redirect out of the worktree must still be denied"
+            );
+            // REGRESSION (Copilot review on #228): a BACKSLASH-ESCAPED `;` is a literal path byte, not a
+            // separator, so the whole token is ONE redirect target. Rooted INSIDE the worktree with a
+            // `..` climb that leaves it, the correct target resolves OUTSIDE → DENY. A naive split at the
+            // `;` truncates the target to the in-worktree prefix (`<wt>/sub\`) and drops the traversal —
+            // the boundary weakening the old whole-token tokenizer did not have. Discriminating because
+            // the prefix is genuinely inside the allowed root (unlike a bare relative path, which
+            // resolves against the process cwd and would be denied either way). Mutation: remove the
+            // escape handling in `shell_tokens` → the split truncates to `<wt>/sub\` and this fails.
+            let escaped = format!(r"echo x > {}/sub\;/../../../../../etc/evil", wt.display());
+            assert!(
+                boundary_denial(&json!({ "command": escaped }), "Bash").is_some(),
+                "an escaped ; must keep the whole target so its ../.. escape is still denied: {escaped}"
+            );
+            // A QUOTED separator is likewise literal — the `;` must not split. (These deny via the
+            // quote-naive relative fallback rather than absolute resolution; see the shell_tokens SCOPE
+            // note. What is guarded here is that quote tracking keeps `;` inside the token, not split.)
+            for q in ['"', '\''] {
+                let quoted = format!(
+                    "echo x > {q}{}/sub;/../../../../../etc/evil{q}",
+                    wt.display()
+                );
+                assert!(
+                    boundary_denial(&json!({ "command": quoted }), "Bash").is_some(),
+                    "a quoted ; must not split the target and hide a ../.. escape: {quoted}"
                 );
             }
         });
