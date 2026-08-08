@@ -224,6 +224,24 @@ pub fn get_repo(store: &dyn GraphRead, repo_id: &str) -> anyhow::Result<Option<R
     }
 }
 
+/// Front-half coverage for ONE registered repo, computed over that repo's OWN code graph.
+///
+/// `recompute_front_half_coverage` run against the daemon store (`~/.wicked-crew/core.db`) is
+/// meaningless: that store holds run/governance nodes but none of a repo's domain/requirement nodes,
+/// so it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo
+/// (FINDING-009). This resolves `repo_ref` from the registry on `daemon`, opens its `code_graph_db`
+/// (`<root>/.codegraph/estate.db` — the one spelling every consumer shares) READ-ONLY, and recomputes
+/// over THAT. An unknown `repo_ref` is an error, never a silent vacuous report.
+pub fn coverage_report_for_repo(
+    daemon: &dyn GraphRead,
+    repo_ref: &str,
+) -> anyhow::Result<wicked_governance::CoverageReport> {
+    let repo = get_repo(daemon, repo_ref)?
+        .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?;
+    let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
+    wicked_governance::recompute_front_half_coverage(&repo_store)
+}
+
 /// The directory worktrees for `repo_root` live under.
 fn worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".wicked").join("worktrees")
@@ -850,6 +868,58 @@ mod tests {
         root
     }
 
+    /// FINDING-009. Coverage for a repo must be computed over the REPO's own code graph, not the
+    /// daemon store. We register a repo whose `code_graph_db` holds 3 nodes and a daemon store that
+    /// holds only the RepoEntry (1 node): `report.total` (all-kinds node count) must be 3, proving the
+    /// repo store was read. Mutation — recomputing over `daemon` instead — yields the daemon's count
+    /// (not 3), failing here. An unknown repo_ref errors rather than returning a vacuous report.
+    #[test]
+    fn coverage_report_for_repo_reads_the_repo_store_not_the_daemon() {
+        let root = git_repo("cov009");
+        // The repo's OWN code graph: 3 arbitrary nodes (total counts all kinds, so plain nodes work).
+        let cg_path = code_graph_db(root.to_str().unwrap());
+        std::fs::create_dir_all(Path::new(&cg_path).parent().unwrap()).unwrap();
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&cg_path)).unwrap();
+            for i in 0..3 {
+                let n = Node::new(
+                    synthetic_symbol("thing", &format!("n{i}")),
+                    NodeKind::Other("thing".to_string()),
+                    format!("n{i}"),
+                    Language::new(SYMBOL_SCHEME),
+                    Location::new(format!("thing/n{i}"), Span::ZERO),
+                );
+                put_node(&mut repo_store, n).unwrap();
+            }
+        }
+        // The daemon store: a DIFFERENT file that ends up with just the RepoEntry node (count != 3).
+        let daemon_path = root.join("daemon-store.db");
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "Cov 009".into(),
+                root_path: root.to_str().unwrap().into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+
+        let report = coverage_report_for_repo(&daemon, &entry.id).unwrap();
+        assert_eq!(
+            report.total, 3,
+            "coverage is computed over the REPO store (3 nodes), not the daemon store"
+        );
+
+        // An unknown repo is an error, never a vacuous 1.0 report.
+        assert!(
+            coverage_report_for_repo(&daemon, "no-such-repo").is_err(),
+            "an unknown repo_ref must error, not return a vacuous report"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// core#214. `register_repo` must persist an ABSOLUTE, normalised root — never the caller's
     /// as-given spelling. A relative `--path ./repo` stored verbatim resolves to nothing from the
     /// daemon's cwd, and the `code_graph_db` derived from it inherits the break.
@@ -859,7 +929,7 @@ mod tests {
     /// fails `assert_eq`. (`..` is deliberately NOT used: `absolute` keeps `..` on POSIX to preserve
     /// symlink meaning, so it would not falsify there.) We assert equality to `absolute(root)`, NOT to
     /// `canonicalize`: the fix must not resolve symlinks (canonicalize breaks `git worktree add` on
-    /// Windows via `\\?\` and rewrites `/var`→`/private/var` on macOS — see the fn's doc comment).
+    /// Windows via `\?\` and rewrites `/var`→`/private/var` on macOS — see the fn's doc comment).
     #[test]
     fn register_repo_stores_an_absolute_normalised_root() {
         let root = git_repo("core214");

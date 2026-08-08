@@ -753,6 +753,26 @@ impl Core {
         })
     }
 
+    /// Coverage for ONE registered repo, computed over that repo's OWN code graph — not the daemon's
+    /// bookkeeping store (FINDING-009). `get_coverage_report` above reads `self.db_path` (the daemon
+    /// `core.db`), which holds run/governance nodes but none of a repo's domain/requirement nodes, so
+    /// it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo. This
+    /// resolves the repo from the registry, opens its `code_graph_db` (`<root>/.codegraph/estate.db`,
+    /// the one spelling every consumer shares), and recomputes over it. An unknown `repo_ref` is an
+    /// ERROR, never a silent vacuous report — the caller must name a real repo.
+    #[napi]
+    pub fn get_coverage_report_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            // The resolve-repo → open-its-store → recompute logic lives in wicked-core so it is
+            // unit-testable there (this napi layer stays thin glue). An unknown repo errors.
+            let report = wicked_core::coverage_report_for_repo(&daemon, &repo_ref).map_err(err)?;
+            serde_json::to_string(&report).map_err(err)
+        })
+    }
+
     // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────
     // Each method runs its (potentially blocking) Core call on a libuv worker thread via the SAME
     // `CoreTask`/`AsyncTask` pattern as every other method — the Node event loop is never blocked on
