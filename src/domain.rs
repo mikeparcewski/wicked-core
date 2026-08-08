@@ -49,9 +49,9 @@ impl HumanConfirm {
     /// point — the bus bridge, the CLI, the napi layer, the HTTP API — must route through this so a
     /// token cannot mean three different things depending on which door it came through (FINDING-019).
     ///
-    /// FAILS CLOSED. An absent field is the legitimate unattended default (`Ok(None)`), but a PRESENT
-    /// unrecognised token — a typo like `"al"`, or an unparseable `"before:x"` — is an `Err`, never a
-    /// silent downgrade to `None`. The old per-door parsers all fell through to `None` on a typo, so
+    /// FAILS CLOSED. An absent field is the legitimate unattended default (`Ok(HumanConfirm::None)`),
+    /// but a PRESENT unrecognised token — a typo like `"al"`, or an unparseable `"before:x"` — is an
+    /// `Err`, never a silent downgrade. The old per-door parsers all fell through to `None` on a typo, so
     /// an operator who asked to pause silently got an UNGATED run (the bus path dropped `before:<ord>`
     /// entirely). Returning the option to `None` on a typo is a governance bypass; refusing the launch
     /// is not.
