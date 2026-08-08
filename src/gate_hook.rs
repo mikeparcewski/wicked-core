@@ -318,7 +318,17 @@ pub(crate) fn evaluate_tool_call(
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
     if let Some(reason) = boundary_denial(context, tool) {
-        append_boundary_deny(decisions_path, scope, phase, &reason);
+        // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
+        // escape attempt and stays unit-fatal; a READ probe is advisory — blocked, audited, but not
+        // unit-fatal, so a worker probing an out-of-bounds file (then adapting) is not failed for it
+        // (P8 #10 / core#219). See `append_boundary_deny`.
+        append_boundary_deny(
+            decisions_path,
+            scope,
+            phase,
+            &reason,
+            WRITE_TOOLS.contains(&tool),
+        );
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -639,22 +649,66 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
 /// a boundary deny says "governance evaluated this and the call left its scope". Filing the second
 /// under the first mislabels the evaluator and criteria in the append-only log — the record audits
 /// and alerts read — so a real escape would surface as an infrastructure wobble (review).
-fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
+/// The evaluator identity stamped on every filesystem-boundary deny (read OR write). Distinguishes a
+/// containment block from an operator POLICY deny (which carries a policy evaluator identity), so the
+/// fold/drain can treat the two differently.
+const BOUNDARY_EVALUATOR: &str = "wicked-governance-boundary";
+/// Claim-id prefix for a boundary deny that STAYS unit-fatal: a WRITE outside the sandbox (an escape
+/// attempt — e.g. the FINDING-098 pin-rewrite), plus any un-classified boundary deny.
+const BOUNDARY_WRITE_DENY_PREFIX: &str = "boundary-deny:";
+/// Claim-id prefix for an ADVISORY boundary deny: a READ outside the sandbox. The tool-call is STILL
+/// blocked (the worker never reads the file), but a blocked read leaks nothing and the worker adapts,
+/// so it is recorded for audit and does NOT fail the unit (P8 #10 / core#219). Whether the blocked
+/// read MATTERED is decided by the unit's own output gate, not by the containment event.
+const BOUNDARY_READ_DENY_PREFIX: &str = "boundary-read-deny:";
+
+/// Record a filesystem-boundary block. `is_write` picks whether it is unit-fatal (a write/escape) or
+/// ADVISORY (a read probe). Either way the caller has already exited 2 — the tool-call is blocked.
+fn append_boundary_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    reason: &str,
+    is_write: bool,
+) {
+    let (prefix, criteria) = if is_write {
+        (
+            BOUNDARY_WRITE_DENY_PREFIX,
+            format!("filesystem boundary: {reason}"),
+        )
+    } else {
+        (
+            BOUNDARY_READ_DENY_PREFIX,
+            format!("filesystem boundary (advisory: read blocked, worker continues): {reason}"),
+        )
+    };
     let claim = ConformanceClaim {
         // Keyed on `phase` only, for the same reason `append_infra_deny` is: `scope` embeds `/`
         // and would make an unbounded claim symbol.
-        claim_id: format!("boundary-deny:{phase}"),
+        claim_id: format!("{prefix}{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
         policy_ids: vec![],
         decision: Decision::Deny,
         obligations: vec![reason.to_string()],
         evaluated_context_ref: "sha256:boundary".to_string(),
-        criteria: format!("filesystem boundary: {reason}"),
-        evaluator_identity: "wicked-governance-boundary".to_string(),
+        criteria,
+        evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
         evaluated_at: crate::clock::eval_now(),
     };
     let _ = append_decision(Path::new(decisions_path), &claim);
+}
+
+/// Whether a Deny claim is an ADVISORY boundary READ block — recorded for audit but NOT unit-fatal.
+/// A blocked read is containment SUCCEEDING (the read was prevented, nothing leaked, the worker
+/// adapts); failing the whole unit for it conflates prevention with violation (P8 #10 / core#219).
+/// Requires BOTH the boundary evaluator identity AND the read prefix, so a policy deny or a write
+/// escape can never be mistaken for advisory. The worker cannot forge this: the decisions log lives
+/// outside its write boundary and is written only by the gate-hook.
+fn is_advisory_boundary_read_deny(claim: &ConformanceClaim) -> bool {
+    claim.decision == Decision::Deny
+        && claim.evaluator_identity == BOUNDARY_EVALUATOR
+        && claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX)
 }
 
 /// If `v` is an armed-marker object, the phase it marks; else `None`. Checks the ROOT key
@@ -878,7 +932,13 @@ pub fn fold_input_denial(
         }
         has_claim_lines = true;
         conform(store, &claim)?;
-        if denial.is_none() && claim.decision == Decision::Deny {
+        // An ADVISORY boundary READ deny is recorded (conform above, for audit) but does NOT fail the
+        // unit: the read was blocked, nothing leaked, and the worker adapts — whether the missing file
+        // mattered is judged by the unit's OUTPUT gate, not this containment event (P8 #10 / core#219).
+        if denial.is_none()
+            && claim.decision == Decision::Deny
+            && !is_advisory_boundary_read_deny(&claim)
+        {
             denial = Some(format!(
                 "input governance denied a tool-call in {phase} (claim {})",
                 claim.claim_id
@@ -976,15 +1036,25 @@ pub fn apply_hook_decisions(
     for (phase_name, claims) in &by_phase {
         let phase_id = format!("{workflow_id}:{phase_name}");
         ensure_phase_at_gate(store, &phase_id, &workflow_id, phase_name)?;
-        let verdict = claims
+        // Advisory boundary READ denies are audit-only (conform()'d in Pass 1) and never veto the
+        // input-governance gate (P8 #10 / core#219) — exclude them from the deny-dominating verdict at
+        // every tier. A phase whose ONLY claims are advisory has nothing gate-affecting to resolve, so
+        // it is skipped (no spurious veto).
+        let verdict = match claims
             .iter()
+            .filter(|c| !is_advisory_boundary_read_deny(c))
             .find(|c| c.decision == Decision::Deny)
             .or_else(|| {
                 claims
                     .iter()
+                    .filter(|c| !is_advisory_boundary_read_deny(c))
                     .find(|c| c.decision == Decision::AllowWithConditions)
             })
-            .unwrap_or(&claims[0]);
+            .or_else(|| claims.iter().find(|c| !is_advisory_boundary_read_deny(c)))
+        {
+            Some(v) => v,
+            None => continue,
+        };
         let gate_event_id = format!("hookgate-{}", verdict.claim_id);
         let outcome = apply_gate(store, &phase_id, Some(verdict), &gate_event_id)?;
         // Count a veto only when the Deny actually resolved the gate (never mask a refused transition).
@@ -1548,6 +1618,109 @@ mod tests {
     }
 
     #[test]
+    fn advisory_boundary_read_deny_is_recorded_but_not_unit_fatal() {
+        // core#219 / P8 #10. A governed unit whose worker probes a READ outside its boundary must NOT
+        // fail: the read is BLOCKED (containment succeeded, nothing leaked), the worker adapts, and the
+        // block is recorded for audit. A blocked WRITE (escape attempt) and operator POLICY denies stay
+        // unit-fatal. This is the last blocker to a fully-green unattended governed clean pass.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("advisory-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+
+        // --- fold_input_denial (unit verdict) ---------------------------------------------------
+
+        // (a) GOVERNED unit, marker + ONLY an advisory boundary READ deny → NOT denied (Ok(None)).
+        let p0 = decisions_path_for(&run_id, 0);
+        write_armed_marker(&p0, "unit-5").unwrap();
+        write_hook_fired(&p0, "unit-5");
+        // Written by the real production path — exercises the actual prefix/criteria/evaluator wiring,
+        // not a hand-forged claim. is_write=false ⇒ `boundary-read-deny:` + BOUNDARY_EVALUATOR.
+        append_boundary_deny(
+            p0.to_str().unwrap(),
+            "wf/unit-5",
+            "unit-5",
+            "path outside this unit's boundary: /other/repo/domain-modeler.md (read)",
+            false,
+        );
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-5", true).unwrap(),
+            None,
+            "an advisory boundary READ deny does not fail the unit"
+        );
+        // ...but it IS durable evidence — the block was conformed to the store, not dropped.
+        assert_eq!(
+            count_claims(&store, "boundary-read-deny:unit-5").unwrap(),
+            1,
+            "the blocked read is recorded for audit even though it is non-fatal"
+        );
+
+        // (b) GOVERNED unit, marker + a boundary WRITE deny → DENIED (an escape attempt stays fatal).
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker(&p1, "unit-5").unwrap();
+        append_boundary_deny(
+            p1.to_str().unwrap(),
+            "wf/unit-5",
+            "unit-5",
+            "path outside this unit's boundary: /etc/evil (write)",
+            true,
+        );
+        let write_denial = fold_input_denial(&mut store, &run_id, 1, "unit-5", true).unwrap();
+        assert!(
+            write_denial
+                .as_deref()
+                .is_some_and(|d| d.contains("boundary-deny:unit-5")),
+            "a boundary WRITE deny fails the unit and names the claim: {write_denial:?}"
+        );
+
+        // (c) MIXED: an advisory read deny AND a real POLICY deny in the same unit → still DENIED. The
+        // advisory exclusion must not mask a co-occurring fatal deny (a policy deny carries a policy
+        // evaluator identity, so it is never mistaken for advisory).
+        let p2 = decisions_path_for(&run_id, 2);
+        write_armed_marker(&p2, "unit-5").unwrap();
+        append_boundary_deny(
+            p2.to_str().unwrap(),
+            "wf/unit-5",
+            "unit-5",
+            "path outside this unit's boundary: /other/probe (read)",
+            false,
+        );
+        let mut policy_deny = allow_claim("POL-042", "unit-5");
+        policy_deny.decision = Decision::Deny;
+        append_decision(&p2, &policy_deny).unwrap();
+        assert!(
+            fold_input_denial(&mut store, &run_id, 2, "unit-5", true)
+                .unwrap()
+                .is_some(),
+            "an advisory read deny does not mask a co-occurring policy deny"
+        );
+
+        // --- apply_hook_decisions (phase-gate drain) --------------------------------------------
+
+        // (d) A phase whose ONLY Deny is an advisory read block must NOT veto the gate.
+        let p3 = decisions_path_for(&run_id, 3);
+        append_decision(&p3, &allow_claim("drain-allow", "exec")).unwrap();
+        append_boundary_deny(
+            p3.to_str().unwrap(),
+            "wf/exec",
+            "exec",
+            "path outside this unit's boundary: /other/read (read)",
+            false,
+        );
+        let summary = apply_hook_decisions(&mut store, "advisory-drain", &p3).unwrap();
+        assert_eq!(
+            summary.denied, 0,
+            "an advisory read deny does not veto the phase gate on drain"
+        );
+        assert_eq!(
+            summary.applied, 2,
+            "both the allow and the advisory deny still conform as durable evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(gov_run_dir("advisory-drain"));
+    }
+
+    #[test]
     fn hook_fails_closed_on_postgres_or_missing_store() {
         // postgres:// → deny (SQLite-only for now).
         assert!(store_unavailable(Some("postgres://h/db")).is_some());
@@ -1714,6 +1887,19 @@ mod tests {
     }
 
     /// A minimal Allow [`ConformanceClaim`] on `phase` for the drain/recall tests.
+    /// Append a hook-fired liveness sentinel — the production hook writes one per phase before any
+    /// claim, so a governed fold that reaches its liveness check does not fail closed (core#34).
+    fn write_hook_fired(path: &Path, phase: &str) {
+        use std::io::Write;
+        let line = serde_json::json!({ HOOK_FIRED_KEY: phase }).to_string() + "\n";
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(line.as_bytes()).unwrap();
+    }
+
     fn allow_claim(id: &str, phase: &str) -> ConformanceClaim {
         ConformanceClaim {
             claim_id: id.to_string(),
