@@ -332,6 +332,98 @@ fn bus_request_agent_verdict(
 /// is passed in (resolved by the actor on-thread). The LLM `agent_validate` runs here — OFF the actor —
 /// exactly as it did on the worker thread. A non-`Ok` step or a workdir-less run gets no agent verdict
 /// (the actor handles a failed/cancelled worker before any gate; layer-1 fails closed without a worktree).
+/// Concatenate the readable declared deliverables (each a path relative to `workdir`) into one blob for
+/// the agent judge, each headed by its filename. `None` if none are readable.
+///
+/// Only worktree-relative, non-escaping deliverables are read — the SAME constraint the deterministic
+/// floor (`missing_deliverables`, execute_wrapped.rs) enforces. A `required_deliverables` list comes from
+/// a WorkflowDef (arbitrary author data) and the worker itself writes the files, so the judge input must
+/// never pull content from OUTSIDE the worktree. Three fences, all fail-closed (skip on violation):
+///
+/// - TEXTUAL: reject an absolute or `..`-escaping declared path (already unverifiable at the det floor).
+/// - SYMLINK: canonicalize the resolved path and require it to stay under the canonicalized worktree, so
+///   an in-worktree symlink to `/etc/passwd` cannot exfiltrate outside content (Copilot review #229).
+/// - SIZE: cap each deliverable so a huge file can't balloon the judge prompt / bus payload (#229).
+///
+/// `None` if the worktree can't be canonicalized or nothing readable remains.
+fn read_deliverables_for_judge(
+    deliverables: &[String],
+    workdir: &std::path::Path,
+) -> Option<String> {
+    /// Per-deliverable byte cap for what is fed to the LAYER-2 judge.
+    const MAX_DELIVERABLE_BYTES: u64 = 1_000_000;
+    // Resolve the worktree once (also collapses macOS `/var`→`/private/var`) for the containment check.
+    // Fail-closed: if the worktree itself can't be canonicalized, read nothing.
+    let wt_canon = std::fs::canonicalize(workdir).ok()?;
+    let mut blob = String::new();
+    for rel in deliverables {
+        let trimmed = rel.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let p = std::path::Path::new(trimmed);
+        if p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        // Resolve symlinks and confirm the real target is still inside the worktree.
+        let Ok(canon) = std::fs::canonicalize(wt_canon.join(p)) else {
+            continue;
+        };
+        if !canon.starts_with(&wt_canon) {
+            continue;
+        }
+        // Skip an over-cap file rather than read it (metadata failure ⇒ treat as over-cap, fail-closed).
+        if std::fs::metadata(&canon)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            > MAX_DELIVERABLE_BYTES
+        {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&canon) {
+            if !blob.is_empty() {
+                blob.push('\n');
+            }
+            blob.push_str("=== ");
+            blob.push_str(trimmed);
+            blob.push_str(" ===\n");
+            blob.push_str(&content);
+        }
+    }
+    (!blob.is_empty()).then_some(blob)
+}
+
+/// Pick the text the LAYER-2 agent judge reviews.
+///
+/// An Evaluator-role unit that declares its OWN `required_deliverables` (e.g. `coverage` →
+/// `coverage-report.json`) is judged against a criterion that TARGETS that deliverable, so the judge must
+/// see the deliverable content. `agent_review_target` (the prior creator's cold output) is the right
+/// target ONLY for a PURE reviewer — an Evaluator with no deliverable of its own (adversarial-review),
+/// which judges the work it reviews. Before this, `coverage`'s judge was fed the upstream domain-model
+/// narrative and rejected a correct `coverage-report.json` (behavior_bearing=766, coverage=1.0, 0
+/// unaccounted) as "a narrative … never presents a coverage computation" — a false-NEGATIVE gate, the
+/// mirror of FINDING-091. If the deliverable can't be read (should not happen once the deterministic
+/// floor passed), fall back to the creator-output target — fail-closed, not silently permissive.
+fn select_work_for_agent<'a>(
+    role: crate::workflow::PhaseRole,
+    required_deliverables: &[String],
+    workdir: Option<&std::path::Path>,
+    agent_review_target: Option<&'a str>,
+    own_output: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if role == crate::workflow::PhaseRole::Evaluator && !required_deliverables.is_empty() {
+        if let Some(blob) =
+            workdir.and_then(|wd| read_deliverables_for_judge(required_deliverables, wd))
+        {
+            return std::borrow::Cow::Owned(blob);
+        }
+    }
+    std::borrow::Cow::Borrowed(agent_review_target.unwrap_or(own_output))
+}
+
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -358,7 +450,14 @@ fn run_unit_and_judge_with_roster(
     roster: &[crate::AgenticCli],
 ) -> (StepOutput, Option<(bool, String)>) {
     let output = runner.run_unit_streaming(input, emit_delta);
-    let work_for_agent = agent_review_target.unwrap_or(&output.output);
+    let work_owned = select_work_for_agent(
+        input.unit.role,
+        &input.unit.required_deliverables,
+        input.workdir.as_deref(),
+        agent_review_target,
+        &output.output,
+    );
+    let work_for_agent: &str = &work_owned;
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         input
             .unit
@@ -866,6 +965,120 @@ fn run_task_completed_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The coverage LAYER-2 finding: an Evaluator-role unit that produces its own analytical deliverable
+    /// must be judged on that deliverable, not on the prior creator's cold output. Feeding the judge the
+    /// upstream domain-model narrative made it reject a correct `coverage-report.json` (766/1.0) as "not a
+    /// coverage computation". A PURE reviewer (Evaluator, no deliverable) must still judge the creator's
+    /// work. Mutation: drop the deliverable branch of `select_work_for_agent` (always use
+    /// `agent_review_target`) and the first block's asserts fail — the judge would see the narrative.
+    #[test]
+    fn evaluator_with_a_deliverable_is_judged_on_the_deliverable_not_the_creator_output() {
+        let dir = std::env::temp_dir().join(format!("wcov_judge_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = r#"{"behavior_bearing":766,"coverage":1.0,"unaccounted":0}"#;
+        std::fs::write(dir.join("coverage-report.json"), report).unwrap();
+        let deliverables = vec!["coverage-report.json".to_string()];
+        let narrative = "a narrative transcript of domain-model edits (BR-* additions/corrections)";
+
+        // Evaluator WITH its own deliverable → judge sees the deliverable, not the creator narrative.
+        let work = select_work_for_agent(
+            crate::workflow::PhaseRole::Evaluator,
+            &deliverables,
+            Some(dir.as_path()),
+            Some(narrative),
+            "own worker transcript",
+        );
+        assert!(
+            work.contains("\"coverage\":1.0") && work.contains("behavior_bearing"),
+            "the coverage-report.json deliverable must be what the judge reviews: {work}"
+        );
+        assert!(
+            !work.contains("narrative transcript"),
+            "the judge must NOT be fed the upstream creator narrative for a deliverable-bearing evaluator"
+        );
+
+        // A PURE reviewer (Evaluator, NO deliverable) still judges the creator's work — guard
+        // adversarial-review, whose target is correctly the creator's cold output.
+        let reviewer = select_work_for_agent(
+            crate::workflow::PhaseRole::Evaluator,
+            &[],
+            Some(dir.as_path()),
+            Some(narrative),
+            "own worker transcript",
+        );
+        assert_eq!(
+            reviewer, narrative,
+            "a reviewer with no deliverable of its own must still be judged on the creator's work"
+        );
+
+        // A Creator/Neutral unit judges its own output (no agent_review_target).
+        let creator = select_work_for_agent(
+            crate::workflow::PhaseRole::Creator,
+            &deliverables,
+            Some(dir.as_path()),
+            None,
+            "own worker transcript",
+        );
+        assert_eq!(
+            creator, "own worker transcript",
+            "a non-Evaluator unit is judged on its own output regardless of deliverables"
+        );
+
+        // PATH-ESCAPE GUARD (Copilot review on #229): a `..`-escaping (or absolute) declared deliverable
+        // must NOT be read into the judge input — a WorkflowDef is arbitrary author data. Plant a secret
+        // OUTSIDE the worktree and declare a `..` path to it; the judge must fall back to the creator
+        // work, never the secret. Mutation: drop the is_absolute/ParentDir skip and this fails.
+        let secret = dir
+            .parent()
+            .unwrap()
+            .join(format!("wcov_secret_{}.txt", std::process::id()));
+        std::fs::write(&secret, "SECRET-OUTSIDE-WORKTREE").unwrap();
+        let escaping = vec![format!(
+            "../{}",
+            secret.file_name().unwrap().to_str().unwrap()
+        )];
+        let guarded = select_work_for_agent(
+            crate::workflow::PhaseRole::Evaluator,
+            &escaping,
+            Some(dir.as_path()),
+            Some(narrative),
+            "own worker transcript",
+        );
+        assert!(
+            !guarded.contains("SECRET-OUTSIDE-WORKTREE"),
+            "a ..-escaping deliverable must never be read into the judge input: {guarded}"
+        );
+        assert_eq!(
+            guarded, narrative,
+            "an escaping deliverable falls back to the creator-output target (fail-closed)"
+        );
+
+        // SYMLINK-ESCAPE GUARD (Copilot review on #229): a deliverable whose path is textually relative
+        // and non-escaping, but is an in-worktree SYMLINK pointing OUTSIDE, must NOT be read into the
+        // judge input. The worker can write such a symlink (the boundary allows writes to in-worktree
+        // paths). Mutation: drop the canonicalize/starts_with containment check and this reads the secret.
+        #[cfg(unix)]
+        {
+            let link = dir.join("linked-report.json");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let via_symlink = select_work_for_agent(
+                crate::workflow::PhaseRole::Evaluator,
+                &["linked-report.json".to_string()],
+                Some(dir.as_path()),
+                Some(narrative),
+                "own worker transcript",
+            );
+            assert!(
+                !via_symlink.contains("SECRET-OUTSIDE-WORKTREE"),
+                "an in-worktree symlink to an outside file must not be read into the judge input: {via_symlink}"
+            );
+            std::fs::remove_file(&link).ok();
+        }
+        std::fs::remove_file(&secret).ok();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn status_string_roundtrips() {
