@@ -1143,6 +1143,8 @@ mod tests {
                 attempt: 0,
                 input_tokens: 10,
                 output_tokens: 20,
+                cache_read_tokens: 6,
+                cache_creation_tokens: 2,
                 cost_usd: Some(0.4),
             },
             "cliUsage",
@@ -1153,6 +1155,8 @@ mod tests {
                 "attempt",
                 "inputTokens",
                 "outputTokens",
+                "cacheReadTokens",
+                "cacheCreationTokens",
                 "costUsd",
             ],
         );
