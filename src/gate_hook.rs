@@ -267,22 +267,39 @@ fn bash_write_targets(command: &str) -> Vec<String> {
             _ => {}
         }
     }
+    // Drop standard shell write SINKS — writing to them discards or streams bytes, it does not place
+    // a file outside the worktree, so they are not escapes. `> /dev/null` is in ~every real command
+    // (the governed PageIndex pass failed on an `analyze` unit's `… > /dev/null` before this — a false
+    // positive that would fail essentially every workflow). FINDING-045 is a fence against files
+    // leaving the worktree, not a ban on discarding output.
+    targets.retain(|t| !is_safe_write_sink(t));
     targets
 }
 
-/// If `tok` is a WRITE-redirect operator (`>`, `>>`, `>|`, `N>`, `&>`, optionally glued to a
+/// A standard character-device write sink (not a filesystem location that can hold an escaped file).
+/// `> /dev/null` / `2>/dev/stderr` / `>/dev/fd/3` are ordinary output plumbing, never an escape.
+fn is_safe_write_sink(target: &str) -> bool {
+    matches!(
+        target,
+        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/tty" | "/dev/zero"
+    ) || target.starts_with("/dev/fd/")
+}
+
+/// If `tok` is a WRITE-redirect operator to a FILE (`>`, `>>`, `>|`, `N>`, `&>`, optionally glued to a
 /// filename), return the glued filename (`""` when the filename is the next token). `None` for a
-/// non-redirect token or a READ redirect (`<`). Fd prefixes and a leading `&` are stripped first.
+/// non-redirect token, a READ redirect (`<`), or an fd DUPLICATION (`2>&1`, `>&2`) — the latter
+/// redirects a descriptor to another descriptor, it writes no file, so it is not a boundary target.
 fn redirect_glob(tok: &str) -> Option<&str> {
     let t = tok.trim_start_matches(|c: char| c.is_ascii_digit());
-    let t = t.strip_prefix('&').unwrap_or(t);
-    if let Some(rest) = t.strip_prefix(">>") {
-        return Some(rest.trim_start_matches('|'));
+    let t = t.strip_prefix('&').unwrap_or(t); // `&>` = redirect stdout+stderr to a file
+                                              // `>>` must be tried before `>` (the latter is a prefix of the former).
+    let rest = t.strip_prefix(">>").or_else(|| t.strip_prefix('>'))?;
+    let rest = rest.trim_start_matches('|');
+    // `2>&1` / `>&2`: after the operator the target is `&N` — a descriptor dup, not a file.
+    if rest.starts_with('&') {
+        return None;
     }
-    if let Some(rest) = t.strip_prefix('>') {
-        return Some(rest.trim_start_matches('|'));
-    }
-    None
+    Some(rest)
 }
 
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
@@ -2239,6 +2256,21 @@ mod boundary_tests {
                     .is_none(),
                 "a Bash write inside the worktree must be allowed"
             );
+            // Standard write SINKS are not escapes — the governed PageIndex pass failed on an
+            // `analyze` unit's `… > /dev/null` before this (a false positive that fails ~every
+            // workflow). These must be allowed.
+            for sink in [
+                "echo x > /dev/null",
+                "cmd 2> /dev/null",
+                "cmd > /dev/null 2>&1",
+                "cmd 2>/dev/stderr",
+                "echo hi | tee /dev/null",
+            ] {
+                assert!(
+                    boundary_denial(&json!({ "command": sink }), "Bash").is_none(),
+                    "a Bash write to a standard sink must be allowed: {sink}"
+                );
+            }
         });
     }
 
