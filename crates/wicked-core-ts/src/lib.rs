@@ -760,6 +760,30 @@ impl Core {
         })
     }
 
+    /// Coverage for ONE registered repo, computed over that repo's OWN code graph — not the daemon's
+    /// bookkeeping store (FINDING-009). `get_coverage_report` above reads `self.db_path` (the daemon
+    /// `core.db`), which holds run/governance nodes but none of a repo's domain/requirement nodes, so
+    /// it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo. This
+    /// resolves the repo from the registry, opens its `code_graph_db` (`<root>/.codegraph/estate.db`,
+    /// the one spelling every consumer shares), and recomputes over it. An unknown `repo_ref` is an
+    /// ERROR, never a silent vacuous report — the caller must name a real repo.
+    #[napi]
+    pub fn get_coverage_report_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            use wicked_governance::recompute_front_half_coverage;
+            let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let repo = wicked_core::get_repo(&daemon, &repo_ref)
+                .map_err(err)?
+                .ok_or_else(|| err(format!("no registered repo '{repo_ref}'")))?;
+            let repo_store = open_store_ro(Some(repo.code_graph_db.as_str())).map_err(err)?;
+            recompute_front_half_coverage(&repo_store)
+                .map_err(err)
+                .and_then(|report| serde_json::to_string(&report).map_err(err))
+        })
+    }
+
     // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────
     // Each method runs its (potentially blocking) Core call on a libuv worker thread via the SAME
     // `CoreTask`/`AsyncTask` pattern as every other method — the Node event loop is never blocked on
