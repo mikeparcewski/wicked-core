@@ -772,15 +772,11 @@ impl Core {
         let db_path = self.db_path.clone();
         task(move || {
             use wicked_apps_core::open_store_ro;
-            use wicked_governance::recompute_front_half_coverage;
             let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
-            let repo = wicked_core::get_repo(&daemon, &repo_ref)
-                .map_err(err)?
-                .ok_or_else(|| err(format!("no registered repo '{repo_ref}'")))?;
-            let repo_store = open_store_ro(Some(repo.code_graph_db.as_str())).map_err(err)?;
-            recompute_front_half_coverage(&repo_store)
-                .map_err(err)
-                .and_then(|report| serde_json::to_string(&report).map_err(err))
+            // The resolve-repo → open-its-store → recompute logic lives in wicked-core so it is
+            // unit-testable there (this napi layer stays thin glue). An unknown repo errors.
+            let report = wicked_core::coverage_report_for_repo(&daemon, &repo_ref).map_err(err)?;
+            serde_json::to_string(&report).map_err(err)
         })
     }
 
