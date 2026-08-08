@@ -168,12 +168,29 @@ pub fn validate_git_repo(root: &str) -> anyhow::Result<String> {
 
 /// Register a repository: validate it, resolve its id + default branch, persist the [`RepoEntry`].
 pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Result<RepoEntry> {
+    // Validate FIRST (its "not a directory" / "not a git repository" errors are friendlier than a raw
+    // canonicalize ENOENT), then resolve the root to an ABSOLUTE, symlink-free path before persisting.
+    // A caller may register with a relative path (`register-repo --path ./repo`), but the daemon and
+    // every downstream consumer — worktree creation, code-graph resolution — run from a DIFFERENT cwd
+    // and assume the stored root_path is absolute. Persisting the as-given relative path yields a
+    // root_path (and a code_graph_db derived from it) that resolves to nothing outside the registering
+    // cwd. `canonicalize` also collapses `..`/symlink spellings to ONE identity, so the same repo
+    // registered two ways lands on one RepoEntry (core#214).
     let default_branch = validate_git_repo(&spec.root_path)?;
+    let root_path = std::fs::canonicalize(&spec.root_path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve repo path {} to an absolute path: {e}",
+                spec.root_path
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
     let entry = RepoEntry {
         id: slug(&spec.name),
         name: spec.name,
-        code_graph_db: code_graph_db(&spec.root_path),
-        root_path: spec.root_path,
+        code_graph_db: code_graph_db(&root_path),
+        root_path,
         default_branch,
         registered_at: spec.registered_at,
     };
@@ -826,6 +843,63 @@ mod tests {
         assert!(git(p, &["add", "-A"]).unwrap().0);
         assert!(git(p, &["commit", "-qm", "base"]).unwrap().0);
         root
+    }
+
+    /// core#214. `register_repo` must persist an ABSOLUTE, canonical root — never the caller's
+    /// as-given spelling. A relative `--path ./repo` (or any `..`/symlink spelling) stored verbatim
+    /// resolves to nothing from the daemon's cwd, and the `code_graph_db` derived from it inherits the
+    /// break. Uses a non-canonical-but-absolute input (`<root>/../<name>`) so the falsification holds
+    /// on every platform — on Linux CI `/tmp` is not a symlink, so ONLY the `..` guarantees a
+    /// difference between as-given and canonical.
+    #[test]
+    fn register_repo_stores_a_canonical_absolute_root() {
+        let root = git_repo("core214");
+        let name = root.file_name().unwrap();
+        let non_canonical = root.join("..").join(name);
+        assert!(
+            non_canonical.to_string_lossy().contains(".."),
+            "precondition: the registered path is non-canonical: {}",
+            non_canonical.display()
+        );
+
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Core 214 Repo".into(),
+                root_path: non_canonical.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+
+        let canonical = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            entry.root_path, canonical,
+            "root_path is stored canonical + absolute, not as-given"
+        );
+        assert!(
+            !entry.root_path.contains(".."),
+            "the '..' must be resolved away: {}",
+            entry.root_path
+        );
+        assert!(
+            Path::new(&entry.code_graph_db).is_absolute()
+                && entry.code_graph_db.starts_with(&canonical),
+            "code_graph_db is absolute and under the canonical root: {}",
+            entry.code_graph_db
+        );
+
+        // The persisted node round-trips to the SAME canonical paths (FromNode re-derives code_graph_db
+        // from root_path), so a consumer reading the store back never sees the as-given spelling.
+        let fetched = get_repo(&store, &entry.id).unwrap().unwrap();
+        assert_eq!(fetched.root_path, canonical);
+        assert_eq!(fetched.code_graph_db, entry.code_graph_db);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The heart of FINDING-059. `rev-parse` succeeds anywhere beneath the parent repo, including in
