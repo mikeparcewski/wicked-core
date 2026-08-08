@@ -255,6 +255,28 @@ fn distribute_one(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     relay: Option<EventRelay>,
 ) -> anyhow::Result<Distribution> {
+    // FINDING-010: a single-seat roster has nothing to elect. Convening a council here still queues a
+    // ballot and dispatches it to the sole CLI — a real subprocess turn spent asking one voter to pick
+    // the one option, ~30s of dead wall-clock per unit for a foregone conclusion (and a councilConvened
+    // the operator must then read past). Short-circuit: assign the only seat directly and record a
+    // TRUTHFUL one-seat verdict (1 of 1, 100% agreement, no dissent). No ballot, no dispatch, no
+    // council estate — the dispatcher is never touched. `enforce_evaluator_distinct` is a no-op at
+    // len < 2, so nothing downstream depends on the council having run here.
+    if let [only] = clis {
+        return Ok(Distribution {
+            assigned_invocation: invocation_of(clis, &only.key),
+            assigned_cli: only.key.clone(),
+            council_task_ref: None,
+            routing: RoutingInfo::Council {
+                winner: only.key.clone(),
+                agreement_pct: 100,
+                returned: 1,
+                seated: Some(1),
+                dissent: 0,
+            },
+        });
+    }
+
     let estate = match db_path {
         Some(path) => EstateHandle::new(
             wicked_apps_core::SqliteStore::open(path)
@@ -460,7 +482,113 @@ fn route_from_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wicked_council::Verdict;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wicked_council::types::{Category, Confidence, InputMode, Vote};
+    use wicked_council::{CouncilTask, Verdict};
+
+    /// Counts every `dispatch` — a ballot dispatched to a CLI is a real subprocess turn. A
+    /// short-circuited single-seat roster must never reach it.
+    struct SpyDispatcher {
+        calls: Arc<AtomicUsize>,
+    }
+    impl Dispatcher for SpyDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Some(Vote {
+                cli: cli.key.clone(),
+                // "1 …" resolves to option 1 so the >1-seat control path reaches a real verdict.
+                recommendation: "1 — fit".into(),
+                top_risk: "none".into(),
+                change_my_mind: "no".into(),
+                disqualifier: None,
+                confidence: Confidence::default(),
+                provenance: "spy".into(),
+            })
+        }
+    }
+
+    fn seat(key: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: format!("run-{key} {{PROMPT}}"),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: Some(format!("{key} capabilities")),
+        }
+    }
+
+    /// FINDING-010: a single-seat roster is assigned WITHOUT convening a council — the dispatcher is
+    /// never called (no ballot subprocess), and the routing is a truthful 1-of-1 verdict. The 2-seat
+    /// control proves the guard is scoped to len==1: there, the council DOES convene (dispatcher hit).
+    /// Mutation: delete the `if let [only] = clis` short-circuit and the single-seat case dispatches
+    /// (calls > 0), failing the first assertion.
+    #[test]
+    fn a_single_seat_roster_skips_the_council_and_dispatches_nothing() {
+        let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
+
+        // Single seat → short-circuit.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(SpyDispatcher {
+            calls: calls.clone(),
+        });
+        let dists = distribute_units_on(
+            std::slice::from_ref(&unit),
+            &[seat("solo")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+        )
+        .expect("distribute a single-seat roster");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a one-seat roster must NOT dispatch a ballot"
+        );
+        assert_eq!(dists.len(), 1);
+        assert_eq!(dists[0].assigned_cli, "solo");
+        assert_eq!(
+            dists[0].assigned_invocation.as_deref(),
+            Some("run-solo {PROMPT}")
+        );
+        assert!(
+            dists[0].council_task_ref.is_none(),
+            "no council task convened"
+        );
+        assert!(
+            matches!(&dists[0].routing, RoutingInfo::Council { winner, agreement_pct, returned, seated, dissent }
+                if winner == "solo" && *agreement_pct == 100 && *returned == 1 && *seated == Some(1) && *dissent == 0),
+            "single seat records a truthful 1-of-1 verdict, got {:?}",
+            dists[0].routing
+        );
+
+        // Two seats → the council genuinely convenes (guard is scoped to len==1).
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let dispatcher2: Arc<dyn Dispatcher + Send + Sync> = Arc::new(SpyDispatcher {
+            calls: calls2.clone(),
+        });
+        let _ = distribute_units_on(
+            &[unit],
+            &[seat("alpha"), seat("beta")],
+            "s1",
+            None,
+            &dispatcher2,
+            None,
+        )
+        .expect("distribute a two-seat roster");
+        assert!(
+            calls2.load(Ordering::SeqCst) >= 1,
+            "a multi-seat roster still convenes a council (dispatches ballots)"
+        );
+    }
 
     fn status_with_winner(winner: Option<&str>, state: TaskState) -> PollStatus {
         PollStatus {
