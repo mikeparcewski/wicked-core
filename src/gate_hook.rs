@@ -158,25 +158,131 @@ const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 /// unrelated network failure stopped it. `evaluator != creator` is this platform's headline
 /// structural claim, and it was enforced by a file the creator could rewrite.
 ///
-/// Returns the denial reason, or `None` when the call is inside the boundary, carries no path, or
-/// no boundary was configured.
-fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<String> {
+/// Returns `(reason, is_write)`, or `None` when the call is inside the boundary, carries nothing
+/// path-shaped, or no boundary was configured. `is_write` drives whether the deny is unit-FATAL (a
+/// write/escape) or ADVISORY (a read probe) — see [`append_boundary_deny`] / core#219.
+fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, bool)> {
     let roots = allowed_roots_from_env()?;
-    let path = context
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .filter(|p| !p.is_empty())?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    crate::path_policy::check(
-        path,
-        &roots,
-        WRITE_TOOLS.contains(&tool),
-        &cwd,
-        home.as_deref(),
-    )
-    .err()
-    .map(|d| d.to_string())
+
+    // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
+    if let Some(path) = context
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty())
+    {
+        let is_write = WRITE_TOOLS.contains(&tool);
+        if let Err(d) = crate::path_policy::check(path, &roots, is_write, &cwd, home.as_deref()) {
+            return Some((d.to_string(), is_write));
+        }
+    }
+
+    // Bash: inspect the command for WRITE targets that leave the boundary (FINDING-045). A path
+    // gate is blind to `Bash{echo x > ~/outside}` / cp / mv / dd — the command carries no `path`, so
+    // the check above never sees it, and a shell write out of the worktree was permitted. This is a
+    // WRITE escape → unit-fatal (is_write = true). DEFENSE-IN-DEPTH, not a hermetic sandbox: the
+    // shell is Turing-complete, so a determined escape (via `$(...)`, a variable, `base64|sh`) can
+    // still evade a scan of the literal command — the honest containment guarantee remains OS-level,
+    // which this codebase does not yet have. This closes the DIRECT, common escapes the finding names.
+    if tool == "Bash" {
+        if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
+            for target in bash_write_targets(command) {
+                if let Err(d) =
+                    crate::path_policy::check(&target, &roots, true, &cwd, home.as_deref())
+                {
+                    return Some((format!("Bash write leaves the unit boundary: {d}"), true));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
+/// Covers the direct escapes: `>`/`>>`/`N>` redirects (spaced or glued), `tee [-a] FILE...`, and the
+/// destination of `cp`/`mv`/`install` (last non-flag arg) and `dd of=FILE`. Deliberately NOT a shell
+/// parser — see the caller's note on why this is defense-in-depth rather than a sandbox.
+fn bash_write_targets(command: &str) -> Vec<String> {
+    let toks: Vec<&str> = command.split_whitespace().collect();
+    let mut targets: Vec<String> = Vec::new();
+
+    // Redirection targets. `redirect_glob(tok)` returns Some(glued-filename-or-empty) for a write
+    // redirect operator; an empty string means the filename is the NEXT token.
+    let mut i = 0;
+    while i < toks.len() {
+        if let Some(glued) = redirect_glob(toks[i]) {
+            if !glued.is_empty() {
+                targets.push(glued.to_string());
+            } else if i + 1 < toks.len() {
+                targets.push(toks[i + 1].to_string());
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+
+    // Command-shaped destinations. Split into pipeline/sequence SEGMENTS on shell separators so a
+    // write command after a pipe (`echo x | tee FILE`) or `;`/`&&` is checked as its own program —
+    // not missed because the first word of the whole line was something else.
+    const SEPS: [&str; 6] = ["|", "||", "&&", ";", "&", "|&"];
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut seg: Vec<&str> = Vec::new();
+    for &t in &toks {
+        if SEPS.contains(&t) {
+            if !seg.is_empty() {
+                segments.push(std::mem::take(&mut seg));
+            }
+        } else if redirect_glob(t).is_none() {
+            seg.push(t); // drop redirect operators/targets — handled above
+        }
+    }
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
+    for words in &segments {
+        let Some(prog) = words.first() else { continue };
+        let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+        match base {
+            "cp" | "mv" | "install" => {
+                if let Some(dest) = words[1..].iter().rev().find(|w| !w.starts_with('-')) {
+                    targets.push((*dest).to_string());
+                }
+            }
+            "tee" => {
+                for w in &words[1..] {
+                    if !w.starts_with('-') {
+                        targets.push((*w).to_string());
+                    }
+                }
+            }
+            "dd" => {
+                for w in &words[1..] {
+                    if let Some(f) = w.strip_prefix("of=") {
+                        targets.push(f.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// If `tok` is a WRITE-redirect operator (`>`, `>>`, `>|`, `N>`, `&>`, optionally glued to a
+/// filename), return the glued filename (`""` when the filename is the next token). `None` for a
+/// non-redirect token or a READ redirect (`<`). Fd prefixes and a leading `&` are stripped first.
+fn redirect_glob(tok: &str) -> Option<&str> {
+    let t = tok.trim_start_matches(|c: char| c.is_ascii_digit());
+    let t = t.strip_prefix('&').unwrap_or(t);
+    if let Some(rest) = t.strip_prefix(">>") {
+        return Some(rest.trim_start_matches('|'));
+    }
+    if let Some(rest) = t.strip_prefix('>') {
+        return Some(rest.trim_start_matches('|'));
+    }
+    None
 }
 
 /// Body of the `wicked-core gate-hook` subcommand. Returns the process exit code (2 = DENY).
@@ -317,18 +423,13 @@ pub(crate) fn evaluate_tool_call(
     // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
-    if let Some(reason) = boundary_denial(context, tool) {
+    if let Some((reason, is_write)) = boundary_denial(context, tool) {
         // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
         // escape attempt and stays unit-fatal; a READ probe is advisory — blocked, audited, but not
         // unit-fatal, so a worker probing an out-of-bounds file (then adapting) is not failed for it
-        // (P8 #10 / core#219). See `append_boundary_deny`.
-        append_boundary_deny(
-            decisions_path,
-            scope,
-            phase,
-            &reason,
-            WRITE_TOOLS.contains(&tool),
-        );
+        // (P8 #10 / core#219). `is_write` comes from the boundary check itself so a Bash write-escape
+        // (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See `append_boundary_deny`.
+        append_boundary_deny(decisions_path, scope, phase, &reason, is_write);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -2040,8 +2141,9 @@ mod boundary_tests {
         std::fs::create_dir_all(&wt).unwrap();
         let pin = dirs_config_workflow();
         with_roots(Some(wt.to_str().unwrap()), || {
-            let denial = boundary_denial(&ctx(&pin), "Write")
+            let (denial, is_write) = boundary_denial(&ctx(&pin), "Write")
                 .expect("writing the gate's own pin must be refused");
+            assert!(is_write, "writing the pin is a WRITE escape (unit-fatal)");
             assert!(
                 denial.contains(&wt.to_string_lossy().to_string()),
                 "the denial must name where the call WOULD have been allowed, or the agent \
@@ -2093,14 +2195,50 @@ mod boundary_tests {
         });
     }
 
-    /// A call with no path argument is not a boundary question. Bash is the residual this layer
-    /// deliberately does not claim to cover (see crate::path_policy's module docs).
+    /// A Bash command with no write target is not a boundary question — a read/list is not an escape.
     #[test]
-    fn a_call_without_a_path_is_not_judged_here() {
+    fn a_bash_command_with_no_write_target_is_not_judged() {
         let wt = std::env::temp_dir().join("wicked-boundary-wt5");
         std::fs::create_dir_all(&wt).unwrap();
         with_roots(Some(wt.to_str().unwrap()), || {
             assert!(boundary_denial(&json!({"command": "ls /"}), "Bash").is_none());
+        });
+    }
+
+    /// FINDING-045: a Bash WRITE that leaves the worktree is refused and unit-FATAL, even though
+    /// "Bash" is not a path-bearing WRITE_TOOL. A write INSIDE the worktree is allowed. Covers the
+    /// direct escape shapes the finding names (redirect, cp, tee). Mutation: delete the Bash arm of
+    /// `boundary_denial` and the out-of-boundary writes return None — these asserts fail.
+    #[test]
+    fn a_bash_write_outside_the_worktree_is_refused_and_fatal() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-bash");
+        std::fs::create_dir_all(&wt).unwrap();
+        let inside = wt.join("out.txt");
+        let inside = inside.to_str().unwrap();
+        with_roots(Some(wt.to_str().unwrap()), || {
+            // Redirect to an absolute path outside the boundary → DENY, is_write=true (fatal).
+            let d = boundary_denial(&json!({"command": "echo pwned > /etc/evil-marker"}), "Bash");
+            assert!(
+                d.as_ref().is_some_and(|(_, is_write)| *is_write),
+                "a Bash redirect out of the worktree must be a FATAL boundary deny: {d:?}"
+            );
+            // cp and tee destinations outside → also denied.
+            assert!(
+                boundary_denial(&json!({"command": "cp ./a.txt /etc/evil-marker"}), "Bash")
+                    .is_some(),
+                "cp to an outside destination must be denied"
+            );
+            assert!(
+                boundary_denial(&json!({"command": "echo x | tee /etc/evil-marker"}), "Bash")
+                    .is_some(),
+                "tee to an outside file must be denied"
+            );
+            // A write INSIDE the worktree is fine — the boundary is a fence, not a Bash ban.
+            assert!(
+                boundary_denial(&json!({ "command": format!("echo ok > {inside}") }), "Bash")
+                    .is_none(),
+                "a Bash write inside the worktree must be allowed"
+            );
         });
     }
 
