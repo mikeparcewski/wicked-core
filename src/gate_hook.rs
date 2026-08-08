@@ -654,7 +654,11 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
 /// fold/drain can treat the two differently.
 const BOUNDARY_EVALUATOR: &str = "wicked-governance-boundary";
 /// Claim-id prefix for a boundary deny that STAYS unit-fatal: a WRITE outside the sandbox (an escape
-/// attempt — e.g. the FINDING-098 pin-rewrite), plus any un-classified boundary deny.
+/// attempt — e.g. the FINDING-098 pin-rewrite). This is the DEFAULT-FATAL prefix, and it is fatal by
+/// omission rather than by enumeration: `is_advisory_boundary_read_deny` is an allowlist that fires
+/// ONLY for [`BOUNDARY_READ_DENY_PREFIX`], so a claim carrying this prefix — or any other deny the
+/// fold/drain ever sees — is treated as fatal. `append_boundary_deny` reaches here whenever
+/// `is_write` is set; there is no third writer-side category.
 const BOUNDARY_WRITE_DENY_PREFIX: &str = "boundary-deny:";
 /// Claim-id prefix for an ADVISORY boundary deny: a READ outside the sandbox. The tool-call is STILL
 /// blocked (the worker never reads the file), but a blocked read leaks nothing and the worker adapts,
