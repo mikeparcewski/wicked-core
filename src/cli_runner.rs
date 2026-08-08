@@ -334,18 +334,36 @@ fn bus_request_agent_verdict(
 /// (the actor handles a failed/cancelled worker before any gate; layer-1 fails closed without a worktree).
 /// Concatenate the readable declared deliverables (each a path relative to `workdir`) into one blob for
 /// the agent judge, each headed by its filename. `None` if none are readable.
+///
+/// Only worktree-relative, non-escaping deliverables are read — the SAME constraint the deterministic
+/// floor (`missing_deliverables`, execute_wrapped.rs) enforces. A `required_deliverables` list comes from
+/// a WorkflowDef (arbitrary author data), so an absolute or `..`-escaping declared path must NEVER pull
+/// content from OUTSIDE the worktree into the judge prompt. Such a path already fails the deterministic
+/// floor as unverifiable; skipping it here too is defense-in-depth, independent of gate ordering
+/// (Copilot review on #229).
 fn read_deliverables_for_judge(
     deliverables: &[String],
     workdir: &std::path::Path,
 ) -> Option<String> {
     let mut blob = String::new();
     for rel in deliverables {
-        if let Ok(content) = std::fs::read_to_string(workdir.join(rel)) {
+        let trimmed = rel.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let p = std::path::Path::new(trimmed);
+        if p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(workdir.join(p)) {
             if !blob.is_empty() {
                 blob.push('\n');
             }
             blob.push_str("=== ");
-            blob.push_str(rel);
+            blob.push_str(trimmed);
             blob.push_str(" ===\n");
             blob.push_str(&content);
         }
@@ -981,6 +999,36 @@ mod tests {
             creator, "own worker transcript",
             "a non-Evaluator unit is judged on its own output regardless of deliverables"
         );
+
+        // PATH-ESCAPE GUARD (Copilot review on #229): a `..`-escaping (or absolute) declared deliverable
+        // must NOT be read into the judge input — a WorkflowDef is arbitrary author data. Plant a secret
+        // OUTSIDE the worktree and declare a `..` path to it; the judge must fall back to the creator
+        // work, never the secret. Mutation: drop the is_absolute/ParentDir skip and this fails.
+        let secret = dir
+            .parent()
+            .unwrap()
+            .join(format!("wcov_secret_{}.txt", std::process::id()));
+        std::fs::write(&secret, "SECRET-OUTSIDE-WORKTREE").unwrap();
+        let escaping = vec![format!(
+            "../{}",
+            secret.file_name().unwrap().to_str().unwrap()
+        )];
+        let guarded = select_work_for_agent(
+            crate::workflow::PhaseRole::Evaluator,
+            &escaping,
+            Some(dir.as_path()),
+            Some(narrative),
+            "own worker transcript",
+        );
+        assert!(
+            !guarded.contains("SECRET-OUTSIDE-WORKTREE"),
+            "a ..-escaping deliverable must never be read into the judge input: {guarded}"
+        );
+        assert_eq!(
+            guarded, narrative,
+            "an escaping deliverable falls back to the creator-output target (fail-closed)"
+        );
+        std::fs::remove_file(&secret).ok();
 
         std::fs::remove_dir_all(&dir).ok();
     }
