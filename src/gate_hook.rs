@@ -207,6 +207,14 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
 /// not a safe sink, so `is_safe_write_sink` missed it and the governed PageIndex domain-graph unit was
 /// wrongly denied (run 4c63ba17). Splitting the `;` off yields the bare `/dev/null` AND keeps a glued
 /// second redirect (`>/dev/null;>/outside`) visible as its own token, so real escapes still surface.
+///
+/// SCOPE (quoting): this splits on the *shell command string*, where `;`/`(`/`)` are metacharacters —
+/// a LITERAL one in a path must be quoted or backslash-escaped. So an UNQUOTED `> foo;evil/x` really
+/// does write to `foo` (the shell then runs `evil/x`), and splitting matches that semantics rather than
+/// masking anything; an ESCAPED `> /etc/x\;y` still yields the absolute `/etc/x\` and is still denied.
+/// A QUOTED target (`> "/etc/x;y"`) keeps its surrounding quote, which defeats the absolute-path check
+/// identically with or without this split — a pre-existing limitation of this quote-naive,
+/// defense-in-depth (non-hermetic) check, not a regression introduced here.
 fn shell_tokens(command: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in command.split_whitespace() {
