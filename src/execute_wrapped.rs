@@ -154,14 +154,18 @@ impl OutputAdapter for ClaudeStreamJson {
                     // path by orders of magnitude while `total_cost_usd` — which does bill the
                     // cache — stayed correct, so a run showed a plausible dollar figure beside a
                     // token count too small to explain it, and the pair invited belief in both.
+                    let cache_read_tokens = field("cache_read_input_tokens");
+                    let cache_creation_tokens = field("cache_creation_input_tokens");
                     let input_tokens = field("input_tokens")
-                        .saturating_add(field("cache_read_input_tokens"))
-                        .saturating_add(field("cache_creation_input_tokens"));
+                        .saturating_add(cache_read_tokens)
+                        .saturating_add(cache_creation_tokens);
                     let output_tokens = field("output_tokens");
                     let cost_usd = v.get("total_cost_usd").and_then(|c| c.as_f64());
                     out.usage = Some(Usage {
                         input_tokens,
                         output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
                         cost_usd,
                     });
                 }
@@ -2686,6 +2690,9 @@ mod tests {
             Some(Usage {
                 input_tokens: 85_990,
                 output_tokens: 83,
+                // The cache split of that 85_990 total: 34_098 read + 26_103 creation (FINDING-012).
+                cache_read_tokens: 34_098,
+                cache_creation_tokens: 26_103,
                 cost_usd: Some(0.409099),
             })
         );
