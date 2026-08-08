@@ -337,14 +337,24 @@ fn bus_request_agent_verdict(
 ///
 /// Only worktree-relative, non-escaping deliverables are read — the SAME constraint the deterministic
 /// floor (`missing_deliverables`, execute_wrapped.rs) enforces. A `required_deliverables` list comes from
-/// a WorkflowDef (arbitrary author data), so an absolute or `..`-escaping declared path must NEVER pull
-/// content from OUTSIDE the worktree into the judge prompt. Such a path already fails the deterministic
-/// floor as unverifiable; skipping it here too is defense-in-depth, independent of gate ordering
-/// (Copilot review on #229).
+/// a WorkflowDef (arbitrary author data) and the worker itself writes the files, so the judge input must
+/// never pull content from OUTSIDE the worktree. Three fences, all fail-closed (skip on violation):
+///
+/// - TEXTUAL: reject an absolute or `..`-escaping declared path (already unverifiable at the det floor).
+/// - SYMLINK: canonicalize the resolved path and require it to stay under the canonicalized worktree, so
+///   an in-worktree symlink to `/etc/passwd` cannot exfiltrate outside content (Copilot review #229).
+/// - SIZE: cap each deliverable so a huge file can't balloon the judge prompt / bus payload (#229).
+///
+/// `None` if the worktree can't be canonicalized or nothing readable remains.
 fn read_deliverables_for_judge(
     deliverables: &[String],
     workdir: &std::path::Path,
 ) -> Option<String> {
+    /// Per-deliverable byte cap for what is fed to the LAYER-2 judge.
+    const MAX_DELIVERABLE_BYTES: u64 = 1_000_000;
+    // Resolve the worktree once (also collapses macOS `/var`→`/private/var`) for the containment check.
+    // Fail-closed: if the worktree itself can't be canonicalized, read nothing.
+    let wt_canon = std::fs::canonicalize(workdir).ok()?;
     let mut blob = String::new();
     for rel in deliverables {
         let trimmed = rel.trim();
@@ -358,7 +368,22 @@ fn read_deliverables_for_judge(
         {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(workdir.join(p)) {
+        // Resolve symlinks and confirm the real target is still inside the worktree.
+        let Ok(canon) = std::fs::canonicalize(wt_canon.join(p)) else {
+            continue;
+        };
+        if !canon.starts_with(&wt_canon) {
+            continue;
+        }
+        // Skip an over-cap file rather than read it (metadata failure ⇒ treat as over-cap, fail-closed).
+        if std::fs::metadata(&canon)
+            .map(|m| m.len())
+            .unwrap_or(u64::MAX)
+            > MAX_DELIVERABLE_BYTES
+        {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&canon) {
             if !blob.is_empty() {
                 blob.push('\n');
             }
@@ -1028,6 +1053,28 @@ mod tests {
             guarded, narrative,
             "an escaping deliverable falls back to the creator-output target (fail-closed)"
         );
+
+        // SYMLINK-ESCAPE GUARD (Copilot review on #229): a deliverable whose path is textually relative
+        // and non-escaping, but is an in-worktree SYMLINK pointing OUTSIDE, must NOT be read into the
+        // judge input. The worker can write such a symlink (the boundary allows writes to in-worktree
+        // paths). Mutation: drop the canonicalize/starts_with containment check and this reads the secret.
+        #[cfg(unix)]
+        {
+            let link = dir.join("linked-report.json");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let via_symlink = select_work_for_agent(
+                crate::workflow::PhaseRole::Evaluator,
+                &["linked-report.json".to_string()],
+                Some(dir.as_path()),
+                Some(narrative),
+                "own worker transcript",
+            );
+            assert!(
+                !via_symlink.contains("SECRET-OUTSIDE-WORKTREE"),
+                "an in-worktree symlink to an outside file must not be read into the judge input: {via_symlink}"
+            );
+            std::fs::remove_file(&link).ok();
+        }
         std::fs::remove_file(&secret).ok();
 
         std::fs::remove_dir_all(&dir).ok();
