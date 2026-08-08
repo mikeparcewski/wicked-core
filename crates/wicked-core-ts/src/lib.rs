@@ -85,18 +85,8 @@ fn status_token(s: SessionStatus) -> String {
     .to_string()
 }
 
-/// Parse the human-confirm gate policy from a wire token: `none` | `all` | `before:<ord>`.
-fn parse_human_confirm(raw: Option<&str>) -> HumanConfirm {
-    match raw.map(str::trim) {
-        Some("all") => HumanConfirm::All,
-        Some(s) if s.starts_with("before:") => s["before:".len()..]
-            .trim()
-            .parse::<u32>()
-            .map(HumanConfirm::Before)
-            .unwrap_or(HumanConfirm::None),
-        _ => HumanConfirm::None,
-    }
-}
+// Human-confirm parsing lives in wicked_core::HumanConfirm::parse — the ONE parser every entry point
+// shares, so the napi layer cannot disagree with the bus/CLI/HTTP paths (FINDING-019).
 
 /// Serialize one [`CoreEvent`] to its tagged JSON object for the JS callback.
 ///
@@ -204,7 +194,10 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
             .map(EntityMode::parse)
             .unwrap_or(EntityMode::Shared),
         session_id: o.session_id,
-        human_confirm: parse_human_confirm(o.human_confirm.as_deref()),
+        // The ONE canonical parser (FINDING-019): fail CLOSED on a typo instead of the old
+        // silent downgrade to None, so a JS caller that mistypes humanConfirm gets a thrown error,
+        // not an unattended run.
+        human_confirm: HumanConfirm::parse(o.human_confirm.as_deref()).map_err(err)?,
         repo_ref: o.repo_ref,
         workflow: o.workflow,
     })

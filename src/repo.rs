@@ -168,12 +168,34 @@ pub fn validate_git_repo(root: &str) -> anyhow::Result<String> {
 
 /// Register a repository: validate it, resolve its id + default branch, persist the [`RepoEntry`].
 pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Result<RepoEntry> {
+    // Resolve the root to an ABSOLUTE path before persisting. A caller may register with a relative
+    // path (`register-repo --path ./repo`), but the daemon and every downstream consumer — worktree
+    // creation, code-graph resolution — run from a DIFFERENT cwd and assume the stored root_path is
+    // absolute. Persisting the as-given relative path yields a root_path (and a code_graph_db derived
+    // from it) that resolves to nothing outside the registering cwd (core#214).
+    //
+    // `std::path::absolute`, NOT `std::fs::canonicalize`: canonicalize resolves symlinks and, on
+    // Windows, returns a `\\?\C:\…` extended-length path that `git worktree add` rejects (breaking
+    // create_worktree), and on macOS rewrites `/var`→`/private/var` — a spelling change the registry
+    // contract does not want (a registered absolute path must round-trip verbatim). `absolute` makes
+    // the path absolute and lexically normalises it WITHOUT touching the filesystem, so an already-
+    // absolute root is preserved while a relative one is anchored to the cwd, on every platform.
+    // validate_git_repo still runs first for its friendly "not a git repository" error.
     let default_branch = validate_git_repo(&spec.root_path)?;
+    let root_path = std::path::absolute(&spec.root_path)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve repo path {} to an absolute path: {e}",
+                spec.root_path
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
     let entry = RepoEntry {
         id: slug(&spec.name),
         name: spec.name,
-        code_graph_db: code_graph_db(&spec.root_path),
-        root_path: spec.root_path,
+        code_graph_db: code_graph_db(&root_path),
+        root_path,
         default_branch,
         registered_at: spec.registered_at,
     };
@@ -894,6 +916,66 @@ mod tests {
             coverage_report_for_repo(&daemon, "no-such-repo").is_err(),
             "an unknown repo_ref must error, not return a vacuous report"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#214. `register_repo` must persist an ABSOLUTE, normalised root — never the caller's
+    /// as-given spelling. A relative `--path ./repo` stored verbatim resolves to nothing from the
+    /// daemon's cwd, and the `code_graph_db` derived from it inherits the break.
+    ///
+    /// The input carries a redundant `.` (CurDir) component: `std::path::absolute` strips it on EVERY
+    /// platform, so the stored root differs from the as-given spelling — reverting to store-as-given
+    /// fails `assert_eq`. (`..` is deliberately NOT used: `absolute` keeps `..` on POSIX to preserve
+    /// symlink meaning, so it would not falsify there.) We assert equality to `absolute(root)`, NOT to
+    /// `canonicalize`: the fix must not resolve symlinks (canonicalize breaks `git worktree add` on
+    /// Windows via `\?\` and rewrites `/var`→`/private/var` on macOS — see the fn's doc comment).
+    #[test]
+    fn register_repo_stores_an_absolute_normalised_root() {
+        let root = git_repo("core214");
+        let messy = root.join("."); // `<root>/.` — absolute but not normalised
+        let expected = std::path::absolute(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_ne!(
+            messy.to_string_lossy(),
+            expected,
+            "precondition: the registered spelling is not already normalised"
+        );
+
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Core 214 Repo".into(),
+                root_path: messy.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            Path::new(&entry.root_path).is_absolute(),
+            "root_path must be absolute: {}",
+            entry.root_path
+        );
+        assert_eq!(
+            entry.root_path, expected,
+            "root_path is stored absolute + normalised, not as-given"
+        );
+        assert!(
+            Path::new(&entry.code_graph_db).is_absolute()
+                && entry.code_graph_db.starts_with(&expected),
+            "code_graph_db is absolute and under the normalised root: {}",
+            entry.code_graph_db
+        );
+
+        // The persisted node round-trips to the SAME paths (FromNode re-derives code_graph_db from
+        // root_path), so a consumer reading the store back never sees the as-given spelling.
+        let fetched = get_repo(&store, &entry.id).unwrap().unwrap();
+        assert_eq!(fetched.root_path, expected);
+        assert_eq!(fetched.code_graph_db, entry.code_graph_db);
 
         let _ = std::fs::remove_dir_all(&root);
     }
