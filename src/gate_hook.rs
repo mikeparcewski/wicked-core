@@ -200,12 +200,41 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
     None
 }
 
+/// Whitespace-tokenize, then split the pure control operators `;`, `(`, `)` out of any token they are
+/// glued to. Those three NEVER participate in a redirect operator (`>`, `>>`, `&>`, `2>&1`, `>|`) or an
+/// unquoted filename, so splitting them is unambiguous — unlike `&`/`|`, which do. Whitespace-only
+/// tokenizing captured `> /dev/null; next` as the target `/dev/null;` (trailing `;` glued), which is
+/// not a safe sink, so `is_safe_write_sink` missed it and the governed PageIndex domain-graph unit was
+/// wrongly denied (run 4c63ba17). Splitting the `;` off yields the bare `/dev/null` AND keeps a glued
+/// second redirect (`>/dev/null;>/outside`) visible as its own token, so real escapes still surface.
+fn shell_tokens(command: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in command.split_whitespace() {
+        let mut cur = String::new();
+        for ch in raw.chars() {
+            if matches!(ch, ';' | '(' | ')') {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                out.push(ch.to_string());
+            } else {
+                cur.push(ch);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
 /// Best-effort extraction of the filesystem WRITE targets from a Bash command line (FINDING-045).
 /// Covers the direct escapes: `>`/`>>`/`N>` redirects (spaced or glued), `tee [-a] FILE...`, and the
 /// destination of `cp`/`mv`/`install` (last non-flag arg) and `dd of=FILE`. Deliberately NOT a shell
 /// parser — see the caller's note on why this is defense-in-depth rather than a sandbox.
 fn bash_write_targets(command: &str) -> Vec<String> {
-    let toks: Vec<&str> = command.split_whitespace().collect();
+    let owned = shell_tokens(command);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
     let mut targets: Vec<String> = Vec::new();
 
     // Redirection targets. `redirect_glob(tok)` returns Some(glued-filename-or-empty) for a write
@@ -226,7 +255,7 @@ fn bash_write_targets(command: &str) -> Vec<String> {
     // Command-shaped destinations. Split into pipeline/sequence SEGMENTS on shell separators so a
     // write command after a pipe (`echo x | tee FILE`) or `;`/`&&` is checked as its own program —
     // not missed because the first word of the whole line was something else.
-    const SEPS: [&str; 6] = ["|", "||", "&&", ";", "&", "|&"];
+    const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut seg: Vec<&str> = Vec::new();
     for &t in &toks {
@@ -2265,12 +2294,30 @@ mod boundary_tests {
                 "cmd > /dev/null 2>&1",
                 "cmd 2>/dev/stderr",
                 "echo hi | tee /dev/null",
+                // A sequence separator glued to the sink — the real run-4c63ba17 false positive.
+                // Whitespace-only tokenizing captured the target as `/dev/null;`, which is not a safe
+                // sink, so the governed domain-graph unit was denied. `shell_tokens` splits the `;`.
+                "echo x > /dev/null; echo done",
+                "cmd >/dev/null;ls",
+                "cmd 2>/dev/null; true",
+                // Subshell parens glued to a sink.
+                "(echo x > /dev/null)",
             ] {
                 assert!(
                     boundary_denial(&json!({ "command": sink }), "Bash").is_none(),
                     "a Bash write to a standard sink must be allowed: {sink}"
                 );
             }
+            // NON-MASKING: splitting the glued `;` must not hide a second redirect that DOES escape.
+            // `>/dev/null;>/etc/evil` is a safe sink followed by a glued escape — the escape must win.
+            assert!(
+                boundary_denial(
+                    &json!({"command": "echo x >/dev/null;>/etc/evil-marker"}),
+                    "Bash"
+                )
+                .is_some(),
+                "a glued second redirect out of the worktree must still be denied"
+            );
         });
     }
 
