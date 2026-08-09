@@ -1953,6 +1953,9 @@ mod tests {
                 code_graph_db: None,
             }),
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
 
         let out = runner.run_unit(&input);
@@ -2011,6 +2014,9 @@ mod tests {
             workdir: Some(dir.clone()),
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let _ = runner.run_unit(&input);
         assert!(
@@ -2217,6 +2223,9 @@ mod tests {
             workdir: None,
             governance: Some(gov.clone()),
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
         let g = arm_input_governance(&input, &gov, &mut argv).unwrap();
@@ -2311,6 +2320,9 @@ mod tests {
             workdir: Some(dir.clone()),
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
         std::env::remove_var(crate::gate_hook::ESTATE_DB_ENV);
@@ -2352,6 +2364,9 @@ mod tests {
                 workdir: None,
                 governance: Some(gov.clone()),
                 prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
             };
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
             arm_input_governance(&input, gov, &mut argv).unwrap();
@@ -2558,6 +2573,9 @@ mod tests {
             workdir: Some(root.clone()),
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let seen = unit_prompt(&input);
         assert!(
@@ -2601,6 +2619,9 @@ mod tests {
             workdir: Some(root.clone()),
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
 
         let p = pty_unit_prompt(&input).expect("a short description must not fail");
@@ -2666,6 +2687,9 @@ mod tests {
             workdir: None,
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         };
         let err = pty_unit_prompt(&input)
             .expect_err("a multi-line prompt must be refused, not submitted to the terminal");
