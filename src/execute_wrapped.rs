@@ -668,6 +668,12 @@ impl WrappedCliStepRunner {
                 if !g.phase_id.is_empty() {
                     cmd.env(crate::gate_hook::GATE_PHASE_ID_ENV, &g.phase_id);
                 }
+                // Wire the worker's estate CLI channel (`wicked-core coverage` / `wicked-estate`) to
+                // the repo's OWN graph via `$WICKED_ESTATE_DB` — the completion of FINDING-069, which
+                // wired only the MCP channel. Repo store or nothing, NEVER the operational store; the
+                // full rationale (the #229 × #9b coverage-gate interaction, the FINDING-067 wipe
+                // vector) lives on `arm_worker_estate_channel`.
+                arm_worker_estate_channel(&mut cmd, g);
                 // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE root stays the
                 // worktree and ONLY the worktree — deliberately unchanged, and guarded by
                 // `the_launcher_arms_the_write_root`: a wider write root would let a governed worker
@@ -1134,12 +1140,36 @@ struct GovLaunch {
     /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
     phase_id: String,
     /// The repo's code-graph store (`<repo>/.codegraph/estate.db`), when this unit runs against a
-    /// registered repo. Used to (a) point the worker's estate MCP at the repo-local graph and
-    /// (b) widen the READ boundary to the repo root (graph paths anchor there, not to the worktree).
+    /// registered repo. Used to (a) point the worker's estate MCP at the repo-local graph,
+    /// (b) widen the READ boundary to the repo root (graph paths anchor there, not to the worktree),
+    /// and (c) set `$WICKED_ESTATE_DB` so the worker's estate CLI channel (`wicked-core coverage`,
+    /// `wicked-estate`) resolves the SAME repo graph — see [`arm_worker_estate_channel`].
     /// It does NOT widen the WRITE boundary — that stays worktree-only; the extractor's store
     /// annotations ride Bash, which the boundary does not path-judge, so no write-widening is
     /// needed (and widening it would let a worker rewrite its own gate pin). `None` for a repo-less run.
     code_graph_db: Option<String>,
+}
+
+/// Point a GOVERNED worker's estate CLI channel at the repo's OWN graph via `$WICKED_ESTATE_DB`.
+///
+/// `wicked-core coverage` and `wicked-estate` resolve `--db` ELSE [`gate_hook::ESTATE_DB_ENV`], which
+/// the launcher strips UNCONDITIONALLY at spawn (FINDING-067). Without re-setting it, the
+/// domain-coverage skill's `wicked-core coverage --db "${WICKED_ESTATE_DB:-<global default>}"` fell
+/// back to the EMPTY global store and reported `behavior_bearing=0` for a repo whose own graph holds
+/// hundreds of behavior-bearing nodes. The LAYER-2 judge reads that worker report (#229), so it
+/// rejected genuinely-covered work — and no human-confirm could clear it, because a conditional gate
+/// RE-DISPATCHES the unit (re-running the stale worker) rather than accepting the verdict.
+///
+/// Set to `code_graph_db` — the repo's own `<repo>/.codegraph/estate.db`, the SAME store FINDING-069
+/// already hands the worker's estate MCP and the one store the worker is allowed to write. NEVER
+/// `gov.db_path` (the operational store): a worker `wicked-estate index .` against the repo graph
+/// rebuilds its own graph, but against the operational store its delete-sweep removes every
+/// operational node (FINDING-067). Left UNSET when the repo was never indexed — no store beats the
+/// wrong store (the same reasoning as the estate-MCP half, which arms no MCP at all in that case).
+fn arm_worker_estate_channel(cmd: &mut Command, gov: &GovLaunch) {
+    if let Some(db) = gov.code_graph_db.as_deref() {
+        cmd.env(crate::gate_hook::ESTATE_DB_ENV, db);
+    }
 }
 
 /// The repo-root READ root to add for a governed unit whose repo has a code graph, or `None`.
@@ -2307,6 +2337,82 @@ mod tests {
         );
         // The hook still arms — this is a scoping fix, not a governance downgrade.
         assert_eq!(json["hooks"]["PreToolUse"][0]["matcher"], "*");
+    }
+
+    /// The CLI-channel twin of `the_worker_mcp_never_receives_the_operational_store`. FINDING-069
+    /// wired the MCP channel to the repo graph but left the CLI channel (`$WICKED_ESTATE_DB`, the
+    /// `--db` fallback `wicked-core coverage` reads) stripped — so the coverage skill measured the
+    /// EMPTY global store, reported `behavior_bearing=0`, and the LAYER-2 judge (#229) rejected a
+    /// repo whose own graph holds hundreds of nodes, with no human-confirm able to clear it (a
+    /// conditional gate re-dispatches, not accepts). Inspect the ACTUAL Command env via `get_envs`,
+    /// so this tests the wiring, not a copy of the decision.
+    ///
+    /// Falsified by `cmd.env(ESTATE_DB_ENV, &gov.db_path)` (hand the worker the operational store):
+    /// the WITH-repo case then reads the op store instead of the graph, and the no-repo case sets a
+    /// key that must stay absent — both re-open the FINDING-067 wipe vector.
+    #[test]
+    fn the_governed_worker_estate_channel_is_the_repo_graph_never_the_operational_store() {
+        let op = "/abs/operational-core.db";
+        let graph = "/abs/repo/.codegraph/estate.db";
+        let read = |code_graph_db: Option<&str>| {
+            let gov = GovLaunch {
+                decisions_path: std::path::PathBuf::from("/tmp/decisions.ndjson"),
+                db_path: op.to_string(),
+                scope: "s".to_string(),
+                phase: "unit-1".to_string(),
+                phase_id: String::new(),
+                code_graph_db: code_graph_db.map(str::to_string),
+            };
+            // spawn-audit: test-only — this Command is never spawned; it is a probe whose `get_envs`
+            // we inspect to assert exactly which store the helper hands the worker's estate CLI. It
+            // must NOT be `.hardened()` here, or the env under test would be cleared out from under it.
+            let mut cmd = Command::new("true");
+            arm_worker_estate_channel(&mut cmd, &gov);
+            cmd.get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(crate::gate_hook::ESTATE_DB_ENV))
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        // Repo indexed → the repo's OWN graph, provably not the operational store.
+        assert_eq!(
+            read(Some(graph)),
+            Some(Some(graph.to_string())),
+            "a governed worker's WICKED_ESTATE_DB must be the repo's own code graph"
+        );
+        assert_ne!(
+            read(Some(graph)),
+            Some(Some(op.to_string())),
+            "WICKED_ESTATE_DB must NEVER be the operational store — the FINDING-067 wipe vector"
+        );
+        // Never indexed → the key is ABSENT (no store beats the wrong store).
+        assert_eq!(
+            read(None),
+            None,
+            "no repo graph ⇒ no WICKED_ESTATE_DB; any fallback store re-opens FINDING-067"
+        );
+    }
+
+    /// The helper is only a boundary if the launcher calls it — the same gap
+    /// `run_gate_hook_actually_consults_the_boundary` and `the_launcher_arms_the_write_root` guard.
+    /// Assert the governed launch path invokes it, so deleting the call (leaving the worker's estate
+    /// CLI on the empty global store) fails loudly rather than silently reverting the fix.
+    #[test]
+    fn the_launcher_wires_the_worker_estate_channel() {
+        // Scope the search to PRODUCTION code — everything before the first `#[cfg(test)]` — so the
+        // call-site string in this very test cannot self-satisfy the assertion (the latent weakness
+        // in `the_launcher_arms_the_write_root`, whose search literal lives in its own body). The
+        // governed call site (`arm_worker_estate_channel(&mut cmd, g)`) precedes every test module,
+        // so deleting it genuinely drops the substring from this segment.
+        let src = include_str!("execute_wrapped.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a production prefix before any test module");
+        assert!(
+            production.contains("arm_worker_estate_channel(&mut cmd, g)"),
+            "execute_wrapped no longer wires the governed worker's estate CLI channel to the repo \
+             graph — `wicked-core coverage` falls back to the empty global store and the coverage \
+             gate denies genuinely-covered repos (#229 × #9b)"
+        );
     }
 
     // The gov run dir for cleanup — mirrors gate_hook::gov_run_dir without exposing it beyond the crate.
