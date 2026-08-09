@@ -14,3 +14,4 @@ coverage-report.json
 # Python bytecode from scripts/ (install-local.py). Committed once by accident.
 __pycache__/
 *.py[cod]
+.loop-run/

@@ -381,6 +381,14 @@ impl Core {
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
         let log_path = path.clone();
+        // Each actor gets its own lifecycle maps (epoch tracking + tombstone) and an empty
+        // write registry (no ACP sessions for PTY path).
+        let lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::acp_runner::ElicitationMaps::new(),
+        ));
+        let empty_write_reg: crate::acp_runner::WriteReg = std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        );
         std::thread::spawn(move || {
             actor::run(
                 path,
@@ -390,6 +398,9 @@ impl Core {
                 runner_actor,
                 pty_actor,
                 None,
+                false, // is_acp
+                Some(lifecycle_arc),
+                empty_write_reg,
             )
         });
         let core = Core {
@@ -419,6 +430,10 @@ impl Core {
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
         let runner = std::sync::Arc::new(AcpStepRunner::new(tx.clone()));
+        // Share the maps and write registry already inside the runner so the actor and the
+        // ACP execution layer use a single consistent lock.
+        let actor_maps = runner.elicitation_maps().clone();
+        let actor_write_reg = runner.write_reg.clone();
         let runner_actor = runner.clone();
         // Captured before `path` moves into the actor thread: the handle needs the same store path to
         // resolve the event-log root, and both sides must agree (see `actor::sidecar_base`).
@@ -432,6 +447,9 @@ impl Core {
                 runner_actor,
                 pty_actor,
                 None,
+                true, // is_acp
+                Some(actor_maps),
+                actor_write_reg,
             )
         });
         spawn_chat_reaper(&runner);
@@ -460,8 +478,19 @@ impl Core {
         let pty_actor = pty.clone();
         // Captured before `path` moves into the actor thread (see `spawn_with_pty_sessions`).
         let log_path = path.clone();
+        let spawn_lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::acp_runner::ElicitationMaps::new(),
+        ));
+        let spawn_write_reg: crate::acp_runner::WriteReg = std::sync::Arc::new(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        );
         std::thread::spawn(move || {
-            actor::run(path, rx, self_tx, dispatcher, runner, pty_actor, exec_bus)
+            actor::run(
+                path, rx, self_tx, dispatcher, runner, pty_actor, exec_bus,
+                false, // is_acp
+                Some(spawn_lifecycle_arc),
+                spawn_write_reg,
+            )
         });
         Core {
             tx: tx.clone(),
@@ -579,6 +608,34 @@ impl Core {
         self.tx
             .send(Command::CancelRun {
                 run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Resolve a pending ACP elicitation for `run_id`. The `action` must be one of `"accept"`,
+    /// `"decline"`, or `"cancel"`; `response` carries the human's typed/selected value when
+    /// `action == "accept"`, and is `None` otherwise.
+    ///
+    /// Returns `Ok(())` when the elicitation was found and the resolution was delivered to the
+    /// waiting turn, or an error when no matching elicitation exists (already resolved, unknown
+    /// run, or elicitation not supported for this runner).
+    pub fn resolve_elicitation(
+        &self,
+        run_id: &str,
+        elicitation_id: &str,
+        action: String,
+        response: Option<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let (reply, rx) = std::sync::mpsc::sync_channel(0);
+        self.tx
+            .send(Command::ResolveElicitation {
+                run_id: run_id.to_string(),
+                elicitation_id: elicitation_id.to_string(),
+                action,
+                response,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
