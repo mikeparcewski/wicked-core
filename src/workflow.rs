@@ -70,18 +70,6 @@ pub struct StepInput {
     /// boundary is crossed) and for non-ACP fallback paths. Actor-populated so the worker holds no
     /// store handle (single-writer invariant).
     pub prior_outputs: Vec<PriorUnitOutput>,
-    // ── ACP elicitation (DES-002) ────────────────────────────────────────────────────────────────
-    /// Epoch the actor allocated for ACP elicitation on this unit (`0` = no elicitation, local
-    /// path, or non-ACP runner). The `EpochCleanup` RAII guard uses this to call `cleanup_run`
-    /// at the right epoch even after a panic.
-    pub elicitation_epoch: u64,
-    /// Process-generation token minted at `actor::run` entry for this Core instance. Threaded
-    /// through to `DispatchedTask` on the bus so the bus consumer can discard completions that
-    /// belong to a different Core restart (stale-result guard).
-    pub process_gen: Option<uuid::Uuid>,
-    /// Per-run monotonic launch sequence number. Incremented at every `begin_launch` call.
-    /// Used together with `process_gen` as the bus dedup key and stale-completion guard.
-    pub launch_seq: u64,
 }
 
 /// The governance context threaded to a GOVERNED wrapped-CLI unit (DES-OUTGOV-003 §4). Carries the
@@ -126,11 +114,6 @@ pub enum StepStatus {
     Ok,
     Failed,
     Cancelled,
-    /// ACP elicitation reached a terminal state without a human response — deadline expiry,
-    /// adapter disconnect, or `Err(Disconnected)` on the resolution channel (DES-002).
-    /// Distinct from `Failed` (which enters the `FailureTriageReady` path and can produce
-    /// `Retry`). `ElicitationFailed` routes directly to the run-terminal path, bypassing triage.
-    ElicitationFailed,
 }
 
 /// End-of-unit resource usage a runner's `OutputAdapter` parsed from a CLI's
