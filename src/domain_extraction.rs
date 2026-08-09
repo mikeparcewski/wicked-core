@@ -30,14 +30,21 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 pub const COVERAGE_CRITERION: &str =
     "at least one behavior-bearing node, and resolved-or-flagged coverage == 1.0 over them (zero unaccounted)";
 
-/// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF the phase worktree's
-/// `coverage-report.json` reports FULL coverage EVERYWHERE. If `coverage-report.json` is absent AND
-/// `WICKED_COVERAGE_DB` is set (injected by the validator runner from the actor's store path — its own
-/// carrier, so the OPERATIONAL `WICKED_ESTATE_DB` can be removed from the validator env entirely,
-/// core#166), `wicked-core
-/// coverage` is invoked to generate it from the estate store — the gate both produces AND checks the report
-/// in one step. Without `WICKED_COVERAGE_DB` (e.g. in standalone tests), an absent file FAILS CLOSED
-/// (the `test -n` guard keeps fail-closed semantics when no estate path is provided). brain's report
+/// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF FULL coverage EVERYWHERE.
+/// When `WICKED_COVERAGE_DB` is set (injected by the validator runner from the actor's store path — its
+/// own carrier, so the OPERATIONAL `WICKED_ESTATE_DB` can be removed from the validator env entirely,
+/// core#166), the gate ALWAYS RECOMPUTES `coverage-report.json` from that store via `wicked-core
+/// coverage`, OVERWRITING any report the creator worker produced, then checks it. This is deliberate
+/// evaluator≠creator: the gate must not trust the worker's SELF-produced coverage-report.json. Doing so
+/// was the #9b bug — the domain-coverage skill runs `wicked-core coverage --db "${WICKED_ESTATE_DB:-…}"`
+/// but the governed worker's shell has no `WICKED_ESTATE_DB` (stripped by `hardened()`, FINDING-067), so
+/// it fell back to a STALE global `~/.wicked-estate/graph.db` (0 behavior-bearing) and the old
+/// `test -f coverage-report.json ||` short-circuit accepted that stale file, denying a repo whose real
+/// store has 766 behavior-bearing nodes. Recomputing from `WICKED_COVERAGE_DB` (the repo's own
+/// `code_graph_db`, per FINDING-091/#009) is authoritative. Without `WICKED_COVERAGE_DB` (e.g. standalone
+/// tests), it FALLS BACK to a pre-existing file and FAILS CLOSED if absent (the `test -n`/`test -f`
+/// guards). Ordering uses sh's equal-precedence left-assoc `&&`/`||`: `test -n DB && recompute ||
+/// test -f file` = `(recompute-if-db) else (use-file)`. brain's report
 /// carries a top-level `coverage`/`unaccounted` PLUS a per-app breakdown (each app object has its OWN
 /// `coverage`/`unaccounted`), so an unanchored positive grep false-PASSes on a single fully-covered app
 /// under a sub-1.0 total. The gate is therefore: (1) at least one full-coverage marker exists (guards an
@@ -50,7 +57,7 @@ pub const COVERAGE_CRITERION: &str =
 /// binary without relying on PATH. It used to inject `current_exe()`, which is the NODE binary when
 /// the engine runs as a napi addon — so the script ran `node coverage` and the floor never executed
 /// on a real run (FINDING-093).
-pub const COVERAGE_SCRIPT: &str = r#"(test -f coverage-report.json || (test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage)) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
+pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage || test -f coverage-report.json ) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
@@ -82,7 +89,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "adaf3e9b6d088f1a";
+pub const COVERAGE_VALIDATOR_PIN: &str = "857fcc1df244c155";
 
 /// Phases whose `validator_pin` the BINARY has an opinion about, as `(workflow, phase, pin)`.
 ///
@@ -583,6 +590,69 @@ mod tests {
         assert!(
             run_predicate(&dir),
             "a real, fully-accounted report must still pass, or the gate denies every honest run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #9b FIX: when `WICKED_COVERAGE_DB` is set, the gate RECOMPUTES from that store (authoritative,
+    /// evaluator≠creator) and must NOT trust a stale creator-produced `coverage-report.json`. The bug:
+    /// the governed worker's domain-coverage skill wrote a report from a STALE global store (0
+    /// behavior-bearing, because its `WICKED_ESTATE_DB` was unset), and the old `test -f
+    /// coverage-report.json ||` FIRST-ordering accepted that file, denying a repo whose real store has
+    /// behavior-bearing nodes. Here: plant a stale 0-bb report; point `WICKED_CORE_EXE` at a stub that
+    /// writes a GOOD report (standing in for `wicked-core coverage` reading the real repo store);
+    /// `WICKED_COVERAGE_DB` non-empty ⇒ the gate must recompute (overwrite the stale file) and PASS.
+    /// Mutation: restore `(test -f coverage-report.json || (test -n DB && …))` and this fails — the
+    /// stale 0-bb file is trusted, greps fail on `behavior_bearing:0`, gate denies.
+    #[test]
+    fn coverage_gate_recomputes_from_the_store_and_ignores_a_stale_creator_report() {
+        use wicked_apps_core::HardenedCommand;
+        let dir = std::env::temp_dir().join(format!("cov_recompute_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Stale creator report: vacuous 0-behavior-bearing → would FAIL the greps if trusted.
+        std::fs::write(
+            dir.join("coverage-report.json"),
+            r#"{"total":2188,"behavior_bearing":0,"resolved":0,"risk_flagged":0,"unaccounted":0,"coverage":1}"#,
+        )
+        .unwrap();
+
+        // Stub standing in for `wicked-core coverage` reading the REAL repo store: writes a GOOD report
+        // into cwd, ignoring its arg. (The script invokes `"${WICKED_CORE_EXE}" coverage`.)
+        let stub = dir.join("stub-wicked-core.sh");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\ncat > coverage-report.json <<'JSON'\n{\"total\":900,\"behavior_bearing\":42,\"resolved\":42,\"risk_flagged\":0,\"unaccounted\":0,\"coverage\":1.0}\nJSON\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let ok = std::process::Command::new("sh")
+            .hardened()
+            .arg("-c")
+            .arg(COVERAGE_SCRIPT)
+            .current_dir(&dir)
+            // Set AFTER hardened() (which clears the env), exactly as the validator runner injects them.
+            .env(crate::gate_hook::COVERAGE_DB_ENV, dir.join("repo.db")) // non-empty ⇒ recompute branch
+            .env(crate::gate_hook::WICKED_CORE_EXE_ENV, &stub)
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(
+            ok,
+            "gate must RECOMPUTE from the store (stub) and pass — not trust the stale 0-bb creator report"
+        );
+
+        // The recompute overwrote the stale file with the authoritative one.
+        let after = std::fs::read_to_string(dir.join("coverage-report.json")).unwrap();
+        assert!(
+            after.contains("\"behavior_bearing\":42"),
+            "recompute must overwrite the stale creator report: {after}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
