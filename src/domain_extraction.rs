@@ -42,9 +42,13 @@ pub const COVERAGE_CRITERION: &str =
 /// `test -f coverage-report.json ||` short-circuit accepted that stale file, denying a repo whose real
 /// store has 766 behavior-bearing nodes. Recomputing from `WICKED_COVERAGE_DB` (the repo's own
 /// `code_graph_db`, per FINDING-091/#009) is authoritative. Without `WICKED_COVERAGE_DB` (e.g. standalone
-/// tests), it FALLS BACK to a pre-existing file and FAILS CLOSED if absent (the `test -n`/`test -f`
-/// guards). Ordering uses sh's equal-precedence left-assoc `&&`/`||`: `test -n DB && recompute ||
-/// test -f file` = `(recompute-if-db) else (use-file)`. brain's report
+/// tests), it FALLS BACK to a pre-existing file and FAILS CLOSED if absent. Crucially, the file
+/// fallback is guarded by `test -z "${WICKED_COVERAGE_DB}"` so it applies ONLY when NO store was given:
+/// when the store IS set, a recompute that EXITS NON-ZERO FAILS CLOSED rather than silently trusting a
+/// pre-existing (stale/creator) report — a recompute failure must not degrade to the trust it replaced
+/// (Copilot review on #230). Shape (sh equal-precedence left-assoc `&&`/`||`, subshells binding each
+/// branch): `( test -n DB && recompute ) || ( test -z DB && test -f file ) && test -f file && <greps>`
+/// = `(recompute-if-store ELSE file-only-if-no-store) && validate`. brain's report
 /// carries a top-level `coverage`/`unaccounted` PLUS a per-app breakdown (each app object has its OWN
 /// `coverage`/`unaccounted`), so an unanchored positive grep false-PASSes on a single fully-covered app
 /// under a sub-1.0 total. The gate is therefore: (1) at least one full-coverage marker exists (guards an
@@ -57,7 +61,7 @@ pub const COVERAGE_CRITERION: &str =
 /// binary without relying on PATH. It used to inject `current_exe()`, which is the NODE binary when
 /// the engine runs as a napi addon — so the script ran `node coverage` and the floor never executed
 /// on a real run (FINDING-093).
-pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage || test -f coverage-report.json ) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
+pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json ) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
@@ -89,7 +93,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "857fcc1df244c155";
+pub const COVERAGE_VALIDATOR_PIN: &str = "49b61ba3ab5264e4";
 
 /// Phases whose `validator_pin` the BINARY has an opinion about, as `(workflow, phase, pin)`.
 ///
@@ -653,6 +657,53 @@ mod tests {
         assert!(
             after.contains("\"behavior_bearing\":42"),
             "recompute must overwrite the stale creator report: {after}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FAIL-CLOSED on recompute failure (Copilot review on #230): when `WICKED_COVERAGE_DB` IS set but
+    /// the recompute EXITS NON-ZERO, the gate must NOT fall back to trusting a pre-existing (stale,
+    /// otherwise-passing) `coverage-report.json` — a recompute failure must fail closed, not degrade to
+    /// the very trust this fix removes. The file fallback is guarded by `test -z "${WICKED_COVERAGE_DB}"`
+    /// so it applies ONLY when no store was provided. Mutation: drop that guard (revert to
+    /// `… coverage || test -f coverage-report.json`) and this fails — the stale passing report is
+    /// accepted despite the recompute failing.
+    #[test]
+    fn coverage_gate_fails_closed_when_recompute_fails_even_if_a_passing_report_exists() {
+        use wicked_apps_core::HardenedCommand;
+        let dir = std::env::temp_dir().join(format!("cov_failclosed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A pre-existing report that WOULD pass the greps if trusted.
+        std::fs::write(
+            dir.join("coverage-report.json"),
+            r#"{"total":900,"behavior_bearing":42,"resolved":42,"risk_flagged":0,"unaccounted":0,"coverage":1.0}"#,
+        )
+        .unwrap();
+
+        // Stub standing in for a FAILED recompute: exits non-zero, writes nothing.
+        let stub = dir.join("stub-fail.sh");
+        std::fs::write(&stub, "#!/bin/sh\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let ok = std::process::Command::new("sh")
+            .hardened()
+            .arg("-c")
+            .arg(COVERAGE_SCRIPT)
+            .current_dir(&dir)
+            .env(crate::gate_hook::COVERAGE_DB_ENV, dir.join("repo.db")) // store IS set
+            .env(crate::gate_hook::WICKED_CORE_EXE_ENV, &stub) // …but recompute fails
+            .status()
+            .map(|st| st.success())
+            .unwrap_or(false);
+        assert!(
+            !ok,
+            "a recompute failure with the store set must FAIL CLOSED, not trust the stale passing report"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
