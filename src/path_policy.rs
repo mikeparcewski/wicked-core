@@ -156,10 +156,7 @@ pub fn check(
     };
 
     for root in &permitted {
-        // Compare against the resolved ROOT too: a worktree reached through a symlink (macOS
-        // `/tmp` -> `/private/tmp` is the everyday case) would otherwise never match.
-        let root_real = resolve_symlinks(root);
-        if resolved == root_real || resolved.starts_with(&root_real) {
+        if resolved_is_within(&resolved, root) {
             return Ok(resolved);
         }
     }
@@ -168,6 +165,19 @@ pub fn check(
         write,
         allowed: permitted.into_iter().cloned().collect(),
     })
+}
+
+/// Is `resolved` the root itself or a descendant of it, compared against the SYMLINK-RESOLVED root?
+///
+/// The per-root containment test [`check`] applies, factored out so a caller deciding a carve-out
+/// (the `~/.claude` advisory downgrade in [`crate::gate_hook::boundary_denial`], core#235) uses the
+/// IDENTICAL symlink-aware matching rather than a naive `starts_with` that a `/tmp`→`/private/tmp`
+/// symlink would defeat. `resolved` is expected already symlink-resolved (as [`Denial::resolved`]
+/// is); `root` is resolved here. Comparing against the resolved ROOT too is what lets a worktree
+/// reached through a symlink match at all.
+pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
+    let root_real = resolve_symlinks(root);
+    resolved == root_real || resolved.starts_with(&root_real)
 }
 
 #[cfg(test)]
@@ -186,6 +196,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// The containment predicate `check` uses per-root, and the carve-out in
+    /// `gate_hook::boundary_denial` (core#235) reuses: the root itself and descendants match, a
+    /// sibling does not. Mutation: hardcode the body `true` → the sibling assert fails; `false` →
+    /// the root/descendant asserts fail.
+    #[test]
+    fn resolved_is_within_matches_the_root_and_descendants_but_not_siblings() {
+        let base = scratch("within");
+        assert!(
+            resolved_is_within(&base, &base),
+            "the root is within itself"
+        );
+        assert!(
+            resolved_is_within(&base.join("a/b/c.rs"), &base),
+            "a descendant is within"
+        );
+        let sibling = base.parent().unwrap().join("pp_within_sibling");
+        assert!(
+            !resolved_is_within(&sibling, &base),
+            "a sibling that merely shares a parent is NOT within"
+        );
     }
 
     /// C1 — the finding's own shape: a read of the operator's brain store from inside a unit.

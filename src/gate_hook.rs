@@ -158,9 +158,11 @@ const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 /// unrelated network failure stopped it. `evaluator != creator` is this platform's headline
 /// structural claim, and it was enforced by a file the creator could rewrite.
 ///
-/// Returns `(reason, is_write)`, or `None` when the call is inside the boundary, carries nothing
-/// path-shaped, or no boundary was configured. `is_write` drives whether the deny is unit-FATAL (a
-/// write/escape) or ADVISORY (a read probe) — see [`append_boundary_deny`] / core#219.
+/// Returns `(reason, fatal)`, or `None` when the call is inside the boundary, carries nothing
+/// path-shaped, or no boundary was configured. `fatal` drives whether the deny ABORTS the unit (a
+/// write/escape) or is ADVISORY (blocked but the worker continues) — see [`append_boundary_deny`] /
+/// core#219. A blocked READ is always advisory; a blocked WRITE is fatal EXCEPT into the worker's
+/// own Claude Code state tree (`~/.claude/**`) — see the carve-out below (core#235).
 fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, bool)> {
     let roots = allowed_roots_from_env()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -174,7 +176,20 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
     {
         let is_write = WRITE_TOOLS.contains(&tool);
         if let Err(d) = crate::path_policy::check(path, &roots, is_write, &cwd, home.as_deref()) {
-            return Some((d.to_string(), is_write));
+            // A blocked WRITE is unit-FATAL — EXCEPT into the worker's OWN Claude Code state tree
+            // (`~/.claude/**`, e.g. `~/.claude/projects/<slug>/memory/*.md`). A governed claude
+            // worker routinely writes its own project-memory there; the write is STILL blocked
+            // (exit 2, nothing lands outside the worktree), but a benign agent-memory write must
+            // not ABORT the run (core#235 — infigraph died here). Downgrade it to advisory, exactly
+            // as a blocked read is (core#219). The carve-out is scoped to `~/.claude`: the gate pin
+            // (`~/.config/wicked-core/**`) and the operational store are NOT under it and stay
+            // fatal, so the FINDING-098 pin-rewrite escape is untouched. Reads are already advisory,
+            // so this relaxes ONLY writes, and ONLY into the agent's own state dir.
+            let fatal = is_write
+                && !home.as_deref().is_some_and(|h| {
+                    crate::path_policy::resolved_is_within(&d.resolved, &h.join(".claude"))
+                });
+            return Some((d.to_string(), fatal));
         }
     }
 
@@ -514,13 +529,15 @@ pub(crate) fn evaluate_tool_call(
     // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
-    if let Some((reason, is_write)) = boundary_denial(context, tool) {
+    if let Some((reason, fatal)) = boundary_denial(context, tool) {
         // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
-        // escape attempt and stays unit-fatal; a READ probe is advisory — blocked, audited, but not
-        // unit-fatal, so a worker probing an out-of-bounds file (then adapting) is not failed for it
-        // (P8 #10 / core#219). `is_write` comes from the boundary check itself so a Bash write-escape
-        // (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See `append_boundary_deny`.
-        append_boundary_deny(decisions_path, scope, phase, &reason, is_write);
+        // escape attempt and stays unit-FATAL; a READ probe — and a benign write into the worker's
+        // own `~/.claude` state tree (core#235) — is ADVISORY: blocked, audited, but not unit-fatal,
+        // so a worker probing an out-of-bounds file or persisting its own memory (then adapting) is
+        // not failed for it (P8 #10 / core#219). `fatal` comes from the boundary check itself so a
+        // Bash write-escape (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See
+        // `boundary_denial` / `append_boundary_deny`.
+        append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -858,16 +875,13 @@ const BOUNDARY_WRITE_DENY_PREFIX: &str = "boundary-deny:";
 /// read MATTERED is decided by the unit's own output gate, not by the containment event.
 const BOUNDARY_READ_DENY_PREFIX: &str = "boundary-read-deny:";
 
-/// Record a filesystem-boundary block. `is_write` picks whether it is unit-fatal (a write/escape) or
-/// ADVISORY (a read probe). Either way the caller has already exited 2 — the tool-call is blocked.
-fn append_boundary_deny(
-    decisions_path: &str,
-    scope: &str,
-    phase: &str,
-    reason: &str,
-    is_write: bool,
-) {
-    let (prefix, criteria) = if is_write {
+/// Record a filesystem-boundary block. `fatal` picks whether it ABORTS the unit (a write/escape) or
+/// is ADVISORY (a read probe, or a benign write into the worker's own `~/.claude` tree — core#235).
+/// Either way the caller has already exited 2 — the tool-call is blocked. The `reason` carries the
+/// accurate `(write)`/`(read)` from the boundary `Denial`, so an advisory WRITE is still honestly
+/// described even though it shares the advisory prefix a read uses (the fold keys on that prefix).
+fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str, fatal: bool) {
+    let (prefix, criteria) = if fatal {
         (
             BOUNDARY_WRITE_DENY_PREFIX,
             format!("filesystem boundary: {reason}"),
@@ -875,7 +889,7 @@ fn append_boundary_deny(
     } else {
         (
             BOUNDARY_READ_DENY_PREFIX,
-            format!("filesystem boundary (advisory: read blocked, worker continues): {reason}"),
+            format!("filesystem boundary (advisory: blocked, worker continues): {reason}"),
         )
     };
     let claim = ConformanceClaim {
@@ -2239,6 +2253,42 @@ mod boundary_tests {
                 denial.contains(&wt.to_string_lossy().to_string()),
                 "the denial must name where the call WOULD have been allowed, or the agent \
                  retries blind: {denial}"
+            );
+        });
+    }
+
+    /// core#235. The governed claude worker routinely writes its OWN Claude Code project-memory
+    /// (`~/.claude/projects/<slug>/memory/*.md`), which is outside the worktree. The write is STILL
+    /// blocked (nothing lands), but it must be ADVISORY (`fatal == false`) — not abort the run.
+    /// infigraph's domain-extraction died exactly here. The pin control below proves the carve-out
+    /// is scoped to `~/.claude` and does not reopen the FINDING-098 pin-rewrite escape.
+    ///
+    /// Falsified by dropping the carve-out in `boundary_denial` (returning the raw `is_write`): the
+    /// memory write is then reported fatal and the first assert fails. The pin control catches the
+    /// opposite mutation (a blanket `fatal = false`, which would also un-gate the pin).
+    #[cfg(unix)]
+    #[test]
+    fn a_write_to_the_workers_own_claude_memory_is_advisory_not_fatal() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-mem");
+        std::fs::create_dir_all(&wt).unwrap();
+        let home = std::env::var("HOME").expect("HOME set in the unix test env");
+        let mem = format!(
+            "{home}/.claude/projects/-tmp-wicked-boundary-wt-mem/memory/project_x_domain.md"
+        );
+        with_roots(Some(wt.to_str().unwrap()), || {
+            let (_, fatal) = boundary_denial(&ctx(&mem), "Write")
+                .expect("a write outside the worktree is STILL blocked");
+            assert!(
+                !fatal,
+                "a write into the worker's own ~/.claude memory must be ADVISORY, not unit-fatal (core#235)"
+            );
+            // Control: an escape to a DIFFERENT out-of-boundary path (the gate pin) stays FATAL —
+            // the carve-out is scoped to ~/.claude, it does not relax the pin.
+            let (_, pin_fatal) = boundary_denial(&ctx(&dirs_config_workflow()), "Write")
+                .expect("writing the gate pin is still refused");
+            assert!(
+                pin_fatal,
+                "the gate pin (~/.config/**) write must stay unit-fatal"
             );
         });
     }
