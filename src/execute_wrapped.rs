@@ -1156,7 +1156,7 @@ struct GovLaunch {
 /// the launcher strips UNCONDITIONALLY at spawn (FINDING-067). Without re-setting it, the
 /// domain-coverage skill's `wicked-core coverage --db "${WICKED_ESTATE_DB:-<global default>}"` fell
 /// back to the EMPTY global store and reported `behavior_bearing=0` for a repo whose own graph holds
-/// hundreds of behaviour-bearing nodes. The LAYER-2 judge reads that worker report (#229), so it
+/// hundreds of behavior-bearing nodes. The LAYER-2 judge reads that worker report (#229), so it
 /// rejected genuinely-covered work — and no human-confirm could clear it, because a conditional gate
 /// RE-DISPATCHES the unit (re-running the stale worker) rather than accepting the verdict.
 ///
