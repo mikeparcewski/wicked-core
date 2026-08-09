@@ -138,6 +138,9 @@ pub fn author_deterministic_validator(
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
         prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     };
     let out = runner.run_unit(&input);
     runner.on_run_complete(&run_id);
@@ -1105,6 +1108,11 @@ fn agent_validate_in(
             StepStatus::Failed => {
                 refusals.push(format!("{} ({})", seat.key, out.output.trim()));
             }
+            // Elicitation is not expected on a validator seat (no interactive human path exists);
+            // treat as a seat failure and rotate to the next.
+            StepStatus::ElicitationFailed => {
+                refusals.push(format!("{} (elicitation failed)", seat.key));
+            }
         }
     }
     // Every eligible seat refused to run. Fail CLOSED, naming each one — the operator needs to know
@@ -1154,6 +1162,9 @@ fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
         // It must never self-govern against an empty scope — `None` suppresses all hook injection.
         governance: None,
         prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     }
 }
 
@@ -1234,6 +1245,9 @@ pub fn triage_failure(
         // Engine-internal judge call — ungoverned, like agent_validate.
         governance: None,
         prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
     };
     let out = runner.run_unit(&input);
     // Drop any session the judge's runner opened under the triage run id.
