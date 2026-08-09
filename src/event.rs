@@ -628,6 +628,36 @@ pub enum CoreEvent {
     CampaignFailed { campaign: String },
     /// The campaign was cancelled by the operator.
     CampaignCancelled { campaign: String },
+    // ── ACP elicitation (DES-002) ────────────────────────────────────────────────────────────────
+    /// An MCP server running inside an ACP adapter called `elicitation/create`; wicked-core minted
+    /// an `elicitationId` and is now waiting for the operator to respond. `session` is the `run_id`.
+    /// `options` and `prop_type` are ALWAYS explicit in the wire JSON (`null`, never absent key) so
+    /// crew's `ElicitationCache` has a stable shape to parse (I-1 / I-5).
+    ElicitationCreated {
+        session: String,
+        /// The epoch the actor allocated for this elicitation turn (non-zero for ACP bus dispatch).
+        epoch: u64,
+        /// Wicked-core–minted opaque identifier — distinct from the JSON-RPC `id` of the
+        /// `elicitation/create` request (I-1).
+        elicitation_id: String,
+        /// Human-readable prompt from the MCP server (capped at 8 KB, byte-length; I-5).
+        message: String,
+        /// Predefined selection options, if any (≤ 100 entries; entries > 512 bytes dropped; I-5).
+        options: Option<Vec<String>>,
+        /// The JSON Schema `type` of the single expected response property, if the schema carried
+        /// one (e.g. `"string"`, `"boolean"`). `None` when no type constraint was specified.
+        prop_type: Option<String>,
+    },
+    /// The elicitation identified by `elicitation_id` reached a terminal state. `session` is the
+    /// `run_id`. `action` mirrors the resolved `action` field from the `elicitation/create`
+    /// response. `reason` is one of: `"human"`, `"session_prompt"`, `"timeout"`, `"teardown"`,
+    /// `"adapter_write_failure"`.
+    ElicitationResolved {
+        session: String,
+        elicitation_id: String,
+        action: String,
+        reason: String,
+    },
 }
 
 impl CoreEvent {
@@ -1300,6 +1330,36 @@ impl CoreEvent {
             CoreEvent::ChatClosed { chat, reason } => {
                 json!({ "type": "chatClosed", "chat": chat, "reason": reason })
             }
+            // ACP elicitation (DES-002). `options` and `propType` are ALWAYS explicit in the wire
+            // JSON — `null` not absent — so crew's ElicitationCache parser has a stable contract.
+            CoreEvent::ElicitationCreated {
+                session,
+                epoch,
+                elicitation_id,
+                message,
+                options,
+                prop_type,
+            } => json!({
+                "type": "elicitationCreated",
+                "session": session,
+                "epoch": epoch,
+                "elicitationId": elicitation_id,
+                "message": message,
+                "options": options,   // serde_json renders Some(v) → v, None → null
+                "propType": prop_type,
+            }),
+            CoreEvent::ElicitationResolved {
+                session,
+                elicitation_id,
+                action,
+                reason,
+            } => json!({
+                "type": "elicitationResolved",
+                "session": session,
+                "elicitationId": elicitation_id,
+                "action": action,
+                "reason": reason,
+            }),
         }
     }
 }

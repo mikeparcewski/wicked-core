@@ -760,6 +760,10 @@ fn dispatch(
             in_flight,
             ls,
             seams.registry,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
         )
         .map(|_| ())
     } else {
@@ -777,6 +781,10 @@ fn dispatch(
             in_flight,
             &run_id,
             decision,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
         )
         .map(|_| ())
     };
@@ -992,6 +1000,10 @@ pub(crate) fn confirm_gate(
                 in_flight,
                 &run_id,
                 HumanDecision::Reject,
+                &None,
+                &None,
+                uuid::Uuid::nil(),
+                false,
             );
         }
         // ── HumanGateOnFailure policy gate ──────────────────────────────────────
@@ -1206,6 +1218,10 @@ pub(crate) fn resume(
                         in_flight,
                         spec.to_launch_spec(run_id.clone()),
                         seams.registry,
+                        &None,
+                        &None,
+                        uuid::Uuid::nil(),
+                        false,
                     )
                     .map(|_| ()),
                     None => Err(anyhow::anyhow!("resume: unknown node {node}")),
@@ -1243,6 +1259,10 @@ pub(crate) fn resume(
                     seams.self_tx,
                     in_flight,
                     run_id,
+                    &None,
+                    &None,
+                    uuid::Uuid::nil(),
+                    false,
                 ) {
                     emit(
                         subscribers,

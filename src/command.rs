@@ -193,9 +193,23 @@ pub(crate) enum Command {
     /// message rather than on `StepOutput` so the `StepRunner` trait + its impls stay untouched; the
     /// actor folds it into the gate via `combine_verdict`. `None` ⇒ the unit carried no pinned
     /// validator (no agent judgment for this phase). `(pass, reasoning)`.
+    ///
+    /// `process_gen` and `launch_seq` are the ACP bus stale-completion guard tokens (DES-002).
+    /// `ack` is `Some` on the degraded / predecessor bus-consumer paths — the consumer sends `()`
+    /// after the actor commits the result to the store, then advances the durable cursor. `None` for
+    /// all normal worker-initiated paths (no blocking needed).
     ApplyStepResult {
         output: StepOutput,
         agent_verdict: Option<(bool, String)>,
+        /// Process-generation token from the dispatching Core instance (DES-002 stale-result guard).
+        #[allow(dead_code)] // used by bus consumer path added in T6/T7
+        process_gen: Option<uuid::Uuid>,
+        /// Per-run launch sequence number at dispatch time (DES-002 stale-result guard).
+        #[allow(dead_code)]
+        launch_seq: u64,
+        /// Rendezvous ack: bus consumer blocks until actor sends `()` after DB commit (DES-002).
+        #[allow(dead_code)]
+        ack: Option<std::sync::mpsc::SyncSender<()>>,
     },
     /// Internal: the off-actor triage thread posts the agent judge's decision for an
     /// unrecognized worker failure; the actor applies it (retry / escalate / fail).
@@ -208,6 +222,12 @@ pub(crate) enum Command {
         analysis: String,
         /// Bounded excerpt of the original failure output (for prompts + denial reasons).
         failure_excerpt: String,
+        /// Process-generation token (DES-002): disambiguates triage for a relaunched run.
+        #[allow(dead_code)]
+        process_gen: Option<uuid::Uuid>,
+        /// Per-run launch sequence number at dispatch time (DES-002).
+        #[allow(dead_code)]
+        launch_seq: u64,
     },
     /// Internal: a worker streams a live output chunk; the actor (the single emit point) fans it out
     /// as a [`CoreEvent::CliOutputDelta`]. Keeps the single-emit-point invariant while streaming.
@@ -215,6 +235,27 @@ pub(crate) enum Command {
         run_id: String,
         ord: u32,
         chunk: String,
+        /// Process-generation token at dispatch time (DES-002 stale-delta guard).
+        #[allow(dead_code)]
+        process_gen: Option<uuid::Uuid>,
+        /// Per-run launch sequence number at dispatch time (DES-002 stale-delta guard).
+        #[allow(dead_code)]
+        launch_seq: u64,
+    },
+    // ── ACP elicitation (DES-002) ────────────────────────────────────────────────────────────────
+    /// Deliver a human's elicitation response to the suspended `exec_turn_acp` worker thread.
+    /// The `reply` sender is signalled after the worker acknowledges receipt (success) or if the
+    /// `run_id`/`elicitation_id` pair is not found in `ElicitationMaps` (error). Uses
+    /// `std::sync::mpsc::sync_channel(1)` — root crate has no Tokio dep.
+    ResolveElicitation {
+        run_id: String,
+        elicitation_id: String,
+        /// JSON-RPC `action` field: `"accept"`, `"decline"`, or `"cancel"`.
+        action: String,
+        /// The human's typed or selected response value (required for `"accept"`; `None` otherwise).
+        response: Option<serde_json::Value>,
+        /// Reply channel: `Ok(())` = delivered; `Err(...)` = elicitation not found or already resolved.
+        reply: std::sync::mpsc::SyncSender<anyhow::Result<()>>,
     },
     /// Internal: relay an arbitrary event from an off-actor thread through the single emit point.
     /// Workers send this when they need to emit a structured event without holding a subscriber list

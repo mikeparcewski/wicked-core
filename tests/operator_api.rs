@@ -96,6 +96,9 @@ mod tests {
             workdir: Some(std::env::temp_dir()),
             governance: None,
             prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
         }
     }
 
