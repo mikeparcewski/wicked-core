@@ -364,14 +364,15 @@ pub fn preflight_tool_phases(def: &WorkflowDef) -> anyhow::Result<()> {
 /// Resolve a tool binary the way `Command::new` will: an explicit path must exist as a file; a
 /// bare name must resolve on `PATH` via the shared PATHEXT-aware [`crate::validator::find_on_path`].
 fn tool_binary_resolves(bin: &str) -> bool {
-    // The engine's OWN binary is always available: `run_tool_cmd` resolves `wicked-core` via
-    // `resolve_wicked_core_exe` ($WICKED_CORE_EXE → current_exe → PATH → bare) at exec time, not as a
-    // literal `wicked-core` on PATH — so a `wicked-core domain-graph` Tool phase invokes THIS engine.
-    // The preflight exists to catch MISSING EXTERNAL tools (e.g. `wicked-estate`); the engine cannot
-    // be missing from itself, and under `cargo test` `wicked-core` is not on PATH yet is still the
-    // running binary (core#237).
+    // The engine's OWN binary: `run_tool_cmd` resolves `wicked-core` via `resolve_wicked_core_exe`
+    // ($WICKED_CORE_EXE → current_exe → PATH → bare) at exec time, not as a literal `wicked-core` on
+    // PATH. Report it resolvable IFF the engine can actually LOCATE itself — the `_opt` form, which
+    // EXCLUDES the bare-name last resort. This keeps the core#120 fail-loud-at-launch guard honest: a
+    // napi addon under `node` with no $WICKED_CORE_EXE and no `wicked-core` on PATH refuses to START
+    // rather than reaching the domain-graph phase and failing at dispatch (Copilot review, #237/#238).
+    // Under `cargo test`, current_exe is a real (non-`node`) binary, so this still resolves.
     if bin == "wicked-core" {
-        return true;
+        return crate::execute_wrapped::resolve_wicked_core_exe_opt().is_some();
     }
     let p = std::path::Path::new(bin);
     if p.components().count() > 1 || p.is_absolute() {

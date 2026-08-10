@@ -1576,29 +1576,37 @@ mod resolve_tests {
         // register_repo validates the root is a git repo WITH ≥1 commit (a worktree needs a base).
         // Two direct `git` spawns (cross-platform; `sh -c` would not run on Windows CI): init, then
         // an empty base commit with a LOCAL identity so no global config or signing is required.
-        // spawn-audit: test-only — fixture setup, never spawned in production.
-        std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&dir)
-            .status()
-            .expect("git init the scratch repo");
-        // spawn-audit: test-only — fixture setup, never spawned in production.
-        std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.email=t@wicked.test",
-                "-c",
-                "user.name=wicked",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--allow-empty",
-                "-qm",
-                "base",
-            ])
-            .current_dir(&dir)
-            .status()
-            .expect("git base commit");
+        assert!(
+            // spawn-audit: test-only — fixture setup, never spawned in production.
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .expect("spawn git init")
+                .success(),
+            "git init the scratch repo must succeed"
+        );
+        assert!(
+            // spawn-audit: test-only — fixture setup, never spawned in production.
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@wicked.test",
+                    "-c",
+                    "user.name=wicked",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "base",
+                ])
+                .current_dir(&dir)
+                .status()
+                .expect("spawn git commit")
+                .success(),
+            "git base commit must succeed"
+        );
         let repo = crate::repo::register_repo(
             &mut store,
             crate::repo::RepoSpec {
