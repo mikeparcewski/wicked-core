@@ -83,8 +83,6 @@ postgres = ["wicked-apps-core/postgres"]
 [dev-dependencies]
 # The terminal round-trip test decodes `TerminalOutput.bytes_b64` to assert the echoed bytes.
 base64 = "0.22"
-# Enables tracing event capture in tests (tests 14 and 17 assert tracing::warn events).
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # Validates the domain-graph builder's OUTPUT against the KEPT domain-model.schema.json (the
 # meta-fix for wire-fidelity — catches enum/const/pattern/minItems drift a hand-written literal misses).
 jsonschema = "0.18"

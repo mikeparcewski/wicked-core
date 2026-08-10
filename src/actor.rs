@@ -1071,7 +1071,7 @@ pub(crate) fn run(
             Command::ApplyStepResult {
                 output,
                 agent_verdict,
-                process_gen: _,  // stale-result guard — consumed by bus consumer; ignored here
+                process_gen: _, // stale-result guard — consumed by bus consumer; ignored here
                 launch_seq: _,
                 ack,
             } => {
@@ -1257,7 +1257,13 @@ pub(crate) fn run(
             Command::RetireConformanceRule { id, reply } => {
                 let _ = reply.send(wicked_governance::retire_rule(&mut store, &id));
             }
-            Command::CliOutputDelta { run_id, ord, chunk, process_gen: _, launch_seq: _ } => {
+            Command::CliOutputDelta {
+                run_id,
+                ord,
+                chunk,
+                process_gen: _,
+                launch_seq: _,
+            } => {
                 // The single emit point fans a worker's live output chunk out to subscribers.
                 emit(
                     &mut subscribers,
@@ -1268,15 +1274,23 @@ pub(crate) fn run(
                     },
                 );
             }
-            Command::ResolveElicitation { run_id, elicitation_id, action, response, reply } => {
+            Command::ResolveElicitation {
+                run_id,
+                elicitation_id,
+                action,
+                response,
+                reply,
+            } => {
                 // Deliver the human response to the waiting exec_turn_acp dual-poll loop.
                 // actor_maps is Some only for ACP runners; PTY/injected runners return Err.
                 let res = match &actor_maps {
                     None => Err(anyhow::anyhow!("elicitation not supported for this runner")),
-                    Some(maps) => {
-                        maps.lock().unwrap_or_else(|e| e.into_inner())
-                            .deliver(&run_id, &elicitation_id, action, response)
-                    }
+                    Some(maps) => maps.lock().unwrap_or_else(|e| e.into_inner()).deliver(
+                        &run_id,
+                        &elicitation_id,
+                        action,
+                        response,
+                    ),
                 };
                 let _ = reply.send(res);
             }
@@ -1285,7 +1299,10 @@ pub(crate) fn run(
                 // ── ElicitationCreated suppression (DES-002 T6) ──────────────────────────
                 // Suppress a stale ElicitationCreated when cancel_epoch ran before the actor
                 // processed this queued event. Use suppressed_creations + creation_announced.
-                if let CoreEvent::ElicitationCreated { ref elicitation_id, .. } = ev {
+                if let CoreEvent::ElicitationCreated {
+                    ref elicitation_id, ..
+                } = ev
+                {
                     if let Some(ref maps) = actor_maps {
                         let mut maps = maps.lock().unwrap_or_else(|e| e.into_inner());
                         // take_suppressed_creation removes the marker if present.
@@ -1311,7 +1328,10 @@ pub(crate) fn run(
                 // ── ElicitationResolved suppression (DES-002 T6) ─────────────────────────
                 // If the paired ElicitationCreated was suppressed, suppress the resolved event.
                 // Subscribers must not receive a terminal event for an elicitation they never saw.
-                if let CoreEvent::ElicitationResolved { ref elicitation_id, .. } = ev {
+                if let CoreEvent::ElicitationResolved {
+                    ref elicitation_id, ..
+                } = ev
+                {
                     if let Some(ref maps) = actor_maps {
                         let mut maps = maps.lock().unwrap_or_else(|e| e.into_inner());
                         if maps.take_suppressed_resolution(elicitation_id) {
@@ -1776,6 +1796,18 @@ pub(crate) fn run(
                     .assigned_cli
                     .clone()
                     .unwrap_or_else(|| "claude".to_string());
+                // Invalidate the old launch before asynchronously killing its ACP session.
+                // Otherwise the killed worker can interpret the deliberate disconnect as an
+                // adapter failure and start a wrapped-CLI fallback that continues mutating the
+                // worktree after reassignment.
+                if let Some(ref maps) = lifecycle_maps {
+                    let mut maps = maps.lock().unwrap_or_else(|p| p.into_inner());
+                    let epoch = maps.current_epoch(&run_id);
+                    if epoch > 0 {
+                        maps.cancel_epoch(&run_id, epoch);
+                    }
+                    maps.advance_launch_seq(&run_id);
+                }
                 // ── close the PTY session (if any) ──────────────────────────────────────────
                 if let Some(session_entries) = run_sessions.remove(&run_id) {
                     for (cli_key, terminal_id) in &session_entries {
@@ -2265,6 +2297,26 @@ pub(crate) fn run(
                 }
             }
             Command::Shutdown => {
+                // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
+                // do not poll the elicitation tombstone, so they must be interrupted through
+                // the registered child kill handles; elicitation waits also observe the flag.
+                let mut acp_run_ids = if let Some(ref maps) = lifecycle_maps {
+                    let mut maps = maps.lock().unwrap_or_else(|p| p.into_inner());
+                    maps.set_shutdown_flag();
+                    maps.active_run_ids()
+                } else {
+                    Vec::new()
+                };
+                {
+                    let registry = write_reg.lock().unwrap_or_else(|p| p.into_inner());
+                    acp_run_ids.extend(registry.keys().map(|(run_id, _, _)| run_id.clone()));
+                }
+                acp_run_ids.sort();
+                acp_run_ids.dedup();
+                for run_id in acp_run_ids {
+                    shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                    runner.on_run_complete(&run_id);
+                }
                 // Reap every live PTY: kill children + join reader threads so no process/thread is
                 // leaked when the last `Core` drops (DES §5, R1).
                 let ids: Vec<String> = terminals.keys().cloned().collect();
@@ -2477,8 +2529,16 @@ pub(crate) fn launch_run_inner(
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
     )?;
     match advance_or_pause(
-        store, subscribers, runner, self_tx, &run_id, 0,
-        lifecycle_maps, actor_maps, process_gen, is_acp,
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        &run_id,
+        0,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
     ) {
         Ok(Progress::Dispatched) => {
             in_flight.insert(run_id.clone());
@@ -2572,8 +2632,16 @@ pub(crate) fn resume_run_inner(
         put_node(store, s.to_node())?;
     }
     match advance_or_pause(
-        store, subscribers, runner, self_tx, run_id, session.unit_ix,
-        lifecycle_maps, actor_maps, process_gen, is_acp,
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        session.unit_ix,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
     )? {
         Progress::Dispatched => {
             in_flight.insert(run_id.to_string());
@@ -2713,8 +2781,16 @@ fn redrive_executing_sessions(
             );
         }
         match dispatch_unit(
-            store, subscribers, runner, self_tx, &run_id, sess.unit_ix,
-            lifecycle_maps, actor_maps, process_gen, is_acp,
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &run_id,
+            sess.unit_ix,
+            lifecycle_maps,
+            actor_maps,
+            process_gen,
+            is_acp,
         ) {
             Ok(true) => {
                 in_flight.insert(run_id);
@@ -2968,6 +3044,37 @@ fn apply_step_result(
         notify_campaign(self_tx, &run_id, crate::campaign::NodeOutcome::Cancelled);
         return Ok(StepApplied::Finished);
     }
+    // An elicitation that could not be completed is terminal and non-retriable. In
+    // particular, do not let it fall through to `apply_and_finish_unit` (which would
+    // mark the unit successful) or enter the generic failure-triage/retry ladder.
+    if output.status == crate::workflow::StepStatus::ElicitationFailed {
+        unit.status = crate::domain::UnitStatus::Rejected;
+        let detail = if output.output.trim().is_empty() {
+            "ACP elicitation ended before a human response could be applied".to_string()
+        } else {
+            output.output.trim().chars().take(800).collect()
+        };
+        unit.denial_reason = Some(detail.clone());
+        put_node(store, unit.to_node())?;
+        emit(
+            subscribers,
+            CoreEvent::StepFailed {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                detail,
+                failure_kind: crate::event::StepFailureKind::WorkerError,
+            },
+        );
+        return Ok(fail_run(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &mut session,
+            ord,
+        ));
+    }
     // A worker FAILURE halts the run as `Failed` (the run-level contract: never complete
     // past a failure) — EXCEPT environment refusals (untrusted dir, missing TTY,
     // folder-trust prompt), which say nothing about the work. Escalation ladder:
@@ -3027,8 +3134,16 @@ fn apply_step_result(
                     session.attempt = session.attempt.saturating_add(1);
                     put_node(store, session.to_node())?;
                     dispatch_unit(
-                        store, subscribers, runner, self_tx, &run_id, output.unit_ix,
-                        lifecycle_maps, actor_maps, process_gen, is_acp,
+                        store,
+                        subscribers,
+                        runner,
+                        self_tx,
+                        &run_id,
+                        output.unit_ix,
+                        lifecycle_maps,
+                        actor_maps,
+                        process_gen,
+                        is_acp,
                     )?;
                     return Ok(StepApplied::Continuing);
                 }
@@ -3532,8 +3647,16 @@ fn advance_or_pause(
     }
 
     dispatch_unit(
-        store, subscribers, runner, self_tx, run_id, unit_ix,
-        lifecycle_maps, actor_maps, process_gen, is_acp,
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        unit_ix,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
     )?;
     Ok(Progress::Dispatched)
 }
@@ -3695,18 +3818,6 @@ fn dispatch_unit(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<bool> {
-    // Allocate launch sequence + ACP epoch under a single lock acquisition.
-    // For ACP actors `elicitation_maps` and `_actor_maps` point to the same Mutex, so
-    // a single lock covers both begin_launch and next_epoch — no double-lock needed.
-    let (elicitation_epoch, launch_seq) = if let Some(ref m) = elicitation_maps {
-        let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
-        let seq = maps.begin_launch(run_id, is_acp);
-        // epoch=0 acts as the sentinel for non-ACP units; try_next_epoch_bus activates bus consumers.
-        let ep = if is_acp { maps.next_epoch(run_id) } else { 0 };
-        (ep, seq)
-    } else {
-        (0, 0)
-    };
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
@@ -3798,6 +3909,19 @@ fn dispatch_unit(
             },
         );
     }
+    // Allocate launch sequence + ACP epoch only after every fallible actor-side read has
+    // succeeded. Tool commands bypass the ACP runner entirely and therefore must not create
+    // an epoch that no `EpochCleanup` guard could ever release.
+    let (elicitation_epoch, launch_seq) = if unit.tool_cmd.is_some() {
+        (0, 0)
+    } else if let Some(ref m) = elicitation_maps {
+        let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
+        let seq = maps.begin_launch(run_id, is_acp);
+        let ep = if is_acp { maps.next_epoch(run_id) } else { 0 };
+        (ep, seq)
+    } else {
+        (0, 0)
+    };
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -4186,8 +4310,16 @@ pub(crate) fn confirm_gate(
             );
             in_flight.insert(run_id.to_string());
             match dispatch_unit(
-                store, subscribers, runner, self_tx, run_id, s.unit_ix,
-                lifecycle_maps, actor_maps, process_gen, is_acp,
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                run_id,
+                s.unit_ix,
+                lifecycle_maps,
+                actor_maps,
+                process_gen,
+                is_acp,
             ) {
                 Ok(true) => Ok(SessionStatus::Executing),
                 Ok(false) => {
@@ -4222,7 +4354,9 @@ fn shared_run_terminal(
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     write_reg: &WriteReg,
 ) {
-    let Some(maps_arc) = lifecycle_maps else { return };
+    let Some(maps_arc) = lifecycle_maps else {
+        return;
+    };
 
     // Step 1: snapshot (run_id, session_key, gen) → (write_lock, kill_handle).
     let sessions: Vec<(Arc<std::sync::Mutex<()>>, Arc<KillHandle>)> = {
@@ -4817,7 +4951,19 @@ mod terminal_gate_tests {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
 
-        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1, &None, &None, uuid::Uuid::nil(), false).unwrap();
+        let progress = advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
         assert!(
             matches!(progress, Progress::Paused),
             "the terminal unit's own HumanConfirm gate must pause before finalize, got a Done finalize"
@@ -4836,7 +4982,19 @@ mod terminal_gate_tests {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
 
-        let progress = advance_or_pause(&mut store, &mut subs, &runner, &tx, "r", 1, &None, &None, uuid::Uuid::nil(), false).unwrap();
+        let progress = advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
         assert!(
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
@@ -4912,7 +5070,19 @@ mod def_gate_disclosure_tests {
         subs.push(evtx);
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
-        let progress = advance_or_pause(store, &mut subs, &runner, &tx, "d", unit_ix, &None, &None, uuid::Uuid::nil(), false).unwrap();
+        let progress = advance_or_pause(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            "d",
+            unit_ix,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
         assert!(
             matches!(progress, Progress::Paused),
             "precondition: the def gate pauses"

@@ -403,9 +403,8 @@ impl Core {
         let lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
             crate::acp_runner::ElicitationMaps::new(),
         ));
-        let empty_write_reg: crate::acp_runner::WriteReg = std::sync::Arc::new(
-            std::sync::Mutex::new(std::collections::HashMap::new()),
-        );
+        let empty_write_reg: crate::acp_runner::WriteReg =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         std::thread::spawn(move || {
             actor::run(
                 path,
@@ -498,12 +497,17 @@ impl Core {
         let spawn_lifecycle_arc = std::sync::Arc::new(std::sync::Mutex::new(
             crate::acp_runner::ElicitationMaps::new(),
         ));
-        let spawn_write_reg: crate::acp_runner::WriteReg = std::sync::Arc::new(
-            std::sync::Mutex::new(std::collections::HashMap::new()),
-        );
+        let spawn_write_reg: crate::acp_runner::WriteReg =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         std::thread::spawn(move || {
             actor::run(
-                path, rx, self_tx, dispatcher, runner, pty_actor, exec_bus,
+                path,
+                rx,
+                self_tx,
+                dispatcher,
+                runner,
+                pty_actor,
+                exec_bus,
                 false, // is_acp
                 Some(spawn_lifecycle_arc),
                 spawn_write_reg,
