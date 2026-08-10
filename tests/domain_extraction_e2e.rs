@@ -304,6 +304,12 @@ fn setup(
             "WICKED_WORKFLOWS_DIR",
             format!("{}/workflows", env!("CARGO_MANIFEST_DIR")),
         );
+        // core#237: the domain-graph Tool phase runs `wicked-core domain-graph`, which `run_tool_cmd`
+        // resolves via `resolve_wicked_core_exe` ($WICKED_CORE_EXE → current_exe → PATH → bare). Under
+        // `cargo test` current_exe is THIS test harness — spawning it as `wicked-core` would re-exec
+        // the suite (a fork bomb). Pin $WICKED_CORE_EXE to the real binary Cargo built so the Tool
+        // (and the coverage recompute, same resolver) invoke the actual engine.
+        std::env::set_var("WICKED_CORE_EXE", BIN);
     });
     let repo = make_git_repo(name);
     let core = Core::spawn_with_engine(db.clone(), Arc::new(StubDispatcher), Arc::new(runner));
@@ -314,6 +320,12 @@ fn setup(
             registered_at: 0,
         })
         .expect("register repo");
+    // core#237: domain-graph is now a real `wicked-core domain-graph --db {code_graph_db}` Tool and
+    // the coverage gate recomputes from WICKED_COVERAGE_DB — BOTH read the REPO's OWN code graph, not
+    // the engine store. Seed the repo's code_graph_db (the exact path the run resolves) so the real
+    // executor path finds the fixture; the engine-store seed above still serves the mock's ord-4 shell.
+    std::fs::create_dir_all(std::path::Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
+    seed(&entry.code_graph_db, accounted);
     (core, entry.id, db, repo)
 }
 

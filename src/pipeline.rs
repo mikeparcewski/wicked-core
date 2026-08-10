@@ -1567,6 +1567,56 @@ mod resolve_tests {
         let mut registry = crate::workflow::WorkflowRegistry::with_defaults();
         registry.register(def).expect("drop-in registers");
 
+        // domain-graph is now a deterministic `wicked-core domain-graph --db {code_graph_db}` Tool
+        // (core#237 persist fix), so the workflow legitimately requires a bound repo to fill that
+        // placeholder — a domain graph cannot persist without a repo store. Register one at the
+        // scratch dir; `pre_distribute` only `get_repo`+`bind_repo_paths` at plan time (no worktree/
+        // git). The PIN-resolution assertion below — the seed-in-the-wrong-db regression this test
+        // actually guards — is unchanged.
+        // register_repo validates the root is a git repo WITH ≥1 commit (a worktree needs a base).
+        // Two direct `git` spawns (cross-platform; `sh -c` would not run on Windows CI): init, then
+        // an empty base commit with a LOCAL identity so no global config or signing is required.
+        assert!(
+            // spawn-audit: test-only — fixture setup, never spawned in production.
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .expect("spawn git init")
+                .success(),
+            "git init the scratch repo must succeed"
+        );
+        assert!(
+            // spawn-audit: test-only — fixture setup, never spawned in production.
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.email=t@wicked.test",
+                    "-c",
+                    "user.name=wicked",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "base",
+                ])
+                .current_dir(&dir)
+                .status()
+                .expect("spawn git commit")
+                .success(),
+            "git base commit must succeed"
+        );
+        let repo = crate::repo::register_repo(
+            &mut store,
+            crate::repo::RepoSpec {
+                name: "dropin-unseeded-repo".to_string(),
+                root_path: dir.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .expect("register a scratch repo so {code_graph_db} binds");
+
         let pre = pre_distribute(
             &mut store,
             &[],
@@ -1574,7 +1624,7 @@ mod resolve_tests {
             EntityMode::Isolated,
             "s-dropin-unseeded",
             crate::domain::HumanConfirm::None,
-            None,
+            Some(repo.id.clone()),
             None,
             Some(&id),
             &mut |_| {},

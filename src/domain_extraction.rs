@@ -424,11 +424,40 @@ mod tests {
         assert_eq!(dg.gate_type, Some(GateType::Strategy));
         assert!(matches!(dg.gate, GateSpec::HumanConfirm { .. }));
         assert!(dg.depends_on.contains(&"coverage".to_string()));
+        // PERSIST FIX (core#237): domain-graph is a DETERMINISTIC Tool that runs `wicked-core
+        // domain-graph --db {code_graph_db}`, which builds AND PERSISTS the domain/requirement/rule
+        // graph into the repo store — not an LLM skill that could hit a non-persisting hermetic
+        // fallback (which left the store empty and the milestone unverifiable). Mutation: revert it
+        // to the `wicked-garden-domain-modeler` skill phase (executor → Agent) and this fails.
+        match &dg.executor {
+            crate::workflow::PhaseExecutor::Tool { cmd } => {
+                assert_eq!(cmd.first().map(String::as_str), Some("wicked-core"));
+                assert!(
+                    cmd.iter().any(|a| a == "domain-graph"),
+                    "runs the domain-graph subcommand"
+                );
+                assert!(
+                    cmd.iter().any(|a| a == crate::workflow::CODE_GRAPH_DB_TOKEN),
+                    "targets the repo's own code graph via {} so the persist lands in the repo store",
+                    crate::workflow::CODE_GRAPH_DB_TOKEN
+                );
+            }
+            other => panic!(
+                "domain-graph must persist via a `wicked-core domain-graph` Tool executor, not {other:?}"
+            ),
+        }
+        assert!(
+            dg.skill_ref.is_none(),
+            "domain-graph is a deterministic Tool, not a skill (no LLM hermetic-fallback lane)"
+        );
     }
 
     #[test]
-    fn every_phase_carries_a_garden_skill_ref_in_dash_form() {
+    fn skill_phases_carry_a_garden_skill_ref_in_dash_form() {
         // CONTRACT-4 §3 SKILL NAMING: dash-form `wicked-<product>-<skill>`, never a colon namespace.
+        // The four AGENTIC front phases are garden skills; `domain-graph` is NOT — it is a
+        // deterministic `wicked-core domain-graph` Tool executor (core#237 persist fix) and carries
+        // no skill_ref (asserted in `domain_graph_is_gated_human_confirm_after_coverage`).
         let def = load_shipped_def();
         // Retargeted to the REAL garden `domain` surface (core#43) — renamed from `modernize`.
         let expected = [
@@ -436,7 +465,6 @@ mod tests {
             ("analyze", "wicked-garden-domain"),
             ("extract", "wicked-garden-domain-extractor"),
             ("coverage", "wicked-garden-domain-coverage"),
-            ("domain-graph", "wicked-garden-domain-modeler"),
         ];
         for (phase_id, skill) in expected {
             let phase = def.phases.iter().find(|p| p.id == phase_id).unwrap();
