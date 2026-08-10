@@ -242,6 +242,22 @@ pub fn coverage_report_for_repo(
     wicked_governance::recompute_front_half_coverage(&repo_store)
 }
 
+/// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
+/// graph store (`<repo>/.codegraph/estate.db`), never the daemon store (same discipline as
+/// [`coverage_report_for_repo`]; FINDING-009/067/122). This is the read half of #122's web surface:
+/// the studio shows what the estate graph holds for a repo instead of the operator wondering whether
+/// it was ever populated. An unknown `repo_ref` is an ERROR, never a silent empty summary.
+pub fn graph_kinds_for_repo(
+    daemon: &dyn GraphRead,
+    repo_ref: &str,
+) -> anyhow::Result<Vec<(String, usize)>> {
+    let repo = get_repo(daemon, repo_ref)?
+        .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?;
+    // `graph_kinds` opens the store read-only itself (it takes the db path), so this stays a thin
+    // resolve-repo → delegate, exactly like the coverage path above.
+    crate::graph_browser::graph_kinds(repo.code_graph_db.as_str())
+}
+
 /// The directory worktrees for `repo_root` live under.
 fn worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".wicked").join("worktrees")
@@ -915,6 +931,57 @@ mod tests {
         assert!(
             coverage_report_for_repo(&daemon, "no-such-repo").is_err(),
             "an unknown repo_ref must error, not return a vacuous report"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #122 web surface: `graph_kinds_for_repo` summarises a repo's OWN graph (node counts by kind),
+    /// read over the repo store — NOT the daemon. Mutation — resolving against `daemon` — yields the
+    /// daemon's single RepoEntry node instead of the seeded function/struct counts, failing here. An
+    /// unknown repo errors rather than returning an empty summary.
+    #[test]
+    fn graph_kinds_for_repo_summarises_the_repo_store_not_the_daemon() {
+        let root = git_repo("kinds122");
+        let cg_path = code_graph_db(root.to_str().unwrap());
+        std::fs::create_dir_all(Path::new(&cg_path).parent().unwrap()).unwrap();
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&cg_path)).unwrap();
+            // Two functions + one struct, so the kind histogram is distinguishable from any count.
+            for (kind, i) in [("function", 0), ("function", 1), ("struct", 0)] {
+                let n = Node::new(
+                    synthetic_symbol(kind, &format!("{kind}{i}")),
+                    NodeKind::Other(kind.to_string()),
+                    format!("{kind}{i}"),
+                    Language::new(SYMBOL_SCHEME),
+                    Location::new(format!("{kind}/{kind}{i}"), Span::ZERO),
+                );
+                put_node(&mut repo_store, n).unwrap();
+            }
+        }
+        let daemon_path = root.join("daemon-store.db");
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "Kinds 122".into(),
+                root_path: root.to_str().unwrap().into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+
+        let kinds = graph_kinds_for_repo(&daemon, &entry.id).unwrap();
+        // BTreeMap-ordered: "function" (2) before "struct" (1) — the REPO's histogram, not the daemon's.
+        assert_eq!(
+            kinds,
+            vec![("function".to_string(), 2), ("struct".to_string(), 1)],
+            "graph kinds must summarise the REPO store, not the daemon"
+        );
+
+        assert!(
+            graph_kinds_for_repo(&daemon, "no-such-repo").is_err(),
+            "an unknown repo_ref must error, not return an empty summary"
         );
 
         let _ = std::fs::remove_dir_all(&root);

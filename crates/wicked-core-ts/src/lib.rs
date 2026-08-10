@@ -760,7 +760,9 @@ impl Core {
     /// resolves the repo from the registry, opens its `code_graph_db` (`<root>/.codegraph/estate.db`,
     /// the one spelling every consumer shares), and recomputes over it. An unknown `repo_ref` is an
     /// ERROR, never a silent vacuous report — the caller must name a real repo.
-    #[napi]
+    /// Resolves to the coverage report as a JSON string (`ts_return_type` pins it — the crew adapter
+    /// used to cast away an `unknown` here; #225 review).
+    #[napi(ts_return_type = "Promise<string>")]
     pub fn get_coverage_report_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
         task(move || {
@@ -770,6 +772,24 @@ impl Core {
             // unit-testable there (this napi layer stays thin glue). An unknown repo errors.
             let report = wicked_core::coverage_report_for_repo(&daemon, &repo_ref).map_err(err)?;
             serde_json::to_string(&report).map_err(err)
+        })
+    }
+
+    /// Node-count-by-kind summary of ONE registered repo's code graph, over that repo's OWN store
+    /// (#122). Resolves to a JSON string: an array of `{ "kind": string, "count": number }`,
+    /// kind-sorted. An unknown `repo_ref` REJECTS — never a silent empty summary.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn get_graph_kinds_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let kinds = wicked_core::graph_kinds_for_repo(&daemon, &repo_ref).map_err(err)?;
+            let shaped: Vec<_> = kinds
+                .into_iter()
+                .map(|(kind, count)| serde_json::json!({ "kind": kind, "count": count }))
+                .collect();
+            serde_json::to_string(&shaped).map_err(err)
         })
     }
 

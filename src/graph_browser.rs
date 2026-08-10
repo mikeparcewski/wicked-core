@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use wicked_apps_core::{open_store, GraphRead, Node, NodeKind};
+use wicked_apps_core::{open_store_ro, GraphRead, Node, NodeKind};
 use wicked_estate_core::{Direction, SymbolId};
 
 /// A node, flattened for the Core/UI (egui-free, serde-friendly).
@@ -73,7 +73,7 @@ pub struct NodeNote {
 
 /// All notes tied to nodes in a graph (manual `note` annotations), newest first.
 pub fn list_node_notes(db: &str) -> anyhow::Result<Vec<NodeNote>> {
-    let store = open_store(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
+    let store = open_store_ro(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
     let mut out = Vec::new();
     for (sym, ann) in store.annotations_by_type("note").unwrap_or_default() {
         if let Ok(Some(n)) = store.get_node(&sym) {
@@ -92,7 +92,7 @@ pub fn list_node_notes(db: &str) -> anyhow::Result<Vec<NodeNote>> {
 
 /// The node kinds present in a graph + their counts (the graph's shape).
 pub fn graph_kinds(db: &str) -> anyhow::Result<Vec<(String, usize)>> {
-    let store = open_store(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
+    let store = open_store_ro(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for n in store.all_nodes()? {
         *counts.entry(kind_label(&n.kind)).or_default() += 1;
@@ -107,7 +107,7 @@ pub fn browse_nodes(
     search: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<NodeSummary>> {
-    let store = open_store(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
+    let store = open_store_ro(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
     let q = search.to_lowercase();
     let mut out: Vec<NodeSummary> = store
         .all_nodes()?
@@ -127,7 +127,7 @@ pub fn browse_nodes(
 
 /// Full detail for one node by id: signature/doc/metadata + neighbor edges (dependencies + dependents).
 pub fn node_detail(db: &str, id: &str) -> anyhow::Result<Option<NodeDetail>> {
-    let store = open_store(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
+    let store = open_store_ro(Some(db)).map_err(|e| anyhow::anyhow!("open graph {db}: {e}"))?;
     let sym = SymbolId(id.to_string());
     let Some(n) = store.get_node(&sym)? else {
         return Ok(None);

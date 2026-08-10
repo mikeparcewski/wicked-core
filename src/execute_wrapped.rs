@@ -984,6 +984,25 @@ fn resolve_estate_mcp_exe() -> String {
     "wicked-estate-mcp".to_string()
 }
 
+/// The `(command, args)` for the estate MCP server a governed worker should get, scoped to the
+/// repo's OWN graph (FINDING-122). `None` when there is no repo graph: a scratch or the daemon store
+/// is worse than nothing — tools that answer "not found" for a symbol the repo plainly has is how an
+/// agent concludes the code does not exist (estate's R3), and handing over the daemon store is the
+/// FINDING-067 wipe. Shared by BOTH governed paths so the wrapped `settings.json` and the ACP
+/// `session/new` inject the SAME server against the SAME repo store; each caller formats its own
+/// protocol shape (claude's keyed object vs the ACP array).
+pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(String, Vec<String>)> {
+    code_graph_db
+        .map(str::trim)
+        .filter(|db| !db.is_empty())
+        .map(|db| {
+            (
+                resolve_estate_mcp_exe(),
+                vec!["--db".to_string(), db.to_string()],
+            )
+        })
+}
+
 /// Locate a binary on PATH using the same search the shell would do.
 /// Probe the resolved `wicked-core` CLI for the gate protocol it speaks, ONCE per process.
 ///
@@ -1279,11 +1298,13 @@ fn arm_input_governance(
     // `None` ⇒ NO estate MCP. Falling back to `gov.db_path` is the bug; falling back to a scratch db
     // is worse than nothing (tools that answer "not found" for a repo that plainly has the symbol are
     // how an agent concludes the code does not exist — estate's own R3).
-    let estate_mcp = gov.code_graph_db.as_ref().map(|graph_db| {
+    // Claude's `settings.json` wants a name-keyed object; the ACP path formats the same parts as an
+    // array (see `acp_runner`). One helper, one repo-scoped store, two shapes (FINDING-122).
+    let estate_mcp = repo_estate_mcp_parts(gov.code_graph_db.as_deref()).map(|(command, args)| {
         serde_json::json!({
             "wicked-estate": {
-                "command": resolve_estate_mcp_exe(),
-                "args": ["--db", graph_db]
+                "command": command,
+                "args": args
             }
         })
     });

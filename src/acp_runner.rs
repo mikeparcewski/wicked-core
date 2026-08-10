@@ -439,7 +439,15 @@ fn worker_config_token() -> anyhow::Result<String> {
 /// <path>` plus the gate-hook's env vars; the env vars arrived, the flag did not (the bridge does
 /// not parse it), so the hook had everything it needed except the instruction to run. Governed units
 /// take the wrapped path now — see the fail-closed return in `run_unit_streaming` and FINDING-060.
-fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Result<AcpProcess> {
+/// `code_graph_db` is the run's repo-local estate graph (`<repo>/.codegraph/estate.db`), or `None`
+/// for an ungoverned / repo-less session. When present, the worker's `session/new` advertises the
+/// estate MCP server scoped to that store (FINDING-122) — the ACP-array twin of the wrapped path's
+/// `settings.json` injection. `None` ⇒ no estate server (never the daemon store; see FINDING-067).
+fn start_acp_process(
+    config: &AcpConfig,
+    cwd: &std::path::Path,
+    code_graph_db: Option<&str>,
+) -> anyhow::Result<AcpProcess> {
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
     // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
     // that proceeded without the override would run under the operator's own configuration,
@@ -630,7 +638,20 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     }
 
     // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp)
-    // reject session/new with -32602 when it is absent; bridges ignore it.
+    // reject session/new with -32602 when it is absent; bridges ignore it. When the run has a repo
+    // graph, advertise the estate MCP server scoped to it (FINDING-122) — the ACP stdio-server shape
+    // ({name,command,args,env}) of the same parts the wrapped path writes into settings.json. A
+    // repo-less session keeps the empty array exactly as before.
+    let mcp_servers = crate::execute_wrapped::repo_estate_mcp_parts(code_graph_db)
+        .map(|(command, args)| {
+            json!([{
+                "name": "wicked-estate",
+                "command": command,
+                "args": args,
+                "env": []
+            }])
+        })
+        .unwrap_or_else(|| json!([]));
     let session_new_id = next_id;
     next_id += 1;
     if let Err(e) = rpc_send(
@@ -639,7 +660,7 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
         "session/new",
         json!({
             "cwd": cwd.to_string_lossy().as_ref(),
-            "mcpServers": []
+            "mcpServers": mcp_servers
         }),
     ) {
         handshake_err!(child, e);
@@ -1544,7 +1565,8 @@ impl AcpStepRunner {
                 "ACP HTTP transport not supported for chat ('{cli_key}')"
             ));
         }
-        let proc = start_acp_process(&config, cwd).map_err(|e| e.to_string())?;
+        // Chat is repo-less exploration → no estate MCP server (FINDING-122).
+        let proc = start_acp_process(&config, cwd, None).map_err(|e| e.to_string())?;
         let arc = Arc::new(Mutex::new(proc));
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         // A racing ensure may have inserted first — reuse theirs, drop ours.
@@ -1886,7 +1908,13 @@ impl AcpStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                match start_acp_process(&acp_config, &cwd) {
+                // Scope the worker's estate MCP server to THIS run's repo graph (FINDING-122). The
+                // session is cached per (run_id, cli_key), so the repo is stable for its lifetime.
+                let code_graph_db = input
+                    .governance
+                    .as_ref()
+                    .and_then(|g| g.code_graph_db.as_deref());
+                match start_acp_process(&acp_config, &cwd, code_graph_db) {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
                         let arc = Arc::new(Mutex::new(proc));
@@ -2421,7 +2449,7 @@ sleep 30
             .map(|_| {
                 let config = config.clone();
                 let cwd = dir.clone();
-                std::thread::spawn(move || start_acp_process(&config, &cwd))
+                std::thread::spawn(move || start_acp_process(&config, &cwd, None))
             })
             .collect();
         let procs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -2631,7 +2659,7 @@ sleep 30
         std::fs::write(&ledger, "").unwrap();
         let script = stub_auth_requiring_bridge(&dir, &ledger);
 
-        let proc = start_acp_process(&stub_config(&script, None), &dir)
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None)
             .expect("an auth-requiring agent must start once the client authenticates");
         assert_eq!(proc.session_id, "authed-session");
         // initialize=1, authenticate=2, session/new=3 — the first turn must not reuse an id.
@@ -2658,7 +2686,7 @@ sleep 30
         std::fs::write(&ledger, "").unwrap();
         let script = stub_auth_requiring_bridge(&dir, &ledger);
 
-        let proc = start_acp_process(&stub_config(&script, Some("method-b")), &dir)
+        let proc = start_acp_process(&stub_config(&script, Some("method-b")), &dir, None)
             .expect("configured-method authentication must start the session");
 
         let frames = std::fs::read_to_string(&ledger).unwrap();
@@ -2696,7 +2724,7 @@ sleep 30
 "#,
         );
 
-        let err = match start_acp_process(&stub_config(&script, None), &dir) {
+        let err = match start_acp_process(&stub_config(&script, None), &dir, None) {
             Err(e) => e,
             Ok(_) => panic!("an agent that refuses every session must fail the start"),
         };
@@ -2735,7 +2763,7 @@ sleep 30
 "#,
         );
 
-        let proc = start_acp_process(&stub_config(&script, None), &dir)
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None)
             .expect("a rejected authenticate must not fail a start the agent is willing to grant");
         assert_eq!(proc.session_id, "already-authed");
         drop(proc);
@@ -2776,7 +2804,7 @@ sleep 30
             ),
         );
 
-        let proc = start_acp_process(&stub_config(&script, None), &dir).expect("start");
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None).expect("start");
         let seen = std::fs::read_to_string(&ledger).unwrap().trim().to_string();
         assert_ne!(
             seen, "UNSET",
@@ -2805,6 +2833,77 @@ sleep 30
         drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&seen_dir);
+    }
+
+    /// FINDING-122, ACP half: a run WITH a repo graph must advertise the estate MCP server on
+    /// `session/new`, scoped to that repo's OWN store — the ACP-array twin of the wrapped path's
+    /// settings.json injection — so the worker consumes the graph instead of re-deriving it. A
+    /// repo-less session (`None`) advertises no server. The stub echoes the `session/new` frame it
+    /// received; reverting `mcpServers` to a bare `[]` empties the echo and fails the assertions.
+    #[test]
+    #[cfg(unix)]
+    fn session_new_advertises_the_repo_scoped_estate_mcp_server() {
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("estate-mcp");
+        let ledger = dir.join("session-new.json");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read new
+printf '%s\n' "$new" > "{ledger}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"mcp"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+
+        // WITH a repo graph → the estate server, scoped to that exact db.
+        let graph_db = "/tmp/wicked-122-repo/.codegraph/estate.db";
+        let proc =
+            start_acp_process(&stub_config(&script, None), &dir, Some(graph_db)).expect("start");
+        let seen = std::fs::read_to_string(&ledger).unwrap();
+        assert!(
+            seen.contains("\"mcpServers\""),
+            "session/new must carry mcpServers: {seen}"
+        );
+        assert!(
+            seen.contains("wicked-estate"),
+            "session/new must advertise the estate MCP server (FINDING-122): {seen}"
+        );
+        assert!(
+            seen.contains(graph_db),
+            "the estate server must be scoped to the REPO graph, not the daemon store: {seen}"
+        );
+        drop(proc);
+
+        // WITHOUT a repo graph → no estate server (repo-less parity with the wrapped path).
+        let ledger2 = dir.join("session-new-none.json");
+        let script2 = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read new
+printf '%s\n' "$new" > "{ledger}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"none"}}}}'
+sleep 30
+"#,
+                ledger = ledger2.display()
+            ),
+        );
+        let proc2 = start_acp_process(&stub_config(&script2, None), &dir, None).expect("start");
+        let seen2 = std::fs::read_to_string(&ledger2).unwrap();
+        assert!(
+            !seen2.contains("wicked-estate"),
+            "a repo-less session must advertise no estate server: {seen2}"
+        );
+        drop(proc2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The escape hatch: `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` set means NO override — the one
