@@ -52,6 +52,7 @@ impl StepRunner for OutRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            tools: Vec::new(),
             governed: false,
         }
     }
@@ -69,6 +70,7 @@ impl StepRunner for OkRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            tools: Vec::new(),
             governed: false,
         }
     }

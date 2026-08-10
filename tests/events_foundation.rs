@@ -76,6 +76,7 @@ impl StepRunner for FailRunner {
             status: StepStatus::Failed,
             usage: None,
             files: vec![],
+            tools: Vec::new(),
             governed: false,
         }
     }
@@ -93,6 +94,7 @@ impl StepRunner for OkRunner {
             status: StepStatus::Ok,
             usage: None,
             files: vec![],
+            tools: Vec::new(),
             governed: false,
         }
     }
@@ -1199,6 +1201,7 @@ impl StepRunner for UnknownCommandRunner {
             status: StepStatus::Ok,
             usage: None,
             files: vec![],
+            tools: Vec::new(),
             governed: false,
         }
     }

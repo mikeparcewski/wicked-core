@@ -2651,6 +2651,21 @@ fn apply_step_result(
             },
         );
     }
+    // (FINDING-046) The tools this unit's CLI invoked, emitted here for the SAME reason and on the same
+    // "adapter saw ≥1" gate as DataUsed above — deliberately NOT gated on `governed`, because an operator
+    // watching an ungoverned run was just as blind to a unit's tool activity as a governed one. Passthrough
+    // seats report no tools, so the default path stays silent.
+    if !output.tools.is_empty() {
+        emit(
+            subscribers,
+            CoreEvent::ToolInvoked {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                tools: output.tools.clone(),
+            },
+        );
+    }
 
     // (EVT-013) UnitOutputCaptured — fires here, after all guards pass and usage/data events land,
     // before the three status branches (Cancelled / Failed / Ok-gate). This is the earliest point
@@ -3554,6 +3569,9 @@ fn dispatch_unit(
                     status,
                     usage: None,
                     files: Vec::new(),
+                    // A Tool-executor phase (`run_tool_cmd`) invokes a single fixed binary directly
+                    // — it has no per-tool-call breakdown to report (FINDING-046).
+                    tools: Vec::new(),
                     governed: false,
                 },
                 agent_verdict: None,
@@ -4329,6 +4347,7 @@ mod terminal_gate_tests {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                tools: Vec::new(),
                 governed: false,
             }
         }
@@ -4426,6 +4445,7 @@ mod def_gate_disclosure_tests {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                tools: Vec::new(),
                 governed: false,
             }
         }
@@ -4698,6 +4718,7 @@ mod terminal_worktree_reap_tests {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                tools: Vec::new(),
                 governed: false,
             }
         }
@@ -5204,6 +5225,7 @@ mod phase_boundary_governance_tests {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                tools: Vec::new(),
                 governed: false,
             }
         }

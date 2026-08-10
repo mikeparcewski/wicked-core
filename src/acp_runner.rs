@@ -811,6 +811,13 @@ struct TurnResult {
     status: StepStatus,
     usage: Option<Usage>,
     files: Vec<String>,
+    /// Tool NAMES invoked this turn (FINDING-046). Empty on the ACP path today: unlike the
+    /// stream-json path (`tool_use.name` → Read/Bash/Edit), ACP reports tool activity on
+    /// `tool_call`/`tool_call_update` notifications as `kind`/`title`, a different identity that
+    /// must be pinned against a live frame before it can be emitted without misleading an operator.
+    /// Carried as a field now so the `ToolInvoked` event is uniform across runners; populating it
+    /// from ACP frames is the scoped follow-up.
+    tools: Vec<String>,
 }
 
 /// Send one `session/prompt` request and collect `session/update` notifications until
@@ -978,6 +985,7 @@ prior output you are reviewing, testing, or revising."
         },
         usage,
         files,
+        tools: Vec::new(),
     })
 }
 
@@ -1950,6 +1958,7 @@ impl AcpStepRunner {
                 status: StepStatus::Ok,
                 usage: result.usage,
                 files: result.files,
+                tools: result.tools,
                 governed: gate.is_some(),
             },
             Ok(result) if result.status == StepStatus::Cancelled => {
@@ -1965,6 +1974,7 @@ impl AcpStepRunner {
                     status: StepStatus::Cancelled,
                     usage: result.usage,
                     files: result.files,
+                    tools: result.tools,
                     governed: gate.is_some(),
                 }
             }

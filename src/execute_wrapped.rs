@@ -30,6 +30,11 @@ pub struct AdapterOut {
     pub text: Vec<String>,
     pub usage: Option<Usage>,
     pub files: Vec<String>,
+    /// Tool NAMES the CLI invoked this turn (`tool_use.name` — Read/Bash/Edit/…). Captured for
+    /// per-tool observability (FINDING-046): the operator was blind to which tools ran on a unit,
+    /// governed AND ungoverned. Distinct from `files` (which only sees `input.file_path`); a Bash or
+    /// a no-file tool contributes a name here but no file. Empty for the passthrough adapter.
+    pub tools: Vec<String>,
 }
 
 /// Per-CLI stdout adapter: turns a binary's raw stdout into readable deltas plus optional structured
@@ -55,6 +60,7 @@ impl OutputAdapter for Passthrough {
             text: vec![line.to_string()],
             usage: None,
             files: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -88,6 +94,7 @@ impl OutputAdapter for ClaudeStreamJson {
                     text: vec![line.to_string()],
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                 };
             }
         };
@@ -115,8 +122,14 @@ impl OutputAdapter for ClaudeStreamJson {
                                         }
                                     }
                                 }
-                                // A tool call touching a file (Read/Edit/Write/…) → a data-in-use signal (B4).
+                                // A tool call → per-tool observability (FINDING-046: capture the NAME) plus,
+                                // when it touches a file (Read/Edit/Write/…), a data-in-use signal (B4).
                                 Some("tool_use") => {
+                                    if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
+                                        if !name.is_empty() {
+                                            out.tools.push(name.to_string());
+                                        }
+                                    }
                                     if let Some(fp) = block
                                         .get("input")
                                         .and_then(|i| i.get("file_path"))
@@ -595,6 +608,7 @@ impl WrappedCliStepRunner {
                         status: StepStatus::Failed,
                         usage: None,
                         files: Vec::new(),
+                        tools: Vec::new(), // arming failed → nothing ran → no tools
                         governed: false, // arming failed → not governed (and the unit fails anyway)
                     };
                 }
@@ -632,11 +646,12 @@ impl WrappedCliStepRunner {
         let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
         let _ = std::fs::create_dir_all(&cwd);
 
-        let (status, output, usage, files) = if argv.is_empty() {
+        let (status, output, usage, files, tools) = if argv.is_empty() {
             (
                 StepStatus::Failed,
                 format!("(no invocation configured for cli `{cli_key}`)"),
                 None,
+                Vec::new(),
                 Vec::new(),
             )
         } else {
@@ -738,7 +753,7 @@ impl WrappedCliStepRunner {
                 // half an hour later, still climbing. The gate was right; the completion claim was
                 // not. `done` is re-derived from evidence everywhere else in this platform, and a
                 // process still writing inside this unit's own worktree is exactly that evidence.
-                Ok((0, out, _, usage, files)) => {
+                Ok((0, out, _, usage, files, tools)) => {
                     let settled = crate::outstanding_work::settle(&cwd);
                     let out = match settled.note() {
                         Some(note) => format!("{out}\n{note}"),
@@ -781,30 +796,36 @@ impl WrappedCliStepRunner {
                             ),
                             usage,
                             files,
+                            tools,
                         )
                     } else {
-                        (StepStatus::Ok, out, usage, files)
+                        (StepStatus::Ok, out, usage, files, tools)
                     }
                 }
-                Ok((-1, _, err, _, _)) if err == TIMED_OUT => (
+                // A timeout still surfaces the tools that DID run before the kill — this is exactly
+                // when an operator needs to see what a hung unit was doing (FINDING-046).
+                Ok((-1, _, err, _, _, tools)) if err == TIMED_OUT => (
                     StepStatus::Cancelled,
                     format!("(cli `{cli_key}` exceeded the timeout and was killed)"),
                     None,
                     Vec::new(),
+                    tools,
                 ),
-                Ok((code, out, err, _, _)) => {
+                Ok((code, out, err, _, _, tools)) => {
                     let detail = if !out.trim().is_empty() { out } else { err };
                     (
                         StepStatus::Failed,
                         format!("(cli `{cli_key}` exited {code}) {detail}"),
                         None,
                         Vec::new(),
+                        tools,
                     )
                 }
                 Err(e) => (
                     StepStatus::Failed,
                     format!("(could not run `{}`: {e})", argv[0]),
                     None,
+                    Vec::new(),
                     Vec::new(),
                 ),
             }
@@ -818,6 +839,7 @@ impl WrappedCliStepRunner {
             status,
             usage,
             files,
+            tools,
             // The wrapped-CLI runner is the ONLY authority on whether input governance was armed (it wrote
             // the armed marker). The fold trusts this, not unit properties, so a stub/test runner never
             // false-denies a claude-assigned unit for a marker it never wrote.
@@ -1348,14 +1370,14 @@ pub(crate) fn resolve_invocation(cli_key: &str) -> String {
 
 const TIMED_OUT: &str = "__wicked_timed_out__";
 
-/// The outcome of a bounded run: `(exit_code, stdout, stderr, usage, files)`.
-type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>);
+/// The outcome of a bounded run: `(exit_code, stdout, stderr, usage, files, tools)`.
+type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>);
 
 /// Run `cmd` bounded by `timeout`, draining stdout+stderr CONCURRENTLY (no pipe-buffer deadlock). Each
 /// raw stdout line is routed through `adapter`, whose READABLE text deltas are streamed through `emit`
 /// (live output) exactly as raw lines were before (for passthrough) while its structured signals (usage,
-/// files) are accumulated. Returns `(exit_code, stdout, stderr, usage, files)`; a timeout returns
-/// `(-1, "", TIMED_OUT, None, [])` after killing. Uses a scoped thread so the stdout drain can borrow
+/// files) are accumulated. Returns `(exit_code, stdout, stderr, usage, files, tools)`; a timeout returns
+/// `(-1, "", TIMED_OUT, None, [], [])` after killing. Uses a scoped thread so the stdout drain can borrow
 /// `emit` (which lives on the worker stack); the adapter is MOVED into that thread.
 fn run_bounded(
     mut cmd: Command,
@@ -1375,7 +1397,7 @@ fn run_bounded(
     // `emit` is unaffected (every delta still streams); only the retained string is bounded.
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
-    let (code, timed_out, out, usage, files, err) = std::thread::scope(|scope| {
+    let (code, timed_out, out, usage, files, tools, err) = std::thread::scope(|scope| {
         // Stdout: read line-by-line, route through `adapter`, stream each readable delta through `emit`,
         // accumulate the readable text (bounded) + the structured signals (usage/files).
         let out_h = scope.spawn(move || {
@@ -1384,6 +1406,7 @@ fn run_bounded(
             let mut capped = false;
             let mut usage: Option<Usage> = None;
             let mut files: Vec<String> = Vec::new();
+            let mut tools: Vec<String> = Vec::new();
             let mut absorb = |ao: AdapterOut, s: &mut String, capped: &mut bool| {
                 for t in ao.text {
                     emit(&t);
@@ -1399,6 +1422,7 @@ fn run_bounded(
                     usage = ao.usage;
                 }
                 files.extend(ao.files);
+                tools.extend(ao.tools);
             };
             for line in std::io::BufReader::new(so).lines().map_while(Result::ok) {
                 let ao = adapter.on_line(&line);
@@ -1406,7 +1430,7 @@ fn run_bounded(
             }
             let fin = adapter.finish();
             absorb(fin, &mut s, &mut capped);
-            (s, usage, files)
+            (s, usage, files, tools)
         });
         let err_h = scope.spawn(move || {
             let mut s = String::new();
@@ -1430,16 +1454,16 @@ fn run_bounded(
                 Err(_) => break (-1, false),
             }
         };
-        let (out, usage, files) = out_h.join().unwrap_or_default();
+        let (out, usage, files, tools) = out_h.join().unwrap_or_default();
         let err = err_h.join().unwrap_or_default();
-        (code, timed_out, out, usage, files, err)
+        (code, timed_out, out, usage, files, tools, err)
     });
 
     if timed_out {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
-        Ok((-1, out, TIMED_OUT.to_string(), usage, files))
+        Ok((-1, out, TIMED_OUT.to_string(), usage, files, tools))
     } else {
-        Ok((code, out, err, usage, files))
+        Ok((code, out, err, usage, files, tools))
     }
 }
 
@@ -1750,7 +1774,7 @@ mod deliverables_tests {
     fn the_completion_path_fails_a_unit_missing_its_deliverables() {
         let src = include_str!("execute_wrapped.rs");
         let ok_arm = src
-            .split("Ok((0, out, _, usage, files))")
+            .split("Ok((0, out, _, usage, files, tools))")
             .nth(1)
             .expect("the exit-0 arm still exists");
         let window = &ok_arm[..ok_arm.len().min(2600)];
@@ -1837,7 +1861,7 @@ mod tests {
         // spawn-audit: test-only — `printf` fixture proving run_bounded emits each stdout line live.
         let mut cmd = Command::new("printf");
         cmd.arg("alpha\nbeta\ngamma\n");
-        let (code, out, _err, _usage, _files) =
+        let (code, out, _err, _usage, _files, _tools) =
             run_bounded(cmd, Duration::from_secs(5), &emit, Box::new(Passthrough)).unwrap();
         assert_eq!(code, 0);
         assert_eq!(
@@ -2755,6 +2779,7 @@ mod tests {
                 acc.usage = ao.usage;
             }
             acc.files.extend(ao.files);
+            acc.tools.extend(ao.tools);
         };
         for l in lines {
             absorb(adapter.on_line(l));
@@ -2804,6 +2829,32 @@ mod tests {
         );
         // Files from the tool_use `input.file_path`.
         assert_eq!(out.files, vec!["/tmp/wc-probe.txt".to_string()]);
+        // The Read tool's NAME is captured too (FINDING-046) — the file path alone left an operator
+        // unable to see WHICH tool ran, and a no-file tool (below) leaves no trace in `files` at all.
+        assert_eq!(out.tools, vec!["Read".to_string()]);
+    }
+
+    #[test]
+    fn t_d1_claude_adapter_captures_tool_names_including_no_file_tools() {
+        // FINDING-046. The operator was blind to a unit's tool activity: a run could burn hundreds of
+        // tool calls with nothing in the event log naming even one. This asserts the ADAPTER captures
+        // every `tool_use.name` in order, and — critically — that a tool touching no file (Bash) still
+        // contributes a NAME. That is the case `DataUsed` (files-only) can never surface, so if this
+        // regresses, `ToolInvoked` silently loses exactly the tools that leave no file trail.
+        let mut adapter = ClaudeStreamJson::default();
+        let out = drive(
+            &mut adapter,
+            &[
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/tmp/a.txt"}}]}}"#,
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"ls -la"}}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+            ],
+        );
+        // Both names, in invocation order. Removing the `out.tools.push(name)` line in the adapter's
+        // `tool_use` arm makes this empty — the mutation the fix exists to prevent.
+        assert_eq!(out.tools, vec!["Read".to_string(), "Bash".to_string()]);
+        // Bash carries a `command`, not a `file_path`, so it adds a NAME but no FILE: `tools` ⊋ `files`.
+        assert_eq!(out.files, vec!["/tmp/a.txt".to_string()]);
     }
 
     #[test]

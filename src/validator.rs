@@ -1796,6 +1796,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }
@@ -2657,6 +2658,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }
@@ -2727,6 +2729,7 @@ mod tests {
                     },
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }
@@ -2777,6 +2780,7 @@ mod tests {
                     status: StepStatus::Failed,
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }
@@ -2822,6 +2826,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }
@@ -2870,6 +2875,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }
