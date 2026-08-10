@@ -1455,7 +1455,10 @@ mod tests {
             .unwrap();
 
         let result = db.find_completed("test-consumer", "my-run", 7).unwrap();
-        assert!(result.is_some(), "target event found despite preceding unrelated events");
+        assert!(
+            result.is_some(),
+            "target event found despite preceding unrelated events"
+        );
         let ev = result.unwrap();
         assert_eq!(ev.event_id, target_id);
         assert_eq!(ev.payload["run_id"], "my-run");

@@ -254,13 +254,25 @@ fn status_from_str(s: &str) -> StepStatus {
     }
 }
 
-/// The deterministic idempotency key for a task's dispatched/completed pair, per `(run, unit, attempt)`.
-fn task_key(event_type: &str, run_id: &str, unit_ix: usize, attempt: u32) -> String {
+/// The deterministic idempotency key for one exact launch. Generation and sequence
+/// prevent a post-restart launch from deduplicating against an already-consumed
+/// predecessor event with the same run, unit, and attempt.
+fn task_key(
+    event_type: &str,
+    run_id: &str,
+    unit_ix: usize,
+    attempt: u32,
+    process_gen: Option<uuid::Uuid>,
+    launch_seq: u64,
+) -> String {
+    let process_gen = process_gen.map(|gen| gen.to_string()).unwrap_or_default();
     deterministic_key(&[
         event_type,
         run_id,
         &unit_ix.to_string(),
         &attempt.to_string(),
+        &process_gen,
+        &launch_seq.to_string(),
     ])
 }
 
@@ -592,7 +604,11 @@ pub(crate) fn is_exec_enabled() -> bool {
 /// dispatch dedups. Returns `true` if published (exec mode armed), `false` if the in-process path should
 /// run instead. A publish error is surfaced as `false` so the run still makes progress in-process rather
 /// than wedging with no worker.
-pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Option<&str>, is_acp: bool) -> bool {
+pub(crate) fn try_publish_dispatched(
+    input: &StepInput,
+    agent_review_target: Option<&str>,
+    is_acp: bool,
+) -> bool {
     EXEC_PUBLISHER.with(|cell| {
         let guard = cell.borrow();
         let Some(db) = guard.as_ref() else {
@@ -638,7 +654,14 @@ pub(crate) fn try_publish_dispatched(input: &StepInput, agent_review_target: Opt
                 return false;
             }
         };
-        let key = task_key(TASK_DISPATCHED, &input.run_id, input.unit_ix, input.attempt);
+        let key = task_key(
+            TASK_DISPATCHED,
+            &input.run_id,
+            input.unit_ix,
+            input.attempt,
+            input.process_gen,
+            input.launch_seq,
+        );
         let ev = BusEmit::new(TASK_DISPATCHED, CORE_DOMAIN, "core.task", payload).with_key(key);
         match db.emit(&ev) {
             Ok(_) => true,
@@ -790,15 +813,47 @@ pub(crate) fn reclaim_predecessor_cursors(
         let old_completed = format!("cli-runner-completed-{old_uuid}");
 
         // MIGRATE cursor positions FIRST.
-        if let Ok(Some(pos)) = db.load_cursor(old_consumer) {
-            let _ = db.save_cursor(new_consumer, pos);
+        match db.load_cursor(old_consumer) {
+            Ok(Some(pos)) => {
+                if let Err(e) = db.save_cursor(new_consumer, pos) {
+                    eprintln!("wicked-core: reclamation could not migrate dispatch cursor: {e}");
+                    return None;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: reclamation could not read predecessor dispatch cursor: {e}"
+                );
+                return None;
+            }
         }
-        if let Ok(Some(pos)) = db.load_cursor(&old_completed) {
-            let _ = db.save_cursor(new_completed, pos);
+        match db.load_cursor(&old_completed) {
+            Ok(Some(pos)) => {
+                if let Err(e) = db.save_cursor(new_completed, pos) {
+                    eprintln!("wicked-core: reclamation could not migrate completed cursor: {e}");
+                    return None;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: reclamation could not read predecessor completed cursor: {e}"
+                );
+                return None;
+            }
         }
         // DELETE old rows AFTER migration, BEFORE set_stable.
-        let _ = db.delete_cursor(old_consumer);
-        let _ = db.delete_cursor(&old_completed);
+        if let Err(e) = db.delete_cursor(old_consumer) {
+            eprintln!("wicked-core: reclamation could not delete predecessor dispatch cursor: {e}");
+            return None;
+        }
+        if let Err(e) = db.delete_cursor(&old_completed) {
+            eprintln!(
+                "wicked-core: reclamation could not delete predecessor completed cursor: {e}"
+            );
+            return None;
+        }
     }
 
     // Step 4: set_stable LAST.
@@ -894,7 +949,16 @@ pub(crate) fn spawn_exec_consumers(
             poll_interval,
             stop.clone(),
         ),
-        run_task_completed_poller(completed_db, completed_floor, completed_consumer_name, tx, poll_interval, stop),
+        run_task_completed_poller(
+            completed_db,
+            completed_floor,
+            completed_consumer_name,
+            tx,
+            actor_process_gen,
+            predecessor_gen,
+            poll_interval,
+            stop,
+        ),
     ]
 }
 
@@ -1012,31 +1076,34 @@ fn run_cli_runner(
                         // This task was dispatched by the previous process (now dead). Check
                         // find_completed first: the predecessor may have finished the work and
                         // published task.completed before crashing without advancing its cursor.
-                        let real_completion = BusDb::open(&bus_db_path)
-                            .ok()
-                            .and_then(|scan_db| {
-                                scan_db
-                                    .find_completed(&completed_consumer_name, &task.run_id, task.launch_seq)
-                                    .ok()
-                                    .flatten()
-                            });
+                        let real_completion = BusDb::open(&bus_db_path).ok().and_then(|scan_db| {
+                            scan_db
+                                .find_completed(
+                                    &completed_consumer_name,
+                                    &task.run_id,
+                                    task.launch_seq,
+                                )
+                                .ok()
+                                .flatten()
+                        });
 
                         if let Some(completion_ev) = real_completion {
                             // Real completion found — apply it and gate cursor advance on ack.
-                            let completed: CompletedTask =
-                                match serde_json::from_value(completion_ev.payload.clone()) {
-                                    Ok(c) => c,
-                                    Err(e) => {
-                                        eprintln!(
+                            let completed: CompletedTask = match serde_json::from_value(
+                                completion_ev.payload.clone(),
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    eprintln!(
                                             "wicked-core: cli-runner predecessor completion unparseable \
                                              for {}#{}: {e}",
                                             task.run_id, task.unit_ix
                                         );
-                                        floor = ev.event_id;
-                                        persist_cursor(&db, &consumer_name, floor);
-                                        continue;
-                                    }
-                                };
+                                    floor = ev.event_id;
+                                    persist_cursor(&db, &consumer_name, floor);
+                                    continue;
+                                }
+                            };
                             let output = StepOutput {
                                 run_id: completed.run_id.clone(),
                                 unit_ix: completed.unit_ix,
@@ -1064,7 +1131,11 @@ fn run_cli_runner(
                                 floor = ev.event_id;
                                 persist_cursor(&db, &consumer_name, floor);
                                 // Also advance the completed cursor past this event.
-                                persist_cursor(&db, &completed_consumer_name, completion_ev.event_id);
+                                persist_cursor(
+                                    &db,
+                                    &completed_consumer_name,
+                                    completion_ev.event_id,
+                                );
                             }
                             continue;
                         }
@@ -1108,10 +1179,7 @@ fn run_cli_runner(
 
                 // Extended dedup key includes process_gen + launch_seq (plan step 8).
                 let dedup = {
-                    let gen_str = task
-                        .process_gen
-                        .map(|u| u.to_string())
-                        .unwrap_or_default();
+                    let gen_str = task.process_gen.map(|u| u.to_string()).unwrap_or_default();
                     deterministic_key(&[
                         "done",
                         &task.run_id,
@@ -1254,22 +1322,44 @@ fn run_cli_runner(
                             "wicked-core: cli-runner could not serialize task.completed for {}#{}: {e}",
                             task.run_id, task.unit_ix
                         );
+                        if let Some(ref maps) = lifecycle_maps {
+                            maps.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clear_bus_in_flight(&task.run_id, task.launch_seq);
+                        }
                         floor = ev.event_id; // can't ever serialize — don't wedge the batch
                         persist_cursor(&db, &consumer_name, floor);
                         continue;
                     }
                 };
-                let key = task_key(TASK_COMPLETED, &task.run_id, task.unit_ix, task.attempt);
+                let key = task_key(
+                    TASK_COMPLETED,
+                    &task.run_id,
+                    task.unit_ix,
+                    task.attempt,
+                    task.process_gen,
+                    task.launch_seq,
+                );
                 let ev_out =
                     BusEmit::new(TASK_COMPLETED, CORE_DOMAIN, "core.task", payload).with_key(key);
                 match db.emit(&ev_out) {
                     Ok(_) => {
+                        if let Some(ref maps) = lifecycle_maps {
+                            maps.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .clear_bus_in_flight(&task.run_id, task.launch_seq);
+                        }
                         done.insert(dedup);
                         floor = ev.event_id; // handled — advance the floor + persist the durable cursor
                         persist_cursor(&db, &consumer_name, floor);
                     }
                     // Transient publish fault → do NOT advance; break the batch and re-poll (at-least-once).
                     Err(e) => {
+                        if let Some(ref maps) = lifecycle_maps {
+                            maps.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .reset_bus_activation(&task.run_id, task.launch_seq);
+                        }
                         eprintln!(
                             "wicked-core: cli-runner could not publish task.completed for {} (transient, \
                              will retry): {e}",
@@ -1296,6 +1386,8 @@ fn run_task_completed_poller(
     floor_init: i64,
     consumer_name: String,
     tx: Sender<Command>,
+    actor_process_gen: uuid::Uuid,
+    predecessor_gen: Option<uuid::Uuid>,
     poll_interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
@@ -1325,6 +1417,16 @@ fn run_task_completed_poller(
                         continue;
                     }
                 };
+                // This cursor may share a bus with other live Core actors. Apply only
+                // completions owned by this process or its single reclaimed predecessor;
+                // foreign/legacy completions must never mutate this actor's store.
+                let owned_generation = task.process_gen == Some(actor_process_gen)
+                    || (task.process_gen.is_some() && task.process_gen == predecessor_gen);
+                if !owned_generation {
+                    floor = ev.event_id;
+                    persist_cursor(&db, &consumer_name, floor);
+                    continue;
+                }
                 let output = StepOutput {
                     run_id: task.run_id,
                     unit_ix: task.unit_ix,
@@ -1748,19 +1850,37 @@ mod tests {
     }
 
     #[test]
-    fn task_key_is_deterministic_per_run_unit_attempt() {
-        let a = task_key(TASK_DISPATCHED, "run-1", 2, 0);
-        let b = task_key(TASK_DISPATCHED, "run-1", 2, 0);
-        assert_eq!(a, b, "same (run, unit, attempt) ⇒ same key (idempotent)");
+    fn task_key_is_deterministic_per_exact_launch() {
+        let generation = Some(uuid::Uuid::new_v4());
+        let a = task_key(TASK_DISPATCHED, "run-1", 2, 0, generation, 1);
+        let b = task_key(TASK_DISPATCHED, "run-1", 2, 0, generation, 1);
+        assert_eq!(a, b, "same launch token ⇒ same key (idempotent)");
         assert_ne!(
             a,
-            task_key(TASK_DISPATCHED, "run-1", 2, 1),
+            task_key(TASK_DISPATCHED, "run-1", 2, 1, generation, 1),
             "attempt varies the key"
         );
         assert_ne!(
             a,
-            task_key(TASK_COMPLETED, "run-1", 2, 0),
+            task_key(TASK_COMPLETED, "run-1", 2, 0, generation, 1),
             "event type varies the key"
+        );
+        assert_ne!(
+            a,
+            task_key(TASK_DISPATCHED, "run-1", 2, 0, generation, 2),
+            "launch sequence varies the key"
+        );
+        assert_ne!(
+            a,
+            task_key(
+                TASK_DISPATCHED,
+                "run-1",
+                2,
+                0,
+                Some(uuid::Uuid::new_v4()),
+                1,
+            ),
+            "process generation varies the key"
         );
     }
 
@@ -1784,8 +1904,8 @@ mod tests {
             governance: None,
             prior_outputs: vec![],
             elicitation_epoch: 0,
-            process_gen: Some(uuid::Uuid::new_v4()),  // will be stripped below
-            launch_seq: 5,                             // will be stripped below
+            process_gen: Some(uuid::Uuid::new_v4()), // will be stripped below
+            launch_seq: 5,                           // will be stripped below
         };
         // Publish a dispatched task to a real bus db so we can round-trip through serde.
         let bus_path = tmp_bus("t7a");
@@ -1814,9 +1934,7 @@ mod tests {
         assert_eq!(task.launch_seq, 0, "launch_seq defaults to 0");
         assert!(!task.is_acp, "is_acp defaults to false");
 
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new(&bus_path).parent().unwrap(),
-        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path).parent().unwrap());
     }
 
     // ── T7-b/c: status string roundtrips ─────────────────────────────────────────────────────────────
@@ -1860,10 +1978,8 @@ mod tests {
     // ── T7-e/f: startup reclamation ──────────────────────────────────────────────────────────────────
 
     fn tmp_bus(tag: &str) -> String {
-        let dir = std::env::temp_dir().join(format!(
-            "wc-clirunner-t7-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("wc-clirunner-t7-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("bus.db").to_str().unwrap().to_string()
@@ -1940,9 +2056,7 @@ mod tests {
             "predecessor_gen matches old actor gen"
         );
 
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new(&bus_path).parent().unwrap(),
-        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path).parent().unwrap());
     }
 
     /// T7-f: `predecessor_gen` is `Some(_)` when an old consumer exists in the stable record;
@@ -1959,11 +2073,7 @@ mod tests {
         // First boot: no predecessor.
         let result = reclaim_predecessor_cursors(&bus, workspace_id, &new_consumer, &new_completed);
         assert!(result.is_some(), "reclamation succeeds on first boot");
-        assert_eq!(
-            result.unwrap(),
-            None,
-            "no predecessor on first boot → None"
-        );
+        assert_eq!(result.unwrap(), None, "no predecessor on first boot → None");
 
         // Simulate second boot with a predecessor.
         let stable_key = format!("{CORE_STABLE_ID_KEY_PREFIX}{workspace_id}");
@@ -1985,9 +2095,7 @@ mod tests {
             "predecessor_gen is Some(old_gen) when old consumer exists"
         );
 
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new(&bus_path).parent().unwrap(),
-        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path).parent().unwrap());
     }
 
     // ── T7-g: ack-gated cursor advance ───────────────────────────────────────────────────────────────
@@ -2002,10 +2110,13 @@ mod tests {
         let consumer = "cli-runner-completed-test-t7g".to_string();
 
         // Publish one task.completed event
+        let actor_gen = uuid::Uuid::new_v4();
         let payload = serde_json::json!({
             "run_id": "r-t7g", "unit_ix": 0, "attempt": 0,
             "output": "ok", "status": "ok",
-            "governed": false
+            "governed": false,
+            "process_gen": actor_gen,
+            "launch_seq": 1
         });
         let ev = crate::bus::BusEmit::new(TASK_COMPLETED, CORE_DOMAIN, "test", payload);
         bus.emit(&ev).unwrap();
@@ -2030,6 +2141,8 @@ mod tests {
                 0,
                 consumer_clone,
                 tx,
+                actor_gen,
+                None,
                 std::time::Duration::from_millis(50),
                 stop_clone,
             )
@@ -2049,9 +2162,7 @@ mod tests {
             "cursor must stay at 0 when the actor channel is closed"
         );
 
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new(&bus_path).parent().unwrap(),
-        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path).parent().unwrap());
     }
 
     // ── T7-h: find_completed with interleaved events ─────────────────────────────────────────────────
@@ -2074,7 +2185,13 @@ mod tests {
             "launch_seq": launch_seq_other,
             "process_gen": uuid::Uuid::new_v4().to_string()
         });
-        bus.emit(&crate::bus::BusEmit::new(TASK_COMPLETED, CORE_DOMAIN, "test", unrelated)).unwrap();
+        bus.emit(&crate::bus::BusEmit::new(
+            TASK_COMPLETED,
+            CORE_DOMAIN,
+            "test",
+            unrelated,
+        ))
+        .unwrap();
 
         // Then publish the TARGET completion
         let target_gen = uuid::Uuid::new_v4();
@@ -2084,7 +2201,13 @@ mod tests {
             "launch_seq": launch_seq_target,
             "process_gen": target_gen.to_string()
         });
-        bus.emit(&crate::bus::BusEmit::new(TASK_COMPLETED, CORE_DOMAIN, "test", target)).unwrap();
+        bus.emit(&crate::bus::BusEmit::new(
+            TASK_COMPLETED,
+            CORE_DOMAIN,
+            "test",
+            target,
+        ))
+        .unwrap();
 
         // Set cursor to 0 so find_completed scans from the start.
         bus.save_cursor(&consumer, 0).unwrap();
@@ -2106,7 +2229,10 @@ mod tests {
         let result2 = bus
             .find_completed(&consumer, "other-run", launch_seq_other)
             .expect("find_completed for unrelated must not error");
-        assert!(result2.is_some(), "should find the unrelated completion too");
+        assert!(
+            result2.is_some(),
+            "should find the unrelated completion too"
+        );
 
         // A non-existent run returns None.
         let result3 = bus
@@ -2114,9 +2240,7 @@ mod tests {
             .expect("find_completed for ghost must not error");
         assert!(result3.is_none(), "non-existent run returns None");
 
-        let _ = std::fs::remove_dir_all(
-            std::path::Path::new(&bus_path).parent().unwrap(),
-        );
+        let _ = std::fs::remove_dir_all(std::path::Path::new(&bus_path).parent().unwrap());
     }
 
     // ── Test 38: degraded-mode ack-gated cursor advance ──────────────────────────────────────────────
@@ -2157,13 +2281,17 @@ mod tests {
             m.mark_bus_in_flight("run-t38a", seq);
             m.clear_bus_in_flight("run-t38a", seq);
             assert!(m.has_activated_seq("run-t38a", seq), "should be activated");
-            assert!(!m.is_bus_worker_in_flight("run-t38a", seq), "should NOT be in-flight");
+            assert!(
+                !m.is_bus_worker_in_flight("run-t38a", seq),
+                "should NOT be in-flight"
+            );
         }
 
         // Publish a properly-serialized task.dispatched so serde can parse it (GateSpec::Auto
         // serializes as the string "auto", not {"kind":"none"} — hand-crafted JSON would be a
         // poison payload and the cursor would advance for the wrong reason).
-        let unit_a = crate::domain::WorkUnit::pending("run-t38a:u1", "run-t38a", 1, "degraded-mode test");
+        let unit_a =
+            crate::domain::WorkUnit::pending("run-t38a:u1", "run-t38a", 1, "degraded-mode test");
         let input_a = StepInput {
             run_id: "run-t38a".into(),
             unit_ix: 0,
@@ -2179,7 +2307,10 @@ mod tests {
             launch_seq: 1,
         };
         assert!(arm_exec_publisher(&bus_path_a), "arm publisher t38a");
-        assert!(try_publish_dispatched(&input_a, None, false), "publish t38a");
+        assert!(
+            try_publish_dispatched(&input_a, None, false),
+            "publish t38a"
+        );
         disarm_exec_publisher();
 
         {
@@ -2225,7 +2356,10 @@ mod tests {
             stop_a.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = inner.join();
 
-            let pos = BusDb::open(&bus_path_a).unwrap().load_cursor(&c_name_a).unwrap();
+            let pos = BusDb::open(&bus_path_a)
+                .unwrap()
+                .load_cursor(&c_name_a)
+                .unwrap();
             assert!(
                 pos.unwrap_or(0) > 0,
                 "cursor must advance after ack in degraded mode (sub-case a)"
@@ -2249,12 +2383,16 @@ mod tests {
             m.mark_bus_in_flight("run-t38b", seq);
             m.clear_bus_in_flight("run-t38b", seq);
             assert!(m.has_activated_seq("run-t38b", seq), "should be activated");
-            assert!(!m.is_bus_worker_in_flight("run-t38b", seq), "should NOT be in-flight");
+            assert!(
+                !m.is_bus_worker_in_flight("run-t38b", seq),
+                "should NOT be in-flight"
+            );
         }
 
         // Same publish pattern as sub-case (a): use a real StepInput so GateSpec serializes
         // correctly as "auto", not {"kind":"none"}.
-        let unit_b = crate::domain::WorkUnit::pending("run-t38b:u1", "run-t38b", 1, "degraded-mode test");
+        let unit_b =
+            crate::domain::WorkUnit::pending("run-t38b:u1", "run-t38b", 1, "degraded-mode test");
         let input_b = StepInput {
             run_id: "run-t38b".into(),
             unit_ix: 0,
@@ -2270,7 +2408,10 @@ mod tests {
             launch_seq: 1,
         };
         assert!(arm_exec_publisher(&bus_path_b), "arm publisher t38b");
-        assert!(try_publish_dispatched(&input_b, None, false), "publish t38b");
+        assert!(
+            try_publish_dispatched(&input_b, None, false),
+            "publish t38b"
+        );
         disarm_exec_publisher();
 
         {
@@ -2317,9 +2458,13 @@ mod tests {
             ack_drop_thread.join().unwrap();
             let _ = inner.join();
 
-            let pos = BusDb::open(&bus_path_b).unwrap().load_cursor(&c_name_b).unwrap();
+            let pos = BusDb::open(&bus_path_b)
+                .unwrap()
+                .load_cursor(&c_name_b)
+                .unwrap();
             assert_eq!(
-                pos.unwrap_or(0), 0,
+                pos.unwrap_or(0),
+                0,
                 "cursor must NOT advance when actor drops ack (sub-case b)"
             );
         }
