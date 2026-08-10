@@ -2499,6 +2499,7 @@ pub(crate) fn launch_run_inner(
 
 /// The body of `Command::ResumeRun` (also the campaign driver's crash-resume re-attach, DES §6).
 /// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_run_inner(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -2658,6 +2659,7 @@ fn report_orphaned_executing_sessions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn redrive_executing_sessions(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -2802,6 +2804,7 @@ fn environment_refusal(output: &str) -> Option<EnvironmentRefusal> {
 /// cursor AND the unit isn't already `Done`. A stale or duplicate result — e.g. a worker orphaned by
 /// a superseded run or a re-delivered message — is ignored (`Stale`). This is the defense the
 /// per-actor `in_flight` set cannot provide (it can't see results from a different actor/process).
+#[allow(clippy::too_many_arguments)]
 fn apply_step_result(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -2809,7 +2812,7 @@ fn apply_step_result(
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
     agent_verdict: Option<(bool, String)>,
-    db_path: &str,
+    _db_path: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -3478,6 +3481,7 @@ fn pause_for_human(
 /// Advance one step: if the unit at `unit_ix` should pause for human confirmation, set the run
 /// `AwaitingHuman` + emit `AwaitingHuman` and return `Paused`; if there's no unit left, return
 /// `Done`; otherwise dispatch the unit off-thread and return `Dispatched`.
+#[allow(clippy::too_many_arguments)]
 fn advance_or_pause(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -3729,6 +3733,7 @@ fn unsuppressed_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'stati
 /// Read the next unit at `unit_ix`, emit `UnitExecuting`, and spawn a worker that runs its slow work
 /// (no store handle) and posts an `ApplyStepResult` back to the actor. Returns `Ok(false)` if
 /// `unit_ix` is past the last unit (nothing to dispatch — the run is done).
+#[allow(clippy::too_many_arguments)]
 fn dispatch_unit(
     store: &dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,

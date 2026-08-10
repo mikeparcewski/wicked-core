@@ -219,8 +219,9 @@ impl ElicitationMaps {
     /// `run_index` are updated atomically under the caller's lock.
     ///
     /// The message is byte-capped at 8 KB (truncated); individual `options` entries
-    /// > 512 bytes are dropped; `options` list is capped at 100 entries; empty-string
-    /// options entries are dropped.
+    /// larger than 512 bytes are dropped; `options` list is capped at 100 entries;
+    /// empty-string options entries are dropped.
+    #[allow(clippy::type_complexity)]
     pub fn register(
         &mut self,
         run_id: &str,
@@ -1706,12 +1707,14 @@ struct TurnResult {
 impl TurnResult {
     /// Construct a default-failed `TurnResult` with empty output. Used as the
     /// starting state before a turn executes; callers overwrite it on success.
+    #[allow(dead_code)]
     fn default_failed() -> Self {
         Self {
             output: String::new(),
             status: StepStatus::Failed,
             usage: None,
             files: Vec::new(),
+            tools: Vec::new(),
         }
     }
 }
@@ -1745,6 +1748,7 @@ fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>
     Some((prop_name.clone(), prop_type.map(|s| s.to_string())))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_turn_acp(
     proc: &mut AcpProcess,
     prompt: &str,
@@ -1907,7 +1911,11 @@ prior output you are reviewing, testing, or revising."
                     // Keep draining stdout (prevents buffer full / deadlock) while also
                     // checking the resolution channel every ELICITATION_POLL_MS.
                     let mut elicit_action = String::new();
-                    let mut elicit_reason = String::new();
+                    // Assigned on every `break 'elicit` path before the post-loop read; declared
+                    // without an initializer so the dead `String::new()` doesn't trip
+                    // `-D unused-assignments` (unlike `elicit_action`, whose initial empty value
+                    // is read on the `session_prompt` break paths).
+                    let mut elicit_reason: String;
 
                     'elicit: loop {
                         let remaining = deadline
@@ -3329,6 +3337,7 @@ impl AcpStepRunner {
                 status: StepStatus::ElicitationFailed,
                 usage,
                 files,
+                tools: Vec::new(),
                 governed: gate.is_some(),
             };
         }
@@ -3376,6 +3385,7 @@ impl AcpStepRunner {
                     status: StepStatus::ElicitationFailed,
                     usage: result.usage,
                     files: result.files,
+                    tools: result.tools,
                     governed: gate.is_some(),
                 }
             }
@@ -4771,14 +4781,17 @@ sleep 30
     /// the StepOutput the runner returns. Fourth instance of that gap in this campaign — hence a
     /// source audit rather than another test of the helper.
     #[cfg(unix)]
+    #[allow(dead_code)]
     const CHEAP_OK: &str = "/bin/echo wicked-fallback-ran";
     #[cfg(not(unix))]
+    #[allow(dead_code)]
     const CHEAP_OK: &str = "wicked-no-such-binary-fallback-probe";
 
     /// A unit assigned to `claude` — the routing predicate reads `assigned_cli` — whose actual
     /// invocation is [`CHEAP_OK`], so the wrapped fallback this must reach executes something cheap
     /// instead of a real CLI. The two are deliberately different: the ACP branch classifies by the
     /// assigned key, the wrapped runner by argv[0].
+    #[allow(dead_code)]
     fn claude_unit_running_echo() -> crate::domain::WorkUnit {
         crate::domain::WorkUnit {
             id: "u-gov".to_string(),
@@ -4807,6 +4820,7 @@ sleep 30
         }
     }
 
+    #[allow(dead_code)]
     fn governed_input(dir: &std::path::Path) -> StepInput {
         StepInput {
             run_id: "run-gov".to_string(),
@@ -5150,7 +5164,7 @@ sleep 30
     #[test]
     fn message_truncation_8kb_byte_length_cap() {
         // U+1F600 is 4 bytes in UTF-8; 2049 codepoints = 8196 bytes > 8192.
-        let long_msg: String = std::iter::repeat('😀').take(2049).collect();
+        let long_msg: String = "😀".repeat(2049);
         assert_eq!(long_msg.len(), 2049 * 4, "each codepoint is 4 bytes");
         let mut m = maps();
         let result = m.register("run-8", 1, "e8", &long_msg, None, "response");
@@ -5174,7 +5188,7 @@ sleep 30
     #[test]
     fn options_entry_over_512_bytes_dropped() {
         // 129 U+1F600 (4 bytes each) = 516 bytes > 512.
-        let over_cap: String = std::iter::repeat('😀').take(129).collect();
+        let over_cap: String = "😀".repeat(129);
         assert!(
             over_cap.len() > 512,
             "over-cap entry is {} bytes",
@@ -5481,6 +5495,8 @@ sleep 30
     /// Behaviors:
     /// - `"ok"`: completes immediately with `stopReason:"end_turn"`
     /// - `"elicit_ok"`: sends a valid string-schema elicitation, reads one response, completes
+    /// - `"elicit_disabled"`: sends a valid string-schema elicitation, tolerates the cancel the
+    ///   disabled-epoch path returns (does not assert an accept), completes
     /// - `"elicit_multi_prop"`: sends a multi-property schema → must receive immediate cancel, completes
     /// - `"elicit_non_string"`: sends an integer-type schema → immediate cancel, completes
     /// - `"elicit_nested"`: sends two elicitations in rapid succession (to test test-20)
@@ -5543,6 +5559,19 @@ elif behavior == "elicit_ok":
     expected = {"action": "accept", "content": {"name": "Alice"}}
     if answer is None or answer.get("result") != expected:
         sys.exit(2)
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
+    }})
+
+elif behavior == "elicit_disabled":
+    # Valid string-schema elicitation that we expect to be CANCELLED because elicitation is
+    # disabled for the epoch (epoch=0). Read whatever response arrives WITHOUT asserting an
+    # accept (a real adapter would simply proceed), then complete the prompt so the turn is Ok.
+    w({"jsonrpc": "2.0", "id": "elicit-1", "method": "elicitation/create", "params": {
+        "message": "What is your name?",
+        "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+    }})
+    r()  # receives action:cancel from the disabled path — do NOT assert it is an accept
     w({"jsonrpc": "2.0", "id": prompt_id, "result": {
         "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
     }})
@@ -5624,7 +5653,7 @@ else:
             transport: AcpTransport::default(),
             auth_method: None,
         };
-        start_acp_process(&config, dir)
+        start_acp_process(&config, dir, None)
             .unwrap_or_else(|e| panic!("mock ACP start failed for behavior={behavior}: {e}"))
     }
 
@@ -5636,7 +5665,7 @@ else:
         let dir = std::env::temp_dir().join(format!("wicked-des002-t12-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut proc = start_mock_proc(&dir, "elicit_ok");
+        let mut proc = start_mock_proc(&dir, "elicit_disabled");
         let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
         let (tx, _rx) = std::sync::mpsc::channel();
         let noop: &DeltaSink = &|_: &str| {};
@@ -5727,7 +5756,7 @@ else:
             std::thread::sleep(Duration::from_millis(200));
             let m = maps_clone.lock().unwrap();
             // Find the elicitation id and deliver a response.
-            let elicitation_id = m.pending.keys().next().map(|s| s.clone());
+            let elicitation_id = m.pending.keys().next().cloned();
             drop(m);
             if let Some(id) = elicitation_id {
                 let mut m = maps_clone.lock().unwrap();
@@ -5821,14 +5850,14 @@ else:
         let mut proc = start_mock_proc(&dir, "elicit_nested");
         let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
         let maps_clone = Arc::clone(&maps);
-        let (tx, event_rx) = std::sync::mpsc::channel();
+        let (tx, _event_rx) = std::sync::mpsc::channel();
         let noop: &DeltaSink = &|_: &str| {};
 
         // Concurrently deliver a cancel for the FIRST elicitation (no human available).
         let deliver_thread = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(400));
             let m = maps_clone.lock().unwrap();
-            let elicitation_id = m.pending.keys().next().map(|s| s.clone());
+            let elicitation_id = m.pending.keys().next().cloned();
             drop(m);
             if let Some(id) = elicitation_id {
                 let mut m = maps_clone.lock().unwrap();
@@ -5873,6 +5902,8 @@ else:
         let mut prior_usage: Option<Usage> = Some(Usage {
             input_tokens: 999, // would be wrong if kept
             output_tokens: 888,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             cost_usd: Some(0.42),
         });
         let mut files: Vec<String> = Vec::new();
