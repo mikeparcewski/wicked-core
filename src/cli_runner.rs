@@ -1429,6 +1429,7 @@ fn run_cli_runner(
 /// in-process worker posts. Cursor advance is GATED on the actor's ack (a rendezvous sync_channel
 /// send): if the actor dies between dequeue and commit the ack never arrives, the cursor stays behind,
 /// and the event is redelivered on the next restart (T7-g). Exits when `stop` is set or the actor is gone.
+#[allow(clippy::too_many_arguments)]
 fn run_task_completed_poller(
     db: BusDb,
     floor_init: i64,
@@ -2476,12 +2477,11 @@ mod tests {
             let stop_a2 = stop_a.clone();
 
             let ack_thread = std::thread::spawn(move || {
-                if let Ok(cmd) = cmd_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                    if let Command::ApplyStepResult { ack, .. } = cmd {
-                        if let Some(ack_tx) = ack {
-                            let _ = ack_tx.send(());
-                        }
-                    }
+                if let Ok(Command::ApplyStepResult {
+                    ack: Some(ack_tx), ..
+                }) = cmd_rx.recv_timeout(std::time::Duration::from_secs(5))
+                {
+                    let _ = ack_tx.send(());
                 }
             });
 
@@ -2579,10 +2579,10 @@ mod tests {
             // Actor: receive command, DROP ack without sending (simulates actor crash), then stop consumer.
             let stop_b3 = stop_b.clone();
             let ack_drop_thread = std::thread::spawn(move || {
-                if let Ok(cmd) = cmd_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-                    if let Command::ApplyStepResult { ack, .. } = cmd {
-                        drop(ack); // drop without sending → ack_rx.recv() returns Err
-                    }
+                if let Ok(Command::ApplyStepResult { ack, .. }) =
+                    cmd_rx.recv_timeout(std::time::Duration::from_secs(5))
+                {
+                    drop(ack); // drop without sending → ack_rx.recv() returns Err
                 }
                 // Signal the consumer to stop so it doesn't loop indefinitely.
                 stop_b3.store(true, std::sync::atomic::Ordering::SeqCst);
