@@ -2662,7 +2662,9 @@ fn apply_step_result(
                 session: run_id.clone(),
                 ord,
                 attempt: output.attempt,
-                tools: output.tools.clone(),
+                // `output.tools` is not read after this — move it out rather than clone the vec
+                // (up to MAX_TOOLS_RETAINED short strings per attempt). Review nit, #239.
+                tools: std::mem::take(&mut output.tools),
             },
         );
     }

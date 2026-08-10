@@ -1182,6 +1182,16 @@ mod tests {
             "dataUsed",
             &["type", "session", "ord", "files"],
         );
+        check(
+            CoreEvent::ToolInvoked {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                tools: vec![s()],
+            },
+            "toolInvoked",
+            &["type", "session", "ord", "attempt", "tools"],
+        );
         // ── remaining variants ──
         check(
             CoreEvent::UnitDone {
