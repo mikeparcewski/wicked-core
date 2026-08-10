@@ -250,6 +250,18 @@ pub enum CoreEvent {
         ord: u32,
         files: Vec<String>,
     },
+    /// (FINDING-046) The tool NAMES a unit's CLI invoked this attempt (`tool_use.name` — Read/Bash/Edit/…),
+    /// emitted after the unit completes when ≥1 tool was seen. Before this, an operator watching the event
+    /// stream saw a unit burn hundreds of tool calls with nothing in the log naming even one — governed AND
+    /// ungoverned. Distinct from `DataUsed` (only file-touching tools show a path there; a Bash or a no-file
+    /// tool contributes a NAME here but no file). Absent for seats that report no tool activity (passthrough)
+    /// and for the ACP path today (its tool identity needs a separate frame parse — see `TurnResult.tools`).
+    ToolInvoked {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        tools: Vec<String>,
+    },
     /// A live PTY worker has produced NO output for `stalled_secs` while its turn is
     /// still open — it may be sitting at an interactive prompt the sentinel parser
     /// cannot answer. Emitted once per turn; the operator can inspect via the terminal
@@ -855,6 +867,15 @@ impl CoreEvent {
                 ord,
                 files,
             } => json!({ "type": "dataUsed", "session": session, "ord": ord, "files": files }),
+            // (FINDING-046) The tool names a unit's CLI invoked this attempt.
+            CoreEvent::ToolInvoked {
+                session,
+                ord,
+                attempt,
+                tools,
+            } => {
+                json!({ "type": "toolInvoked", "session": session, "ord": ord, "attempt": attempt, "tools": tools })
+            }
             CoreEvent::UnitDone { session, ord } => {
                 json!({ "type": "unitDone", "session": session, "ord": ord })
             }

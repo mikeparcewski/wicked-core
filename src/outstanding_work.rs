@@ -375,7 +375,7 @@ mod tests {
         // …and it must be on the SUCCESS arm. Waiting only on failure would look wired and do
         // nothing, because the defect only manifests when a unit claims success.
         let ok_arm = src
-            .split("Ok((0, out, _, usage, files))")
+            .split("Ok((0, out, _, usage, files, tools))")
             .nth(1)
             .expect("the exit-0 arm is still where a unit reports success");
         assert!(

@@ -225,6 +225,7 @@ impl StepRunner for DomainExtractionRunner {
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),
+                tools: Vec::new(),
                 governed: false,
             };
         }
@@ -276,6 +277,7 @@ impl StepRunner for DomainExtractionRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            tools: Vec::new(),
             governed: false,
         }
     }

@@ -84,6 +84,7 @@ impl StepRunner for OkRunner {
             status: StepStatus::Ok,
             usage: None,
             files: vec![],
+            tools: Vec::new(),
             governed: false,
         }
     }

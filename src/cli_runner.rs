@@ -193,6 +193,11 @@ struct CompletedTask {
     usage: Option<crate::workflow::Usage>,
     #[serde(default)]
     files: Vec<String>,
+    /// Tool NAMES the runner's adapter captured (FINDING-046) — rides the bus alongside usage/files
+    /// so the exec-mediated daemon path emits `ToolInvoked` identically to the in-process path.
+    /// `#[serde(default)]` keeps older payloads (no tools) parseable — absent ⇒ empty.
+    #[serde(default)]
+    tools: Vec<String>,
     /// Whether the off-actor runner armed input governance (wrote the armed marker) — carried so the
     /// actor-side fold applies evidence-integrity fail-closure identically for the bus delivery mode.
     #[serde(default)]
@@ -853,6 +858,7 @@ fn run_cli_runner(
                         .map(|(pass, reasoning)| AgentVerdictWire { pass, reasoning }),
                     usage: output.usage.clone(),
                     files: output.files.clone(),
+                    tools: output.tools.clone(),
                     governed: output.governed,
                 };
                 let payload = match serde_json::to_value(&completed) {
@@ -940,6 +946,7 @@ fn run_task_completed_poller(
                     status: status_from_str(&task.status),
                     usage: task.usage,
                     files: task.files,
+                    tools: task.tools,
                     governed: task.governed,
                 };
                 let agent_verdict = task.agent_verdict.map(|v| (v.pass, v.reasoning));
@@ -1259,6 +1266,7 @@ mod tests {
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
+                    tools: Vec::new(),
                     governed: false,
                 }
             }

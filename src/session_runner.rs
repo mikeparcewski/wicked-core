@@ -365,6 +365,10 @@ fn collect_turn(
     let mut output = String::new();
     let mut usage: Option<Usage> = None;
     let mut files: Vec<String> = Vec::new();
+    // Tool NAMES this session's CLI invoked (FINDING-046). Same capture as the wrapped path — this
+    // persistent-session path drives the same `ClaudeStreamJson` adapter, so per-tool observability
+    // must be symmetric or a governed unit that happens to run in a session would be blind.
+    let mut tools: Vec<String> = Vec::new();
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
     let deadline = Instant::now() + timeout;
@@ -421,6 +425,7 @@ fn collect_turn(
                     &mut output,
                     &mut usage,
                     &mut files,
+                    &mut tools,
                     MAX_OUT,
                 ) {
                     break (true, false);
@@ -441,11 +446,20 @@ fn collect_turn(
         &mut output,
         &mut usage,
         &mut files,
+        &mut tools,
         MAX_OUT,
     );
     // Adapter finish (both current adapters are stateless, but call for completeness).
     let fin = adapter.finish();
-    absorb(fin, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+    absorb(
+        fin,
+        emit,
+        &mut output,
+        &mut usage,
+        &mut files,
+        &mut tools,
+        MAX_OUT,
+    );
 
     StepOutput {
         run_id: input.run_id.clone(),
@@ -461,12 +475,14 @@ fn collect_turn(
         },
         usage,
         files,
+        tools,
         governed: false,
     }
 }
 
 /// Process all complete lines in `buf` through `adapter`. Returns `true` when a result sentinel
 /// line is found (turn complete). Partial trailing content stays in `buf` for the next chunk.
+#[allow(clippy::too_many_arguments)] // parallel accumulators (output/usage/files/tools) travel together
 fn drain_lines(
     buf: &mut String,
     adapter: &mut ClaudeStreamJson,
@@ -474,6 +490,7 @@ fn drain_lines(
     output: &mut String,
     usage: &mut Option<Usage>,
     files: &mut Vec<String>,
+    tools: &mut Vec<String>,
     max_out: usize,
 ) -> bool {
     let mut found = false;
@@ -489,7 +506,7 @@ fn drain_lines(
             found = true;
         }
         let ao = adapter.on_line(line);
-        absorb(ao, emit, output, usage, files, max_out);
+        absorb(ao, emit, output, usage, files, tools, max_out);
     }
     found
 }
@@ -501,6 +518,7 @@ fn absorb(
     output: &mut String,
     usage: &mut Option<Usage>,
     files: &mut Vec<String>,
+    tools: &mut Vec<String>,
     max_out: usize,
 ) {
     for t in ao.text {
@@ -514,6 +532,9 @@ fn absorb(
         *usage = ao.usage;
     }
     files.extend(ao.files);
+    // Capped like the wrapped path (FINDING-046 review): a looping CLI can emit unboundedly many
+    // `tool_use` blocks, so retain only up to the shared ceiling.
+    crate::execute_wrapped::retain_tools_capped(tools, ao.tools);
 }
 
 /// Quick sentinel check — is this line a `{"type":"result",...}` NDJSON row?
@@ -540,6 +561,7 @@ fn failed_output(input: &StepInput, msg: String) -> StepOutput {
         status: StepStatus::Failed,
         usage: None,
         files: Vec::new(),
+        tools: Vec::new(),
         governed: false,
     }
 }

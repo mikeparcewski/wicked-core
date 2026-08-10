@@ -156,6 +156,11 @@ pub struct StepOutput {
     pub usage: Option<Usage>,
     /// Data files the unit's CLI touched, from `tool_use` file paths (B4). Empty for passthrough seats.
     pub files: Vec<String>,
+    /// Tool NAMES the unit's CLI invoked (`tool_use.name` — Read/Bash/Edit/…), for per-tool
+    /// observability (FINDING-046): the actor emits `ToolInvoked` from these for governed AND
+    /// ungoverned units, closing the "N tool calls, zero events / operator blind" gap. Empty for
+    /// passthrough seats and non-tool runners.
+    pub tools: Vec<String>,
     /// Whether the RUNNER armed input governance for this unit (wrote the decisions-log armed marker). Set
     /// only by the wrapped-CLI runner when it injects the PreToolUse gate-hook; `false` for stub/test
     /// runners and ungoverned units. The actor-side fold uses THIS (not unit properties) to decide whether
@@ -240,6 +245,7 @@ impl StepRunner for StubStepRunner {
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
+            tools: Vec::new(),
             governed: false,
         }
     }
