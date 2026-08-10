@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::process::{Child, ChildStdin, Stdio};
+use std::process::{ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,12 +63,16 @@ pub struct KillHandle {
 impl KillHandle {
     /// Construct a no-op handle for tests (no child to kill).
     pub fn noop() -> Self {
-        Self { inner: Mutex::new(None) }
+        Self {
+            inner: Mutex::new(None),
+        }
     }
 
     /// Construct a handle that will kill `child` on `signal()`.
     pub fn new(child: std::process::Child) -> Self {
-        Self { inner: Mutex::new(Some(child)) }
+        Self {
+            inner: Mutex::new(Some(child)),
+        }
     }
 
     /// Kill and reap the child process. Idempotent: the first call kills; subsequent calls
@@ -91,7 +95,7 @@ pub type SessionHandles = (Arc<Mutex<()>>, Arc<KillHandle>);
 
 /// The write-lock session registry.
 ///
-/// Key: `(run_id, session_key, session_gen)` — session_gen prevents a torn eviction when
+/// Key: `(run_id, session_key, launch_seq)` — the launch token prevents a torn eviction when
 /// a replacement session has the same `(run_id, cli_key)` pair as the one being evicted.
 /// Value: `(write_lock, kill_handle)` — `shared_run_terminal` uses these to serialise
 /// teardown with in-flight writes and to signal the child process.
@@ -116,6 +120,9 @@ pub struct ElicitationResult {
 struct ElicitationEntry {
     run_id: String,
     epoch: u64,
+    /// Filtered options shown to the operator. Retained so `deliver` can reject a
+    /// stale or forged selection without consuming the pending elicitation.
+    options: Option<Vec<String>>,
     /// Rendezvous channel to `exec_turn_acp`'s dual-poll loop. `SyncSender<_>` with
     /// capacity 1 so the actor never blocks on send (I-8: no Tokio runtime in wicked-core).
     tx: std::sync::mpsc::SyncSender<ElicitationResult>,
@@ -134,9 +141,6 @@ struct ElicitationEntry {
 /// Several fields coordinate the actor with the off-actor CLI bus consumer
 /// (T7 / `cli_runner.rs`):
 ///
-/// - `bus_dispatched_runs`: the actor-side set of run-ids that have been sent to
-///   the bus. The bus consumer checks this before publishing `task.dispatched`
-///   events to avoid a double-dispatch.
 /// - `bus_in_flight_workers`: `HashSet<(run_id, launch_seq)>` — one entry per
 ///   live bus-dispatched worker. Tracked independently so a reassigned run
 ///   (two workers alive simultaneously) doesn't lose the older entry.
@@ -149,9 +153,10 @@ pub struct ElicitationMaps {
     pending: HashMap<String, ElicitationEntry>,
     /// `run_id → [(elicitation_id, epoch)]` for bulk cancel/cleanup.
     run_index: HashMap<String, Vec<(String, u64)>>,
-    /// Count of workers (`exec_turn_acp` invocations) currently alive. Used by
-    /// `EpochCleanup` to know when the last worker exits (shutdown drain).
-    active_workers: u32,
+    /// Exact `(run_id, launch_seq)` tokens for ACP workers currently alive. Exact
+    /// tokens make completion-publication retries idempotent and keep concurrent
+    /// reassignments independent.
+    active_workers: HashSet<(String, u64)>,
     /// `(run_id, epoch)` pairs marked as cancelled; `register` checks this before
     /// adding to `pending` (creation suppression for late-arriving registrations).
     cancelled_epochs: Vec<(String, u64)>,
@@ -159,8 +164,6 @@ pub struct ElicitationMaps {
     /// `exec_turn_acp` creation-announcement guard checks this so a retry does not
     /// re-emit the event.
     suppressed_creations: HashSet<String>,
-    /// Run ids that have been dispatched to the bus (actor → bus-publisher path).
-    bus_dispatched_runs: HashSet<String>,
     /// `(run_id, launch_seq)` for every live bus-dispatched worker (see module doc).
     bus_in_flight_workers: HashSet<(String, u64)>,
     /// `run_id → highest launch_seq` that reached the ack-gated cursor-advance
@@ -195,10 +198,9 @@ impl ElicitationMaps {
         Self {
             pending: HashMap::new(),
             run_index: HashMap::new(),
-            active_workers: 0,
+            active_workers: HashSet::new(),
             cancelled_epochs: Vec::new(),
             suppressed_creations: HashSet::new(),
-            bus_dispatched_runs: HashSet::new(),
             bus_in_flight_workers: HashSet::new(),
             bus_activated_seqs: HashMap::new(),
             run_launch_seq: HashMap::new(),
@@ -227,9 +229,18 @@ impl ElicitationMaps {
         message: &str,
         options: Option<Vec<String>>,
         prop_key: &str,
-    ) -> Option<(std::sync::mpsc::Receiver<ElicitationResult>, String, Option<Vec<String>>, String)> {
+    ) -> Option<(
+        std::sync::mpsc::Receiver<ElicitationResult>,
+        String,
+        Option<Vec<String>>,
+        String,
+    )> {
         // Creation-suppression guard: if the epoch was already cancelled, refuse.
-        if self.cancelled_epochs.iter().any(|(r, e)| r == run_id && *e == epoch) {
+        if self
+            .cancelled_epochs
+            .iter()
+            .any(|(r, e)| r == run_id && *e == epoch)
+        {
             return None;
         }
 
@@ -273,6 +284,7 @@ impl ElicitationMaps {
         let entry = ElicitationEntry {
             run_id: run_id.to_string(),
             epoch,
+            options: options.clone(),
             tx,
         };
         self.pending.insert(elicitation_id.to_string(), entry);
@@ -289,8 +301,12 @@ impl ElicitationMaps {
     /// immediately when a terminal path fires. Idempotent: a missing id is a no-op.
     pub fn remove(&mut self, run_id: &str, elicitation_id: &str) {
         self.pending.remove(elicitation_id);
+        self.creation_announced.remove(elicitation_id);
         if let Some(v) = self.run_index.get_mut(run_id) {
             v.retain(|(id, _)| id != elicitation_id);
+            if v.is_empty() {
+                self.run_index.remove(run_id);
+            }
         }
     }
 
@@ -299,7 +315,7 @@ impl ElicitationMaps {
     /// Returns `Err` if `elicitation_id` is unknown or the `run_id` does not match
     /// the registered entry (cross-run delivery guard).
     pub fn deliver(
-        &self,
+        &mut self,
         run_id: &str,
         elicitation_id: &str,
         action: String,
@@ -317,8 +333,59 @@ impl ElicitationMaps {
                 run_id
             );
         }
-        let _ = entry.tx.send(ElicitationResult { action, response });
-        Ok(())
+        if !matches!(action.as_str(), "accept" | "decline" | "cancel") {
+            anyhow::bail!(
+                "elicitation {} has invalid action {:?}; expected accept, decline, or cancel",
+                elicitation_id,
+                action
+            );
+        }
+        if action == "accept" {
+            let value = response
+                .as_ref()
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "elicitation {} requires a string response for action=accept",
+                        elicitation_id
+                    )
+                })?;
+            const FREE_TEXT_CAP: usize = 64 * 1024;
+            match &entry.options {
+                Some(options) if !options.iter().any(|option| option == value) => {
+                    anyhow::bail!(
+                        "elicitation {} response is not one of the allowed options",
+                        elicitation_id
+                    );
+                }
+                None if value.len() > FREE_TEXT_CAP => {
+                    anyhow::bail!(
+                        "elicitation {} response exceeds {} bytes",
+                        elicitation_id,
+                        FREE_TEXT_CAP
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Remove before sending. This makes a second resolution fail immediately instead
+        // of blocking the single actor thread on an already-full sync channel.
+        let entry = self
+            .pending
+            .remove(elicitation_id)
+            .ok_or_else(|| anyhow::anyhow!("elicitation already resolved: {}", elicitation_id))?;
+        if let Some(entries) = self.run_index.get_mut(run_id) {
+            entries.retain(|(id, _)| id != elicitation_id);
+            if entries.is_empty() {
+                self.run_index.remove(run_id);
+            }
+        }
+        self.creation_announced.remove(elicitation_id);
+        entry
+            .tx
+            .send(ElicitationResult { action, response })
+            .map_err(|_| anyhow::anyhow!("elicitation worker exited before receiving the response"))
     }
 
     /// Cancel all pending elicitations for `(run_id, epoch)`.
@@ -327,7 +394,11 @@ impl ElicitationMaps {
     /// `action:"cancel"` on every matching entry's channel. Idempotent.
     pub fn cancel_epoch(&mut self, run_id: &str, epoch: u64) {
         // Record for creation-suppression guard.
-        if !self.cancelled_epochs.iter().any(|(r, e)| r == run_id && *e == epoch) {
+        if !self
+            .cancelled_epochs
+            .iter()
+            .any(|(r, e)| r == run_id && *e == epoch)
+        {
             self.cancelled_epochs.push((run_id.to_string(), epoch));
         }
         // Cancel all in-flight elicitations for this (run, epoch).
@@ -337,12 +408,23 @@ impl ElicitationMaps {
             .filter(|(_, e)| e.run_id == run_id && e.epoch == epoch)
             .map(|(id, _)| id.clone())
             .collect();
-        for id in ids_to_cancel {
-            if let Some(entry) = self.pending.get(&id) {
+        for id in &ids_to_cancel {
+            if let Some(entry) = self.pending.remove(id) {
                 let _ = entry.tx.send(ElicitationResult {
                     action: "cancel".to_string(),
                     response: None,
                 });
+            }
+            if !self.creation_announced.remove(id) {
+                self.suppressed_creations.insert(id.clone());
+            }
+        }
+        if let Some(entries) = self.run_index.get_mut(run_id) {
+            entries.retain(|(id, entry_epoch)| {
+                *entry_epoch != epoch || !ids_to_cancel.iter().any(|cancelled| cancelled == id)
+            });
+            if entries.is_empty() {
+                self.run_index.remove(run_id);
             }
         }
     }
@@ -352,30 +434,32 @@ impl ElicitationMaps {
     /// Returns the new monotonically-increasing `launch_seq` for this dispatch.
     /// Zero is reserved as a sentinel (`try_next_epoch_bus` unconditionally rejects 0).
     ///
-    /// `_is_bus_dispatch` is accepted for call-site clarity (the bus path always passes
-    /// `false`; the bus marker is set separately by `mark_bus_dispatch` after successful
-    /// publication). It has no effect on the counter.
+    /// `tracks_elicitation_worker` records the exact launch token for ACP units;
+    /// non-ACP launches still receive a sequence but do not participate in epoch cleanup.
     ///
     /// Does NOT clear `bus_in_flight_workers` — each worker manages its own
     /// `(run_id, launch_seq)` entry independently (re-assignment invariant).
-    pub fn begin_launch(&mut self, run_id: &str, _is_bus_dispatch: bool) -> u64 {
-        self.active_workers += 1;
-        self.advance_launch_seq(run_id)
-    }
-
-    /// Record that a run has been dispatched to the bus (actor → bus-publisher path).
-    pub fn mark_bus_dispatch(&mut self, run_id: &str) {
-        self.bus_dispatched_runs.insert(run_id.to_string());
+    pub fn begin_launch(&mut self, run_id: &str, tracks_elicitation_worker: bool) -> u64 {
+        let launch_seq = self.advance_launch_seq(run_id);
+        if tracks_elicitation_worker {
+            self.active_workers.insert((run_id.to_string(), launch_seq));
+        }
+        // A genuine new launch supersedes any terminal tombstone from an earlier attempt.
+        self.all_cancelled_runs.remove(run_id);
+        self.bus_activated_seqs.remove(run_id);
+        launch_seq
     }
 
     /// Record that a bus-dispatched worker for `(run_id, launch_seq)` is now in-flight.
     pub fn mark_bus_in_flight(&mut self, run_id: &str, launch_seq: u64) {
-        self.bus_in_flight_workers.insert((run_id.to_string(), launch_seq));
+        self.bus_in_flight_workers
+            .insert((run_id.to_string(), launch_seq));
     }
 
     /// Check whether a specific `(run_id, launch_seq)` worker is still in-flight.
     pub fn is_bus_worker_in_flight(&self, run_id: &str, launch_seq: u64) -> bool {
-        self.bus_in_flight_workers.contains(&(run_id.to_string(), launch_seq))
+        self.bus_in_flight_workers
+            .contains(&(run_id.to_string(), launch_seq))
     }
 
     /// Remove the in-flight marker for `(run_id, launch_seq)`.
@@ -384,7 +468,17 @@ impl ElicitationMaps {
     /// committed `ApplyStepResult` (normal completion), or immediately by
     /// `EpochCleanup::drop` on panic/cancel.
     pub fn clear_bus_in_flight(&mut self, run_id: &str, launch_seq: u64) {
-        self.bus_in_flight_workers.remove(&(run_id.to_string(), launch_seq));
+        self.bus_in_flight_workers
+            .remove(&(run_id.to_string(), launch_seq));
+    }
+
+    /// Roll back activation after `task.completed` publication fails. The dispatch cursor
+    /// is intentionally left behind, so the next poll may execute this task again.
+    pub fn reset_bus_activation(&mut self, run_id: &str, launch_seq: u64) {
+        self.clear_bus_in_flight(run_id, launch_seq);
+        if self.bus_activated_seqs.get(run_id) == Some(&launch_seq) {
+            self.bus_activated_seqs.remove(run_id);
+        }
     }
 
     /// Returns `true` if ANY bus-dispatched worker is still in-flight (across all runs).
@@ -425,7 +519,9 @@ impl ElicitationMaps {
     /// Returns `true` if the specific `(run_id, launch_seq)` has crossed the ack-gated
     /// activation path (i.e. `bus_activated_seqs[run_id] >= launch_seq`).
     pub fn has_activated_seq(&self, run_id: &str, launch_seq: u64) -> bool {
-        self.bus_activated_seqs.get(run_id).is_some_and(|&s| s >= launch_seq)
+        self.bus_activated_seqs
+            .get(run_id)
+            .is_some_and(|&s| s >= launch_seq)
     }
 
     /// Set the shutdown flag. Workers poll this and exit early.
@@ -451,10 +547,13 @@ impl ElicitationMaps {
     /// Does NOT clear `bus_in_flight_workers` — the `bus_in_flight_deferred` flag
     /// on `EpochCleanup` decides that; on panic/cancel it's cleared before this call;
     /// on normal bus completion the bus consumer clears it after the cursor advance.
-    pub fn cleanup_run(&mut self, run_id: &str, epoch: u64, _launch_seq: u64) {
-        if self.active_workers > 0 {
-            self.active_workers -= 1;
-        }
+    pub fn cleanup_run(&mut self, run_id: &str, epoch: u64, launch_seq: u64) {
+        self.active_workers
+            .remove(&(run_id.to_string(), launch_seq));
+        let last_worker_for_run = !self
+            .active_workers
+            .iter()
+            .any(|(active_run, _)| active_run == run_id);
         // Remove all pending registrations for this (run_id, epoch).
         if let Some(ids) = self.run_index.get(run_id) {
             let to_remove: Vec<String> = ids
@@ -473,11 +572,13 @@ impl ElicitationMaps {
             }
         }
         // Prune the cancelled_epochs list for this (run_id, epoch).
-        self.cancelled_epochs.retain(|(r, e)| !(r == run_id && *e == epoch));
+        self.cancelled_epochs
+            .retain(|(r, e)| !(r == run_id && *e == epoch));
         // When no workers remain for this run, remove the run_epoch entry so
         // `has_active_run` returns false (prevents stale tombstones on reuse).
-        if self.active_workers == 0 {
+        if last_worker_for_run {
             self.run_epoch.remove(run_id);
+            self.cancelled_epochs.retain(|(r, _)| r != run_id);
         }
     }
 
@@ -500,7 +601,9 @@ impl ElicitationMaps {
 
     /// Returns `true` if `(run_id, epoch)` was tombstoned via `cancel_epoch`.
     pub fn is_epoch_cancelled(&self, run_id: &str, epoch: u64) -> bool {
-        self.cancelled_epochs.iter().any(|(r, e)| r == run_id && *e == epoch)
+        self.cancelled_epochs
+            .iter()
+            .any(|(r, e)| r == run_id && *e == epoch)
     }
 
     /// Return all run-ids that currently have an active epoch (epoch ≥ 1).
@@ -542,14 +645,14 @@ impl ElicitationMaps {
     /// before the tombstone is removed.
     pub fn retire_launch_state(&mut self, run_id: &str) {
         self.all_cancelled_runs.remove(run_id);
-        self.bus_dispatched_runs.remove(run_id);
     }
 
     /// Mark the paired `ElicitationResolved` for `elicitation_id` as suppressed.
     /// Called when `ElicitationCreated` was suppressed so subscribers never see
     /// a resolved event for an elicitation they never observed.
     pub fn mark_resolution_suppressed(&mut self, elicitation_id: &str) {
-        self.suppressed_resolutions.insert(elicitation_id.to_string());
+        self.suppressed_resolutions
+            .insert(elicitation_id.to_string());
     }
 
     /// Mark `elicitation_id` as announced (its `ElicitationCreated` event was fanned out).
@@ -581,7 +684,12 @@ impl ElicitationMaps {
     /// - `launch_seq < current_launch_seq(run_id)` (stale; superseded by reassign)
     ///
     /// On success, marks `(run_id, launch_seq)` as bus-in-flight.
-    pub fn try_next_epoch_bus(&mut self, run_id: &str, launch_seq: u64, is_acp: bool) -> Option<u64> {
+    pub fn try_next_epoch_bus(
+        &mut self,
+        run_id: &str,
+        launch_seq: u64,
+        is_acp: bool,
+    ) -> Option<u64> {
         // Unconditionally reject the sentinel / malformed case.
         if launch_seq == 0 {
             return None;
@@ -596,12 +704,19 @@ impl ElicitationMaps {
             return None;
         }
         // Record activation — highest seq seen for this run.
-        let entry = self.bus_activated_seqs.entry(run_id.to_string()).or_insert(0);
+        let entry = self
+            .bus_activated_seqs
+            .entry(run_id.to_string())
+            .or_insert(0);
         *entry = (*entry).max(launch_seq);
         // Mark as in-flight so the degraded-mode path can detect a lost confirm.
-        self.bus_in_flight_workers.insert((run_id.to_string(), launch_seq));
+        self.bus_in_flight_workers
+            .insert((run_id.to_string(), launch_seq));
 
         if is_acp {
+            // The actor inserted this pair before the first execution. A retry after a
+            // transient completion-publication failure re-inserts the same pair here.
+            self.active_workers.insert((run_id.to_string(), launch_seq));
             Some(self.next_epoch(run_id))
         } else {
             Some(0)
@@ -665,12 +780,14 @@ impl Drop for EpochCleanup {
         }
         // Step 2: emit ElicitationResolved if a resolution is pending.
         if let Some(ref id) = self.in_flight_id {
-            let _ = self.tx.send(Command::EmitEvent(crate::event::CoreEvent::ElicitationResolved {
-                session: self.run_id.clone(),
-                elicitation_id: id.clone(),
-                action: self.in_flight_action.clone().unwrap_or_default(),
-                reason: self.in_flight_reason.clone().unwrap_or_default(),
-            }));
+            let _ = self.tx.send(Command::EmitEvent(
+                crate::event::CoreEvent::ElicitationResolved {
+                    session: self.run_id.clone(),
+                    elicitation_id: id.clone(),
+                    action: self.in_flight_action.clone().unwrap_or_default(),
+                    reason: self.in_flight_reason.clone().unwrap_or_default(),
+                },
+            ));
         }
         // Step 3: call cleanup_run — the one and only call site.
         if let Ok(mut m) = self.maps.lock() {
@@ -682,7 +799,10 @@ impl Drop for EpochCleanup {
 // ── ACP child process ─────────────────────────────────────────────────────────
 
 struct AcpProcess {
-    child: Child,
+    /// Shared with the actor's teardown registry so cancellation can interrupt a
+    /// turn that is blocked waiting for ordinary ACP output (not only elicitation).
+    kill_handle: Arc<KillHandle>,
+    write_lock: Arc<Mutex<()>>,
     stdin: BufWriter<ChildStdin>,
     /// Lines arriving from the ACP server's stdout, fed by the reader thread.
     /// Unbounded so the reader never blocks the child on a full pipe.
@@ -698,8 +818,7 @@ struct AcpProcess {
 
 impl Drop for AcpProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill_handle.signal();
     }
 }
 
@@ -1173,10 +1292,21 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     // Unbounded channel — the reader thread never blocks the child on a full buffer.
     let (tx, rx) = std::sync::mpsc::channel();
     let reader_thread = std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if !line.is_empty() && tx.send(line).is_err() {
-                break;
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_frame(&mut reader, FRAME_BYTE_CAP) {
+                Ok(FrameRead::Frame(line)) => {
+                    if !line.is_empty() && tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Ok(FrameRead::Oversized) => {
+                    tracing::warn!(
+                        frame_byte_cap = FRAME_BYTE_CAP,
+                        "dropping oversized ACP stdout frame"
+                    );
+                }
+                Ok(FrameRead::Eof) | Err(_) => break,
             }
         }
     });
@@ -1308,7 +1438,8 @@ fn start_acp_process(config: &AcpConfig, cwd: &std::path::Path) -> anyhow::Resul
     };
 
     Ok(AcpProcess {
-        child,
+        kill_handle: Arc::new(KillHandle::new(child)),
+        write_lock: Arc::new(Mutex::new(())),
         stdin,
         line_rx: rx,
         _reader: reader_thread,
@@ -1366,11 +1497,7 @@ fn rpc_send(
 /// number). The `id` field is echoed VERBATIM from the incoming request — NOT cast
 /// to u64 — so string-typed request ids (common in ACP adapters) round-trip
 /// correctly. `result` is the response payload.
-fn rpc_respond<W: Write>(
-    writer: &mut W,
-    request_id: &Value,
-    result: Value,
-) -> anyhow::Result<()> {
+fn rpc_respond<W: Write>(writer: &mut W, request_id: &Value, result: Value) -> anyhow::Result<()> {
     // Guard: a null id is a JSON-RPC notification, never a request — do not respond.
     if request_id.is_null() {
         return Ok(());
@@ -1405,6 +1532,59 @@ const ELICITATION_POLL_MS: u64 = 50;
 /// Cap on bytes read from a single stdout frame. Prevents a runaway adapter from
 /// growing the output buffer beyond MAX_OUT * 7 (56 MB).
 const FRAME_BYTE_CAP: usize = 8 * 1024 * 1024 * 7;
+
+enum FrameRead {
+    Frame(String),
+    Oversized,
+    Eof,
+}
+
+/// Read one newline-delimited frame without ever allocating beyond `cap` bytes.
+/// Oversized frames are drained through their newline and reported to the caller so
+/// the following well-formed frame remains parseable.
+fn read_bounded_frame<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<FrameRead> {
+    let mut bytes = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if bytes.is_empty() && !oversized {
+                Ok(FrameRead::Eof)
+            } else if oversized {
+                Ok(FrameRead::Oversized)
+            } else {
+                Ok(FrameRead::Frame(
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                ))
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        let payload_len = newline.unwrap_or(available.len());
+        if !oversized {
+            if bytes.len().saturating_add(payload_len) > cap {
+                oversized = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&available[..payload_len]);
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            if oversized {
+                return Ok(FrameRead::Oversized);
+            }
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return Ok(FrameRead::Frame(
+                String::from_utf8_lossy(&bytes).into_owned(),
+            ));
+        }
+    }
+}
 
 /// Wait for the JSON-RPC response whose `"id"` matches `id`, skipping both
 /// notifications and non-JSON startup banners/logs. Returns `Err` on timeout,
@@ -1555,8 +1735,7 @@ fn exec_turn_acp(
 
     // Elicitation is gated on a non-zero epoch AND on the adapter being in the verified
     // allow-list (OQ-R-6). Chat turns always pass epoch=0 and are never suspended.
-    let elicitation_enabled =
-        epoch > 0 && ELICITATION_VERIFIED_ADAPTERS.contains(&adapter_key);
+    let elicitation_enabled = epoch > 0 && ELICITATION_VERIFIED_ADAPTERS.contains(&adapter_key);
 
     // Build the prompt block array: a contract header, the prior outputs, then the work prompt.
     let mut blocks: Vec<Value> = Vec::new();
@@ -1607,6 +1786,9 @@ prior output you are reviewing, testing, or revising."
     // Set when the turn is suspended on elicitation and the suspend deadline expires without a
     // human response.
     let mut elicitation_timed_out = false;
+    // A human or teardown cancellation is terminal for the unit. `decline` is not:
+    // the adapter may continue the turn after being told it cannot obtain the value.
+    let mut elicitation_cancelled = false;
     // Set when stdin closes mid-turn (write_failed during `rpc_respond` inside `'elicit`).
     let mut write_failed_terminal = false;
     // Set when `line_rx` disconnects inside the `'elicit` poll loop (adapter died mid-suspend).
@@ -1635,7 +1817,8 @@ prior output you are reviewing, testing, or revising."
 
                     // Guard 1: elicitation disabled for this epoch/adapter → immediate cancel.
                     if !elicitation_enabled {
-                        let _ = rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                        let _ =
+                            rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
                         continue 'exec;
                     }
 
@@ -1643,7 +1826,11 @@ prior output you are reviewing, testing, or revising."
                     let (prop_name, prop_type) = match validate_elicitation_schema(schema) {
                         Some(v) => v,
                         None => {
-                            let _ = rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                            let _ = rpc_respond(
+                                &mut proc.stdin,
+                                &request_id,
+                                json!({"action":"cancel"}),
+                            );
                             continue 'exec;
                         }
                     };
@@ -1651,7 +1838,11 @@ prior output you are reviewing, testing, or revising."
                     // Extract enum options from the property schema if present.
                     let options = schema["properties"][&prop_name]["enum"]
                         .as_array()
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>());
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_string))
+                                .collect::<Vec<_>>()
+                        });
 
                     // Mint a unique elicitation id and register in the maps.
                     let elicitation_id = uuid::Uuid::new_v4().to_string();
@@ -1663,20 +1854,26 @@ prior output you are reviewing, testing, or revising."
                         Some(r) => r,
                         None => {
                             // Epoch was cancelled (suppressed creation) — cancel and continue.
-                            let _ = rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                            let _ = rpc_respond(
+                                &mut proc.stdin,
+                                &request_id,
+                                json!({"action":"cancel"}),
+                            );
                             continue 'exec;
                         }
                     };
 
                     // Announce the elicitation so the UI can show the question.
-                    let _ = tx.send(Command::EmitEvent(crate::event::CoreEvent::ElicitationCreated {
-                        session: run_id.to_string(),
-                        epoch,
-                        elicitation_id: elicitation_id.clone(),
-                        message: capped_msg,
-                        options: filtered_opts,
-                        prop_type,
-                    }));
+                    let _ = tx.send(Command::EmitEvent(
+                        crate::event::CoreEvent::ElicitationCreated {
+                            session: run_id.to_string(),
+                            epoch,
+                            elicitation_id: elicitation_id.clone(),
+                            message: capped_msg,
+                            options: filtered_opts,
+                            prop_type,
+                        },
+                    ));
 
                     // ── 'elicit: dual-poll loop ────────────────────────────────────────
                     // Keep draining stdout (prevents buffer full / deadlock) while also
@@ -1723,23 +1920,42 @@ prior output you are reviewing, testing, or revising."
                             Ok(result) => {
                                 // Remove from maps before responding.
                                 {
-                                    let mut m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                    let mut m =
+                                        elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
                                     m.remove(run_id, &elicitation_id);
                                 }
-                                elicit_action = result.action.clone();
-                                let response_payload = if result.action == "submit" {
-                                    if let Some(resp_val) = result.response {
-                                        json!({"action":"submit","values":{&prop_key: resp_val}})
-                                    } else {
-                                        // Malformed submit — treat as cancel.
-                                        elicit_action = "cancel".to_string();
-                                        json!({"action":"cancel"})
-                                    }
-                                } else {
-                                    json!({"action":"cancel"})
+                                let epoch_cancelled = {
+                                    let m =
+                                        elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                    m.is_epoch_cancelled(run_id, epoch)
                                 };
-                                elicit_reason = "human".to_string();
-                                if rpc_respond(&mut proc.stdin, &request_id, response_payload).is_err() {
+                                elicit_action = if epoch_cancelled {
+                                    "cancel".to_string()
+                                } else {
+                                    result.action.clone()
+                                };
+                                let response_payload = match elicit_action.as_str() {
+                                    "accept" => match result.response {
+                                        Some(resp_val) => {
+                                            json!({"action":"accept","content":{&prop_key: resp_val}})
+                                        }
+                                        None => {
+                                            elicit_action = "cancel".to_string();
+                                            json!({"action":"cancel"})
+                                        }
+                                    },
+                                    "decline" => json!({"action":"decline"}),
+                                    _ => json!({"action":"cancel"}),
+                                };
+                                elicitation_cancelled = elicit_action == "cancel";
+                                elicit_reason = if epoch_cancelled {
+                                    "teardown".to_string()
+                                } else {
+                                    "human".to_string()
+                                };
+                                if rpc_respond(&mut proc.stdin, &request_id, response_payload)
+                                    .is_err()
+                                {
                                     write_failed_terminal = true;
                                     // Phase 3 post-write tombstone gate (test 36):
                                     // If the epoch was deliberately cancelled (teardown) before
@@ -1747,7 +1963,9 @@ prior output you are reviewing, testing, or revising."
                                     // "adapter_write_failure". The latter is reserved for
                                     // unexpected transport failures on non-cancelled epochs.
                                     let was_cancelled = {
-                                        let m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                        let m = elicitation_maps
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
                                         m.is_epoch_cancelled(run_id, epoch)
                                     };
                                     elicit_reason = if was_cancelled {
@@ -1774,7 +1992,10 @@ prior output you are reviewing, testing, or revising."
                         }
 
                         // Poll stdout with a short timeout to drain the pipe.
-                        match proc.line_rx.recv_timeout(Duration::from_millis(ELICITATION_POLL_MS)) {
+                        match proc
+                            .line_rx
+                            .recv_timeout(Duration::from_millis(ELICITATION_POLL_MS))
+                        {
                             Ok(inner_line) => {
                                 let v2: Value = match serde_json::from_str(&inner_line) {
                                     Ok(v) => v,
@@ -1782,7 +2003,9 @@ prior output you are reviewing, testing, or revising."
                                 };
 
                                 // Second elicitation/create during suspension → immediately cancel.
-                                if v2.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                                if v2.get("method").and_then(Value::as_str)
+                                    == Some("elicitation/create")
+                                {
                                     let nested_id = v2.get("id").cloned().unwrap_or(Value::Null);
                                     let _ = rpc_respond(
                                         &mut proc.stdin,
@@ -1797,20 +2020,25 @@ prior output you are reviewing, testing, or revising."
                                 if v2.get("id").and_then(Value::as_u64) == Some(id) {
                                     // Remove from maps if still registered (edge: result raced resolution).
                                     {
-                                        let mut m = elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+                                        let mut m = elicitation_maps
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
                                         m.remove(run_id, &elicitation_id);
                                     }
                                     elicit_reason = "session_prompt".to_string();
                                     if v2.get("error").is_some() {
                                         break 'elicit;
                                     }
-                                    let stop = v2["result"]["stopReason"].as_str().unwrap_or("end_turn");
+                                    let stop =
+                                        v2["result"]["stopReason"].as_str().unwrap_or("end_turn");
                                     if stop == "cancelled" {
                                         timed_out = true;
                                     } else {
                                         found = true;
                                     }
-                                    if let Some(result_usage) = parse_result_usage(&v2["result"]["usage"]) {
+                                    if let Some(result_usage) =
+                                        parse_result_usage(&v2["result"]["usage"])
+                                    {
                                         let cost = usage.as_ref().and_then(|u| u.cost_usd);
                                         usage = Some(Usage {
                                             cost_usd: cost.or(result_usage.cost_usd),
@@ -1821,8 +2049,17 @@ prior output you are reviewing, testing, or revising."
                                 }
 
                                 // session/update during elicitation → handle normally.
-                                if v2.get("method").and_then(Value::as_str) == Some("session/update") {
-                                    handle_update(&v2, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+                                if v2.get("method").and_then(Value::as_str)
+                                    == Some("session/update")
+                                {
+                                    handle_update(
+                                        &v2,
+                                        emit,
+                                        &mut output,
+                                        &mut usage,
+                                        &mut files,
+                                        MAX_OUT,
+                                    );
                                 }
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'elicit,
@@ -1837,16 +2074,24 @@ prior output you are reviewing, testing, or revising."
 
                     // Emit the resolution event now that 'elicit has exited with a reason.
                     if !elicit_reason.is_empty() {
-                        let _ = tx.send(Command::EmitEvent(crate::event::CoreEvent::ElicitationResolved {
-                            session: run_id.to_string(),
-                            elicitation_id: elicitation_id.clone(),
-                            action: elicit_action.clone(),
-                            reason: elicit_reason.clone(),
-                        }));
+                        let _ = tx.send(Command::EmitEvent(
+                            crate::event::CoreEvent::ElicitationResolved {
+                                session: run_id.to_string(),
+                                elicitation_id: elicitation_id.clone(),
+                                action: elicit_action.clone(),
+                                reason: elicit_reason.clone(),
+                            },
+                        ));
                     }
 
                     // After 'elicit: decide whether the outer loop should keep going.
-                    if found || timed_out || dead_session || elicitation_timed_out || write_failed_terminal {
+                    if found
+                        || timed_out
+                        || dead_session
+                        || elicitation_timed_out
+                        || elicitation_cancelled
+                        || write_failed_terminal
+                    {
                         break 'exec;
                     }
                     // Otherwise: normal elicitation resolution (adapter continues) → keep looping.
@@ -1921,7 +2166,13 @@ prior output you are reviewing, testing, or revising."
     // No `stopReason` and no timeout means the bridge stopped answering — it died mid-turn. Its
     // stderr is the only account of why, and `StepOutput.output` is where an operator looks, so
     // say it there rather than reporting a Failed unit with an empty reason.
-    if !found && !timed_out && !elicitation_timed_out && !dead_session && !write_failed_terminal {
+    if !found
+        && !timed_out
+        && !elicitation_timed_out
+        && !elicitation_cancelled
+        && !dead_session
+        && !write_failed_terminal
+    {
         let note = format!(
             "\n[wicked-core] ACP turn ended with no stopReason (the bridge stopped answering){}",
             stderr_context(&proc.stderr_tail)
@@ -1933,7 +2184,11 @@ prior output you are reviewing, testing, or revising."
         output: output.trim_end().to_string(),
         status: if found {
             StepStatus::Ok
-        } else if elicitation_timed_out || dead_session || write_failed_terminal {
+        } else if elicitation_timed_out
+            || elicitation_cancelled
+            || dead_session
+            || write_failed_terminal
+        {
             // Elicitation-terminal paths: not retriable, bypass FailureTriageReady (spec I-7).
             StepStatus::ElicitationFailed
         } else if timed_out {
@@ -2247,13 +2502,8 @@ pub struct AcpStepRunner {
     /// Shared elicitation coordination state (DES-002). One Arc per Core instance; also held
     /// by the actor for `Command::ResolveElicitation` dispatch.
     pub elicitation_maps: Arc<Mutex<ElicitationMaps>>,
-    /// Per-run process-generation tokens. A new uuid is minted when a run starts; threaded
-    /// through `StepInput.process_gen` so bus consumers can discard completions from a prior
-    /// daemon restart (stale-result guard).
-    #[allow(dead_code)]
-    session_gen: HashMap<String, uuid::Uuid>,
     /// Write-lock session registry shared with the actor.
-    /// Key: `(run_id, session_key, session_gen)`. Value: `(write_lock, kill_handle)`.
+    /// Key: `(run_id, session_key, launch_seq)`. Value: `(write_lock, kill_handle)`.
     /// Created in `spawn_with_acp_sessions`; PTY and injected runners hold an empty registry.
     pub write_reg: WriteReg,
 }
@@ -2322,7 +2572,6 @@ impl AcpStepRunner {
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs(secs),
             elicitation_maps,
-            session_gen: HashMap::new(),
             write_reg,
         }
     }
@@ -2689,18 +2938,16 @@ impl AcpStepRunner {
     pub fn drop_session(&self, run_id: &str) {
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         guard.retain(|(rid, _), _| rid != run_id);
+        drop(guard);
+        self.write_reg
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(rid, _, _), _| rid != run_id);
         let mut injects = self
             .pending_injects
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         injects.remove(run_id);
-    }
-
-    /// Retire the process-generation token for a run. Called when a run ends so the
-    /// gen-id slot is freed (avoids unbounded growth for long-lived daemons).
-    #[allow(dead_code)]
-    pub fn drop_session_gen(&mut self, run_id: &str) {
-        self.session_gen.remove(run_id);
     }
 
     /// Drain queued operator messages matching `(run_id, cli_key)` — `All`-targeted and
@@ -2745,6 +2992,38 @@ impl AcpStepRunner {
     }
 
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
+        // The actor allocates one epoch for every ACP unit before it leaves the actor
+        // thread. Keep the cleanup guard outside the implementation so every return path
+        // (including wrapped fallback and a panic) releases that epoch exactly once.
+        let mut epoch_guard = (input.elicitation_epoch > 0).then(|| EpochCleanup {
+            maps: Arc::clone(&self.elicitation_maps),
+            run_id: input.run_id.clone(),
+            epoch: input.elicitation_epoch,
+            launch_seq: input.launch_seq,
+            bus_in_flight_deferred: false,
+            tx: self.tx.clone(),
+            in_flight_id: None,
+            in_flight_action: None,
+            in_flight_reason: None,
+        });
+
+        let output = self.exec_turn_inner(input, emit);
+
+        // On a normal bus-worker return, publication owns the in-flight marker until
+        // `task.completed` is durable. A panic never reaches this assignment, so Drop
+        // clears the marker and the degraded recovery path can terminalize the task.
+        if let Some(guard) = epoch_guard.as_mut() {
+            let maps = self
+                .elicitation_maps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            guard.bus_in_flight_deferred =
+                maps.is_bus_worker_in_flight(&input.run_id, input.launch_seq);
+        }
+        output
+    }
+
+    fn exec_turn_inner(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
         let cli_key = input
             .unit
@@ -2902,6 +3181,10 @@ impl AcpStepRunner {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
                         let arc = Arc::new(Mutex::new(proc));
+                        let session_handles = {
+                            let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+                            (Arc::clone(&proc.write_lock), Arc::clone(&proc.kill_handle))
+                        };
                         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                         use std::collections::hash_map::Entry;
                         let (result, did_insert) = match guard.entry(session_key.clone()) {
@@ -2909,10 +3192,26 @@ impl AcpStepRunner {
                                 let slot = v.insert(Some(arc.clone()));
                                 (slot.as_ref().unwrap().clone(), true)
                             }
-                            Entry::Occupied(o) => (o.into_mut().as_ref().unwrap().clone(), false),
+                            Entry::Occupied(mut o) => {
+                                let existing = o.get().as_ref().cloned();
+                                match existing {
+                                    Some(existing) => (existing, false),
+                                    None => {
+                                        o.insert(Some(Arc::clone(&arc)));
+                                        (arc.clone(), true)
+                                    }
+                                }
+                            }
                         };
                         drop(guard);
                         if did_insert {
+                            self.write_reg
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(
+                                    (run_id.clone(), cli_key.clone(), input.launch_seq),
+                                    session_handles,
+                                );
                             self.emit_event(CoreEvent::AcpSessionStarted {
                                 session: run_id.clone(),
                                 cli_key: cli_key.clone(),
@@ -2954,7 +3253,7 @@ impl AcpStepRunner {
                 decisions_path,
             }
         });
-        match exec_turn_acp(
+        let turn = exec_turn_acp(
             &mut proc,
             &prompt,
             prior_outputs,
@@ -2966,7 +3265,39 @@ impl AcpStepRunner {
             &cli_key,
             &self.tx,
             gate.as_ref(),
-        ) {
+        );
+        let superseded = {
+            let maps = self
+                .elicitation_maps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            maps.shutdown_flag()
+                || maps.is_epoch_cancelled(&run_id, input.elicitation_epoch)
+                || maps.current_launch_seq(&run_id) > input.launch_seq
+        };
+        if superseded {
+            let (output, usage, files) = match turn {
+                Ok(result) => (result.output, result.usage, result.files),
+                Err(error) => (
+                    format!("[wicked-core] superseded ACP turn stopped: {error}"),
+                    None,
+                    Vec::new(),
+                ),
+            };
+            drop(proc);
+            return StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output,
+                status: StepStatus::ElicitationFailed,
+                usage,
+                files,
+                governed: gate.is_some(),
+            };
+        }
+
+        match turn {
             Ok(result) if result.status == StepStatus::Ok => StepOutput {
                 run_id: input.run_id.clone(),
                 unit_ix: input.unit_ix,
@@ -3087,29 +3418,46 @@ impl StepRunner for AcpStepRunner {
     fn on_run_complete(&self, run_id: &str) {
         let sessions = self.sessions.clone();
         let pending_injects = self.pending_injects.clone();
+        let write_reg = self.write_reg.clone();
         let run_id = run_id.to_string();
         std::thread::spawn(move || {
             let mut guard = sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard.retain(|(rid, _), _| *rid != run_id);
             drop(guard);
+            write_reg
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .retain(|(rid, _, _), _| *rid != run_id);
             let mut injects = pending_injects.lock().unwrap_or_else(|p| p.into_inner());
             injects.remove(&run_id);
         });
     }
 
     /// Close a single ACP session for `(run_id, cli_key)` — called by `ReassignUnit` before
-    /// re-dispatching to a different CLI. Runs on a background thread (drop may block on kill/wait).
+    /// re-dispatching to a different CLI. Registry/session removal is synchronous so the
+    /// replacement cannot race with cleanup; kill/wait remains on a background thread.
     fn close_cli_session(&self, run_id: &str, cli_key: &str) {
-        let sessions = self.sessions.clone();
         let run_id = run_id.to_string();
         let cli_key = cli_key.to_string();
+        let kill_handles: Vec<Arc<KillHandle>> = {
+            let mut registry = self.write_reg.lock().unwrap_or_else(|p| p.into_inner());
+            let handles = registry
+                .iter()
+                .filter(|((rid, key, _), _)| rid == &run_id && key == &cli_key)
+                .map(|(_, (_, kill))| Arc::clone(kill))
+                .collect();
+            registry.retain(|(rid, key, _), _| rid != &run_id || key != &cli_key);
+            handles
+        };
+        let removed = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(run_id, cli_key));
         std::thread::spawn(move || {
-            // Remove under the lock, then drop the process value OUTSIDE the lock so the
-            // ACP child's Drop impl (kill + wait) never holds the mutex while blocking.
-            let removed = {
-                let mut guard = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                guard.remove(&(run_id, cli_key))
-            };
+            for kill in kill_handles {
+                kill.signal();
+            }
             drop(removed);
         });
     }
@@ -4455,26 +4803,32 @@ sleep 30
         }
     }
 
-    /// Test 35: cleanup_run reclaims state — pass launch_seq=0 for local/non-bus case.
+    /// Test 35: cleanup_run reclaims state for the exact launch token.
     #[test]
     fn cleanup_run_reclaims_state_local_path() {
         let maps_arc = make_maps();
         {
             let mut m = maps_arc.lock().unwrap();
-            m.begin_launch("run-local", false);
-            m.register("run-local", 1, "e-local", "q", None, "r").unwrap();
+            m.begin_launch("run-local", true);
+            m.register("run-local", 1, "e-local", "q", None, "r")
+                .unwrap();
         }
         {
             let m = maps_arc.lock().unwrap();
-            assert_eq!(m.active_workers, 1);
+            assert!(m.active_workers.contains(&("run-local".to_string(), 1)));
             assert!(m.pending.contains_key("e-local"));
         }
         {
             let mut m = maps_arc.lock().unwrap();
-            m.cleanup_run("run-local", 1, 0);
+            m.cleanup_run("run-local", 1, 1);
         }
         let m = maps_arc.lock().unwrap();
-        assert_eq!(m.active_workers, 0, "worker count decremented");
+        assert!(
+            !m.active_workers
+                .iter()
+                .any(|(run_id, _)| run_id == "run-local"),
+            "worker count decremented"
+        );
         assert!(!m.pending.contains_key("e-local"), "pending entry removed");
     }
 
@@ -4484,12 +4838,15 @@ sleep 30
         let maps_arc = make_maps();
         {
             let mut m = maps_arc.lock().unwrap();
-            m.begin_launch("run-drop", false);
+            m.begin_launch("run-drop", true);
             m.mark_bus_in_flight("run-drop", 1);
         }
         {
             let m = maps_arc.lock().unwrap();
-            assert!(m.is_bus_worker_in_flight("run-drop", 1), "in-flight before drop");
+            assert!(
+                m.is_bus_worker_in_flight("run-drop", 1),
+                "in-flight before drop"
+            );
         }
         {
             let guard = make_guard(maps_arc.clone(), "run-drop", 1, 1);
@@ -4497,8 +4854,16 @@ sleep 30
             drop(guard);
         }
         let m = maps_arc.lock().unwrap();
-        assert!(!m.is_bus_worker_in_flight("run-drop", 1), "in-flight cleared after drop");
-        assert_eq!(m.active_workers, 0, "cleanup_run fired (worker decremented)");
+        assert!(
+            !m.is_bus_worker_in_flight("run-drop", 1),
+            "in-flight cleared after drop"
+        );
+        assert!(
+            !m.active_workers
+                .iter()
+                .any(|(run_id, _)| run_id == "run-drop"),
+            "cleanup_run fired (worker decremented)"
+        );
     }
 
     /// EpochCleanup drop with bus_in_flight_deferred=true does NOT clear in-flight.
@@ -4507,7 +4872,7 @@ sleep 30
         let maps_arc = make_maps();
         {
             let mut m = maps_arc.lock().unwrap();
-            m.begin_launch("run-defer", false);
+            m.begin_launch("run-defer", true);
             m.mark_bus_in_flight("run-defer", 1);
         }
         {
@@ -4522,7 +4887,12 @@ sleep 30
             "in-flight NOT cleared when deferred — bus consumer will clear it"
         );
         // cleanup_run still fired (worker decremented).
-        assert_eq!(m.active_workers, 0, "cleanup_run still decremented worker count");
+        assert!(
+            !m.active_workers
+                .iter()
+                .any(|(run_id, _)| run_id == "run-defer"),
+            "cleanup_run still decremented worker count"
+        );
     }
 
     // ── DES-002 ElicitationMaps unit tests (T3, tests 1–11 + 10a) ────────────────
@@ -4587,10 +4957,20 @@ sleep 30
     #[test]
     fn deliver_resolves_receiver() {
         let mut m = maps();
-        let (rx, ..) = m.register("run-5", 1, "e5", "confirm?", None, "response").unwrap();
-        m.deliver("run-5", "e5", "confirm".to_string(), Some(serde_json::json!("yes"))).unwrap();
-        let res = rx.recv_timeout(std::time::Duration::from_millis(200)).unwrap();
-        assert_eq!(res.action, "confirm");
+        let (rx, ..) = m
+            .register("run-5", 1, "e5", "confirm?", None, "response")
+            .unwrap();
+        m.deliver(
+            "run-5",
+            "e5",
+            "accept".to_string(),
+            Some(serde_json::json!("yes")),
+        )
+        .unwrap();
+        let res = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+        assert_eq!(res.action, "accept");
         assert_eq!(res.response, Some(serde_json::json!("yes")));
     }
 
@@ -4599,23 +4979,61 @@ sleep 30
     fn deliver_wrong_run_id_returns_err() {
         let mut m = maps();
         m.register("run-6", 1, "e6", "q", None, "r").unwrap();
-        let result = m.deliver("WRONG-RUN", "e6", "confirm".to_string(), None);
+        let result = m.deliver("WRONG-RUN", "e6", "cancel".to_string(), None);
         assert!(result.is_err(), "cross-run deliver must fail");
-        assert!(result.unwrap_err().to_string().contains("belongs to run run-6"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("belongs to run run-6"));
     }
 
-    /// Test 6: deliver after cancel_epoch is a no-op (channel already closed).
+    /// Test 6: deliver after cancel_epoch fails immediately without blocking.
     #[test]
-    fn deliver_after_cancel_epoch_is_noop() {
+    fn deliver_after_cancel_epoch_fails_without_blocking() {
         let mut m = maps();
         let (rx, ..) = m.register("run-7", 1, "e7", "q", None, "r").unwrap();
         m.cancel_epoch("run-7", 1);
-        // cancel_epoch already sent "cancel" on the channel; channel has capacity 1.
-        // A second send (deliver) would either block or return SendError — both are fine.
-        let _ = rx.recv_timeout(std::time::Duration::from_millis(100));
-        // Deliver after cancel: entry still in pending (cancel_epoch doesn't remove it).
-        // The important thing is deliver does not panic.
-        let _ = m.deliver("run-7", "e7", "confirm".to_string(), None);
+        let cancelled = rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(cancelled.action, "cancel");
+        let err = m
+            .deliver("run-7", "e7", "cancel".to_string(), None)
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn invalid_delivery_does_not_consume_pending_elicitation() {
+        let mut m = maps();
+        let (rx, ..) = m
+            .register(
+                "run-validate",
+                1,
+                "e-validate",
+                "pick",
+                Some(vec!["yes".to_string(), "no".to_string()]),
+                "answer",
+            )
+            .unwrap();
+        assert!(m
+            .deliver(
+                "run-validate",
+                "e-validate",
+                "accept".to_string(),
+                Some(serde_json::json!("maybe")),
+            )
+            .is_err());
+        assert!(m.is_pending("e-validate"));
+
+        m.deliver(
+            "run-validate",
+            "e-validate",
+            "accept".to_string(),
+            Some(serde_json::json!("yes")),
+        )
+        .unwrap();
+        assert_eq!(rx.recv().unwrap().response, Some(serde_json::json!("yes")));
     }
 
     /// Test 7: 8 KB byte-length message cap — a 4-byte-per-codepoint string of 2,049
@@ -4628,7 +5046,10 @@ sleep 30
         let mut m = maps();
         let result = m.register("run-8", 1, "e8", &long_msg, None, "response");
         let (_, stored_msg, ..) = result.unwrap();
-        assert!(stored_msg.ends_with("[truncated]"), "truncation marker appended");
+        assert!(
+            stored_msg.ends_with("[truncated]"),
+            "truncation marker appended"
+        );
         // The total byte length is ≤ 8192 (truncated part) + len("[truncated]").
         let truncated_part_len = stored_msg.len() - "[truncated]".len();
         assert!(
@@ -4645,13 +5066,28 @@ sleep 30
     fn options_entry_over_512_bytes_dropped() {
         // 129 U+1F600 (4 bytes each) = 516 bytes > 512.
         let over_cap: String = std::iter::repeat('😀').take(129).collect();
-        assert!(over_cap.len() > 512, "over-cap entry is {} bytes", over_cap.len());
+        assert!(
+            over_cap.len() > 512,
+            "over-cap entry is {} bytes",
+            over_cap.len()
+        );
         let under_cap = "short option".to_string();
         let mut m = maps();
-        let result = m.register("run-9", 1, "e9", "q", Some(vec![over_cap, under_cap.clone()]), "r");
+        let result = m.register(
+            "run-9",
+            1,
+            "e9",
+            "q",
+            Some(vec![over_cap, under_cap.clone()]),
+            "r",
+        );
         let (_, _, opts, _) = result.unwrap();
         let opts = opts.unwrap();
-        assert_eq!(opts.len(), 1, "over-cap entry dropped; only under-cap remains");
+        assert_eq!(
+            opts.len(),
+            1,
+            "over-cap entry dropped; only under-cap remains"
+        );
         assert_eq!(opts[0], under_cap);
     }
 
@@ -4659,7 +5095,14 @@ sleep 30
     #[test]
     fn empty_options_entry_dropped() {
         let mut m = maps();
-        let result = m.register("run-10", 1, "e10", "q", Some(vec!["".to_string(), "valid".to_string()]), "r");
+        let result = m.register(
+            "run-10",
+            1,
+            "e10",
+            "q",
+            Some(vec!["".to_string(), "valid".to_string()]),
+            "r",
+        );
         let (_, _, opts, _) = result.unwrap();
         let opts = opts.unwrap();
         assert_eq!(opts, vec!["valid".to_string()], "empty entry dropped");
@@ -4681,7 +5124,10 @@ sleep 30
         // verify that register with None options and default prop_key works.
         let mut m = maps();
         let result = m.register("run-12", 1, "e12", "q", None, "response");
-        assert!(result.is_some(), "null/absent constraints do not break registration");
+        assert!(
+            result.is_some(),
+            "null/absent constraints do not break registration"
+        );
         let (_, _, opts, prop_key) = result.unwrap();
         assert!(opts.is_none(), "options is None");
         assert_eq!(prop_key, "response");
@@ -4691,16 +5137,43 @@ sleep 30
     #[test]
     fn cleanup_run_decrements_workers_and_clears_pending() {
         let mut m = maps();
-        m.begin_launch("run-13", false);
-        assert_eq!(m.active_workers, 1);
+        m.begin_launch("run-13", true);
+        assert!(m.active_workers.contains(&("run-13".to_string(), 1)));
         m.register("run-13", 1, "e13a", "q", None, "r").unwrap();
         m.register("run-13", 2, "e13b", "q2", None, "r").unwrap(); // different epoch
 
         // cleanup for epoch 1 only.
         m.cleanup_run("run-13", 1, 1);
-        assert_eq!(m.active_workers, 0, "worker decremented");
-        assert!(!m.pending.contains_key("e13a"), "epoch-1 registration removed");
-        assert!(m.pending.contains_key("e13b"), "epoch-2 registration survives");
+        assert!(
+            !m.active_workers
+                .iter()
+                .any(|(run_id, _)| run_id == "run-13"),
+            "worker decremented"
+        );
+        assert!(
+            !m.pending.contains_key("e13a"),
+            "epoch-1 registration removed"
+        );
+        assert!(
+            m.pending.contains_key("e13b"),
+            "epoch-2 registration survives"
+        );
+    }
+
+    #[test]
+    fn cleanup_is_scoped_to_the_finished_run() {
+        let mut m = maps();
+        m.begin_launch("run-a", true);
+        let epoch_a = m.next_epoch("run-a");
+        m.begin_launch("run-b", true);
+        let epoch_b = m.next_epoch("run-b");
+
+        m.cleanup_run("run-a", epoch_a, 1);
+
+        assert!(!m.has_active_run("run-a"));
+        assert!(m.has_active_run("run-b"));
+        assert_eq!(m.current_epoch("run-b"), epoch_b);
+        assert!(m.active_workers.contains(&("run-b".to_string(), 1)));
     }
 
     // ── DES-002 T5 tests: rpc_respond, rpc_expect, validate_elicitation_schema ─────
@@ -4735,6 +5208,20 @@ sleep 30
         let mut buf: Vec<u8> = Vec::new();
         rpc_respond(&mut buf, &serde_json::Value::Null, serde_json::json!({})).unwrap();
         assert!(buf.is_empty(), "null id must produce no output");
+    }
+
+    #[test]
+    fn bounded_frame_reader_drops_oversized_frame_and_recovers() {
+        let bytes = b"12345\n{\"ok\":true}\n";
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(bytes));
+        assert!(matches!(
+            read_bounded_frame(&mut reader, 4).unwrap(),
+            FrameRead::Oversized
+        ));
+        match read_bounded_frame(&mut reader, 32).unwrap() {
+            FrameRead::Frame(frame) => assert_eq!(frame, r#"{"ok":true}"#),
+            _ => panic!("expected the frame after the oversized line"),
+        }
     }
 
     /// Test 22: `rpc_expect` returns the matching response frame and skips non-matching frames.
@@ -4788,12 +5275,12 @@ sleep 30
         let (_tx, rx) = std::sync::mpsc::channel::<String>(); // nothing sent
         let mut sink: Vec<u8> = Vec::new();
         let result = rpc_expect(&rx, &mut sink, 1, Duration::from_millis(10));
-        assert!(result.is_err(), "must return Err when timeout expires: {result:?}");
-        let msg = result.unwrap_err().to_string();
         assert!(
-            msg.contains("timeout"),
-            "error must mention timeout: {msg}"
+            result.is_err(),
+            "must return Err when timeout expires: {result:?}"
         );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("timeout"), "error must mention timeout: {msg}");
     }
 
     /// Test 13: schema with a single non-string property → `validate_elicitation_schema` returns None.
@@ -4848,7 +5335,10 @@ sleep 30
             }
         });
         let result = validate_elicitation_schema(&schema);
-        assert!(result.is_some(), "single-string schema must pass validation");
+        assert!(
+            result.is_some(),
+            "single-string schema must pass validation"
+        );
         let (prop_name, prop_type) = result.unwrap();
         assert_eq!(prop_name, "name");
         assert_eq!(prop_type, Some("string".to_string()));
@@ -4864,7 +5354,10 @@ sleep 30
             }
         });
         let result = validate_elicitation_schema(&schema);
-        assert!(result.is_some(), "single property with no type must pass validation");
+        assert!(
+            result.is_some(),
+            "single property with no type must pass validation"
+        );
         let (prop_name, prop_type) = result.unwrap();
         assert_eq!(prop_name, "answer");
         assert!(prop_type.is_none());
@@ -4937,7 +5430,10 @@ elif behavior == "elicit_ok":
         "message": "What is your name?",
         "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
     }})
-    r()  # read the submit/cancel response from wicked-core
+    answer = r()
+    expected = {"action": "accept", "content": {"name": "Alice"}}
+    if answer is None or answer.get("result") != expected:
+        sys.exit(2)
     w({"jsonrpc": "2.0", "id": prompt_id, "result": {
         "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
     }})
@@ -5028,8 +5524,7 @@ else:
     #[test]
     #[cfg(unix)]
     fn elicitation_disabled_when_epoch_is_zero() {
-        let dir = std::env::temp_dir()
-            .join(format!("wicked-des002-t12-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wicked-des002-t12-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut proc = start_mock_proc(&dir, "elicit_ok");
@@ -5108,8 +5603,7 @@ else:
     #[test]
     #[cfg(unix)]
     fn valid_elicitation_schema_emits_elicitation_created_event() {
-        let dir = std::env::temp_dir()
-            .join(format!("wicked-des002-t15-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wicked-des002-t15-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut proc = start_mock_proc(&dir, "elicit_ok");
@@ -5128,7 +5622,12 @@ else:
             drop(m);
             if let Some(id) = elicitation_id {
                 let mut m = maps_clone.lock().unwrap();
-                let _ = m.deliver("run-t15", &id, "submit".to_string(), Some(serde_json::json!("Alice")));
+                let _ = m.deliver(
+                    "run-t15",
+                    &id,
+                    "accept".to_string(),
+                    Some(serde_json::json!("Alice")),
+                );
             }
         });
 
@@ -5169,8 +5668,7 @@ else:
     #[test]
     #[cfg(unix)]
     fn adapter_disconnect_mid_elicitation_returns_elicitation_failed() {
-        let dir = std::env::temp_dir()
-            .join(format!("wicked-des002-t19-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wicked-des002-t19-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut proc = start_mock_proc(&dir, "elicit_disconnect");
@@ -5206,8 +5704,7 @@ else:
     #[test]
     #[cfg(unix)]
     fn nested_elicitation_create_is_immediately_cancelled() {
-        let dir = std::env::temp_dir()
-            .join(format!("wicked-des002-t20-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wicked-des002-t20-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Use the "elicit_nested" behavior: mock sends elicit-nested-2 while elicit-nested-1 is
@@ -5246,16 +5743,10 @@ else:
         .unwrap();
         deliver_thread.join().unwrap();
 
-        // The turn should complete with Cancelled (human sent cancel → adapter sent stopReason:cancelled)
-        // OR Ok (depends on mock behavior after cancel). With our mock behavior above:
-        // - nested-2 gets immediate cancel (from inside 'elicit loop)
-        // - nested-1 gets cancel from the deliver thread
-        // - mock then responds to nested-1 cancel then completes the prompt
-        // So the turn should complete ok.
-        assert!(
-            result.status == StepStatus::Ok || result.status == StepStatus::Cancelled,
-            "turn must complete ok or cancelled after nested elicitation: {:?}",
-            result.status
+        assert_eq!(
+            result.status,
+            StepStatus::ElicitationFailed,
+            "a human cancellation is terminal and must bypass retry"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5298,7 +5789,10 @@ else:
 
         let final_usage = prior_usage.unwrap();
         // Tokens come from the result frame, not the prior notification.
-        assert_eq!(final_usage.input_tokens, 100, "result tokens replace notification tokens");
+        assert_eq!(
+            final_usage.input_tokens, 100,
+            "result tokens replace notification tokens"
+        );
         assert_eq!(final_usage.output_tokens, 50);
         // Cost is preserved from the prior usage_update notification.
         assert_eq!(
@@ -5326,13 +5820,18 @@ else:
 
         // register for the same (run_id, epoch) must return None (creation suppressed).
         let result = m.register("run-25", 1, "eid-25", "msg", None, "r");
-        assert!(result.is_none(), "register must return None when epoch was pre-cancelled");
+        assert!(
+            result.is_none(),
+            "register must return None when epoch was pre-cancelled"
+        );
         assert!(
             !m.pending.contains_key("eid-25"),
             "pending must not contain the suppressed elicitation"
         );
         assert!(
-            m.run_index.get("run-25").is_none_or(|v| !v.iter().any(|(id, _)| id == "eid-25")),
+            m.run_index
+                .get("run-25")
+                .is_none_or(|v| !v.iter().any(|(id, _)| id == "eid-25")),
             "run_index must not contain the suppressed elicitation"
         );
     }
@@ -5345,7 +5844,11 @@ else:
 
         // cancel_epoch tombstones epoch 1 but does NOT bump the epoch counter.
         m.cancel_epoch("run-27", 1);
-        assert_eq!(m.current_epoch("run-27"), 0, "cancel_epoch must not allocate an epoch");
+        assert_eq!(
+            m.current_epoch("run-27"),
+            0,
+            "cancel_epoch must not allocate an epoch"
+        );
 
         // register on the cancelled epoch returns None.
         let r1 = m.register("run-27", 1, "eid-27a", "msg", None, "r");
@@ -5386,7 +5889,10 @@ else:
         assert!(r2.is_some(), "register on live epoch 2 returns Some(rx)");
 
         // epoch 1 remains cancelled; epoch 2 is not.
-        assert!(m.is_epoch_cancelled("run-27", 1), "epoch 1 still tombstoned");
+        assert!(
+            m.is_epoch_cancelled("run-27", 1),
+            "epoch 1 still tombstoned"
+        );
         assert!(!m.is_epoch_cancelled("run-27", 2), "epoch 2 not tombstoned");
     }
 
@@ -5446,10 +5952,19 @@ else:
 
         // A stale epoch-1 worker is still rejected (tombstone persists).
         let r1_stale = m.register("run-31", 1, "eid-31c", "q2", None, "r");
-        assert!(r1_stale.is_none(), "stale epoch-1 registration must still return None");
-        assert!(m.is_epoch_cancelled("run-31", 1), "epoch 1 tombstone persists after next_epoch");
+        assert!(
+            r1_stale.is_none(),
+            "stale epoch-1 registration must still return None"
+        );
+        assert!(
+            m.is_epoch_cancelled("run-31", 1),
+            "epoch 1 tombstone persists after next_epoch"
+        );
         // Epoch 2 registration did not disturb epoch 1's tombstone or epoch 2.
-        assert!(!m.is_epoch_cancelled("run-31", 2), "epoch 2 must not be tombstoned");
+        assert!(
+            !m.is_epoch_cancelled("run-31", 2),
+            "epoch 2 must not be tombstoned"
+        );
     }
 
     /// Test 29d: EpochCleanup RAII guard emits ElicitationResolved with reason="teardown"
@@ -5484,7 +5999,8 @@ else:
         drop(guard);
 
         // Receive the command from the channel.
-        let cmd = cmd_rx.recv_timeout(std::time::Duration::from_millis(200))
+        let cmd = cmd_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
             .expect("EpochCleanup must emit Command::EmitEvent on drop");
 
         match cmd {
@@ -5497,7 +6013,10 @@ else:
                 assert_eq!(session, "run-29d");
                 assert_eq!(elicitation_id, "eid-29d");
                 assert_eq!(action, "cancel");
-                assert_eq!(reason, "teardown", "teardown path must emit reason=teardown");
+                assert_eq!(
+                    reason, "teardown",
+                    "teardown path must emit reason=teardown"
+                );
             }
             _other => panic!("expected ElicitationResolved event"),
         }
@@ -5535,7 +6054,9 @@ else:
         } else {
             "adapter_write_failure"
         };
-        assert_eq!(reason, "teardown",
-            "deliberate-kill path must produce reason=teardown, not adapter_write_failure");
+        assert_eq!(
+            reason, "teardown",
+            "deliberate-kill path must produce reason=teardown, not adapter_write_failure"
+        );
     }
 }
