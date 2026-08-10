@@ -532,7 +532,9 @@ fn absorb(
         *usage = ao.usage;
     }
     files.extend(ao.files);
-    tools.extend(ao.tools);
+    // Capped like the wrapped path (FINDING-046 review): a looping CLI can emit unboundedly many
+    // `tool_use` blocks, so retain only up to the shared ceiling.
+    crate::execute_wrapped::retain_tools_capped(tools, ao.tools);
 }
 
 /// Quick sentinel check — is this line a `{"type":"result",...}` NDJSON row?

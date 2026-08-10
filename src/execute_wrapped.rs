@@ -1370,6 +1370,24 @@ pub(crate) fn resolve_invocation(cli_key: &str) -> String {
 
 const TIMED_OUT: &str = "__wicked_timed_out__";
 
+/// Upper bound on retained tool names per unit turn (FINDING-046 review, Copilot). `output` is capped
+/// at `MAX_OUT`; `tools` needs its own ceiling or a hung/looping CLI emitting `tool_use` blocks with
+/// little text would grow the vec without bound. 4096 tool calls in one turn is already far past any
+/// legitimate unit — names past the cap are dropped (the event is observability, not an audit ledger).
+pub(crate) const MAX_TOOLS_RETAINED: usize = 4096;
+
+/// Append `names` to `tools`, retaining at most [`MAX_TOOLS_RETAINED`] total (FINDING-046 review).
+/// Shared by both wrapped-CLI accumulation and the persistent-session path so the ceiling is defined
+/// once. Unlike `files` (bounded by real file access), tool-call volume is attacker/bug-controllable.
+pub(crate) fn retain_tools_capped(tools: &mut Vec<String>, names: Vec<String>) {
+    for name in names {
+        if tools.len() >= MAX_TOOLS_RETAINED {
+            break;
+        }
+        tools.push(name);
+    }
+}
+
 /// The outcome of a bounded run: `(exit_code, stdout, stderr, usage, files, tools)`.
 type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>);
 
@@ -1422,7 +1440,9 @@ fn run_bounded(
                     usage = ao.usage;
                 }
                 files.extend(ao.files);
-                tools.extend(ao.tools);
+                // Capped, unlike `files` (whose growth is bounded by real file access): a looping CLI
+                // can emit unboundedly many `tool_use` blocks (FINDING-046 review).
+                retain_tools_capped(&mut tools, ao.tools);
             };
             for line in std::io::BufReader::new(so).lines().map_while(Result::ok) {
                 let ao = adapter.on_line(&line);
@@ -2855,6 +2875,27 @@ mod tests {
         assert_eq!(out.tools, vec!["Read".to_string(), "Bash".to_string()]);
         // Bash carries a `command`, not a `file_path`, so it adds a NAME but no FILE: `tools` ⊋ `files`.
         assert_eq!(out.files, vec!["/tmp/a.txt".to_string()]);
+    }
+
+    #[test]
+    fn retain_tools_capped_bounds_a_looping_cli() {
+        // FINDING-046 review (Copilot): `output` is capped at MAX_OUT, but a hung/looping CLI can emit
+        // unboundedly many `tool_use` blocks carrying almost no text — `tools` needs its own ceiling.
+        // Exercises the SHARED production helper (both runner paths call it), not a copy of its logic.
+        let mut tools: Vec<String> = Vec::new();
+        // Under the cap: everything is retained, in order.
+        retain_tools_capped(&mut tools, vec!["Read".into(), "Bash".into()]);
+        assert_eq!(tools, vec!["Read".to_string(), "Bash".to_string()]);
+        // A surplus beyond the cap is truncated to exactly the ceiling — not grown with input.
+        let surplus: Vec<String> = (0..MAX_TOOLS_RETAINED + 50)
+            .map(|i| format!("T{i}"))
+            .collect();
+        retain_tools_capped(&mut tools, surplus);
+        assert_eq!(
+            tools.len(),
+            MAX_TOOLS_RETAINED,
+            "retained tool names must stop at MAX_TOOLS_RETAINED, not grow with input"
+        );
     }
 
     #[test]
