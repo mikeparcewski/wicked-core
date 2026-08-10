@@ -3632,6 +3632,19 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
     // whatever a workflow author wrote. A def whose tool phase is `["wicked-estate", "index", "."]`
     // reproduces FINDING-067 with no agent involved at all: the indexer needs no `--db`, it reads
     // the inherited environment. Found by enumerating spawn sites, not by a failure.
+    //
+    // The engine's OWN binary (`wicked-core`, e.g. the domain-extraction `domain-graph` persist
+    // phase, core#237) is not necessarily on PATH under that literal name — it may be a napi addon,
+    // or live at ~/.local/bin. Resolve it exactly as the validator/coverage paths do
+    // ($WICKED_CORE_EXE → current_exe → PATH → bare) so the Tool phase invokes THIS engine, not a
+    // missing PATH entry. Any other binary is spawned as written.
+    let resolved_bin;
+    let bin: &str = if bin == "wicked-core" {
+        resolved_bin = crate::execute_wrapped::resolve_wicked_core_exe();
+        &resolved_bin
+    } else {
+        bin
+    };
     let mut proc = Command::new(bin);
     proc.hardened().args(&cmd[1..]);
     if let Some(wd) = workdir {

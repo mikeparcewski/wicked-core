@@ -364,6 +364,15 @@ pub fn preflight_tool_phases(def: &WorkflowDef) -> anyhow::Result<()> {
 /// Resolve a tool binary the way `Command::new` will: an explicit path must exist as a file; a
 /// bare name must resolve on `PATH` via the shared PATHEXT-aware [`crate::validator::find_on_path`].
 fn tool_binary_resolves(bin: &str) -> bool {
+    // The engine's OWN binary is always available: `run_tool_cmd` resolves `wicked-core` via
+    // `resolve_wicked_core_exe` ($WICKED_CORE_EXE → current_exe → PATH → bare) at exec time, not as a
+    // literal `wicked-core` on PATH — so a `wicked-core domain-graph` Tool phase invokes THIS engine.
+    // The preflight exists to catch MISSING EXTERNAL tools (e.g. `wicked-estate`); the engine cannot
+    // be missing from itself, and under `cargo test` `wicked-core` is not on PATH yet is still the
+    // running binary (core#237).
+    if bin == "wicked-core" {
+        return true;
+    }
     let p = std::path::Path::new(bin);
     if p.components().count() > 1 || p.is_absolute() {
         return p.is_file();

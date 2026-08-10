@@ -83,9 +83,20 @@
         "coverage"
       ],
       "role": "neutral",
-      "skill_ref": "wicked-garden-domain-modeler",
+      "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": null
+      "validator_pin": null,
+      "executor": {
+        "type": "tool",
+        "cmd": [
+          "wicked-core",
+          "domain-graph",
+          "--db",
+          "{code_graph_db}",
+          "--out",
+          "requirements_graph.json"
+        ]
+      }
     }
   ]
 }
