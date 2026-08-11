@@ -7,9 +7,9 @@ description = "Node/TypeScript bindings (napi-rs) for wicked-core: drive the in-
 publish = false
 
 # Standalone napi cdylib — deliberately NOT a cargo workspace member (mirrors the archived
-# wicked-memory-ts pattern). It path-depends on wicked-core (../..) which itself is a standalone
-# package with relative deps on ../../../wicked-estate; keeping this crate out of any workspace
-# preserves that resolution. Build from THIS directory: `cargo build -p wicked-core-ts`.
+# wicked-memory-ts pattern). It path-depends on wicked-core (../..), a standalone package that
+# now pulls wicked-estate from crates.io; keeping this crate out of any workspace preserves its
+# own [profile.release] + lockfile. Build from THIS directory: `cargo build -p wicked-core-ts`.
 
 [lib]
 crate-type = ["cdylib"]
@@ -24,7 +24,7 @@ wicked-apps-core = { path = "../wicked-apps-core" }
 # Policy / ConformanceRule / claim_from_node / recall_rules.
 wicked-governance = { path = "../wicked-governance" }
 # SymbolQuery — not re-exported by wicked-apps-core; needed by the governance read methods.
-wicked-estate-core = { path = "../../../wicked-estate/crates/wicked-estate-core" }
+wicked-estate-core = "0.14.3"
 napi = { version = "2", default-features = false, features = ["napi8"] }
 napi-derive = "2"
 serde = { version = "1", features = ["derive"] }
