@@ -123,28 +123,27 @@ mod tests {
         serde_json::from_str(&raw).expect("crates/wicked-core-ts/package.json is valid JSON")
     }
 
-    /// CI compiles against one wicked-estate checkout; the napi release build compiles against
-    /// another. Both are pinned by a `WICKED_ESTATE_REF` in their own workflow, and the only thing
-    /// holding them together today is a comment in each asking the reader to remember the other.
+    /// wicked-core once resolved wicked-estate through relative PATH deps, so both CI and the napi
+    /// release build had to check estate out as a sibling and pin the SAME `WICKED_ESTATE_REF` — a
+    /// skew there shipped a `.node` bundling an estate no test in this repo exercised. That coupling
+    /// is gone: estate is an ordinary versioned crates.io dependency now, so CI, local, and the
+    /// release all resolve the identical published release with nothing left to keep in sync.
     ///
-    /// Divergence is not a build break — both files are individually valid and both jobs go green.
-    /// It means the `.node` shipped to npm statically bundles a different estate than the one every
-    /// test ran against, so the addon's behaviour in the field is untested by construction. That is
-    /// the worst kind of skew: silent, and detectable only in production.
+    /// This pin guards the kill. A `WICKED_ESTATE_REF` reappearing in either workflow means the
+    /// sibling-checkout coupling — and its silent artifact-drift class — is being reintroduced.
     #[test]
-    fn ci_and_the_napi_release_build_against_the_same_estate() {
+    fn no_workflow_pins_a_raw_estate_ref() {
         const KEY: &str = "WICKED_ESTATE_REF";
-        let ci = yaml_scalar(&read(".github/workflows/ci.yml"), KEY)
-            .unwrap_or_else(|| panic!("no `{KEY}:` in ci.yml"));
-        let release = yaml_scalar(&read(".github/workflows/napi-release.yml"), KEY)
-            .unwrap_or_else(|| panic!("no `{KEY}:` in napi-release.yml"));
-
-        assert_eq!(
-            ci, release,
-            "ci.yml pins {KEY}={ci} but napi-release.yml pins {KEY}={release}. The published \
-             addon would bundle an estate no test in this repo ever exercised. Bump both, or \
-             neither."
-        );
+        for wf in [
+            ".github/workflows/ci.yml",
+            ".github/workflows/napi-release.yml",
+        ] {
+            assert!(
+                yaml_scalar(&read(wf), KEY).is_none(),
+                "{wf} pins {KEY} — estate is a versioned crates.io dependency now, not a sibling \
+                 checkout. Remove the ref pin; there is nothing to keep in lockstep."
+            );
+        }
     }
 
     /// The addon's version is written in three places: the crate manifest napi compiles, the

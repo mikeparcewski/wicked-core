@@ -28,18 +28,11 @@ concurrency:
   group: napi-release-${{ github.ref }}
   cancel-in-progress: false
 
-# wicked-core resolves wicked-estate via RELATIVE PATH deps (../wicked-estate/...), and three of them
-# (wicked-estate-memory, -memory-core, -knowledge) are `publish = false` — they will NEVER be on
-# crates.io, so there is no version-dep fallback. The build MUST check out wicked-estate as a SIBLING
-# of wicked-core so the path deps resolve from source (the .node statically bundles the bytes). Pin the
-# estate ref here; bump on each estate release that changes what the addon bundles.
-# Pinned to a released estate TAG: v0.14.3 is the first release that carries the
-# `set_node_semantics(ValidationClaim)` API (estate#81). It contains the previously-pinned commit
-# c7763495 plus 5 follow-ups, so the addon no longer bundles an UNRELEASED estate. Immutable and
-# reproducible — the hazard is a floating ref like `main`, not a pinned tag. Bump to the newest
-# estate release tag on each release that changes what the addon bundles.
-env:
-  WICKED_ESTATE_REF: v0.14.3
+# wicked-core resolves wicked-estate from crates.io (published semver deps — see Cargo.toml), so the
+# build needs NO sibling estate checkout and pins NO estate ref: the .node bundles the same published
+# estate CI and local builds compile against. wicked-core is still checked out UNDER ./wicked-core so
+# the napi build's working-directory (crates/wicked-core-ts, where .cargo/config.toml lives) and the
+# artifact upload path below stay put — there is just no sibling next to it anymore.
 
 jobs:
   # ── build the native addon once per target triple, upload the per-target *.node ────────────────
@@ -74,12 +67,6 @@ jobs:
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           path: wicked-core
-      - name: Checkout wicked-estate (sibling — path deps + publish=false crates build from source)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: mikeparcewski/wicked-estate
-          ref: ${{ env.WICKED_ESTATE_REF }}
-          path: wicked-estate
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
@@ -125,7 +112,7 @@ jobs:
         with:
           name: bindings-${{ matrix.target }}
           # path is workspace-root-relative (upload-artifact ignores defaults.run.working-directory);
-          # wicked-core is checked out under ./wicked-core (see the sibling-checkout note above).
+          # wicked-core is checked out under ./wicked-core (see the checkout-path note above).
           path: wicked-core/crates/wicked-core-ts/*.node
           if-no-files-found: error
           retention-days: 7

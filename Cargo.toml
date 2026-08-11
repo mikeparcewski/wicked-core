@@ -38,21 +38,22 @@ path = "src/bin/wicked-core.rs"
 
 [dependencies]
 # Vendored ex-crates.io crates (yanked 0.2.0/0.3.0) — copied into crates/ and repointed onto
-# wicked-estate 0.13 path deps. apps-core is the domain wrapper (ToNode/FromNode, Decision/
+# published wicked-estate crates.io deps. apps-core is the domain wrapper (ToNode/FromNode, Decision/
 # ConformanceClaim, event catalog + emit seam, synthetic_symbol, convenience open_store) that has
 # no estate 0.13 equivalent; the three engines COE composes build on it (in-process, no wicked-agent).
 wicked-apps-core = { path = "crates/wicked-apps-core" }
 wicked-governance = { path = "crates/wicked-governance" }
 wicked-orchestration = { path = "crates/wicked-orchestration" }
 wicked-council = { path = "crates/wicked-council" }
-# wicked-estate 0.13 — local, not-yet-published; relative path deps (cross-platform, no cargo update).
-wicked-estate-core = { path = "../wicked-estate/crates/wicked-estate-core" }
-wicked-estate-rank = { path = "../wicked-estate/crates/wicked-estate-rank" }
-wicked-estate-retrieve = { path = "../wicked-estate/crates/wicked-estate-retrieve", features = ["model2vec"] }
-# Memory + knowledge migrated off tombstone wicked-memory/-core/knowledge-mcp onto estate 0.13.
-wicked-estate-memory = { path = "../wicked-estate/crates/wicked-estate-memory" }
-wicked-estate-memory-core = { path = "../wicked-estate/crates/wicked-estate-memory-core" }
-wicked-estate-knowledge = { path = "../wicked-estate/crates/wicked-estate-knowledge" }
+# wicked-estate — published crates.io semver deps. No sibling checkout: CI/local/operator all
+# resolve the SAME registry release, killing the path-dep coupling + napi artifact drift.
+wicked-estate-core = "0.14.3"
+wicked-estate-rank = "0.14.3"
+wicked-estate-retrieve = { version = "0.14.3", features = ["model2vec"] }
+# Memory + knowledge migrated off tombstone wicked-memory/-core/knowledge-mcp onto estate.
+wicked-estate-memory = "0.14.3"
+wicked-estate-memory-core = "0.14.3"
+wicked-estate-knowledge = "0.14.3"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
