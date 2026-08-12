@@ -419,8 +419,8 @@ mod tests {
                 "rawInput": {"query": "fn pretool_payload"}
             },
         });
-        let (tool4, _) = pretool_payload(&mcp_params)
-            .expect("MCP tool name must resolve from toolCall.name");
+        let (tool4, _) =
+            pretool_payload(&mcp_params).expect("MCP tool name must resolve from toolCall.name");
         assert_eq!(
             tool4, "mcp__wicked-estate__SearchEntity",
             "full MCP-prefixed name must be preserved for policy evaluation"
