@@ -250,9 +250,9 @@ fn task_key(event_type: &str, run_id: &str, unit_ix: usize, attempt: u32) -> Str
 /// Publish `wicked.gate.eval.requested` to the bus and BLOCK until the governed evaluator daemon
 /// responds with `wicked.gate.eval.responded` — or until [`GATE_EVAL_TIMEOUT`] elapses.
 ///
-/// Returns `Some(AgentVerdict)` on a successful response, `None` on timeout or bus error. A `None`
-/// result is NOT a reject — the caller interprets it as "no agent verdict" so `combine_verdict`
-/// falls through to the deterministic-only path (Approve iff deterministic passes).
+/// Returns an infallible `AgentVerdict`. On timeout or any bus error the verdict is a **hard deny**
+/// (`pass: false`) — governance fails closed; a timeout or infrastructure failure must never silently
+/// approve a gate.
 ///
 /// WHY NOT A SUBPROCESS: the inline `agent_validate` spawns `claude -p --plugin-dir <garden>` whose
 /// `SessionStart` hook fires `bootstrap.py` → bubbletea TUI → "open /dev/tty: device not configured"
@@ -1407,17 +1407,17 @@ mod tests {
         );
     }
 
-    /// BUS-PATH GOVERNANCE BLOCKER — timeout must be a hard DENY (fail-closed).
+    /// Verifies the `GateEvalRequest` wire format: `work_author` survives JSON serialization and
+    /// `#[serde(default)]` preserves backward compat for receivers that emit the field as `null` or
+    /// omit it entirely.
     ///
-    /// If `bus_request_agent_verdict` returned `None` on timeout, `combine_verdict(det_pass=true, None)`
-    /// would approve the gate silently — a 3-minute disruption to the evaluator daemon would bypass
-    /// the entire semantic judgment layer with no audit trail. The function now returns a deny verdict
-    /// on timeout so `combine_verdict` sees `agent_rejects=true` and rejects the gate.
-    ///
-    /// Mutation test: change the final `return AgentVerdict { pass: false, … }` to `pass: true` and
-    /// this assertion fails — confirming the gate rejects on timeout.
+    /// Note: the timeout-deny behavior of `bus_request_agent_verdict` itself is not exercised here
+    /// because the production timeout is 180s — too long for a unit test. The timeout path is covered
+    /// by the doc-level contract guarantee: every error/timeout branch uses `bus_deny!` (infallible
+    /// deny) rather than returning `None`. The serialization test below remains the regression guard
+    /// for the wire contract that the evaluator daemon depends on.
     #[test]
-    fn bus_path_timeout_returns_deny_not_none() {
+    fn gate_eval_request_wire_format_work_author_survives_round_trip() {
         let dir =
             std::env::temp_dir().join(format!("wicked-core-bus-timeout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

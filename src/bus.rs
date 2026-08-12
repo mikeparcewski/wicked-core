@@ -4,7 +4,9 @@
 //! module gives core three capabilities against that log, all speaking the *same* SQLite schema the
 //! JS bus reads/writes so a row written here is indistinguishable from one the JS `emit()` wrote:
 //!
-//!  1. [`BusDb::emit`] — publish a `wicked.<event_domain>.<noun>.<verb>` event (deterministic idempotency key, the
+//!  1. [`BusDb::emit`] — publish a dot-separated `wicked.*` event (production events follow the
+//!     `wicked.<event_domain>.<noun>.<verb>` 4-segment convention; the bus itself accepts any prefix,
+//!     and filter matching uses glob-style `**` for depth; deterministic idempotency key, the
 //!     bus's two-timer TTL) into the `events` table.
 //!  2. [`BusDb::poll`] — read events by filter past an integer cursor floor (at-least-once, idempotent
 //!     — the caller advances its own floor; a re-read is harmless because the launch it drives is
@@ -116,8 +118,10 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// An event ready to publish onto the bus. The `event_type` string follows the
-/// `wicked.<event_domain>.<noun>.<verb>` 4-segment grammar (e.g. `wicked.crew.run.requested`).
+/// An event ready to publish onto the bus. The `event_type` string is a dot-separated `wicked.*`
+/// identifier; by convention production events follow `wicked.<event_domain>.<noun>.<verb>`
+/// (e.g. `wicked.crew.run.requested`), but the bus accepts any depth and filter matching uses
+/// glob-style `**` — see `matches_filter` for the exact rules.
 ///
 /// Note on naming: the `domain` field here is the **publisher identity** (e.g. `wicked-core`),
 /// not the `<event_domain>` segment of the event-type string — those two happen to share the
