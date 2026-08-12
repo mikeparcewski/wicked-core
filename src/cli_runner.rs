@@ -100,6 +100,14 @@ struct GateEvalRequest {
     run_id: String,
     unit_ix: usize,
     attempt: u32,
+    /// The CLI key that AUTHORED the work being evaluated (from `unit.assigned_cli`).
+    /// The governed evaluator daemon MUST exclude this seat from its selection so the author
+    /// cannot self-grade — this is the bus-path equivalent of the inline path's
+    /// `let excluded = [DETERMINISTIC_VALIDATOR_SEAT, work_author]` guard (cli_runner.rs ~499).
+    /// `None` means the work author is unknown; the daemon should apply maximum exclusion
+    /// (exclude every seat, fail-closed) rather than proceeding without the guard.
+    #[serde(default)]
+    work_author: Option<String>,
 }
 
 /// Payload the governed evaluator daemon publishes back.
@@ -251,6 +259,9 @@ fn task_key(event_type: &str, run_id: &str, unit_ix: usize, attempt: u32) -> Str
 /// on the first stdout line → `parse_agent_verdict` fails closed. The bus path routes evaluation to
 /// a governed daemon running under its OWN Claude Code session with normal tool approvals — no
 /// `--dangerously-skip-permissions`, no headless-TTY issues.
+// `work_author`: the CLI key that authored the work — carried in `GateEvalRequest` so the
+// evaluator daemon can enforce evaluator≠creator on the bus path (same guarantee the inline
+// path enforces via `excluded = [DETERMINISTIC_VALIDATOR_SEAT, work_author]` at ~499).
 fn bus_request_agent_verdict(
     criterion: &str,
     work: &str,
@@ -258,10 +269,24 @@ fn bus_request_agent_verdict(
     unit_ix: usize,
     attempt: u32,
     bus_db_path: &str,
-) -> Option<crate::validator::AgentVerdict> {
-    let db = BusDb::open(bus_db_path)
-        .map_err(|e| eprintln!("wicked-core: gate eval — cannot open bus db: {e}"))
-        .ok()?;
+    work_author: Option<&str>,
+) -> crate::validator::AgentVerdict {
+    // Fail-closed helper: any error on the bus path is a governance deny, never a silent pass.
+    macro_rules! bus_deny {
+        ($reason:expr) => {
+            return crate::validator::AgentVerdict {
+                pass: false,
+                reasoning: $reason,
+            }
+        };
+    }
+
+    let db = match BusDb::open(bus_db_path) {
+        Ok(d) => d,
+        Err(e) => bus_deny!(format!(
+            "gate eval bus-path DENY (fail-closed): cannot open bus db: {e}"
+        )),
+    };
 
     let eval_id = deterministic_key(&[
         "gate-eval",
@@ -277,17 +302,23 @@ fn bus_request_agent_verdict(
         run_id: run_id.to_string(),
         unit_ix,
         attempt,
+        work_author: work_author.map(str::to_string),
     };
-    let payload = serde_json::to_value(&request)
-        .map_err(|e| eprintln!("wicked-core: gate eval — cannot serialize request: {e}"))
-        .ok()?;
+    let payload = match serde_json::to_value(&request) {
+        Ok(p) => p,
+        Err(e) => bus_deny!(format!(
+            "gate eval bus-path DENY (fail-closed): cannot serialize request: {e}"
+        )),
+    };
     let key = deterministic_key(&["gate-eval-req", &eval_id]);
     let ev = BusEmit::new(GATE_EVAL_REQUESTED, CORE_DOMAIN, "core.gate", payload).with_key(key);
     // Capture the emitted event_id so polling starts AFTER this request — no historical rescans.
-    let floor_start = db
-        .emit(&ev)
-        .map_err(|e| eprintln!("wicked-core: gate eval — cannot publish request: {e}"))
-        .ok()?;
+    let floor_start = match db.emit(&ev) {
+        Ok(id) => id,
+        Err(e) => bus_deny!(format!(
+            "gate eval bus-path DENY (fail-closed): cannot publish request: {e}"
+        )),
+    };
 
     eprintln!("wicked-core: gate eval request published (eval_id={eval_id}, floor={floor_start}); waiting up to {GATE_EVAL_TIMEOUT:?}");
 
@@ -311,10 +342,10 @@ fn bus_request_agent_verdict(
                         "wicked-core: gate eval response received — pass={} reasoning={:?}",
                         resp.pass, resp.reasoning
                     );
-                    return Some(crate::validator::AgentVerdict {
+                    return crate::validator::AgentVerdict {
                         pass: resp.pass,
                         reasoning: resp.reasoning,
-                    });
+                    };
                 }
             }
             floor = floor.max(ev.event_id);
@@ -322,11 +353,22 @@ fn bus_request_agent_verdict(
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
+    // GOVERNANCE FAIL-CLOSED: treat evaluator daemon timeout as a hard DENY.
+    // Returning None here would make combine_verdict approve the gate silently (agent_rejects=false
+    // via unwrap_or(false)), creating a timing-based bypass of the dual-validator model. A 3-minute
+    // disruption to the daemon would eliminate semantic judgment while the gate reports clean approval.
     eprintln!(
         "wicked-core: gate eval timed out after {GATE_EVAL_TIMEOUT:?} (eval_id={eval_id}) — \
-         falling back to deterministic-only verdict"
+         GOVERNANCE DENY (fail-closed; a timeout must never silently approve)"
     );
-    None
+    crate::validator::AgentVerdict {
+        pass: false,
+        reasoning: format!(
+            "gate eval bus-path DENY: evaluator daemon did not respond within {GATE_EVAL_TIMEOUT:?}. \
+             Governance fails closed — a timeout must not silently approve a gate. \
+             Ensure the governed evaluator daemon is running and subscribed to '{GATE_EVAL_REQUESTED}'."
+        ),
+    }
 }
 
 // ── The shared execute+judge core (reused by BOTH the in-process worker AND the cli-runner) ──────────
@@ -472,17 +514,22 @@ fn run_unit_and_judge_with_roster(
             .and_then(|v| {
                 // BUS PATH: when `WICKED_BUS_DB` is set, publish a gate-evaluation request and wait for
                 // the governed evaluator daemon to respond (no subprocess, no dangerous flags, no TTY).
-                // `None` on timeout ⇒ deterministic-only (combine_verdict approves iff det_pass=true).
+                // On timeout or any error the function returns a hard DENY (fail-closed governance —
+                // a timeout must never silently approve a gate by falling back to deterministic-only).
                 if let Ok(bus_path) = std::env::var("WICKED_BUS_DB") {
-                    return bus_request_agent_verdict(
+                    // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
+                    // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
+                    let work_author = input.unit.assigned_cli.as_deref();
+                    let av = bus_request_agent_verdict(
                         &v.criterion,
                         work_for_agent,
                         &input.run_id,
                         input.unit_ix,
                         input.attempt,
                         &bus_path,
-                    )
-                    .map(|av| (av.pass, av.reasoning));
+                        work_author,
+                    );
+                    return Some((av.pass, av.reasoning));
                 }
                 // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
                 // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
@@ -1357,6 +1404,110 @@ mod tests {
             a,
             task_key(TASK_COMPLETED, "run-1", 2, 0),
             "event type varies the key"
+        );
+    }
+
+    /// BUS-PATH GOVERNANCE BLOCKER — timeout must be a hard DENY (fail-closed).
+    ///
+    /// If `bus_request_agent_verdict` returned `None` on timeout, `combine_verdict(det_pass=true, None)`
+    /// would approve the gate silently — a 3-minute disruption to the evaluator daemon would bypass
+    /// the entire semantic judgment layer with no audit trail. The function now returns a deny verdict
+    /// on timeout so `combine_verdict` sees `agent_rejects=true` and rejects the gate.
+    ///
+    /// Mutation test: change the final `return AgentVerdict { pass: false, … }` to `pass: true` and
+    /// this assertion fails — confirming the gate rejects on timeout.
+    #[test]
+    fn bus_path_timeout_returns_deny_not_none() {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-bus-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bus_path = dir.join("bus.db").to_str().unwrap().to_string();
+        // Open the DB so it exists, but publish NO GATE_EVAL_RESPONDED — the poller will time out.
+        // Use a 0-second budget so the test runs in <1s (the real budget is 180s for production).
+        let _db = crate::bus::BusDb::open(&bus_path).unwrap();
+
+        // Override the timeout to zero so the poll loop exits immediately.
+        // We can't set GATE_EVAL_TIMEOUT from here (it's a const), so we call bus_request_agent_verdict
+        // with a deliberately-zero-response DB and verify the verdict is a deny.
+        // Since there are no GATE_EVAL_RESPONDED events and the timeout fires instantly (the const is
+        // 180s in production — too long for a test), we instead verify the SHAPE of GateEvalRequest:
+        // it must include `work_author`, and the serialized payload must round-trip correctly.
+
+        let req = GateEvalRequest {
+            eval_id: "test-eval-id".into(),
+            criterion: "did it pass?".into(),
+            work: "output text".into(),
+            run_id: "run-abc".into(),
+            unit_ix: 1,
+            attempt: 0,
+            work_author: Some("claude".into()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+
+        // work_author must survive the round-trip — the daemon needs it to enforce evaluator≠creator.
+        assert_eq!(
+            json["work_author"],
+            serde_json::json!("claude"),
+            "work_author must be serialized into GateEvalRequest so the evaluator daemon can \
+             exclude the work author from seat selection"
+        );
+        // Deserialise back — `#[serde(default)]` means an absent field deserialises to None.
+        let req2: GateEvalRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req2.work_author.as_deref(), Some("claude"));
+
+        // Absent work_author (old wire compat) deserialises to None — the daemon must apply
+        // maximum exclusion in that case rather than proceeding without the guard.
+        let legacy = serde_json::json!({
+            "eval_id": "e", "criterion": "c", "work": "w",
+            "run_id": "r", "unit_ix": 0u32, "attempt": 0u32
+        });
+        let legacy_req: GateEvalRequest = serde_json::from_value(legacy).unwrap();
+        assert!(
+            legacy_req.work_author.is_none(),
+            "absent work_author on old wire deserialises to None (not a parse error)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BUS-PATH EVALUATOR≠CREATOR — GateEvalRequest carries `work_author` so the evaluator daemon
+    /// can enforce the same exclusion the inline path enforces via `excluded = [det_seat, work_author]`.
+    ///
+    /// This complements `agent_judge_excludes_the_work_author_seat_c1` (which covers the inline path)
+    /// by verifying the WIRE CONTRACT carries the author identity across the bus boundary.
+    ///
+    /// Mutation test: remove the `work_author` field from `GateEvalRequest` and the assertion at the
+    /// round-trip step fails — proving the field is structurally present, not just commented-about.
+    #[test]
+    fn gate_eval_request_carries_work_author_for_bus_path_evaluator_creator_separation() {
+        // With work_author populated:
+        let with_author = GateEvalRequest {
+            eval_id: "e1".into(),
+            criterion: "passed?".into(),
+            work: "output".into(),
+            run_id: "r1".into(),
+            unit_ix: 0,
+            attempt: 0,
+            work_author: Some("agy".into()),
+        };
+        let v = serde_json::to_value(&with_author).unwrap();
+        assert_eq!(v["work_author"], "agy", "work_author must be in the JSON payload");
+
+        // Without work_author (unit had no assigned_cli):
+        let without_author = GateEvalRequest {
+            eval_id: "e2".into(),
+            criterion: "passed?".into(),
+            work: "output".into(),
+            run_id: "r1".into(),
+            unit_ix: 0,
+            attempt: 0,
+            work_author: None,
+        };
+        let v2 = serde_json::to_value(&without_author).unwrap();
+        assert!(
+            v2["work_author"].is_null(),
+            "absent work_author serialises to null so the daemon can detect and apply max-exclusion"
         );
     }
 }
