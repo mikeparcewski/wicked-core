@@ -77,6 +77,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
     LaunchSpec {
+        project_id: None,
         problem: "Do step one. Do step two".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: wicked_core::EntityMode::Shared,

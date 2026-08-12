@@ -251,3 +251,50 @@ pub fn now_secs() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+/// STRICT scope-path validation for caller-supplied scopes (DES-PROJECT-001 §3.1). `Scope::parse`
+/// is lenient — it silently SKIPS malformed segments, which once re-rooted 205 memories to root —
+/// so every scope that crosses the binding boundary must pass through here first: every
+/// `/`-separated segment must be a non-empty `kind:id` with both halves non-empty. Empty string =
+/// root, which is valid.
+pub fn validate_scope_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    for seg in path.split('/') {
+        let ok = seg
+            .split_once(':')
+            .is_some_and(|(kind, id)| !kind.is_empty() && !id.is_empty());
+        if !ok {
+            anyhow::bail!(
+                "invalid scope path '{path}': segment '{seg}' is not '<kind>:<id>' \
+                 (the lenient parser would silently drop it — refusing instead)"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod scope_path_tests {
+    use super::validate_scope_path;
+
+    #[test]
+    fn strict_scope_validation_rejects_what_parse_would_drop() {
+        for ok in ["", "project:p1", "project:p1/run:r-1", "app:x/doc:y"] {
+            assert!(validate_scope_path(ok).is_ok(), "{ok:?} should be valid");
+        }
+        for bad in [
+            "project",
+            "project:",
+            ":p1",
+            "project:p1//run:r",
+            "project:p1/run",
+        ] {
+            assert!(
+                validate_scope_path(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+}

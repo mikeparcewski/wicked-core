@@ -93,6 +93,7 @@ impl StepRunner for OkRunner {
 
 fn spec(session: &str) -> LaunchSpec {
     LaunchSpec {
+        project_id: None,
         problem: "Do step one. Do step two. Do step three".into(),
         session_id: session.into(),
         clis: vec![cli("a")],

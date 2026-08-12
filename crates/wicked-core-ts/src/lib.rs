@@ -180,6 +180,10 @@ pub struct LaunchOptions {
     /// A registered `WorkflowDef` id (`feature` | `bug` | `migration` or a drop-in). When set, planning
     /// is data-driven from the def's phases; omit for the free-text planner.
     pub workflow: Option<String>,
+    /// The project to file this run into (DES-PROJECT-001). The `crew.run` membership is attached
+    /// ATOMICALLY with the launch record (one store batch); an unknown or archived project rejects
+    /// the launch with no session persisted. Omit for an unfiled run (the synthesized `default`).
+    pub project_id: Option<String>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
@@ -200,6 +204,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         human_confirm: HumanConfirm::parse(o.human_confirm.as_deref()).map_err(err)?,
         repo_ref: o.repo_ref,
         workflow: o.workflow,
+        project_id: o.project_id,
     })
 }
 
@@ -562,6 +567,227 @@ impl Core {
         task(move || {
             let repos = core.list_repos().map_err(err)?;
             serde_json::to_string(&repos).map_err(err)
+        })
+    }
+
+    // ── Projects (DES-PROJECT-001) ─────────────────────────────────────────────
+    // Writes ride the single-writer actor; reads open READ-ONLY connections, exactly
+    // like the governance reads below.
+
+    /// Create a project. Resolves to the persisted `Project` as a JSON object
+    /// (`{ id, name, description, status, scope, created_at, updated_at }`). Rejects on an
+    /// empty/overlong name or a name already used by an ACTIVE project (the API's 409).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_create(&self, name: String, description: Option<String>) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let project = core.project_create(&name, description).map_err(err)?;
+            serde_json::to_string(&project).map_err(err)
+        })
+    }
+
+    /// Rename / describe / archive / restore a project (`status`: `active` | `archived`;
+    /// `description: ""` clears it). Resolves to the updated `Project` JSON. Rejects for the
+    /// synthesized `default` project or an unknown id.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_update(
+        &self,
+        id: String,
+        name: Option<String>,
+        description: Option<String>,
+        status: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let status = match status.as_deref() {
+                Some(s) => Some(wicked_core::ProjectStatus::parse(s).map_err(err)?),
+                None => None,
+            };
+            let patch = wicked_core::ProjectPatch {
+                name,
+                description,
+                status,
+            };
+            let project = core.project_update(&id, patch).map_err(err)?;
+            serde_json::to_string(&project).map_err(err)
+        })
+    }
+
+    /// Every project on the store (all statuses — the caller filters), newest first, as a JSON
+    /// array of `Project` objects. The synthesized `default` project is an API-layer concept and
+    /// is NOT in this list.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_list(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let projects = wicked_core::list_projects(&store).map_err(err)?;
+            serde_json::to_string(&projects).map_err(err)
+        })
+    }
+
+    /// One project by id, as a JSON `Project` object — or the JSON literal `null` when unknown.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_get(&self, id: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let project = wicked_core::get_project(&store, &id).map_err(err)?;
+            serde_json::to_string(&project).map_err(err)
+        })
+    }
+
+    /// The LIVE members of a project, oldest attach first, as a JSON array of `ProjectMember`
+    /// objects (`{ id, project_id, member_kind, member_ref, meta, attached_at, attached_by }`).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_members(&self, project_id: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let members = wicked_core::list_members(&store, &project_id).map_err(err)?;
+            serde_json::to_string(&members).map_err(err)
+        })
+    }
+
+    /// Attach a member (`memberKind` is the open `<product>.<noun>` grammar, e.g. `crew.run`,
+    /// `interactive.doc`; `metaJson` is opaque JSON text; `attachedBy` ∈ studio|interactive|cli|api).
+    /// Idempotent on `(project, kind, ref)`. Resolves to `{ "member": ProjectMember, "created":
+    /// boolean }` — emit the membership.attached event only when `created` is true.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_member_attach(
+        &self,
+        project_id: String,
+        member_kind: String,
+        member_ref: String,
+        meta_json: Option<String>,
+        attached_by: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let spec = wicked_core::MemberSpec {
+                project_id,
+                member_kind,
+                member_ref,
+                meta: meta_json,
+                attached_by: attached_by.unwrap_or_else(|| "api".to_string()),
+            };
+            let (member, created) = core.project_attach_member(spec).map_err(err)?;
+            serde_json::to_string(&serde_json::json!({
+                "member": member,
+                "created": created,
+            }))
+            .map_err(err)
+        })
+    }
+
+    /// Detach a member. Resolves to `"true"` when a live membership was removed, `"false"` when
+    /// no such live member exists on that project (the caller answers 404). Detaching never
+    /// touches the member's own data (the run, the doc dir).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn project_member_detach(
+        &self,
+        project_id: String,
+        member_id: String,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let removed = core
+                .project_detach_member(&project_id, &member_id)
+                .map_err(err)?;
+            serde_json::to_string(&removed).map_err(err)
+        })
+    }
+
+    /// The project ids holding a live membership for `(memberKind, memberRef)` — the reverse read
+    /// (run → projects) the daemon uses to tag frames and synthesize the `default` project. JSON
+    /// array of strings.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn member_projects(&self, member_kind: String, member_ref: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let ids =
+                wicked_core::member_projects(&store, &member_kind, &member_ref).map_err(err)?;
+            serde_json::to_string(&ids).map_err(err)
+        })
+    }
+
+    /// Durable interaction requests (DES-PROJECT-001 §5.3), newest first, optionally filtered by
+    /// run and/or status (`open` | `answered` | `expired` | `cancelled`). JSON array of
+    /// `{ id, session_id, kind, ord, reviewing_ord, prompt, status, answer, created_at,
+    /// resolved_at }`. This is the durable truth the daemon's gate/elicitation caches demote to
+    /// latency layers over — it survives a daemon restart because the actor wrote it in the same
+    /// batch as the run's `awaiting_human` transition.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn interaction_requests(
+        &self,
+        session_id: Option<String>,
+        status: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let status = match status.as_deref() {
+                Some(s) => Some(wicked_core::InteractionStatus::parse(s).map_err(err)?),
+                None => None,
+            };
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let requests = wicked_core::list_interactions(&store, session_id.as_deref(), status)
+                .map_err(err)?;
+            serde_json::to_string(&requests).map_err(err)
+        })
+    }
+
+    // ── Memory + knowledge (the foundation record, DES-PROJECT-001 §3.2) ────────
+    // Thin wrappers over the actor's existing memory/knowledge commands, so the daemon can write
+    // the project charter + probe a project's record without opening the stores itself (they are
+    // single-writer sidecars the actor owns).
+
+    /// Capture an episodic memory at `scope` (STRICT `kind:id[/kind:id...]` path; `""` = root —
+    /// a malformed segment REJECTS rather than silently re-rooting). Resolves to `"ok"`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn capture_memory(&self, content: String, scope: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            wicked_core::validate_scope_path(&scope).map_err(err)?;
+            core.capture_memory(&content, &scope).map_err(err)?;
+            Ok("ok".to_string())
+        })
+    }
+
+    /// LIST memories within `scope`'s subtree (strict path; `""` = all), newest first, up to
+    /// `limit`. JSON array of `{ content, score, tier }`. `listMemories("project:<id>", …).length
+    /// > 0` is the cheap "does this project have a record?" probe (the ADR's memory.coverage).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn list_memories(&self, scope: String, limit: u32) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            wicked_core::validate_scope_path(&scope).map_err(err)?;
+            let memories = core.list_memories(&scope, limit as usize).map_err(err)?;
+            serde_json::to_string(&memories).map_err(err)
+        })
+    }
+
+    /// Ingest a document (title + chunks) into the knowledge store. `chunksJson` is a JSON array
+    /// of strings. Resolves to the ingested chunk count as a JSON number.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn ingest_knowledge(&self, title: String, chunks_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let chunks: Vec<String> = serde_json::from_str(&chunks_json)
+                .map_err(|e| err(format!("chunksJson is not a JSON string array: {e}")))?;
+            let n = core.ingest_knowledge(&title, chunks).map_err(err)?;
+            serde_json::to_string(&n).map_err(err)
+        })
+    }
+
+    /// Recall up to `k` knowledge chunks relevant to `query`. JSON array of
+    /// `{ content, score, source }`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn recall_knowledge(&self, query: String, k: u32) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let hits = core.recall_knowledge(&query, k as usize).map_err(err)?;
+            serde_json::to_string(&hits).map_err(err)
         })
     }
 

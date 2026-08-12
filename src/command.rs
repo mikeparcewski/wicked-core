@@ -96,6 +96,30 @@ pub(crate) enum Command {
     ListRepos {
         reply: Sender<anyhow::Result<Vec<RepoEntry>>>,
     },
+    // ── Projects (DES-PROJECT-001) — single-writer control facts, like repos ────────
+    /// Create a project (validates the name, mints the id + scope, persists).
+    ProjectCreate {
+        name: String,
+        description: Option<String>,
+        reply: Sender<anyhow::Result<crate::project::Project>>,
+    },
+    /// Rename / describe / archive / restore a project.
+    ProjectUpdate {
+        id: String,
+        patch: crate::project::ProjectPatch,
+        reply: Sender<anyhow::Result<crate::project::Project>>,
+    },
+    /// Attach a member (idempotent on `(project, kind, ref)`; bool = newly created).
+    ProjectMemberAttach {
+        spec: crate::project::MemberSpec,
+        reply: Sender<anyhow::Result<(crate::project::ProjectMember, bool)>>,
+    },
+    /// Detach a member (tombstone). `false` = no such live member on that project.
+    ProjectMemberDetach {
+        project_id: String,
+        member_id: String,
+        reply: Sender<anyhow::Result<bool>>,
+    },
     /// Register a deny policy (real governance) on the shared store — single-writer, through the
     /// actor (not a shelled binary). Blocks any tool-call in `phase` whose context contains `trigger`.
     RegisterDenyPolicy {

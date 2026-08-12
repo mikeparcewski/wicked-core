@@ -454,6 +454,16 @@ pub fn put_node(store: &mut dyn GraphStore, node: Node) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Upsert SEVERAL nodes in ONE batch — the atomic multi-record write (e.g. a run's launch stub +
+/// its project membership, or an `AwaitingHuman` session + its durable interaction request, both
+/// DES-PROJECT-001). One `begin_batch`/`commit_batch`, so the records commit together or not at all.
+pub fn put_nodes(store: &mut dyn GraphStore, nodes: &[Node]) -> anyhow::Result<()> {
+    store.begin_batch()?;
+    store.upsert_nodes(nodes)?;
+    store.commit_batch()?;
+    Ok(())
+}
+
 /// Read an [`AgentSession`] back by id.
 pub fn get_session(
     store: &dyn GraphRead,

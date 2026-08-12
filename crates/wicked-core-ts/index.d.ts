@@ -25,6 +25,12 @@ export interface LaunchOptions {
    * is data-driven from the def's phases; omit for the free-text planner.
    */
   workflow?: string
+  /**
+   * The project to file this run into (DES-PROJECT-001). The `crew.run` membership is attached
+   * ATOMICALLY with the launch record (one store batch); an unknown or archived project rejects
+   * the launch with no session persisted. Omit for an unfiled run (the synthesized `default`).
+   */
+  projectId?: string
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -148,6 +154,80 @@ export declare class Core {
   registerRepo(name: string, rootPath: string): Promise<string>
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
+  /**
+   * Create a project. Resolves to the persisted `Project` as a JSON object
+   * (`{ id, name, description, status, scope, created_at, updated_at }`). Rejects on an
+   * empty/overlong name or a name already used by an ACTIVE project (the API's 409).
+   */
+  projectCreate(name: string, description?: string | undefined | null): Promise<string>
+  /**
+   * Rename / describe / archive / restore a project (`status`: `active` | `archived`;
+   * `description: ""` clears it). Resolves to the updated `Project` JSON. Rejects for the
+   * synthesized `default` project or an unknown id.
+   */
+  projectUpdate(id: string, name?: string | undefined | null, description?: string | undefined | null, status?: string | undefined | null): Promise<string>
+  /**
+   * Every project on the store (all statuses — the caller filters), newest first, as a JSON
+   * array of `Project` objects. The synthesized `default` project is an API-layer concept and
+   * is NOT in this list.
+   */
+  projectList(): Promise<string>
+  /** One project by id, as a JSON `Project` object — or the JSON literal `null` when unknown. */
+  projectGet(id: string): Promise<string>
+  /**
+   * The LIVE members of a project, oldest attach first, as a JSON array of `ProjectMember`
+   * objects (`{ id, project_id, member_kind, member_ref, meta, attached_at, attached_by }`).
+   */
+  projectMembers(projectId: string): Promise<string>
+  /**
+   * Attach a member (`memberKind` is the open `<product>.<noun>` grammar, e.g. `crew.run`,
+   * `interactive.doc`; `metaJson` is opaque JSON text; `attachedBy` ∈ studio|interactive|cli|api).
+   * Idempotent on `(project, kind, ref)`. Resolves to `{ "member": ProjectMember, "created":
+   * boolean }` — emit the membership.attached event only when `created` is true.
+   */
+  projectMemberAttach(projectId: string, memberKind: string, memberRef: string, metaJson?: string | undefined | null, attachedBy?: string | undefined | null): Promise<string>
+  /**
+   * Detach a member. Resolves to `"true"` when a live membership was removed, `"false"` when
+   * no such live member exists on that project (the caller answers 404). Detaching never
+   * touches the member's own data (the run, the doc dir).
+   */
+  projectMemberDetach(projectId: string, memberId: string): Promise<string>
+  /**
+   * The project ids holding a live membership for `(memberKind, memberRef)` — the reverse read
+   * (run → projects) the daemon uses to tag frames and synthesize the `default` project. JSON
+   * array of strings.
+   */
+  memberProjects(memberKind: string, memberRef: string): Promise<string>
+  /**
+   * Durable interaction requests (DES-PROJECT-001 §5.3), newest first, optionally filtered by
+   * run and/or status (`open` | `answered` | `expired` | `cancelled`). JSON array of
+   * `{ id, session_id, kind, ord, reviewing_ord, prompt, status, answer, created_at,
+   * resolved_at }`. This is the durable truth the daemon's gate/elicitation caches demote to
+   * latency layers over — it survives a daemon restart because the actor wrote it in the same
+   * batch as the run's `awaiting_human` transition.
+   */
+  interactionRequests(sessionId?: string | undefined | null, status?: string | undefined | null): Promise<string>
+  /**
+   * Capture an episodic memory at `scope` (STRICT `kind:id[/kind:id...]` path; `""` = root —
+   * a malformed segment REJECTS rather than silently re-rooting). Resolves to `"ok"`.
+   */
+  captureMemory(content: string, scope: string): Promise<string>
+  /**
+   * LIST memories within `scope`'s subtree (strict path; `""` = all), newest first, up to
+   * `limit`. JSON array of `{ content, score, tier }`. `listMemories("project:<id>", …).length
+   * > 0` is the cheap "does this project have a record?" probe (the ADR's memory.coverage).
+   */
+  listMemories(scope: string, limit: number): Promise<string>
+  /**
+   * Ingest a document (title + chunks) into the knowledge store. `chunksJson` is a JSON array
+   * of strings. Resolves to the ingested chunk count as a JSON number.
+   */
+  ingestKnowledge(title: string, chunksJson: string): Promise<string>
+  /**
+   * Recall up to `k` knowledge chunks relevant to `query`. JSON array of
+   * `{ content, score, source }`.
+   */
+  recallKnowledge(query: string, k: number): Promise<string>
   /** All registered governance policies, as a JSON array of `Policy` objects. */
   listPolicies(): Promise<string>
   /** All conformance rules on the store (Pattern + Policy types), as a JSON array. */
@@ -210,6 +290,24 @@ export declare class Core {
    * never blocks the single-writer actor.
    */
   getCoverageReport(): Promise<string>
+  /**
+   * Coverage for ONE registered repo, computed over that repo's OWN code graph — not the daemon's
+   * bookkeeping store (FINDING-009). `get_coverage_report` above reads `self.db_path` (the daemon
+   * `core.db`), which holds run/governance nodes but none of a repo's domain/requirement nodes, so
+   * it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo. This
+   * resolves the repo from the registry, opens its `code_graph_db` (`<root>/.codegraph/estate.db`,
+   * the one spelling every consumer shares), and recomputes over it. An unknown `repo_ref` is an
+   * ERROR, never a silent vacuous report — the caller must name a real repo.
+   * Resolves to the coverage report as a JSON string (`ts_return_type` pins it — the crew adapter
+   * used to cast away an `unknown` here; #225 review).
+   */
+  getCoverageReportForRepo(repoRef: string): Promise<string>
+  /**
+   * Node-count-by-kind summary of ONE registered repo's code graph, over that repo's OWN store
+   * (#122). Resolves to a JSON string: an array of `{ "kind": string, "count": number }`,
+   * kind-sorted. An unknown `repo_ref` REJECTS — never a silent empty summary.
+   */
+  getGraphKindsForRepo(repoRef: string): Promise<string>
   /**
    * Open a PTY terminal session running `cmd` (or the login shell if omitted) in `cwd`, sized
    * `cols`x`rows`. `governed=false` is a loud, opt-in UNGOVERNED operator shell that bypasses the

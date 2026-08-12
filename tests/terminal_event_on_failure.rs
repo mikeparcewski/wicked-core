@@ -119,6 +119,7 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
 
     let run_id = core
         .launch_run(LaunchSpec {
+            project_id: None,
             problem: "this run must die at plan time".into(),
             clis: vec![cli("a")],
             entity_mode: EntityMode::Shared,

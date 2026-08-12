@@ -113,6 +113,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
     );
     // "build" unit + "review" unit (the keyword classifies stage), roster of two seats.
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "Build the auth feature. Then review it for security".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,

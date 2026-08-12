@@ -153,6 +153,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(session_id: &str, problem: &str) -> LaunchSpec {
     LaunchSpec {
+        project_id: None,
         problem: problem.into(),
         clis: vec![cli("a")],
         entity_mode: wicked_core::EntityMode::Shared,

@@ -306,6 +306,7 @@ mod tests {
 
         // Launch a single-unit run; the blocking runner will hold the session in Executing.
         core.launch_run(LaunchSpec {
+            project_id: None,
             problem: "do step one".to_string(),
             clis: vec![mk_cli("a"), mk_cli("b")],
             entity_mode: EntityMode::Shared,

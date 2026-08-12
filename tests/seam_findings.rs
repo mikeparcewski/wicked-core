@@ -178,6 +178,7 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
 
     // Two units; unit 1's description trips the deny → the SYNC run must halt as Failed BEFORE unit 2.
     let _ = core.launch(LaunchSpec {
+        project_id: None,
         problem: "please DENYME this task. then a second task".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
@@ -214,6 +215,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
     }
     let core = Core::spawn_with_engine(db, Arc::new(StubDispatcher), Arc::new(OkRunner));
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "fix the bug".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
@@ -268,6 +270,7 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
     let core = Core::spawn_with_engine(db, Arc::new(StubDispatcher), Arc::new(OkRunner));
     let events = core.subscribe();
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "fix the bug".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
@@ -330,6 +333,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         }),
     );
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "task one. task two".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
