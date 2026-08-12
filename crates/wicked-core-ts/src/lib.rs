@@ -664,6 +664,13 @@ impl Core {
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
+            // `meta` is opaque to the ENGINE, but the contract says it is JSON text — enforce
+            // that here at the boundary so a malformed blob is refused rather than persisted
+            // for a downstream consumer to choke on (Copilot, PR #246).
+            if let Some(ref meta) = meta_json {
+                serde_json::from_str::<serde_json::Value>(meta)
+                    .map_err(|e| err(format!("metaJson is not valid JSON: {e}")))?;
+            }
             let spec = wicked_core::MemberSpec {
                 project_id,
                 member_kind,

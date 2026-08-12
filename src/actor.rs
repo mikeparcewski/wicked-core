@@ -3999,13 +3999,21 @@ pub(crate) fn cancel_run(
     put_node(store, session.to_node())?;
     // A cancelled run's open prompt is dead state — resolve it `cancelled` so no skin renders a
     // gate nobody can answer (DES-PROJECT-001 §5.3). No-op when the run was answered/never paused.
-    let _ = crate::interaction::resolve_open_for_session(
+    // Best-effort by design (the cancel itself already committed), but LOGGED: a prompt stuck
+    // open after a failed resolve keeps rendering in UIs, and silence would make that
+    // undiagnosable (Copilot, PR #246).
+    if let Err(e) = crate::interaction::resolve_open_for_session(
         store,
         run_id,
         crate::interaction::InteractionStatus::Cancelled,
         None,
         crate::interaction::now_millis(),
-    );
+    ) {
+        eprintln!(
+            "wicked-core: failed to resolve {run_id}'s open interaction request on cancel \
+             (the prompt may keep rendering as open): {e}"
+        );
+    }
     // FORCE-discard the worktree — Cancel is the operator explicitly abandoning the work, the one
     // terminal status where uncommitted bytes are discarded on purpose. Completed/Failed runs reap
     // through `reap_terminal_worktree` instead (FINDING-003): a clean tree goes, unlanded work stays.
@@ -4079,21 +4087,24 @@ fn capture_run_outcome(
     // An UNFILED run's outcome stays at ROOT — the global briefing pool that `recall` (querying at
     // root) draws from. A PROJECT-BOUND run's outcome is scope-prefixed `project:<id>/run:<run_id>`
     // (DES-PROJECT-001 §3.2) so the project has a record; root listing/recall still sees it
-    // (subtree inheritance — root is an ancestor of every scope).
-    let scope =
+    // (subtree inheritance — root is an ancestor of every scope). Membership is many-to-many by
+    // design (§9.4), so EVERY holding project gets the outcome under its own scope — scoping only
+    // the first would leave the other projects recordless (Copilot, PR #246).
+    let scopes: Vec<wicked_estate_memory_core::Scope> =
         match crate::project::member_projects(store, crate::project::MEMBER_KIND_RUN, run_id) {
-            Ok(pids) if !pids.is_empty() => wicked_estate_memory_core::Scope::parse(&format!(
-                "project:{}/run:{run_id}",
-                pids[0]
-            )),
-            _ => wicked_estate_memory_core::Scope::root(),
+            Ok(pids) if !pids.is_empty() => pids
+                .iter()
+                .map(|pid| {
+                    wicked_estate_memory_core::Scope::parse(&format!("project:{pid}/run:{run_id}"))
+                })
+                .collect(),
+            _ => vec![wicked_estate_memory_core::Scope::root()],
         };
-    if let Err(e) = mem.capture(
-        format!("Run '{brief}' ({run_id}) {outcome}{detail}."),
-        scope,
-        crate::memory::now_secs(),
-    ) {
-        eprintln!("wicked-core: memory capture failed: {e}");
+    let content = format!("Run '{brief}' ({run_id}) {outcome}{detail}.");
+    for scope in scopes {
+        if let Err(e) = mem.capture(content.clone(), scope, crate::memory::now_secs()) {
+            eprintln!("wicked-core: memory capture failed: {e}");
+        }
     }
 }
 

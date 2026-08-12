@@ -187,12 +187,14 @@ pub struct MemberSpec {
 }
 
 /// Mint a lowercase, time-sortable project id: `proj_<millis:013><seq:05>`. The seq disambiguates
-/// same-millisecond creates; ids are minted only on the single-writer actor, so this is unique per
-/// store. (The ADR's `proj_<ulid>` intent — lowercase + time-sortable — without a new dependency,
-/// mirroring `wicked-council`'s sortable-id idiom.)
+/// same-millisecond creates. Sortability comes from here; UNIQUENESS does not — a counter alone
+/// cannot promise it across process restarts (Copilot, PR #246), so [`create_project`] verifies
+/// the minted id against the store and re-mints on the (pathological) hit. The seq deliberately
+/// does NOT wrap: past 99_999 in one process lifetime the id merely widens, which stays unique
+/// and stays lexicographically sortable for ids sharing a millisecond prefix width.
 pub fn mint_project_id(now_ms: i64) -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed) % 100_000;
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     format!("proj_{:013}{:05}", now_ms.max(0), seq)
 }
 
@@ -233,7 +235,19 @@ pub fn create_project(
     {
         anyhow::bail!("project name '{name}' is already in use by an active project");
     }
-    let id = mint_project_id(now_ms);
+    // Uniqueness is VERIFIED, not assumed: the seq counter resets on restart, so the mint alone
+    // cannot rule out a collision with a stored id. An upsert on a hit would silently overwrite
+    // an existing project — re-mint instead (the seq advances each try; termination is bounded).
+    let mut id = mint_project_id(now_ms);
+    for _ in 0..8 {
+        if get_project(store, &id)?.is_none() {
+            break;
+        }
+        id = mint_project_id(now_ms);
+    }
+    if get_project(store, &id)?.is_some() {
+        anyhow::bail!("could not mint a unique project id (8 collisions — store anomaly?)");
+    }
     let project = Project {
         scope: format!("project:{id}"),
         id,
@@ -257,6 +271,10 @@ pub fn list_projects(store: &dyn GraphRead) -> anyhow::Result<Vec<Project>> {
         .find_symbols(&query)?
         .iter()
         .filter_map(|n| Project::from_node(n).ok())
+        // The reserved id can never be created through this module, but a migrated or hand-edited
+        // store could carry one — filter it so the "synthesized, never stored" invariant holds on
+        // READ regardless of what the store holds (Copilot, PR #246).
+        .filter(|p| p.id != DEFAULT_PROJECT_ID)
         .collect();
     projects.sort_by(|a, b| b.id.cmp(&a.id)); // ids are time-sortable → newest first
     Ok(projects)
@@ -264,6 +282,11 @@ pub fn list_projects(store: &dyn GraphRead) -> anyhow::Result<Vec<Project>> {
 
 /// Read one project by id (`None` for unknown — and always `None` for the synthesized `default`).
 pub fn get_project(store: &dyn GraphRead, id: &str) -> anyhow::Result<Option<Project>> {
+    // Enforce the reserved-id contract at the read seam itself, not just in the writers: even a
+    // store carrying a rogue `default` node must never surface it as a real project.
+    if id == DEFAULT_PROJECT_ID {
+        return Ok(None);
+    }
     match store.get_node(&synthetic_symbol(PROJECT, id))? {
         Some(node) => Ok(Some(Project::from_node(&node)?)),
         None => Ok(None),
