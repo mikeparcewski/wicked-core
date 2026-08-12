@@ -227,6 +227,24 @@ fn enforce_evaluator_distinct(
     if roster_keys.len() < 2 || builder_clis.is_empty() {
         return; // can't distinguish with one seat / nothing built
     }
+    // Warn when every roster seat is a builder CLI so operators can detect degraded separation.
+    // `find` below will return `None` for every Review/Test unit in this configuration, leaving
+    // them on their original (builder) CLI with no routing change — silently, unless we speak up.
+    let has_evaluator_seat = roster_keys.iter().any(|k| !builder_clis.contains(k));
+    if !has_evaluator_seat {
+        let review_test_affected = units.iter().zip(dists.iter()).any(|(u, d)| {
+            u.tool_cmd.is_none()
+                && matches!(u.stage, StageKind::Review | StageKind::Test)
+                && builder_clis.contains(&d.assigned_cli)
+        });
+        if review_test_affected {
+            eprintln!(
+                "wicked-core: evaluator\u{2260}creator separation cannot be enforced: all roster \
+                 seats are assigned Build/Recon phases; Review/Test phases will use builder CLIs. \
+                 Consider adding a dedicated evaluator seat."
+            );
+        }
+    }
     for (u, d) in units.iter().zip(dists.iter_mut()) {
         if u.tool_cmd.is_some() {
             continue; // Tool phases have no CLI to distinct

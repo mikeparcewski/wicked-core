@@ -4,14 +4,14 @@
 //! module gives core three capabilities against that log, all speaking the *same* SQLite schema the
 //! JS bus reads/writes so a row written here is indistinguishable from one the JS `emit()` wrote:
 //!
-//!  1. [`BusDb::emit`] — publish a `wicked.<noun>.<verb>` event (deterministic idempotency key, the
+//!  1. [`BusDb::emit`] — publish a `wicked.<event_domain>.<noun>.<verb>` event (deterministic idempotency key, the
 //!     bus's two-timer TTL) into the `events` table.
 //!  2. [`BusDb::poll`] — read events by filter past an integer cursor floor (at-least-once, idempotent
 //!     — the caller advances its own floor; a re-read is harmless because the launch it drives is
 //!     idempotent by run id).
 //!  3. [`spawn_run_requested_poller`] / [`connect`] — a DEDICATED thread that turns each
-//!     `wicked.run.requested {workflow, problem, args}` into a `Command::LaunchRun` posted to the
-//!     actor, and (proof of the publish path) emits `wicked.run.launched` back onto the bus.
+//!     `wicked.crew.run.requested {workflow, problem, args}` into a `Command::LaunchRun` posted to the
+//!     actor, and (proof of the publish path) emits `wicked.crew.run.launched` back onto the bus.
 //!
 //! ## Why raw SQL and not `wicked_apps_core::emit_event_to`
 //! `emit_event_to` writes an `EVENT` *node* onto the ESTATE graph store — a different database with a
@@ -116,10 +116,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// A `wicked.<noun>.<verb>` event ready to publish onto the bus. `domain` is the publisher identity
-/// (e.g. `wicked-core`), `subdomain` its functional area (e.g. `core.run`). A `None` idempotency_key
-/// means "always a new row" (a fresh UUID is minted); pass `Some(..)` for a deterministic, dedup-able
-/// event (the bus enforces UNIQUE on the key).
+/// An event ready to publish onto the bus. The `event_type` string follows the
+/// `wicked.<event_domain>.<noun>.<verb>` 4-segment grammar (e.g. `wicked.crew.run.requested`).
+///
+/// Note on naming: the `domain` field here is the **publisher identity** (e.g. `wicked-core`),
+/// not the `<event_domain>` segment of the event-type string — those two happen to share the
+/// word "domain" but carry different information. The `subdomain` field is the functional area
+/// within the publisher (e.g. `core.run`).
+///
+/// A `None` idempotency_key means "always a new row" (a fresh UUID is minted); pass `Some(..)`
+/// for a deterministic, dedup-able event (the bus enforces UNIQUE on the key).
 #[derive(Debug, Clone)]
 pub struct BusEmit {
     pub event_type: String,
@@ -417,7 +423,7 @@ fn fresh_key() -> String {
 }
 
 /// A deterministic idempotency key from parts (SHA-256 hex, truncated). Use for lifecycle events that
-/// must dedup across at-least-once redelivery (e.g. `wicked.run.launched` keyed on the run id).
+/// must dedup across at-least-once redelivery (e.g. `wicked.crew.run.launched` keyed on the run id).
 pub fn deterministic_key(parts: &[&str]) -> String {
     let mut h = Sha256::new();
     for p in parts {
@@ -477,7 +483,7 @@ pub const RUN_LAUNCHED: &str = "wicked.crew.run.launched";
 /// The domain core publishes under.
 pub const CORE_DOMAIN: &str = "wicked-core";
 
-/// The `wicked.run.requested` payload contract: `{ workflow?, problem, args? }`.
+/// The `wicked.crew.run.requested` payload contract: `{ workflow?, problem, args? }`.
 #[derive(Debug, Deserialize)]
 struct RunRequested {
     /// A registered `WorkflowDef` id (`feature`/`bug`/`migration`/drop-in). `None` ⇒ the free-text planner.
@@ -526,7 +532,7 @@ impl Drop for BusBridge {
     }
 }
 
-/// Spawn the launch bridge: a dedicated poller thread reading `wicked.run.requested` from the bus db
+/// Spawn the launch bridge: a dedicated poller thread reading `wicked.crew.run.requested` from the bus db
 /// at `bus_db_path` and posting a `Command::LaunchRun` (built from each event) to the actor over `tx`.
 /// Returns a [`BusBridge`] owning the thread. See the module docs for the actor-safety argument.
 pub fn connect(
@@ -668,8 +674,8 @@ enum BridgeError {
     Permanent(anyhow::Error),
 }
 
-/// Turn one `wicked.run.requested` event into a `LaunchRun` posted to the actor, then emit
-/// `wicked.run.launched` back onto the bus (proof of the publish path). Idempotent redeliveries (the
+/// Turn one `wicked.crew.run.requested` event into a `LaunchRun` posted to the actor, then emit
+/// `wicked.crew.run.launched` back onto the bus (proof of the publish path). Idempotent redeliveries (the
 /// run is already in flight — [`RunBusy`] — or already exists non-terminally — [`RunExists`]) are
 /// treated as SUCCESS, not failure: the launched event is still (idempotently) emitted so downstream
 /// consumers see a stable signal, and the poller advances its floor past the request.
@@ -758,7 +764,7 @@ fn launch_from_event(
     }
 }
 
-/// Emit `wicked.run.launched {run_id, workflow, problem}` — deterministically keyed on the run id so
+/// Emit `wicked.crew.run.launched {run_id, workflow, problem}` — deterministically keyed on the run id so
 /// at-least-once redelivery dedups to one row. Best-effort: a failed publish is logged, never fatal.
 fn emit_run_launched(db: &BusDb, run_id: &str, workflow: Option<&str>, problem: &str) {
     let payload = serde_json::json!({
