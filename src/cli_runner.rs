@@ -1492,7 +1492,10 @@ mod tests {
             work_author: Some("agy".into()),
         };
         let v = serde_json::to_value(&with_author).unwrap();
-        assert_eq!(v["work_author"], "agy", "work_author must be in the JSON payload");
+        assert_eq!(
+            v["work_author"], "agy",
+            "work_author must be in the JSON payload"
+        );
 
         // Without work_author (unit had no assigned_cli):
         let without_author = GateEvalRequest {
