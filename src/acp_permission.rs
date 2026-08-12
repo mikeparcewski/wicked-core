@@ -57,12 +57,21 @@ const REJECT_KINDS: [&str; 2] = ["reject_once", "reject_always"];
 ///
 /// Returns `None` when the request carries no usable tool name, which the caller treats as a deny.
 pub(crate) fn pretool_payload(params: &Value) -> Option<(String, Value)> {
-    // The bridge sends the tool name at the top level and the arguments under `toolCall.rawInput`.
-    // `rawInput` is the tool's own argument object — the same thing Claude's hook calls
-    // `tool_input` — so the two line up field-for-field.
+    // The bridge sends the tool name at the top level (`toolName`) and the arguments under
+    // `toolCall.rawInput`. `rawInput` is the tool's own argument object — the same thing
+    // Claude's hook calls `tool_input` — so the two line up field-for-field.
+    //
+    // Fallback chain (FINDING-100 / core#100): some bridge versions (and some tool types, such as
+    // MCP tools surfaced through the estate server) omit the top-level `toolName` field and carry
+    // the canonical tool name only in `toolCall.name`. `toolCall.title` is a human-readable
+    // per-call description (e.g. "Reading /tmp/foo") — NOT the canonical name — so it is the last
+    // resort and must not substitute for `toolCall.name` when the latter is present.
+    // Without the `toolCall.name` step this function returned `None`, causing `permission_result`
+    // to answer `cancelled` (deny) with no governance record, silently blocking legitimate calls.
     let tool = params
         .get("toolName")
         .and_then(Value::as_str)
+        .or_else(|| params.pointer("/toolCall/name").and_then(Value::as_str))
         .or_else(|| params.pointer("/toolCall/title").and_then(Value::as_str))
         .filter(|s| !s.is_empty())?
         .to_string();
@@ -334,5 +343,87 @@ mod tests {
     fn a_request_without_a_tool_name_is_not_evaluable() {
         assert!(pretool_payload(&json!({"sessionId": "s1"})).is_none());
         assert!(pretool_payload(&json!({"toolName": ""})).is_none());
+    }
+
+    /// FINDING-100 / core#100 regression: the ACP bridge sometimes omits the top-level `toolName`
+    /// and only carries the canonical tool name in `toolCall.name`. The old fallback went straight
+    /// to `toolCall.title` (a human-readable description, not the canonical name), so these
+    /// permission requests returned `None` → `cancelled` (deny) with no governance record,
+    /// silently blocking legitimate tool calls.
+    ///
+    /// This test proves both that `toolCall.name` is now resolved AND that it is preferred over
+    /// `toolCall.title` when both are present (a display title like "Reading /tmp/foo" is NOT a
+    /// valid tool identity for governance evaluation).
+    #[test]
+    fn tool_name_resolves_from_tool_call_name_when_top_level_is_absent() {
+        // Case 1: only `toolCall.name` present (no top-level `toolName`, no `toolCall.title`).
+        // This is the exact shape that caused the (unknown) deny before the fix.
+        let params = json!({
+            "sessionId": "s1",
+            "toolCall": {
+                "toolCallId": "tc-1",
+                "name": "Bash",
+                "rawInput": {"command": "ls -la"}
+            },
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "reject", "kind": "reject_once"},
+            ],
+        });
+        let (tool, payload) = pretool_payload(&params)
+            .expect("toolCall.name must resolve the tool when toolName is absent");
+        assert_eq!(tool, "Bash", "canonical name extracted from toolCall.name");
+        assert_eq!(payload["tool_name"], "Bash");
+        assert_eq!(payload["tool_input"]["command"], "ls -la");
+
+        // The shared context builder must read it — same as the `acp_params_translate` test.
+        let (context, name) =
+            crate::gate_hook::claude_pretool_context(&payload.to_string(), "unit", "build");
+        assert_eq!(name, "Bash");
+        assert_eq!(context["command"], "ls -la");
+
+        // Case 2: `toolCall.name` wins over `toolCall.title` — title is a display string, not an
+        // identity, so governance must never evaluate a call under its display description.
+        let params_with_title = json!({
+            "sessionId": "s2",
+            "toolCall": {
+                "toolCallId": "tc-2",
+                "name": "Read",
+                "title": "Reading /tmp/important.txt",
+                "rawInput": {"file_path": "/tmp/important.txt"}
+            },
+        });
+        let (tool2, _) = pretool_payload(&params_with_title)
+            .expect("toolCall.name must win over toolCall.title");
+        assert_eq!(
+            tool2, "Read",
+            "toolCall.name ('Read') must take precedence over toolCall.title ('Reading /tmp/…')"
+        );
+
+        // Case 3: `toolName` at the top level still wins when all three are present — preserving
+        // existing behaviour for bridges that do send the top-level field.
+        let params_all = json!({
+            "toolName": "Edit",
+            "toolCall": {"name": "Edit", "title": "Editing /src/main.rs", "rawInput": {}},
+        });
+        let (tool3, _) = pretool_payload(&params_all).expect("toolName wins when present");
+        assert_eq!(tool3, "Edit");
+
+        // Case 4: MCP-prefixed tool names (e.g. estate server tools) resolve correctly.
+        // `mcp__wicked-estate__SearchEntity` must survive the extraction unchanged so governance
+        // policies can match on the full name.
+        let mcp_params = json!({
+            "toolCall": {
+                "toolCallId": "tc-mcp",
+                "name": "mcp__wicked-estate__SearchEntity",
+                "rawInput": {"query": "fn pretool_payload"}
+            },
+        });
+        let (tool4, _) = pretool_payload(&mcp_params)
+            .expect("MCP tool name must resolve from toolCall.name");
+        assert_eq!(
+            tool4, "mcp__wicked-estate__SearchEntity",
+            "full MCP-prefixed name must be preserved for policy evaluation"
+        );
     }
 }
