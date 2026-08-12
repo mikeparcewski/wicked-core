@@ -68,12 +68,24 @@ pub(crate) fn pretool_payload(params: &Value) -> Option<(String, Value)> {
     // resort and must not substitute for `toolCall.name` when the latter is present.
     // Without the `toolCall.name` step this function returned `None`, causing `permission_result`
     // to answer `cancelled` (deny) with no governance record, silently blocking legitimate calls.
+    // Empty strings at any step must not short-circuit the fallback — an explicit `"toolName": ""`
+    // is semantically absent and must fall through to `toolCall.name` / `toolCall.title`.
     let tool = params
         .get("toolName")
         .and_then(Value::as_str)
-        .or_else(|| params.pointer("/toolCall/name").and_then(Value::as_str))
-        .or_else(|| params.pointer("/toolCall/title").and_then(Value::as_str))
-        .filter(|s| !s.is_empty())?
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            params
+                .pointer("/toolCall/name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            params
+                .pointer("/toolCall/title")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })?
         .to_string();
     let input = params
         .pointer("/toolCall/rawInput")
@@ -424,6 +436,24 @@ mod tests {
         assert_eq!(
             tool4, "mcp__wicked-estate__SearchEntity",
             "full MCP-prefixed name must be preserved for policy evaluation"
+        );
+
+        // Case 5: empty `toolName` string must fall through to `toolCall.name`, not return None.
+        // An explicit `"toolName": ""` sent by a bridge is semantically absent — the filter must
+        // apply BEFORE the or_else chain so the fallback is actually reached.
+        let params_empty_toplevel = json!({
+            "toolName": "",
+            "toolCall": {
+                "toolCallId": "tc-5",
+                "name": "Write",
+                "rawInput": {"file_path": "/src/lib.rs", "content": ""}
+            },
+        });
+        let (tool5, _) = pretool_payload(&params_empty_toplevel)
+            .expect("empty toolName must fall through to toolCall.name");
+        assert_eq!(
+            tool5, "Write",
+            "toolCall.name must be reached when toolName is an empty string"
         );
     }
 }

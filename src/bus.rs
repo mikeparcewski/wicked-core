@@ -4,7 +4,7 @@
 //! module gives core three capabilities against that log, all speaking the *same* SQLite schema the
 //! JS bus reads/writes so a row written here is indistinguishable from one the JS `emit()` wrote:
 //!
-//!  1. [`BusDb::emit`] — publish a `wicked.<domain>.<noun>.<verb>` event (deterministic idempotency key, the
+//!  1. [`BusDb::emit`] — publish a `wicked.<event_domain>.<noun>.<verb>` event (deterministic idempotency key, the
 //!     bus's two-timer TTL) into the `events` table.
 //!  2. [`BusDb::poll`] — read events by filter past an integer cursor floor (at-least-once, idempotent
 //!     — the caller advances its own floor; a re-read is harmless because the launch it drives is
@@ -116,10 +116,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// A `wicked.<domain>.<noun>.<verb>` event ready to publish onto the bus. `domain` is the publisher identity
-/// (e.g. `wicked-core`), `subdomain` its functional area (e.g. `core.run`). A `None` idempotency_key
-/// means "always a new row" (a fresh UUID is minted); pass `Some(..)` for a deterministic, dedup-able
-/// event (the bus enforces UNIQUE on the key).
+/// An event ready to publish onto the bus. The `event_type` string follows the
+/// `wicked.<event_domain>.<noun>.<verb>` 4-segment grammar (e.g. `wicked.crew.run.requested`).
+///
+/// Note on naming: the `domain` field here is the **publisher identity** (e.g. `wicked-core`),
+/// not the `<event_domain>` segment of the event-type string — those two happen to share the
+/// word "domain" but carry different information. The `subdomain` field is the functional area
+/// within the publisher (e.g. `core.run`).
+///
+/// A `None` idempotency_key means "always a new row" (a fresh UUID is minted); pass `Some(..)`
+/// for a deterministic, dedup-able event (the bus enforces UNIQUE on the key).
 #[derive(Debug, Clone)]
 pub struct BusEmit {
     pub event_type: String,
