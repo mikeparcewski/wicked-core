@@ -511,7 +511,7 @@ fn run_unit_and_judge_with_roster(
             .validator
             .as_ref()
             .filter(|v| v.approved)
-            .and_then(|v| {
+            .map(|v| {
                 // BUS PATH: when `WICKED_BUS_DB` is set, publish a gate-evaluation request and wait for
                 // the governed evaluator daemon to respond (no subprocess, no dangerous flags, no TTY).
                 // On timeout or any error the function returns a hard DENY (fail-closed governance —
@@ -529,7 +529,7 @@ fn run_unit_and_judge_with_roster(
                         &bus_path,
                         work_author,
                     );
-                    return Some((av.pass, av.reasoning));
+                    return (av.pass, av.reasoning);
                 }
                 // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
                 // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
@@ -544,18 +544,16 @@ fn run_unit_and_judge_with_roster(
                     .as_deref()
                     .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
                 let excluded = [crate::validator::DETERMINISTIC_VALIDATOR_SEAT, work_author];
-                Some(
-                    match crate::validator::agent_validate(
-                        &v.criterion,
-                        work_for_agent,
-                        &excluded,
-                        roster,
-                        &**runner,
-                    ) {
-                        Ok(av) => (av.pass, av.reasoning),
-                        Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
-                    },
-                )
+                match crate::validator::agent_validate(
+                    &v.criterion,
+                    work_for_agent,
+                    &excluded,
+                    roster,
+                    &**runner,
+                ) {
+                    Ok(av) => (av.pass, av.reasoning),
+                    Err(e) => (false, format!("agent validator errored (fail-closed): {e}")),
+                }
             })
     } else {
         None
