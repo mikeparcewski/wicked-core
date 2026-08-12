@@ -714,6 +714,8 @@ fn launch_from_event(
         human_confirm,
         repo_ref: req.args.repo_ref.clone(),
         workflow: req.workflow.clone(),
+        // Bus-requested runs are unfiled in v1 — filing arrives via the daemon API's `projectId`.
+        project_id: None,
     };
 
     let (reply, rx) = channel();

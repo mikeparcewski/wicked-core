@@ -106,6 +106,7 @@ fn cli(key: &str) -> AgenticCli {
 
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
+        project_id: None,
         problem: "Do step one. Do step two".into(),
         clis: vec![cli("fake-a"), cli("fake-b")],
         entity_mode: wicked_core::EntityMode::Shared,

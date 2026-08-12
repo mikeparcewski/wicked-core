@@ -390,6 +390,7 @@ fn main() {
                 human_confirm: HumanConfirm::None,
                 repo_ref: None,
                 workflow: flag(&args, "--workflow"),
+                project_id: flag(&args, "--project"),
             });
             println!(
                 "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
@@ -691,6 +692,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         human_confirm,
         repo_ref,
         workflow: flag(args, "--workflow"),
+        project_id: flag(args, "--project"),
     }) {
         Ok(id) => id,
         Err(e) => {

@@ -114,6 +114,7 @@ fn core_for(name: &str) -> (Core, Arc<Mutex<Vec<Option<PathBuf>>>>) {
 
 fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
     LaunchSpec {
+        project_id: None,
         problem: "Do the one task".into(),
         clis: vec![cli("a")],
         entity_mode: wicked_core::EntityMode::Shared,

@@ -153,6 +153,7 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
     let ev = core.subscribe();
     core.register_workflow(&def_json).unwrap();
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "Do the thing.".into(),
         clis: vec![cli("stub")],
         entity_mode: EntityMode::Shared,
@@ -213,6 +214,7 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
     let ev = core.subscribe();
     core.register_workflow(&def_json).unwrap();
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "Do the thing.".into(),
         clis: vec![cli("stub")],
         entity_mode: EntityMode::Shared,

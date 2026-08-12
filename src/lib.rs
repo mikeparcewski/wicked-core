@@ -34,6 +34,7 @@ mod execute;
 mod execute_wrapped;
 mod gate_hook;
 mod graph_browser;
+mod interaction;
 mod knowledge;
 #[cfg(test)]
 mod lockstep;
@@ -42,6 +43,7 @@ mod outstanding_work;
 pub mod path_policy;
 mod pipeline;
 mod plan;
+mod project;
 mod repo;
 mod repo_intel;
 mod scope;
@@ -73,7 +75,7 @@ pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
 pub use command::InjectTarget;
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
-    all_sessions, get_session, get_work_output, put_node, session_units, AgentSession,
+    all_sessions, get_session, get_work_output, put_node, put_nodes, session_units, AgentSession,
     HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind, UnitStatus, WorkUnit,
 };
 pub use domain_extraction::{
@@ -92,10 +94,19 @@ pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,
 };
+pub use interaction::{
+    list_interactions, now_millis, InteractionKind, InteractionRequest, InteractionStatus,
+    INTERACTION_REQUEST,
+};
 pub use knowledge::RecalledKnowledge;
-pub use memory::{now_secs, RecalledMemory};
+pub use memory::{now_secs, validate_scope_path, RecalledMemory};
 pub use pipeline::SessionResult;
 pub use plan::plan_from_def;
+pub use project::{
+    get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
+    Project, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID, MEMBER_KIND_RUN,
+    PROJECT, PROJECT_MEMBER,
+};
 pub use repo::{coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoSpec};
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
@@ -137,6 +148,12 @@ pub struct LaunchSpec {
     /// `kind`) via [`crate::plan_from_def`]. `None` ⇒ the legacy free-text planner (prose split +
     /// keyword classify), so existing callers are unchanged.
     pub workflow: Option<String>,
+    /// The project this run is filed into (DES-PROJECT-001 §2.2). When set, the actor validates
+    /// the project (must exist and be active) and attaches the `crew.run` membership IN THE SAME
+    /// BATCH as the run's launch record — a crash cannot leave the run outside its project. An
+    /// invalid or archived id fails the launch with no session persisted. `None` ⇒ unfiled (the
+    /// synthesized `default` project).
+    pub project_id: Option<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's
@@ -602,6 +619,68 @@ impl Core {
         let (reply, rx) = channel();
         self.tx
             .send(Command::ListRepos { reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    // ── Projects (DES-PROJECT-001) ───────────────────────────────────────────────
+    // Writes go through the actor (the single writer); reads are open_store_ro at the
+    // binding layer, exactly like governance reads.
+
+    /// Create a project: validate the name (1–120 chars, unique among active projects), mint the
+    /// `proj_<sortable>` id + `project:<id>` scope, persist. Returns the created [`Project`].
+    pub fn project_create(
+        &self,
+        name: &str,
+        description: Option<String>,
+    ) -> anyhow::Result<Project> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ProjectCreate {
+                name: name.to_string(),
+                description,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Rename / describe / archive / restore a project (`active ⇄ archived`; no hard delete).
+    pub fn project_update(&self, id: &str, patch: ProjectPatch) -> anyhow::Result<Project> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ProjectUpdate {
+                id: id.to_string(),
+                patch,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Attach a member to a project. Idempotent on `(project, kind, ref)` — the bool is `true`
+    /// only when a NEW membership was written (the caller emits its bus event on that).
+    pub fn project_attach_member(&self, spec: MemberSpec) -> anyhow::Result<(ProjectMember, bool)> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ProjectMemberAttach { spec, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Detach a member (tombstone — the member's own data is never touched). `false` = not found.
+    pub fn project_detach_member(&self, project_id: &str, member_id: &str) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ProjectMemberDetach {
+                project_id: project_id.to_string(),
+                member_id: member_id.to_string(),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?

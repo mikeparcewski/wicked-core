@@ -88,6 +88,7 @@ fn tmp_dir(name: &str) -> std::path::PathBuf {
 
 fn spec(session_id: &str) -> LaunchSpec {
     LaunchSpec {
+        project_id: None,
         // Two sentences → the free-text planner decomposes into 2 units.
         problem: "Do step one. Do step two".into(),
         clis: vec![cli("fake-a"), cli("fake-b")],
@@ -485,6 +486,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         bus_db.clone(),
     );
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "fix the bug".into(),
         clis: vec![cli("fake-a"), cli("fake-b")],
         entity_mode: EntityMode::Shared,

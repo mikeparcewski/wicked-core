@@ -294,6 +294,7 @@ fn a_denied_tool_call_fails_the_session() {
         Arc::new(HookDenyRunner),
     );
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "Build the thing".into(),
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Isolated,
@@ -333,6 +334,7 @@ fn a_shell_hostile_session_id_is_rejected_at_launch() {
         "a|b",
     ] {
         let res = core.launch_run(LaunchSpec {
+            project_id: None,
             problem: "Build the thing".into(),
             clis: vec![cli("a")],
             entity_mode: EntityMode::Isolated,

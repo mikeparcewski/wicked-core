@@ -113,6 +113,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
 
     // One unit: the planner produces a single unit whose description becomes the echo prompt.
     core.launch_run(LaunchSpec {
+        project_id: None,
         problem: "wicked-orchestrator-marker".into(),
         clis: vec![echo_cli()],
         entity_mode: wicked_core::EntityMode::Shared,

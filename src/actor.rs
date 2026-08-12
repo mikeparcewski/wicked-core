@@ -437,6 +437,7 @@ pub(crate) fn run(
                     human_confirm: _, // legacy straight-through path ignores gates
                     repo_ref: _,      // legacy path has no worktree
                     workflow,
+                    project_id: _, // legacy path predates projects; filing rides LaunchRun only
                 } = spec;
                 // Legacy straight-through path: runs to completion on this thread (stub = fast).
                 let res = pipeline::run_session(
@@ -506,6 +507,30 @@ pub(crate) fn run(
                     } else {
                         (None, None)
                     };
+                    // Project filing (DES-PROJECT-001 §2.2): validate BEFORE the stub write so an
+                    // invalid/archived project is a synchronous Err with NO session persisted —
+                    // never a silent unfiled run the caller believed was filed. The membership row
+                    // is built here and committed IN THE SAME BATCH as the stub below.
+                    let project_member = match spec.project_id {
+                        Some(ref pid) => {
+                            let mspec = crate::project::MemberSpec {
+                                project_id: pid.clone(),
+                                member_kind: crate::project::MEMBER_KIND_RUN.to_string(),
+                                member_ref: run_id.clone(),
+                                meta: None,
+                                attached_by: "api".to_string(),
+                            };
+                            match crate::project::validate_attach(&store, &mspec)? {
+                                // A re-launch of a terminal run that is already filed: keep the row.
+                                Some(existing) => Some(existing),
+                                None => Some(crate::project::member_from_spec(
+                                    &mspec,
+                                    crate::interaction::now_millis(),
+                                )),
+                            }
+                        }
+                        None => None,
+                    };
                     // Governed unit limit check (fast, no LLM): reject over-limit runs BEFORE
                     // creating the stub so callers receive a synchronous Err, preserving the
                     // contract that an error at launch means no session was persisted.
@@ -552,7 +577,13 @@ pub(crate) fn run(
                         workdir: None, // resolved off-thread; updated in WorktreeReady
                         repo_ref: repo_ref.clone(),
                     };
-                    put_node(&mut store, stub.to_node())?;
+                    // ONE batch: the launch record and (when filed) its membership commit together
+                    // — a crash between "run exists" and "run is in the project" cannot happen.
+                    let mut launch_nodes = vec![stub.to_node()];
+                    if let Some(ref member) = project_member {
+                        launch_nodes.push(member.to_node());
+                    }
+                    crate::domain::put_nodes(&mut store, &launch_nodes)?;
                     emit(
                         &mut subscribers,
                         CoreEvent::SessionStarted {
@@ -1068,6 +1099,42 @@ pub(crate) fn run(
                 let res = cancel_run(&mut store, &mut subscribers, &runner, &self_tx, &run_id);
                 in_flight.remove(&run_id);
                 let _ = reply.send(res);
+            }
+            // ── Projects (DES-PROJECT-001) — CoreEvent frames are NOT changed in v1 (§2.2):
+            // the daemon emits the bus vocabulary post-commit from these replies.
+            Command::ProjectCreate {
+                name,
+                description,
+                reply,
+            } => {
+                let now = crate::interaction::now_millis();
+                let _ = reply.send(crate::project::create_project(
+                    &mut store,
+                    &name,
+                    description,
+                    now,
+                ));
+            }
+            Command::ProjectUpdate { id, patch, reply } => {
+                let now = crate::interaction::now_millis();
+                let _ = reply.send(crate::project::update_project(&mut store, &id, patch, now));
+            }
+            Command::ProjectMemberAttach { spec, reply } => {
+                let now = crate::interaction::now_millis();
+                let _ = reply.send(crate::project::attach_member(&mut store, spec, now));
+            }
+            Command::ProjectMemberDetach {
+                project_id,
+                member_id,
+                reply,
+            } => {
+                let now = crate::interaction::now_millis();
+                let _ = reply.send(crate::project::detach_member(
+                    &mut store,
+                    &project_id,
+                    &member_id,
+                    now,
+                ));
             }
             Command::RegisterRepo { spec, reply } => {
                 let res = crate::repo::register_repo(&mut store, spec);
@@ -3156,7 +3223,17 @@ fn pause_for_human(
     prompt: String,
 ) -> anyhow::Result<()> {
     session.status = SessionStatus::AwaitingHuman;
-    put_node(store, session.to_node())?;
+    // DES-PROJECT-001 §5.3: the prompt is DURABLE STATE, not just an event — the session's
+    // AwaitingHuman write and the open interaction_request commit in ONE batch, so a skin that
+    // was not connected when this fired (or a daemon restarted after it) still finds the prompt.
+    let request = crate::interaction::open_gate(
+        &session.id,
+        ord,
+        reviewing_ord,
+        &prompt,
+        crate::interaction::now_millis(),
+    );
+    crate::domain::put_nodes(store, &[session.to_node(), request.to_node()])?;
     emit(
         subscribers,
         CoreEvent::AwaitingHuman {
@@ -3743,6 +3820,27 @@ pub(crate) fn confirm_gate(
         );
     }
 
+    // DES-PROJECT-001 §5.3: the durable prompt resolves on the SAME command that resolves the
+    // gate — `answered`, with the decision payload. This is what empties `/projects/:id/prompts`
+    // the moment ANY skin answers. (The Reject arm still cancels below; the human DID answer.)
+    {
+        let answer = match &decision {
+            crate::workflow::HumanDecision::Approve { amend } => {
+                serde_json::json!({ "approve": true, "amend": amend }).to_string()
+            }
+            crate::workflow::HumanDecision::Reject => {
+                serde_json::json!({ "approve": false, "amend": null }).to_string()
+            }
+        };
+        crate::interaction::resolve_open_for_session(
+            store,
+            run_id,
+            crate::interaction::InteractionStatus::Answered,
+            Some(answer),
+            crate::interaction::now_millis(),
+        )?;
+    }
+
     match decision {
         crate::workflow::HumanDecision::Reject => {
             let s = cancel_run(store, subscribers, runner, self_tx, run_id)?;
@@ -3899,6 +3997,23 @@ pub(crate) fn cancel_run(
     }
     session.status = SessionStatus::Cancelled;
     put_node(store, session.to_node())?;
+    // A cancelled run's open prompt is dead state — resolve it `cancelled` so no skin renders a
+    // gate nobody can answer (DES-PROJECT-001 §5.3). No-op when the run was answered/never paused.
+    // Best-effort by design (the cancel itself already committed), but LOGGED: a prompt stuck
+    // open after a failed resolve keeps rendering in UIs, and silence would make that
+    // undiagnosable (Copilot, PR #246).
+    if let Err(e) = crate::interaction::resolve_open_for_session(
+        store,
+        run_id,
+        crate::interaction::InteractionStatus::Cancelled,
+        None,
+        crate::interaction::now_millis(),
+    ) {
+        eprintln!(
+            "wicked-core: failed to resolve {run_id}'s open interaction request on cancel \
+             (the prompt may keep rendering as open): {e}"
+        );
+    }
     // FORCE-discard the worktree — Cancel is the operator explicitly abandoning the work, the one
     // terminal status where uncommitted bytes are discarded on purpose. Completed/Failed runs reap
     // through `reap_terminal_worktree` instead (FINDING-003): a clean tree goes, unlanded work stays.
@@ -3969,14 +4084,27 @@ fn capture_run_outcome(
     } else {
         String::new()
     };
-    if let Err(e) = mem.capture(
-        format!("Run '{brief}' ({run_id}) {outcome}{detail}."),
-        // Run outcomes stay at ROOT — the global briefing pool that `recall` (querying at root) draws
-        // from. Only APPLICATION memories carry an `app:<id>` scope for per-app listing.
-        wicked_estate_memory_core::Scope::root(),
-        crate::memory::now_secs(),
-    ) {
-        eprintln!("wicked-core: memory capture failed: {e}");
+    // An UNFILED run's outcome stays at ROOT — the global briefing pool that `recall` (querying at
+    // root) draws from. A PROJECT-BOUND run's outcome is scope-prefixed `project:<id>/run:<run_id>`
+    // (DES-PROJECT-001 §3.2) so the project has a record; root listing/recall still sees it
+    // (subtree inheritance — root is an ancestor of every scope). Membership is many-to-many by
+    // design (§9.4), so EVERY holding project gets the outcome under its own scope — scoping only
+    // the first would leave the other projects recordless (Copilot, PR #246).
+    let scopes: Vec<wicked_estate_memory_core::Scope> =
+        match crate::project::member_projects(store, crate::project::MEMBER_KIND_RUN, run_id) {
+            Ok(pids) if !pids.is_empty() => pids
+                .iter()
+                .map(|pid| {
+                    wicked_estate_memory_core::Scope::parse(&format!("project:{pid}/run:{run_id}"))
+                })
+                .collect(),
+            _ => vec![wicked_estate_memory_core::Scope::root()],
+        };
+    let content = format!("Run '{brief}' ({run_id}) {outcome}{detail}.");
+    for scope in scopes {
+        if let Err(e) = mem.capture(content.clone(), scope, crate::memory::now_secs()) {
+            eprintln!("wicked-core: memory capture failed: {e}");
+        }
     }
 }
 
