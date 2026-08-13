@@ -5916,8 +5916,6 @@ else:
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             cost_usd: Some(0.42),
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
         });
         let mut files: Vec<String> = Vec::new();
 
