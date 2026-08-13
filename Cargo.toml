@@ -47,13 +47,13 @@ wicked-orchestration = { path = "crates/wicked-orchestration" }
 wicked-council = { path = "crates/wicked-council" }
 # wicked-estate — published crates.io semver deps. No sibling checkout: CI/local/operator all
 # resolve the SAME registry release, killing the path-dep coupling + napi artifact drift.
-wicked-estate-core = "0.14.3"
-wicked-estate-rank = "0.14.3"
-wicked-estate-retrieve = { version = "0.14.3", features = ["model2vec"] }
+wicked-estate-core = "0.14.5"
+wicked-estate-rank = "0.14.5"
+wicked-estate-retrieve = { version = "0.14.5", features = ["model2vec"] }
 # Memory + knowledge migrated off tombstone wicked-memory/-core/knowledge-mcp onto estate.
-wicked-estate-memory = "0.14.3"
-wicked-estate-memory-core = "0.14.3"
-wicked-estate-knowledge = "0.14.3"
+wicked-estate-memory = "0.14.5"
+wicked-estate-memory-core = "0.14.5"
+wicked-estate-knowledge = "0.14.5"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

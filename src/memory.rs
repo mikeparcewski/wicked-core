@@ -12,7 +12,7 @@
 //! It also exposes an in-process MCP tool surface ([`RunMemory::mcp`]) so other agents can call
 //! `memory.recall` / `memory.capture` over JSON-RPC.
 
-use wicked_estate_memory::MemoryEngine;
+use wicked_estate_memory::{MemoryEngine, ScopeFilter};
 use wicked_estate_memory_core::{MemKind, Memory, Scope, Tier};
 
 /// A recalled memory, flattened for the Core API (egui-free, serde-friendly).
@@ -158,7 +158,7 @@ impl RunMemory {
         let budget = k.saturating_mul(64).max(64);
         let recalled = self
             .engine
-            .recall(query, &Scope::root(), &[], budget, now)
+            .recall(query, ScopeFilter::Ancestors(&Scope::root()), &[], budget, now)
             .map_err(|e| anyhow::anyhow!("recall memory: {e}"))?;
         Ok(recalled
             .into_iter()
