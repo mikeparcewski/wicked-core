@@ -6321,8 +6321,7 @@ else:
     #[test]
     #[cfg(unix)]
     fn epoch_cleanup_fires_on_normal_exec_turn_completion_no_leak() {
-        let dir = std::env::temp_dir()
-            .join(format!("wicked-254-cleanup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wicked-254-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let maps_arc = Arc::new(Mutex::new(ElicitationMaps::new()));
