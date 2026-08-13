@@ -429,7 +429,7 @@ impl BusDb {
         Ok(())
     }
 
-    /// Scan the `wicked.task.completed` stream starting from `consumer`'s durable cursor floor and
+    /// Scan the `wicked.crew.task.completed` stream starting from `consumer`'s durable cursor floor and
     /// return the FIRST event whose payload `run_id` and `launch_seq` match. Does NOT advance the
     /// consumer's cursor — the caller decides whether and when to persist the floor.
     ///

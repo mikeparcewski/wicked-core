@@ -480,7 +480,7 @@ impl Core {
     }
 
     /// Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;
-    /// `response` is the human's typed/selected value serialised as a JSON string — pass `null` for
+    /// `response` is the human's typed/selected value as a JSON-typed value — pass `null` for
     /// `decline`/`cancel`. Resolves to `"ok"` on success, rejects if no matching elicitation exists.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn resolve_elicitation(
@@ -488,15 +488,11 @@ impl Core {
         run_id: String,
         elicitation_id: String,
         action: String,
-        response: Option<String>,
+        response: Option<serde_json::Value>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
-            let response_value: Option<serde_json::Value> = match response {
-                Some(s) => Some(serde_json::from_str(&s).map_err(err)?),
-                None => None,
-            };
-            core.resolve_elicitation(&run_id, &elicitation_id, action, response_value)
+            core.resolve_elicitation(&run_id, &elicitation_id, action, response)
                 .map(|_| "ok".to_string())
                 .map_err(err)
         })
