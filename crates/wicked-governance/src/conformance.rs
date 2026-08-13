@@ -190,6 +190,7 @@ impl ConformanceRule {
             resolved_by: CONFORMANCE_RESOLVED_BY.to_string(),
             location: None,
             metadata: Metadata::new(),
+            evidence_count: 0,
         }
     }
 }

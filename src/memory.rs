@@ -158,7 +158,7 @@ impl RunMemory {
         let budget = k.saturating_mul(64).max(64);
         let recalled = self
             .engine
-            .recall(query, &Scope::root(), &[], budget, now)
+            .recall(query, wicked_estate_memory::ScopeFilter::Ancestors(&Scope::root()), &[], budget, now)
             .map_err(|e| anyhow::anyhow!("recall memory: {e}"))?;
         Ok(recalled
             .into_iter()

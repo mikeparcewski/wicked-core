@@ -3464,6 +3464,17 @@ impl StepRunner for AcpStepRunner {
     /// `wait()` on the child process, which blocks. Doing that on the actor thread would stall
     /// the entire actor while waiting for the subprocess to exit.
     fn on_run_complete(&self, run_id: &str) {
+        // Defensive cancel: shared_run_terminal does the primary cancel_epoch before calling
+        // on_run_complete, but if it was skipped (e.g. non-ACP path or future code path),
+        // this ensures no in-flight elicitations are left dangling. Guarded by has_active_run
+        // so PTY runs and tool_cmd units (epoch 0) never insert a stale tombstone.
+        {
+            let mut maps = self.elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+            if maps.has_active_run(run_id) {
+                let epoch = maps.current_epoch(run_id);
+                maps.cancel_epoch(run_id, epoch);
+            }
+        }
         let sessions = self.sessions.clone();
         let pending_injects = self.pending_injects.clone();
         let write_reg = self.write_reg.clone();
