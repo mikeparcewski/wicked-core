@@ -1093,16 +1093,30 @@ pub(crate) fn run(
                     Ok(StepApplied::Finished) => {
                         in_flight.remove(&run_id);
                         capture_run_outcome(memory.as_mut(), &store, &run_id);
+                        if let Some(ack_tx) = ack {
+                            let _ = ack_tx.send(());
+                        }
                     }
                     // Paused at a gate → not terminal, no capture (avoids a needless store read).
                     Ok(StepApplied::Paused) => {
                         in_flight.remove(&run_id);
+                        if let Some(ack_tx) = ack {
+                            let _ = ack_tx.send(());
+                        }
                     }
                     // Next unit dispatched → still in flight (leave it).
-                    Ok(StepApplied::Continuing) => {}
+                    Ok(StepApplied::Continuing) => {
+                        if let Some(ack_tx) = ack {
+                            let _ = ack_tx.send(());
+                        }
+                    }
                     // A stale/duplicate result for a superseded/terminal run → ignore; do NOT touch
                     // in_flight (a live worker, if any, still owns it).
-                    Ok(StepApplied::Stale) => {}
+                    Ok(StepApplied::Stale) => {
+                        if let Some(ack_tx) = ack {
+                            let _ = ack_tx.send(());
+                        }
+                    }
                     Err(e) => {
                         emit_run_error(&mut subscribers, &run_id, e);
                         // Never leave a run non-terminal on an apply error — that would wedge the session
@@ -1129,12 +1143,12 @@ pub(crate) fn run(
                             }
                         }
                         in_flight.remove(&run_id);
+                        // Intentionally do NOT ack on error: the bus consumer sees RecvError and
+                        // withholds cursor advancement, triggering a re-delivery. On re-delivery the
+                        // run will be terminal (fail_run above) → StepApplied::Stale → ack fires
+                        // from the Stale arm above, durably advancing the cursor. `None` on all
+                        // non-bus paths so the drop is a no-op there.
                     }
-                }
-                // ACP elicitation bus consumer ack (DES-002): signal AFTER store commit so the
-                // consumer's cursor advance is durable. `None` on all non-bus paths.
-                if let Some(ack_tx) = ack {
-                    let _ = ack_tx.send(());
                 }
             }
             Command::ConfirmGate {
@@ -1531,7 +1545,7 @@ pub(crate) fn run(
             }
             // ── Campaign DAG scheduler (DES-CAMPAIGN-001) ────────────────────────────────────────
             Command::LaunchCampaign { def, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
                 let res = crate::campaign::launch(
                     &mut store,
                     &mut subscribers,
@@ -1542,7 +1556,7 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::ResumeCampaign { id, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
                 let res = crate::campaign::resume(
                     &mut store,
                     &mut subscribers,
@@ -1553,7 +1567,7 @@ pub(crate) fn run(
                 let _ = reply.send(res);
             }
             Command::CancelCampaign { id, reply } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
                 let res = crate::campaign::cancel(
                     &mut store,
                     &mut subscribers,
@@ -1573,7 +1587,7 @@ pub(crate) fn run(
                 decision,
                 reply,
             } => {
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
                 let res = crate::campaign::confirm_gate(
                     &mut store,
                     &mut subscribers,
@@ -1596,7 +1610,7 @@ pub(crate) fn run(
             Command::CampaignRunFinished { run_id, outcome } => {
                 // Deferred reconcile of a per-Run terminal signal (sent from the run's terminal emit
                 // points). No-op if the run isn't campaign-owned.
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
                 if let Err(e) = crate::campaign::on_run_finished(
                     &mut store,
                     &mut subscribers,
@@ -1610,7 +1624,7 @@ pub(crate) fn run(
             }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
-                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry);
+                let seams = campaign_seams(&dispatcher, &runner, &self_tx, &registry, process_gen);
                 if let Err(e) = crate::campaign::on_node_awaiting(
                     &mut store,
                     &mut subscribers,
@@ -2413,12 +2427,14 @@ fn campaign_seams<'a>(
     runner: &'a Arc<dyn StepRunner>,
     self_tx: &'a Sender<Command>,
     registry: &'a crate::workflow::WorkflowRegistry,
+    process_gen: uuid::Uuid,
 ) -> crate::campaign::Seams<'a> {
     crate::campaign::Seams {
         dispatcher,
         runner,
         self_tx,
         registry,
+        process_gen,
     }
 }
 

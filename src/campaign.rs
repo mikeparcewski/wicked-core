@@ -614,6 +614,9 @@ pub(crate) struct Seams<'a> {
     /// The actor-owned workflow registry (built-ins + file overlay + runtime-registered defs).
     /// Passed to `launch_run_inner` so campaign nodes can use defs registered at runtime.
     pub registry: &'a crate::workflow::WorkflowRegistry,
+    /// Actor's `process_gen` UUID — passed to `launch_run_inner`/`confirm_gate` so
+    /// exec-bus consumers (DES-002) can match campaign-owned tasks to this actor instance.
+    pub process_gen: uuid::Uuid,
 }
 
 /// Record + fan out one event (mirrors the actor's single-emit-point helper). Both helpers now bottom
@@ -762,7 +765,7 @@ fn dispatch(
             seams.registry,
             &None,
             &None,
-            uuid::Uuid::nil(),
+            seams.process_gen,
             false,
         )
         .map(|_| ())
@@ -783,7 +786,7 @@ fn dispatch(
             decision,
             &None,
             &None,
-            uuid::Uuid::nil(),
+            seams.process_gen,
             false,
         )
         .map(|_| ())
@@ -1002,7 +1005,7 @@ pub(crate) fn confirm_gate(
                 HumanDecision::Reject,
                 &None,
                 &None,
-                uuid::Uuid::nil(),
+                seams.process_gen,
                 false,
             );
         }
@@ -1220,7 +1223,7 @@ pub(crate) fn resume(
                         seams.registry,
                         &None,
                         &None,
-                        uuid::Uuid::nil(),
+                        seams.process_gen,
                         false,
                     )
                     .map(|_| ()),
@@ -1261,7 +1264,7 @@ pub(crate) fn resume(
                     run_id,
                     &None,
                     &None,
-                    uuid::Uuid::nil(),
+                    seams.process_gen,
                     false,
                 ) {
                     emit(
