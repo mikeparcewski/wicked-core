@@ -9,19 +9,18 @@ __      _(_) ___| | _____  __| |       ___ ___  _ __ ___
 
 # wicked-core
 
-**The runtime that makes wicked-estate concurrency-safe.**
+**The execution engine behind wicked-crew — and the concurrency-safe runtime for wicked-estate.**
 
-wicked-core is the in-process composition runtime for wicked-estate's services. A single-writer
-store actor owns the SQLite file on one thread while the agent, UI, and MCP servers compose through
-a shared command API and a live event stream — so consumers stop re-opening, racing on, and polling
-the shared database. It is also being grown into the agentic-CLI orchestrator engine
-(recon → adversarial-review → functional-test) that [wicked-crew](https://github.com/mikeparcewski/wicked-crew)
-drives.
+wicked-core is the in-process composition runtime that powers [wicked-crew](https://github.com/mikeparcewski/wicked-crew):
+workflows-as-data, data-driven planning, skills-driven CLI invocation, and the governed gate ladder.
+A single-writer store actor owns the SQLite file on one thread while the agent, UI, and MCP servers
+compose through a shared command API and a live event stream — no consumer ever re-opens or races on
+the shared DB.
 
-> **Status:** design/active. **v0.1.0, unpublished** — and structurally unpublishable to crates.io
-> today (a path dependency on the unpublished estate 0.13, plus four vendored engine crates marked
-> `publish = false`). The orchestrator build is mid-flight (P0/P1/P1.5 done and green; the CI gate
-> has landed). Not end-user-facing.
+> **Status:** active. **v0.4.0, not published to crates.io** — four internal workspace crates are
+> marked `publish = false` (`wicked-apps-core`, `wicked-governance`, `wicked-orchestration`,
+> `wicked-council`). The estate path-dep coupling is resolved (now pins published crates.io semver).
+> Not end-user-facing — consumed by the wicked-crew daemon via napi-rs bindings.
 
 **The differentiator:** it cleanly separates the *system-of-record* (SQLite, one owning writer
 thread) from the *orchestration seam* (a command API + a live event stream), so no consumer ever
@@ -37,23 +36,22 @@ re-opens or races on the shared DB.
   Postgres, the same command/event API across both backends.
 - **One composition surface** for plan → distribute → execute → evidence, plus cross-platform
   PTY terminal sessions streamed as events.
-- **napi-rs Node/TS bindings** (`wicked-core-ts`) so JS/TS callers — the crew daemon and its bundled
-  studio HITL UI (`wicked-crew/packages/studio`) — drive runs and consume the event stream.
+- **napi-rs Node/TS bindings** (`wicked-core-ts`) so JS/TS callers — the crew daemon and
+  [wicked-studio](https://github.com/mikeparcewski/wicked-studio) (the Studio HITL UI, now its own repo) — drive runs and consume the event stream.
 
 ## Audience
 
 Internal. The consumers are the other wicked-* products — the [wicked-crew](https://github.com/mikeparcewski/wicked-crew)
-daemon (including its bundled studio HITL UI, `wicked-crew/packages/studio`), and the MCP servers — that compose
+daemon (via napi-rs bindings; the Studio UI lives in the separate [wicked-studio](https://github.com/mikeparcewski/wicked-studio) repo), and the MCP servers — that compose
 [wicked-estate](https://github.com/mikeparcewski/wicked-estate).
 
 ## The foundation
 
-wicked-core is the **runtime** of the [wicked-* foundation](https://wickedagile.com): a
+wicked-core is the **execution engine** of the [wicked-* foundation](https://wickedagile.com): a
 local-first stack for AI coding agents anchored by
-[wicked-estate](https://github.com/mikeparcewski/wicked-estate) (the code graph), with
-[wicked-bus](https://github.com/mikeparcewski/wicked-bus) (the event substrate),
-[wicked-brain](https://github.com/mikeparcewski/wicked-brain) (memory), and
-[wicked-crew](https://github.com/mikeparcewski/wicked-crew) (the workflow governor).
+[wicked-estate](https://github.com/mikeparcewski/wicked-estate) (the code graph + memory + knowledge), with
+[wicked-bus](https://github.com/mikeparcewski/wicked-bus) (the event substrate), and
+[wicked-crew](https://github.com/mikeparcewski/wicked-crew) (the workflow governor, which drives this engine).
 
 ## License
 
