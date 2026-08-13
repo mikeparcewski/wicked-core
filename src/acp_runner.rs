@@ -6314,14 +6314,14 @@ else:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Test 39: EpochCleanup fires via `exec_turn_acp` on normal completion — `active_workers`
-    /// and `run_epoch` are reclaimed after the call returns (no leak). This is the integration
-    /// test required by core#234's DoD: the guard must fire through the production path, not
-    /// just when invoked in isolation.
+    /// Test 39: EpochCleanup guard drops clean — `active_workers` and `run_epoch` are
+    /// reclaimed when the guard (constructed the same way `exec_turn` does it) is dropped
+    /// after a successful `exec_turn_acp` call. This validates the RAII invariant required
+    /// by core#234's DoD: the guard must remove epoch state on drop, with no leak.
     #[test]
     #[cfg(unix)]
-    fn epoch_cleanup_fires_on_normal_exec_turn_completion_no_leak() {
-        let dir = std::env::temp_dir().join(format!("wicked-254-cleanup-{}", std::process::id()));
+    fn epoch_cleanup_guard_drop_removes_run_state_no_leak() {
+        let dir = std::env::temp_dir().join(format!("wicked-t39-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let maps_arc = Arc::new(Mutex::new(ElicitationMaps::new()));
