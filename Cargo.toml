@@ -69,6 +69,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 portable-pty = "0.8"
 # base64-encode raw PTY output bytes for the `TerminalOutput` event (CoreEvent → tagged JSON).
 base64 = "0.22"
+# ACP elicitation (DES-002): UUID minting for elicitation IDs + process-gen tokens; structured tracing.
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
 
 [features]
 default = []

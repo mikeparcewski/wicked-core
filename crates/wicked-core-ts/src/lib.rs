@@ -479,6 +479,25 @@ impl Core {
         task(move || core.cancel_run(&run_id).map(status_token).map_err(err))
     }
 
+    /// Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;
+    /// `response` is the human's typed/selected value as a JSON-typed value — pass `null` for
+    /// `decline`/`cancel`. Resolves to `"ok"` on success, rejects if no matching elicitation exists.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn resolve_elicitation(
+        &self,
+        run_id: String,
+        elicitation_id: String,
+        action: String,
+        response: Option<serde_json::Value>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.resolve_elicitation(&run_id, &elicitation_id, action, response)
+                .map(|_| "ok".to_string())
+                .map_err(err)
+        })
+    }
+
     // NOTE: there is intentionally no `pauseRun`. wicked-core has no imperative pause — a run pauses
     // ONLY at a declared human-confirm gate (set `humanConfirm` to `all` / `before:<ord>` at launch).
     // Exposing a fake `pauseRun` would misrepresent the engine, so it is omitted (see the report).

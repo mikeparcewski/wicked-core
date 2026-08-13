@@ -3324,6 +3324,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tracing",
+ "uuid",
  "wicked-apps-core",
  "wicked-council",
  "wicked-estate-core",

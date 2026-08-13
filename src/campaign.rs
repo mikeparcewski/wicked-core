@@ -614,6 +614,9 @@ pub(crate) struct Seams<'a> {
     /// The actor-owned workflow registry (built-ins + file overlay + runtime-registered defs).
     /// Passed to `launch_run_inner` so campaign nodes can use defs registered at runtime.
     pub registry: &'a crate::workflow::WorkflowRegistry,
+    /// Actor's `process_gen` UUID — passed to `launch_run_inner`/`confirm_gate` so
+    /// exec-bus consumers (DES-002) can match campaign-owned tasks to this actor instance.
+    pub process_gen: uuid::Uuid,
 }
 
 /// Record + fan out one event (mirrors the actor's single-emit-point helper). Both helpers now bottom
@@ -760,6 +763,10 @@ fn dispatch(
             in_flight,
             ls,
             seams.registry,
+            &None,
+            &None,
+            seams.process_gen,
+            false,
         )
         .map(|_| ())
     } else {
@@ -777,6 +784,10 @@ fn dispatch(
             in_flight,
             &run_id,
             decision,
+            &None,
+            &None,
+            seams.process_gen,
+            false,
         )
         .map(|_| ())
     };
@@ -992,6 +1003,10 @@ pub(crate) fn confirm_gate(
                 in_flight,
                 &run_id,
                 HumanDecision::Reject,
+                &None,
+                &None,
+                seams.process_gen,
+                false,
             );
         }
         // ── HumanGateOnFailure policy gate ──────────────────────────────────────
@@ -1206,6 +1221,10 @@ pub(crate) fn resume(
                         in_flight,
                         spec.to_launch_spec(run_id.clone()),
                         seams.registry,
+                        &None,
+                        &None,
+                        seams.process_gen,
+                        false,
                     )
                     .map(|_| ()),
                     None => Err(anyhow::anyhow!("resume: unknown node {node}")),
@@ -1243,6 +1262,10 @@ pub(crate) fn resume(
                     seams.self_tx,
                     in_flight,
                     run_id,
+                    &None,
+                    &None,
+                    seams.process_gen,
+                    false,
                 ) {
                     emit(
                         subscribers,

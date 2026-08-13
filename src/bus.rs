@@ -111,6 +111,21 @@ CREATE TABLE IF NOT EXISTS core_exec_cursors (
 );
 "#;
 
+/// Stable-owner registry for wicked-core's bus consumer name generation (DES-002 startup
+/// reclamation). Maps an arbitrary `key` (e.g. `"cli-runner-owner"`) to the CURRENT canonical
+/// consumer name so a new daemon can find the predecessor's cursor name and migrate its position.
+///
+/// ## Distinct from `core_exec_cursors`
+/// `core_exec_cursors` stores per-consumer CURSOR POSITIONS (integer event ids); `core_exec_meta`
+/// stores per-key STRING METADATA (the current owner name). Never touch `schema_migrations`
+/// (would break JS WB-005). The JS bus silently ignores unknown tables.
+const CURSOR_OWNERS_DDL: &str = r#"
+CREATE TABLE IF NOT EXISTS core_exec_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+"#;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -253,6 +268,9 @@ impl BusDb {
         // wicked-core's OWN durable-cursor table (namespaced, JS-bus-ignored — see CURSORS_DDL).
         conn.execute_batch(CURSORS_DDL)
             .context("ensure core_exec_cursors table")?;
+        // Stable-owner registry (DES-002 startup reclamation — see CURSOR_OWNERS_DDL).
+        conn.execute_batch(CURSOR_OWNERS_DDL)
+            .context("ensure core_exec_meta table")?;
         let (default_ttl_hours, dedup_ttl_hours) = load_bus_ttls(path);
         Ok(Self {
             conn,
@@ -371,6 +389,102 @@ impl BusDb {
             rusqlite::params![consumer, last_event_id],
         )?;
         Ok(())
+    }
+
+    /// Remove a consumer's cursor row from `core_exec_cursors`. Used by startup cursor reclamation
+    /// (DES-002) to delete the predecessor's cursor row AFTER migrating its position to the new name.
+    /// A missing row is a no-op (idempotent delete).
+    pub fn delete_cursor(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM core_exec_cursors WHERE consumer_name = ?1",
+            rusqlite::params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Read the current stable-owner value for `key` from `core_exec_meta`.
+    /// Returns `Ok(None)` when no row exists (first boot), `Ok(Some(value))` when one does,
+    /// or `Err(...)` on a SQLite error. The `Err` path is intentional — callers must fail
+    /// closed rather than silently minting a new owner and racing with the old one.
+    pub fn get_stable(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM core_exec_meta WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Upsert the stable-owner value for `key` in `core_exec_meta`. Called by startup cursor
+    /// reclamation AFTER migrating predecessor cursor positions and deleting old rows, so the
+    /// stable record always reflects a consumer whose cursor row actually exists.
+    pub fn set_stable(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO core_exec_meta(key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Scan the `wicked.crew.task.completed` stream starting from `consumer`'s durable cursor floor and
+    /// return the FIRST event whose payload `run_id` and `launch_seq` match. Does NOT advance the
+    /// consumer's cursor — the caller decides whether and when to persist the floor.
+    ///
+    /// ## Why scan, not peek
+    /// Interleaved completions from other runs may sit BEFORE the target event in the stream. A
+    /// peek-only implementation returns `None` incorrectly, causing the caller to treat a
+    /// succeeded task as unresolved. Scanning all events until the match (or stream-end) is correct.
+    ///
+    /// ## Filter by payload fields
+    /// The match uses `serde_json::Value` field inspection so it is forward-compatible: a field
+    /// absent from older wire payloads yields `None` (via `as_str()`/`as_u64()` returning `None`),
+    /// and those older events are skipped, not matched. `launch_seq=0` rows from pre-DES-002
+    /// payloads are therefore never matched (callers always pass a non-zero `launch_seq`).
+    pub fn find_completed(
+        &self,
+        consumer: &str,
+        run_id: &str,
+        launch_seq: u64,
+    ) -> Result<Option<BusEvent>> {
+        let floor = self.load_cursor(consumer)?.unwrap_or(0);
+        let now = now_ms();
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, event_type, domain, subdomain, payload FROM events \
+             WHERE event_id > ?1 AND expires_at > ?2 AND event_type = ?3 ORDER BY event_id ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![floor, now, "wicked.crew.task.completed"],
+            |row| {
+                let payload_str: String = row.get(4)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    payload_str,
+                ))
+            },
+        )?;
+        for row in rows {
+            let (event_id, event_type, domain, subdomain, payload_str) = row?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_str)
+                .with_context(|| format!("corrupt JSON in bus event {event_id}"))?;
+            let row_run_id = payload.get("run_id").and_then(|v| v.as_str());
+            let row_launch_seq = payload.get("launch_seq").and_then(|v| v.as_u64());
+            if row_run_id == Some(run_id) && row_launch_seq == Some(launch_seq) {
+                return Ok(Some(BusEvent {
+                    event_id,
+                    event_type,
+                    domain,
+                    subdomain,
+                    payload,
+                }));
+            }
+        }
+        Ok(None)
     }
 
     /// Poll up to `batch` events matching `filter`, strictly after `after_event_id`, that have not
@@ -1247,5 +1361,142 @@ mod tests {
         drop(db);
         drop(held);
         actor.join().unwrap();
+    }
+
+    // ── DES-002: cursor metadata APIs (T2) ───────────────────────────────────────────────────────
+
+    /// `delete_cursor` removes the named cursor row; subsequent `load_cursor` returns `None`.
+    #[test]
+    fn delete_cursor_removes_row_and_load_returns_none() {
+        let db = BusDb::open(&tmp_bus("del-cur")).unwrap();
+        db.save_cursor("c1", 77).unwrap();
+        assert_eq!(db.load_cursor("c1").unwrap(), Some(77));
+        db.delete_cursor("c1").unwrap();
+        assert_eq!(db.load_cursor("c1").unwrap(), None, "deleted row is gone");
+        // Deleting a non-existent cursor is a no-op, not an error.
+        db.delete_cursor("ghost").unwrap();
+    }
+
+    /// `get_stable` returns `None` before any `set_stable` call, then `Some(value)` after.
+    #[test]
+    fn get_stable_returns_none_then_some_after_set() {
+        let db = BusDb::open(&tmp_bus("stable")).unwrap();
+        assert_eq!(
+            db.get_stable("cli-runner-owner").unwrap(),
+            None,
+            "no row on first boot"
+        );
+        db.set_stable("cli-runner-owner", "wicked-core.cli-runner.v2.proc-42")
+            .unwrap();
+        assert_eq!(
+            db.get_stable("cli-runner-owner").unwrap(),
+            Some("wicked-core.cli-runner.v2.proc-42".to_string()),
+        );
+        // Upsert: a second set_stable replaces the value.
+        db.set_stable("cli-runner-owner", "wicked-core.cli-runner.v3.proc-99")
+            .unwrap();
+        assert_eq!(
+            db.get_stable("cli-runner-owner").unwrap(),
+            Some("wicked-core.cli-runner.v3.proc-99".to_string()),
+            "upsert replaces old value"
+        );
+    }
+
+    /// Startup cursor reclamation order: migrate positions → delete old rows → set_stable.
+    /// Verifies that an old consumer's cursor can be read, migrated, deleted, and a new stable
+    /// entry written — the ordering that spec §Always do mandates.
+    #[test]
+    fn startup_cursor_reclamation_ordering() {
+        let path = tmp_bus("reclaim");
+        // Simulate a predecessor's state: cursor exists, stable points to old name.
+        let old_name = "wicked-core.cli-runner.v1";
+        let new_name = "wicked-core.cli-runner.v2";
+        let db = BusDb::open(&path).unwrap();
+        db.save_cursor(old_name, 55).unwrap();
+        db.set_stable("cli-runner-owner", old_name).unwrap();
+
+        // New daemon startup: read stable (get predecessor), migrate, delete old, set new stable.
+        let old_owner = db.get_stable("cli-runner-owner").unwrap().unwrap();
+        assert_eq!(old_owner, old_name, "predecessor identified");
+
+        // Migrate: copy old cursor position to new consumer name.
+        let old_pos = db.load_cursor(&old_owner).unwrap().unwrap_or(0);
+        db.save_cursor(new_name, old_pos).unwrap();
+
+        // Delete old cursor row only after migration.
+        db.delete_cursor(&old_owner).unwrap();
+        assert_eq!(db.load_cursor(old_name).unwrap(), None);
+        assert_eq!(db.load_cursor(new_name).unwrap(), Some(55));
+
+        // Set new stable only after migration and deletion.
+        db.set_stable("cli-runner-owner", new_name).unwrap();
+        assert_eq!(
+            db.get_stable("cli-runner-owner").unwrap(),
+            Some(new_name.to_string())
+        );
+    }
+
+    /// `find_completed` returns the matching event even when unrelated events (other `run_id`s)
+    /// precede it in the stream. Does NOT advance the consumer's cursor.
+    #[test]
+    fn find_completed_scans_past_unrelated_events() {
+        let db = BusDb::open(&tmp_bus("find-compl")).unwrap();
+
+        // Two unrelated completions from other run_ids or launch_seqs come first.
+        db.emit(&BusEmit::new(
+            "wicked.crew.task.completed",
+            "wicked-core",
+            "core.task",
+            serde_json::json!({ "run_id": "other-run", "launch_seq": 1, "status": "ok", "output": "" }),
+        ))
+        .unwrap();
+        db.emit(&BusEmit::new(
+            "wicked.crew.task.completed",
+            "wicked-core",
+            "core.task",
+            serde_json::json!({ "run_id": "my-run", "launch_seq": 5, "status": "ok", "output": "" }),
+        ))
+        .unwrap();
+        // The target event.
+        let target_id = db
+            .emit(&BusEmit::new(
+                "wicked.crew.task.completed",
+                "wicked-core",
+                "core.task",
+                serde_json::json!({ "run_id": "my-run", "launch_seq": 7, "status": "ok", "output": "done" }),
+            ))
+            .unwrap();
+
+        let result = db.find_completed("test-consumer", "my-run", 7).unwrap();
+        assert!(
+            result.is_some(),
+            "target event found despite preceding unrelated events"
+        );
+        let ev = result.unwrap();
+        assert_eq!(ev.event_id, target_id);
+        assert_eq!(ev.payload["run_id"], "my-run");
+        assert_eq!(ev.payload["launch_seq"], 7);
+
+        // Consumer cursor was NOT advanced by find_completed.
+        assert_eq!(
+            db.load_cursor("test-consumer").unwrap(),
+            None,
+            "find_completed does not advance the cursor"
+        );
+    }
+
+    /// `find_completed` returns `None` when no matching event exists in the stream.
+    #[test]
+    fn find_completed_returns_none_when_no_match() {
+        let db = BusDb::open(&tmp_bus("find-none")).unwrap();
+        db.emit(&BusEmit::new(
+            "wicked.crew.task.completed",
+            "wicked-core",
+            "core.task",
+            serde_json::json!({ "run_id": "other", "launch_seq": 1, "status": "ok", "output": "" }),
+        ))
+        .unwrap();
+        let result = db.find_completed("c", "my-run", 99).unwrap();
+        assert!(result.is_none(), "no match → None");
     }
 }
