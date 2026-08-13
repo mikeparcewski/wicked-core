@@ -27,8 +27,10 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 
 /// The acceptance criterion of the coverage gate — anti-legacy GATE_3 / `coverage.py` DoD
 /// (CONTRACT-3 §2: "resolved-or-flagged coverage == 1.0 (zero unaccounted behavior-bearing nodes)").
+/// Substance check added: at least one requirement must be genuinely resolved (not solely RISK-flagged),
+/// closing the gameable-by-RISK-placeholders case (FINDING-D1, 2026-08-12).
 pub const COVERAGE_CRITERION: &str =
-    "at least one behavior-bearing node, and resolved-or-flagged coverage == 1.0 over them (zero unaccounted)";
+    "at least one behavior-bearing node, resolved-or-flagged coverage == 1.0 over them (zero unaccounted), and at least one requirement genuinely resolved (resolved > 0)";
 
 /// The deterministic re-verify (port of `coverage.py --check`): exit 0 IFF FULL coverage EVERYWHERE.
 /// When `WICKED_COVERAGE_DB` is set (injected by the validator runner from the actor's store path — its
@@ -53,15 +55,18 @@ pub const COVERAGE_CRITERION: &str =
 /// `coverage`/`unaccounted`), so an unanchored positive grep false-PASSes on a single fully-covered app
 /// under a sub-1.0 total. The gate is therefore: (1) at least one full-coverage marker exists (guards an
 /// empty/malformed report), AND (2) NO `coverage` value is sub-1.0 anywhere, AND (3) NO `unaccounted`
-/// is non-zero anywhere. Built only from `test`/`grep`/`!`/`${VAR:-fallback}` so it passes the
-/// [`looks_dangerous`](crate::validator) denylist (no redirection, command substitution `$(`, or
-/// destructive/network token; `${VAR}`/`${VAR:-default}` expansion and `!`/`||` are allowed).
+/// is non-zero anywhere, AND (4) at least one requirement is genuinely resolved (`resolved >= 1`
+/// in the top-level or any per-app entry), closing the gameable-by-RISK-placeholders case where
+/// all behavior-bearing nodes receive RISK annotations and the model emits zero concrete rules
+/// (FINDING-D1, 2026-08-12). Built only from `test`/`grep`/`!`/`${VAR:-fallback}` so it passes
+/// the [`looks_dangerous`](crate::validator) denylist (no redirection, command substitution `$(`,
+/// or destructive/network token; `${VAR}`/`${VAR:-default}` expansion and `!`/`||` are allowed).
 /// The binary is invoked as `${WICKED_CORE_EXE:-wicked-core}`. The validator runner resolves and
 /// injects that path (`execute_wrapped::resolve_wicked_core_exe_opt`) so the script finds the right
 /// binary without relying on PATH. It used to inject `current_exe()`, which is the NODE binary when
 /// the engine runs as a napi addon — so the script ran `node coverage` and the floor never executed
 /// on a real run (FINDING-093).
-pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json ) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json"#;
+pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json ) && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
@@ -93,7 +98,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "49b61ba3ab5264e4";
+pub const COVERAGE_VALIDATOR_PIN: &str = "bfe4020a365c598b";
 
 /// Phases whose `validator_pin` the BINARY has an opinion about, as `(workflow, phase, pin)`.
 ///
@@ -843,6 +848,31 @@ mod tests {
         assert!(
             !run_validator(&approved, &per_app_wt).unwrap(),
             "sub-1.0 TOTAL with a fully-covered per_app entry ⇒ gate FAILS (no per-app false-pass)"
+        );
+
+        // SUBSTANCE CHECK — the RISK-placeholder false-pass (D1 substance fix). An extraction
+        // where every behavior-bearing node has a RISK placeholder produces coverage == 1.0 and
+        // unaccounted == 0 (all nodes accounted for), but resolved == 0 (no real rules emitted).
+        // The pre-D1 gate accepted this; the new `resolved >= 1` check rejects it.
+        let risk_wt = base.join("risk_only");
+        std::fs::create_dir_all(&risk_wt).unwrap();
+        std::fs::write(
+            risk_wt.join("coverage-report.json"),
+            r#"{
+  "total": 30,
+  "behavior_bearing": 20,
+  "resolved": 0,
+  "risk_flagged": 20,
+  "unaccounted": 0,
+  "coverage": 1.0,
+  "resolve_threshold": 0.75,
+  "unaccounted_nodes": []
+}"#,
+        )
+        .unwrap();
+        assert!(
+            !run_validator(&approved, &risk_wt).unwrap(),
+            "coverage == 1.0 but resolved == 0 (all RISK placeholders) ⇒ gate FAILS (substance check)"
         );
 
         let _ = std::fs::remove_dir_all(&base);
