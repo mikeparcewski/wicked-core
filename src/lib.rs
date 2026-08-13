@@ -650,7 +650,7 @@ impl Core {
         action: String,
         response: Option<serde_json::Value>,
     ) -> anyhow::Result<()> {
-        let (reply, rx) = std::sync::mpsc::sync_channel(0);
+        let (reply, rx) = std::sync::mpsc::sync_channel(1);
         self.tx
             .send(Command::ResolveElicitation {
                 run_id: run_id.to_string(),
