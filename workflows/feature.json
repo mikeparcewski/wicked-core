@@ -99,10 +99,10 @@
       "role": "neutral",
       "skill_ref": null,
       "allowed_skills": [],
+      "validator_pin": "2fcde907d57f3ee2",
       "executor": {
         "type": "agent"
-      },
-      "validator_pin": "2fcde907d57f3ee2"
+      }
     },
     {
       "id": "review",
