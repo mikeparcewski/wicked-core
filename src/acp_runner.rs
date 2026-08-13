@@ -3469,7 +3469,10 @@ impl StepRunner for AcpStepRunner {
         // this ensures no in-flight elicitations are left dangling. Guarded by has_active_run
         // so PTY runs and tool_cmd units (epoch 0) never insert a stale tombstone.
         {
-            let mut maps = self.elicitation_maps.lock().unwrap_or_else(|p| p.into_inner());
+            let mut maps = self
+                .elicitation_maps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if maps.has_active_run(run_id) {
                 let epoch = maps.current_epoch(run_id);
                 maps.cancel_epoch(run_id, epoch);
