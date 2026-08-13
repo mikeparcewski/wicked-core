@@ -471,7 +471,7 @@ impl BusDb {
         for row in rows {
             let (event_id, event_type, domain, subdomain, payload_str) = row?;
             let payload: serde_json::Value = serde_json::from_str(&payload_str)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                .with_context(|| format!("corrupt JSON in bus event {event_id}"))?;
             let row_run_id = payload.get("run_id").and_then(|v| v.as_str());
             let row_launch_seq = payload.get("launch_seq").and_then(|v| v.as_u64());
             if row_run_id == Some(run_id) && row_launch_seq == Some(launch_seq) {
