@@ -1765,6 +1765,11 @@ fn exec_turn_acp(
     let id = proc.next_id;
     proc.next_id += 1;
 
+    // Clone the write_lock Arc so we can hold it around each proc.stdin write without
+    // borrowing proc for the whole function. shared_run_terminal's try_lock() must see
+    // this held to detect an in-flight write (FINDING-254 / core#254).
+    let write_lock = Arc::clone(&proc.write_lock);
+
     // Elicitation is gated on a non-zero epoch AND on the adapter being in the verified
     // allow-list (OQ-R-6). Chat turns always pass epoch=0 and are never suspended.
     let elicitation_enabled = epoch > 0 && ELICITATION_VERIFIED_ADAPTERS.contains(&adapter_key);
@@ -1796,15 +1801,18 @@ prior output you are reviewing, testing, or revising."
     }));
     blocks.push(json!({"type": "text", "text": prompt}));
 
-    rpc_send(
-        &mut proc.stdin,
-        id,
-        "session/prompt",
-        json!({
-            "sessionId": proc.session_id,
-            "prompt": blocks
-        }),
-    )?;
+    {
+        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        rpc_send(
+            &mut proc.stdin,
+            id,
+            "session/prompt",
+            json!({
+                "sessionId": proc.session_id,
+                "prompt": blocks
+            }),
+        )?;
+    }
 
     let mut output = String::new();
     let mut usage: Option<Usage> = None;
@@ -1849,6 +1857,7 @@ prior output you are reviewing, testing, or revising."
 
                     // Guard 1: elicitation disabled for this epoch/adapter → immediate cancel.
                     if !elicitation_enabled {
+                        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                         let _ =
                             rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
                         continue 'exec;
@@ -1858,6 +1867,7 @@ prior output you are reviewing, testing, or revising."
                     let (prop_name, prop_type) = match validate_elicitation_schema(schema) {
                         Some(v) => v,
                         None => {
+                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                             let _ = rpc_respond(
                                 &mut proc.stdin,
                                 &request_id,
@@ -1886,6 +1896,7 @@ prior output you are reviewing, testing, or revising."
                         Some(r) => r,
                         None => {
                             // Epoch was cancelled (suppressed creation) — cancel and continue.
+                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                             let _ = rpc_respond(
                                 &mut proc.stdin,
                                 &request_id,
@@ -1926,6 +1937,7 @@ prior output you are reviewing, testing, or revising."
                             elicitation_timed_out = true;
                             elicit_action = "cancel".to_string();
                             elicit_reason = "timeout".to_string();
+                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                             let _ = rpc_respond(
                                 &mut proc.stdin,
                                 &request_id,
@@ -1942,6 +1954,7 @@ prior output you are reviewing, testing, or revising."
                                 elicit_action = "cancel".to_string();
                                 elicit_reason = "teardown".to_string();
                                 drop(m);
+                                let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                                 let _ = rpc_respond(
                                     &mut proc.stdin,
                                     &request_id,
@@ -1989,8 +2002,11 @@ prior output you are reviewing, testing, or revising."
                                 } else {
                                     "human".to_string()
                                 };
-                                if rpc_respond(&mut proc.stdin, &request_id, response_payload)
-                                    .is_err()
+                                if {
+                                    let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+                                    rpc_respond(&mut proc.stdin, &request_id, response_payload)
+                                }
+                                .is_err()
                                 {
                                     write_failed_terminal = true;
                                     // Phase 3 post-write tombstone gate (test 36):
@@ -2018,6 +2034,7 @@ prior output you are reviewing, testing, or revising."
                                 elicitation_timed_out = true;
                                 elicit_action = "cancel".to_string();
                                 elicit_reason = "teardown".to_string();
+                                let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                                 let _ = rpc_respond(
                                     &mut proc.stdin,
                                     &request_id,
@@ -2043,6 +2060,7 @@ prior output you are reviewing, testing, or revising."
                                     == Some("elicitation/create")
                                 {
                                     let nested_id = v2.get("id").cloned().unwrap_or(Value::Null);
+                                    let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                                     let _ = rpc_respond(
                                         &mut proc.stdin,
                                         &nested_id,
@@ -2184,7 +2202,11 @@ prior output you are reviewing, testing, or revising."
                         // NOT `let _ =`. A failed write leaves the agent blocked until the turn
                         // times out, and the reason is the only thing that explains the stall —
                         // dropping it turns a broken pipe into "the model was slow" (review).
-                        if let Err(e) = rpc_respond(&mut proc.stdin, &req_id, result) {
+                        let respond_err = {
+                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+                            rpc_respond(&mut proc.stdin, &req_id, result).err()
+                        };
+                        if let Some(e) = respond_err {
                             let note = format!(
                                 "\n[wicked-core] could not answer a permission request: {e}. The \
                                  agent is blocked on it and this turn will time out."
@@ -6212,5 +6234,83 @@ else:
             reason, "teardown",
             "deliberate-kill path must produce reason=teardown, not adapter_write_failure"
         );
+    }
+
+    /// Test 38 (FINDING-254): exec_turn_acp must hold `proc.write_lock` around every
+    /// `proc.stdin` write so `shared_run_terminal`'s `try_lock()` can detect an
+    /// in-flight write and delay teardown until the write completes.
+    ///
+    /// Proof by blocking: pre-acquire `write_lock` on the test thread before spawning
+    /// exec_turn_acp. If exec_turn_acp correctly acquires the lock before writing, it
+    /// blocks until we release. The mock never receives the `session/prompt` while the
+    /// lock is held, so it cannot send a response and the turn cannot complete. After
+    /// we drop the guard, exec_turn_acp proceeds and the turn succeeds with `Ok`.
+    ///
+    /// Mutation check: removing the `write_lock.lock()` call from the initial `rpc_send`
+    /// would let exec_turn_acp write without holding the lock; the mock would respond
+    /// immediately and `done_rx` would fire BEFORE we release the guard — causing the
+    /// `try_recv().is_err()` assertion to fail.
+    #[test]
+    #[cfg(unix)]
+    fn write_lock_is_held_during_rpc_send_invariant() {
+        let dir = std::env::temp_dir().join(format!("wicked-254-wl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut proc = start_mock_proc(&dir, "ok");
+
+        // Pre-acquire write_lock on the test thread; exec_turn_acp must block on it.
+        let wl = Arc::clone(&proc.write_lock);
+        let guard = wl.lock().expect("write_lock must start unlocked");
+
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<Command>();
+        // Channel exec_turn_acp sends to when it completes.
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<StepStatus>(1);
+
+        let handle = std::thread::spawn(move || {
+            let noop: &DeltaSink = &|_: &str| {};
+            let result = exec_turn_acp(
+                &mut proc,
+                "hello",
+                &[],
+                noop,
+                Duration::from_secs(5),
+                maps,
+                "run-wl-invariant",
+                0,
+                "claude-agent-acp",
+                &cmd_tx,
+                None,
+            );
+            let status = result.map(|r| r.status).unwrap_or(StepStatus::Failed);
+            let _ = done_tx.send(status);
+            status
+        });
+
+        // Give the thread time to reach the write_lock acquisition attempt inside
+        // exec_turn_acp. 100ms is generous — the thread starts and enters the fn
+        // in microseconds. If write_lock is not acquired (pre-fix bug), the mock
+        // receives the prompt immediately and done_rx fires within ~5ms.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            done_rx.try_recv().is_err(),
+            "exec_turn_acp must still be blocked on write_lock — \
+             the done channel must not have fired yet"
+        );
+
+        // Releasing write_lock lets exec_turn_acp write the prompt. The mock
+        // immediately responds, completing the turn.
+        drop(guard);
+
+        let status = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("exec_turn_acp must complete after write_lock is released");
+        assert_eq!(
+            status,
+            StepStatus::Ok,
+            "turn must complete Ok after write_lock is released"
+        );
+        handle.join().expect("background thread must not panic");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
