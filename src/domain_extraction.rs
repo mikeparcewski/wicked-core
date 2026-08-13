@@ -850,6 +850,31 @@ mod tests {
             "sub-1.0 TOTAL with a fully-covered per_app entry ⇒ gate FAILS (no per-app false-pass)"
         );
 
+        // SUBSTANCE CHECK — the RISK-placeholder false-pass (D1 substance fix). An extraction
+        // where every behavior-bearing node has a RISK placeholder produces coverage == 1.0 and
+        // unaccounted == 0 (all nodes accounted for), but resolved == 0 (no real rules emitted).
+        // The pre-D1 gate accepted this; the new `resolved >= 1` check rejects it.
+        let risk_wt = base.join("risk_only");
+        std::fs::create_dir_all(&risk_wt).unwrap();
+        std::fs::write(
+            risk_wt.join("coverage-report.json"),
+            r#"{
+  "total": 30,
+  "behavior_bearing": 20,
+  "resolved": 0,
+  "risk_flagged": 20,
+  "unaccounted": 0,
+  "coverage": 1.0,
+  "resolve_threshold": 0.75,
+  "unaccounted_nodes": []
+}"#,
+        )
+        .unwrap();
+        assert!(
+            !run_validator(&approved, &risk_wt).unwrap(),
+            "coverage == 1.0 but resolved == 0 (all RISK placeholders) ⇒ gate FAILS (substance check)"
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
