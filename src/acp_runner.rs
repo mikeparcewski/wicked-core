@@ -6313,4 +6313,92 @@ else:
         handle.join().expect("background thread must not panic");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Test 39: EpochCleanup guard drops clean — `active_workers` and `run_epoch` are
+    /// reclaimed when the guard (constructed the same way `exec_turn` does it) is dropped
+    /// after a successful `exec_turn_acp` call. This validates the RAII invariant required
+    /// by core#234's DoD: the guard must remove epoch state on drop, with no leak.
+    #[test]
+    #[cfg(unix)]
+    fn epoch_cleanup_guard_drop_removes_run_state_no_leak() {
+        let dir = std::env::temp_dir().join(format!("wicked-t39-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let maps_arc = Arc::new(Mutex::new(ElicitationMaps::new()));
+
+        // Simulate begin_launch + next_epoch (what the actor does before dispatching a unit).
+        let epoch = {
+            let mut m = maps_arc.lock().unwrap();
+            m.begin_launch("run-cleanup-integration", true);
+            m.next_epoch("run-cleanup-integration")
+        };
+        assert_eq!(epoch, 1, "first epoch must be 1");
+
+        // Verify the pre-call state: one active worker, run_epoch entry present.
+        {
+            let m = maps_arc.lock().unwrap();
+            assert!(
+                m.has_active_run("run-cleanup-integration"),
+                "run_epoch must be set before exec_turn_acp"
+            );
+            assert!(
+                m.active_workers
+                    .contains(&("run-cleanup-integration".to_string(), 1)),
+                "active_workers must contain the launch token before exec_turn_acp"
+            );
+        }
+
+        let mut proc = start_mock_proc(&dir, "ok");
+        let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel::<Command>();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // Construct the EpochCleanup guard the same way exec_turn does.
+        let guard = EpochCleanup {
+            maps: Arc::clone(&maps_arc),
+            run_id: "run-cleanup-integration".to_string(),
+            epoch,
+            launch_seq: 1,
+            bus_in_flight_deferred: false,
+            tx: cmd_tx.clone(),
+            in_flight_id: None,
+            in_flight_action: None,
+            in_flight_reason: None,
+        };
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "hello",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            Arc::clone(&maps_arc),
+            "run-cleanup-integration",
+            epoch,
+            "claude-agent-acp",
+            &cmd_tx,
+            None,
+        );
+        assert_eq!(
+            result.map(|r| r.status).unwrap_or(StepStatus::Failed),
+            StepStatus::Ok,
+            "turn must complete Ok on normal subprocess completion"
+        );
+
+        // Drop the guard (simulating exec_turn returning) — this fires cleanup_run.
+        drop(guard);
+
+        // Post-call state: epoch reclaimed, no leak.
+        let m = maps_arc.lock().unwrap();
+        assert!(
+            !m.has_active_run("run-cleanup-integration"),
+            "run_epoch entry must be removed after EpochCleanup::drop (no leak)"
+        );
+        assert!(
+            !m.active_workers
+                .iter()
+                .any(|(r, _)| r == "run-cleanup-integration"),
+            "active_workers entry must be removed after EpochCleanup::drop (no leak)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
