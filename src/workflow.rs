@@ -943,6 +943,7 @@ pub fn feature_def() -> WorkflowDef {
                     GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
                 )
                 .verified()
+                .evidence_floor()
                 .after("build"),
             PhaseDef::new("review", StageKind::Review)
                 .gate(GateType::Execution, GateSpec::Auto)
