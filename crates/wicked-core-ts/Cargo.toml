@@ -24,7 +24,7 @@ wicked-apps-core = { path = "../wicked-apps-core" }
 # Policy / ConformanceRule / claim_from_node / recall_rules.
 wicked-governance = { path = "../wicked-governance" }
 # SymbolQuery — not re-exported by wicked-apps-core; needed by the governance read methods.
-wicked-estate-core = "0.14.3"
+wicked-estate-core = "0.14.5"
 napi = { version = "2", default-features = false, features = ["napi8"] }
 napi-derive = "2"
 serde = { version = "1", features = ["derive"] }
