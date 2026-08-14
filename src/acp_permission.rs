@@ -315,6 +315,12 @@ mod tests {
         std::fs::create_dir_all(&inbox).unwrap();
         let outside = dir.join("outside/evil.html");
         let decisions = dir.join("decisions.jsonl");
+        // A REAL (empty) store for the allow arm: after the boundary passes, evaluation
+        // proceeds to policy selection, and an unresolvable store is an infra-deny — which is
+        // fail-closed and correct, but not what this test is about. (The deny arm never reaches
+        // the store: boundary is judged first, which the first arm also proves.)
+        let db = dir.join("gov.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
 
         let request = |path: &std::path::Path| {
             json!({
@@ -344,7 +350,7 @@ mod tests {
             scope: "unit",
             phase: "unit-1",
             phase_alias: None,
-            db: None, // empty store — no policies; only the boundary can deny
+            db: db.to_str(), // empty store — no policies; only the boundary can deny
             decisions_path: decisions.to_str().unwrap(),
             boundary: boundary(),
         };
@@ -370,7 +376,7 @@ mod tests {
             scope: "unit",
             phase: "unit-1",
             phase_alias: None,
-            db: None,
+            db: db.to_str(),
             decisions_path: decisions_ok.to_str().unwrap(),
             boundary: boundary(),
         };
