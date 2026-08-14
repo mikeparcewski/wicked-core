@@ -946,6 +946,25 @@ impl Core {
         })
     }
 
+    /// Archive (or unarchive) a TERMINAL run (crew#265) — a write-off, not a delete: the run and
+    /// its artifacts stay fully readable, but default run listings exclude it. Resolves to a
+    /// JSON-encoded boolean (`true` = session existed, `false` = unknown id → answer 404); REJECTS
+    /// when the run is non-terminal (the caller answers 409 — write-off is for finished history
+    /// only). Parse the reply; a bare truthiness test reads a miss as a hit.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn archive_run(
+        &self,
+        run_id: String,
+        archived: bool,
+        note: Option<String>,
+    ) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let found = core.archive_run(&run_id, archived, note).map_err(err)?;
+            serde_json::to_string(&found).map_err(err)
+        })
+    }
+
     /// Withdraw a conformance rule from recall. Same retire-not-delete contract as
     /// [`Core::retire_policy`], and the same JSON-encoded `true`/`false` reply that must be
     /// parsed rather than tested for truthiness.

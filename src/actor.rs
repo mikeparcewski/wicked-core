@@ -628,6 +628,8 @@ pub(crate) fn run(
                         workdir: None, // resolved off-thread; updated in WorktreeReady
                         repo_ref: repo_ref.clone(),
                         extra_write_roots: spec.extra_write_roots.clone(),
+                        archived_at: None,
+                        archive_note: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1284,6 +1286,34 @@ pub(crate) fn run(
             }
             Command::RetirePolicy { id, reply } => {
                 let _ = reply.send(wicked_governance::retire_policy(&mut store, &id));
+            }
+            Command::ArchiveRun {
+                run_id,
+                archived,
+                note,
+                reply,
+            } => {
+                let _ = reply.send((|| {
+                    let Some(mut session) = crate::domain::get_session(&store, &run_id)? else {
+                        return Ok(false); // unknown run → the route answers 404
+                    };
+                    // Write-off is for FINISHED history only (crew#265): archiving a live run
+                    // would hide in-flight work from the default listing — a 409, never a
+                    // silent success. Unarchive of a live run is equally nonsensical.
+                    if !matches!(
+                        session.status,
+                        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                    ) {
+                        anyhow::bail!(
+                            "run {run_id} is {:?} — only a terminal run can be (un)archived",
+                            session.status
+                        );
+                    }
+                    session.archived_at = archived.then(crate::interaction::now_millis);
+                    session.archive_note = if archived { note } else { None };
+                    crate::domain::put_node(&mut store, session.to_node())?;
+                    Ok(true)
+                })());
             }
             Command::RetireConformanceRule { id, reply } => {
                 let _ = reply.send(wicked_governance::retire_rule(&mut store, &id));
@@ -4819,6 +4849,8 @@ mod gate_pause_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -4978,6 +5010,8 @@ mod terminal_gate_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -5103,6 +5137,8 @@ mod def_gate_disclosure_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -5197,6 +5233,8 @@ mod def_gate_disclosure_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -5445,6 +5483,8 @@ mod terminal_worktree_reap_tests {
             workdir: Some(wt.to_string_lossy().to_string()),
             repo_ref: Some(entry.id),
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -5584,6 +5624,8 @@ mod terminal_worktree_reap_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -5674,6 +5716,8 @@ mod worker_code_graph_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         }
     }
 
@@ -5902,6 +5946,8 @@ mod phase_boundary_governance_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").

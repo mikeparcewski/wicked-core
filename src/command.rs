@@ -146,6 +146,16 @@ pub(crate) enum Command {
         id: String,
         reply: Sender<anyhow::Result<bool>>,
     },
+    /// Archive (or unarchive) a TERMINAL run (crew#265) — a write-off, not a delete: the session
+    /// node gains/loses `archived_at` (+ optional note); every artifact stays readable. Replies
+    /// `false` when no session with that id exists (→ 404); an Err names a NON-TERMINAL status
+    /// (→ 409 — write-off is for finished history only, never a way to hide live work).
+    ArchiveRun {
+        run_id: String,
+        archived: bool,
+        note: Option<String>,
+        reply: Sender<anyhow::Result<bool>>,
+    },
     /// Withdraw a conformance rule from recall. Same retire-not-delete contract as [`Self::RetirePolicy`].
     RetireConformanceRule {
         id: String,
