@@ -185,6 +185,32 @@ pub(crate) struct BoundaryCtx {
     pub home: Option<std::path::PathBuf>,
 }
 
+/// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
+/// (core#264): `std::env::temp_dir()` — on macOS `$TMPDIR` (`/var/folders/…`) — plus the literal
+/// `/tmp`, which macOS symlinks to `/private/tmp` and which is exactly where run fc46a3a1's
+/// worker wrote its scratch (temp_dir() alone would have missed it). Same symlink-aware
+/// containment as every other boundary comparison.
+fn in_system_temp(resolved: &std::path::Path) -> bool {
+    // ONE temp_dir() read for both the exclusion and the inclusion set — two reads could
+    // diverge under a concurrently-mutated temp env and make the gov-root exclusion judge a
+    // different tree than the carve-out (Copilot).
+    let sys_temp = std::env::temp_dir();
+    // The governance evidence tree ALSO lives under temp (`$TMPDIR/wicked-core-gov/…` — the
+    // decisions logs the fold reads). A blocked write there is a tamper attempt against the
+    // audit trail, not scratch: it must NOT ride the scratch carve-out. (It is still blocked
+    // either way; this keeps it unit-FATAL.)
+    if crate::path_policy::resolved_is_within(resolved, &sys_temp.join("wicked-core-gov")) {
+        return false;
+    }
+    let mut temps = vec![sys_temp];
+    if cfg!(unix) {
+        temps.push(std::path::PathBuf::from("/tmp"));
+    }
+    temps
+        .iter()
+        .any(|t| crate::path_policy::resolved_is_within(resolved, t))
+}
+
 /// The pure boundary judgement both carriers share: roots, cwd AND home are PARAMETERS, never
 /// ambient process state, so the wrapped subprocess (env-armed) and the in-process ACP bridge
 /// (context-armed, core#260) cannot diverge on what "outside the boundary" means.
@@ -203,19 +229,25 @@ fn boundary_denial_with(
     {
         let is_write = WRITE_TOOLS.contains(&tool);
         if let Err(d) = crate::path_policy::check(path, roots, is_write, cwd, home) {
-            // A blocked WRITE is unit-FATAL — EXCEPT into the worker's OWN Claude Code state tree
-            // (`~/.claude/**`, e.g. `~/.claude/projects/<slug>/memory/*.md`). A governed claude
-            // worker routinely writes its own project-memory there; the write is STILL blocked
-            // (exit 2, nothing lands outside the worktree), but a benign agent-memory write must
-            // not ABORT the run (core#235 — infigraph died here). Downgrade it to advisory, exactly
-            // as a blocked read is (core#219). The carve-out is scoped to `~/.claude`: the gate pin
-            // (`~/.config/wicked-core/**`) and the operational store are NOT under it and stay
-            // fatal, so the FINDING-098 pin-rewrite escape is untouched. Reads are already advisory,
-            // so this relaxes ONLY writes, and ONLY into the agent's own state dir.
+            // A blocked WRITE is unit-FATAL — EXCEPT into two benign trees, where it stays
+            // BLOCKED and AUDITED but must not ABORT the run (advisory, exactly as a blocked
+            // read is, core#219):
+            //  - the worker's OWN Claude Code state tree (`~/.claude/**`, e.g. project memory)
+            //    — a governed claude worker routinely writes there (core#235; infigraph died
+            //    over it);
+            //  - the SYSTEM temp dirs (core#264) — `> /tmp/x`, `mktemp`, `tee /tmp/log` are
+            //    everyday scratch idioms; run fc46a3a1 produced its deliverable correctly and
+            //    was then failed over one blocked `/private/tmp` redirect. Nothing lands (the
+            //    block holds), and a scratch file in temp is neither work exfiltration nor a
+            //    pin rewrite.
+            // The carve-outs are scoped: the gate pin (`~/.config/wicked-core/**`), the home
+            // dir, and the operational store are under NEITHER tree and stay fatal, so the
+            // FINDING-098 pin-rewrite escape is untouched.
             let fatal = is_write
                 && !home.is_some_and(|h| {
                     crate::path_policy::resolved_is_within(&d.resolved, &h.join(".claude"))
-                });
+                })
+                && !in_system_temp(&d.resolved);
             return Some((d.to_string(), fatal));
         }
     }
@@ -231,7 +263,11 @@ fn boundary_denial_with(
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
             for target in bash_write_targets(command) {
                 if let Err(d) = crate::path_policy::check(&target, roots, true, cwd, home) {
-                    return Some((format!("Bash write leaves the unit boundary: {d}"), true));
+                    // A shell write into the SYSTEM temp is the same benign-scratch class as
+                    // the direct-tool arm above (core#264): still blocked, still audited,
+                    // advisory. Everything else a shell redirect reaches stays unit-fatal.
+                    let fatal = !in_system_temp(&d.resolved);
+                    return Some((format!("Bash write leaves the unit boundary: {d}"), fatal));
                 }
             }
         }
@@ -2278,6 +2314,63 @@ mod boundary_tests {
         json!({ "path": path })
     }
 
+    /// core#264. Run fc46a3a1 produced its deliverable correctly and was then unit-FAILED over one
+    /// blocked Bash redirect to `/private/tmp/out.txt`. A blocked write into the SYSTEM temp is
+    /// benign scratch: STILL blocked, STILL audited, but ADVISORY — on the Bash arm and the
+    /// direct-tool arm alike. The gov-tree control proves the carve-out excludes the audit trail
+    /// (a tamper attempt against the decisions logs stays fatal even though they live under temp),
+    /// and the home control proves everything outside temp stays fatal.
+    #[test]
+    fn a_scratch_write_into_the_system_temp_is_advisory_not_fatal() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-tmp");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let scratch = std::env::temp_dir().join("wicked-scratch-out.txt");
+
+        // Bash redirect into temp (the fc46a3a1 shape) → blocked, advisory.
+        let cmd_ctx = json!({ "command": format!("echo x > {}", scratch.display()) });
+        let (_, fatal) = boundary_denial_with(&roots, &wt, None, &cmd_ctx, "Bash")
+            .expect("a Bash write outside the worktree is STILL blocked");
+        assert!(
+            !fatal,
+            "a Bash scratch write into the system temp must be ADVISORY (core#264)"
+        );
+
+        // Direct Write tool into temp → same class, same verdict.
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, None, &ctx(scratch.to_str().unwrap()), "Write")
+                .expect("blocked");
+        assert!(
+            !fatal,
+            "a Write-tool scratch into the system temp must be ADVISORY"
+        );
+
+        // Control 1: the governance evidence tree lives under temp and must NOT ride the
+        // carve-out — a write there is a tamper attempt against the audit trail.
+        let gov = std::env::temp_dir()
+            .join("wicked-core-gov")
+            .join("some-run/attempt-0/decisions.ndjson");
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, None, &ctx(gov.to_str().unwrap()), "Write")
+                .expect("blocked");
+        assert!(
+            fatal,
+            "a write into the gov evidence tree stays FATAL despite being under temp"
+        );
+
+        // Control 2: an escape anywhere else (unix: a home-shaped path) stays fatal.
+        #[cfg(unix)]
+        {
+            let (_, fatal) =
+                boundary_denial_with(&roots, &wt, None, &ctx("/Users/nobody/evil.txt"), "Write")
+                    .expect("blocked");
+            assert!(fatal, "a non-temp escape stays unit-FATAL");
+        }
+    }
+
     /// THE case. A governed worker located the pin binding its own gate and began authoring a
     /// replacement. With the worktree armed as the only write root, that write is refused.
     #[test]
@@ -2532,6 +2625,13 @@ mod boundary_tests {
         assert!(
             launch.contains("validate_extra_write_roots"),
             "the launch path no longer validates extra write roots against the pin tree"
+        );
+        // The worker's scratch is pointed INSIDE the boundary (core#264) — removing the TMPDIR
+        // arming silently reintroduces the advisory-deny noise (and, before #264, the fatal
+        // aborts) on every worker that uses platform temp.
+        assert!(
+            launcher.contains(r#"cmd.env("TMPDIR", &unit_tmp)"#),
+            "the launcher no longer points the governed worker's TMPDIR into the unit tree"
         );
     }
 
