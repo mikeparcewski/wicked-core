@@ -166,31 +166,35 @@ const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, bool)> {
     let roots = allowed_roots_from_env()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    boundary_denial_with(&roots, &cwd, context, tool)
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    boundary_denial_with(&roots, &cwd, home.as_deref(), context, tool)
 }
 
 /// The unit's filesystem boundary as EXPLICIT state (core#260) — for the carrier that evaluates
 /// IN-PROCESS (the ACP permission bridge), where env vars would read the DAEMON's environment
 /// (never armed → no boundary) and `current_dir()` the daemon's cwd (wrong base for resolving a
 /// tool call's relative paths). The wrapped path's hook subprocess keeps the env carrier:
-/// [`boundary_denial`] resolves env + process cwd and calls the same pure check.
+/// [`boundary_denial`] resolves env + process cwd + `$HOME` and calls the same pure check.
 pub(crate) struct BoundaryCtx {
     pub roots: crate::path_policy::AllowedRoots,
     /// The unit's working directory — the base for resolving relative tool-call paths.
     pub cwd: std::path::PathBuf,
+    /// The `$HOME` used for `~` expansion and the `~/.claude` advisory carve-out — captured at
+    /// gate construction so the in-process carrier judges with the SAME home the worker's own
+    /// subprocess would inherit, not whatever the evaluating thread happens to see (Copilot).
+    pub home: Option<std::path::PathBuf>,
 }
 
-/// The pure boundary judgement both carriers share: roots and cwd are PARAMETERS, never ambient
-/// process state, so the wrapped subprocess (env-armed) and the in-process ACP bridge (context-
-/// armed, core#260) cannot diverge on what "outside the boundary" means.
+/// The pure boundary judgement both carriers share: roots, cwd AND home are PARAMETERS, never
+/// ambient process state, so the wrapped subprocess (env-armed) and the in-process ACP bridge
+/// (context-armed, core#260) cannot diverge on what "outside the boundary" means.
 fn boundary_denial_with(
     roots: &crate::path_policy::AllowedRoots,
     cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
     context: &serde_json::Value,
     tool: &str,
 ) -> Option<(String, bool)> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-
     // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
     if let Some(path) = context
         .get("path")
@@ -198,7 +202,7 @@ fn boundary_denial_with(
         .filter(|p| !p.is_empty())
     {
         let is_write = WRITE_TOOLS.contains(&tool);
-        if let Err(d) = crate::path_policy::check(path, roots, is_write, cwd, home.as_deref()) {
+        if let Err(d) = crate::path_policy::check(path, roots, is_write, cwd, home) {
             // A blocked WRITE is unit-FATAL — EXCEPT into the worker's OWN Claude Code state tree
             // (`~/.claude/**`, e.g. `~/.claude/projects/<slug>/memory/*.md`). A governed claude
             // worker routinely writes its own project-memory there; the write is STILL blocked
@@ -209,7 +213,7 @@ fn boundary_denial_with(
             // fatal, so the FINDING-098 pin-rewrite escape is untouched. Reads are already advisory,
             // so this relaxes ONLY writes, and ONLY into the agent's own state dir.
             let fatal = is_write
-                && !home.as_deref().is_some_and(|h| {
+                && !home.is_some_and(|h| {
                     crate::path_policy::resolved_is_within(&d.resolved, &h.join(".claude"))
                 });
             return Some((d.to_string(), fatal));
@@ -226,9 +230,7 @@ fn boundary_denial_with(
     if tool == "Bash" {
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
             for target in bash_write_targets(command) {
-                if let Err(d) =
-                    crate::path_policy::check(&target, roots, true, cwd, home.as_deref())
-                {
+                if let Err(d) = crate::path_policy::check(&target, roots, true, cwd, home) {
                     return Some((format!("Bash write leaves the unit boundary: {d}"), true));
                 }
             }
@@ -537,6 +539,29 @@ pub(crate) fn evaluate_tool_call(
     // Read-only use of the store: select reads policies, decide is pure. NO store write here.
     // Use open_store_ro (SQLITE_OPEN_READONLY, no DDL) so the hook subprocess never races the
     // single-writer actor on schema or WAL operations (P4b).
+    // BOUNDARY FIRST — before the store is even OPENED. A call reaching outside the unit's
+    // worktree is refused before any policy is consulted: policies answer "is this action allowed
+    // HERE", and a path outside the boundary has already left here. It is also refused before the
+    // store-open below, because a boundary escape needs NO policy store to judge — an unreachable
+    // store used to mask a boundary escape as `infra-deny`, losing the claim the fold and the
+    // operator diagnose by (caught by CI on the #260 proof test, which runs storeless).
+    let boundary_verdict = match boundary {
+        Some(b) => boundary_denial_with(&b.roots, &b.cwd, b.home.as_deref(), context, tool),
+        None => boundary_denial(context, tool),
+    };
+    if let Some((reason, fatal)) = boundary_verdict {
+        // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
+        // escape attempt and stays unit-FATAL; a READ probe — and a benign write into the worker's
+        // own `~/.claude` state tree (core#235) — is ADVISORY: blocked, audited, but not unit-fatal,
+        // so a worker probing an out-of-bounds file or persisting its own memory (then adapting) is
+        // not failed for it (P8 #10 / core#219). `fatal` comes from the boundary check itself so a
+        // Bash write-escape (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See
+        // `boundary_denial` / `append_boundary_deny`.
+        append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
+        eprintln!("wicked-governance: DENY ({reason})");
+        return 2;
+    }
+
     // On an INFRA failure below we still exit 2 (the tool IS blocked), but we ALSO best-effort append a
     // synthetic Deny so the block leaves durable evidence — otherwise the fold would see no claim and the
     // run could Complete despite a governance-infra block (council blocker, infra-exit-2 arm).
@@ -556,25 +581,6 @@ pub(crate) fn evaluate_tool_call(
             return 2;
         }
     };
-    // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
-    // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
-    // already left here. Checking it second would let a permissive rule authorise an escape.
-    let boundary_verdict = match boundary {
-        Some(b) => boundary_denial_with(&b.roots, &b.cwd, context, tool),
-        None => boundary_denial(context, tool),
-    };
-    if let Some((reason, fatal)) = boundary_verdict {
-        // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
-        // escape attempt and stays unit-FATAL; a READ probe — and a benign write into the worker's
-        // own `~/.claude` state tree (core#235) — is ADVISORY: blocked, audited, but not unit-fatal,
-        // so a worker probing an out-of-bounds file or persisting its own memory (then adapting) is
-        // not failed for it (P8 #10 / core#219). `fatal` comes from the boundary check itself so a
-        // Bash write-escape (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See
-        // `boundary_denial` / `append_boundary_deny`.
-        append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
-        eprintln!("wicked-governance: DENY ({reason})");
-        return 2;
-    }
 
     let phases = crate::scope::phase_aliases(phase, phase_alias);
     let selected = match select_any(&store, scope, &phases, context) {

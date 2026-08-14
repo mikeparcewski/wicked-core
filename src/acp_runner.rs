@@ -3213,6 +3213,10 @@ impl AcpStepRunner {
                         ),
                     },
                     cwd: unit_cwd.clone(),
+                    // The same HOME the worker subprocess inherits — captured once here so the
+                    // in-process judgement's `~` expansion and `~/.claude` carve-out cannot
+                    // diverge from the wrapped carrier's (Copilot).
+                    home: std::env::var_os("HOME").map(std::path::PathBuf::from),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -3261,7 +3265,28 @@ impl AcpStepRunner {
                 // per-run sandbox. The old `current_dir()` fallback ran repo-less units in the
                 // DAEMON's own directory.
                 let cwd = unit_cwd.clone();
-                let _ = std::fs::create_dir_all(&cwd);
+                // Fail CLOSED if the unit's directory cannot exist (permissions, bad path):
+                // proceeding would spawn the agent somewhere else and fail later with a less
+                // specific error, without marking this session slot failed (Copilot). The
+                // single-shot fallback resolves the same cwd and reports its own spawn error.
+                if let Err(e) = std::fs::create_dir_all(&cwd) {
+                    let reason = format!(
+                        "[wicked-core] cannot create unit workdir {} ({e}); \
+                         using single-shot fallback",
+                        cwd.display()
+                    );
+                    {
+                        let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                        guard.entry(session_key.clone()).or_insert(None);
+                    }
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::BINARY_UNAVAILABLE.to_string(),
+                    });
+                    return fallback_with_warning(reason, input, emit, &self.fallback);
+                }
                 // Scope the worker's estate MCP server to THIS run's repo graph (FINDING-122). The
                 // session is cached per (run_id, cli_key), so the repo is stable for its lifetime.
                 let code_graph_db = input
@@ -3352,6 +3377,7 @@ impl AcpStepRunner {
                             read: boundary.roots.read.clone(),
                         },
                         cwd: boundary.cwd.clone(),
+                        home: boundary.home.clone(),
                     }),
                 }
             });

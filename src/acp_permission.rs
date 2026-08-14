@@ -335,6 +335,7 @@ mod tests {
                     read: vec![],
                 },
                 cwd: sandbox.clone(),
+                home: None, // no `~` paths in this test; the carve-out is out of scope here
             })
         };
 

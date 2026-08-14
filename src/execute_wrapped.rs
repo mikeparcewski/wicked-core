@@ -718,15 +718,15 @@ impl WrappedCliStepRunner {
                         .into_iter()
                         .map(PathBuf::into_os_string)
                         .collect();
-                if g.code_graph_db.is_some() && repo_read_root(g.code_graph_db.as_deref()).is_none()
-                {
-                    eprintln!(
-                        "wicked-core: code_graph_db {:?} is not an absolute \
-                         <repo>/.codegraph/estate.db path; not widening the read boundary \
-                         to a repo root for unit {}",
-                        g.code_graph_db.as_deref(),
-                        input.unit.id
-                    );
+                if let Some(db) = g.code_graph_db.as_deref() {
+                    if repo_read_root(Some(db)).is_none() {
+                        eprintln!(
+                            "wicked-core: code_graph_db {db:?} is not an absolute \
+                             <repo>/.codegraph/estate.db path; not widening the read boundary \
+                             to a repo root for unit {}",
+                            input.unit.id
+                        );
+                    }
                 }
                 // A `join_paths` failure (e.g. a root containing the platform path separator) must
                 // not silently drop the read roots — that would leave the governed worker unable to
