@@ -709,29 +709,23 @@ impl WrappedCliStepRunner {
                 // worktree, so the worker reads source there. Both are READ-ONLY: the write root is
                 // untouched, so this cannot reopen the pin-rewrite escape. Worktree reads are already
                 // covered by the write root; this ADDS the repo root + the skill/plugin dir.
-                let mut read_roots: Vec<std::ffi::OsString> = Vec::new();
-                if let Some(home) = std::env::var_os("HOME") {
-                    read_roots.push(
-                        std::path::Path::new(&home)
-                            .join(".claude")
-                            .join("plugins")
-                            .into_os_string(),
-                    );
-                }
-                // `<repo>/.codegraph/estate.db` → widen the READ boundary to the repo root (two
-                // levels up). `repo_read_root` returns it only for an ABSOLUTE, correctly-shaped
-                // path; a relative or mis-shaped `code_graph_db` is NOT widened (see the helper).
-                match repo_read_root(g.code_graph_db.as_deref()) {
-                    Some(repo_root) => read_roots.push(repo_root),
-                    None => {
-                        if let Some(db) = g.code_graph_db.as_deref() {
-                            eprintln!(
-                                "wicked-core: code_graph_db {db:?} is not an absolute \
-                                 <repo>/.codegraph/estate.db path; not widening the read boundary \
-                                 to a repo root for unit {}",
-                                input.unit.id
-                            );
-                        }
+                // `<repo>/.codegraph/estate.db` → widen the READ boundary to the repo root; the
+                // skill/plugin dir rides along. ONE assembly shared with the ACP carrier
+                // (core#260) — see `assemble_read_roots`. A mis-shaped `code_graph_db` is NOT
+                // widened (the helper's shape check), reported here so the operator sees why.
+                let read_roots: Vec<std::ffi::OsString> =
+                    assemble_read_roots(g.code_graph_db.as_deref())
+                        .into_iter()
+                        .map(PathBuf::into_os_string)
+                        .collect();
+                if let Some(db) = g.code_graph_db.as_deref() {
+                    if repo_read_root(Some(db)).is_none() {
+                        eprintln!(
+                            "wicked-core: code_graph_db {db:?} is not an absolute \
+                             <repo>/.codegraph/estate.db path; not widening the read boundary \
+                             to a repo root for unit {}",
+                            input.unit.id
+                        );
                     }
                 }
                 // A `join_paths` failure (e.g. a root containing the platform path separator) must
@@ -876,7 +870,7 @@ fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
 }
 
 /// A per-run temp sandbox for repo-less runs (so a real CLI never edits the orchestrator's own tree).
-fn sandbox_for(input: &StepInput) -> PathBuf {
+pub(crate) fn sandbox_for(input: &StepInput) -> PathBuf {
     std::env::temp_dir()
         .join("wicked-core-sandbox")
         .join(&input.run_id)
@@ -1269,6 +1263,21 @@ fn repo_read_root(code_graph_db: Option<&str>) -> Option<std::ffi::OsString> {
     p.parent()
         .and_then(std::path::Path::parent)
         .map(|root| root.as_os_str().to_os_string())
+}
+
+/// The evidence-derived READ roots for a governed unit, as ONE assembly both carriers share
+/// (core#260): the worker's skill/plugin dir plus the repo root its code graph anchors to.
+/// The wrapped path env-joins these onto the subprocess; the ACP path hands them to the
+/// in-process boundary. Two assemblies would drift the first time one grew a root.
+pub(crate) fn assemble_read_roots(code_graph_db: Option<&str>) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(Path::new(&home).join(".claude").join("plugins"));
+    }
+    if let Some(repo_root) = repo_read_root(code_graph_db) {
+        roots.push(PathBuf::from(repo_root));
+    }
+    roots
 }
 
 /// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL

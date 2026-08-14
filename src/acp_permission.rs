@@ -41,6 +41,12 @@ pub(crate) struct AcpGate<'a> {
     pub phase_alias: Option<&'a str>,
     pub db: Option<&'a str>,
     pub decisions_path: &'a str,
+    /// The unit's filesystem boundary (core#260). This carrier evaluates IN-PROCESS, so the env
+    /// vars the wrapped path arms would read the DAEMON's environment — never set → no boundary,
+    /// which is exactly the asymmetry core#260 closes. `None` preserves that (boundary-less)
+    /// behavior only for callers that genuinely have no unit filesystem, e.g. tests of pure
+    /// policy evaluation; the runner always supplies it for governed units.
+    pub boundary: Option<crate::gate_hook::BoundaryCtx>,
 }
 
 /// ACP permission option kinds, per the protocol's `PermissionOption.kind`.
@@ -144,6 +150,7 @@ pub(crate) fn permission_result(gate: &AcpGate<'_>, params: &Value) -> (Value, b
         gate.decisions_path,
         &context,
         &tool_name,
+        gate.boundary.as_ref(),
     ) == 0;
 
     match choose_option(params.get("options").unwrap_or(&Value::Null), allowed) {
@@ -245,6 +252,7 @@ mod tests {
             phase_alias: None,
             db: Some(db.to_str().unwrap()),
             decisions_path: decisions.to_str().unwrap(),
+            boundary: None, // pure policy-evaluation test — no unit filesystem
         };
         let params = json!({
             "sessionId": "s1",
@@ -288,6 +296,97 @@ mod tests {
             log.contains("unit-1"),
             "the hook-fired sentinel for the phase is missing: {log}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#260 — THE ASYMMETRY CLOSED. The ACP carrier evaluates in-process, where the env vars
+    /// the wrapped launcher arms are never set, so `boundary_denial` answered "no boundary
+    /// configured" and a governed ACP unit could write ANYWHERE — including the gate pin that
+    /// FINDING-098 is about. This proves the explicit `BoundaryCtx` carrier: the SAME governed
+    /// Write is denied outside the declared roots (with a durable boundary claim) and permitted
+    /// inside them, with no policy involved — the boundary is judged BEFORE policy.
+    #[test]
+    fn a_governed_acp_write_outside_the_boundary_is_denied_and_inside_is_allowed() {
+        let dir = std::env::temp_dir().join(format!("wicked-acpbnd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sandbox = dir.join("sandbox");
+        let inbox = dir.join("inbox"); // the launcher-declared extra write root
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&inbox).unwrap();
+        let outside = dir.join("outside/evil.html");
+        let decisions = dir.join("decisions.jsonl");
+        // A REAL (empty) store for the allow arm: after the boundary passes, evaluation
+        // proceeds to policy selection, and an unresolvable store is an infra-deny — which is
+        // fail-closed and correct, but not what this test is about. (The deny arm never reaches
+        // the store: boundary is judged first, which the first arm also proves.)
+        let db = dir.join("gov.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+
+        let request = |path: &std::path::Path| {
+            json!({
+                "sessionId": "s1",
+                "toolName": "Write",
+                "toolCall": {"toolCallId": "t1", "rawInput": {
+                    "file_path": path.to_str().unwrap(), "content": "x"}},
+                "options": [
+                    {"optionId": "allow", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"},
+                ],
+            })
+        };
+        let boundary = || {
+            Some(crate::gate_hook::BoundaryCtx {
+                roots: crate::path_policy::AllowedRoots {
+                    write: vec![sandbox.clone(), inbox.clone()],
+                    read: vec![],
+                },
+                cwd: sandbox.clone(),
+                home: None, // no `~` paths in this test; the carve-out is out of scope here
+            })
+        };
+
+        // OUTSIDE both roots → denied, and the deny is durable as a boundary claim.
+        let g = AcpGate {
+            scope: "unit",
+            phase: "unit-1",
+            phase_alias: None,
+            db: db.to_str(), // empty store — no policies; only the boundary can deny
+            decisions_path: decisions.to_str().unwrap(),
+            boundary: boundary(),
+        };
+        let (result, allowed) = permission_result(&g, &request(&outside));
+        assert!(
+            !allowed,
+            "a write outside every declared root must be denied"
+        );
+        assert_eq!(result["outcome"]["optionId"], "reject");
+        let log = std::fs::read_to_string(&decisions).expect("decisions log");
+        assert!(
+            log.contains("boundary-deny"),
+            "the denial must be recorded as a BOUNDARY claim the fold can see: {log}"
+        );
+        assert!(
+            log.contains("outside this unit's boundary"),
+            "the claim must name the escape: {log}"
+        );
+
+        // INSIDE the declared inbox (the crew#263 deliverable shape) → allowed.
+        let decisions_ok = dir.join("decisions-ok.jsonl");
+        let g = AcpGate {
+            scope: "unit",
+            phase: "unit-1",
+            phase_alias: None,
+            db: db.to_str(),
+            decisions_path: decisions_ok.to_str().unwrap(),
+            boundary: boundary(),
+        };
+        let (result, allowed) = permission_result(&g, &request(&inbox.join("doc-v1.html")));
+        assert!(
+            allowed,
+            "a write inside a launcher-declared root must be permitted: {result}"
+        );
+        assert_eq!(result["outcome"]["optionId"], "allow");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
