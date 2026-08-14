@@ -859,12 +859,17 @@ impl WrappedCliStepRunner {
 /// be joined (it contains the platform's PATH separator), falls back to the NARROW cwd-only
 /// boundary — dropping the widening is a degraded run; dropping the boundary would be an escape.
 fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
+    // No extras ⇒ the pre-#259 boundary, byte-identical — and no join_paths round-trip that
+    // could misattribute a separator-collision in the CWD to the (empty) extras (Copilot).
+    if extras.is_empty() {
+        return cwd.as_os_str().to_os_string();
+    }
     let mut write_roots: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
     write_roots.extend(extras.iter().map(std::ffi::OsString::from));
     match std::env::join_paths(&write_roots) {
         Ok(joined) => joined,
         Err(e) => {
-            eprintln!("[wicked-core] extra write roots not joinable ({e}); arming cwd only");
+            eprintln!("[wicked-core] write-root list not joinable ({e}); arming cwd only");
             cwd.as_os_str().to_os_string()
         }
     }
@@ -2385,9 +2390,14 @@ mod tests {
             "cwd first, then the declared inbox"
         );
 
-        // A root the platform cannot join (embedded separator) → NARROW fallback, not escape.
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let bad = format!("/abs/evil{sep}extra");
+        // A root the platform cannot join → NARROW fallback, not escape. The unjoinable
+        // character differs by platform: unix `join_paths` refuses an embedded `:`, while
+        // Windows QUOTES a `;`-containing path (join succeeds) and refuses only `"`.
+        let bad = if cfg!(windows) {
+            "/abs/ev\"il".to_string()
+        } else {
+            "/abs/evil:extra".to_string()
+        };
         assert_eq!(
             armed_write_roots(cwd, &[bad]),
             cwd.as_os_str(),
