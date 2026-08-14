@@ -2472,12 +2472,26 @@ mod boundary_tests {
             "execute_wrapped no longer sets {WRITE_ROOTS_ENV} on the governed child, so no \
              governed unit has a filesystem boundary (FINDING-045/098)"
         );
-        // Armed from the WORKTREE specifically. Pointing it anywhere wider — the repo root, the
-        // home dir — would satisfy the check above while permitting the escape it exists to stop.
+        // Armed from the WORKTREE first, widened ONLY by the launcher-declared roots on the
+        // governance context (core#259, validated at launch against the pin tree). Pointing the
+        // base anywhere wider — the repo root, the home dir — or sourcing extras from anything
+        // the WORKER controls would permit the escape this exists to stop.
         assert!(
-            launcher.contains("WRITE_ROOTS_ENV, cwd.as_os_str()"),
-            "the write root must be the unit's worktree; a wider root passes the presence check \
-             and still allows the governance pin to be rewritten"
+            launcher.contains("vec![cwd.as_os_str().to_os_string()]"),
+            "the write-root list must START from the unit's worktree; a wider base passes the \
+             presence check and still allows the governance pin to be rewritten"
+        );
+        assert!(
+            launcher.contains("armed_write_roots(&cwd, &g.extra_write_roots)"),
+            "the ONLY widening must be the launch-validated extra_write_roots riding the \
+             governance context — not env, not the unit, not the workflow def"
+        );
+        // The launch side must actually judge those extras — remove the validation and the
+        // widening becomes an unvetted door straight past FINDING-098.
+        let launch = include_str!("actor.rs");
+        assert!(
+            launch.contains("validate_extra_write_roots"),
+            "the launch path no longer validates extra write roots against the pin tree"
         );
     }
 

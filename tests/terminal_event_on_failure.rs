@@ -127,6 +127,7 @@ fn a_pre_dispatch_failure_emits_a_terminal_session_failed() {
             human_confirm: HumanConfirm::None,
             repo_ref: None,
             workflow: Some("unresolvable-pin".into()),
+            extra_write_roots: Vec::new(),
         })
         // The actor replies to the caller BEFORE `pre_distribute` runs, so the launch itself
         // succeeds and the failure arrives asynchronously — exactly as the daemon saw it (HTTP 200,

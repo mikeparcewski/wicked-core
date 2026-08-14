@@ -162,6 +162,7 @@ fn a_def_gate_names_the_phase_whose_output_is_under_review() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("attr-test".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -223,6 +224,7 @@ fn a_run_level_confirm_attributes_the_pause_to_no_unit() {
         human_confirm: HumanConfirm::All,
         repo_ref: None,
         workflow: Some("attr-runlevel".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 

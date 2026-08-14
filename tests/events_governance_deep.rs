@@ -156,6 +156,7 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("gated-test".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -230,6 +231,7 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("tool-test".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 

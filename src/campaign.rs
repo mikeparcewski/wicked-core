@@ -76,6 +76,8 @@ impl RunSpec {
             // Campaign nodes are unfiled in v1 — a campaign-level projectId is an open question
             // (DES-PROJECT-001 §9); filing a campaign's runs rides the daemon, not the scheduler.
             project_id: None,
+            // Campaign runs deliver inside their worktrees; no widening (core#259).
+            extra_write_roots: Vec::new(),
         }
     }
 }

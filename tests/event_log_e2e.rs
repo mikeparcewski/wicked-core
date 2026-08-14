@@ -101,6 +101,7 @@ fn spec(session: &str) -> LaunchSpec {
         repo_ref: None,
         entity_mode: EntityMode::Shared,
         workflow: None,
+        extra_write_roots: Vec::new(),
     }
 }
 

@@ -184,6 +184,12 @@ pub struct LaunchOptions {
     /// ATOMICALLY with the launch record (one store batch); an unknown or archived project rejects
     /// the launch with no session persisted. Omit for an unfiled run (the synthesized `default`).
     pub project_id: Option<String>,
+    /// ADDITIONAL absolute write roots for the run's deliverables (core#259) — e.g. an inbox dir
+    /// the workflow contract names as the output destination. Widens the governed units'
+    /// filesystem boundary by exactly these roots, after the unit cwd. Each root must be absolute
+    /// and outside the engine's config/pin tree — an invalid root REJECTS the launch with no
+    /// session persisted. Omit for runs that deliver inside their own workdir.
+    pub extra_write_roots: Option<Vec<String>>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
@@ -205,6 +211,7 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         repo_ref: o.repo_ref,
         workflow: o.workflow,
         project_id: o.project_id,
+        extra_write_roots: o.extra_write_roots.unwrap_or_default(),
     })
 }
 

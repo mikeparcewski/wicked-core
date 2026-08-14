@@ -189,6 +189,7 @@ fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     }
 }
 
@@ -252,6 +253,7 @@ fn session_started_cli_count_matches_spec() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
     let collected = drain_until_terminal(&ev, "clicount-sess");
@@ -282,6 +284,7 @@ fn session_started_entity_mode_is_serialized() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch shared");
     let collected = drain_until_terminal(&ev, "em-shared");
@@ -305,6 +308,7 @@ fn session_started_entity_mode_is_serialized() {
             human_confirm: HumanConfirm::None,
             repo_ref: None,
             workflow: None,
+            extra_write_roots: Vec::new(),
         })
         .expect("launch isolated");
     let collected2 = drain_until_terminal(&ev2, "em-isolated");
@@ -330,6 +334,7 @@ fn session_started_workflow_id_is_none_for_free_text() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None, // free-text
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
     let collected = drain_until_terminal(&ev, "wf-none-sess");
@@ -386,6 +391,7 @@ fn unit_planned_role_and_gate_from_phase_def() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("test-rolegate".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -460,6 +466,7 @@ fn unit_planned_skill_ref_and_has_validator_pin() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("test-skillref".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -529,6 +536,7 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("test-toolexec".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -576,6 +584,7 @@ fn unit_planned_free_text_defaults() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -622,6 +631,7 @@ fn unit_distributed_council_routing_carries_agreement_fields() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -689,6 +699,7 @@ fn unit_distributed_evaluator_distinct_routing() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -749,6 +760,7 @@ fn unit_distributed_degraded_routing_carries_reason() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -868,6 +880,7 @@ fn workflow_selected_fires_for_structured_run_only() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("test-wfsel".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch structured");
     let collected = drain_until_terminal(&ev, "wfsel-sess");
@@ -1043,6 +1056,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
         human_confirm: HumanConfirm::All, // pauses before unit 1
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 
@@ -1139,6 +1153,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
             human_confirm: HumanConfirm::All,
             repo_ref: None,
             workflow: None,
+            extra_write_roots: Vec::new(),
         })
         .expect("launch empty amend run");
     let mut collected2 = drain_until_terminal(&ev2, "ura-empty-sess");

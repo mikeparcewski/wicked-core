@@ -186,6 +186,7 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     });
 
     assert!(
@@ -223,6 +224,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("bug".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch bug workflow");
 
@@ -278,6 +280,7 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("bug".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch bug workflow");
     assert!(
@@ -341,6 +344,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 

@@ -4869,6 +4869,7 @@ sleep 30
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
+                extra_write_roots: Vec::new(),
             }),
             prior_outputs: Vec::new(),
             elicitation_epoch: 0,

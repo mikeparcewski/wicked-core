@@ -121,6 +121,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .unwrap();
     assert!(wait_done(&core, "r"), "the run completes");
