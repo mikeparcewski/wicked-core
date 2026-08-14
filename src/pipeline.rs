@@ -470,6 +470,8 @@ pub(crate) fn pre_distribute(
         workdir,
         repo_ref,
         extra_write_roots,
+        archived_at: None,
+        archive_note: None,
     };
     if !session_already_started {
         put_node(store, session.to_node())?;

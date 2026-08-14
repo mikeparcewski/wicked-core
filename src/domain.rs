@@ -114,6 +114,15 @@ pub struct AgentSession {
     /// older sessions deserialize with no extra roots, i.e. the pre-#259 boundary.
     #[serde(default)]
     pub extra_write_roots: Vec<String>,
+    /// When the operator ARCHIVED this run (crew#265) — a write-off, not a delete: the run and
+    /// every artifact stay fully readable (same retire-not-delete contract as retired policies,
+    /// FINDING-038), but default run listings exclude it. Only a TERMINAL run can be archived.
+    /// Unix millis; `None` = live. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub archived_at: Option<i64>,
+    /// Optional operator note recorded at archival ("superseded by fix X", "campaign backlog").
+    #[serde(default)]
+    pub archive_note: Option<String>,
 }
 
 impl ToNode for AgentSession {
@@ -581,6 +590,8 @@ mod tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
         }
     }
 

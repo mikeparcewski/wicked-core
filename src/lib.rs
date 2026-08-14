@@ -909,6 +909,27 @@ impl Core {
     /// Retire, not delete: a governance system whose rules cannot be withdrawn cannot correct a
     /// mistake, but hard-deleting would strand every past decision that cites the id. The node
     /// stays readable and stops being selected.
+    /// Archive (or unarchive) a TERMINAL run (crew#265) — write-off, not delete. `Ok(false)` when
+    /// no session with that id exists; `Err` when the run is non-terminal (the caller answers 409).
+    pub fn archive_run(
+        &self,
+        run_id: &str,
+        archived: bool,
+        note: Option<String>,
+    ) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::ArchiveRun {
+                run_id: run_id.to_string(),
+                archived,
+                note,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     pub fn retire_policy(&self, id: &str) -> anyhow::Result<bool> {
         let (reply, rx) = channel();
         self.tx
