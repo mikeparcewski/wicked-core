@@ -840,6 +840,9 @@ fn launch_from_event(
         workflow: req.workflow.clone(),
         // Bus-requested runs are unfiled in v1 — filing arrives via the daemon API's `projectId`.
         project_id: None,
+        // Bus launches declare no deliverable roots in v1 (core#259) — the boundary stays the
+        // unit cwd. Wire through `req.args` only with launch-side validation, never implicitly.
+        extra_write_roots: Vec::new(),
     };
 
     let (reply, rx) = channel();

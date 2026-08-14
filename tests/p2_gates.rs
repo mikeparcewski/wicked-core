@@ -85,6 +85,7 @@ fn spec(session_id: &str, hc: HumanConfirm) -> LaunchSpec {
         human_confirm: hc,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     }
 }
 

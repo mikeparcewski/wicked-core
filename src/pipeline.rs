@@ -65,6 +65,7 @@ pub fn run_session(
         crate::domain::HumanConfirm::None, // sync path runs straight through (no interactive gates)
         None,                              // sync path has no registered repo
         None,
+        Vec::new(), // sync path declares no extra write roots (core#259)
         workflow,
         &dispatcher,
         emit,
@@ -349,6 +350,9 @@ pub(crate) fn pre_distribute(
     human_confirm: crate::domain::HumanConfirm,
     repo_ref: Option<String>,
     workdir: Option<String>,
+    // Launcher-declared extra write roots (core#259), already validated at launch; persisted on
+    // the session so resume/redrive re-arms the boundary the launch declared.
+    extra_write_roots: Vec<String>,
     workflow: Option<&str>,
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
@@ -465,6 +469,7 @@ pub(crate) fn pre_distribute(
         attempt: 0,
         workdir,
         repo_ref,
+        extra_write_roots,
     };
     if !session_already_started {
         put_node(store, session.to_node())?;
@@ -649,6 +654,7 @@ pub(crate) fn plan_and_distribute(
     human_confirm: crate::domain::HumanConfirm,
     repo_ref: Option<String>,
     workdir: Option<String>,
+    extra_write_roots: Vec<String>,
     workflow: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
@@ -669,6 +675,7 @@ pub(crate) fn plan_and_distribute(
         human_confirm,
         repo_ref,
         workdir,
+        extra_write_roots,
         workflow,
         emit,
         workflow_registry,
@@ -1506,6 +1513,7 @@ mod resolve_tests {
             crate::domain::HumanConfirm::None,
             None,
             None,
+            Vec::new(),
             Some("feature"),
             &mut |_| {},
             Some(&registry),
@@ -1626,6 +1634,7 @@ mod resolve_tests {
             crate::domain::HumanConfirm::None,
             Some(repo.id.clone()),
             None,
+            Vec::new(),
             Some(&id),
             &mut |_| {},
             Some(&registry),

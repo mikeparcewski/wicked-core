@@ -97,6 +97,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     }
 }
 
@@ -494,6 +495,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: Some("bug".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch bug workflow");
 

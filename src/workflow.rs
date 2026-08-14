@@ -116,6 +116,16 @@ pub struct GovernanceContext {
     /// `None`, i.e. no estate tools, which is the safe reading of "this peer never told me a repo".
     #[serde(default)]
     pub code_graph_db: Option<String>,
+    /// ADDITIONAL absolute write roots the LAUNCHER declared for this run's deliverables (core#259)
+    /// — e.g. wicked-crew's interactive-draft inbox, where the workflow's contract says the output
+    /// file must land. Joined AFTER the unit cwd into `WICKED_WRITE_ROOTS` by the wrapped-CLI
+    /// launcher, so `boundary_denial` admits the declared inbox and nothing else. Validated at
+    /// launch by [`crate::path_policy::validate_extra_write_roots`]: every root must be absolute
+    /// and outside the engine's own config/pin tree — a launcher-declared root must never reopen
+    /// the FINDING-098 pin-rewrite escape. Empty (the default, and the deserialization fallback
+    /// for tasks from older peers) means the boundary stays exactly the unit cwd.
+    #[serde(default)]
+    pub extra_write_roots: Vec<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

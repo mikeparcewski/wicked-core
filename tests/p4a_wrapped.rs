@@ -121,6 +121,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
         human_confirm: HumanConfirm::None,
         repo_ref: Some(entry.id.clone()),
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .expect("launch");
 

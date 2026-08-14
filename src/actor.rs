@@ -135,6 +135,9 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         // which repo a run targets. `dispatch_unit` fills it in from the session's registered repo
         // (`repo_code_graph_db`). Leaving it `None` is the safe default — no repo, no estate MCP.
         code_graph_db: None,
+        // Per-RUN, not process-wide: `dispatch_unit` fills this from the session (core#259).
+        // Empty here means an ungoverned/standalone context widens nothing.
+        extra_write_roots: Vec::new(),
     })
 }
 
@@ -475,6 +478,7 @@ pub(crate) fn run(
                     repo_ref: _,      // legacy path has no worktree
                     workflow,
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
+                    extra_write_roots: _, // legacy sync path widens nothing (core#259)
                 } = spec;
                 // Legacy straight-through path: runs to completion on this thread (stub = fast).
                 let res = pipeline::run_session(
@@ -534,6 +538,16 @@ pub(crate) fn run(
                         }
                     }
                     let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+                    // Extra write roots (core#259) are judged in the sync fast path like the
+                    // project/preflight checks above: an invalid root is a synchronous Err with
+                    // NO session persisted — never a session whose boundary silently reopens
+                    // the FINDING-098 pin-rewrite escape.
+                    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+                    crate::path_policy::validate_extra_write_roots(
+                        &spec.extra_write_roots,
+                        home.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
                     // Read the repo from the store (fast, no git subprocess) so the worker thread
                     // can create the worktree with its root_path without holding a store handle.
                     // `create_worktree` (git worktree add) is moved off the actor thread below.
@@ -613,6 +627,7 @@ pub(crate) fn run(
                         attempt: 0,
                         workdir: None, // resolved off-thread; updated in WorktreeReady
                         repo_ref: repo_ref.clone(),
+                        extra_write_roots: spec.extra_write_roots.clone(),
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -687,6 +702,7 @@ pub(crate) fn run(
                     spec.human_confirm,
                     repo_ref,
                     workdir,
+                    spec.extra_write_roots.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
@@ -844,6 +860,7 @@ pub(crate) fn run(
                     spec.human_confirm,
                     repo_ref.clone(),
                     workdir.clone(),
+                    spec.extra_write_roots.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
@@ -2526,6 +2543,13 @@ pub(crate) fn launch_run_inner(
     // run can't spuriously fail this one (decisions_path_for is never otherwise truncated). resume_run_inner
     // / redrive do NOT clear — they continue the same run's log. A brand-new id has no dir (harmless no-op).
     let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+    // Same launch-time judgement as the interactive path (core#259): an invalid extra write root
+    // is a synchronous Err before anything is planned or persisted.
+    {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        crate::path_policy::validate_extra_write_roots(&spec.extra_write_roots, home.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
     pipeline::plan_and_distribute(
@@ -2537,6 +2561,7 @@ pub(crate) fn launch_run_inner(
         spec.human_confirm,
         repo_ref,
         workdir,
+        spec.extra_write_roots.clone(),
         spec.workflow.as_deref(),
         dispatcher,
         &mut |ev| emit(subscribers, ev),
@@ -3957,6 +3982,9 @@ fn dispatch_unit(
         // so the worker's estate tools never need — and never get — the operational store.
         governance: in_process_governance().map(|g| crate::workflow::GovernanceContext {
             code_graph_db: repo_code_graph_db(store, session.repo_ref.as_deref()),
+            // From the SESSION, so a resume/redrive re-arms exactly the boundary the launch
+            // declared and validated (core#259).
+            extra_write_roots: session.extra_write_roots.clone(),
             ..g
         }),
         prior_outputs,
@@ -4790,6 +4818,7 @@ mod gate_pause_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -4948,6 +4977,7 @@ mod terminal_gate_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -5072,6 +5102,7 @@ mod def_gate_disclosure_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -5165,6 +5196,7 @@ mod def_gate_disclosure_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -5412,6 +5444,7 @@ mod terminal_worktree_reap_tests {
             attempt: 0,
             workdir: Some(wt.to_string_lossy().to_string()),
             repo_ref: Some(entry.id),
+            extra_write_roots: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -5550,6 +5583,7 @@ mod terminal_worktree_reap_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -5639,6 +5673,7 @@ mod worker_code_graph_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         }
     }
 
@@ -5866,6 +5901,7 @@ mod phase_boundary_governance_tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").

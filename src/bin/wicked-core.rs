@@ -391,6 +391,7 @@ fn main() {
                 repo_ref: None,
                 workflow: flag(&args, "--workflow"),
                 project_id: flag(&args, "--project"),
+                extra_write_roots: Vec::new(),
             });
             println!(
                 "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
@@ -693,6 +694,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         repo_ref,
         workflow: flag(args, "--workflow"),
         project_id: flag(args, "--project"),
+        extra_write_roots: Vec::new(),
     }) {
         Ok(id) => id,
         Err(e) => {

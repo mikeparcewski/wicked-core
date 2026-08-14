@@ -154,6 +154,13 @@ pub struct LaunchSpec {
     /// invalid or archived id fails the launch with no session persisted. `None` ⇒ unfiled (the
     /// synthesized `default` project).
     pub project_id: Option<String>,
+    /// ADDITIONAL absolute write roots for this run's deliverables (core#259) — e.g. an inbox dir
+    /// the workflow's contract names as the output destination. Widens the governed units'
+    /// filesystem boundary (`WICKED_WRITE_ROOTS`) by exactly these roots, after the unit cwd.
+    /// Validated at launch: each root must be absolute and outside the engine's config/pin tree
+    /// ([`crate::path_policy::validate_extra_write_roots`]) — an invalid root fails the launch
+    /// loudly with no session persisted. Empty for runs that deliver inside their own workdir.
+    pub extra_write_roots: Vec<String>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's

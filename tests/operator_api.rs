@@ -317,6 +317,7 @@ mod tests {
             human_confirm: HumanConfirm::default(),
             repo_ref: None,
             workflow: None,
+            extra_write_roots: Vec::new(),
         })
         .expect("launch_run must not fail");
 

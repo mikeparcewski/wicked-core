@@ -122,6 +122,7 @@ fn spec(session_id: &str, repo_ref: Option<String>) -> LaunchSpec {
         human_confirm: HumanConfirm::None,
         repo_ref,
         workflow: None,
+        extra_write_roots: Vec::new(),
     }
 }
 

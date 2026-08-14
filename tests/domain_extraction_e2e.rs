@@ -341,6 +341,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         human_confirm: HumanConfirm::None,
         repo_ref: Some(repo_ref.into()),
         workflow: Some("domain-extraction".into()),
+        extra_write_roots: Vec::new(),
     })
     .expect("launch domain-extraction");
 }

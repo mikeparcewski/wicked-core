@@ -302,6 +302,7 @@ fn a_denied_tool_call_fails_the_session() {
         human_confirm: HumanConfirm::None,
         repo_ref: None,
         workflow: None,
+        extra_write_roots: Vec::new(),
     })
     .unwrap();
 
@@ -342,6 +343,7 @@ fn a_shell_hostile_session_id_is_rejected_at_launch() {
             human_confirm: HumanConfirm::None,
             repo_ref: None,
             workflow: None,
+            extra_write_roots: Vec::new(),
         });
         assert!(
             res.is_err(),

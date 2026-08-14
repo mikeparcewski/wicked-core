@@ -180,6 +180,57 @@ pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
     resolved == root_real || resolved.starts_with(&root_real)
 }
 
+/// Validate launcher-declared extra write roots at LAUNCH time (core#259), before any session is
+/// persisted. Fails the launch loudly rather than arming a boundary that would reopen FINDING-098.
+///
+/// Two rules, both fail-closed:
+/// - Every root must be ABSOLUTE. A relative root would be resolved against whatever cwd the
+///   launcher happened to have, which is not a statement of intent.
+/// - No root may contain or be contained by the engine's own config tree
+///   (`~/.config/wicked-core` — the workflow overlays and gate pins). "Contain" cuts both ways:
+///   `~/.config/wicked-core/x` is inside the pin tree, and `~` / `/` CONTAIN it — either direction
+///   hands a governed worker write access to the pin that gates its own work.
+///
+/// Symlink-resolved with the same [`resolve_symlinks`] the boundary check uses, so a root reached
+/// through `/tmp`→`/private/tmp` (or a symlinked config dir) cannot dodge the comparison.
+pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
+    if roots.is_empty() {
+        return Ok(());
+    }
+    let config_tree = match home {
+        Some(h) => resolve_symlinks(&h.join(".config").join("wicked-core")),
+        // No HOME ⇒ the pin tree cannot be located, so containment cannot be proven either way.
+        // Fail CLOSED: refuse the widening rather than arm roots we cannot judge.
+        None => {
+            return Err(
+                "extra write roots need $HOME to validate against the engine config tree; \
+                 refusing to widen the boundary without it"
+                    .to_string(),
+            )
+        }
+    };
+    for raw in roots {
+        let p = Path::new(raw);
+        if !p.is_absolute() {
+            return Err(format!(
+                "extra write root is not absolute: {raw} (a relative root binds to the \
+                 launcher's incidental cwd, not a declared destination)"
+            ));
+        }
+        let resolved = resolve_symlinks(p);
+        if resolved_is_within(&resolved, &config_tree)
+            || resolved_is_within(&config_tree, &resolved)
+        {
+            return Err(format!(
+                "extra write root {raw} would expose the engine config tree ({}) — a governed \
+                 worker could rewrite the pin that gates its own work (FINDING-098); refused",
+                config_tree.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +382,43 @@ mod tests {
         let d = check("src/main.rs", &AllowedRoots::default(), false, &wt, None)
             .expect_err("empty roots must deny");
         assert!(d.allowed.is_empty());
+    }
+
+    /// core#259 — the launch-time judgement on launcher-declared deliverable roots. A scratch dir
+    /// passes; anything touching the pin tree, in EITHER containment direction, is refused, and so
+    /// is a relative root (it would bind to the launcher's incidental cwd).
+    #[test]
+    fn extra_write_roots_validation_admits_scratch_and_refuses_the_pin_tree() {
+        let home = scratch("xwr_home");
+        let inbox = scratch("xwr_inbox");
+
+        // Declaring nothing is always fine — and needs no HOME.
+        validate_extra_write_roots(&[], None).expect("empty roots need no validation");
+
+        // A scratch inbox outside the pin tree is the intended use.
+        validate_extra_write_roots(&[inbox.to_string_lossy().into_owned()], Some(&home))
+            .expect("a scratch inbox must be admitted");
+
+        // Relative → refused (binds to incidental cwd, not a declared destination).
+        let e = validate_extra_write_roots(&["relative/inbox".to_string()], Some(&home))
+            .expect_err("a relative root must be refused");
+        assert!(e.contains("not absolute"), "names the failure: {e}");
+
+        // Inside the pin tree → refused (FINDING-098: the worker could rewrite its own gate pin).
+        let pin_child = home.join(".config/wicked-core/workflows");
+        let e =
+            validate_extra_write_roots(&[pin_child.to_string_lossy().into_owned()], Some(&home))
+                .expect_err("a root inside the pin tree must be refused");
+        assert!(e.contains("FINDING-098"), "names the escape: {e}");
+
+        // CONTAINING the pin tree (the home dir itself) → refused for the same reason.
+        let e = validate_extra_write_roots(&[home.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("a root containing the pin tree must be refused");
+        assert!(e.contains("FINDING-098"), "names the escape: {e}");
+
+        // Roots present but no HOME to judge against → fail CLOSED, not open.
+        let e = validate_extra_write_roots(&[inbox.to_string_lossy().into_owned()], None)
+            .expect_err("no HOME must refuse the widening, never wave it through");
+        assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
     }
 }

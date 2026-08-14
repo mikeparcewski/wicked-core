@@ -108,6 +108,12 @@ pub struct AgentSession {
     /// The registered repo this run targets, if any (P3).
     #[serde(default)]
     pub repo_ref: Option<String>,
+    /// Launcher-declared extra write roots for the run's deliverables (core#259). Persisted on the
+    /// session so a resume/redrive re-arms the SAME boundary the launch declared — the widening
+    /// must never depend on the daemon's memory of the launch. `#[serde(default)]` for back-compat:
+    /// older sessions deserialize with no extra roots, i.e. the pre-#259 boundary.
+    #[serde(default)]
+    pub extra_write_roots: Vec<String>,
 }
 
 impl ToNode for AgentSession {
@@ -574,6 +580,7 @@ mod tests {
             attempt: 0,
             workdir: None,
             repo_ref: None,
+            extra_write_roots: Vec::new(),
         }
     }
 

@@ -689,14 +689,19 @@ impl WrappedCliStepRunner {
                 // full rationale (the #229 × #9b coverage-gate interaction, the FINDING-067 wipe
                 // vector) lives on `arm_worker_estate_channel`.
                 arm_worker_estate_channel(&mut cmd, g);
-                // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE root stays the
-                // worktree and ONLY the worktree — deliberately unchanged, and guarded by
-                // `the_launcher_arms_the_write_root`: a wider write root would let a governed worker
-                // rewrite the pin/workflow that gates its own work (the FINDING-098 escape). The
-                // extractor's own annotation writes do NOT need a wider write root — they go through
-                // `wicked-estate annotate` (a Bash call), which `boundary_denial` does not path-judge;
-                // only Write/Edit/Read tool-calls carrying a `path` are judged.
-                cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, cwd.as_os_str());
+                // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE roots are the
+                // worktree FIRST, then only the LAUNCHER-declared deliverable roots riding the
+                // governance context (core#259 — validated at launch against the pin tree), and
+                // nothing else; guarded by `the_launcher_arms_the_write_root`: any wider root would
+                // let a governed worker rewrite the pin/workflow that gates its own work (the
+                // FINDING-098 escape). The extractor's own annotation writes do NOT need a wider
+                // write root — they go through `wicked-estate annotate` (a Bash call), which
+                // `boundary_denial` does not path-judge; only Write/Edit/Read tool-calls carrying
+                // a `path` are judged.
+                cmd.env(
+                    crate::gate_hook::WRITE_ROOTS_ENV,
+                    armed_write_roots(&cwd, &g.extra_write_roots),
+                );
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
                 // worker reading, in turn, its own skill docs and then the repo's OWN SOURCE — the
@@ -844,6 +849,23 @@ impl WrappedCliStepRunner {
             // the armed marker). The fold trusts this, not unit properties, so a stub/test runner never
             // false-denies a claude-assigned unit for a marker it never wrote.
             governed: gov_env.is_some(),
+        }
+    }
+}
+
+/// The `WICKED_WRITE_ROOTS` value for a governed unit (core#259): the unit cwd FIRST, widened by
+/// ONLY the launcher-declared extras riding the governance context — validated at launch against
+/// the pin tree, so this join cannot introduce a root the launch did not judge. When a root cannot
+/// be joined (it contains the platform's PATH separator), falls back to the NARROW cwd-only
+/// boundary — dropping the widening is a degraded run; dropping the boundary would be an escape.
+fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
+    let mut write_roots: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
+    write_roots.extend(extras.iter().map(std::ffi::OsString::from));
+    match std::env::join_paths(&write_roots) {
+        Ok(joined) => joined,
+        Err(e) => {
+            eprintln!("[wicked-core] extra write roots not joinable ({e}); arming cwd only");
+            cwd.as_os_str().to_os_string()
         }
     }
 }
@@ -1189,6 +1211,10 @@ struct GovLaunch {
     /// annotations ride Bash, which the boundary does not path-judge, so no write-widening is
     /// needed (and widening it would let a worker rewrite its own gate pin). `None` for a repo-less run.
     code_graph_db: Option<String>,
+    /// LAUNCHER-declared extra WRITE roots for the run's deliverables (core#259), copied from
+    /// [`crate::workflow::GovernanceContext::extra_write_roots`] — already validated at launch
+    /// against the pin tree. Joined after the cwd into `WICKED_WRITE_ROOTS`.
+    extra_write_roots: Vec<String>,
 }
 
 /// Point a GOVERNED worker's estate CLI channel at the repo's OWN graph via `$WICKED_ESTATE_DB`.
@@ -1370,6 +1396,7 @@ fn arm_input_governance(
         phase,
         phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
         code_graph_db: gov.code_graph_db.clone(),
+        extra_write_roots: gov.extra_write_roots.clone(),
     })
 }
 
@@ -1951,6 +1978,7 @@ mod tests {
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
+                extra_write_roots: Vec::new(),
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -2212,6 +2240,7 @@ mod tests {
         let gov = crate::workflow::GovernanceContext {
             db_path: "/abs/estate.db".to_string(),
             code_graph_db: Some("/abs/repo/.codegraph/estate.db".to_string()),
+            extra_write_roots: Vec::new(),
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -2335,6 +2364,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#259 — the boundary value the launcher arms: cwd FIRST (the FINDING-098 base is never
+    /// displaced), launcher-declared extras after, `join_paths`-encoded so the hook's `split_paths`
+    /// round-trips each root intact. The separator-collision arm falls back to cwd ONLY — the
+    /// degraded-narrow direction, never the escape.
+    #[test]
+    fn armed_write_roots_is_cwd_first_plus_declared_extras() {
+        let cwd = std::path::Path::new("/wt/run-1");
+        let inbox = "/abs/drafts-inbox".to_string();
+
+        // No extras: exactly the cwd (the pre-#259 boundary, byte-identical).
+        assert_eq!(armed_write_roots(cwd, &[]), cwd.as_os_str());
+
+        // With extras: split_paths recovers [cwd, inbox] in that order.
+        let joined = armed_write_roots(cwd, std::slice::from_ref(&inbox));
+        let roots: Vec<std::path::PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(
+            roots,
+            vec![cwd.to_path_buf(), std::path::PathBuf::from(&inbox)],
+            "cwd first, then the declared inbox"
+        );
+
+        // A root the platform cannot join (embedded separator) → NARROW fallback, not escape.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let bad = format!("/abs/evil{sep}extra");
+        assert_eq!(
+            armed_write_roots(cwd, &[bad]),
+            cwd.as_os_str(),
+            "unjoinable extras must collapse to the cwd-only boundary"
+        );
+    }
+
     /// FINDING-067. The settings file is the ONE place the worker's own tools are handed a store, and
     /// the store it must never be handed is the operational one — the launcher used to pass exactly
     /// that, and a worker that ran the estate indexer against it deleted all 833 operational nodes.
@@ -2386,6 +2446,7 @@ mod tests {
             &crate::workflow::GovernanceContext {
                 db_path: op_db.to_string(),
                 code_graph_db: Some(graph_db.to_string()),
+                extra_write_roots: Vec::new(),
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
@@ -2404,6 +2465,7 @@ mod tests {
             &crate::workflow::GovernanceContext {
                 db_path: op_db.to_string(),
                 code_graph_db: None,
+                extra_write_roots: Vec::new(),
             },
             &format!("mcptest-norepo-{}", std::process::id()),
         );
@@ -2442,6 +2504,7 @@ mod tests {
                 phase: "unit-1".to_string(),
                 phase_id: String::new(),
                 code_graph_db: code_graph_db.map(str::to_string),
+                extra_write_roots: Vec::new(),
             };
             // spawn-audit: test-only — this Command is never spawned; it is a probe whose `get_envs`
             // we inspect to assert exactly which store the helper hands the worker's estate CLI. It

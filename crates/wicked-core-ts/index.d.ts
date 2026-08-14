@@ -31,6 +31,14 @@ export interface LaunchOptions {
    * the launch with no session persisted. Omit for an unfiled run (the synthesized `default`).
    */
   projectId?: string
+  /**
+   * ADDITIONAL absolute write roots for the run's deliverables (core#259) — e.g. an inbox dir
+   * the workflow contract names as the output destination. Widens the governed units'
+   * filesystem boundary by exactly these roots, after the unit cwd. Each root must be absolute
+   * and outside the engine's config/pin tree — an invalid root REJECTS the launch with no
+   * session persisted. Omit for runs that deliver inside their own workdir.
+   */
+  extraWriteRoots?: Array<string>
 }
 /**
  * A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -123,6 +131,12 @@ export declare class Core {
    * token. Safe whether the run is executing or paused.
    */
   cancelRun(runId: string): Promise<string>
+  /**
+   * Resolve a pending ACP elicitation. `action` must be `"accept"`, `"decline"`, or `"cancel"`;
+   * `response` is the human's typed/selected value as a JSON-typed value — pass `null` for
+   * `decline`/`cancel`. Resolves to `"ok"` on success, rejects if no matching elicitation exists.
+   */
+  resolveElicitation(runId: string, elicitationId: string, action: string, response?: any | undefined | null): Promise<string>
   /** The agent session ids currently on the store, as a JSON array of strings. */
   sessions(): Promise<string>
   /**
