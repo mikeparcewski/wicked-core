@@ -166,6 +166,29 @@ const WRITE_TOOLS: [&str; 3] = ["Write", "Edit", "NotebookEdit"];
 fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, bool)> {
     let roots = allowed_roots_from_env()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    boundary_denial_with(&roots, &cwd, context, tool)
+}
+
+/// The unit's filesystem boundary as EXPLICIT state (core#260) — for the carrier that evaluates
+/// IN-PROCESS (the ACP permission bridge), where env vars would read the DAEMON's environment
+/// (never armed → no boundary) and `current_dir()` the daemon's cwd (wrong base for resolving a
+/// tool call's relative paths). The wrapped path's hook subprocess keeps the env carrier:
+/// [`boundary_denial`] resolves env + process cwd and calls the same pure check.
+pub(crate) struct BoundaryCtx {
+    pub roots: crate::path_policy::AllowedRoots,
+    /// The unit's working directory — the base for resolving relative tool-call paths.
+    pub cwd: std::path::PathBuf,
+}
+
+/// The pure boundary judgement both carriers share: roots and cwd are PARAMETERS, never ambient
+/// process state, so the wrapped subprocess (env-armed) and the in-process ACP bridge (context-
+/// armed, core#260) cannot diverge on what "outside the boundary" means.
+fn boundary_denial_with(
+    roots: &crate::path_policy::AllowedRoots,
+    cwd: &std::path::Path,
+    context: &serde_json::Value,
+    tool: &str,
+) -> Option<(String, bool)> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
 
     // Path-bearing tools (Write/Edit/NotebookEdit/Read): the direct path check.
@@ -175,7 +198,7 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
         .filter(|p| !p.is_empty())
     {
         let is_write = WRITE_TOOLS.contains(&tool);
-        if let Err(d) = crate::path_policy::check(path, &roots, is_write, &cwd, home.as_deref()) {
+        if let Err(d) = crate::path_policy::check(path, roots, is_write, cwd, home.as_deref()) {
             // A blocked WRITE is unit-FATAL — EXCEPT into the worker's OWN Claude Code state tree
             // (`~/.claude/**`, e.g. `~/.claude/projects/<slug>/memory/*.md`). A governed claude
             // worker routinely writes its own project-memory there; the write is STILL blocked
@@ -204,7 +227,7 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
             for target in bash_write_targets(command) {
                 if let Err(d) =
-                    crate::path_policy::check(&target, &roots, true, &cwd, home.as_deref())
+                    crate::path_policy::check(&target, roots, true, cwd, home.as_deref())
                 {
                     return Some((format!("Bash write leaves the unit boundary: {d}"), true));
                 }
@@ -443,6 +466,8 @@ pub fn run_gate_hook(scope: &str, phase: &str, phase_alias: Option<&str>, db: Op
         &decisions_path,
         &context,
         &tool,
+        // Hook-subprocess carrier: the launcher armed the boundary on OUR env (core#260).
+        None,
     )
 }
 
@@ -473,6 +498,11 @@ pub(crate) fn evaluate_tool_call(
     decisions_path: &str,
     context: &serde_json::Value,
     tool: &str,
+    // The carrier's boundary (core#260): `None` ⇒ the hook-SUBPROCESS carrier, which resolves
+    // roots from the env the launcher armed (`WICKED_WRITE_ROOTS`/`WICKED_READ_ROOTS`) and the
+    // process cwd. `Some` ⇒ an IN-PROCESS carrier (the ACP permission bridge), whose ambient env/
+    // cwd belong to the DAEMON, not the unit — its boundary must arrive as explicit state.
+    boundary: Option<&BoundaryCtx>,
 ) -> i32 {
     // No clones: this runs once per tool call on both carriers, and `context` carries the tool's
     // whole input — file contents included (review).
@@ -529,7 +559,11 @@ pub(crate) fn evaluate_tool_call(
     // BOUNDARY FIRST. A call reaching outside the unit's worktree is refused before any policy is
     // consulted: policies answer "is this action allowed HERE", and a path outside the boundary has
     // already left here. Checking it second would let a permissive rule authorise an escape.
-    if let Some((reason, fatal)) = boundary_denial(context, tool) {
+    let boundary_verdict = match boundary {
+        Some(b) => boundary_denial_with(&b.roots, &b.cwd, context, tool),
+        None => boundary_denial(context, tool),
+    };
+    if let Some((reason, fatal)) = boundary_verdict {
         // The tool-call is BLOCKED either way (return 2 below). A WRITE outside the sandbox is an
         // escape attempt and stays unit-FATAL; a READ probe — and a benign write into the worker's
         // own `~/.claude` state tree (core#235) — is ADVISORY: blocked, audited, but not unit-fatal,

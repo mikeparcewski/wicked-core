@@ -3161,6 +3161,14 @@ impl AcpStepRunner {
         // we now answer with the same policy and the same audit records as the hook
         // (`acp_permission`, FINDING-060/062). The cost that reroute paid — a governed unit gets
         // one turn — is what made domain-extraction unable to finish on a real repo (FINDING-100).
+        // The unit's working directory, decided ONCE for both the ACP process spawn and the
+        // boundary base (core#260): the worktree when the run targets a repo, else the SAME
+        // per-run sandbox the wrapped path uses — never the daemon's own cwd, which is where
+        // repo-less ACP units used to run (and where relative tool-call paths resolved).
+        let unit_cwd = input
+            .workdir
+            .clone()
+            .unwrap_or_else(|| crate::execute_wrapped::sandbox_for(input));
         let gate_ctx = match (&input.governance, cli_runs_claude(&cli_key)) {
             (Some(g), true) => {
                 let scope =
@@ -3190,7 +3198,23 @@ impl AcpStepRunner {
                     });
                     return fallback_with_warning(reason, input, emit, &self.fallback);
                 }
-                Some((scope, phase, decisions_path, g.db_path.clone()))
+                // The unit's filesystem boundary, mirroring what the wrapped launcher arms by
+                // env (core#260): WRITE = unit cwd + the launch-validated extra roots; READ =
+                // the shared evidence-derived assembly (skills dir + repo root). Built HERE, on
+                // the runner with the governance context in hand — the in-process evaluation
+                // cannot read it from any env.
+                let boundary = crate::gate_hook::BoundaryCtx {
+                    roots: crate::path_policy::AllowedRoots {
+                        write: std::iter::once(unit_cwd.clone())
+                            .chain(g.extra_write_roots.iter().map(std::path::PathBuf::from))
+                            .collect(),
+                        read: crate::execute_wrapped::assemble_read_roots(
+                            g.code_graph_db.as_deref(),
+                        ),
+                    },
+                    cwd: unit_cwd.clone(),
+                };
+                Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
             _ => None,
         };
@@ -3233,10 +3257,11 @@ impl AcpStepRunner {
                 }
             } else {
                 drop(guard);
-                let cwd = input
-                    .workdir
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                // The SAME cwd the boundary was built from (core#260) — worktree, else the
+                // per-run sandbox. The old `current_dir()` fallback ran repo-less units in the
+                // DAEMON's own directory.
+                let cwd = unit_cwd.clone();
+                let _ = std::fs::create_dir_all(&cwd);
                 // Scope the worker's estate MCP server to THIS run's repo graph (FINDING-122). The
                 // session is cached per (run_id, cli_key), so the repo is stable for its lifetime.
                 let code_graph_db = input
@@ -3310,15 +3335,26 @@ impl AcpStepRunner {
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
         let prompt = unit_prompt(input);
 
-        let gate = gate_ctx.as_ref().map(|(scope, phase, decisions_path, db)| {
-            crate::acp_permission::AcpGate {
-                scope,
-                phase,
-                phase_alias: None,
-                db: Some(db.as_str()),
-                decisions_path,
-            }
-        });
+        let gate = gate_ctx
+            .as_ref()
+            .map(|(scope, phase, decisions_path, db, boundary)| {
+                crate::acp_permission::AcpGate {
+                    scope,
+                    phase,
+                    phase_alias: None,
+                    db: Some(db.as_str()),
+                    decisions_path,
+                    // Clone rather than borrow: BoundaryCtx owns its PathBufs and the gate is
+                    // rebuilt per turn; the roots are a handful of paths.
+                    boundary: Some(crate::gate_hook::BoundaryCtx {
+                        roots: crate::path_policy::AllowedRoots {
+                            write: boundary.roots.write.clone(),
+                            read: boundary.roots.read.clone(),
+                        },
+                        cwd: boundary.cwd.clone(),
+                    }),
+                }
+            });
         let turn = exec_turn_acp(
             &mut proc,
             &prompt,
