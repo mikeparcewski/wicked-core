@@ -1237,11 +1237,15 @@ fn start_acp_process(
         }
         // In-boundary scratch for unit sessions (core#264) — tools the bridge spawns inherit
         // this, so `mktemp`/`$TMPDIR` writes land inside the unit instead of the system temp.
+        // Set ONLY when the dir really exists as a directory (same rule as the wrapped path):
+        // a temp env pointing at nothing breaks tools that consult it; left unset, the worker
+        // falls back to the system temp, which the advisory carve-out tolerates (Copilot).
         if let Some(tmp) = scratch_tmp {
-            let _ = std::fs::create_dir_all(tmp);
-            cmd.env("TMPDIR", tmp);
-            cmd.env("TMP", tmp);
-            cmd.env("TEMP", tmp);
+            if std::fs::create_dir_all(tmp).is_ok() && tmp.is_dir() {
+                cmd.env("TMPDIR", tmp);
+                cmd.env("TMP", tmp);
+                cmd.env("TEMP", tmp);
+            }
         }
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);

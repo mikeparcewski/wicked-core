@@ -191,15 +191,18 @@ pub(crate) struct BoundaryCtx {
 /// worker wrote its scratch (temp_dir() alone would have missed it). Same symlink-aware
 /// containment as every other boundary comparison.
 fn in_system_temp(resolved: &std::path::Path) -> bool {
+    // ONE temp_dir() read for both the exclusion and the inclusion set — two reads could
+    // diverge under a concurrently-mutated temp env and make the gov-root exclusion judge a
+    // different tree than the carve-out (Copilot).
+    let sys_temp = std::env::temp_dir();
     // The governance evidence tree ALSO lives under temp (`$TMPDIR/wicked-core-gov/…` — the
     // decisions logs the fold reads). A blocked write there is a tamper attempt against the
     // audit trail, not scratch: it must NOT ride the scratch carve-out. (It is still blocked
     // either way; this keeps it unit-FATAL.)
-    let gov_root = std::env::temp_dir().join("wicked-core-gov");
-    if crate::path_policy::resolved_is_within(resolved, &gov_root) {
+    if crate::path_policy::resolved_is_within(resolved, &sys_temp.join("wicked-core-gov")) {
         return false;
     }
-    let mut temps = vec![std::env::temp_dir()];
+    let mut temps = vec![sys_temp];
     if cfg!(unix) {
         temps.push(std::path::PathBuf::from("/tmp"));
     }
