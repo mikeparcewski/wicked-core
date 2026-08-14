@@ -1197,6 +1197,11 @@ fn start_acp_process(
     config: &AcpConfig,
     cwd: &std::path::Path,
     code_graph_db: Option<&str>,
+    // `Some` ⇒ point the worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at this dir
+    // (core#264) so scratch lands inside the unit boundary instead of tripping (advisory)
+    // denies in the system temp. UNIT sessions pass `<cwd>/tmp`; CHAT sessions pass `None` —
+    // dropping a `tmp/` dir into a user's own working directory would be intrusive.
+    scratch_tmp: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
     // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
@@ -1229,6 +1234,14 @@ fn start_acp_process(
         // frequently exactly that variable.
         if let Some(dir) = &worker_config_dir {
             cmd.env(CLAUDE_CONFIG_DIR_ENV, dir);
+        }
+        // In-boundary scratch for unit sessions (core#264) — tools the bridge spawns inherit
+        // this, so `mktemp`/`$TMPDIR` writes land inside the unit instead of the system temp.
+        if let Some(tmp) = scratch_tmp {
+            let _ = std::fs::create_dir_all(tmp);
+            cmd.env("TMPDIR", tmp);
+            cmd.env("TMP", tmp);
+            cmd.env("TEMP", tmp);
         }
         cmd.args(&config.start_args);
         cmd.current_dir(cwd);
@@ -2845,7 +2858,7 @@ impl AcpStepRunner {
             ));
         }
         // Chat is repo-less exploration → no estate MCP server (FINDING-122).
-        let proc = start_acp_process(&config, cwd, None).map_err(|e| e.to_string())?;
+        let proc = start_acp_process(&config, cwd, None, None).map_err(|e| e.to_string())?;
         let arc = Arc::new(Mutex::new(proc));
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         // A racing ensure may have inserted first — reuse theirs, drop ours.
@@ -3293,7 +3306,7 @@ impl AcpStepRunner {
                     .governance
                     .as_ref()
                     .and_then(|g| g.code_graph_db.as_deref());
-                match start_acp_process(&acp_config, &cwd, code_graph_db) {
+                match start_acp_process(&acp_config, &cwd, code_graph_db, Some(&cwd.join("tmp"))) {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
                         let arc = Arc::new(Mutex::new(proc));
@@ -3947,7 +3960,7 @@ sleep 30
             .map(|_| {
                 let config = config.clone();
                 let cwd = dir.clone();
-                std::thread::spawn(move || start_acp_process(&config, &cwd, None))
+                std::thread::spawn(move || start_acp_process(&config, &cwd, None, None))
             })
             .collect();
         let procs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -4157,7 +4170,7 @@ sleep 30
         std::fs::write(&ledger, "").unwrap();
         let script = stub_auth_requiring_bridge(&dir, &ledger);
 
-        let proc = start_acp_process(&stub_config(&script, None), &dir, None)
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None, None)
             .expect("an auth-requiring agent must start once the client authenticates");
         assert_eq!(proc.session_id, "authed-session");
         // initialize=1, authenticate=2, session/new=3 — the first turn must not reuse an id.
@@ -4184,7 +4197,7 @@ sleep 30
         std::fs::write(&ledger, "").unwrap();
         let script = stub_auth_requiring_bridge(&dir, &ledger);
 
-        let proc = start_acp_process(&stub_config(&script, Some("method-b")), &dir, None)
+        let proc = start_acp_process(&stub_config(&script, Some("method-b")), &dir, None, None)
             .expect("configured-method authentication must start the session");
 
         let frames = std::fs::read_to_string(&ledger).unwrap();
@@ -4222,7 +4235,7 @@ sleep 30
 "#,
         );
 
-        let err = match start_acp_process(&stub_config(&script, None), &dir, None) {
+        let err = match start_acp_process(&stub_config(&script, None), &dir, None, None) {
             Err(e) => e,
             Ok(_) => panic!("an agent that refuses every session must fail the start"),
         };
@@ -4261,7 +4274,7 @@ sleep 30
 "#,
         );
 
-        let proc = start_acp_process(&stub_config(&script, None), &dir, None)
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None, None)
             .expect("a rejected authenticate must not fail a start the agent is willing to grant");
         assert_eq!(proc.session_id, "already-authed");
         drop(proc);
@@ -4302,7 +4315,7 @@ sleep 30
             ),
         );
 
-        let proc = start_acp_process(&stub_config(&script, None), &dir, None).expect("start");
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None, None).expect("start");
         let seen = std::fs::read_to_string(&ledger).unwrap().trim().to_string();
         assert_ne!(
             seen, "UNSET",
@@ -4361,8 +4374,8 @@ sleep 30
 
         // WITH a repo graph → the estate server, scoped to that exact db.
         let graph_db = "/tmp/wicked-122-repo/.codegraph/estate.db";
-        let proc =
-            start_acp_process(&stub_config(&script, None), &dir, Some(graph_db)).expect("start");
+        let proc = start_acp_process(&stub_config(&script, None), &dir, Some(graph_db), None)
+            .expect("start");
         let seen = std::fs::read_to_string(&ledger).unwrap();
         assert!(
             seen.contains("\"mcpServers\""),
@@ -4394,7 +4407,8 @@ sleep 30
                 ledger = ledger2.display()
             ),
         );
-        let proc2 = start_acp_process(&stub_config(&script2, None), &dir, None).expect("start");
+        let proc2 =
+            start_acp_process(&stub_config(&script2, None), &dir, None, None).expect("start");
         let seen2 = std::fs::read_to_string(&ledger2).unwrap();
         assert!(
             !seen2.contains("wicked-estate"),
@@ -5752,7 +5766,7 @@ else:
             transport: AcpTransport::default(),
             auth_method: None,
         };
-        start_acp_process(&config, dir, None)
+        start_acp_process(&config, dir, None, None)
             .unwrap_or_else(|e| panic!("mock ACP start failed for behavior={behavior}: {e}"))
     }
 

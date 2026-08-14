@@ -702,6 +702,16 @@ impl WrappedCliStepRunner {
                     crate::gate_hook::WRITE_ROOTS_ENV,
                     armed_write_roots(&cwd, &g.extra_write_roots),
                 );
+                // Point the worker's scratch INSIDE the boundary (core#264): `mktemp`, `> $TMPDIR/x`
+                // and every tool honoring the platform temp env land in `<cwd>/tmp` — in-boundary,
+                // reaped with the sandbox/worktree — instead of tripping (advisory) boundary denies
+                // in the system temp. Deliberate explicit set, same as the gate vars above;
+                // best-effort mkdir (a worker that never uses temp must not fail over it).
+                let unit_tmp = cwd.join("tmp");
+                let _ = std::fs::create_dir_all(&unit_tmp);
+                cmd.env("TMPDIR", &unit_tmp);
+                cmd.env("TMP", &unit_tmp);
+                cmd.env("TEMP", &unit_tmp);
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
                 // worker reading, in turn, its own skill docs and then the repo's OWN SOURCE — the

@@ -313,7 +313,16 @@ mod tests {
         let inbox = dir.join("inbox"); // the launcher-declared extra write root
         std::fs::create_dir_all(&sandbox).unwrap();
         std::fs::create_dir_all(&inbox).unwrap();
-        let outside = dir.join("outside/evil.html");
+        // A path OUTSIDE the roots AND outside the system temp: the scratch carve-out (core#264)
+        // downgrades temp-located escapes to the advisory claim, and this arm proves the FATAL
+        // one. Derive it from the temp dir's own filesystem root so it is absolute on every
+        // platform (a bare `/x` is not absolute on Windows and would resolve INSIDE the cwd).
+        let fs_root = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("every path has a root")
+            .to_path_buf();
+        let outside = fs_root.join("wicked-nonexistent-outside").join("evil.html");
         let decisions = dir.join("decisions.jsonl");
         // A REAL (empty) store for the allow arm: after the boundary passes, evaluation
         // proceeds to policy selection, and an unresolvable store is an infra-deny — which is
