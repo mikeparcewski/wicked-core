@@ -155,7 +155,7 @@ fn real_cli_runs_in_the_worktree_and_output_is_governed_and_persisted() {
     // Assert instead that the session RECORDED that worktree as its workdir — deterministic, and
     // the honest evidence that the run used it. `actor.rs` sets workdir to the worktree path on
     // `WorktreeReady`.
-    let expected_wt = repo.join(".wicked").join("worktrees").join("run");
+    let expected_wt = repo.join("wicked-worktrees").join("run");
     assert_eq!(
         v.session.workdir.as_deref(),
         Some(expected_wt.to_string_lossy().as_ref()),

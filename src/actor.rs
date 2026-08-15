@@ -2659,10 +2659,36 @@ pub(crate) fn resume_run_inner(
     };
     if matches!(
         session.status,
-        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+        SessionStatus::Completed | SessionStatus::Cancelled
     ) {
         return Ok(session.status);
     }
+    // crew#277: a FAILED run resumes from its cursor unit instead of no-opping — three dogfood
+    // runs each burned three verified, gate-approved phases because a seat-level worker error at
+    // one unit had no recovery short of a full relaunch. Reset the cursor unit for re-dispatch
+    // (done units stay done; "done" is re-derived from evidence, never re-asserted) and put the
+    // session back on the executing path. The R1 planning guard below still applies: a run that
+    // never planned has no cursor to resume from.
+    let session = if session.status == SessionStatus::Failed {
+        let mut units = crate::domain::session_units(store, run_id)?;
+        let Some(unit) = units.get_mut(session.unit_ix) else {
+            // Failed with no cursor unit (planning-time failure) — nothing to re-dispatch.
+            return Ok(SessionStatus::Failed);
+        };
+        if unit.status == crate::domain::UnitStatus::Rejected {
+            unit.status = crate::domain::UnitStatus::Distributed;
+            unit.denial_reason = None;
+            put_node(store, unit.to_node())?;
+        }
+        let mut s = session;
+        s.status = SessionStatus::Executing;
+        put_node(store, s.to_node())?;
+        // No UnitExecuting here: `dispatch_unit` (reached via `advance_or_pause` below) is the
+        // single emit point, and a second emission would duplicate the event (Copilot).
+        s
+    } else {
+        session
+    };
     // R1 — crash-during-planning guard. A crash between `plan_and_distribute`'s `session=Planning`
     // write and the first unit write (or anywhere before `Executing`) leaves the session in a
     // PRE-EXECUTION status with no complete, distributed unit plan on the store. Advancing from the
@@ -3330,6 +3356,99 @@ fn apply_step_result(
                 return Ok(StepApplied::Continuing);
             }
         }
+        // ── AUTONOMOUS SEAT FAILOVER (crew#277) ──────────────────────────────────────────
+        // Three governed runs died at ONE unit each on a seat-level workerError (agy exit-1
+        // timeout ×2, copilot hang) while healthy seats sat idle. A CLI process failure says
+        // nothing about the WORK — a task judgment surfaces as exit-0 plus a downstream gate
+        // deny, never a nonzero exit (see `is_transient_cli_failure`) — so burning the run on
+        // it discards every verified phase behind it. Mechanical ladder, no judge required:
+        // while attempts remain and another ELIGIBLE seat exists, reassign the unit and
+        // re-dispatch; otherwise fall through to the standard fail contract. Eligible = in
+        // the session roster, not the seat that just failed, and not the seat of any unit
+        // this one `depends_on` — a failover must never hand an evaluation unit to its
+        // creator (the evaluator≠creator invariant the council encoded at routing).
+        // Governed units only: their phases are idempotent (the same argument that gates the
+        // wrapped runner's transient retry); the engine's own internal calls are not.
+        const MAX_SEAT_FAILOVERS: u32 = 2;
+        if output.governed
+            && output.attempt < MAX_SEAT_FAILOVERS
+            && crate::acp_runner::is_transient_cli_failure(&output.output)
+        {
+            let failed_cli = unit
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            let depends_on = unit.depends_on.clone();
+            let unit_ix = output.unit_ix;
+            // Immutable scan ends the `unit` borrow; the branch re-borrows before mutating.
+            // `assigned_cli: None` means the DEFAULT seat everywhere else in this file — a
+            // depends_on creator on the default must be excluded too, not dropped (Copilot).
+            let creator_seats: std::collections::HashSet<String> = units
+                .iter()
+                .filter(|u| {
+                    u.phase_id()
+                        .is_some_and(|p| depends_on.iter().any(|d| d == p))
+                })
+                .map(|u| {
+                    u.assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string())
+                })
+                .collect();
+            let next_seat = session
+                .clis
+                .iter()
+                .find(|c| **c != failed_cli && !creator_seats.contains(*c))
+                .cloned();
+            if let Some(next) = next_seat {
+                let invocation = crate::registry_roster()
+                    .into_iter()
+                    .find(|c| c.key == next)
+                    .map(|c| c.headless_invocation);
+                let unit = units
+                    .get_mut(unit_ix)
+                    .ok_or_else(|| anyhow::anyhow!("unit ix {unit_ix} vanished mid-failover"))?;
+                unit.assigned_cli = Some(next.clone());
+                unit.assigned_invocation = invocation;
+                put_node(store, unit.to_node())?;
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: format!(
+                            "seat '{failed_cli}' failed (worker error); failing over to '{next}' \
+                             ({}/{MAX_SEAT_FAILOVERS})",
+                            output.attempt + 1
+                        ),
+                        failure_kind: crate::event::StepFailureKind::WorkerError,
+                    },
+                );
+                // Drop any cached (dead) session for the failed seat, then rework: bump the
+                // attempt so the stale-result guard discards late output from the failed
+                // worker, and re-dispatch through the single funnel.
+                runner.close_cli_session(&run_id, &failed_cli);
+                session.attempt = session.attempt.saturating_add(1);
+                put_node(store, session.to_node())?;
+                dispatch_unit(
+                    store,
+                    subscribers,
+                    runner,
+                    self_tx,
+                    &run_id,
+                    unit_ix,
+                    lifecycle_maps,
+                    actor_maps,
+                    process_gen,
+                    is_acp,
+                )?;
+                return Ok(StepApplied::Continuing);
+            }
+        }
+        let unit = units
+            .get_mut(output.unit_ix)
+            .ok_or_else(|| anyhow::anyhow!("unit ix {} vanished post-failover", output.unit_ix))?;
         unit.status = crate::domain::UnitStatus::Rejected;
         // Capture WHY for the UI: the worker's failure output (bounded). Head+TAIL, not head
         // only — fatal lines come LAST by convention (a tool that prints N warnings then the

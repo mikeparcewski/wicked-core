@@ -2258,21 +2258,51 @@ mod tests {
 pub const GATE_PROTOCOL_VERSION: u32 = 1;
 
 /// The line `gate-hook --protocol-version` prints. Parsed by the launcher; keep it one stable line.
+///
+/// Carries BOTH versions (crew#275): the PROTOCOL version (the carrier interface — args, env,
+/// exit codes) and the SEMANTIC version (the crate — what the gate actually enforces). The
+/// deployment-skew incident passed the protocol check because a two-day-stale binary still spoke
+/// protocol 1 while enforcing pre-core#264 boundary semantics; equal semver is what proves both
+/// artifacts came from one source tree.
 #[must_use]
 pub fn protocol_version_line() -> String {
-    format!("wicked-core gate-hook protocol {GATE_PROTOCOL_VERSION}")
+    format!(
+        "wicked-core gate-hook protocol {GATE_PROTOCOL_VERSION} semver {}",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
-/// Parse [`protocol_version_line`] back out of a probe's stdout.
+/// Parse the protocol number back out of a probe's stdout.
 ///
 /// Tolerant of surrounding whitespace and trailing output, strict about the shape: anything it does
 /// not recognise is `None`, which the caller must treat as skew rather than as "probably fine".
+/// Takes the FIRST whitespace token after the prefix so it reads both the pre-semver line
+/// (`… protocol 1`) and the current one (`… protocol 1 semver 0.4.0`).
 #[must_use]
 pub fn parse_protocol_version(stdout: &str) -> Option<u32> {
     stdout
         .lines()
         .find_map(|l| l.trim().strip_prefix("wicked-core gate-hook protocol "))
-        .and_then(|v| v.trim().parse().ok())
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse().ok())
+}
+
+/// Parse the SEMANTIC version out of a probe's stdout (crew#275). `None` for a binary that
+/// predates the semantic handshake — the caller must treat that as skew (an old binary is
+/// exactly what this detects), never as "probably fine".
+#[must_use]
+pub fn parse_gate_semver(stdout: &str) -> Option<String> {
+    stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("wicked-core gate-hook protocol "))
+        .and_then(|rest| {
+            let mut toks = rest.split_whitespace();
+            toks.next()?; // protocol number
+            match (toks.next()?, toks.next()) {
+                ("semver", Some(v)) => Some(v.to_string()),
+                _ => None,
+            }
+        })
 }
 
 #[cfg(test)]
