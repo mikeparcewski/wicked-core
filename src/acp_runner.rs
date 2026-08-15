@@ -1684,6 +1684,14 @@ fn read_bounded_frame<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result
 /// sent (via [`RpcServerError`]), never by pattern-matching a rendered message.
 const AUTH_REQUIRED_CODE: i64 = -32000;
 
+/// Whether a turn error is the bridge's `-32000 Authentication required` refusal (crew#267) —
+/// matched on the CODE via downcast, never on display text. Pure so the classification is
+/// testable without a live bridge.
+fn is_auth_required_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcServerError>()
+        .is_some_and(|se| se.code == Some(AUTH_REQUIRED_CODE))
+}
+
 /// A JSON-RPC error frame from the agent, kept structured so a caller can react to the CODE
 /// (e.g. [`AUTH_REQUIRED_CODE`]) with a `downcast_ref` instead of grepping the display string.
 /// Renders exactly the message [`rpc_expect`] always produced, so nothing operator-visible
@@ -1964,6 +1972,8 @@ prior output you are reviewing, testing, or revising."
 
     // State variables for this turn.
     let (mut found, mut timed_out) = (false, false);
+    // A JSON-RPC error frame answering THIS turn's id, kept structured (crew#267).
+    let mut rpc_error: Option<RpcServerError> = None;
     // Set when the turn is suspended on elicitation and the suspend deadline expires without a
     // human response.
     let mut elicitation_timed_out = false;
@@ -2295,8 +2305,14 @@ prior output you are reviewing, testing, or revising."
                 // ── end elicitation/create arm ─────────────────────────────────────────
 
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
-                    if v.get("error").is_some() {
-                        // JSON-RPC error response: treat as a failed turn (not cancelled).
+                    if let Some(err) = v.get("error") {
+                        // JSON-RPC error response: surface it STRUCTURED so the caller can
+                        // classify by CODE (crew#267: the bridge's -32000 auth refusal must
+                        // become a named fallback, not a generic failed-turn/"session exited").
+                        rpc_error = Some(RpcServerError {
+                            code: err.get("code").and_then(Value::as_i64),
+                            raw: err.to_string(),
+                        });
                         break 'exec;
                     }
                     let stop = v["result"]["stopReason"].as_str().unwrap_or("end_turn");
@@ -2377,6 +2393,12 @@ prior output you are reviewing, testing, or revising."
             stderr_context(&proc.stderr_tail)
         );
         append_within_cap(&mut output, &note, MAX_OUT);
+    }
+
+    // A structured error frame outranks the flag-derived status: the caller's Err arm
+    // classifies by code (auth_required vs session death) and runs the fallback either way.
+    if let Some(err) = rpc_error {
+        return Err(anyhow::Error::new(err));
     }
 
     Ok(TurnResult {
@@ -2668,6 +2690,11 @@ type SessionMap = Arc<Mutex<HashMap<(String, String), Option<Arc<Mutex<AcpProces
 pub(crate) mod fallback_kind {
     pub const BINARY_UNAVAILABLE: &str = "binary_unavailable";
     pub const SESSION_DIED: &str = "session_died";
+    /// The bridge answered the turn with `-32000 Authentication required` (crew#267): the
+    /// engine-minted `CLAUDE_CONFIG_DIR` (FINDING-061) severs the CLI's logged-in state, so a
+    /// governed ACP claude session fails its FIRST prompt by construction. Named so the seat
+    /// health surface and operators see AUTH, not a generic session death.
+    pub const AUTH_REQUIRED: &str = "auth_required";
     pub const HTTP_UNIMPLEMENTED: &str = "http_unimplemented";
     /// A governed claude unit, routed to the wrapped path on purpose. Not a failure — nothing broke
     /// — but it IS a behaviour change the operator has to be able to see: the unit runs single-shot
@@ -3669,16 +3696,33 @@ impl AcpStepRunner {
                 let stderr_note = death_context(&proc);
                 drop(proc);
                 self.drop_session(&run_id);
-                let reason = format!(
-                    "[wicked-core] ACP error for '{cli_key}' ({e}); \
-                     using single-shot fallback{stderr_note}"
-                );
+                // crew#267: an auth refusal is NOT a session death — name it, so the operator's
+                // fix (restore worker auth) is visible instead of a generic bridge post-mortem.
+                let auth_required = is_auth_required_error(&e);
+                let (reason, kind) = if auth_required {
+                    (
+                        format!(
+                            "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
+                             (the isolated worker config dir carries no login state — crew#267); \
+                             using single-shot fallback, which runs under the operator's own auth"
+                        ),
+                        fallback_kind::AUTH_REQUIRED,
+                    )
+                } else {
+                    (
+                        format!(
+                            "[wicked-core] ACP error for '{cli_key}' ({e}); \
+                             using single-shot fallback{stderr_note}"
+                        ),
+                        fallback_kind::SESSION_DIED,
+                    )
+                };
                 eprintln!("{reason}");
                 self.emit_event(CoreEvent::AcpFallback {
                     session: run_id.clone(),
                     cli_key: cli_key.clone(),
                     reason: reason.clone(),
-                    fallback_kind: fallback_kind::SESSION_DIED.to_string(),
+                    fallback_kind: kind.to_string(),
                 });
                 fallback_with_warning(reason, input, emit, &self.fallback)
             }
@@ -3830,6 +3874,29 @@ mod tests {
     use crate::workflow::StepStatus;
 
     // ── FINDING #5: transient single-shot failures are retried; deterministic ones are not ────────
+
+    /// crew#267 — the bridge's auth refusal is classified by CODE (downcast), never by display
+    /// text, and only -32000 qualifies: a generic io error or another RPC code stays a session
+    /// death (fallback still fires either way; only the NAME changes).
+    #[test]
+    fn an_auth_refusal_is_classified_by_code_not_text() {
+        let auth = anyhow::Error::new(RpcServerError {
+            code: Some(AUTH_REQUIRED_CODE),
+            raw: "{\"code\":-32000,\"message\":\"Authentication required\"}".into(),
+        });
+        assert!(is_auth_required_error(&auth));
+
+        let other_code = anyhow::Error::new(RpcServerError {
+            code: Some(-32603),
+            raw: "internal".into(),
+        });
+        assert!(!is_auth_required_error(&other_code));
+
+        // Text that MENTIONS auth without the code must not match — the classification is a
+        // protocol fact, not a grep.
+        let text_only = anyhow::anyhow!("Authentication required (but plain text)");
+        assert!(!is_auth_required_error(&text_only));
+    }
 
     #[test]
     fn transient_cli_failures_are_recognized_and_deterministic_ones_are_not() {
