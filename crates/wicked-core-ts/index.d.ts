@@ -276,6 +276,14 @@ export declare class Core {
    */
   retirePolicy(id: string): Promise<string>
   /**
+   * Archive (or unarchive) a TERMINAL run (crew#265) — a write-off, not a delete: the run and
+   * its artifacts stay fully readable, but default run listings exclude it. Resolves to a
+   * JSON-encoded boolean (`true` = session existed, `false` = unknown id → answer 404); REJECTS
+   * when the run is non-terminal (the caller answers 409 — write-off is for finished history
+   * only). Parse the reply; a bare truthiness test reads a miss as a hit.
+   */
+  archiveRun(runId: string, archived: boolean, note?: string | undefined | null): Promise<string>
+  /**
    * Withdraw a conformance rule from recall. Same retire-not-delete contract as
    * [`Core::retire_policy`], and the same JSON-encoded `true`/`false` reply that must be
    * parsed rather than tested for truthiness.

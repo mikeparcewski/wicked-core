@@ -1765,6 +1765,64 @@ fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>
     Some((prop_name.clone(), prop_type.map(|s| s.to_string())))
 }
 
+/// Strip pi's RPC-mode startup banner from captured text (core#268).
+///
+/// The pi bridge spawns `pi --mode rpc`, whose FIRST payload is the startup banner — version
+/// line, `---`, a `## Skills`/`## Extensions` listing, `---`, and an optional "New version
+/// available…" line — and pi's `quietStartup` setting does not silence the rpc path (verified
+/// empirically: setting on, banner still streamed). The banner then pollutes every captured
+/// unit output, compounds through prior-output context injection, and opens every chat reply.
+/// Stripping at CAPTURE (here) cleans all three consumers at one seam.
+///
+/// Pattern-gated and loss-averse: only fires when the text head is a `pi v<digit…>` line
+/// followed by a `---` line, and only removes through the MATCHING closing `---` (plus the
+/// optional version-notice line). Anything else — including legitimate `---` inside real
+/// content — is left byte-identical. Loops because the banner has been observed twice in one
+/// capture.
+pub(crate) fn strip_pi_banner(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        let t = rest.trim_start_matches(['\n', '\r']);
+        let mut lines = t.split_inclusive('\n');
+        // Head must be `pi v<digit>…` and the next line a bare `---`, else not a banner.
+        let Some(head) = lines.next() else {
+            return rest;
+        };
+        if !(head.starts_with("pi v") && head[4..].starts_with(|c: char| c.is_ascii_digit())) {
+            return rest;
+        }
+        let Some(open) = lines.next() else {
+            return rest;
+        };
+        if open.trim_end() != "---" {
+            return rest;
+        }
+        // Scan to the CLOSING bare `---`; refuse to strip when it never comes (loss-averse).
+        let mut consumed = head.len() + open.len();
+        let mut closed = false;
+        for line in lines {
+            consumed += line.len();
+            if line.trim_end() == "---" {
+                closed = true;
+                break;
+            }
+        }
+        if !closed {
+            return rest;
+        }
+        let mut after = &t[consumed..];
+        // Optional single-line update notice directly after the banner.
+        let trimmed = after.trim_start_matches(['\n', '\r']);
+        if trimmed.starts_with("New version available") {
+            after = match trimmed.find('\n') {
+                Some(i) => &trimmed[i + 1..],
+                None => "",
+            };
+        }
+        rest = after;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exec_turn_acp(
     proc: &mut AcpProcess,
@@ -2256,7 +2314,10 @@ prior output you are reviewing, testing, or revising."
     }
 
     Ok(TurnResult {
-        output: output.trim_end().to_string(),
+        // Banner-strip at the ONE assembly seam (core#268): cleans unit outputs, the prior-
+        // output injections derived from them, and chat replies alike. Deltas already streamed
+        // raw — cosmetic only; every durable consumer reads this assembled form.
+        output: strip_pi_banner(&output).trim_end().to_string(),
         status: if found {
             StepStatus::Ok
         } else if elicitation_timed_out
@@ -2956,14 +3017,20 @@ impl AcpStepRunner {
             Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.output),
             Ok(turn) => {
                 self.chat_evict(chat_id, cli_key);
-                Err(format!(
+                let msg = format!(
                     "seat '{cli_key}' turn ended {:?}: {}",
                     turn.status, turn.output
-                ))
+                );
+                // Daemon-log the eviction (crew#267): a chat user sees only a hang until the
+                // turn timeout; the operator log must say what happened without a live repro.
+                eprintln!("[wicked-core] chat '{chat_id}' evicting {msg}");
+                Err(msg)
             }
             Err(e) => {
                 self.chat_evict(chat_id, cli_key);
-                Err(format!("seat '{cli_key}' session error: {e}"))
+                let msg = format!("seat '{cli_key}' session error: {e}");
+                eprintln!("[wicked-core] chat '{chat_id}' evicting {msg}");
+                Err(msg)
             }
         }
     }
@@ -3491,12 +3558,17 @@ impl AcpStepRunner {
                 }
             }
             Ok(_) => {
+                // The tail is the only account of WHY the bridge died — surface it in the
+                // fallback reason and the daemon log, or the death is invisible to operators
+                // (crew#267: a live seat death left a 619-line daemon log with zero errors).
+                let stderr_note = stderr_context(&proc.stderr_tail);
                 drop(proc);
                 self.drop_session(&run_id);
                 let reason = format!(
                     "[wicked-core] ACP session exited for '{cli_key}'; \
-                     using single-shot fallback"
+                     using single-shot fallback{stderr_note}"
                 );
+                eprintln!("{reason}");
                 self.emit_event(CoreEvent::AcpFallback {
                     session: run_id.clone(),
                     cli_key: cli_key.clone(),
@@ -3506,12 +3578,14 @@ impl AcpStepRunner {
                 fallback_with_warning(reason, input, emit, &self.fallback)
             }
             Err(e) => {
+                let stderr_note = stderr_context(&proc.stderr_tail);
                 drop(proc);
                 self.drop_session(&run_id);
                 let reason = format!(
                     "[wicked-core] ACP error for '{cli_key}' ({e}); \
-                     using single-shot fallback"
+                     using single-shot fallback{stderr_note}"
                 );
+                eprintln!("{reason}");
                 self.emit_event(CoreEvent::AcpFallback {
                     session: run_id.clone(),
                     cli_key: cli_key.clone(),
@@ -4737,6 +4811,52 @@ sleep 30
         // live child, so unit tests cannot produce one. The seat-name path is covered by
         // `chat_seats`, which reads the same map with the same warm filter.
         assert!(listed[0].seats.is_empty());
+    }
+
+    /// core#268 — the banner strip is pattern-gated and loss-averse: it removes exactly the
+    /// observed rpc-startup shapes and NOTHING else. Falsified by loosening the head gate (the
+    /// legit-content arm fails) or by stripping without a closing `---` (the unterminated arm).
+    #[test]
+    fn strip_pi_banner_removes_observed_shapes_and_nothing_else() {
+        let banner = "pi v0.83.0\n---\n\n## Skills\n- /x/SKILL.md\n- /y/SKILL.md\n\n## Extensions\n- /z.ts\n\n---\nNew version available: v0.84.2 (installed v0.83.0). Run: `npm i -g x`\n";
+        // Single banner + content.
+        let text = format!("{banner}The actual reply.");
+        assert_eq!(strip_pi_banner(&text), "The actual reply.");
+        // Doubled banner (observed in survey outputs).
+        let text = format!("{banner}{banner}Real synthesis here.");
+        assert_eq!(strip_pi_banner(&text), "Real synthesis here.");
+        // No update-notice variant.
+        let text = "pi v1.0.0\n---\n## Skills\n- a\n---\ncontent";
+        assert_eq!(strip_pi_banner(text), "content");
+        // Legit content that merely CONTAINS --- lines: untouched.
+        let doc = "# Title\n---\nbody\n---\nmore";
+        assert_eq!(strip_pi_banner(doc), doc);
+        // A reply that TALKS about pi but is not a banner: untouched.
+        let talk = "pi version notes:\n---\nnope";
+        assert_eq!(strip_pi_banner(talk), talk);
+        // Unterminated banner (no closing ---): loss-averse, untouched.
+        let cut = "pi v0.83.0\n---\n## Skills\n- a\n(no close)";
+        assert_eq!(strip_pi_banner(cut), cut);
+        // Empty and bannerless.
+        assert_eq!(strip_pi_banner(""), "");
+        assert_eq!(strip_pi_banner("plain"), "plain");
+    }
+
+    /// crew#267 — the SESSION_DIED arms must carry the bridge stderr tail and hit the daemon
+    /// log; a seat death that leaves a clean log needs a live repro to diagnose (observed:
+    /// 619 log lines, zero errors, one dead seat). Source-scan, same style as the launcher
+    /// guard: these literals disappearing means the observability regressed.
+    #[test]
+    fn session_death_surfaces_stderr_and_logs() {
+        let src = include_str!("acp_runner.rs");
+        assert!(
+            src.contains("using single-shot fallback{stderr_note}"),
+            "the fallback reason no longer carries the bridge stderr tail"
+        );
+        assert!(
+            src.contains("chat '{chat_id}' evicting {msg}"),
+            "chat evictions no longer reach the daemon log"
+        );
     }
 
     #[test]
