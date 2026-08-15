@@ -1771,7 +1771,9 @@ fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>
 /// source-scan audit windows (FINDING-101) that a multi-line insertion overflows.
 pub(crate) fn strip_pi_banner_owned(text: String) -> String {
     let stripped = strip_pi_banner(&text);
-    if stripped.len() == text.len() {
+    // Same POINTER and length ⇒ provably the untouched original — a same-length check alone
+    // would wrongly skip the clone for any future same-length subslice (Copilot, #271).
+    if std::ptr::eq(stripped.as_ptr(), text.as_ptr()) && stripped.len() == text.len() {
         text
     } else {
         stripped.to_string()
