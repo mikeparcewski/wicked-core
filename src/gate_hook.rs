@@ -256,9 +256,8 @@ fn boundary_denial_with(
                 .map(std::path::Path::to_path_buf)
                 .or_else(|| home.map(|h| h.join(".claude")));
             let fatal = is_write
-                && !state_tree.is_some_and(|t| {
-                    crate::path_policy::resolved_is_within(&d.resolved, &t)
-                })
+                && !state_tree
+                    .is_some_and(|t| crate::path_policy::resolved_is_within(&d.resolved, &t))
                 && !in_system_temp(&d.resolved);
             return Some((d.to_string(), fatal));
         }
@@ -2366,9 +2365,15 @@ mod boundary_tests {
         );
 
         // Direct Write tool into temp → same class, same verdict.
-        let (_, fatal) =
-            boundary_denial_with(&roots, &wt, None, None, &ctx(scratch.to_str().unwrap()), "Write")
-                .expect("blocked");
+        let (_, fatal) = boundary_denial_with(
+            &roots,
+            &wt,
+            None,
+            None,
+            &ctx(scratch.to_str().unwrap()),
+            "Write",
+        )
+        .expect("blocked");
         assert!(
             !fatal,
             "a Write-tool scratch into the system temp must be ADVISORY"
@@ -2379,9 +2384,15 @@ mod boundary_tests {
         let gov = std::env::temp_dir()
             .join("wicked-core-gov")
             .join("some-run/attempt-0/decisions.ndjson");
-        let (_, fatal) =
-            boundary_denial_with(&roots, &wt, None, None, &ctx(gov.to_str().unwrap()), "Write")
-                .expect("blocked");
+        let (_, fatal) = boundary_denial_with(
+            &roots,
+            &wt,
+            None,
+            None,
+            &ctx(gov.to_str().unwrap()),
+            "Write",
+        )
+        .expect("blocked");
         assert!(
             fatal,
             "a write into the gov evidence tree stays FATAL despite being under temp"
@@ -2390,9 +2401,15 @@ mod boundary_tests {
         // Control 2: an escape anywhere else (unix: a home-shaped path) stays fatal.
         #[cfg(unix)]
         {
-            let (_, fatal) =
-                boundary_denial_with(&roots, &wt, None, None, &ctx("/Users/nobody/evil.txt"), "Write")
-                    .expect("blocked");
+            let (_, fatal) = boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &ctx("/Users/nobody/evil.txt"),
+                "Write",
+            )
+            .expect("blocked");
             assert!(fatal, "a non-temp escape stays unit-FATAL");
         }
     }
@@ -2429,14 +2446,20 @@ mod boundary_tests {
         let (_, fatal) =
             boundary_denial_with(&roots, &wt, Some(home), None, &ctx(home_mem), "Write")
                 .expect("blocked");
-        assert!(!fatal, "without an override, home/.claude stays ADVISORY (core#235)");
+        assert!(
+            !fatal,
+            "without an override, home/.claude stays ADVISORY (core#235)"
+        );
 
         // With the override set, the carve-out MOVES rather than widens: `home/.claude`
         // is no longer the agent-state tree and a write there is an ordinary escape.
         let (_, fatal) =
             boundary_denial_with(&roots, &wt, Some(home), Some(alt), &ctx(home_mem), "Write")
                 .expect("blocked");
-        assert!(fatal, "the override replaces the fallback tree; it does not add to it");
+        assert!(
+            fatal,
+            "the override replaces the fallback tree; it does not add to it"
+        );
     }
 
     /// THE case. A governed worker located the pin binding its own gate and began authoring a
