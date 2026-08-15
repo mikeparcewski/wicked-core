@@ -766,6 +766,19 @@ impl WrappedCliStepRunner {
                 // not. `done` is re-derived from evidence everywhere else in this platform, and a
                 // process still writing inside this unit's own worktree is exactly that evidence.
                 Ok((0, out, _, usage, files, tools)) => {
+                    // Single-shot pi runs print the same rpc/startup banner into stdout —
+                    // strip at capture, same seam-contract as the ACP path (core#268). Clone
+                    // ONLY when something was actually stripped: the strip returns a subslice,
+                    // so equal length ⇒ untouched ⇒ keep the original String (no per-run copy
+                    // of arbitrarily large non-pi outputs — Copilot).
+                    let out = {
+                        let stripped = crate::acp_runner::strip_pi_banner(&out);
+                        if stripped.len() == out.len() {
+                            out
+                        } else {
+                            stripped.to_string()
+                        }
+                    };
                     let settled = crate::outstanding_work::settle(&cwd);
                     let out = match settled.note() {
                         Some(note) => format!("{out}\n{note}"),
