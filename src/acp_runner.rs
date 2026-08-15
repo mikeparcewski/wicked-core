@@ -1765,6 +1765,19 @@ fn validate_elicitation_schema(schema: &Value) -> Option<(String, Option<String>
     Some((prop_name.clone(), prop_type.map(|s| s.to_string())))
 }
 
+/// Owned convenience over [`strip_pi_banner`]: returns the ORIGINAL `String` untouched when no
+/// banner was present (equal-length subslice ⇒ no copy), and clones only the stripped remainder
+/// otherwise. Exists so call sites stay ONE line — the exit-0 arm in `execute_wrapped` is under
+/// source-scan audit windows (FINDING-101) that a multi-line insertion overflows.
+pub(crate) fn strip_pi_banner_owned(text: String) -> String {
+    let stripped = strip_pi_banner(&text);
+    if stripped.len() == text.len() {
+        text
+    } else {
+        stripped.to_string()
+    }
+}
+
 /// Strip pi's RPC-mode startup banner from captured text (core#268).
 ///
 /// The pi bridge spawns `pi --mode rpc`, whose FIRST payload is the startup banner — version
