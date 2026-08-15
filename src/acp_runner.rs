@@ -75,6 +75,16 @@ impl KillHandle {
         }
     }
 
+    /// Report the child's exit status if it has ALREADY exited — without killing or reaping it
+    /// (`try_wait` leaves an unexited child untouched). `None` when the child is still running,
+    /// was already taken by `signal()`, or this is a no-op handle. crew#267: the SESSION_DIED
+    /// arms use this so a bridge death reports HOW the process ended, not only that it stopped
+    /// answering.
+    pub fn try_exit_status(&self) -> Option<std::process::ExitStatus> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_mut().and_then(|c| c.try_wait().ok().flatten())
+    }
+
     /// Kill and reap the child process. Idempotent: the first call kills; subsequent calls
     /// are no-ops (the child has been taken). Releases the mutex before `wait()` so a
     /// concurrent `signal()` on another thread never deadlocks.
@@ -1045,6 +1055,34 @@ fn stderr_context(tail: &StderrTail) -> String {
     )
 }
 
+/// The full post-mortem note for a died bridge (crew#267): stderr tail (existing), the child's
+/// exit status when knowable, and the last stdout lines still queued in the reader channel —
+/// a bridge that dies mid-write leaves its final words there, unread by any turn. Two silent
+/// deaths in the field carried "(silent)" stderr; exit + stdout are the next discriminators.
+fn death_context(proc: &AcpProcess) -> String {
+    let mut note = stderr_context(&proc.stderr_tail);
+    match proc.kill_handle.try_exit_status() {
+        Some(status) => note.push_str(&format!("; bridge exit: {status}")),
+        None => note.push_str("; bridge exit: unknown (not yet reaped)"),
+    }
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    while let Ok(line) = proc.line_rx.try_recv() {
+        if tail.len() == 5 {
+            tail.pop_front();
+        }
+        tail.push_back(line.chars().take(240).collect());
+    }
+    if tail.is_empty() {
+        note.push_str("; bridge stdout tail: (empty)");
+    } else {
+        note.push_str(&format!(
+            "; bridge stdout tail: {}",
+            tail.into_iter().collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    note
+}
+
 // ── Session startup ───────────────────────────────────────────────────────────
 
 /// The env var claude's CLI and Agent SDK resolve their per-user configuration directory from —
@@ -1475,6 +1513,18 @@ fn start_acp_process(
             anyhow::anyhow!("ACP session/new: missing sessionId in response")
         ),
     };
+    // core#274: a pi unit reported its worktree "completely empty" while the diff sat exactly
+    // where session/new's cwd pointed — whether the bridge honoured the param was undecidable
+    // because the response was never recorded. Log it (bounded) with the cwd we REQUESTED, so
+    // the next such report pins the divergence to the bridge, not the spawn.
+    {
+        let resp_note: String = resp["result"].to_string().chars().take(600).collect();
+        eprintln!(
+            "[wicked-core] ACP session/new for '{}': requested cwd={} → {resp_note}",
+            config.binary,
+            cwd.display()
+        );
+    }
 
     Ok(AcpProcess {
         kill_handle: Arc::new(KillHandle::new(child)),
@@ -2490,7 +2540,7 @@ const MAX_TRANSIENT_RETRIES: u32 = 2;
 /// retry) rather than a deterministic one. Pure, so the policy is falsifiable without a `StepInput`
 /// fixture. Matches the wrapped runner's own nonzero-exit / could-not-run messages
 /// (`execute_wrapped.rs`) plus the network signatures a `claude -p` prints on an API/connection drop.
-fn is_transient_cli_failure(output: &str) -> bool {
+pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
     // FINDING-101 incompleteness is deterministic — a retry cannot produce the missing deliverable.
     if output.contains("did not produce its declared deliverable") {
         return false;
@@ -3598,7 +3648,7 @@ impl AcpStepRunner {
                 // The tail is the only account of WHY the bridge died — surface it in the
                 // fallback reason and the daemon log, or the death is invisible to operators
                 // (crew#267: a live seat death left a 619-line daemon log with zero errors).
-                let stderr_note = stderr_context(&proc.stderr_tail);
+                let stderr_note = death_context(&proc);
                 drop(proc);
                 self.drop_session(&run_id);
                 let reason = format!(
@@ -3615,7 +3665,7 @@ impl AcpStepRunner {
                 fallback_with_warning(reason, input, emit, &self.fallback)
             }
             Err(e) => {
-                let stderr_note = stderr_context(&proc.stderr_tail);
+                let stderr_note = death_context(&proc);
                 drop(proc);
                 self.drop_session(&run_id);
                 let reason = format!(
@@ -3676,6 +3726,10 @@ impl StepRunner for AcpStepRunner {
     /// `wait()` on the child process, which blocks. Doing that on the actor thread would stall
     /// the entire actor while waiting for the subprocess to exit.
     fn on_run_complete(&self, run_id: &str) {
+        // crew#277: in-flight WRAPPED workers (the fallback path every non-ACP CLI takes) must
+        // die with the run too — a canceled run's hung `copilot -p` survived ~90 minutes because
+        // only ACP sessions had kill handles.
+        self.fallback.cancel_run_workers(run_id);
         // Defensive cancel: shared_run_terminal does the primary cancel_epoch before calling
         // on_run_complete, but if it was skipped (e.g. non-ACP path or future code path),
         // this ensures no in-flight elicitations are left dangling. Guarded by has_active_run

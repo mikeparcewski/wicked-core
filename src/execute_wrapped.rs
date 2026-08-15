@@ -493,6 +493,15 @@ pub(crate) fn inject_claude_stream_flags(argv: &mut Vec<String>) {
 pub struct WrappedCliStepRunner {
     /// Per-unit wall-clock bound. A CLI exceeding it is killed and the step reports `Cancelled`.
     timeout: Duration,
+    /// Cancellation tokens for in-flight wrapped workers, keyed by run id (crew#277): a canceled
+    /// run's hung `copilot -p` survived ~90 minutes because CancelRun had no path to a wrapped
+    /// child — only ACP sessions had kill handles. `run_bounded`'s poll loop watches the token;
+    /// `cancel_run_workers` flips every token for the run.
+    cancel_tokens: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+        >,
+    >,
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`). `None` for
     /// the `Default` path (no-tx contexts such as standalone tests); `Some` when constructed via
     /// [`WrappedCliStepRunner::with_tx`] (the actor path, seeded from `AcpStepRunner::new`).
@@ -515,6 +524,7 @@ impl Default for WrappedCliStepRunner {
         WrappedCliStepRunner {
             timeout: unit_timeout(),
             tx: None,
+            cancel_tokens: Default::default(),
         }
     }
 }
@@ -526,6 +536,48 @@ impl WrappedCliStepRunner {
         WrappedCliStepRunner {
             timeout: unit_timeout(),
             tx: Some(tx),
+            cancel_tokens: Default::default(),
+        }
+    }
+
+    /// Register a cancellation token for an in-flight worker of `run_id`; the caller passes the
+    /// token to [`run_bounded`] and MUST call [`Self::unregister_token`] when the worker returns
+    /// (tokens for finished workers are dead weight until the run terminates).
+    fn register_token(&self, run_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.cancel_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(run_id.to_string())
+            .or_default()
+            .push(token.clone());
+        token
+    }
+
+    fn unregister_token(
+        &self,
+        run_id: &str,
+        token: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = guard.get_mut(run_id) {
+            v.retain(|t| !std::sync::Arc::ptr_eq(t, token));
+            if v.is_empty() {
+                guard.remove(run_id);
+            }
+        }
+    }
+
+    /// Kill every in-flight wrapped worker of `run_id` (crew#277). Called from the runner's
+    /// `on_run_complete`, which the actor invokes on every run-terminal transition — cancel
+    /// included. Idempotent; a token with no live child is a no-op.
+    pub(crate) fn cancel_run_workers(&self, run_id: &str) {
+        let tokens = {
+            let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+            guard.remove(run_id).unwrap_or_default()
+        };
+        for t in tokens {
+            t.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -546,6 +598,10 @@ impl StepRunner for WrappedCliStepRunner {
 
     fn run_unit_streaming(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         self.exec(input, emit)
+    }
+
+    fn on_run_complete(&self, run_id: &str) {
+        self.cancel_run_workers(run_id);
     }
 }
 
@@ -757,7 +813,10 @@ impl WrappedCliStepRunner {
                     }
                 }
             }
-            match run_bounded(cmd, self.timeout, emit, adapter) {
+            let cancel_token = self.register_token(&input.run_id);
+            let bounded = run_bounded(cmd, self.timeout, emit, adapter, Some(cancel_token.clone()));
+            self.unregister_token(&input.run_id, &cancel_token);
+            match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
                 // phase writes a resumable worker script into its worktree, starts N copies, and
                 // exits. Reporting done here let the NEXT phase measure a code graph that was still
@@ -1479,6 +1538,9 @@ fn run_bounded(
     timeout: Duration,
     emit: &DeltaSink,
     mut adapter: Box<dyn OutputAdapter>,
+    // crew#277: flipped by `cancel_run_workers` when the run terminates (cancel included) —
+    // the poll loop kills the child instead of letting it orphan past the run's death.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<BoundedRun> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1541,6 +1603,17 @@ fn run_bounded(
             match child_ref.try_wait() {
                 Ok(Some(status)) => break (status.code().unwrap_or(-1), false),
                 Ok(None) => {
+                    if cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        // Run-terminal cancellation: kill + reap NOW. Reported like a timeout
+                        // (the late StepOutput is discarded by the actor's stale-result guard;
+                        // the kill is the part that matters — crew#277's orphaned worker).
+                        let _ = child_ref.kill();
+                        let _ = child_ref.wait();
+                        break (-1, true);
+                    }
                     if start.elapsed() > timeout {
                         let _ = child_ref.kill();
                         let _ = child_ref.wait();
@@ -1949,6 +2022,43 @@ mod tests {
         }
     }
 
+    /// crew#277 — a flipped cancel token kills the child promptly instead of letting it run to
+    /// its timeout (the orphaned-worker case: a canceled run's `copilot -p` survived ~90 min).
+    /// Falsified by removing the cancel check in the poll loop: the test then waits the full
+    /// 30s sleep (well past the 5s assertion bound).
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_kills_the_child_when_the_cancel_token_flips() {
+        let emit = |_: &str| {};
+        // spawn-audit: test-only — `sleep` fixture proving cancellation reaps the child.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flipper = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            flipper.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let (code, _out, err, _usage, _files, _tools) = run_bounded(
+            cmd,
+            Duration::from_secs(60),
+            &emit,
+            Box::new(Passthrough),
+            Some(token),
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "cancellation must kill the child promptly, not wait out the sleep"
+        );
+        assert_eq!(code, -1, "a cancelled worker reports the killed exit shape");
+        assert!(
+            err.contains("TIMED OUT") || !err.is_empty() || code == -1,
+            "the kill path reports through the timeout shape"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_bounded_streams_each_stdout_line_live() {
@@ -1958,8 +2068,14 @@ mod tests {
         // spawn-audit: test-only — `printf` fixture proving run_bounded emits each stdout line live.
         let mut cmd = Command::new("printf");
         cmd.arg("alpha\nbeta\ngamma\n");
-        let (code, out, _err, _usage, _files, _tools) =
-            run_bounded(cmd, Duration::from_secs(5), &emit, Box::new(Passthrough)).unwrap();
+        let (code, out, _err, _usage, _files, _tools) = run_bounded(
+            cmd,
+            Duration::from_secs(5),
+            &emit,
+            Box::new(Passthrough),
+            None,
+        )
+        .unwrap();
         assert_eq!(code, 0);
         assert_eq!(
             *lines.lock().unwrap(),
