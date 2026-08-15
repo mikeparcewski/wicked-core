@@ -1972,6 +1972,8 @@ prior output you are reviewing, testing, or revising."
 
     // State variables for this turn.
     let (mut found, mut timed_out) = (false, false);
+    // A JSON-RPC error frame answering THIS turn's id, kept structured (crew#267).
+    let mut rpc_error: Option<RpcServerError> = None;
     // Set when the turn is suspended on elicitation and the suspend deadline expires without a
     // human response.
     let mut elicitation_timed_out = false;
@@ -2303,8 +2305,14 @@ prior output you are reviewing, testing, or revising."
                 // ── end elicitation/create arm ─────────────────────────────────────────
 
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
-                    if v.get("error").is_some() {
-                        // JSON-RPC error response: treat as a failed turn (not cancelled).
+                    if let Some(err) = v.get("error") {
+                        // JSON-RPC error response: surface it STRUCTURED so the caller can
+                        // classify by CODE (crew#267: the bridge's -32000 auth refusal must
+                        // become a named fallback, not a generic failed-turn/"session exited").
+                        rpc_error = Some(RpcServerError {
+                            code: err.get("code").and_then(Value::as_i64),
+                            raw: err.to_string(),
+                        });
                         break 'exec;
                     }
                     let stop = v["result"]["stopReason"].as_str().unwrap_or("end_turn");
@@ -2385,6 +2393,12 @@ prior output you are reviewing, testing, or revising."
             stderr_context(&proc.stderr_tail)
         );
         append_within_cap(&mut output, &note, MAX_OUT);
+    }
+
+    // A structured error frame outranks the flag-derived status: the caller's Err arm
+    // classifies by code (auth_required vs session death) and runs the fallback either way.
+    if let Some(err) = rpc_error {
+        return Err(anyhow::Error::new(err));
     }
 
     Ok(TurnResult {
