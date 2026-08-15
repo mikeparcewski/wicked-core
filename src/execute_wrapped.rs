@@ -1209,9 +1209,11 @@ fn probe_key(exe: &str) -> ProbeKey {
 }
 
 /// Probe results, keyed by [`ProbeKey`].
-static PROBED: std::sync::Mutex<
-    Option<std::collections::HashMap<ProbeKey, Result<(u32, Option<String>), String>>>,
-> = std::sync::Mutex::new(None);
+/// One probe answer: (protocol, semver-if-reported) or the failure string (crew#275).
+type ProbeAnswer = Result<(u32, Option<String>), String>;
+
+static PROBED: std::sync::Mutex<Option<std::collections::HashMap<ProbeKey, ProbeAnswer>>> =
+    std::sync::Mutex::new(None);
 
 /// Seed the probe cache, so a unit test can arm governance without a `wicked-core` CLI on PATH.
 ///
@@ -2278,10 +2280,6 @@ mod tests {
         assert!(check_gate_protocol(&exe).is_ok());
     }
 
-    /// A CLI that cannot be probed refuses the run rather than arming an ungoverned one — the
-    /// FINDING-063 shape. The earlier version asserted that an `Err` was an error, which is true of
-    /// every `Err` ever constructed and told us nothing about `check_gate_protocol`.
-    #[test]
     /// crew#275 — the incident shape: the stale hook binary spoke the CURRENT protocol while
     /// enforcing two-day-old semantics, and the protocol-only handshake let it arm. Same
     /// protocol + different (or unreportable) crate version must now refuse with the
@@ -2331,6 +2329,9 @@ mod tests {
         assert_eq!(crate::gate_hook::parse_gate_semver(old_line), None);
     }
 
+    /// A CLI that cannot be probed refuses the run rather than arming an ungoverned one — the
+    /// FINDING-063 shape. The earlier version asserted that an `Err` was an error, which is true of
+    /// every `Err` ever constructed and told us nothing about `check_gate_protocol`.
     #[test]
     fn an_unprobeable_cli_refuses_rather_than_arming_ungoverned() {
         let exe = fixture_exe("unprobeable");
