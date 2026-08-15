@@ -3322,6 +3322,9 @@ impl AcpStepRunner {
                     // in-process judgement's `~` expansion and `~/.claude` carve-out cannot
                     // diverge from the wrapped carrier's (Copilot).
                     home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+                    // Same rule for the operator's alternate agent-state home (core#272).
+                    claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
+                        .map(std::path::PathBuf::from),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -3483,6 +3486,7 @@ impl AcpStepRunner {
                         },
                         cwd: boundary.cwd.clone(),
                         home: boundary.home.clone(),
+                        claude_config_dir: boundary.claude_config_dir.clone(),
                     }),
                 }
             });

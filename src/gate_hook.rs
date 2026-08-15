@@ -167,7 +167,8 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
     let roots = allowed_roots_from_env()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    boundary_denial_with(&roots, &cwd, home.as_deref(), context, tool)
+    let cfg = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+    boundary_denial_with(&roots, &cwd, home.as_deref(), cfg.as_deref(), context, tool)
 }
 
 /// The unit's filesystem boundary as EXPLICIT state (core#260) — for the carrier that evaluates
@@ -183,6 +184,11 @@ pub(crate) struct BoundaryCtx {
     /// gate construction so the in-process carrier judges with the SAME home the worker's own
     /// subprocess would inherit, not whatever the evaluating thread happens to see (Copilot).
     pub home: Option<std::path::PathBuf>,
+    /// The RESOLVED Claude config home for the agent-memory carve-out (core#272): an operator
+    /// running with `CLAUDE_CONFIG_DIR=~/alt-configs/.claude` keeps their memory there, and the
+    /// core#235 carve-out hardcoded to `home/.claude` turned that same benign write class fatal
+    /// again. `None` ⇒ fall back to `home/.claude`.
+    pub claude_config_dir: Option<std::path::PathBuf>,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -218,6 +224,7 @@ fn boundary_denial_with(
     roots: &crate::path_policy::AllowedRoots,
     cwd: &std::path::Path,
     home: Option<&std::path::Path>,
+    claude_config_dir: Option<&std::path::Path>,
     context: &serde_json::Value,
     tool: &str,
 ) -> Option<(String, bool)> {
@@ -243,9 +250,14 @@ fn boundary_denial_with(
             // The carve-outs are scoped: the gate pin (`~/.config/wicked-core/**`), the home
             // dir, and the operational store are under NEITHER tree and stay fatal, so the
             // FINDING-098 pin-rewrite escape is untouched.
+            // The agent-state tree is the RESOLVED config home (core#272): CLAUDE_CONFIG_DIR
+            // when the operator runs an alternate home, else `home/.claude` (core#235).
+            let state_tree: Option<std::path::PathBuf> = claude_config_dir
+                .map(std::path::Path::to_path_buf)
+                .or_else(|| home.map(|h| h.join(".claude")));
             let fatal = is_write
-                && !home.is_some_and(|h| {
-                    crate::path_policy::resolved_is_within(&d.resolved, &h.join(".claude"))
+                && !state_tree.is_some_and(|t| {
+                    crate::path_policy::resolved_is_within(&d.resolved, &t)
                 })
                 && !in_system_temp(&d.resolved);
             return Some((d.to_string(), fatal));
@@ -582,7 +594,14 @@ pub(crate) fn evaluate_tool_call(
     // store used to mask a boundary escape as `infra-deny`, losing the claim the fold and the
     // operator diagnose by (caught by CI on the #260 proof test, which runs storeless).
     let boundary_verdict = match boundary {
-        Some(b) => boundary_denial_with(&b.roots, &b.cwd, b.home.as_deref(), context, tool),
+        Some(b) => boundary_denial_with(
+            &b.roots,
+            &b.cwd,
+            b.home.as_deref(),
+            b.claude_config_dir.as_deref(),
+            context,
+            tool,
+        ),
         None => boundary_denial(context, tool),
     };
     if let Some((reason, fatal)) = boundary_verdict {
@@ -2305,7 +2324,14 @@ mod boundary_tests {
             None => std::env::remove_var(WRITE_ROOTS_ENV),
         }
         std::env::remove_var(READ_ROOTS_ENV);
+        // Pin the agent-state override: an operator shell exporting CLAUDE_CONFIG_DIR would
+        // MOVE the core#272 carve-out and flip the `~/.claude` expectations below.
+        let cfg = std::env::var_os("CLAUDE_CONFIG_DIR");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         let out = f();
+        if let Some(v) = cfg {
+            std::env::set_var("CLAUDE_CONFIG_DIR", v);
+        }
         std::env::remove_var(WRITE_ROOTS_ENV);
         out
     }
@@ -2332,7 +2358,7 @@ mod boundary_tests {
 
         // Bash redirect into temp (the fc46a3a1 shape) → blocked, advisory.
         let cmd_ctx = json!({ "command": format!("echo x > {}", scratch.display()) });
-        let (_, fatal) = boundary_denial_with(&roots, &wt, None, &cmd_ctx, "Bash")
+        let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd_ctx, "Bash")
             .expect("a Bash write outside the worktree is STILL blocked");
         assert!(
             !fatal,
@@ -2341,7 +2367,7 @@ mod boundary_tests {
 
         // Direct Write tool into temp → same class, same verdict.
         let (_, fatal) =
-            boundary_denial_with(&roots, &wt, None, &ctx(scratch.to_str().unwrap()), "Write")
+            boundary_denial_with(&roots, &wt, None, None, &ctx(scratch.to_str().unwrap()), "Write")
                 .expect("blocked");
         assert!(
             !fatal,
@@ -2354,7 +2380,7 @@ mod boundary_tests {
             .join("wicked-core-gov")
             .join("some-run/attempt-0/decisions.ndjson");
         let (_, fatal) =
-            boundary_denial_with(&roots, &wt, None, &ctx(gov.to_str().unwrap()), "Write")
+            boundary_denial_with(&roots, &wt, None, None, &ctx(gov.to_str().unwrap()), "Write")
                 .expect("blocked");
         assert!(
             fatal,
@@ -2365,10 +2391,52 @@ mod boundary_tests {
         #[cfg(unix)]
         {
             let (_, fatal) =
-                boundary_denial_with(&roots, &wt, None, &ctx("/Users/nobody/evil.txt"), "Write")
+                boundary_denial_with(&roots, &wt, None, None, &ctx("/Users/nobody/evil.txt"), "Write")
                     .expect("blocked");
             assert!(fatal, "a non-temp escape stays unit-FATAL");
         }
+    }
+
+    /// core#272. Run f09d4331 unit-FAILED at build because the worker wrote its own agent memory
+    /// under an ALTERNATE Claude config home (`CLAUDE_CONFIG_DIR=~/alt-configs/.claude`) and the
+    /// core#235 carve-out only tested `home/.claude`. The carve-out follows the RESOLVED config
+    /// home: the alt tree is advisory, the `home/.claude` fallback still holds when no override
+    /// is set, and an override does NOT widen the fallback (with the override set, `home/.claude`
+    /// is just another out-of-boundary path — fatal).
+    #[test]
+    fn the_agent_memory_carveout_follows_the_resolved_config_home() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-cfg");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let home = std::path::Path::new("/Users/op");
+        let alt = std::path::Path::new("/Users/op/alt-configs/.claude");
+        let alt_mem = "/Users/op/alt-configs/.claude/projects/p/memory/MEMORY.md";
+        let home_mem = "/Users/op/.claude/projects/p/memory/MEMORY.md";
+
+        // The f09d4331 shape: memory write under the alt config home → blocked, ADVISORY.
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, Some(home), Some(alt), &ctx(alt_mem), "Write")
+                .expect("an agent-memory write outside the worktree is STILL blocked");
+        assert!(
+            !fatal,
+            "a memory write under CLAUDE_CONFIG_DIR must be ADVISORY (core#272)"
+        );
+
+        // No override → the core#235 fallback still carves out `home/.claude`.
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, Some(home), None, &ctx(home_mem), "Write")
+                .expect("blocked");
+        assert!(!fatal, "without an override, home/.claude stays ADVISORY (core#235)");
+
+        // With the override set, the carve-out MOVES rather than widens: `home/.claude`
+        // is no longer the agent-state tree and a write there is an ordinary escape.
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, Some(home), Some(alt), &ctx(home_mem), "Write")
+                .expect("blocked");
+        assert!(fatal, "the override replaces the fallback tree; it does not add to it");
     }
 
     /// THE case. A governed worker located the pin binding its own gate and began authoring a
