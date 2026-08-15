@@ -167,8 +167,22 @@ fn boundary_denial(context: &serde_json::Value, tool: &str) -> Option<(String, b
     let roots = allowed_roots_from_env()?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let cfg = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+    // The hook subprocess runs inside the WORKER's environment, so this is the worker's own
+    // effective config home — minted or inherited alike (contrast the in-process arm, which
+    // must gate on the inherit hatch because it reads the DAEMON's env).
+    let cfg = std::env::var_os("CLAUDE_CONFIG_DIR").and_then(|v| valid_config_home(&v));
     boundary_denial_with(&roots, &cwd, home.as_deref(), cfg.as_deref(), context, tool)
+}
+
+/// Validate a raw `CLAUDE_CONFIG_DIR` value before it may steer the agent-state carve-out
+/// (core#272, Copilot). The value is trusted input from the worker's environment: empty or
+/// relative values would resolve against the judgement cwd, and a filesystem root (`/`, `C:\`)
+/// would make the ADVISORY carve-out swallow every out-of-boundary write. Fail closed —
+/// an invalid override is ignored and the carve-out falls back to `home/.claude`.
+pub(crate) fn valid_config_home(raw: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(raw);
+    // `parent() == None` exactly for roots and prefixes on both families.
+    (p.is_absolute() && p.parent().is_some()).then_some(p)
 }
 
 /// The unit's filesystem boundary as EXPLICIT state (core#260) — for the carrier that evaluates
@@ -2469,6 +2483,44 @@ mod boundary_tests {
             fatal,
             "the override replaces the fallback tree; it does not add to it"
         );
+    }
+
+    /// core#272 hardening (Copilot). CLAUDE_CONFIG_DIR is trusted input from the worker env:
+    /// an empty, relative, or filesystem-root value steering the ADVISORY carve-out would
+    /// downgrade every out-of-boundary write. Such values are ignored — fail closed to the
+    /// `home/.claude` fallback.
+    #[test]
+    fn an_over_broad_config_home_override_is_ignored() {
+        use std::ffi::OsStr;
+        assert_eq!(valid_config_home(OsStr::new("")), None, "empty");
+        assert_eq!(
+            valid_config_home(OsStr::new("relative/.claude")),
+            None,
+            "relative"
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(valid_config_home(OsStr::new("/")), None, "filesystem root");
+            assert_eq!(
+                valid_config_home(OsStr::new("/Users/op/alt-configs/.claude")),
+                Some(std::path::PathBuf::from("/Users/op/alt-configs/.claude")),
+                "a sane absolute dir passes"
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(valid_config_home(OsStr::new("C:\\")), None, "drive root");
+            assert_eq!(
+                valid_config_home(OsStr::new("\\")),
+                None,
+                "rooted but driveless"
+            );
+            assert_eq!(
+                valid_config_home(OsStr::new("C:\\Users\\op\\.claude")),
+                Some(std::path::PathBuf::from("C:\\Users\\op\\.claude")),
+                "a sane absolute dir passes"
+            );
+        }
     }
 
     /// THE case. A governed worker located the pin binding its own gate and began authoring a
