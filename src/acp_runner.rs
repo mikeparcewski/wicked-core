@@ -75,8 +75,9 @@ impl KillHandle {
         }
     }
 
-    /// Report the child's exit status if it has ALREADY exited — without killing or reaping it
-    /// (`try_wait` leaves an unexited child untouched). `None` when the child is still running,
+    /// Report the child's exit status if it has ALREADY exited — non-blocking, never killing
+    /// (`try_wait` leaves an unexited child untouched, and reaps one that has exited). `None`
+    /// when the child is still running,
     /// was already taken by `signal()`, or this is a no-op handle. crew#267: the SESSION_DIED
     /// arms use this so a bridge death reports HOW the process ended, not only that it stopped
     /// answering.

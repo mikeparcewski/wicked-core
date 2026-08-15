@@ -349,7 +349,8 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
 /// Derive the run's worktree from the repo root `setup` returns (not by re-deriving the temp-path
 /// scheme — so a change to the repo naming can't silently break this).
 fn worktree(repo_root: &std::path::Path, run_id: &str) -> std::path::PathBuf {
-    repo_root.join(".wicked").join("worktrees").join(run_id)
+    // crew#276: run worktrees live under the non-dotted root now.
+    repo_root.join("wicked-worktrees").join(run_id)
 }
 
 // --- TEST 1: the governed run produces the gated artifacts ---

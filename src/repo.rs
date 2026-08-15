@@ -258,9 +258,56 @@ pub fn graph_kinds_for_repo(
     crate::graph_browser::graph_kinds(repo.code_graph_db.as_str())
 }
 
-/// The directory worktrees for `repo_root` live under.
+/// The directory NEW worktrees for `repo_root` are created under (crew#276): a NON-dotted
+/// path. Worktrees used to live at `.wicked/worktrees/`, which put a dot-segment into every
+/// absolute path inside the run — and dotfile-sensitive behavior in the repo under test broke
+/// purely from location (express `send` 404s any path containing a dot-segment; two
+/// wicked-interactive export tests failed in every governed worktree). A worker diagnosing
+/// phantom failures the operator can't reproduce is a workflow hazard, not a cosmetic one.
 fn worktrees_root(repo_root: &str) -> PathBuf {
+    Path::new(repo_root).join("wicked-worktrees")
+}
+
+/// Where worktrees lived before crew#276. Runs created under the old layout must keep resuming
+/// and reaping — their sessions carry absolute workdirs, but the (repo, run_id) → path derivation
+/// in this module must find them too.
+fn legacy_worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".wicked").join("worktrees")
+}
+
+/// The on-disk path of `run_id`'s worktree: the new root, unless the run already exists under
+/// the legacy root (resume/reap of a pre-move run).
+fn worktree_path(repo_root: &str, run_id: &str) -> PathBuf {
+    let legacy = legacy_worktrees_root(repo_root).join(run_id);
+    if legacy.is_dir() {
+        return legacy;
+    }
+    worktrees_root(repo_root).join(run_id)
+}
+
+/// Keep the operator's `git status` clean in the parent checkout: the new worktree dir is not
+/// dotted, so exclude it via `.git/info/exclude` (repo-local, never touches the tracked
+/// `.gitignore`). Idempotent; best-effort — a failure to write the exclude is cosmetic.
+fn ensure_worktrees_excluded(repo_root: &str) {
+    const ENTRY: &str = "wicked-worktrees/";
+    let exclude = Path::new(repo_root)
+        .join(".git")
+        .join("info")
+        .join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == ENTRY) {
+        return;
+    }
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(ENTRY);
+    content.push('\n');
+    let _ = std::fs::write(&exclude, content);
 }
 
 /// Is `wt` a live git worktree, rather than merely a directory that sits where one should?
@@ -291,7 +338,7 @@ fn is_live_worktree(wt: &Path) -> bool {
 /// `master` of the operator's real clone. A cwd is not a boundary; the worktree is, so its existence
 /// has to be verified rather than inferred from a stat.
 pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf> {
-    let wt = worktrees_root(repo_root).join(run_id);
+    let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
         if is_live_worktree(&wt) {
             return Ok(wt); // genuine resume — reuse it
@@ -319,6 +366,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
         let _ = git(repo_root, &["worktree", "prune"]);
     }
     std::fs::create_dir_all(worktrees_root(repo_root))?;
+    ensure_worktrees_excluded(repo_root);
     let branch = format!("wicked/{run_id}");
     let wt_str = wt.to_string_lossy().to_string();
     let (ok, _, err) = git(repo_root, &["worktree", "add", &wt_str, "-b", &branch])?;
@@ -338,7 +386,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
 /// startup leftover whose run id no longer exists on the store (no record, nothing to preserve).
 /// A run that merely FINISHED goes through [`reap_worktree_if_clean`] instead (FINDING-003).
 pub fn remove_worktree(repo_root: &str, run_id: &str) {
-    let wt = worktrees_root(repo_root).join(run_id);
+    let wt = worktree_path(repo_root, run_id);
     let wt_str = wt.to_string_lossy().to_string();
     let _ = git(repo_root, &["worktree", "remove", "--force", &wt_str]);
     // If git refused (e.g. already gone), drop the dir directly.
@@ -359,7 +407,7 @@ pub fn remove_worktree(repo_root: &str, run_id: &str) {
 /// named leftover rather than a silent leak; a clean tree adds nothing the branch doesn't already
 /// carry, and goes. The branch itself is never touched either way.
 pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
-    let wt = worktrees_root(repo_root).join(run_id);
+    let wt = worktree_path(repo_root, run_id);
     if !wt.is_dir() {
         // Nothing on disk. Drop any dangling admin entry so the path is re-usable.
         let _ = git(repo_root, &["worktree", "prune"]);
@@ -399,19 +447,24 @@ pub fn reap_orphan_worktrees(
     terminal_run_ids: &HashSet<String>,
 ) {
     for repo in repos {
-        let root = worktrees_root(&repo.root_path);
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            if let Some(name) = e.file_name().to_str() {
-                if live_run_ids.contains(name) {
-                    continue;
-                }
-                if terminal_run_ids.contains(name) {
-                    let _ = reap_worktree_if_clean(&repo.root_path, name);
-                } else {
-                    remove_worktree(&repo.root_path, name);
+        // Both layouts: pre-crew#276 leftovers under `.wicked/worktrees` reap by the same rules.
+        for root in [
+            worktrees_root(&repo.root_path),
+            legacy_worktrees_root(&repo.root_path),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str() {
+                    if live_run_ids.contains(name) {
+                        continue;
+                    }
+                    if terminal_run_ids.contains(name) {
+                        let _ = reap_worktree_if_clean(&repo.root_path, name);
+                    } else {
+                        remove_worktree(&repo.root_path, name);
+                    }
                 }
             }
         }
@@ -626,6 +679,38 @@ fn project_children(dir: &Path) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// crew#276 — new worktrees land at the non-dotted root, while a run whose worktree already
+    /// exists under the legacy `.wicked/worktrees` keeps resolving there (resume/reap compat).
+    #[test]
+    fn worktree_path_is_non_dotted_and_prefers_a_legacy_tree_when_present() {
+        let repo = std::env::temp_dir().join(format!("wt-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let root = repo.to_str().unwrap();
+
+        // Fresh run: the non-dotted root.
+        let fresh = worktree_path(root, "run-new");
+        assert!(
+            fresh.starts_with(repo.join("wicked-worktrees")),
+            "a new run's worktree must live under the non-dotted root: {}",
+            fresh.display()
+        );
+        assert!(
+            !fresh.to_string_lossy().contains("/.wicked/"),
+            "no dot-segment in a new worktree path"
+        );
+
+        // Pre-move run: a directory already under the legacy root wins.
+        let legacy = repo.join(".wicked").join("worktrees").join("run-old");
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(
+            worktree_path(root, "run-old"),
+            legacy,
+            "an existing legacy worktree must keep resolving for resume/reap"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
 
     #[test]
     fn slug_takes_four_kebab_words() {

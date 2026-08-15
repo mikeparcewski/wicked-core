@@ -1124,7 +1124,7 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
 /// be read the binary is not cacheable AT ALL — see the guard in the body; an empty fingerprint is
 /// still a stable key, so caching under it would reintroduce exactly the staleness this removes.
 /// Fail toward doing the work, never toward trusting a stale answer.
-fn probe_gate_protocol(exe: &str) -> Result<u32, String> {
+fn probe_gate_protocol(exe: &str) -> Result<(u32, Option<String>), String> {
     let key = probe_key(exe);
     // An unfingerprintable binary is NOT cacheable. `fingerprint: None` is a perfectly stable map
     // key, so storing under it would make every unreadable-metadata probe hit that one entry
@@ -1150,7 +1150,7 @@ fn probe_gate_protocol(exe: &str) -> Result<u32, String> {
 }
 
 /// The subprocess probe itself — one spawn, no caching.
-fn probe_gate_protocol_uncached(exe: &str) -> Result<u32, String> {
+fn probe_gate_protocol_uncached(exe: &str) -> Result<(u32, Option<String>), String> {
     let out = Command::new(exe)
         .hardened()
         .args(["gate-hook", "--protocol-version"])
@@ -1166,12 +1166,13 @@ fn probe_gate_protocol_uncached(exe: &str) -> Result<u32, String> {
         ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::gate_hook::parse_protocol_version(&stdout).ok_or_else(|| {
+    let protocol = crate::gate_hook::parse_protocol_version(&stdout).ok_or_else(|| {
         format!(
             "`{exe} gate-hook --protocol-version` printed no parseable version: {:?}",
             stdout.chars().take(200).collect::<String>()
         )
-    })
+    })?;
+    Ok((protocol, crate::gate_hook::parse_gate_semver(&stdout)))
 }
 
 /// What makes one probe result apply to another lookup: the path AND the file's identity.
@@ -1208,8 +1209,9 @@ fn probe_key(exe: &str) -> ProbeKey {
 }
 
 /// Probe results, keyed by [`ProbeKey`].
-static PROBED: std::sync::Mutex<Option<std::collections::HashMap<ProbeKey, Result<u32, String>>>> =
-    std::sync::Mutex::new(None);
+static PROBED: std::sync::Mutex<
+    Option<std::collections::HashMap<ProbeKey, Result<(u32, Option<String>), String>>>,
+> = std::sync::Mutex::new(None);
 
 /// Seed the probe cache, so a unit test can arm governance without a `wicked-core` CLI on PATH.
 ///
@@ -1217,7 +1219,7 @@ static PROBED: std::sync::Mutex<Option<std::collections::HashMap<ProbeKey, Resul
 /// hatch would be a fail-OPEN switch on the exact path core#167 exists to keep fail-closed, and
 /// FINDING-063 is what that looks like in practice.
 #[cfg(test)]
-pub(crate) fn seed_probe_for_test(exe: &str, v: Result<u32, String>) {
+pub(crate) fn seed_probe_for_test(exe: &str, v: Result<(u32, Option<String>), String>) {
     if let Ok(mut g) = PROBED.lock() {
         g.get_or_insert_with(std::collections::HashMap::new)
             .insert(probe_key(exe), v);
@@ -1233,17 +1235,37 @@ pub(crate) fn seed_probe_for_test(exe: &str, v: Result<u32, String>) {
 /// Fails CLOSED — an unprobeable CLI refuses the run rather than falling through to an ungoverned
 /// one, which is FINDING-063's failure mode.
 fn check_gate_protocol(exe: &str) -> Result<(), String> {
-    let theirs = probe_gate_protocol(exe)?;
+    let (theirs, their_semver) = probe_gate_protocol(exe)?;
     let ours = crate::gate_hook::GATE_PROTOCOL_VERSION;
-    if theirs == ours {
-        return Ok(());
+    if theirs != ours {
+        return Err(format!(
+            "gate protocol mismatch: this engine speaks {ours}, the `wicked-core` CLI at `{exe}` speaks \
+             {theirs}. They exchange every gate argument by environment variable, so a mismatch denies \
+             every tool call of every governed run. Rebuild/reinstall the CLI so both come from the same \
+             source tree (core#167)."
+        ));
     }
-    Err(format!(
-        "gate protocol mismatch: this engine speaks {ours}, the `wicked-core` CLI at `{exe}` speaks \
-         {theirs}. They exchange every gate argument by environment variable, so a mismatch denies \
-         every tool call of every governed run. Rebuild/reinstall the CLI so both come from the same \
-         source tree (core#167)."
-    ))
+    // crew#275: same protocol is NOT same semantics. A two-day-stale hook binary spoke protocol 1
+    // and enforced pre-core#264 boundary rules while the addon ran current ones — a governed run
+    // died on a deny class the engine believed advisory. Equal crate versions are what prove both
+    // artifacts came from one source tree; a binary too old to report one is exactly the skew this
+    // detects. Fail closed with the deploy-both instruction.
+    let our_semver = env!("CARGO_PKG_VERSION");
+    match their_semver.as_deref() {
+        Some(v) if v == our_semver => Ok(()),
+        Some(v) => Err(format!(
+            "gate SEMANTIC version mismatch: engine (napi addon) is {our_semver}, the `wicked-core` \
+             CLI at `{exe}` is {v}. Same protocol, different enforcement semantics — the exact skew \
+             that failed a governed run on rules the engine no longer has (crew#275). Deploy BOTH \
+             artifacts from one build: `cargo build --release` then reinstall the CLI alongside the \
+             addon."
+        )),
+        None => Err(format!(
+            "the `wicked-core` CLI at `{exe}` predates the semantic version handshake — too old to \
+             prove it enforces this engine's ({our_semver}) semantics (crew#275). Rebuild/reinstall \
+             the CLI from the same source tree as the addon."
+        )),
+    }
 }
 
 fn which_binary(name: &str) -> Result<String, ()> {
@@ -2040,7 +2062,7 @@ mod tests {
             flipper.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         let start = Instant::now();
-        let (code, _out, err, _usage, _files, _tools) = run_bounded(
+        let (code, _out, _err, _usage, _files, _tools) = run_bounded(
             cmd,
             Duration::from_secs(60),
             &emit,
@@ -2053,10 +2075,6 @@ mod tests {
             "cancellation must kill the child promptly, not wait out the sleep"
         );
         assert_eq!(code, -1, "a cancelled worker reports the killed exit shape");
-        assert!(
-            err.contains("TIMED OUT") || !err.is_empty() || code == -1,
-            "the kill path reports through the timeout shape"
-        );
     }
 
     #[cfg(unix)]
@@ -2229,7 +2247,10 @@ mod tests {
         let ours = crate::gate_hook::GATE_PROTOCOL_VERSION;
         let theirs = ours + 98;
         let exe = fixture_exe("skewed");
-        seed_probe_for_test(&exe, Ok(theirs));
+        seed_probe_for_test(
+            &exe,
+            Ok((theirs, Some(env!("CARGO_PKG_VERSION").to_string()))),
+        );
 
         let err = check_gate_protocol(&exe).expect_err("a skewed CLI must refuse to arm");
         assert!(
@@ -2247,13 +2268,69 @@ mod tests {
     #[test]
     fn a_matching_cli_is_allowed_to_arm() {
         let exe = fixture_exe("matching");
-        seed_probe_for_test(&exe, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+        seed_probe_for_test(
+            &exe,
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
         assert!(check_gate_protocol(&exe).is_ok());
     }
 
     /// A CLI that cannot be probed refuses the run rather than arming an ungoverned one — the
     /// FINDING-063 shape. The earlier version asserted that an `Err` was an error, which is true of
     /// every `Err` ever constructed and told us nothing about `check_gate_protocol`.
+    #[test]
+    /// crew#275 — the incident shape: the stale hook binary spoke the CURRENT protocol while
+    /// enforcing two-day-old semantics, and the protocol-only handshake let it arm. Same
+    /// protocol + different (or unreportable) crate version must now refuse with the
+    /// deploy-both instruction.
+    #[test]
+    fn a_semantically_skewed_cli_refuses_even_on_a_matching_protocol() {
+        let exe = fixture_exe("semver-skew");
+        seed_probe_for_test(
+            &exe,
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some("0.0.1-stale".to_string()),
+            )),
+        );
+        let err = check_gate_protocol(&exe).expect_err("semantic skew must refuse to arm");
+        assert!(
+            err.contains("SEMANTIC") && err.contains("Deploy BOTH"),
+            "the refusal must name the skew and the fix: {err}"
+        );
+
+        // A binary too old to REPORT a semver is exactly the artifact the incident deployed.
+        let exe2 = fixture_exe("semver-missing");
+        seed_probe_for_test(&exe2, Ok((crate::gate_hook::GATE_PROTOCOL_VERSION, None)));
+        let err2 = check_gate_protocol(&exe2).expect_err("a pre-handshake binary must refuse");
+        assert!(
+            err2.contains("predates the semantic version handshake"),
+            "the refusal must say the binary is too old to prove its semantics: {err2}"
+        );
+    }
+
+    /// The printed line round-trips through BOTH parsers, and the pre-semver line still parses
+    /// its protocol (an old BINARY probed by a new engine must be detected as semver-less, not
+    /// unparseable).
+    #[test]
+    fn the_semver_handshake_line_round_trips() {
+        let line = crate::gate_hook::protocol_version_line();
+        assert_eq!(
+            crate::gate_hook::parse_protocol_version(&line),
+            Some(crate::gate_hook::GATE_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            crate::gate_hook::parse_gate_semver(&line).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let old_line = "wicked-core gate-hook protocol 1";
+        assert_eq!(crate::gate_hook::parse_protocol_version(old_line), Some(1));
+        assert_eq!(crate::gate_hook::parse_gate_semver(old_line), None);
+    }
+
     #[test]
     fn an_unprobeable_cli_refuses_rather_than_arming_ungoverned() {
         let exe = fixture_exe("unprobeable");
@@ -2327,7 +2404,13 @@ mod tests {
         );
 
         // Seed a PASS under the degenerate key. If the cache is consulted, this is what comes back.
-        seed_probe_for_test(path, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+        seed_probe_for_test(
+            path,
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
 
         let got = probe_gate_protocol(path);
         assert!(
@@ -2348,10 +2431,19 @@ mod tests {
         std::fs::write(&exe, b"stable").unwrap();
         let path = exe.to_str().unwrap();
 
-        seed_probe_for_test(path, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
+        seed_probe_for_test(
+            path,
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
         assert_eq!(
             probe_gate_protocol(path),
-            Ok(crate::gate_hook::GATE_PROTOCOL_VERSION),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string())
+            )),
             "an untouched binary must not be re-probed"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2363,8 +2455,20 @@ mod tests {
     fn two_exes_get_two_answers() {
         let good = fixture_exe("two_good");
         let bad = fixture_exe("two_bad");
-        seed_probe_for_test(&good, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION));
-        seed_probe_for_test(&bad, Ok(crate::gate_hook::GATE_PROTOCOL_VERSION + 7));
+        seed_probe_for_test(
+            &good,
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
+        seed_probe_for_test(
+            &bad,
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION + 7,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
         assert!(check_gate_protocol(&good).is_ok());
         assert!(
             check_gate_protocol(&bad).is_err(),
@@ -2378,7 +2482,10 @@ mod tests {
         // This test is about what arming WRITES, so give it a matching CLI.
         seed_probe_for_test(
             &resolve_wicked_core_exe(),
-            Ok(crate::gate_hook::GATE_PROTOCOL_VERSION),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
         );
         let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
         u.assigned_cli = Some("claude".to_string());
@@ -2559,7 +2666,10 @@ mod tests {
         // This test is about what arming WRITES, so give it a matching CLI.
         seed_probe_for_test(
             &resolve_wicked_core_exe(),
-            Ok(crate::gate_hook::GATE_PROTOCOL_VERSION),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
         );
         let read_settings = |gov: &crate::workflow::GovernanceContext, run_id: &str| {
             let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");

@@ -1,7 +1,7 @@
 //! P3 proving test — the repo registry + git-worktree isolation.
 //!
 //! Register a real git repo, launch a run targeting it, and prove: a worktree is created at
-//! `<repo>/.wicked/worktrees/<run_id>`, the worker receives that path as its `workdir`, the run's
+//! `<repo>/wicked-worktrees/<run_id>` (crew#276: non-dotted), the worker receives that path as its `workdir`, the run's
 //! work lands there, a COMPLETED run keeps its worktree (for review), and a CANCELLED run discards it.
 
 use std::path::PathBuf;
@@ -217,10 +217,10 @@ fn launch_in_repo_creates_worktree_and_passes_workdir() {
         .expect("launch in repo");
     assert!(wait_status(&core, "run1", SessionStatus::Completed));
 
-    let expected_wt = repo.join(".wicked").join("worktrees").join("run1");
+    let expected_wt = repo.join("wicked-worktrees").join("run1");
     assert!(
         expected_wt.is_dir(),
-        "worktree created at <repo>/.wicked/worktrees/<run_id>"
+        "worktree created at <repo>/wicked-worktrees/<run_id>"
     );
     // The worker ran in that worktree and its work landed there.
     assert_eq!(
@@ -262,7 +262,7 @@ fn cancel_discards_the_worktree() {
     core.launch_run(s).expect("launch");
     assert!(wait_status(&core, "run2", SessionStatus::AwaitingHuman));
 
-    let wt = repo.join(".wicked").join("worktrees").join("run2");
+    let wt = repo.join("wicked-worktrees").join("run2");
     assert!(wt.is_dir(), "worktree exists while the run is parked");
 
     assert_eq!(core.cancel_run("run2").unwrap(), SessionStatus::Cancelled);

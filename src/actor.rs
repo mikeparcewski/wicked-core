@@ -2675,7 +2675,6 @@ pub(crate) fn resume_run_inner(
             // Failed with no cursor unit (planning-time failure) — nothing to re-dispatch.
             return Ok(SessionStatus::Failed);
         };
-        let ord = unit.ord;
         if unit.status == crate::domain::UnitStatus::Rejected {
             unit.status = crate::domain::UnitStatus::Distributed;
             unit.denial_reason = None;
@@ -2684,13 +2683,8 @@ pub(crate) fn resume_run_inner(
         let mut s = session;
         s.status = SessionStatus::Executing;
         put_node(store, s.to_node())?;
-        emit(
-            subscribers,
-            CoreEvent::UnitExecuting {
-                session: run_id.to_string(),
-                ord,
-            },
-        );
+        // No UnitExecuting here: `dispatch_unit` (reached via `advance_or_pause` below) is the
+        // single emit point, and a second emission would duplicate the event (Copilot).
         s
     } else {
         session
@@ -3387,13 +3381,19 @@ fn apply_step_result(
             let depends_on = unit.depends_on.clone();
             let unit_ix = output.unit_ix;
             // Immutable scan ends the `unit` borrow; the branch re-borrows before mutating.
+            // `assigned_cli: None` means the DEFAULT seat everywhere else in this file — a
+            // depends_on creator on the default must be excluded too, not dropped (Copilot).
             let creator_seats: std::collections::HashSet<String> = units
                 .iter()
                 .filter(|u| {
                     u.phase_id()
                         .is_some_and(|p| depends_on.iter().any(|d| d == p))
                 })
-                .filter_map(|u| u.assigned_cli.clone())
+                .map(|u| {
+                    u.assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string())
+                })
                 .collect();
             let next_seat = session
                 .clis
@@ -3418,7 +3418,8 @@ fn apply_step_result(
                         ord,
                         attempt: output.attempt,
                         detail: format!(
-                            "seat '{failed_cli}' failed (worker error); failing over to                              '{next}' ({}/{MAX_SEAT_FAILOVERS})",
+                            "seat '{failed_cli}' failed (worker error); failing over to '{next}' \
+                             ({}/{MAX_SEAT_FAILOVERS})",
                             output.attempt + 1
                         ),
                         failure_kind: crate::event::StepFailureKind::WorkerError,
