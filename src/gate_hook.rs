@@ -2428,10 +2428,19 @@ mod boundary_tests {
             write: vec![wt.clone()],
             read: vec![],
         };
-        let home = std::path::Path::new("/Users/op");
-        let alt = std::path::Path::new("/Users/op/alt-configs/.claude");
-        let alt_mem = "/Users/op/alt-configs/.claude/projects/p/memory/MEMORY.md";
-        let home_mem = "/Users/op/.claude/projects/p/memory/MEMORY.md";
+        // A drive-prefixed absolute on Windows (a bare `/Users/op` has no drive there and
+        // never matches containment) — and deliberately NOT under temp_dir, which would put
+        // every assertion under the core#264 system-temp carve-out and make them vacuous.
+        #[cfg(unix)]
+        let home = std::path::PathBuf::from("/Users/op");
+        #[cfg(windows)]
+        let home = std::path::PathBuf::from("C:\\Users\\op");
+        let alt = home.join("alt-configs").join(".claude");
+        let alt_mem = alt.join("projects/p/memory/MEMORY.md");
+        let alt_mem = alt_mem.to_str().unwrap();
+        let home_mem = home.join(".claude").join("projects/p/memory/MEMORY.md");
+        let home_mem = home_mem.to_str().unwrap();
+        let (home, alt) = (home.as_path(), alt.as_path());
 
         // The f09d4331 shape: memory write under the alt config home → blocked, ADVISORY.
         let (_, fatal) =
