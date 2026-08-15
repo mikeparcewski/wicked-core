@@ -3322,6 +3322,21 @@ impl AcpStepRunner {
                     // in-process judgement's `~` expansion and `~/.claude` carve-out cannot
                     // diverge from the wrapped carrier's (Copilot).
                     home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+                    // The operator's alternate agent-state home (core#272) — but ONLY when the
+                    // FINDING-061 escape hatch says the worker actually inherits the operator's
+                    // configuration. In the default mode `start_acp_process` points the worker
+                    // at an engine-minted config dir (under the OS temp, which the core#264
+                    // carve-out already tolerates); carving out the DAEMON's CLAUDE_CONFIG_DIR
+                    // there would downgrade writes into a tree the worker has no business in
+                    // (Copilot). Validated: an empty/relative/root value must not steer an
+                    // advisory carve-out.
+                    claude_config_dir: std::env::var_os(
+                        crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
+                    )
+                    .is_some()
+                    .then(|| std::env::var_os(CLAUDE_CONFIG_DIR_ENV))
+                    .flatten()
+                    .and_then(|v| crate::gate_hook::valid_config_home(&v)),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -3483,6 +3498,7 @@ impl AcpStepRunner {
                         },
                         cwd: boundary.cwd.clone(),
                         home: boundary.home.clone(),
+                        claude_config_dir: boundary.claude_config_dir.clone(),
                     }),
                 }
             });
