@@ -3021,9 +3021,15 @@ impl AcpStepRunner {
                     "seat '{cli_key}' turn ended {:?}: {}",
                     turn.status, turn.output
                 );
-                // Daemon-log the eviction (crew#267): a chat user sees only a hang until the
-                // turn timeout; the operator log must say what happened without a live repro.
-                eprintln!("[wicked-core] chat '{chat_id}' evicting {msg}");
+                // Daemon-log the eviction (crew#267) — but SUMMARIZED: turn.output can be up
+                // to the 8MB cap and carry user/model content; the log gets status + size,
+                // the caller (and thus the ChatReply the user sees) keeps the full text
+                // (Copilot).
+                eprintln!(
+                    "[wicked-core] chat '{chat_id}' evicting seat '{cli_key}': turn ended {:?} ({} output bytes)",
+                    turn.status,
+                    turn.output.len()
+                );
                 Err(msg)
             }
             Err(e) => {
