@@ -1176,11 +1176,55 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
     static ENSURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = ENSURE.lock().unwrap_or_else(|p| p.into_inner());
     let dir = worker_config_home()?;
-    // Refuse symlinks at the leaf or its parent — a redirect here re-aims every write the
-    // worker's CLI makes at a path the operator never chose. FAIL CLOSED on any stat error
-    // other than not-found (a PermissionDenied probe must not read as "not a symlink" —
-    // Copilot, PR#277).
-    for probe in [dir.parent(), Some(dir.as_path())].into_iter().flatten() {
+    refuse_symlinked_home(&dir)?;
+    if !dir.is_dir() {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        use anyhow::Context;
+        b.create(&dir)
+            .with_context(|| format!("could not create worker config home {}", dir.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        // Private, always — an existing dir may predate this build or have been loosened.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // TOCTTOU narrowing (Copilot, PR#277): re-verify no component became a symlink between
+    // the pre-create probe and the mutating block below. The window that remains — a same-uid
+    // process swapping the path in the microseconds before each write — cannot be fully closed
+    // without dirfd/O_NOFOLLOW traversal, and a same-uid attacker (the only principal that can
+    // write under $HOME) already holds strictly stronger levers than this directory. The probe
+    // pair + the process-wide ENSURE mutex reduce the practical surface to that residual.
+    refuse_symlinked_home(&dir)?;
+    // RE-SANITIZE: executable-config vectors go; login/session state stays. Judged on
+    // symlink_metadata, never a following stat: a prior worker could plant
+    // `hooks -> ~/.ssh` or `settings.json -> <victim>` and a following remove/write would
+    // act OUTSIDE the home (Copilot, PR#277). A symlink entry is removed AS a link.
+    for entry in WORKER_HOME_SANITIZED {
+        remove_entry_no_follow(&dir.join(entry))?;
+    }
+    // settings.json is re-written every spawn; clear any planted entry (symlink included)
+    // first so the write can never travel through a link.
+    let settings_path = dir.join("settings.json");
+    remove_entry_no_follow(&settings_path)?;
+    let settings = json!({
+        "permissions": { "deny": crate::execute_wrapped::deny_rules() }
+    });
+    std::fs::write(&settings_path, serde_json::to_vec(&settings)?)?;
+    Ok(dir)
+}
+
+/// Refuse a worker home whose leaf or parent is a symlink — a redirect here re-aims every
+/// write the worker's CLI makes at a path the operator never chose. FAIL CLOSED on any stat
+/// error other than not-found (a PermissionDenied probe must not read as "not a symlink").
+fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
+    for probe in [dir.parent(), Some(dir)].into_iter().flatten() {
         match std::fs::symlink_metadata(probe) {
             Ok(m) if m.file_type().is_symlink() => {
                 anyhow::bail!(
@@ -1200,40 +1244,7 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
             }
         }
     }
-    if !dir.is_dir() {
-        let mut b = std::fs::DirBuilder::new();
-        b.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            b.mode(0o700);
-        }
-        use anyhow::Context;
-        b.create(&dir)
-            .with_context(|| format!("could not create worker config home {}", dir.display()))?;
-    }
-    #[cfg(unix)]
-    {
-        // Private, always — an existing dir may predate this build or have been loosened.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    // RE-SANITIZE: executable-config vectors go; login/session state stays. Judged on
-    // symlink_metadata, never a following stat: a prior worker could plant
-    // `hooks -> ~/.ssh` or `settings.json -> <victim>` and a following remove/write would
-    // act OUTSIDE the home (Copilot, PR#277). A symlink entry is removed AS a link.
-    for entry in WORKER_HOME_SANITIZED {
-        remove_entry_no_follow(&dir.join(entry))?;
-    }
-    // settings.json is re-written every spawn; clear any planted entry (symlink included)
-    // first so the write can never travel through a link.
-    let settings_path = dir.join("settings.json");
-    remove_entry_no_follow(&settings_path)?;
-    let settings = json!({
-        "permissions": { "deny": crate::execute_wrapped::deny_rules() }
-    });
-    std::fs::write(&settings_path, serde_json::to_vec(&settings)?)?;
-    Ok(dir)
+    Ok(())
 }
 
 /// Remove a worker-home entry WITHOUT following symlinks: a link is deleted as a link
