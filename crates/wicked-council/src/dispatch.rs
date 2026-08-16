@@ -874,6 +874,7 @@ mod failure_diagnostics_tests {
             enabled_for_council: true,
             acp: None,
             capabilities: None,
+            login_invocation: None,
         }
     }
 

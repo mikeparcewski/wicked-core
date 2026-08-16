@@ -540,6 +540,7 @@ mod tests {
             enabled_for_council: true,
             acp: None,
             capabilities: Some(format!("{key} capabilities")),
+            login_invocation: None,
         }
     }
 

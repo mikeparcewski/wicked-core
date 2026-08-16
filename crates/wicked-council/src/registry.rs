@@ -46,6 +46,8 @@ struct TomlCli {
     #[serde(default)]
     capabilities: Option<String>,
     #[serde(default)]
+    login_invocation: Option<String>,
+    #[serde(default)]
     acp: Option<AcpConfig>,
 }
 
@@ -69,6 +71,7 @@ impl From<TomlCli> for AgenticCli {
             // built-in ACP config requires restating [cli.acp] in the TOML.
             acp: t.acp,
             capabilities: t.capabilities,
+            login_invocation: t.login_invocation,
         }
     }
 }
@@ -101,6 +104,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                  refactoring, API design, technical writing, multi-file edits"
                     .into(),
             ),
+            login_invocation: None,
         },
         AgenticCli {
             key: "agy".into(),
@@ -129,6 +133,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                  structured output, scripting"
                     .into(),
             ),
+            login_invocation: None,
         },
         AgenticCli {
             key: "codex".into(),
@@ -157,6 +162,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                  code completion, OpenAI model family"
                     .into(),
             ),
+            login_invocation: None,
         },
         AgenticCli {
             key: "pi".into(),
@@ -182,6 +188,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                  explanation and documentation"
                     .into(),
             ),
+            login_invocation: None,
         },
         AgenticCli {
             key: "copilot".into(),
@@ -208,6 +215,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                  popular library patterns, IDE-native suggestions"
                     .into(),
             ),
+            login_invocation: None,
         },
         AgenticCli {
             key: "opencode".into(),
@@ -233,6 +241,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                  configurable backends"
                     .into(),
             ),
+            login_invocation: None,
         },
     ]
 }
