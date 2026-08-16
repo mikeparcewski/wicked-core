@@ -1112,109 +1112,109 @@ fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std
     if inherit_operator {
         return None;
     }
-    Some(mint_worker_config_dir())
+    Some(ensure_worker_config_home())
 }
 
 /// Mint a fresh, engine-owned config directory for ONE ACP spawn.
 ///
-/// Per-spawn rather than shared: the directory IS the worker's user scope, so a shared one
-/// would be a user scope every worker can mutate for every later worker — drop a
-/// `settings.json` there and the next spawn inherits it, which is FINDING-047's leak pointed at
-/// a different victim. The directories are a few files each under the OS temp dir; per-spawn
-/// leakage is bounded by session count and reclaimed with the temp dir.
+/// The PERSISTENT, engine-owned config home for ACP claude workers (crew#267, operator
+/// decision: "option 3"). One stable directory per operator, NOT per spawn.
 ///
-/// The minted dir is seeded with a `settings.json` carrying `permissions.deny` — the same deny
-/// fence the wrapped path passes as `--disallowedTools` (operator credentials, agent-tooling
-/// state, the operational store; see `execute_wrapped::deny_rules`), read here as user-scope
-/// settings by the CLI the bridge spawns.
+/// History: this used to mint a fresh temp dir per spawn (FINDING-061) — which also severed
+/// the CLI's login state, so every governed ACP claude session failed its first prompt with
+/// `-32000 Authentication required` and fell back single-shot. The chosen fix: a stable
+/// worker home the operator logs in ONCE (their own browser OAuth — the engine never reads,
+/// copies, or holds credentials), combined with per-spawn RE-SANITIZATION of every mutation
+/// vector FINDING-047/061 named:
 ///
-/// Deliberately NO `permissions.defaultMode`: the wrapped path pins `acceptEdits` because its
-/// governance rides a PreToolUse hook that fires regardless of mode, but on ACP governance
-/// rides `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
-/// resolve them before our policy is ever asked. The bridge's own default keeps the permission
-/// requests flowing to the client, where both the governed and the ungoverned answer live.
-/// A fresh, non-guessable, EXCLUSIVELY-created config dir for one worker's isolated CLI settings.
+///  - `settings.json` is OVERWRITTEN with the deny fence on every spawn — a worker that edits
+///    it changes nothing for the next worker;
+///  - `hooks/`, `plugins/`, `commands/`, `agents/`, `settings.local.json`,
+///    `managed-settings.json` are REMOVED on every spawn — no executable-config carryover;
+///  - login/session state (`.claude.json`, `.credentials.json`, todos) PERSISTS — that is the
+///    point.
 ///
-/// The first cut named this `/tmp/wicked-acp-worker-config-<pid>-<seq>` and used
-/// `create_dir_all_private`, which succeeds on an already-existing leaf. Review (Copilot on #205)
-/// caught that this undermines the very isolation boundary FINDING-061 establishes: a predictable
-/// path lets a local attacker pre-create the leaf to steer where `settings.json` lands, and PID
-/// reuse across daemon restarts silently reuses a stale dir. Two fixes, both load-bearing:
+/// Location: `~/.wicked-worker/claude` — deliberately NOT under `~/.wicked-crew` (the deny
+/// fence blocks worker tools from that whole tree, which would break the worker's own
+/// tool-mediated memory writes) and NOT under `~/.config/wicked-core` (the gate-pin tree,
+/// where writes are boundary-FATAL). The home-dir location also retires the temp-dir
+/// pre-creation attack the old exclusive-create defended against ($HOME is not
+/// world-writable); a symlink planted at either path component is still refused below.
 ///
-///  - NON-GUESSABLE name: 16 bytes of `/dev/urandom` on unix, hex-encoded. A guessed path is the
-///    precondition for the pre-creation attack; entropy removes it. (Non-unix keeps the counter —
-///    the ACP worker path is unix-first, and exclusive-create below still closes reuse there.)
-///  - EXCLUSIVE create: `DirBuilder` with `recursive(false)` FAILS if the leaf already exists, so a
-///    pre-existing dir (attacker-planted or stale) is refused rather than adopted. Fail closed.
-fn mint_worker_config_dir() -> anyhow::Result<std::path::PathBuf> {
-    let name = format!("wicked-acp-worker-config-{}", worker_config_token()?);
-    let dir = std::env::temp_dir().join(name);
-    create_exclusive_private(&dir)?;
+/// `WICKED_WORKER_HOME` overrides the BASE dir (tests point it at scratch space).
+fn worker_config_home() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(base) = std::env::var_os("WICKED_WORKER_HOME") {
+        return Ok(std::path::PathBuf::from(base).join("claude"));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".wicked-worker")
+        .join("claude"))
+}
+
+/// Filesystem entries re-sanitized out of the worker home at EVERY spawn — the exact
+/// executable-config vectors FINDING-047/061 named. Login/session state is not listed.
+const WORKER_HOME_SANITIZED: &[&str] = &[
+    "hooks",
+    "plugins",
+    "commands",
+    "agents",
+    "settings.local.json",
+    "managed-settings.json",
+];
+
+/// Ensure the persistent worker home exists, is private, is not a planted symlink, and has
+/// been re-sanitized for THIS spawn. Returns the home. Fail closed on anything odd.
+fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
+    let dir = worker_config_home()?;
+    // Refuse symlinks at the leaf or its parent — a redirect here re-aims every write the
+    // worker's CLI makes at a path the operator never chose.
+    for probe in [dir.parent(), Some(dir.as_path())].into_iter().flatten() {
+        if std::fs::symlink_metadata(probe)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "refusing worker config home {}: {} is a symlink",
+                dir.display(),
+                probe.display()
+            );
+        }
+    }
+    if !dir.is_dir() {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        use anyhow::Context;
+        b.create(&dir)
+            .with_context(|| format!("could not create worker config home {}", dir.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        // Private, always — an existing dir may predate this build or have been loosened.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    // RE-SANITIZE: executable-config vectors go; login/session state stays.
+    for entry in WORKER_HOME_SANITIZED {
+        let p = dir.join(entry);
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p)?;
+        } else if p.exists() {
+            std::fs::remove_file(&p)?;
+        }
+    }
     let settings = json!({
         "permissions": { "deny": crate::execute_wrapped::deny_rules() }
     });
     std::fs::write(dir.join("settings.json"), serde_json::to_vec(&settings)?)?;
     Ok(dir)
-}
-
-/// Create `dir` EXCLUSIVELY (error if it already exists) with private perms.
-///
-/// `recursive(false)` is the refuse-reuse property: a pre-existing leaf — an attacker's plant or a
-/// stale dir from a prior run — makes this error rather than silently adopt it, which is what
-/// `create_dir_all` did and what review flagged as undermining the FINDING-061 isolation boundary.
-/// Fails closed.
-fn create_exclusive_private(dir: &std::path::Path) -> anyhow::Result<()> {
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    // with_context, not a formatted anyhow!: this preserves the underlying io::Error (its ErrorKind
-    // — AlreadyExists vs PermissionDenied — and any backtrace) as the source of the chain. Folding
-    // it into the message string, as this did before (Copilot review on #206), discards exactly the
-    // signal an operator needs to tell "someone planted this dir" from "the temp dir is unwritable".
-    use anyhow::Context;
-    b.create(dir).with_context(|| {
-        format!("refusing to reuse or adopt an existing worker config dir {dir:?}")
-    })
-}
-
-/// A per-worker directory-name token.
-///
-/// On unix: 16 bytes of `/dev/urandom`, hex — and if that device cannot be read, this FAILS rather
-/// than falling back to the guessable counter (Copilot review on #206). The old code silently
-/// downgraded to `pid-seq` on unix, which made the doc's "non-guessable on unix" a claim the code
-/// did not keep. `/dev/urandom` being unreadable on a unix host is a sign something is badly wrong;
-/// the honest move is to fail closed — the caller's fallback is the wrapped path, which is safe.
-///
-/// On non-unix: a monotonic counter, the only option there. The counter alone is guessable, which
-/// is why the exclusive create in [`mint_worker_config_dir`] — not this token — is what actually
-/// refuses a planted or stale leaf; the entropy only removes the guess that makes planting worth
-/// attempting.
-fn worker_config_token() -> anyhow::Result<String> {
-    #[cfg(unix)]
-    {
-        use anyhow::Context;
-        use std::io::Read;
-        let mut f = std::fs::File::open("/dev/urandom")
-            .context("cannot open /dev/urandom for a non-guessable worker config token")?;
-        let mut buf = [0u8; 16];
-        f.read_exact(&mut buf)
-            .context("cannot read 16 bytes of entropy from /dev/urandom")?;
-        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
-    }
-    #[cfg(not(unix))]
-    {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SPAWN_SEQ: AtomicU64 = AtomicU64::new(0);
-        Ok(format!(
-            "{}-{}",
-            std::process::id(),
-            SPAWN_SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
 }
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an
@@ -3700,11 +3700,16 @@ impl AcpStepRunner {
                 // fix (restore worker auth) is visible instead of a generic bridge post-mortem.
                 let auth_required = is_auth_required_error(&e);
                 let (reason, kind) = if auth_required {
+                    let home_hint = worker_config_home()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_else(|_| "~/.wicked-worker/claude".to_string());
                     (
                         format!(
                             "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
-                             (the isolated worker config dir carries no login state — crew#267); \
-                             using single-shot fallback, which runs under the operator's own auth"
+                             (crew#267). One-time fix: run \
+                             `CLAUDE_CONFIG_DIR={home_hint} claude login` yourself, then every \
+                             worker stays logged in. Using single-shot fallback meanwhile, \
+                             which runs under the operator's own auth"
                         ),
                         fallback_kind::AUTH_REQUIRED,
                     )
@@ -3873,6 +3878,10 @@ mod tests {
     use super::{is_transient_cli_failure, should_retry_worker, MAX_TRANSIENT_RETRIES};
     use crate::workflow::StepStatus;
 
+    /// Serializes tests that mutate process-global env (WICKED_WORKER_HOME) — cargo runs tests
+    /// in one process, in parallel. Same pattern as execute_wrapped's ENV_LOCK.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // ── FINDING #5: transient single-shot failures are retried; deterministic ones are not ────────
 
     /// crew#267 — the bridge's auth refusal is classified by CODE (downcast), never by display
@@ -3971,51 +3980,79 @@ mod tests {
         ));
     }
 
+    /// crew#267 option 3 — the worker home is STABLE across spawns (one login persists), and
+    /// every spawn RE-SANITIZES the executable-config vectors while PRESERVING login state.
     #[test]
-    fn a_worker_config_dir_is_fresh_non_guessable_and_refuses_reuse() {
-        // Two mints never collide and neither is the old predictable pid-seq shape.
-        let a = mint_worker_config_dir().expect("first mint");
-        let b = mint_worker_config_dir().expect("second mint");
-        assert_ne!(a, b, "each worker must get its own dir");
-        #[cfg(unix)]
-        {
-            let name = a.file_name().unwrap().to_string_lossy().to_string();
-            let token = name.trim_start_matches("wicked-acp-worker-config-");
-            assert_eq!(
-                token.len(),
-                32,
-                "unix token must be 16 random bytes hex-encoded, got {token:?}"
-            );
-            assert!(
-                token.chars().all(|c| c.is_ascii_hexdigit()),
-                "token not hex: {token:?}"
-            );
-        }
-        // Refuse-reuse: create_exclusive_private (the ACTUAL helper mint calls) must ERROR on a
-        // path that already exists — attacker-planted or stale — not adopt it. Exercising the real
-        // function, not a re-implementation, so flipping mint to recursive(true) fails this.
-        let planted = std::env::temp_dir().join(format!(
-            "wicked-acp-planted-{:?}",
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&planted);
-        std::fs::create_dir_all(&planted).unwrap();
-        assert!(
-            create_exclusive_private(&planted).is_err(),
-            "the exclusive create must REFUSE a pre-existing leaf, not adopt it"
+    fn the_worker_home_is_stable_sanitized_per_spawn_and_preserves_login_state() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("wworker-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+
+        let a = ensure_worker_config_home().expect("first ensure");
+        let b = ensure_worker_config_home().expect("second ensure");
+        assert_eq!(
+            a, b,
+            "one persistent home, not per-spawn dirs — the login must stick"
         );
-        let fresh = std::env::temp_dir().join(format!(
-            "wicked-acp-fresh-{:?}",
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&fresh);
+
+        // A prior worker's mutations: rogue settings, a hooks dir, a local-settings file…
+        std::fs::create_dir_all(a.join("hooks")).unwrap();
+        std::fs::write(a.join("hooks/evil.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(a.join("settings.local.json"), "{}").unwrap();
+        std::fs::write(
+            a.join("settings.json"),
+            "{\"permissions\":{\"allow\":[\"*\"]}}",
+        )
+        .unwrap();
+        // …and the operator's login state, which must survive.
+        std::fs::write(a.join(".credentials.json"), "{\"token\":\"keep-me\"}").unwrap();
+        std::fs::write(a.join(".claude.json"), "{\"oauthAccount\":{}}").unwrap();
+
+        let c = ensure_worker_config_home().expect("re-ensure sanitizes");
+        assert_eq!(c, a);
         assert!(
-            create_exclusive_private(&fresh).is_ok(),
-            "a fresh path must succeed"
+            !a.join("hooks").exists(),
+            "hooks/ must be re-sanitized away"
         );
-        for d in [a, b, planted, fresh] {
-            let _ = std::fs::remove_dir_all(d);
-        }
+        assert!(
+            !a.join("settings.local.json").exists(),
+            "settings.local.json must be re-sanitized away"
+        );
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(a.join("settings.json")).unwrap()).unwrap();
+        assert!(
+            settings["permissions"]["allow"].is_null(),
+            "a worker-written settings.json must be OVERWRITTEN with the fence"
+        );
+        assert_eq!(
+            std::fs::read_to_string(a.join(".credentials.json")).unwrap(),
+            "{\"token\":\"keep-me\"}",
+            "login state must persist across spawns — that is the point of option 3"
+        );
+        assert!(a.join(".claude.json").exists());
+
+        std::env::remove_var("WICKED_WORKER_HOME");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A symlink planted at the home (or its parent) re-aims every CLI write — refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_worker_home_is_refused() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("wworker-ln-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("elsewhere");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, base.join("claude")).unwrap();
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        let err = ensure_worker_config_home().expect_err("symlinked home must be refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        std::env::remove_var("WICKED_WORKER_HOME");
+        let _ = std::fs::remove_dir_all(&base);
     }
     use super::*;
     use crate::command::InjectTarget;
@@ -4534,6 +4571,9 @@ sleep 30
         if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
             return;
         }
+        // ENV_LOCK first (same order everywhere): this test READS the worker-home resolution,
+        // which the sanitize/fence tests mutate via WICKED_WORKER_HOME.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("config-iso");
         let ledger = dir.join("seen-config-dir.txt");
@@ -4560,12 +4600,12 @@ sleep 30
              its homedir() fallback, which is the operator's ~/.claude"
         );
         let seen_dir = std::path::PathBuf::from(&seen);
-        assert!(
-            seen_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("wicked-acp-worker-config-")),
-            "the worker's config dir must be engine-minted, not inherited: {seen}"
+        // crew#267 option 3: the engine-owned scope is the PERSISTENT worker home now (one
+        // login sticks), never the operator's own ~/.claude / CLAUDE_CONFIG_DIR.
+        assert_eq!(
+            seen_dir,
+            worker_config_home().expect("home resolvable"),
+            "the worker's config dir must be the engine-owned worker home, not inherited: {seen}"
         );
         // Substance, not presence: the minted scope actually carries the deny fence.
         let settings: Value =
@@ -4691,25 +4731,19 @@ sleep 30
         );
     }
 
-    /// Each spawn gets its OWN directory. The minted dir is the worker's user scope, so a shared
-    /// one would be a user scope any worker can mutate for every later worker — FINDING-047's
-    /// leak with the operator swapped out for a previous worker.
+    /// What the worker's user scope says after every re-sanitize. The deny list must be the
+    /// SAME fence the wrapped path ships (not a diverging copy), and no `defaultMode` may be
+    /// pinned: on ACP, governance rides `session/request_permission` (FINDING-062), and a mode
+    /// that auto-approves edits could resolve them before our policy is ever asked.
     #[test]
-    fn each_acp_spawn_gets_its_own_config_dir_never_a_shared_one() {
-        let a = mint_worker_config_dir().expect("mint a");
-        let b = mint_worker_config_dir().expect("mint b");
-        assert_ne!(a, b);
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
-    }
-
-    /// What the minted user scope says. The deny list must be the SAME fence the wrapped path
-    /// ships (not a diverging copy), and no `defaultMode` may be pinned: on ACP, governance rides
-    /// `session/request_permission` (FINDING-062), and a mode that auto-approves edits could
-    /// resolve them before our policy is ever asked.
-    #[test]
-    fn the_minted_config_dir_seeds_the_deny_fence_and_pins_no_permission_mode() {
-        let dir = mint_worker_config_dir().expect("mint");
+    fn the_worker_home_seeds_the_deny_fence_and_pins_no_permission_mode() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("wworker-fence-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        let dir = ensure_worker_config_home().expect("ensure");
+        std::env::remove_var("WICKED_WORKER_HOME");
         let settings: Value =
             serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
         let deny: Vec<String> = settings["permissions"]["deny"]
@@ -4728,7 +4762,8 @@ sleep 30
             "a pinned mode that auto-approves would answer session/request_permission before \
              the governance gate sees it: {settings}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
