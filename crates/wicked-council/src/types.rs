@@ -738,11 +738,17 @@ mod login_tests {
     /// Every built-in seat key has a sign-in command, each the CLI's OWN interactive flow —
     /// the platform hosts them in a PTY and never implements provider auth itself.
     #[test]
-    fn every_known_seat_has_a_default_login_invocation() {
-        for key in ["claude", "codex", "copilot", "opencode", "pi", "agy"] {
+    fn every_builtin_seat_has_a_default_login_invocation() {
+        // Iterated off the REAL registry so a newly added seat without a sign-in command
+        // fails here (Copilot, PR#278) — a hardcoded key list can't catch new seats.
+        let builtins = crate::registry::builtin();
+        assert!(!builtins.is_empty());
+        for seat in &builtins {
             assert!(
-                default_login_invocation(key).is_some(),
-                "seat {key} lost its sign-in command"
+                seat.login_invocation.is_some() || default_login_invocation(&seat.key).is_some(),
+                "built-in seat {} has no sign-in command — add it to default_login_invocation \
+                 or the registry entry",
+                seat.key
             );
         }
         assert_eq!(default_login_invocation("unknown-seat"), None);
