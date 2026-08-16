@@ -1170,17 +1170,27 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
     let dir = worker_config_home()?;
     // Refuse symlinks at the leaf or its parent — a redirect here re-aims every write the
-    // worker's CLI makes at a path the operator never chose.
+    // worker's CLI makes at a path the operator never chose. FAIL CLOSED on any stat error
+    // other than not-found (a PermissionDenied probe must not read as "not a symlink" —
+    // Copilot, PR#277).
     for probe in [dir.parent(), Some(dir.as_path())].into_iter().flatten() {
-        if std::fs::symlink_metadata(probe)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            anyhow::bail!(
-                "refusing worker config home {}: {} is a symlink",
-                dir.display(),
-                probe.display()
-            );
+        match std::fs::symlink_metadata(probe) {
+            Ok(m) if m.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing worker config home {}: {} is a symlink",
+                    dir.display(),
+                    probe.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                anyhow::bail!(
+                    "refusing worker config home {}: cannot stat {} ({e})",
+                    dir.display(),
+                    probe.display()
+                );
+            }
         }
     }
     if !dir.is_dir() {
@@ -1201,20 +1211,39 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    // RE-SANITIZE: executable-config vectors go; login/session state stays.
+    // RE-SANITIZE: executable-config vectors go; login/session state stays. Judged on
+    // symlink_metadata, never a following stat: a prior worker could plant
+    // `hooks -> ~/.ssh` or `settings.json -> <victim>` and a following remove/write would
+    // act OUTSIDE the home (Copilot, PR#277). A symlink entry is removed AS a link.
     for entry in WORKER_HOME_SANITIZED {
-        let p = dir.join(entry);
-        if p.is_dir() {
-            std::fs::remove_dir_all(&p)?;
-        } else if p.exists() {
-            std::fs::remove_file(&p)?;
-        }
+        remove_entry_no_follow(&dir.join(entry))?;
     }
+    // settings.json is re-written every spawn; clear any planted entry (symlink included)
+    // first so the write can never travel through a link.
+    let settings_path = dir.join("settings.json");
+    remove_entry_no_follow(&settings_path)?;
     let settings = json!({
         "permissions": { "deny": crate::execute_wrapped::deny_rules() }
     });
-    std::fs::write(dir.join("settings.json"), serde_json::to_vec(&settings)?)?;
+    std::fs::write(&settings_path, serde_json::to_vec(&settings)?)?;
     Ok(dir)
+}
+
+/// Remove a worker-home entry WITHOUT following symlinks: a link is deleted as a link
+/// (`remove_file` — std's `remove_dir_all` also refuses to traverse links, but routing links
+/// away explicitly keeps the property visible and covers link-to-file too). Missing → Ok.
+fn remove_entry_no_follow(p: &std::path::Path) -> anyhow::Result<()> {
+    let meta = match std::fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => anyhow::bail!("cannot stat {} while sanitizing ({e})", p.display()),
+    };
+    if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(p)?;
+    } else {
+        std::fs::remove_file(p)?;
+    }
+    Ok(())
 }
 
 /// Spawn the ACP binary and complete the `initialize` + `session/new` handshake — with an
@@ -3707,8 +3736,8 @@ impl AcpStepRunner {
                         format!(
                             "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
                              (crew#267). One-time fix: run \
-                             `CLAUDE_CONFIG_DIR={home_hint} claude login` yourself, then every \
-                             worker stays logged in. Using single-shot fallback meanwhile, \
+                             `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude login` yourself, then \
+                             every worker stays logged in. Using single-shot fallback meanwhile, \
                              which runs under the operator's own auth"
                         ),
                         fallback_kind::AUTH_REQUIRED,
@@ -4031,6 +4060,54 @@ mod tests {
             "login state must persist across spawns — that is the point of option 3"
         );
         assert!(a.join(".claude.json").exists());
+
+        std::env::remove_var("WICKED_WORKER_HOME");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A prior worker planting SYMLINKS inside the home (hooks -> victim-dir,
+    /// settings.json -> victim-file) must have the LINKS removed — never the targets touched,
+    /// and never a write through the link (Copilot, PR#277).
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_removes_planted_symlinks_without_following_them() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("wworker-plant-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        let home = ensure_worker_config_home().expect("first ensure");
+
+        // The victims a malicious worker would aim at.
+        let victim_dir = base.join("victim-dir");
+        std::fs::create_dir_all(&victim_dir).unwrap();
+        std::fs::write(victim_dir.join("precious.txt"), "keep").unwrap();
+        let victim_file = base.join("victim.json");
+        std::fs::write(&victim_file, "{\"untouched\":true}").unwrap();
+
+        // The plants.
+        std::os::unix::fs::symlink(&victim_dir, home.join("hooks")).unwrap();
+        std::fs::remove_file(home.join("settings.json")).unwrap();
+        std::os::unix::fs::symlink(&victim_file, home.join("settings.json")).unwrap();
+
+        ensure_worker_config_home().expect("re-ensure sanitizes the plants");
+
+        assert!(
+            victim_dir.join("precious.txt").exists(),
+            "sanitize must remove the LINK, never the target directory's contents"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_file).unwrap(),
+            "{\"untouched\":true}",
+            "the settings re-write must never travel through a planted link"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join("hooks")).is_err(),
+            "the planted hooks link itself must be gone"
+        );
+        let settings: Value =
+            serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
+        assert!(settings["permissions"]["deny"].is_array());
 
         std::env::remove_var("WICKED_WORKER_HOME");
         let _ = std::fs::remove_dir_all(&base);
@@ -4576,6 +4653,9 @@ sleep 30
         let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("config-iso");
+        // Scratch-scope the worker home: without this the spawn would ensure (and re-write
+        // settings in) the DEVELOPER's real ~/.wicked-worker/claude (Copilot, PR#277).
+        std::env::set_var("WICKED_WORKER_HOME", &dir);
         let ledger = dir.join("seen-config-dir.txt");
         let script = write_stub(
             &dir,
@@ -4619,6 +4699,7 @@ sleep 30
             "the seeded user scope must fence the worker, not just exist: {settings}"
         );
         drop(proc);
+        std::env::remove_var("WICKED_WORKER_HOME");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&seen_dir);
     }
