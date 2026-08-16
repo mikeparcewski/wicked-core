@@ -1167,7 +1167,14 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 
 /// Ensure the persistent worker home exists, is private, is not a planted symlink, and has
 /// been re-sanitized for THIS spawn. Returns the home. Fail closed on anything odd.
+///
+/// SERIALIZED process-wide: the start gate admits 2 concurrent handshakes, and two ensures
+/// racing on the same home can interleave remove/write on `settings.json` into a spurious
+/// NotFound failure (caught by the 8-simultaneous-starts gate test on macOS CI). The critical
+/// section is a handful of fs ops; contention is bounded by the start gate anyway.
 fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
+    static ENSURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = ENSURE.lock().unwrap_or_else(|p| p.into_inner());
     let dir = worker_config_home()?;
     // Refuse symlinks at the leaf or its parent — a redirect here re-aims every write the
     // worker's CLI makes at a path the operator never chose. FAIL CLOSED on any stat error
