@@ -173,6 +173,16 @@ pub fn registry_roster() -> Vec<AgenticCli> {
         .unwrap_or_default()
         .into_iter()
         .filter(|c| c.enabled_for_council)
+        .map(|mut c| {
+            // Fill the seat's sign-in command from the built-in table when the registry entry
+            // does not override it — consumers (the studio's sign-in terminal) read it off the
+            // roster and never hardcode per-provider flows.
+            if c.login_invocation.is_none() {
+                c.login_invocation =
+                    wicked_council::types::default_login_invocation(&c.key).map(str::to_string);
+            }
+            c
+        })
         .collect()
 }
 
@@ -1353,6 +1363,7 @@ mod tests {
             enabled_for_council: true,
             acp: None,
             capabilities: None,
+            login_invocation: None,
         };
 
         let dir = std::env::temp_dir().join("wicked-core-pipeline-test");

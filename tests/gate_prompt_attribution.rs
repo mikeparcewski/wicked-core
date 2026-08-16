@@ -55,6 +55,7 @@ fn cli(key: &str) -> AgenticCli {
         enabled_for_council: true,
         acp: None,
         capabilities: None,
+        login_invocation: None,
     }
 }
 

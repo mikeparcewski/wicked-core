@@ -226,6 +226,31 @@ pub struct AgenticCli {
     /// Example: "broad reasoning, TypeScript/React, refactoring, API design"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<String>,
+    /// The INTERACTIVE command that signs this seat in — the CLI's OWN login flow, meant to be
+    /// hosted in a PTY (the studio's sign-in terminal). The platform never implements provider
+    /// auth itself: it runs this command, the operator completes the CLI's URL/paste flow, and
+    /// the CLI writes its own credential store. `None` ⇒ fall back to the registry's built-in
+    /// default for the seat key ([`default_login_invocation`]), else no sign-in surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_invocation: Option<String>,
+}
+
+/// Built-in sign-in commands for the known seat keys — used when a registry entry does not
+/// override `login_invocation`. Each is the seat's OWN documented interactive flow (device-code
+/// or URL+paste), so it works inside a PTY with no localhost-callback assumptions.
+#[must_use]
+pub fn default_login_invocation(key: &str) -> Option<&'static str> {
+    match key {
+        // The worker home (crew#267 option 3): sign in the ENGINE-owned config dir, not the
+        // operator's — inside the REPL, `/login` runs the URL+paste flow.
+        "claude" => Some(r#"CLAUDE_CONFIG_DIR="$HOME/.wicked-worker/claude" claude"#),
+        "codex" => Some("codex login --device-auth"),
+        "copilot" => Some("copilot login"),
+        "opencode" => Some("opencode auth login"),
+        "pi" => Some("pi"),
+        "agy" => Some("agy"),
+        _ => None,
+    }
 }
 
 fn default_true() -> bool {
@@ -705,3 +730,25 @@ impl EventSink for NoopEventSink {
 /// Helper kept on the spine so install-hints round-trip in the registry record
 /// without forcing the engine to know the map shape. Empty by default.
 pub type InstallHints = BTreeMap<String, String>;
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    /// Every built-in seat key has a sign-in command, each the CLI's OWN interactive flow —
+    /// the platform hosts them in a PTY and never implements provider auth itself.
+    #[test]
+    fn every_known_seat_has_a_default_login_invocation() {
+        for key in ["claude", "codex", "copilot", "opencode", "pi", "agy"] {
+            assert!(
+                default_login_invocation(key).is_some(),
+                "seat {key} lost its sign-in command"
+            );
+        }
+        assert_eq!(default_login_invocation("unknown-seat"), None);
+        // The claude entry signs in the WORKER home, never the operator's own config.
+        assert!(default_login_invocation("claude")
+            .unwrap()
+            .contains(".wicked-worker"));
+    }
+}
