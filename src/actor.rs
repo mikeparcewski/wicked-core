@@ -275,6 +275,11 @@ pub(crate) fn run(
     // Populated on WorkerSessionStarted, pruned on WorkerSessionClosed / TerminalExited.
     // Used by InjectWorkerMessage + ReassignUnit without touching the runner or store.
     let mut run_sessions: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // Live-output coalescer: per-(run, ord) pending text + last-flush stamp, turning the raw
+    // CliOutputDelta firehose into the throttled UnitOutputDelta stream (≤1 flush / 500ms / unit,
+    // or 2KB, each capped at 2KB). Owned HERE — the single-writer thread — so workers only ever
+    // send raw chunks. Drained on ApplyStepResult (the tail must not be lost) and CancelRun.
+    let mut output_throttle = crate::output_throttle::UnitOutputThrottle::new();
     // Actor-owned workflow registry: built-ins seeded at startup, runtime defs added via
     // `Command::RegisterWorkflow`. The file overlay dir (`$WICKED_WORKFLOWS_DIR` /
     // `~/.config/wicked-core/workflows`) is loaded ONCE here so every subsequent `LaunchRun` on
@@ -1095,6 +1100,22 @@ pub(crate) fn run(
                 ack,
             } => {
                 let run_id = output.run_id.clone();
+                // FINAL FLUSH: this worker's stream is over — emit any coalesced tail still
+                // pending in the throttle BEFORE the result folds, so the live stream never ends
+                // mid-window (and the run's throttle state cannot leak). Each tail carries the
+                // attempt its chunks arrived under (the throttle keys by attempt), so a superseded
+                // attempt's tail is never relabeled as the finishing worker's.
+                for (ord, attempt, text) in output_throttle.drain_run(&run_id) {
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::UnitOutputDelta {
+                            session: run_id.clone(),
+                            ord,
+                            attempt,
+                            text,
+                        },
+                    );
+                }
                 match apply_step_result(
                     &mut store,
                     &mut subscribers,
@@ -1199,6 +1220,9 @@ pub(crate) fn run(
                     maps.tombstone_run(&run_id);
                     maps.advance_launch_seq(&run_id);
                 }
+                // Discard any coalesced live-output tail: the operator is discarding the run, and
+                // the throttle entry must not outlive it.
+                let _ = output_throttle.drain_run(&run_id);
                 let res = cancel_run(&mut store, &mut subscribers, &runner, &self_tx, &run_id);
                 // Retire launch state now that the sequence has been advanced.
                 if let Some(ref m) = lifecycle_maps {
@@ -1321,19 +1345,39 @@ pub(crate) fn run(
             Command::CliOutputDelta {
                 run_id,
                 ord,
+                attempt,
                 chunk,
                 process_gen: _,
                 launch_seq: _,
             } => {
+                // Coalesce into the throttled UnitOutputDelta stream FIRST (borrows), then fan the
+                // raw chunk out unchanged (moves it). The raw event keeps its exclusion from the
+                // durable log; the coalesced one is what leaves the process. The chunk's IN-BAND
+                // `attempt` (stamped at the dispatch site) keys the buffer AND labels the flush —
+                // no session read, and a re-dispatch mid-window can neither merge attempts nor
+                // mislabel a superseded attempt's late chunks (PR #279 review).
+                let flushed =
+                    output_throttle.push(&run_id, ord, attempt, &chunk, std::time::Instant::now());
                 // The single emit point fans a worker's live output chunk out to subscribers.
                 emit(
                     &mut subscribers,
                     CoreEvent::CliOutputDelta {
-                        session: run_id,
+                        session: run_id.clone(),
                         ord,
                         chunk,
                     },
                 );
+                if let Some(text) = flushed {
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::UnitOutputDelta {
+                            session: run_id,
+                            ord,
+                            attempt,
+                            text,
+                        },
+                    );
+                }
             }
             Command::ResolveElicitation {
                 run_id,
@@ -3499,6 +3543,51 @@ fn apply_step_result(
         ));
     }
 
+    // ── PHASE SUBSTANCE GATE ─────────────────────────────────────────────────────────────────
+    // A governed Creator/Neutral phase that folds Ok with (a) under 200 trimmed chars of prose AND
+    // (b) an untouched worktree produced NOTHING a downstream phase or evaluator could review.
+    // "Done" is re-derived from evidence, and here there is no evidence of ANY kind — so route it
+    // to the standard failure path (Rejected + denial_reason + StepFailed + fail_run) instead of
+    // letting a one-line "done." fold as a completed phase and starve every unit behind it of
+    // context. Evaluator-role units are exempt: their output is a verdict over ANOTHER unit's
+    // work, and they carry their own pinned floors (see `builtin_floors`).
+    const MIN_SUBSTANCE_CHARS: usize = 200;
+    if output.governed
+        && unit.role != crate::workflow::PhaseRole::Evaluator
+        && output.output.trim().chars().count() < MIN_SUBSTANCE_CHARS
+        && worktree_is_clean(session.workdir.as_deref())
+    {
+        const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
+        unit.status = crate::domain::UnitStatus::Rejected;
+        unit.denial_reason = Some(NO_SUBSTANCE.to_string());
+        put_node(store, unit.to_node())?;
+        emit(
+            subscribers,
+            CoreEvent::StepFailed {
+                session: run_id.clone(),
+                ord,
+                attempt: output.attempt,
+                detail: NO_SUBSTANCE.to_string(),
+                // NOT WorkerError: the worker ran and exited Ok — this is core's own governance
+                // veto, and a consumer that reads workerError as "the CLI process failed" (seat
+                // health, failover) must not act on it (PR #279 review).
+                failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+            },
+        );
+        // Same evidence fold as the worker-failure path (core#35): conform any governed Deny
+        // claims recorded before this rejection so the decisions log is not silently dropped.
+        let phase = crate::scope::unit_phase(ord);
+        let _ = crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+        return Ok(fail_run(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            &mut session,
+            ord,
+        ));
+    }
+
     let cli_keys = session.clis.clone();
     let entity_mode = session.entity_mode;
     let workflow_id = session.workflow_id.clone();
@@ -4170,6 +4259,7 @@ fn dispatch_unit(
             let _ = tx.send(crate::command::Command::CliOutputDelta {
                 run_id: run_id2.clone(),
                 ord,
+                attempt,
                 chunk: output_str.clone(),
                 process_gen: None, // PTY tool-cmd path — not bus-dispatched
                 launch_seq: 0,
@@ -4216,15 +4306,17 @@ fn dispatch_unit(
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
-        // Streaming sink: each output chunk is posted back to the actor (the single emit point) as a
-        // `CliOutputDelta` command. The `Mutex` makes the `!Sync` `Sender` shareable across the
-        // runner's concurrent stdout/stderr drains.
+        let attempt = input.attempt; // in-band attempt: labels this worker's throttled output
+                                     // Streaming sink: each output chunk is posted back to the actor (the single emit point) as a
+                                     // `CliOutputDelta` command. The `Mutex` makes the `!Sync` `Sender` shareable across the
+                                     // runner's concurrent stdout/stderr drains.
         let delta_tx = std::sync::Mutex::new(tx.clone());
         let emit = move |chunk: &str| {
             if let Ok(g) = delta_tx.lock() {
                 let _ = g.send(Command::CliOutputDelta {
                     run_id: run_id.clone(),
                     ord,
+                    attempt,
                     chunk: chunk.to_string(),
                     process_gen: None, // local-path worker; bus consumer sets in T7
                     launch_seq: 0,
@@ -4313,6 +4405,33 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
             format!("failed to spawn {:?}: {e}", bin),
             crate::workflow::StepStatus::Failed,
         ),
+    }
+}
+
+/// TRUE iff `workdir` shows NO observable worktree change — no tracked modification, deletion, or
+/// untracked file (`git status --porcelain` reports all three, same instrument as the built-in
+/// evidence floor, `builtin_floors::EVIDENCE_SCRIPT`). Feeds the phase-substance gate in
+/// [`apply_step_result`]: "no diff" + near-empty prose = a phase that produced nothing reviewable.
+///
+/// The degenerate cases resolve in the fail-closed direction the floor established: a run with no
+/// workdir, a non-git workdir (`git status` exits 128), or an unspawnable `git` has no OBSERVABLE
+/// diff, so all return `true` — for such a run, prose is the only substance it can offer, and the
+/// substance gate holds it to that.
+///
+/// Actor-thread subprocess, deliberately: `git status --porcelain` is a fast plumbing read, and
+/// this runs ONLY on the short-output governed path (rare), never per unit.
+fn worktree_is_clean(workdir: Option<&str>) -> bool {
+    let Some(wd) = workdir else {
+        return true;
+    };
+    let out = std::process::Command::new("git")
+        .hardened()
+        .args(["status", "--porcelain"])
+        .current_dir(wd)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => o.stdout.iter().all(|b| b.is_ascii_whitespace()),
+        _ => true,
     }
 }
 
@@ -5202,6 +5321,415 @@ mod terminal_gate_tests {
         assert!(
             matches!(progress, Progress::Done),
             "an Auto terminal gate must finalize (Done), never pause"
+        );
+    }
+}
+
+/// PHASE SUBSTANCE GATE — a governed Creator/Neutral unit whose Ok fold carries neither prose
+/// (under 200 trimmed chars) nor a worktree change is REJECTED through the standard failure path
+/// with `denial_reason: "phase produced no reviewable substance"`, never folded as a completed
+/// phase. Driven through `apply_step_result` — the real fold site — with an in-memory store and
+/// no subprocesses (`workdir: None` ⇒ no observable diff by construction).
+#[cfg(test)]
+mod substance_gate_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{PhaseRole, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// One Executing session at cursor 0 over a single unit of `role`. `workdir: None` — the run
+    /// has no worktree, so "worktree diff is empty" holds by construction and the substance
+    /// decision rides entirely on the output's length (and the unit's role/governed flag).
+    fn seed(store: &mut dyn GraphStore, run_id: &str, role: PhaseRole) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
+        u.role = role;
+        u.status = UnitStatus::Distributed;
+        put_node(store, u.to_node()).unwrap();
+        // The orchestration workflow the Ok fold ticks (same shape `pre_distribute` registers) —
+        // without it every fold that reaches `apply_and_finish_unit` errors "workflow not found".
+        wicked_orchestration::register_workflow(
+            store,
+            format!("wf-{run_id}"),
+            "p",
+            &[(format!("wf-{run_id}:unit-1"), "build the feature")],
+        )
+        .unwrap();
+    }
+
+    /// Fold an Ok result for the seeded unit and return `(StepApplied, session, unit)`.
+    fn fold(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        output_text: &str,
+        governed: bool,
+    ) -> (StepApplied, AgentSession, WorkUnit) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: output_text.into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed,
+        };
+        let applied = apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .remove(0);
+        (applied, session, unit)
+    }
+
+    /// The rejection: governed + Creator role + a one-liner + no worktree change ⇒ the standard
+    /// failure path — unit Rejected with the substance denial, StepFailed emitted with the same
+    /// detail, run terminally Failed.
+    #[test]
+    fn a_governed_no_substance_ok_fold_is_rejected() {
+        let run_id = format!("substance-reject-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (applied, session, unit) = fold(&mut store, &mut subs, &run_id, "done.", true);
+
+        assert!(
+            matches!(applied, StepApplied::Finished),
+            "the substance rejection must terminate the run (standard failure path)"
+        );
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(unit.denial_reason.as_deref(), Some(NO_SUBSTANCE));
+        let saw_step_failed = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
+            matches!(
+                ev,
+                CoreEvent::StepFailed { detail, failure_kind, .. }
+                    if detail == NO_SUBSTANCE
+                        && failure_kind == crate::event::StepFailureKind::SubstanceRejected
+            )
+        });
+        assert!(
+            saw_step_failed,
+            "the standard failure path emits StepFailed carrying the substance denial, \
+             kinded SubstanceRejected (a core veto, not a worker failure)"
+        );
+    }
+
+    /// The passing case: the SAME one-liner + clean worktree folds fine when the unit is
+    /// ungoverned — the gate is scoped to governed units, so the engine's own internal phases
+    /// and ungoverned runs are untouched.
+    #[test]
+    fn an_ungoverned_short_ok_fold_still_completes() {
+        let run_id = format!("substance-ungoverned-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (applied, session, unit) = fold(&mut store, &mut subs, &run_id, "done.", false);
+
+        assert!(
+            matches!(applied, StepApplied::Finished),
+            "single-unit run folds Ok and finalizes"
+        );
+        assert_eq!(
+            session.status,
+            SessionStatus::Completed,
+            "an ungoverned short Ok fold must complete, never trip the substance gate"
+        );
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(unit.denial_reason, None);
+    }
+
+    /// Evaluator exemption: an Evaluator-role unit's output is a VERDICT over another unit's work
+    /// — it is short by nature and carries its own pinned floors (`builtin_floors`), so the
+    /// substance gate must not fire on it. (The unit still fails downstream here — a governed
+    /// unit with no decisions log fails closed — which is exactly the point: it reached the
+    /// NORMAL gate, not the substance rejection.)
+    #[test]
+    fn an_evaluator_unit_is_exempt_from_the_substance_gate() {
+        let run_id = format!("substance-evaluator-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Evaluator);
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (_applied, _session, unit) = fold(&mut store, &mut subs, &run_id, "PASS", true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_SUBSTANCE),
+            "an Evaluator-role unit must never be rejected for lack of substance"
+        );
+    }
+
+    /// The prose threshold: 200+ trimmed chars IS reviewable substance even with a clean
+    /// worktree (recon/analysis phases legitimately produce prose only), so the substance gate
+    /// stays closed and the fold proceeds to the normal gates.
+    #[test]
+    fn two_hundred_chars_of_prose_clears_the_substance_gate() {
+        let run_id = format!("substance-prose-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let mut subs = crate::event_log::EventSink::default();
+        // Exactly 200 TRIMMED chars — the boundary itself must pass ("under 200" rejects).
+        let prose = format!("  {}  ", "a".repeat(200));
+
+        let (_applied, _session, unit) = fold(&mut store, &mut subs, &run_id, &prose, true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_SUBSTANCE),
+            "200 trimmed chars of prose must clear the substance gate"
+        );
+    }
+}
+
+/// Live-output stream (`UnitOutputDelta`) — the ACTOR wiring over [`crate::output_throttle`],
+/// whose window/boundary semantics are pinned in that module's own tests with fabricated
+/// instants. Driven through a REAL actor (`Core::spawn_with_engine`, stub dispatcher + runner, no
+/// subprocesses) by sending raw `Command::CliOutputDelta` — exactly what every worker path
+/// (in-process, bus consumer, tool executor) sends.
+///
+/// DETERMINISM UNDER LOAD (PR #279 review): the actor's throttle runs on the wall clock, and a
+/// loaded CI runner can stall the actor thread ≥500ms between chunks — so no assertion here may
+/// depend on WHICH boundary (window vs. drain) flushes a pending tail. Every expectation below
+/// is boundary-independent: the first chunk of a `(run, ord, attempt)` buffer always flushes
+/// immediately, an over-cap chunk always flushes on size, and a pending tail always surfaces as
+/// the same `(session, ord, attempt, text)` tuple whether the 500ms window elapsed mid-sequence
+/// (time flush) or the step result drained it — because the attempt label rides IN-BAND on the
+/// chunk, not on scheduling.
+#[cfg(test)]
+mod live_output_stream_tests {
+    use super::*;
+    use std::time::Duration;
+    use wicked_council::types::{AgenticCli, Dispatcher, Vote};
+    use wicked_council::CouncilTask;
+
+    struct StubDispatcher;
+    impl Dispatcher for StubDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            None // never convened — this test launches no run
+        }
+    }
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> crate::workflow::StepOutput {
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn cli_output_chunks_surface_as_throttled_unit_output_deltas() {
+        let dir = std::env::temp_dir().join(format!("wicked-live-output-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("live.db");
+        let _ = std::fs::remove_file(&db);
+        let core = crate::Core::spawn_with_engine(
+            db.to_str().unwrap().to_string(),
+            Arc::new(StubDispatcher),
+            Arc::new(NoopRunner),
+        );
+        let events = core.subscribe();
+        let send = |attempt: u32, chunk: String| {
+            core.tx
+                .send(Command::CliOutputDelta {
+                    run_id: "live-run".into(),
+                    ord: 3,
+                    attempt,
+                    chunk,
+                    process_gen: None,
+                    launch_seq: 0,
+                })
+                .expect("actor alive");
+        };
+
+        // The sequence is queued up-front, back-to-back — but NOTHING below depends on how fast
+        // the actor works through it (see the module doc): each expected flush is pinned by a
+        // scheduling-independent boundary, and the pending tail's tuple is identical whether it
+        // leaves via the 500ms window (actor stalled mid-sequence) or the final drain.
+        //
+        // 1. A unit's FIRST chunk streams immediately (no startup delay), verbatim.
+        send(0, "first chunk".into());
+        // 2. An over-cap chunk flushes on the SIZE boundary (2KB pending forces a flush NOW,
+        //    even inside the 500ms window) and the emitted text is capped by the head+tail elide.
+        send(0, "z".repeat(5000));
+        // 3. A RE-DISPATCHED attempt's first chunk: a fresh `(run, ord, attempt)` buffer — flushes
+        //    immediately, labeled with ITS in-band attempt, never merged with attempt 0's buffer.
+        send(1, "rework output".into());
+        // 4. A chunk pending when the step result arrives surfaces labeled with the CHUNK's
+        //    attempt — via the ApplyStepResult drain, or via the window if CI stalled us ≥500ms —
+        //    NOT the result's attempt (7): the throttle keys by the in-band attempt, so a
+        //    superseded attempt's tail can never be relabeled. (The fold itself errors on the
+        //    unknown run; the drain runs before it.)
+        send(0, "the tail".into());
+        core.tx
+            .send(Command::ApplyStepResult {
+                output: crate::workflow::StepOutput {
+                    run_id: "live-run".into(),
+                    unit_ix: 0,
+                    attempt: 7,
+                    output: String::new(),
+                    status: crate::workflow::StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                },
+                agent_verdict: None,
+                process_gen: None,
+                launch_seq: 0,
+                ack: None,
+            })
+            .expect("actor alive");
+
+        // Everything is queued; dropping the handle queues Shutdown BEHIND it (FIFO), so the
+        // whole stream can be collected to completion and asserted in order. Guard the collect
+        // with a deadline so a wedged actor fails the test instead of hanging it.
+        drop(core);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut collected: Vec<CoreEvent> = Vec::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("actor did not shut down within the deadline");
+            match events.recv_timeout(remaining) {
+                Ok(ev) => collected.push(ev),
+                Err(_) => break, // channel closed — the actor shut down cleanly
+            }
+        }
+
+        let unit_outputs: Vec<(&str, u32, u32, &str)> = collected
+            .iter()
+            .filter_map(|ev| match ev {
+                CoreEvent::UnitOutputDelta {
+                    session,
+                    ord,
+                    attempt,
+                    text,
+                } => Some((session.as_str(), *ord, *attempt, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            unit_outputs.len(),
+            4,
+            "four flushes: first-chunk, size-boundary, rework first-chunk, the tail — got {unit_outputs:?}"
+        );
+        // (1) first chunk, verbatim, immediately, labeled with its in-band attempt.
+        assert_eq!(unit_outputs[0], ("live-run", 3, 0, "first chunk"));
+        // (2) size-boundary flush, capped by the head+tail elide, still attempt 0.
+        let (_, _, attempt, text) = unit_outputs[1];
+        assert_eq!(attempt, 0, "the size flush carries the chunk's attempt");
+        assert!(
+            text.len() <= crate::output_throttle::FLUSH_BYTES,
+            "flushed text is capped at 2KB, got {} bytes",
+            text.len()
+        );
+        assert!(
+            text.contains("bytes elided"),
+            "over-cap text is head+tail elided"
+        );
+        // (3) the re-dispatched attempt's first chunk: its own buffer, its own label — attempt 0's
+        //     pending text did not leak into it.
+        assert_eq!(
+            unit_outputs[2],
+            ("live-run", 3, 1, "rework output"),
+            "a bumped attempt streams under its own in-band label, unmerged"
+        );
+        // (4) the pending tail: labeled with the CHUNK's attempt (0) — NOT the finishing result's
+        //     attempt (7) — whether the window or the ApplyStepResult drain flushed it. This is the
+        //     mislabeling fix: a superseded attempt's late output keeps its own attempt.
+        assert_eq!(
+            unit_outputs[3],
+            ("live-run", 3, 0, "the tail"),
+            "the pending tail keeps its chunk's attempt, never the result's"
+        );
+
+        // The raw CliOutputDelta fanout is UNCHANGED alongside the throttled stream.
+        let raw: Vec<&str> = collected
+            .iter()
+            .filter_map(|ev| match ev {
+                CoreEvent::CliOutputDelta { chunk, .. } => Some(chunk.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            raw.contains(&"first chunk") && raw.contains(&"the tail"),
+            "raw chunks still fan out untouched next to the coalesced stream"
+        );
+        assert!(
+            raw.iter().any(|c| c.len() == 5000),
+            "the raw stream is NOT capped — only the throttled stream elides"
         );
     }
 }

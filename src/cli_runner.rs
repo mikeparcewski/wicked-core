@@ -1328,6 +1328,7 @@ fn run_cli_runner(
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does.
                 let delta_run_id = task.run_id.clone();
                 let delta_ord = task.unit.ord;
+                let delta_attempt = task.attempt; // in-band attempt for the throttled stream
                 let delta_process_gen = task.process_gen;
                 let delta_launch_seq = task.launch_seq;
                 let delta_tx = std::sync::Mutex::new(actor_tx.clone());
@@ -1336,6 +1337,7 @@ fn run_cli_runner(
                         let _ = g.send(Command::CliOutputDelta {
                             run_id: delta_run_id.clone(),
                             ord: delta_ord,
+                            attempt: delta_attempt,
                             chunk: chunk.to_string(),
                             process_gen: delta_process_gen,
                             launch_seq: delta_launch_seq,

@@ -244,6 +244,11 @@ pub(crate) enum Command {
     CliOutputDelta {
         run_id: String,
         ord: u32,
+        /// The dispatch attempt this chunk belongs to, carried IN-BAND from the dispatch site
+        /// (the worker knows its own attempt). This — not a session read at flush time — is what
+        /// keys and labels the throttled [`CoreEvent::UnitOutputDelta`] stream, so a late chunk
+        /// from a superseded attempt can never be mislabeled as the re-dispatched one.
+        attempt: u32,
         chunk: String,
         /// Process-generation token at dispatch time (DES-002 stale-delta guard).
         #[allow(dead_code)]
