@@ -2,7 +2,8 @@
 //! stream that consumers actually subscribe to — so the UI watches work happen instead of polling
 //! the store on a timer.
 
-/// Why a unit step failed (worker-reported failure kind; extensible for future tool / govauth errors).
+/// Why a unit step failed — worker-reported kinds plus core-side vetoes (extensible for future
+/// tool / govauth errors).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum StepFailureKind {
@@ -13,6 +14,12 @@ pub enum StepFailureKind {
     /// engages: the detail names the action taken — an automatic trust-grant retry on
     /// the same CLI, or a pause for the operator's decision.
     EnvironmentRefused,
+    /// CORE's phase-substance gate vetoed the fold: the worker ran fine and reported Ok, but a
+    /// governed Creator/Neutral phase produced nothing reviewable (near-empty prose, untouched
+    /// worktree). Distinct from [`Self::WorkerError`] so consumers that treat `workerError` as
+    /// "the CLI worker process failed" (e.g. seat-health failover) never punish a healthy seat
+    /// for a governance rejection.
+    SubstanceRejected,
 }
 
 /// One prior unit whose output was injected into a receiving unit's ACP context (EVT-007).
@@ -1072,6 +1079,7 @@ impl CoreEvent {
                 "failureKind": match failure_kind {
                     StepFailureKind::WorkerError => "workerError",
                     StepFailureKind::EnvironmentRefused => "environmentRefused",
+                    StepFailureKind::SubstanceRejected => "substanceRejected",
                 },
             }),
             CoreEvent::WorkerStalled {

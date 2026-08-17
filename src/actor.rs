@@ -1102,15 +1102,16 @@ pub(crate) fn run(
                 let run_id = output.run_id.clone();
                 // FINAL FLUSH: this worker's stream is over — emit any coalesced tail still
                 // pending in the throttle BEFORE the result folds, so the live stream never ends
-                // mid-window (and the run's throttle state cannot leak). `output.attempt` is the
-                // finishing worker's own attempt — the precise label for its trailing output.
-                for (ord, text) in output_throttle.drain_run(&run_id) {
+                // mid-window (and the run's throttle state cannot leak). Each tail carries the
+                // attempt its chunks arrived under (the throttle keys by attempt), so a superseded
+                // attempt's tail is never relabeled as the finishing worker's.
+                for (ord, attempt, text) in output_throttle.drain_run(&run_id) {
                     emit(
                         &mut subscribers,
                         CoreEvent::UnitOutputDelta {
                             session: run_id.clone(),
                             ord,
-                            attempt: output.attempt,
+                            attempt,
                             text,
                         },
                     );
@@ -1344,14 +1345,19 @@ pub(crate) fn run(
             Command::CliOutputDelta {
                 run_id,
                 ord,
+                attempt,
                 chunk,
                 process_gen: _,
                 launch_seq: _,
             } => {
                 // Coalesce into the throttled UnitOutputDelta stream FIRST (borrows), then fan the
                 // raw chunk out unchanged (moves it). The raw event keeps its exclusion from the
-                // durable log; the coalesced one is what leaves the process.
-                let flushed = output_throttle.push(&run_id, ord, &chunk, std::time::Instant::now());
+                // durable log; the coalesced one is what leaves the process. The chunk's IN-BAND
+                // `attempt` (stamped at the dispatch site) keys the buffer AND labels the flush —
+                // no session read, and a re-dispatch mid-window can neither merge attempts nor
+                // mislabel a superseded attempt's late chunks (PR #279 review).
+                let flushed =
+                    output_throttle.push(&run_id, ord, attempt, &chunk, std::time::Instant::now());
                 // The single emit point fans a worker's live output chunk out to subscribers.
                 emit(
                     &mut subscribers,
@@ -1362,15 +1368,6 @@ pub(crate) fn run(
                     },
                 );
                 if let Some(text) = flushed {
-                    // The attempt currently in flight for this run, read at flush time (a point
-                    // read, bounded by the throttle's cadence — never per raw chunk). `0` when the
-                    // session cannot be read: a delta for an unknown run is already anomalous, and
-                    // the output is still worth showing.
-                    let attempt = crate::domain::get_session(&store, &run_id)
-                        .ok()
-                        .flatten()
-                        .map(|s| s.attempt)
-                        .unwrap_or(0);
                     emit(
                         &mut subscribers,
                         CoreEvent::UnitOutputDelta {
@@ -3571,7 +3568,10 @@ fn apply_step_result(
                 ord,
                 attempt: output.attempt,
                 detail: NO_SUBSTANCE.to_string(),
-                failure_kind: crate::event::StepFailureKind::WorkerError,
+                // NOT WorkerError: the worker ran and exited Ok — this is core's own governance
+                // veto, and a consumer that reads workerError as "the CLI process failed" (seat
+                // health, failover) must not act on it (PR #279 review).
+                failure_kind: crate::event::StepFailureKind::SubstanceRejected,
             },
         );
         // Same evidence fold as the worker-failure path (core#35): conform any governed Deny
@@ -4259,6 +4259,7 @@ fn dispatch_unit(
             let _ = tx.send(crate::command::Command::CliOutputDelta {
                 run_id: run_id2.clone(),
                 ord,
+                attempt,
                 chunk: output_str.clone(),
                 process_gen: None, // PTY tool-cmd path — not bus-dispatched
                 launch_seq: 0,
@@ -4305,15 +4306,17 @@ fn dispatch_unit(
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
-        // Streaming sink: each output chunk is posted back to the actor (the single emit point) as a
-        // `CliOutputDelta` command. The `Mutex` makes the `!Sync` `Sender` shareable across the
-        // runner's concurrent stdout/stderr drains.
+        let attempt = input.attempt; // in-band attempt: labels this worker's throttled output
+                                     // Streaming sink: each output chunk is posted back to the actor (the single emit point) as a
+                                     // `CliOutputDelta` command. The `Mutex` makes the `!Sync` `Sender` shareable across the
+                                     // runner's concurrent stdout/stderr drains.
         let delta_tx = std::sync::Mutex::new(tx.clone());
         let emit = move |chunk: &str| {
             if let Ok(g) = delta_tx.lock() {
                 let _ = g.send(Command::CliOutputDelta {
                     run_id: run_id.clone(),
                     ord,
+                    attempt,
                     chunk: chunk.to_string(),
                     process_gen: None, // local-path worker; bus consumer sets in T7
                     launch_seq: 0,
@@ -5457,11 +5460,18 @@ mod substance_gate_tests {
         assert_eq!(session.status, SessionStatus::Failed);
         assert_eq!(unit.status, UnitStatus::Rejected);
         assert_eq!(unit.denial_reason.as_deref(), Some(NO_SUBSTANCE));
-        let saw_step_failed = std::iter::from_fn(|| erx.try_recv().ok())
-            .any(|ev| matches!(ev, CoreEvent::StepFailed { detail, .. } if detail == NO_SUBSTANCE));
+        let saw_step_failed = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
+            matches!(
+                ev,
+                CoreEvent::StepFailed { detail, failure_kind, .. }
+                    if detail == NO_SUBSTANCE
+                        && failure_kind == crate::event::StepFailureKind::SubstanceRejected
+            )
+        });
         assert!(
             saw_step_failed,
-            "the standard failure path emits StepFailed carrying the substance denial"
+            "the standard failure path emits StepFailed carrying the substance denial, \
+             kinded SubstanceRejected (a core veto, not a worker failure)"
         );
     }
 
@@ -5537,8 +5547,16 @@ mod substance_gate_tests {
 /// whose window/boundary semantics are pinned in that module's own tests with fabricated
 /// instants. Driven through a REAL actor (`Core::spawn_with_engine`, stub dispatcher + runner, no
 /// subprocesses) by sending raw `Command::CliOutputDelta` — exactly what every worker path
-/// (in-process, bus consumer, tool executor) sends. Only the SIZE boundary and the final drain
-/// are exercised here; the 500ms window is wall-clock timing and would flake under load.
+/// (in-process, bus consumer, tool executor) sends.
+///
+/// DETERMINISM UNDER LOAD (PR #279 review): the actor's throttle runs on the wall clock, and a
+/// loaded CI runner can stall the actor thread ≥500ms between chunks — so no assertion here may
+/// depend on WHICH boundary (window vs. drain) flushes a pending tail. Every expectation below
+/// is boundary-independent: the first chunk of a `(run, ord, attempt)` buffer always flushes
+/// immediately, an over-cap chunk always flushes on size, and a pending tail always surfaces as
+/// the same `(session, ord, attempt, text)` tuple whether the 500ms window elapsed mid-sequence
+/// (time flush) or the step result drained it — because the attempt label rides IN-BAND on the
+/// chunk, not on scheduling.
 #[cfg(test)]
 mod live_output_stream_tests {
     use super::*;
@@ -5582,11 +5600,12 @@ mod live_output_stream_tests {
             Arc::new(NoopRunner),
         );
         let events = core.subscribe();
-        let send = |chunk: String| {
+        let send = |attempt: u32, chunk: String| {
             core.tx
                 .send(Command::CliOutputDelta {
                     run_id: "live-run".into(),
                     ord: 3,
+                    attempt,
                     chunk,
                     process_gen: None,
                     launch_seq: 0,
@@ -5594,19 +5613,25 @@ mod live_output_stream_tests {
                 .expect("actor alive");
         };
 
-        // Queue the WHOLE sequence up-front, back-to-back, so the actor processes the pushes with
-        // only in-process emit work between them — the 500ms window cannot elapse mid-sequence,
-        // and every boundary exercised below is the deterministic one (first-chunk / size / drain).
+        // The sequence is queued up-front, back-to-back — but NOTHING below depends on how fast
+        // the actor works through it (see the module doc): each expected flush is pinned by a
+        // scheduling-independent boundary, and the pending tail's tuple is identical whether it
+        // leaves via the 500ms window (actor stalled mid-sequence) or the final drain.
         //
         // 1. A unit's FIRST chunk streams immediately (no startup delay), verbatim.
-        send("first chunk".into());
+        send(0, "first chunk".into());
         // 2. An over-cap chunk flushes on the SIZE boundary (2KB pending forces a flush NOW,
-        //    inside the 500ms window) and the emitted text is capped by the head+tail elide.
-        send("z".repeat(5000));
-        // 3. FINAL DRAIN: a chunk still pending when the step result arrives is flushed by the
-        //    ApplyStepResult arm — labeled with the RESULT's attempt — so the stream never loses
-        //    its tail. (The fold itself errors on the unknown run; the drain runs before it.)
-        send("the tail".into());
+        //    even inside the 500ms window) and the emitted text is capped by the head+tail elide.
+        send(0, "z".repeat(5000));
+        // 3. A RE-DISPATCHED attempt's first chunk: a fresh `(run, ord, attempt)` buffer — flushes
+        //    immediately, labeled with ITS in-band attempt, never merged with attempt 0's buffer.
+        send(1, "rework output".into());
+        // 4. A chunk pending when the step result arrives surfaces labeled with the CHUNK's
+        //    attempt — via the ApplyStepResult drain, or via the window if CI stalled us ≥500ms —
+        //    NOT the result's attempt (7): the throttle keys by the in-band attempt, so a
+        //    superseded attempt's tail can never be relabeled. (The fold itself errors on the
+        //    unknown run; the drain runs before it.)
+        send(0, "the tail".into());
         core.tx
             .send(Command::ApplyStepResult {
                 output: crate::workflow::StepOutput {
@@ -5657,13 +5682,14 @@ mod live_output_stream_tests {
             .collect();
         assert_eq!(
             unit_outputs.len(),
-            3,
-            "three flushes: first-chunk, size-boundary, final drain — got {unit_outputs:?}"
+            4,
+            "four flushes: first-chunk, size-boundary, rework first-chunk, the tail — got {unit_outputs:?}"
         );
-        // (1) first chunk, verbatim, immediately; no session in the store ⇒ attempt falls back to 0.
+        // (1) first chunk, verbatim, immediately, labeled with its in-band attempt.
         assert_eq!(unit_outputs[0], ("live-run", 3, 0, "first chunk"));
-        // (2) size-boundary flush, capped by the head+tail elide.
-        let (_, _, _, text) = unit_outputs[1];
+        // (2) size-boundary flush, capped by the head+tail elide, still attempt 0.
+        let (_, _, attempt, text) = unit_outputs[1];
+        assert_eq!(attempt, 0, "the size flush carries the chunk's attempt");
         assert!(
             text.len() <= crate::output_throttle::FLUSH_BYTES,
             "flushed text is capped at 2KB, got {} bytes",
@@ -5673,11 +5699,20 @@ mod live_output_stream_tests {
             text.contains("bytes elided"),
             "over-cap text is head+tail elided"
         );
-        // (3) the drained tail, labeled with the FINISHING result's attempt.
+        // (3) the re-dispatched attempt's first chunk: its own buffer, its own label — attempt 0's
+        //     pending text did not leak into it.
         assert_eq!(
             unit_outputs[2],
-            ("live-run", 3, 7, "the tail"),
-            "the pending tail is flushed on ApplyStepResult with the result's attempt"
+            ("live-run", 3, 1, "rework output"),
+            "a bumped attempt streams under its own in-band label, unmerged"
+        );
+        // (4) the pending tail: labeled with the CHUNK's attempt (0) — NOT the finishing result's
+        //     attempt (7) — whether the window or the ApplyStepResult drain flushed it. This is the
+        //     mislabeling fix: a superseded attempt's late output keeps its own attempt.
+        assert_eq!(
+            unit_outputs[3],
+            ("live-run", 3, 0, "the tail"),
+            "the pending tail keeps its chunk's attempt, never the result's"
         );
 
         // The raw CliOutputDelta fanout is UNCHANGED alongside the throttled stream.
