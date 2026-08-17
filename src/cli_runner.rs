@@ -573,7 +573,10 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
         s.push_str(&clip(&uncommitted));
     }
     if !committed.trim().is_empty() {
-        s.push_str("commits this run made on its own branch (git log --stat):\n");
+        s.push_str(
+            "commits reachable from HEAD and from no non-wicked branch (git log --stat) — \
+             in a run worktree these are the commits made on the run's branch:\n",
+        );
         s.push_str(&clip(&committed));
     }
     Some(s)
@@ -618,7 +621,7 @@ fn run_unit_and_judge_with_roster(
         && input.workdir.is_some()
         && input.unit.validator.as_ref().is_some_and(|v| v.approved);
     let work_owned = match will_judge
-        .then(|| input.workdir.as_deref())
+        .then_some(input.workdir.as_deref())
         .flatten()
         .and_then(worktree_evidence_for_judge)
     {

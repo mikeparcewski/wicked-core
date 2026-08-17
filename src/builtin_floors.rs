@@ -28,9 +28,10 @@
 //! THIS RUN produced, in either of the two places a worker can legitimately leave them:
 //!
 //! - **uncommitted** — `git status --porcelain` (tracked modification, deletion, untracked file);
-//! - **committed** — commits reachable from `HEAD` but from no other local branch
-//!   (`--not --exclude='wicked/*' --branches`: every non-run branch is subtracted, so only the
-//!   commits the run itself made on its `wicked/<run-id>` branch remain).
+//! - **committed** — commits reachable from `HEAD` but from no non-`wicked/*` local branch
+//!   (`--not --exclude='wicked/*' --branches`: every non-run-branch is subtracted; sibling run
+//!   branches are exempt but unreachable from this `HEAD` unless deliberately merged, so what
+//!   remains is the commits the run itself made on its `wicked/<run-id>` branch).
 //!
 //! The second clause is core#280's fix. The first shipped alone, with a soundness note claiming "a
 //! creator's work cannot be hidden from it by a commit" — false, and proven false by the first run
@@ -80,9 +81,12 @@ pub const EVIDENCE_CRITERION: &str =
 /// The deterministic re-verify: exit 0 IFF the run's worktree carries any change, committed or not.
 /// Clause 1 catches uncommitted work: tracked modification, deletion, or untracked new file
 /// (`--porcelain` reports all three; `grep -q .` turns "at least one line" into the exit status).
-/// Clause 2 catches committed work (core#280): any commit reachable from `HEAD` but from no other
-/// local branch — every branch except the run's own `wicked/*` is subtracted, so the base branch's
-/// history never counts and only commits this run authored on its own branch can satisfy it.
+/// Clause 2 catches committed work (core#280): any commit reachable from `HEAD` but from no
+/// NON-`wicked/*` local branch. Precisely: `--not --exclude='wicked/*' --branches` subtracts every
+/// local branch whose name does not match `wicked/*` — the base branch's history never counts. Run
+/// branches (this run's and siblings') are exempt from subtraction; that is safe because a sibling
+/// run's commits are only reachable from THIS run's `HEAD` if this run deliberately merged them,
+/// so in practice the surviving set is exactly the commits this run authored on its own branch.
 ///
 /// Fails closed by construction in every degenerate case. A non-git workdir makes both `git`
 /// invocations exit 128 with their error on STDERR, so each `grep` sees empty stdin and the script
