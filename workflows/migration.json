@@ -80,7 +80,7 @@
       "role": "evaluator",
       "skill_ref": null,
       "allowed_skills": [],
-      "validator_pin": "2fcde907d57f3ee2",
+      "validator_pin": "e2e7af1db9e48454",
       "executor": {
         "type": "agent"
       }

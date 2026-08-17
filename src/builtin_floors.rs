@@ -24,9 +24,21 @@
 //!
 //! The floor is sound *because of how the run's worktree is made*
 //! ([`crate::repo::create_worktree`]): a fresh `git worktree add -b wicked/<run-id>`, so the tree
-//! starts CLEAN, and nothing in the engine commits. `git status --porcelain` at gate time therefore
-//! reports exactly the changes THIS RUN produced — an operator's pre-existing dirt cannot satisfy
-//! the floor vacuously, and a creator's work cannot be hidden from it by a commit.
+//! starts CLEAN, and nothing in the engine commits. The check therefore reports exactly the changes
+//! THIS RUN produced, in either of the two places a worker can legitimately leave them:
+//!
+//! - **uncommitted** — `git status --porcelain` (tracked modification, deletion, untracked file);
+//! - **committed** — commits reachable from `HEAD` but from no other local branch
+//!   (`--not --exclude='wicked/*' --branches`: every non-run branch is subtracted, so only the
+//!   commits the run itself made on its `wicked/<run-id>` branch remain).
+//!
+//! The second clause is core#280's fix. The first shipped alone, with a soundness note claiming "a
+//! creator's work cannot be hidden from it by a commit" — false, and proven false by the first run
+//! whose worker was told to commit incrementally (a liveness contract): 838 committed lines of
+//! deliverable, porcelain clean, gate DENIED. A floor that punishes committing teaches workers to
+//! leave work uncommitted, which is the opposite of the evidence discipline the product wants.
+//! An operator's pre-existing dirt still cannot satisfy the floor vacuously: the worktree starts
+//! clean and its branch starts at the base tip.
 //!
 //! ## Honest limits
 //!
@@ -65,27 +77,32 @@ use crate::validator::DeterministicValidator;
 pub const EVIDENCE_CRITERION: &str =
     "the run left a change in its worktree (done is re-derived from the diff, never asserted)";
 
-/// The deterministic re-verify: exit 0 IFF the run's worktree carries any change — tracked
-/// modification, deletion, or untracked new file (`--porcelain` reports all three; `grep -q .`
-/// turns "at least one line" into the exit status).
+/// The deterministic re-verify: exit 0 IFF the run's worktree carries any change, committed or not.
+/// Clause 1 catches uncommitted work: tracked modification, deletion, or untracked new file
+/// (`--porcelain` reports all three; `grep -q .` turns "at least one line" into the exit status).
+/// Clause 2 catches committed work (core#280): any commit reachable from `HEAD` but from no other
+/// local branch — every branch except the run's own `wicked/*` is subtracted, so the base branch's
+/// history never counts and only commits this run authored on its own branch can satisfy it.
 ///
-/// Fails closed by construction in every degenerate case. A non-git workdir makes `git status` exit
-/// 128 and write its error to STDERR, so `grep` sees empty stdin and the script exits non-zero — a
-/// DENY, consistent with the module-level rule that "can't re-verify" is treated as NOT-passed.
+/// Fails closed by construction in every degenerate case. A non-git workdir makes both `git`
+/// invocations exit 128 with their error on STDERR, so each `grep` sees empty stdin and the script
+/// exits non-zero — a DENY, consistent with the module-level rule that "can't re-verify" is treated
+/// as NOT-passed.
 ///
 /// Built only from `git`/`grep`/`|` so it passes the [`looks_dangerous`](crate::validator) denylist.
 /// That denylist rejects the substrings `>`, `/dev/`, `:(){`, `$(` and a backtick, plus a table of
 /// whole-word tokens (`rm`, `curl`, `sudo`, `eval`, `exec`, …) — this script carries none of them.
 /// A single `|` is deliberately NOT denied (denying it would also flag every legitimate `||`), and
-/// that pipe is what lets this express "any line at all" without command substitution.
-pub const EVIDENCE_SCRIPT: &str = "git status --porcelain | grep -q .";
+/// pipe-plus-or is what lets this express "any line in either place" without command substitution.
+/// The `'wicked/*'` quoting keeps `sh -c` from globbing the pattern against the run dir.
+pub const EVIDENCE_SCRIPT: &str = "git status --porcelain | grep -q . || git log --oneline HEAD --not --exclude='wicked/*' --branches | grep -q .";
 
 /// The APPROVED content-address pin the built-in Evaluator phases carry. Content-hash over
 /// `(EVIDENCE_CRITERION, EVIDENCE_SCRIPT, approved=true)` — see [`crate::validator_vault::pin`].
 /// Re-derived and asserted equal to the vaulted approved copy by
 /// [`tests::seeded_pin_matches_the_constant_the_builtins_carry`]; if the criterion or the script
 /// ever changes, that test fails loudly and this const must be regenerated.
-pub const EVIDENCE_FLOOR_PIN: &str = "2fcde907d57f3ee2";
+pub const EVIDENCE_FLOOR_PIN: &str = "e2e7af1db9e48454";
 
 /// The authored (UNAPPROVED) evidence floor — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through
@@ -227,6 +244,48 @@ mod tests {
         assert!(
             run_validator(&v, &wt).unwrap(),
             "a tracked modification is evidence and must PASS"
+        );
+    }
+
+    #[test]
+    fn floor_passes_a_run_that_committed_its_work() {
+        // core#280: a worker under an incremental-commit contract leaves porcelain CLEAN — its work
+        // is in commits on the run's `wicked/<run>` branch. The first shipped floor read porcelain
+        // only and DENIED such a run (838 committed lines of deliverable, gate: "no change in its
+        // worktree"). Clause 2 must see the commits; and after the commit, clause 1 must genuinely
+        // be the one that failed (asserted by construction: `git status` is clean post-commit).
+        let dir = scratch("committed");
+        let wt = repo_with_worktree(&dir);
+        let v = evidence_floor_validator().approve();
+
+        std::fs::write(wt.join("deliverable.md"), "the work\n").unwrap();
+        let git = |args: &[&str]| {
+            // spawn-audit: test-only — commits the fixture worker's work in the worktree under test.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&wt)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "docs: the run's committed deliverable"]);
+
+        // Premise guard: the tree really is clean now, so only clause 2 can pass this.
+        // spawn-audit: test-only — asserts the premise (clean porcelain) that makes this test mean something.
+        let porcelain = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt)
+            .output()
+            .expect("git runs");
+        assert!(
+            porcelain.stdout.iter().all(|b| b.is_ascii_whitespace()),
+            "premise broken: porcelain not clean after commit, clause 1 would mask clause 2"
+        );
+
+        assert!(
+            run_validator(&v, &wt).unwrap(),
+            "committed work IS evidence — a worker must not be punished for committing (core#280)"
         );
     }
 
