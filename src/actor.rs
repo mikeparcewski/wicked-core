@@ -4408,31 +4408,47 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
     }
 }
 
-/// TRUE iff `workdir` shows NO observable worktree change — no tracked modification, deletion, or
-/// untracked file (`git status --porcelain` reports all three, same instrument as the built-in
-/// evidence floor, `builtin_floors::EVIDENCE_SCRIPT`). Feeds the phase-substance gate in
-/// [`apply_step_result`]: "no diff" + near-empty prose = a phase that produced nothing reviewable.
+/// TRUE iff `workdir` shows NO observable worktree change in EITHER place a worker can leave one —
+/// uncommitted (`git status --porcelain`: tracked modification, deletion, untracked file) or
+/// committed (run-branch-only commits, `HEAD --not --exclude=wicked/* --branches`) — the same two
+/// instruments as the built-in evidence floor, `builtin_floors::EVIDENCE_SCRIPT`. The committed
+/// clause is core#280's fix: a worker under an incremental-commit contract leaves porcelain clean,
+/// and reading porcelain alone would feed the substance gate a false "produced nothing". Feeds the
+/// phase-substance gate in [`apply_step_result`]: "no change anywhere" + near-empty prose = a phase
+/// that produced nothing reviewable.
 ///
 /// The degenerate cases resolve in the fail-closed direction the floor established: a run with no
-/// workdir, a non-git workdir (`git status` exits 128), or an unspawnable `git` has no OBSERVABLE
-/// diff, so all return `true` — for such a run, prose is the only substance it can offer, and the
-/// substance gate holds it to that.
+/// workdir, a non-git workdir (both `git` calls exit 128), or an unspawnable `git` has no
+/// OBSERVABLE change, so all return `true` — for such a run, prose is the only substance it can
+/// offer, and the substance gate holds it to that.
 ///
-/// Actor-thread subprocess, deliberately: `git status --porcelain` is a fast plumbing read, and
-/// this runs ONLY on the short-output governed path (rare), never per unit.
+/// Actor-thread subprocess, deliberately: both are fast plumbing reads, and this runs ONLY on the
+/// short-output governed path (rare), never per unit.
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
     let Some(wd) = workdir else {
         return true;
     };
-    let out = std::process::Command::new("git")
-        .hardened()
-        .args(["status", "--porcelain"])
-        .current_dir(wd)
-        .output();
-    match out {
-        Ok(o) if o.status.success() => o.stdout.iter().all(|b| b.is_ascii_whitespace()),
-        _ => true,
-    }
+    let no_output = |args: &[&str]| {
+        // spawn-audit: hardened — read-only git plumbing over the run's own worktree.
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(wd)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => o.stdout.iter().all(|b| b.is_ascii_whitespace()),
+            _ => true,
+        }
+    };
+    no_output(&["status", "--porcelain"])
+        && no_output(&[
+            "log",
+            "--oneline",
+            "HEAD",
+            "--not",
+            "--exclude=wicked/*",
+            "--branches",
+        ])
 }
 
 /// Mark a run `Completed` and emit `SessionCompleted`. Propagates a store-write failure so a failed

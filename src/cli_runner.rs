@@ -74,6 +74,7 @@ use crate::bus::{deterministic_key, BusDb, BusEmit, CORE_DOMAIN};
 use crate::command::Command;
 use crate::scope::EntityMode;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus};
+use wicked_apps_core::HardenedCommand;
 
 /// The event the reducer publishes and the `cli-runner` consumes (filtered).
 pub const TASK_DISPATCHED: &str = "wicked.crew.task.dispatched";
@@ -510,6 +511,77 @@ fn select_work_for_agent<'a>(
     std::borrow::Cow::Borrowed(agent_review_target.unwrap_or(own_output))
 }
 
+/// Harness-derived worktree evidence, appended to the WORK the layer-2 agent judge reviews.
+///
+/// Without this the judge sees only PROSE — the creator's cold output (Evaluator units) or the
+/// unit's own output — and a worker that COMMITTED its work presents a clean porcelain plus text
+/// that "merely asserts" a deliverable exists. That is core#280's false rejection: the judge
+/// truthfully reported "no diff is provided" about a run whose branch carried an 838-line committed
+/// deliverable. The harness holds the worktree, so the harness states what it observes, with the
+/// same two instruments as the deterministic floor ([`crate::builtin_floors::EVIDENCE_SCRIPT`]):
+/// porcelain for uncommitted work, run-branch-only commits (`HEAD --not --exclude=wicked/*
+/// --branches`, `--stat` so the judge sees WHICH files) for committed work.
+///
+/// Returns `None` when there is nothing to report (both instruments empty or git unavailable) —
+/// the judge then sees exactly what it saw before this fix. Output is bounded (4 KiB per section,
+/// head-truncated with a marker) so a large diff cannot crowd the criterion out of the prompt.
+fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
+    fn git(workdir: &std::path::Path, args: &[&str]) -> String {
+        // spawn-audit: hardened — read-only git plumbing over the run's own worktree.
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(workdir)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+            _ => String::new(),
+        }
+    }
+    fn clip(s: &str) -> String {
+        const CAP: usize = 4096;
+        if s.len() <= CAP {
+            return s.to_string();
+        }
+        let mut end = CAP;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}\n… [truncated by harness]", &s[..end])
+    }
+    let uncommitted = git(workdir, &["status", "--porcelain"]);
+    let committed = git(
+        workdir,
+        &[
+            "log",
+            "--stat",
+            "--oneline",
+            "HEAD",
+            "--not",
+            "--exclude=wicked/*",
+            "--branches",
+        ],
+    );
+    if uncommitted.trim().is_empty() && committed.trim().is_empty() {
+        return None;
+    }
+    let mut s = String::from(
+        "\n\nWORKTREE EVIDENCE (stated by the harness from the run's worktree, not by the worker):\n",
+    );
+    if !uncommitted.trim().is_empty() {
+        s.push_str("uncommitted changes (git status --porcelain):\n");
+        s.push_str(&clip(&uncommitted));
+    }
+    if !committed.trim().is_empty() {
+        s.push_str(
+            "commits reachable from HEAD and from no non-wicked branch (git log --stat) — \
+             in a run worktree these are the commits made on the run's branch:\n",
+        );
+        s.push_str(&clip(&committed));
+    }
+    Some(s)
+}
+
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
@@ -543,6 +615,19 @@ fn run_unit_and_judge_with_roster(
         agent_review_target,
         &output.output,
     );
+    // Judge-visible worktree evidence (core#280): computed only when a judge will actually run —
+    // same conditions as the `agent_verdict` block below — so ordinary units pay no git spawns.
+    let will_judge = output.status == StepStatus::Ok
+        && input.workdir.is_some()
+        && input.unit.validator.as_ref().is_some_and(|v| v.approved);
+    let work_owned = match will_judge
+        .then_some(input.workdir.as_deref())
+        .flatten()
+        .and_then(worktree_evidence_for_judge)
+    {
+        Some(evidence) => std::borrow::Cow::Owned(format!("{work_owned}{evidence}")),
+        None => work_owned,
+    };
     let work_for_agent: &str = &work_owned;
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         input
