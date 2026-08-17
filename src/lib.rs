@@ -39,6 +39,7 @@ mod knowledge;
 #[cfg(test)]
 mod lockstep;
 mod memory;
+mod output_throttle;
 mod outstanding_work;
 pub mod path_policy;
 mod pipeline;

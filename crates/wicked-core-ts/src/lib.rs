@@ -1398,6 +1398,18 @@ mod tests {
             "cliOutputDelta",
             &["type", "session", "ord", "chunk"],
         );
+        // The throttled/coalesced live-output stream (cliOutputDelta's off-process sibling);
+        // `attempt` rides so a consumer can discard a superseded attempt's output.
+        check(
+            CoreEvent::UnitOutputDelta {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                text: s(),
+            },
+            "unitOutputDelta",
+            &["type", "session", "ord", "attempt", "text"],
+        );
         check(
             CoreEvent::GateDecided {
                 session: s(),

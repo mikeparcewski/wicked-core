@@ -170,6 +170,19 @@ pub enum CoreEvent {
         ord: u32,
         chunk: String,
     },
+    /// A COALESCED span of a unit's live output — the throttled sibling of [`CliOutputDelta`],
+    /// which never leaves the process (excluded from the durable log, too chatty to relay).
+    /// Coalesced per unit at the actor's emit point (at most one flush per 500ms, or immediately
+    /// at 2KB pending; `text` capped at 2KB head+tail — see [`crate::output_throttle`]), so this
+    /// stream is cheap enough to log durably and relay off-process. `attempt` mirrors
+    /// [`UnitDispatched`]: a consumer can drop output belonging to a superseded attempt after a
+    /// re-dispatch.
+    UnitOutputDelta {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        text: String,
+    },
     /// The governance gate decided for a unit (`allow=false` means a structural veto).
     GateDecided {
         session: String,
@@ -824,6 +837,20 @@ impl CoreEvent {
             } => {
                 json!({ "type": "cliOutputDelta", "session": session, "ord": ord, "chunk": chunk })
             }
+            // The throttled live-output stream (see the variant docs). camelCase tag like every
+            // other variant; `attempt` rides so consumers can discard superseded-attempt output.
+            CoreEvent::UnitOutputDelta {
+                session,
+                ord,
+                attempt,
+                text,
+            } => json!({
+                "type": "unitOutputDelta",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "text": text,
+            }),
             CoreEvent::GateDecided {
                 session,
                 ord,
@@ -1367,6 +1394,26 @@ impl CoreEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The throttled live-output frame: camelCase tag `unitOutputDelta`, and `attempt` MUST ride
+    /// alongside `session`/`ord`/`text` — it is what lets a consumer discard a superseded
+    /// attempt's output after a re-dispatch. Mutation: drop any key from the to_json arm and the
+    /// corresponding assertion fails.
+    #[test]
+    fn unit_output_delta_to_json_carries_the_attempt() {
+        let ev = CoreEvent::UnitOutputDelta {
+            session: "run-1".into(),
+            ord: 2,
+            attempt: 1,
+            text: "coalesced output".into(),
+        };
+        let j = ev.to_json();
+        assert_eq!(j["type"], "unitOutputDelta");
+        assert_eq!(j["session"], "run-1");
+        assert_eq!(j["ord"], 2);
+        assert_eq!(j["attempt"], 1);
+        assert_eq!(j["text"], "coalesced output");
+    }
 
     /// FINDING-012: the `cliUsage` wire frame must expose the cache breakdown, so the studio Burn
     /// panel can attribute per-unit cost to cache reuse vs fresh work. `inputTokens` stays the TOTAL
