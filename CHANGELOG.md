@@ -2,6 +2,15 @@
 
 All notable changes to `wicked-core`. Versions follow [SemVer](https://semver.org/).
 
+## [core-ts 0.7.0] — 2026-08-19
+
+### Fixed
+- **The evidence gate sees committed work** (core#280 → #281). `EVIDENCE_SCRIPT` now also counts
+  commits the run branch carries beyond every non-`wicked/*` local branch; the layer-2 agent judge
+  receives harness-derived worktree evidence (porcelain + run-branch `git log --stat`, capped);
+  the phase-substance gate widened identically. The built-in floor pin moved to `e2e7af1db9e48454`
+  (const, shipped defs, and any operator overlay must agree).
+
 ## Unreleased
 
 ## 0.2.0 — 2026-07-21
