@@ -5441,6 +5441,8 @@ sleep 30
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             required_deliverables: Vec::new(),
+            pre_build_scope: false,
+            scope_warnings: Vec::new(),
             status: crate::domain::UnitStatus::Pending,
         }
     }

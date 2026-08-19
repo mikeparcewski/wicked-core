@@ -724,6 +724,24 @@ pub(crate) fn apply_and_finish_unit(
     // FAIL — OR the ABSENCE of a worktree (fail-closed, so the agent LLM can never lone-approve a pinned
     // phase) — denies. Pure, no LLM.
     let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
+
+    // ── PHASE-SCOPE OBSERVABILITY (core#283, the warning half) ── A pre-build, non-creator phase
+    // whose worktree contribution touches NON-documentation files jumped the design-before-build
+    // ladder (the enforced half is the plan-time prompt preamble — see `plan::plan_from_def`).
+    // Record a WARNING onto the unit's persisted gate evidence, visible to operators, and DO NOT
+    // deny: the check is a heuristic over file names, and a deny would turn it into a gate. The
+    // unit (with the warning) is persisted by the `put_node` below, so the evidence rides the same
+    // write as the gate's own resolution. Dedup guards a retried attempt from stacking copies.
+    if let Some(warning) = crate::actor::phase_scope_warning(unit, workdir.as_deref()) {
+        // Log only when NEWLY recorded — a retried attempt re-derives the same warning and
+        // would otherwise spam identical lines while the evidence stays unchanged (Copilot
+        // review on #287).
+        if !unit.scope_warnings.contains(&warning) {
+            eprintln!("wicked-core: {warning}");
+            unit.scope_warnings.push(warning);
+        }
+    }
+
     let det_denial =
         pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new), db_path);
     // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before `det_denial` is

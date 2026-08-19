@@ -96,6 +96,8 @@ mod tests {
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             status: UnitStatus::Pending,
+            pre_build_scope: false,
+            scope_warnings: Vec::new(),
         }
     }
 

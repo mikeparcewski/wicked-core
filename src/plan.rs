@@ -23,6 +23,26 @@ use crate::workflow::WorkflowDef;
 /// call-site `pty_unit_prompt` refusal in `execute_wrapped`.
 const INSTRUCTION_SEP: &str = " ||| ";
 
+/// The recognizable head of the engine-side scope preamble (core#283) — a const so the tests that
+/// assert its presence/absence and any operator grepping a prompt share one spelling.
+pub(crate) const PHASE_SCOPE_PREFIX: &str = "PHASE SCOPE (enforced):";
+
+/// The scope preamble injected into the UNIT PROMPT of every PRE-BUILD, non-creator phase
+/// (core#283). Phase-role scope was a suggestion: a Neutral pre-build phase (e.g. `feature`'s
+/// `design`) received the same problem statement as every phase and routinely implemented the
+/// entire deliverable, collapsing the design-before-build ladder — proven twice, including against
+/// an explicit prompt-level discipline paragraph, so this is injected ENGINE-SIDE from def data
+/// (role + `executes_code` + declaration order), never hardcoded per workflow id and never left to
+/// workflow prose. Single-line by construction: the description IS the PTY prompt
+/// (see [`INSTRUCTION_SEP`]).
+fn phase_scope_preamble(phase_id: &str) -> String {
+    format!(
+        "{PHASE_SCOPE_PREFIX} this is the {phase_id} phase. Produce this phase's deliverable only \
+         (analysis/design/plan as applicable). Do NOT write or commit production code; \
+         implementation belongs to a later phase."
+    )
+}
+
 /// Decompose `problem` into ordered [`WorkUnit`]s owned by `session_id`. Unit ids are
 /// `<session_id>:u<ord>` (1-based, stable).
 pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
@@ -66,6 +86,16 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
         "plan_from_def requires a validated def (unique phase ids); call WorkflowDef::validate first"
     );
     let intent = intent.trim();
+    // core#283: the index where implementation legitimately begins — the def's first
+    // `executes_code` Creator phase. Phases BEFORE it that play neither creator nor evaluator are
+    // the pre-build ladder (clarify/design/plan …): their prompts gain the scope preamble and
+    // their units are marked `pre_build_scope` so the completion path can WARN when one implements
+    // anyway. `None` (a def with no code-executing creator, e.g. `collab`, `survey-repo`) ⇒ there
+    // is no ladder to protect and no phase gets the preamble.
+    let first_code_creator = def
+        .phases
+        .iter()
+        .position(|p| p.executes_code && p.role == crate::workflow::PhaseRole::Creator);
     def.phases
         .iter()
         .enumerate()
@@ -93,6 +123,23 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             {
                 description.push_str(INSTRUCTION_SEP);
                 description.push_str(instr);
+            }
+            // core#283 PHASE-ROLE SCOPE, the enforced half. Prompt-level discipline proved
+            // insufficient twice, so the planner itself injects the scope preamble into the unit
+            // prompt of every phase that (a) plays neither Creator nor Evaluator, (b) runs BEFORE
+            // the first `executes_code` Creator phase, and (c) is agent-executed (a Tool phase's
+            // description is argv context, never a prompt). Threaded ALONGSIDE the instructions
+            // fold above (same single-line separator, appended after — the shared intent and the
+            // phase's own slice still lead), so authored instructions are never clobbered.
+            let pre_build_scope = first_code_creator.is_some_and(|b| i < b)
+                && !matches!(
+                    phase.role,
+                    crate::workflow::PhaseRole::Creator | crate::workflow::PhaseRole::Evaluator
+                )
+                && !matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
+            if pre_build_scope {
+                description.push_str(INSTRUCTION_SEP);
+                description.push_str(&phase_scope_preamble(&phase.id));
             }
             let mut unit = WorkUnit::pending(
                 format!("{session_id}:{}", phase.id),
@@ -128,6 +175,10 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());
             }
+            // core#283, the marker for the observability half: the completion path warns (never
+            // denies) when a pre-build phase's worktree contribution touches non-documentation
+            // files — see `actor::phase_scope_warning`.
+            unit.pre_build_scope = pre_build_scope;
             unit
         })
         .collect()
@@ -416,9 +467,176 @@ mod tests {
     #[test]
     fn plan_from_def_handles_empty_intent() {
         let units = plan_from_def(&feature_def(), "   ", "s");
-        // Falls back to the bare phase id — never an empty description (gate needs work context).
-        assert_eq!(units[0].description, feature_def().phases[0].id);
+        // Falls back to the bare phase id (plus, on a pre-build phase like `clarify`, the core#283
+        // scope preamble) — never an empty description (gate needs work context).
+        assert!(
+            units[0]
+                .description
+                .starts_with(&feature_def().phases[0].id),
+            "{}",
+            units[0].description
+        );
         assert!(units.iter().all(|u| !u.description.is_empty()));
+    }
+
+    /// core#283, the enforced half, asserted against the SHIPPED `feature` def (the workflow the
+    /// collapse was proven on — its `design` phase received the same problem statement as `build`
+    /// and implemented the entire deliverable, twice, once THROUGH an explicit prompt-level
+    /// discipline paragraph). The scope preamble must land on exactly the pre-build non-creator
+    /// phases (`clarify`, `design`) and on no build/evaluator/post-build phase — a preamble on
+    /// `build` would scope the creator away from building, which is the inverse failure.
+    #[test]
+    fn scope_preamble_lands_exactly_on_pre_build_non_creator_phases_of_the_shipped_feature_def() {
+        let def = feature_def();
+        let units = plan_from_def(&def, "add SSO login", "s1");
+        let by_phase = |id: &str| {
+            units
+                .iter()
+                .find(|u| u.id == format!("s1:{id}"))
+                .unwrap_or_else(|| panic!("feature has a `{id}` phase"))
+        };
+
+        for id in ["clarify", "design"] {
+            let u = by_phase(id);
+            assert!(
+                u.description.contains(PHASE_SCOPE_PREFIX),
+                "pre-build phase `{id}` must carry the scope preamble: {}",
+                u.description
+            );
+            assert!(
+                u.description.contains(&format!("this is the {id} phase")),
+                "the preamble is composed from THIS phase's id, not a workflow-wide blurb: {}",
+                u.description
+            );
+            assert!(
+                u.description.contains("add SSO login"),
+                "the shared intent still leads — the preamble threads alongside, not instead: {}",
+                u.description
+            );
+            assert!(
+                !u.description.contains('\n'),
+                "the preamble must stay single-line (the PTY runner submits on the first newline): {}",
+                u.description
+            );
+            assert!(
+                u.pre_build_scope,
+                "`{id}` must be marked for the completion-path warning (the observability half)"
+            );
+        }
+        // build (Creator), adversarial-review (Evaluator), and the POST-build neutral phases: no
+        // preamble, no marker.
+        for id in ["build", "adversarial-review", "test", "review"] {
+            let u = by_phase(id);
+            assert!(
+                !u.description.contains(PHASE_SCOPE_PREFIX),
+                "`{id}` must NOT carry the preamble: {}",
+                u.description
+            );
+            assert!(!u.pre_build_scope, "`{id}` must not be marked pre-build");
+        }
+    }
+
+    /// core#283 across EVERY builtin: the preamble is a function of def DATA — role +
+    /// `executes_code` + declaration order — never of a workflow id. Three invariants: (1) the
+    /// prompt carries the preamble IFF the unit carries the marker (the two halves never diverge);
+    /// (2) no creator/evaluator-role unit and no unit at-or-after the first code-executing Creator
+    /// is ever scoped; (3) a def with NO code-executing Creator (`collab`, `survey-repo`,
+    /// `onboarding`…) gets no preamble anywhere — there is no later build rung to defer to, so the
+    /// preamble's promise would be a lie. Vacuity-guarded: the shipped defs must actually produce
+    /// marked phases (feature: clarify+design, bug: triage+reproduce, migration: plan).
+    #[test]
+    fn scope_preamble_is_derived_from_def_data_across_every_builtin() {
+        use crate::workflow::{PhaseExecutor, PhaseRole};
+        let registry = crate::workflow::WorkflowRegistry::with_defaults();
+        let mut marked = 0usize;
+        for id in registry.ids() {
+            let def = registry.get(&id).expect("registry returned its own id");
+            let first_code_creator = def
+                .phases
+                .iter()
+                .position(|p| p.executes_code && p.role == PhaseRole::Creator);
+            let units = plan_from_def(def, "some intent", "s1");
+            for (ix, (unit, phase)) in units.iter().zip(def.phases.iter()).enumerate() {
+                let has_preamble = unit.description.contains(PHASE_SCOPE_PREFIX);
+                assert_eq!(
+                    has_preamble, unit.pre_build_scope,
+                    "workflow `{id}` phase `{}`: prompt preamble and completion marker diverged",
+                    phase.id
+                );
+                if matches!(phase.role, PhaseRole::Creator | PhaseRole::Evaluator) {
+                    assert!(
+                        !has_preamble,
+                        "workflow `{id}` phase `{}` plays {:?} and must never be scoped away \
+                         from its role",
+                        phase.id, phase.role
+                    );
+                }
+                if first_code_creator.is_none_or(|b| ix >= b) {
+                    assert!(
+                        !has_preamble,
+                        "workflow `{id}` phase `{}` is not PRE-build (no code-executing creator \
+                         after it) and must not carry the preamble",
+                        phase.id
+                    );
+                }
+                if let PhaseExecutor::Tool { .. } = phase.executor {
+                    assert!(
+                        !has_preamble,
+                        "workflow `{id}` phase `{}` is Tool-executed — its description is argv \
+                         context, not a prompt",
+                        phase.id
+                    );
+                }
+                marked += has_preamble as usize;
+            }
+        }
+        assert!(
+            marked >= 5,
+            "the shipped defs must produce pre-build scoped phases (feature ×2, bug ×2, \
+             migration ×1) or this guard is vacuous; found {marked}"
+        );
+    }
+
+    /// core#283 + FINDING-011 interplay: a pre-build phase that ALSO authors `instructions` keeps
+    /// them — the preamble threads alongside via the same single-line fold, never clobbers.
+    #[test]
+    fn scope_preamble_threads_alongside_instructions_without_clobbering_them() {
+        use crate::domain::StageKind;
+        use crate::workflow::{PhaseDef, PhaseRole};
+        let def = WorkflowDef {
+            id: "ladder".to_string(),
+            phases: vec![
+                PhaseDef {
+                    instructions: Some("write the design doc and nothing else".to_string()),
+                    ..PhaseDef::new("design", StageKind::Recon)
+                },
+                PhaseDef {
+                    executes_code: true,
+                    role: PhaseRole::Creator,
+                    depends_on: vec!["design".to_string()],
+                    ..PhaseDef::new("build", StageKind::Build)
+                },
+            ],
+        };
+        let units = plan_from_def(&def, "add SSO", "s");
+        let d = &units[0].description;
+        assert!(d.contains("add SSO"), "intent survives: {d}");
+        assert!(
+            d.contains("write the design doc and nothing else"),
+            "authored instructions survive: {d}"
+        );
+        assert!(d.contains(PHASE_SCOPE_PREFIX), "preamble joins them: {d}");
+        assert!(
+            d.find("write the design doc") < d.find(PHASE_SCOPE_PREFIX),
+            "instructions lead, the scope preamble follows: {d}"
+        );
+        assert!(!d.contains('\n'), "single-line contract holds: {d}");
+        assert!(
+            !units[1].description.contains(PHASE_SCOPE_PREFIX),
+            "the creator phase is never scoped away from building: {}",
+            units[1].description
+        );
+        assert!(!units[1].pre_build_scope);
     }
 
     /// FINDING-011: a phase's own `instructions` reach ITS unit's description — the worker prompt —
