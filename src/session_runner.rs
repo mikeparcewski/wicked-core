@@ -617,6 +617,8 @@ mod tests {
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
+            pre_build_scope: false,
+            scope_warnings: Vec::new(),
             status: UnitStatus::Pending,
         }
     }

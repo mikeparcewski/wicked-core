@@ -4529,6 +4529,264 @@ fn worktree_is_clean(workdir: Option<&str>) -> bool {
         ])
 }
 
+/// The FILES a run's worktree contribution touches — the union of the SAME two instruments as
+/// [`worktree_is_clean`]: uncommitted paths (`git status --porcelain`, including untracked) and
+/// paths changed by run-branch-only commits (`git log --name-only HEAD --not --exclude=wicked/*
+/// --branches`). Deduped, first-seen order.
+///
+/// Best-effort OBSERVABILITY read (core#283), so the degenerate cases resolve to EMPTY — the
+/// opposite fail-direction from `worktree_is_clean`'s `true`: that feeds a deny gate (fail-closed
+/// = "assume nothing observable"), this feeds a warning (fail-open = "no observable contribution,
+/// nothing to warn about"). A non-git workdir, an unspawnable `git`, or a failed read never
+/// invents a warning.
+pub(crate) fn worktree_contribution_files(workdir: &str) -> Vec<String> {
+    let run = |args: &[&str]| -> Vec<String> {
+        // spawn-audit: hardened — read-only git plumbing over the run's own worktree.
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(workdir)
+            .output();
+        match out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut files: Vec<String> = Vec::new();
+    let mut push = |path: &str| {
+        // Strip git's quoting of unusual paths (no unescaping — this feeds a heuristic warning,
+        // not a filesystem access).
+        let path = path.trim().trim_matches('"');
+        if !path.is_empty() && !files.iter().any(|f| f == path) {
+            files.push(path.to_string());
+        }
+    };
+    // Instrument 1: uncommitted. Porcelain lines are `XY <path>` (byte 3 onward), with renames as
+    // `XY <orig> -> <new>` — the NEW path is the contribution.
+    for line in run(&["status", "--porcelain"]) {
+        if let Some(rest) = line.get(3..) {
+            push(rest.rsplit(" -> ").next().unwrap_or(rest));
+        }
+    }
+    // Instrument 2: committed on the run branch only (a worker under an incremental-commit
+    // contract leaves porcelain clean — core#280). `--pretty=format:` blanks the commit header so
+    // every non-empty line is a file path.
+    for line in run(&[
+        "log",
+        "--name-only",
+        "--pretty=format:",
+        "HEAD",
+        "--not",
+        "--exclude=wicked/*",
+        "--branches",
+    ]) {
+        push(&line);
+    }
+    files
+}
+
+/// PURE heuristic (core#283): is this changed `path` a DOCUMENTATION artifact? TRUE for the doc
+/// extensions (`.md` / `.txt` / `.rst`, case-insensitive) and for anything whose directory path
+/// passes through `docs/` or `.product/` (any segment — the per-product artifact conventions).
+/// Everything else — source, config, lockfiles, assets — counts as a production change that a
+/// pre-build phase has no business making. A heuristic, deliberately small: it feeds an
+/// operator-visible WARNING (never a deny), so a borderline misread costs a sentence, not a run.
+pub(crate) fn is_documentation_change(path: &str) -> bool {
+    // Normalize: git emits `/` but a caller-supplied path may be Windows-shaped.
+    let norm = path.trim().replace('\\', "/");
+    let lower = norm.trim_start_matches("./").to_ascii_lowercase();
+    if lower.ends_with(".md") || lower.ends_with(".txt") || lower.ends_with(".rst") {
+        return true;
+    }
+    // Directory segments only — the filename itself was judged by extension above, so a top-level
+    // `docs.ts` is code while `docs/logo.png` is documentation.
+    let mut segments: Vec<&str> = lower.split('/').collect();
+    segments.pop();
+    segments.iter().any(|s| *s == "docs" || *s == ".product")
+}
+
+/// core#283, the OBSERVABILITY half of phase-role scope: `Some(warning)` iff `unit` is a
+/// PRE-BUILD, non-creator phase (the plan-time `pre_build_scope` marker, derived from def data —
+/// see `plan::plan_from_def`) whose worktree contribution touches any NON-documentation file per
+/// [`is_documentation_change`]. The caller records the warning as gate evidence on the unit
+/// (visible to operators) and must NOT deny on it: the enforced half is the plan-time prompt
+/// preamble; this half makes a breach OBSERVABLE instead of silent — prompt-level discipline
+/// alone was proven insufficient, and a hard deny here would turn a heuristic into a gate.
+pub(crate) fn phase_scope_warning(
+    unit: &crate::domain::WorkUnit,
+    workdir: Option<&str>,
+) -> Option<String> {
+    if !unit.pre_build_scope {
+        return None;
+    }
+    let wd = workdir?;
+    let mut non_doc: Vec<String> = worktree_contribution_files(wd)
+        .into_iter()
+        .filter(|p| !is_documentation_change(p))
+        .collect();
+    if non_doc.is_empty() {
+        return None;
+    }
+    // Bound the named files: this string persists on the unit node and surfaces in operator UIs.
+    const MAX_NAMED: usize = 20;
+    let total = non_doc.len();
+    non_doc.truncate(MAX_NAMED);
+    let mut listed = non_doc.join(", ");
+    if total > MAX_NAMED {
+        listed.push_str(&format!(", … {} more", total - MAX_NAMED));
+    }
+    Some(format!(
+        "PHASE SCOPE WARNING: pre-build phase `{}` left non-documentation changes in the worktree \
+         ({listed}) — this phase's deliverable is analysis/design/plan; implementation belongs to \
+         a later phase. Recorded as gate evidence for the operator; NOT a denial.",
+        unit.phase_id().unwrap_or(&unit.id)
+    ))
+}
+
+#[cfg(test)]
+mod phase_scope_tests {
+    use super::{is_documentation_change, phase_scope_warning};
+
+    /// The core#283 heuristic, judged case by case in both directions. Extension decides files
+    /// (`.md`/`.txt`/`.rst`); `docs/` and `.product/` decide DIRECTORIES — so a `docs.ts` file is
+    /// code and a `docs/logo.png` asset is documentation.
+    #[test]
+    fn the_documentation_heuristic_judges_extension_and_docs_directories() {
+        for doc in [
+            "README.md",
+            "notes.TXT",
+            "spec.rst",
+            "./guide.md",
+            "docs/index.html",
+            "docs/api/openapi.yaml",
+            ".product/DES-001.yaml",
+            "site/docs/logo.png",
+            r"docs\win\style.css",
+        ] {
+            assert!(is_documentation_change(doc), "`{doc}` is documentation");
+        }
+        for code in [
+            "src/main.ts",
+            "Cargo.toml",
+            "build.rs",
+            "README",
+            "docs.ts",
+            "mydocs/file.rs",
+            "package-lock.json",
+            "src/.product.rs",
+        ] {
+            assert!(
+                !is_documentation_change(code),
+                "`{code}` is NOT documentation"
+            );
+        }
+    }
+
+    /// core#283 observability, measured against a REAL linked worktree on a `wicked/<run>` branch
+    /// (the layout `repo::create_worktree` provisions): a `.ts` change fires the warning — both
+    /// UNCOMMITTED (instrument 1, porcelain) and COMMITTED on the run branch (instrument 2, the
+    /// core#280 clause) — while a `.md`-only contribution stays silent, and an unmarked
+    /// (build/evaluator) unit is never warned at all.
+    #[test]
+    fn phase_scope_warning_fires_for_a_ts_change_and_not_for_md_only() {
+        let base = std::env::temp_dir().join(format!("wicked-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &std::path::Path, args: &[&str]| {
+            // spawn-audit: test-only — a git fixture building the worktree layout under test; it reads no engine state.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&repo, &["init", "-q", "."]);
+        git(&repo, &["config", "user.email", "t@example.invalid"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let wt = repo.join(".wicked").join("worktrees").join("run1");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/run1",
+            ],
+        );
+        let wd = wt.to_str().unwrap();
+
+        let mut unit =
+            crate::domain::WorkUnit::pending("s:design", "s", 2, "design — add the feature");
+        unit.pre_build_scope = true;
+
+        // A pristine contribution and a docs-only one (uncommitted AND committed on the run
+        // branch): the phase did its job — no warning.
+        assert_eq!(phase_scope_warning(&unit, Some(wd)), None, "clean tree");
+        std::fs::write(wt.join("design.md"), "the design\n").unwrap();
+        assert_eq!(
+            phase_scope_warning(&unit, Some(wd)),
+            None,
+            "an uncommitted .md-only contribution is the phase's deliverable, not a breach"
+        );
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "docs: the design"]);
+        assert_eq!(
+            phase_scope_warning(&unit, Some(wd)),
+            None,
+            "a COMMITTED .md-only contribution is equally fine (instrument 2 sees only docs)"
+        );
+
+        // An UNCOMMITTED production-code contribution: warn, naming the file and the phase.
+        std::fs::write(wt.join("feature.ts"), "export const x = 1;\n").unwrap();
+        let warning =
+            phase_scope_warning(&unit, Some(wd)).expect("an uncommitted .ts change must warn");
+        assert!(warning.contains("feature.ts"), "names the file: {warning}");
+        assert!(warning.contains("`design`"), "names the phase: {warning}");
+        assert!(
+            warning.contains("NOT a denial"),
+            "the record must say it did not deny: {warning}"
+        );
+
+        // COMMITTED on the run branch (porcelain goes clean — the core#280 shape): still warns,
+        // via the second instrument.
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "feat: jumped the ladder"]);
+        // Premise guard: porcelain really is clean now, so only instrument 2 can catch this.
+        // spawn-audit: test-only — asserts the premise (clean porcelain) that makes the clause meaningful.
+        let porcelain = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&wt)
+            .output()
+            .expect("git runs");
+        assert!(
+            porcelain.stdout.iter().all(|b| b.is_ascii_whitespace()),
+            "premise broken: porcelain not clean after commit"
+        );
+        let committed = phase_scope_warning(&unit, Some(wd))
+            .expect("a run-branch COMMITTED .ts change must still warn (core#280 instrument)");
+        assert!(committed.contains("feature.ts"), "{committed}");
+
+        // Role scope: an unmarked (creator/evaluator/post-build) unit is never warned, even with
+        // the breach sitting in the tree — and no workdir means nothing observable, so no warning.
+        unit.pre_build_scope = false;
+        assert_eq!(phase_scope_warning(&unit, Some(wd)), None);
+        unit.pre_build_scope = true;
+        assert_eq!(phase_scope_warning(&unit, None), None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
 /// Mark a run `Completed` and emit `SessionCompleted`. Propagates a store-write failure so a failed
 /// finalize surfaces as a run error (rather than silently wedging the run in `in_flight`).
 fn finalize_run(

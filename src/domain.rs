@@ -260,6 +260,22 @@ pub struct WorkUnit {
     /// is invented). `#[serde(default)]` for back-compat with units planned before this existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// TRUE when this unit's backing phase is a PRE-BUILD, NON-CREATOR rung of a def that later
+    /// runs an `executes_code` Creator phase (core#283) — set at plan time from def DATA (role +
+    /// `executes_code` + declaration order), the same way stage/role/gate flow from the def. It
+    /// marks the phases whose prompt carries the plan-time PHASE SCOPE preamble; the completion
+    /// path reads it to fire the observability half (a non-documentation worktree contribution
+    /// records a WARNING onto [`Self::scope_warnings`] — never a deny). `#[serde(default)]` +
+    /// skip-if-false: pre-existing units deserialize, and unmarked units serialize byte-identical
+    /// to before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pre_build_scope: bool,
+    /// Operator-visible WARNINGS the completion path recorded WITHOUT denying (core#283): today,
+    /// a pre-build phase whose worktree contribution touches non-documentation files — the
+    /// design-before-build ladder collapsing into implementation. Advisory gate evidence on the
+    /// persisted unit; it never drives the unit `Rejected` (that is [`Self::denial_reason`]'s job).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_warnings: Vec<String>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -414,6 +430,8 @@ impl WorkUnit {
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
+            pre_build_scope: false,
+            scope_warnings: Vec::new(),
             status: UnitStatus::Pending,
         }
     }
