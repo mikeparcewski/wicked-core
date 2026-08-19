@@ -241,6 +241,14 @@ pub struct WorkUnit {
     /// `None` for Agent-executor units. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_cmd: Option<Vec<String>>,
+    /// Seats that WORKER-FAILED this unit — the CLI process itself failed (exited nonzero, could
+    /// not spawn, timed out), never a judged rejection of the work. Recorded by the actor's seat
+    /// failover ladder (core#282) and read by both the in-run failover and the resume dispatch so
+    /// the unit is never handed back to a seat that already worker-failed it until every eligible
+    /// seat has been tried. Persisted ON the unit (not actor state) so the guarantee survives a
+    /// resume/restart. `#[serde(default)]` for back-compat with units persisted before this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worker_failed_clis: Vec<String>,
     /// The PHASE IDS this unit's work depends on — carried verbatim from the backing phase's
     /// [`depends_on`](crate::workflow::PhaseDef::depends_on) at plan time (FINDING-024).
     ///
@@ -404,6 +412,7 @@ impl WorkUnit {
             validator: None,
             required_deliverables: Vec::new(),
             tool_cmd: None,
+            worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             status: UnitStatus::Pending,
         }
