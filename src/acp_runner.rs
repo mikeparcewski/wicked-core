@@ -3925,9 +3925,34 @@ mod tests {
     use super::{is_transient_cli_failure, should_retry_worker, MAX_TRANSIENT_RETRIES};
     use crate::workflow::StepStatus;
 
-    /// Serializes tests that mutate process-global env (WICKED_WORKER_HOME) — cargo runs tests
-    /// in one process, in parallel. Same pattern as execute_wrapped's ENV_LOCK.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Guards process-global env (WICKED_WORKER_HOME) — cargo runs tests in one process, in
+    /// parallel. Same pattern as execute_wrapped's ENV_LOCK, plus a READ side (core#285):
+    /// tests that MUTATE the variable hold `write()`; tests that drive a REAL
+    /// `start_acp_process` hold `read()` across the start, because the spawn resolves the
+    /// ambient variable mid-call (`ensure_worker_config_home`). Without the read side, a start
+    /// landing inside a mutator's window resolves the MUTATOR's fixture home — the
+    /// symlink-refusal fixture, in the flake that motivated this — and trips the FINDING-061
+    /// guard. Lock order everywhere: ENV_LOCK before REAL_STARTS.
+    static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    /// A fresh base dir for a worker-home fixture. Keyed by test name + pid + a process-wide
+    /// counter — NEVER by `ThreadId` (core#285): the harness pools test threads, so a
+    /// ThreadId-keyed name repeats across tests (and across processes, after a killed run
+    /// strands its dir in the temp root), letting one test inherit another's poisoned fixture.
+    /// Same idiom as `scratch(name)`; the counter keeps repeated mints inside one test
+    /// disjoint. Callers remove the dir at test end (best-effort); the pre-clean here also
+    /// sweeps any same-named leftover from a crashed earlier run.
+    fn worker_home_base(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "wworker-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
 
     // ── FINDING #5: transient single-shot failures are retried; deterministic ones are not ────────
 
@@ -4031,9 +4056,8 @@ mod tests {
     /// every spawn RE-SANITIZES the executable-config vectors while PRESERVING login state.
     #[test]
     fn the_worker_home_is_stable_sanitized_per_spawn_and_preserves_login_state() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let base = std::env::temp_dir().join(format!("wworker-{:?}", std::thread::current().id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("stable");
         std::env::set_var("WICKED_WORKER_HOME", &base);
 
         let a = ensure_worker_config_home().expect("first ensure");
@@ -4089,10 +4113,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sanitize_removes_planted_symlinks_without_following_them() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let base =
-            std::env::temp_dir().join(format!("wworker-plant-{:?}", std::thread::current().id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("plant");
         std::env::set_var("WICKED_WORKER_HOME", &base);
         let home = ensure_worker_config_home().expect("first ensure");
 
@@ -4135,10 +4157,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_worker_home_is_refused() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let base =
-            std::env::temp_dir().join(format!("wworker-ln-{:?}", std::thread::current().id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("ln");
         std::fs::create_dir_all(&base).unwrap();
         let target = base.join("elsewhere");
         std::fs::create_dir_all(&target).unwrap();
@@ -4310,6 +4330,11 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn eight_simultaneous_starts_never_exceed_the_gate_in_flight() {
+        // ENV read side (core#285): every real start below resolves WICKED_WORKER_HOME mid-call,
+        // so hold the read lock against the fixture tests that re-aim the variable at a
+        // symlink-refusal home. One parent-held guard covers the spawned starts — readers never
+        // block readers. ENV_LOCK before REAL_STARTS (same order everywhere).
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("wicked-acp-gate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4533,6 +4558,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn an_auth_requiring_agent_is_authenticated_before_session_new() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("auth-default");
         let ledger = dir.join("auth-frames.txt");
@@ -4560,6 +4586,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn a_configured_auth_method_overrides_the_agents_first_advertised() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("auth-configured");
         let ledger = dir.join("auth-frames.txt");
@@ -4589,6 +4616,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn still_unauthenticated_after_authenticate_fails_with_the_named_error() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("auth-never");
         let script = write_stub(
@@ -4628,6 +4656,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn an_agent_that_rejects_authenticate_but_grants_sessions_still_starts() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("auth-already");
         let script = write_stub(
@@ -4666,9 +4695,9 @@ sleep 30
         if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
             return;
         }
-        // ENV_LOCK first (same order everywhere): this test READS the worker-home resolution,
-        // which the sanitize/fence tests mutate via WICKED_WORKER_HOME.
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // ENV_LOCK first (same order everywhere). Write side: this test MUTATES
+        // WICKED_WORKER_HOME, like the sanitize/fence tests.
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("config-iso");
         // Scratch-scope the worker home: without this the spawn would ensure (and re-write
@@ -4730,6 +4759,7 @@ sleep 30
     #[test]
     #[cfg(unix)]
     fn session_new_advertises_the_repo_scoped_estate_mcp_server() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("estate-mcp");
         let ledger = dir.join("session-new.json");
@@ -4836,10 +4866,8 @@ sleep 30
     /// that auto-approves edits could resolve them before our policy is ever asked.
     #[test]
     fn the_worker_home_seeds_the_deny_fence_and_pins_no_permission_mode() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let base =
-            std::env::temp_dir().join(format!("wworker-fence-{:?}", std::thread::current().id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("fence");
         std::env::set_var("WICKED_WORKER_HOME", &base);
         let dir = ensure_worker_config_home().expect("ensure");
         std::env::remove_var("WICKED_WORKER_HOME");
@@ -6183,6 +6211,13 @@ else:
             transport: AcpTransport::default(),
             auth_method: None,
         };
+        // The spawn resolves WICKED_WORKER_HOME mid-call (`ensure_worker_config_home`), so hold
+        // the env read-lock across the start (core#285): without it, a start landing inside a
+        // fixture test's mutation window resolved that test's symlink-refusal home and tripped
+        // the FINDING-061 guard — the exact full-suite flake this closes. Held for the start
+        // only; a running process never re-reads the variable. Lock order: callers must not
+        // hold REAL_STARTS when calling this (none do).
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         start_acp_process(&config, dir, None, None)
             .unwrap_or_else(|e| panic!("mock ACP start failed for behavior={behavior}: {e}"))
     }
