@@ -511,6 +511,42 @@ fn select_work_for_agent<'a>(
     std::borrow::Cow::Borrowed(agent_review_target.unwrap_or(own_output))
 }
 
+/// Head bytes kept when an oversized review target is elided (core#282).
+const REVIEW_TARGET_HEAD: usize = 24 * 1024;
+/// Tail bytes kept when an oversized review target is elided (core#282).
+const REVIEW_TARGET_TAIL: usize = 24 * 1024;
+
+/// Bound the review target handed to an Evaluator unit's worker (core#282).
+///
+/// `agent_review_target` — the creator's COLD output — rides verbatim into the evaluator seat's
+/// prompt (and, under exec-mediation, into the `task.dispatched` payload), so a huge creator
+/// output can blow a prompt-arg seat's backend outright. Same instrument as
+/// [`worktree_evidence_for_judge`]'s `clip`, but head+TAIL rather than head-only: creators put
+/// their summary/conclusion LAST by convention, so an evaluator fed only the head would judge N
+/// KB of preamble with the actual result cut off. The marker states the elision so the evaluator
+/// knows it is looking at an excerpt, not the whole artifact. Under the cap the input passes
+/// through untouched (no realloc).
+pub(crate) fn clip_review_target(s: String) -> String {
+    if s.len() <= REVIEW_TARGET_HEAD + REVIEW_TARGET_TAIL {
+        return s;
+    }
+    let mut head_end = REVIEW_TARGET_HEAD;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - REVIEW_TARGET_TAIL;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n[...elided by harness: {} bytes of the creator's output omitted; head and tail \
+         retained...]\n{}",
+        &s[..head_end],
+        tail_start - head_end,
+        &s[tail_start..]
+    )
+}
+
 /// Harness-derived worktree evidence, appended to the WORK the layer-2 agent judge reviews.
 ///
 /// Without this the judge sees only PROSE — the creator's cold output (Evaluator units) or the
@@ -1605,6 +1641,59 @@ fn run_task_completed_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#282 — the review target handed to an Evaluator's worker is BOUNDED with head+TAIL
+    /// elision. An under-cap target passes through untouched; an oversized one keeps its opening
+    /// AND its ending (creators put conclusions last) around an explicit harness marker.
+    #[test]
+    fn an_oversized_review_target_is_elided_keeping_both_head_and_tail() {
+        // Under the cap: byte-identical passthrough.
+        let small = "a modest creator output".to_string();
+        assert_eq!(clip_review_target(small.clone()), small);
+
+        // Over the cap: head start survives, tail end survives, marker names the elision.
+        let head_sentinel = "HEAD-SENTINEL-AT-BYTE-ZERO ";
+        let tail_sentinel = " TAIL-SENTINEL-AT-THE-END";
+        let big = format!(
+            "{head_sentinel}{}{tail_sentinel}",
+            "x".repeat(REVIEW_TARGET_HEAD + REVIEW_TARGET_TAIL + 10_000)
+        );
+        let original_len = big.len();
+        let clipped = clip_review_target(big);
+        assert!(
+            clipped.starts_with(head_sentinel),
+            "the head of the creator output must survive the elision"
+        );
+        assert!(
+            clipped.ends_with(tail_sentinel),
+            "the TAIL of the creator output must survive — conclusions come last by convention"
+        );
+        assert!(
+            clipped.contains("[...elided by harness:"),
+            "the evaluator must be told it is looking at an excerpt: {}",
+            &clipped[..200]
+        );
+        assert!(
+            clipped.len() < original_len,
+            "the clipped form must actually be smaller"
+        );
+        assert!(
+            clipped.len() <= REVIEW_TARGET_HEAD + REVIEW_TARGET_TAIL + 256,
+            "head + tail + marker is the whole budget; got {} bytes",
+            clipped.len()
+        );
+
+        // Multibyte safety: the single-byte bookends throw BOTH raw cut points off the 2-byte
+        // char grid — the head cut lands mid-char (slides down) and the tail cut lands mid-char
+        // (slides up). Must produce valid UTF-8, not panic.
+        let multibyte = format!(
+            "a{}b",
+            "é".repeat((REVIEW_TARGET_HEAD + REVIEW_TARGET_TAIL) / 2 + 4_096)
+        );
+        let clipped = clip_review_target(multibyte);
+        assert!(clipped.contains("[...elided by harness:"));
+        assert!(clipped.starts_with('a') && clipped.ends_with('b'));
+    }
 
     /// The coverage LAYER-2 finding: an Evaluator-role unit that produces its own analytical deliverable
     /// must be judged on that deliverable, not on the prior creator's cold output. Feeding the judge the

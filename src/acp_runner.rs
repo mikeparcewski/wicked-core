@@ -2629,6 +2629,31 @@ pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
         || o.contains("503")
 }
 
+/// Whether a FAILED output is WORKER-ORIGINATED — the CLI process itself failed (nonzero exit,
+/// spawn failure, connection drop, or the harness killed it at a deadline) rather than the WORK
+/// being judged bad (a judged rejection surfaces as exit-0 plus a downstream gate deny, never as
+/// one of these shapes; the deterministic FINDING-101 missing-deliverable failure is excluded
+/// explicitly — a different seat re-running the same prompt is not what conjures a deliverable).
+///
+/// Superset of [`is_transient_cli_failure`], adding the TIMEOUT signatures. A timeout is
+/// deliberately NOT in the transient set: a same-seat in-runner retry would silently burn another
+/// full unit budget on a seat that just proved it cannot finish. But it IS a seat-health signal
+/// the actor's failover ladder must act on by moving to the NEXT seat — core#282: seat `agy`
+/// timed out twice on the same unit because the timeout shape never entered the ladder, so the
+/// engine re-dispatched the same seat until the run died.
+pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
+    if output.contains("did not produce its declared deliverable") {
+        return false;
+    }
+    if is_transient_cli_failure(output) {
+        return true;
+    }
+    let o = output.to_ascii_lowercase();
+    o.contains("exceeded the timeout") // execute_wrapped's bounded-run kill message
+        || o.contains("timed out")
+        || o.contains("acp timeout") // acp_runner's rpc/turn deadline
+}
+
 /// Whether to retry the single-shot worker after an outcome. Pure + exhaustively unit-tested — the
 /// loop in [`fallback_with_warning`] is a trivial application of this policy.
 ///
@@ -3922,7 +3947,10 @@ fn cli_runs_claude(cli_key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_transient_cli_failure, should_retry_worker, MAX_TRANSIENT_RETRIES};
+    use super::{
+        is_transient_cli_failure, is_worker_originated_failure, should_retry_worker,
+        MAX_TRANSIENT_RETRIES,
+    };
     use crate::workflow::StepStatus;
 
     /// Guards process-global env (WICKED_WORKER_HOME) — cargo runs tests in one process, in
@@ -4006,6 +4034,45 @@ mod tests {
         );
         // A plain evaluator-style rejection with no infrastructural marker is not retried.
         assert!(!is_transient_cli_failure(
+            "the requirement claim is content-free"
+        ));
+    }
+
+    /// core#282 — the failover ladder's classifier. Timeouts are WORKER-originated (the seat
+    /// proved it cannot finish → move to the NEXT seat) but deliberately NOT transient (a
+    /// same-seat retry would burn another full unit budget); every transient shape is also
+    /// worker-originated; judged/deterministic failures are neither.
+    #[test]
+    fn timeouts_are_worker_originated_but_not_transient() {
+        for t in [
+            "(cli `agy` exceeded the timeout and was killed)",
+            "ACP timeout waiting for response id=42",
+            "the bridge request timed out after 120s",
+        ] {
+            assert!(
+                is_worker_originated_failure(t),
+                "a timeout is a seat-health signal the failover ladder must act on: {t:?}"
+            );
+            assert!(
+                !is_transient_cli_failure(t),
+                "a timeout must never earn a same-seat in-runner retry: {t:?}"
+            );
+        }
+        // Every transient shape (exit-nonzero, spawn failure, network) is also worker-originated.
+        for t in [
+            "(cli `claude` exited 1) connection reset",
+            "(could not run `claude`: No such file or directory)",
+        ] {
+            assert!(is_worker_originated_failure(t), "transient ⊂ worker: {t:?}");
+        }
+        // The FINDING-101 deterministic exclusion wins even when the message carries a
+        // timeout-looking marker — a different seat re-running cannot conjure the artifact.
+        assert!(!is_worker_originated_failure(
+            "unit u3 reported done but did not produce its declared deliverable(s): rg.json \
+             (the build step timed out)"
+        ));
+        // A judged, work-level rejection has no worker signature at all.
+        assert!(!is_worker_originated_failure(
             "the requirement claim is content-free"
         ));
     }
@@ -5371,6 +5438,7 @@ sleep 30
             role: Default::default(),
             validator: None,
             tool_cmd: None,
+            worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             required_deliverables: Vec::new(),
             status: crate::domain::UnitStatus::Pending,

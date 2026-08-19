@@ -2679,6 +2679,13 @@ pub(crate) fn launch_run_inner(
     Ok(run_id)
 }
 
+/// Engine-authored prefix of every worker-originated denial (`Worker FAILED on unit …`).
+/// `resume_run_inner` keys its seat-rotation decision on it: only a unit whose TERMINAL
+/// failure was worker-originated rotates seats on resume — a judged rejection re-dispatches
+/// the same seat even when an EARLIER attempt left entries in `worker_failed_clis`
+/// (Copilot review on #286).
+pub(crate) const WORKER_FAILURE_MARKER: &str = "Worker FAILED on unit";
+
 /// The body of `Command::ResumeRun` (also the campaign driver's crash-resume re-attach, DES §6).
 /// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
 #[allow(clippy::too_many_arguments)]
@@ -2715,6 +2722,25 @@ pub(crate) fn resume_run_inner(
     // never planned has no cursor to resume from.
     let session = if session.status == SessionStatus::Failed {
         let mut units = crate::domain::session_units(store, run_id)?;
+        // core#282: a unit that reached terminal failure through WORKER errors carries the seats
+        // that failed it (`worker_failed_clis`); a resume must not hand it straight back to one
+        // of them. Select over the immutable view first (same order + evaluator≠creator
+        // exclusions as the in-run failover ladder); the mutation below re-borrows.
+        let failover = match units.get(session.unit_ix) {
+            Some(u)
+                if u.status == crate::domain::UnitStatus::Rejected
+                    && !u.worker_failed_clis.is_empty()
+                    // The LAST failure must itself be worker-originated: a judged (work-level)
+                    // rejection after an earlier failover keeps its seat — rotating there would
+                    // discard a seat that produced reviewable work over a stale ledger entry.
+                    && u.denial_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains(WORKER_FAILURE_MARKER)) =>
+            {
+                Some(next_failover_seat(&units, session.unit_ix, &session.clis))
+            }
+            _ => None,
+        };
         let Some(unit) = units.get_mut(session.unit_ix) else {
             // Failed with no cursor unit (planning-time failure) — nothing to re-dispatch.
             return Ok(SessionStatus::Failed);
@@ -2722,6 +2748,28 @@ pub(crate) fn resume_run_inner(
         if unit.status == crate::domain::UnitStatus::Rejected {
             unit.status = crate::domain::UnitStatus::Distributed;
             unit.denial_reason = None;
+            match failover {
+                // An untried eligible seat remains (terminal failure predates seat
+                // exhaustion): the resume re-dispatches THERE, never to a seat that already
+                // worker-failed this unit.
+                Some(Some(next)) => {
+                    if unit.assigned_cli.as_deref() != Some(next.as_str()) {
+                        unit.assigned_invocation = crate::registry_roster()
+                            .into_iter()
+                            .find(|c| c.key == next)
+                            .map(|c| c.headless_invocation);
+                        unit.assigned_cli = Some(next);
+                    }
+                }
+                // Every eligible seat has worker-failed this unit — that IS why the run went
+                // terminal. A resume is an explicit operator/campaign restart (the environment
+                // may have been fixed), so it grants a fresh failover budget instead of
+                // refusing forever; the seat walk restarts from the currently assigned seat.
+                Some(None) => unit.worker_failed_clis.clear(),
+                // Not a worker failure (judged rejection) — keep the crew#277 behavior:
+                // re-dispatch the same assigned seat.
+                None => {}
+            }
             put_node(store, unit.to_node())?;
         }
         let mut s = session;
@@ -3003,6 +3051,44 @@ fn environment_refusal(output: &str) -> Option<EnvironmentRefusal> {
         });
     }
     None
+}
+
+/// core#282 — the next seat eligible to take over unit `unit_ix` after a WORKER-originated
+/// failure (CLI exited nonzero / could not spawn / timed out — never a judged rejection).
+///
+/// Walks `roster` (the session's cli list) IN ORDER and returns the first seat that
+///   (a) has not already worker-failed this unit ([`crate::domain::WorkUnit::worker_failed_clis`]
+///       — the callers record the failing seat there BEFORE selecting, so a seat is never
+///       repeated until every eligible seat has been tried), and
+///   (b) is not the assigned seat of any unit this one `depends_on` — the evaluator≠creator
+///       invariant: a failover must never hand an evaluation unit to the seat that created the
+///       work it reviews (the exclusion the council encoded at routing).
+///
+/// `None` ⇒ every eligible seat has been tried; the caller falls through to the terminal
+/// failure contract. `assigned_cli: None` means the DEFAULT seat everywhere else in this file —
+/// a depends_on creator on the default must be excluded too, not dropped (Copilot).
+fn next_failover_seat(
+    units: &[crate::domain::WorkUnit],
+    unit_ix: usize,
+    roster: &[String],
+) -> Option<String> {
+    let unit = units.get(unit_ix)?;
+    let creator_seats: std::collections::HashSet<String> = units
+        .iter()
+        .filter(|u| {
+            u.phase_id()
+                .is_some_and(|p| unit.depends_on.iter().any(|d| d == p))
+        })
+        .map(|u| {
+            u.assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string())
+        })
+        .collect();
+    roster
+        .iter()
+        .find(|c| !unit.worker_failed_clis.contains(c) && !creator_seats.contains(*c))
+        .cloned()
 }
 
 /// Apply one worker step's output on the single-writer thread: gate the unit, advance the cursor,
@@ -3400,50 +3486,38 @@ fn apply_step_result(
                 return Ok(StepApplied::Continuing);
             }
         }
-        // ── AUTONOMOUS SEAT FAILOVER (crew#277) ──────────────────────────────────────────
+        // ── AUTONOMOUS SEAT FAILOVER (crew#277, core#282) ────────────────────────────────
         // Three governed runs died at ONE unit each on a seat-level workerError (agy exit-1
         // timeout ×2, copilot hang) while healthy seats sat idle. A CLI process failure says
         // nothing about the WORK — a task judgment surfaces as exit-0 plus a downstream gate
-        // deny, never a nonzero exit (see `is_transient_cli_failure`) — so burning the run on
-        // it discards every verified phase behind it. Mechanical ladder, no judge required:
-        // while attempts remain and another ELIGIBLE seat exists, reassign the unit and
-        // re-dispatch; otherwise fall through to the standard fail contract. Eligible = in
-        // the session roster, not the seat that just failed, and not the seat of any unit
-        // this one `depends_on` — a failover must never hand an evaluation unit to its
-        // creator (the evaluator≠creator invariant the council encoded at routing).
+        // deny, never a nonzero exit (see `is_worker_originated_failure`) — so burning the
+        // run on it discards every verified phase behind it. Mechanical ladder, no judge
+        // required: record the failed seat on the UNIT (persisted, so the guarantee survives
+        // a resume), then walk the session roster IN ORDER for the next eligible seat via
+        // `next_failover_seat` — never a seat that already worker-failed this unit, never
+        // the creator of work this unit reviews (evaluator≠creator) — and re-dispatch there.
+        // Only when EVERY eligible seat has been tried does the unit fall through to the
+        // standard fail contract (core#282: the previous attempt-counted ladder could re-pick
+        // an already-failed seat and let one deterministically-failing seat wedge the phase;
+        // the ladder is now bounded by roster size, not an attempt cap).
         // Governed units only: their phases are idempotent (the same argument that gates the
         // wrapped runner's transient retry); the engine's own internal calls are not.
-        const MAX_SEAT_FAILOVERS: u32 = 2;
-        if output.governed
-            && output.attempt < MAX_SEAT_FAILOVERS
-            && crate::acp_runner::is_transient_cli_failure(&output.output)
-        {
+        if output.governed && crate::acp_runner::is_worker_originated_failure(&output.output) {
             let failed_cli = unit
                 .assigned_cli
                 .clone()
                 .unwrap_or_else(|| "claude".to_string());
-            let depends_on = unit.depends_on.clone();
+            // Record BEFORE selecting, and persist even when the roster turns out exhausted:
+            // the terminal path below re-persists the unit, and a later RESUME reads this
+            // list so it never hands the unit straight back to a seat that already failed it.
+            if !unit.worker_failed_clis.contains(&failed_cli) {
+                unit.worker_failed_clis.push(failed_cli.clone());
+                put_node(store, unit.to_node())?;
+            }
+            let seats_tried = unit.worker_failed_clis.len();
             let unit_ix = output.unit_ix;
-            // Immutable scan ends the `unit` borrow; the branch re-borrows before mutating.
-            // `assigned_cli: None` means the DEFAULT seat everywhere else in this file — a
-            // depends_on creator on the default must be excluded too, not dropped (Copilot).
-            let creator_seats: std::collections::HashSet<String> = units
-                .iter()
-                .filter(|u| {
-                    u.phase_id()
-                        .is_some_and(|p| depends_on.iter().any(|d| d == p))
-                })
-                .map(|u| {
-                    u.assigned_cli
-                        .clone()
-                        .unwrap_or_else(|| "claude".to_string())
-                })
-                .collect();
-            let next_seat = session
-                .clis
-                .iter()
-                .find(|c| **c != failed_cli && !creator_seats.contains(*c))
-                .cloned();
+            // Immutable selection ends the `unit` borrow; the branch re-borrows before mutating.
+            let next_seat = next_failover_seat(&units, unit_ix, &session.clis);
             if let Some(next) = next_seat {
                 let invocation = crate::registry_roster()
                     .into_iter()
@@ -3463,8 +3537,8 @@ fn apply_step_result(
                         attempt: output.attempt,
                         detail: format!(
                             "seat '{failed_cli}' failed (worker error); failing over to '{next}' \
-                             ({}/{MAX_SEAT_FAILOVERS})",
-                            output.attempt + 1
+                             (seats worker-failed on this unit: {seats_tried}/{})",
+                            session.clis.len().max(seats_tried)
                         ),
                         failure_kind: crate::event::StepFailureKind::WorkerError,
                     },
@@ -4132,8 +4206,12 @@ fn dispatch_unit(
     // judge must review the most-recent prior Creator's COLD output — the work it is evaluating — not
     // its own output. Resolve it HERE on the actor thread (a store read); the worker holds no store
     // handle. `None` ⇒ the agent judges the unit's own output (Neutral/Creator, or no prior creator).
+    // Bounded at the SELECTION point (core#282): everything downstream — the in-process judge,
+    // the bus `task.dispatched` payload, the evaluator seat's prompt arg — sees the clipped form,
+    // so an unbounded creator output can never blow a prompt-arg seat's backend.
     let agent_review_target = if unit.role == crate::workflow::PhaseRole::Evaluator {
         pipeline::creator_output_for(store, run_id, unit.ord)
+            .map(crate::cli_runner::clip_review_target)
     } else {
         None
     };
@@ -5555,6 +5633,453 @@ mod substance_gate_tests {
             unit.denial_reason.as_deref(),
             Some(NO_SUBSTANCE),
             "200 trimmed chars of prose must clear the substance gate"
+        );
+    }
+}
+
+/// core#282 — AUTONOMOUS SEAT FAILOVER over the whole roster. A WORKER-originated failure (CLI
+/// exited nonzero / could not spawn / timed out) must hand the unit to the NEXT eligible seat,
+/// never to a seat that already worker-failed it, preserving evaluator≠creator, and only fail
+/// terminally once every eligible seat has been tried. Driven through the REAL
+/// `apply_step_result` / `resume_run_inner` over an in-memory store (the substance-gate tests'
+/// harness), plus pure selection tests over `next_failover_seat`.
+#[cfg(test)]
+mod seat_failover_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{PhaseRole, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// A session at cursor `unit_ix` over `clis`. `HumanConfirm::None` — autonomous, so a worker
+    /// failure skips the attempt-0 triage escalation and lands in the mechanical ladder directly.
+    fn seed_session(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        clis: &[&str],
+        status: SessionStatus,
+        unit_ix: usize,
+    ) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: clis.iter().map(|c| c.to_string()).collect(),
+            status,
+            human_confirm: HumanConfirm::None,
+            unit_ix,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            archived_at: None,
+            archive_note: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+    }
+
+    /// A def-driven unit (`<run>:<phase>` id, so `phase_id()` — and with it the
+    /// evaluator≠creator exclusion — resolves).
+    #[allow(clippy::too_many_arguments)] // test-only seeding helper; the args mirror WorkUnit's shape
+    fn seed_unit(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        ord: u32,
+        phase: &str,
+        cli: &str,
+        role: PhaseRole,
+        depends_on: &[&str],
+        status: UnitStatus,
+    ) {
+        let mut u = WorkUnit::pending(format!("{run_id}:{phase}"), run_id, ord, "work");
+        u.assigned_cli = Some(cli.to_string());
+        u.role = role;
+        u.depends_on = depends_on.iter().map(|d| d.to_string()).collect();
+        u.status = status;
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    /// Fold a GOVERNED worker FAILURE for the run's cursor unit at its live attempt.
+    fn fold_failed(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        failure_text: &str,
+    ) -> (StepApplied, AgentSession, Vec<WorkUnit>) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let live = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: live.unit_ix,
+            attempt: live.attempt,
+            output: failure_text.into(),
+            status: StepStatus::Failed,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: true,
+        };
+        let applied = apply_step_result(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let units = crate::domain::session_units(store, run_id).unwrap();
+        (applied, session, units)
+    }
+
+    /// THE required behavior: failover walks the roster IN ORDER, never repeats a seat that
+    /// already worker-failed the unit, and goes terminal only after every seat has been tried.
+    #[test]
+    fn failover_walks_seats_in_order_and_exhausts_before_terminal_failure() {
+        let run_id = format!("failover-walk-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude", "codex"],
+            SessionStatus::Executing,
+            0,
+        );
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "u1",
+            "agy",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+
+        // Failure 1: agy → claude (the next roster seat), run keeps executing.
+        let (applied, session, units) =
+            fold_failed(&mut store, &run_id, "(cli `agy` exited 1) boom");
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"));
+        assert_eq!(units[0].worker_failed_clis, vec!["agy".to_string()]);
+
+        // Failure 2: claude → codex — NOT back to agy, which already worker-failed this unit
+        // (the core#282 regression: the old ladder re-picked the first non-current seat).
+        let (applied, _s, units) = fold_failed(&mut store, &run_id, "(cli `claude` exited 1) boom");
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(
+            units[0].assigned_cli.as_deref(),
+            Some("codex"),
+            "the walk must advance to the next UNTRIED seat, never repeat a failed one"
+        );
+        assert_eq!(
+            units[0].worker_failed_clis,
+            vec!["agy".to_string(), "claude".to_string()]
+        );
+
+        // Failure 3: the roster is exhausted — ONLY NOW does the unit fail terminally.
+        let (applied, session, units) =
+            fold_failed(&mut store, &run_id, "(cli `codex` exited 1) boom");
+        assert!(matches!(applied, StepApplied::Finished));
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(units[0].status, UnitStatus::Rejected);
+        assert_eq!(
+            units[0].worker_failed_clis,
+            vec!["agy".to_string(), "claude".to_string(), "codex".to_string()],
+            "the terminal write persists the full ledger for a later resume"
+        );
+    }
+
+    /// evaluator≠creator holds DURING failover: the walk skips the seat that created the work
+    /// this unit reviews, even when that seat is untried and earlier in the roster.
+    #[test]
+    fn failover_never_hands_an_evaluator_to_its_creator() {
+        let run_id = format!("failover-evc-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["claude", "agy", "codex"],
+            SessionStatus::Executing,
+            1,
+        );
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "build",
+            "claude",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Done,
+        );
+        seed_unit(
+            &mut store,
+            &run_id,
+            2,
+            "adversarial-review",
+            "agy",
+            PhaseRole::Evaluator,
+            &["build"],
+            UnitStatus::Distributed,
+        );
+
+        let (applied, _s, units) = fold_failed(&mut store, &run_id, "(cli `agy` exited 143)");
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(
+            units[1].assigned_cli.as_deref(),
+            Some("codex"),
+            "claude is the creator of the work under review — the failover must skip it \
+             even though it is first in the roster and untried"
+        );
+    }
+
+    /// The observed core#282 shape: a TIMEOUT is a worker error and must enter the ladder —
+    /// before the fix it matched no transient signature and killed the run at the first seat.
+    #[test]
+    fn a_timeout_shaped_worker_failure_enters_the_failover_ladder() {
+        let run_id = format!("failover-timeout-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude"],
+            SessionStatus::Executing,
+            0,
+        );
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "u1",
+            "agy",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+
+        let (applied, session, units) =
+            fold_failed(&mut store, &run_id, "ACP timeout waiting for response id=7");
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"));
+    }
+
+    /// A resume of a worker-failed run must NOT re-dispatch the seat that failed the unit
+    /// (the "re-dispatches the SAME assigned_cli forever" wedge) while an untried seat remains.
+    #[test]
+    fn a_resume_moves_the_cursor_unit_off_a_worker_failed_seat() {
+        let run_id = format!("resume-rotate-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude"],
+            SessionStatus::Failed,
+            0,
+        );
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
+        u.assigned_cli = Some("agy".to_string());
+        u.worker_failed_clis = vec!["agy".to_string()];
+        u.denial_reason = Some("Worker FAILED on unit 1: (cli `agy` exited 1)".into());
+        u.status = UnitStatus::Rejected;
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let mut in_flight = HashSet::new();
+        let status = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[0].assigned_cli.as_deref(),
+            Some("claude"),
+            "the resume must select the next untried seat, not hammer the failed one"
+        );
+        assert_eq!(
+            units[0].worker_failed_clis,
+            vec!["agy".to_string()],
+            "the ledger survives the resume — agy stays excluded this cycle"
+        );
+    }
+
+    /// A resume AFTER exhaustion (every eligible seat worker-failed — why the run went terminal)
+    /// A JUDGED rejection after an earlier failover keeps its seat on resume (Copilot on
+    /// #286): the ledger still holds the earlier worker-failed seat, but the TERMINAL
+    /// failure was work-level — rotating away from the seat that produced reviewable work
+    /// over a stale ledger entry would be a misclassification.
+    #[test]
+    fn a_judged_rejection_after_an_earlier_failover_keeps_its_seat_on_resume() {
+        let run_id = format!("resume-judged-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude", "codex"],
+            SessionStatus::Failed,
+            0,
+        );
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
+        u.assigned_cli = Some("claude".to_string());
+        u.worker_failed_clis = vec!["agy".to_string()]; // earlier failover, seat agy
+        u.denial_reason = Some("adversarial review rejected the work".into()); // judged, not worker
+        u.status = UnitStatus::Rejected;
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let mut in_flight = std::collections::HashSet::new();
+        resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[0].assigned_cli.as_deref(),
+            Some("claude"),
+            "a work-level rejection must re-dispatch the SAME seat, ledger notwithstanding"
+        );
+        assert_eq!(
+            units[0].worker_failed_clis,
+            vec!["agy".to_string()],
+            "the earlier worker-failure ledger survives untouched"
+        );
+    }
+
+    /// grants a fresh failover budget instead of refusing forever: the operator may have fixed
+    /// the environment, and a resume that could never re-dispatch would strand the run.
+    #[test]
+    fn a_resume_after_seat_exhaustion_clears_the_budget() {
+        let run_id = format!("resume-exhausted-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude"],
+            SessionStatus::Failed,
+            0,
+        );
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
+        u.assigned_cli = Some("claude".to_string());
+        u.worker_failed_clis = vec!["agy".to_string(), "claude".to_string()];
+        u.denial_reason = Some("Worker FAILED on unit 1: (cli `claude` exited 1)".into());
+        u.status = UnitStatus::Rejected;
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let mut in_flight = HashSet::new();
+        let status = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert!(
+            units[0].worker_failed_clis.is_empty(),
+            "an explicit resume after exhaustion is a fresh start — the budget resets"
+        );
+        assert_eq!(
+            units[0].assigned_cli.as_deref(),
+            Some("claude"),
+            "with every seat failed there is no better pick — the walk restarts from here"
+        );
+    }
+
+    /// Pure selection: roster order, the tried-ledger, and the creator exclusion — including a
+    /// depends_on creator sitting on the DEFAULT seat (`assigned_cli: None` ⇒ claude).
+    #[test]
+    fn next_failover_seat_selects_in_order_and_respects_exclusions() {
+        let mut creator = WorkUnit::pending("s:build", "s", 1, "w");
+        creator.assigned_cli = None; // the DEFAULT seat — must exclude "claude", not be dropped
+        let mut eval = WorkUnit::pending("s:review", "s", 2, "w");
+        eval.assigned_cli = Some("agy".into());
+        eval.depends_on = vec!["build".into()];
+        eval.worker_failed_clis = vec!["agy".into()];
+        let units = vec![creator, eval];
+        let roster = vec!["claude".to_string(), "agy".to_string(), "codex".to_string()];
+
+        assert_eq!(
+            next_failover_seat(&units, 1, &roster).as_deref(),
+            Some("codex"),
+            "claude is the (default-seat) creator, agy already failed — codex is next in order"
+        );
+
+        // Exhaustion: with codex tried too, no eligible seat remains.
+        let mut units = units;
+        units[1].worker_failed_clis.push("codex".into());
+        assert_eq!(next_failover_seat(&units, 1, &roster), None);
+
+        // A unit with no dependencies excludes nothing but its own failed seats.
+        let mut lone = WorkUnit::pending("s:u3", "s", 3, "w");
+        lone.worker_failed_clis = vec!["claude".into()];
+        assert_eq!(
+            next_failover_seat(&[lone], 0, &roster).as_deref(),
+            Some("agy")
         );
     }
 }

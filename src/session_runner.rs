@@ -615,6 +615,7 @@ mod tests {
             validator: None,
             required_deliverables: Vec::new(),
             tool_cmd: None,
+            worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
             status: UnitStatus::Pending,
         }
