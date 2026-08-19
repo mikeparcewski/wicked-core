@@ -5689,6 +5689,7 @@ mod seat_failover_tests {
 
     /// A def-driven unit (`<run>:<phase>` id, so `phase_id()` — and with it the
     /// evaluator≠creator exclusion — resolves).
+    #[allow(clippy::too_many_arguments)] // test-only seeding helper; the args mirror WorkUnit's shape
     fn seed_unit(
         store: &mut dyn GraphStore,
         run_id: &str,
