@@ -2679,6 +2679,13 @@ pub(crate) fn launch_run_inner(
     Ok(run_id)
 }
 
+/// Engine-authored prefix of every worker-originated denial (`Worker FAILED on unit …`).
+/// `resume_run_inner` keys its seat-rotation decision on it: only a unit whose TERMINAL
+/// failure was worker-originated rotates seats on resume — a judged rejection re-dispatches
+/// the same seat even when an EARLIER attempt left entries in `worker_failed_clis`
+/// (Copilot review on #286).
+pub(crate) const WORKER_FAILURE_MARKER: &str = "Worker FAILED on unit";
+
 /// The body of `Command::ResumeRun` (also the campaign driver's crash-resume re-attach, DES §6).
 /// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
 #[allow(clippy::too_many_arguments)]
@@ -2722,7 +2729,13 @@ pub(crate) fn resume_run_inner(
         let failover = match units.get(session.unit_ix) {
             Some(u)
                 if u.status == crate::domain::UnitStatus::Rejected
-                    && !u.worker_failed_clis.is_empty() =>
+                    && !u.worker_failed_clis.is_empty()
+                    // The LAST failure must itself be worker-originated: a judged (work-level)
+                    // rejection after an earlier failover keeps its seat — rotating there would
+                    // discard a seat that produced reviewable work over a stale ledger entry.
+                    && u.denial_reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains(WORKER_FAILURE_MARKER)) =>
             {
                 Some(next_failover_seat(&units, session.unit_ix, &session.clis))
             }
@@ -2736,9 +2749,9 @@ pub(crate) fn resume_run_inner(
             unit.status = crate::domain::UnitStatus::Distributed;
             unit.denial_reason = None;
             match failover {
-                // An untried eligible seat remains (terminal failure predates seat exhaustion,
-                // or the run predates the tracking): the resume re-dispatches THERE, never to
-                // a seat that already worker-failed this unit.
+                // An untried eligible seat remains (terminal failure predates seat
+                // exhaustion): the resume re-dispatches THERE, never to a seat that already
+                // worker-failed this unit.
                 Some(Some(next)) => {
                     if unit.assigned_cli.as_deref() != Some(next.as_str()) {
                         unit.assigned_invocation = crate::registry_roster()
@@ -5934,6 +5947,59 @@ mod seat_failover_tests {
     }
 
     /// A resume AFTER exhaustion (every eligible seat worker-failed — why the run went terminal)
+    /// A JUDGED rejection after an earlier failover keeps its seat on resume (Copilot on
+    /// #286): the ledger still holds the earlier worker-failed seat, but the TERMINAL
+    /// failure was work-level — rotating away from the seat that produced reviewable work
+    /// over a stale ledger entry would be a misclassification.
+    #[test]
+    fn a_judged_rejection_after_an_earlier_failover_keeps_its_seat_on_resume() {
+        let run_id = format!("resume-judged-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude", "codex"],
+            SessionStatus::Failed,
+            0,
+        );
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
+        u.assigned_cli = Some("claude".to_string());
+        u.worker_failed_clis = vec!["agy".to_string()]; // earlier failover, seat agy
+        u.denial_reason = Some("adversarial review rejected the work".into()); // judged, not worker
+        u.status = UnitStatus::Rejected;
+        put_node(&mut store, u.to_node()).unwrap();
+
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let mut in_flight = std::collections::HashSet::new();
+        resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(
+            units[0].assigned_cli.as_deref(),
+            Some("claude"),
+            "a work-level rejection must re-dispatch the SAME seat, ledger notwithstanding"
+        );
+        assert_eq!(
+            units[0].worker_failed_clis,
+            vec!["agy".to_string()],
+            "the earlier worker-failure ledger survives untouched"
+        );
+    }
+
     /// grants a fresh failover budget instead of refusing forever: the operator may have fixed
     /// the environment, and a resume that could never re-dispatch would strand the run.
     #[test]
@@ -5950,6 +6016,7 @@ mod seat_failover_tests {
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
         u.assigned_cli = Some("claude".to_string());
         u.worker_failed_clis = vec!["agy".to_string(), "claude".to_string()];
+        u.denial_reason = Some("Worker FAILED on unit 1: (cli `claude` exited 1)".into());
         u.status = UnitStatus::Rejected;
         put_node(&mut store, u.to_node()).unwrap();
 
