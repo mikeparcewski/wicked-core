@@ -4193,8 +4193,12 @@ fn dispatch_unit(
     // judge must review the most-recent prior Creator's COLD output — the work it is evaluating — not
     // its own output. Resolve it HERE on the actor thread (a store read); the worker holds no store
     // handle. `None` ⇒ the agent judges the unit's own output (Neutral/Creator, or no prior creator).
+    // Bounded at the SELECTION point (core#282): everything downstream — the in-process judge,
+    // the bus `task.dispatched` payload, the evaluator seat's prompt arg — sees the clipped form,
+    // so an unbounded creator output can never blow a prompt-arg seat's backend.
     let agent_review_target = if unit.role == crate::workflow::PhaseRole::Evaluator {
         pipeline::creator_output_for(store, run_id, unit.ord)
+            .map(crate::cli_runner::clip_review_target)
     } else {
         None
     };
