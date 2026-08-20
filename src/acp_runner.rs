@@ -835,7 +835,7 @@ impl Drop for AcpProcess {
         // with the session id, so the daemon log carries the ordering evidence — which engine
         // path released the process relative to the turn's own error lines.
         eprintln!(
-            "[wicked-core] dropping ACP bridge (session {}): kill signal sent — if a turn was in \
+            "[wicked-core] dropping ACP bridge (session {}): about to send the kill signal — if a turn was in \
              flight, its failure lines should appear adjacent to this one",
             self.session_id
         );
