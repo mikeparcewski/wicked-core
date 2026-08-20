@@ -830,6 +830,15 @@ struct AcpProcess {
 
 impl Drop for AcpProcess {
     fn drop(&mut self) {
+        // crew#290 instrumentation: every drop KILLS the bridge, and a drop while the bridge
+        // is mid-turn is the leading hypothesis for the field's silent exit-0 deaths. Say so,
+        // with the session id, so the daemon log carries the ordering evidence — which engine
+        // path released the process relative to the turn's own error lines.
+        eprintln!(
+            "[wicked-core] dropping ACP bridge (session {}): kill signal sent — if a turn was in \
+             flight, its failure lines should appear adjacent to this one",
+            self.session_id
+        );
         self.kill_handle.signal();
     }
 }
@@ -1066,9 +1075,11 @@ fn death_context(proc: &AcpProcess) -> String {
         Some(status) => note.push_str(&format!("; bridge exit: {status}")),
         None => note.push_str("; bridge exit: unknown (not yet reaped)"),
     }
+    // crew#290: 5 lines was too little post-mortem — the two field deaths carried "(silent)"
+    // stderr, so the queued stdout frames are the only account of the bridge's last moments.
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     while let Ok(line) = proc.line_rx.try_recv() {
-        if tail.len() == 5 {
+        if tail.len() == 20 {
             tail.pop_front();
         }
         tail.push_back(line.chars().take(240).collect());
