@@ -5087,17 +5087,34 @@ sleep 30
 
     /// The escape hatch: `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` set means NO override — the one
     /// legitimate case is an operator deliberately testing their own hooks/skills through a run.
-    /// Tested on the decision function (both branches) because mutating the process environment
-    /// races every other test; the call site passing the REAL env presence is pinned by the
-    /// source audit below.
+    /// Tested on the decision function (both branches); the call site passing the REAL env
+    /// presence is pinned by the source audit below.
+    ///
+    /// TEST-ONLY RACE FIX (found while adding the core#293 regression tests, which changed the
+    /// scheduling enough to surface it ~25% of runs): this test MINTS a worker home and then
+    /// deletes it, but took no ENV_LOCK. `worker_config_home()` resolves `WICKED_WORKER_HOME` at
+    /// call time, so whenever it interleaved with `an_acp_worker_does_not_inherit_the_operators_
+    /// claude_config_dir` — which sets that variable — the mint resolved to THAT test's home and
+    /// the cleanup below removed the `settings.json` it was mid-assertion on. Taking the lock and
+    /// scoping the home to this test fixes both halves, and stops the cleanup deleting the
+    /// developer's real `~/.wicked-worker/claude` (and its login state) as a side effect.
     #[test]
     fn the_inherit_escape_hatch_disables_acp_config_isolation() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("inherit-hatch");
+        std::env::set_var("WICKED_WORKER_HOME", &base);
         assert!(worker_claude_config_dir(true).is_none());
         let minted = worker_claude_config_dir(false)
             .expect("isolation is the default")
             .expect("minting succeeds");
         assert!(minted.is_dir());
-        let _ = std::fs::remove_dir_all(&minted);
+        assert!(
+            minted.starts_with(&base),
+            "the mint must land in this test's scoped home, not a shared one: {}",
+            minted.display()
+        );
+        std::env::remove_var("WICKED_WORKER_HOME");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The call site must consult the SAME escape-hatch variable as the wrapped path, read from
@@ -6323,6 +6340,11 @@ sleep 30
     /// - `"elicit_non_string"`: sends an integer-type schema → immediate cancel, completes
     /// - `"elicit_nested"`: sends two elicitations in rapid succession (to test test-20)
     /// - `"elicit_disconnect"`: sends elicitation then closes stdout (test-19)
+    /// - `"perm_id_collision"`: drives TWO turns, walking its own request counter into the
+    ///   client's prompt-id space so one `session/request_permission` carries the same id as the
+    ///   in-flight `session/prompt` (core#293)
+    /// - `"unknown_request"`: sends an `fs/read_text_file` request this client does not implement
+    ///   and requires a JSON-RPC error answer (core#293)
     #[cfg(unix)]
     fn write_mock_acp_py(dir: &std::path::Path) -> std::path::PathBuf {
         // The script uses Python dict literals (which json.dumps handles) to avoid Rust brace
@@ -6440,6 +6462,137 @@ elif behavior == "elicit_nested":
     r()
     w({"jsonrpc": "2.0", "id": prompt_id, "result": {
         "stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 2}
+    }})
+
+elif behavior == "perm_id_collision":
+    # core#293 regression fixture. Models the bridge SDK's OWN request counter, which starts at
+    # 0, is independent of the client's `next_id`, and is never reset per turn. Two turns are
+    # driven on ONE session so the counter walks INTO the client's prompt-id space.
+    #
+    #   turn 1 prompt id = P            (the client's next_id after the handshake)
+    #   turn 2 prompt id = P + 1
+    #
+    # Turn 1 makes exactly P asks (agent ids 0 .. P-1) — all strictly below P, so nothing
+    # collides yet and turn 1 is a clean control. The counter is now at P, so turn 2's asks are
+    # id P (harmless — that was turn 1's id) and then id P+1, which EQUALS turn 2's prompt id.
+    # That second ask is the defect's trigger.
+    agent_id = 0
+
+    def ask_permission():
+        global agent_id
+        rid = agent_id
+        agent_id += 1
+        w({"jsonrpc": "2.0", "id": rid, "method": "session/request_permission", "params": {
+            "sessionId": "mock-session",
+            "toolCall": {"toolCallId": "call-%d" % rid, "title": "Write", "kind": "edit",
+                         "rawInput": {"file_path": "/tmp/x", "content": "y"}},
+            "options": [
+                {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+            ],
+        }})
+        resp = r()
+        # The client MUST answer a permission request with a JSON-RPC result carrying an
+        # `outcome`. Anything else (or EOF) means the frame was swallowed or refused.
+        if resp is None or not isinstance(resp.get("result"), dict) \
+                or "outcome" not in resp["result"]:
+            sys.stderr.write("perm_id_collision: bad answer to id=%r: %r\n" % (rid, resp))
+            sys.exit(3)
+        return rid
+
+    # ── turn 1 ────────────────────────────────────────────────────────────────────────────
+    for _ in range(prompt_id):
+        ask_permission()
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}
+    }})
+
+    # ── turn 2 ────────────────────────────────────────────────────────────────────────────
+    req = r()
+    if req is None or req.get("method") != "session/prompt":
+        sys.stderr.write("perm_id_collision: expected a second session/prompt, got %r\n" % (req,))
+        sys.exit(4)
+    prompt_id2 = req["id"]
+
+    ask_permission()                 # agent id == prompt_id (turn 1's id) — must be answered
+    colliding = ask_permission()     # agent id == prompt_id2 — THE COLLISION
+    if colliding != prompt_id2:
+        sys.stderr.write("perm_id_collision: fixture drift, ask id %r != prompt id %r\n"
+                         % (colliding, prompt_id2))
+        sys.exit(5)
+
+    # Only reachable once the colliding permission request was answered as a REQUEST. The marker
+    # is what the Rust assertion looks for: with the id-only match it is never emitted, because
+    # the turn was already declared complete on the permission frame itself.
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "PERMISSION_ANSWERED"}}
+    }})
+    w({"jsonrpc": "2.0", "id": prompt_id2, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 2, "outputTokens": 2}
+    }})
+
+elif behavior == "elicit_perm":
+    # core#293: a permission request that arrives while the turn is SUSPENDED on an elicitation.
+    # The 'elicit sub-loop had no arm for it, so it was silently dropped and the agent blocked.
+    w({"jsonrpc": "2.0", "id": "elicit-p1", "method": "elicitation/create", "params": {
+        "message": "Which one?",
+        "requestedSchema": {"type": "object", "properties": {"pick": {"type": "string"}}}
+    }})
+    w({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission", "params": {
+        "sessionId": "mock-session",
+        "toolCall": {"toolCallId": "call-e", "title": "Write", "kind": "edit",
+                     "rawInput": {"file_path": "/tmp/x", "content": "y"}},
+        "options": [
+            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+            {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+        ],
+    }})
+    # Both answers must arrive; order is not guaranteed (the elicitation is resolved by a
+    # separate thread) so classify rather than assume.
+    saw_permission = False
+    saw_elicitation = False
+    for _ in range(2):
+        resp = r()
+        if resp is None or not isinstance(resp.get("result"), dict):
+            break
+        if "outcome" in resp["result"]:
+            saw_permission = True
+        elif "action" in resp["result"]:
+            saw_elicitation = True
+    if not (saw_permission and saw_elicitation):
+        sys.stderr.write("elicit_perm: permission=%r elicitation=%r\n"
+                         % (saw_permission, saw_elicitation))
+        sys.exit(7)
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "PERM_DURING_ELICIT"}}
+    }})
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}
+    }})
+
+elif behavior == "unknown_request":
+    # core#293: an inbound REQUEST for a method this client does not implement must come back as
+    # a JSON-RPC error, not be dropped. `fs/read_text_file` is the concrete case — `fs: {}`
+    # advertises no filesystem capability, so a conforming agent never asks, but a
+    # non-conforming one must not be left blocked.
+    w({"jsonrpc": "2.0", "id": "fsr-1", "method": "fs/read_text_file", "params": {
+        "sessionId": "mock-session", "path": "/etc/hosts"
+    }})
+    resp = r()
+    if resp is None or "error" not in resp or resp.get("id") != "fsr-1":
+        sys.stderr.write("unknown_request: expected an error response, got %r\n" % (resp,))
+        sys.exit(6)
+    w({"jsonrpc": "2.0", "method": "session/update", "params": {
+        "sessionId": "mock-session",
+        "update": {"sessionUpdate": "agent_message_chunk",
+                   "content": {"type": "text", "text": "REFUSED_%d" % resp["error"]["code"]}}
+    }})
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}
     }})
 
 elif behavior == "elicit_disconnect":
@@ -6716,6 +6869,294 @@ else:
             "a human cancellation is terminal and must bypass retry"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── core#293: agent request ids cross client prompt ids ───────────────────────
+
+    /// THE core#293 REGRESSION TEST — two turns on ONE session, driven until the agent's own
+    /// request counter walks into the client's prompt-id space.
+    ///
+    /// The two id spaces are independent: `AcpProcess::next_id` starts at 2 and is never reset
+    /// per turn; the bridge SDK counts its own requests from 0. They eventually cross. Before the
+    /// fix, the dispatcher matched inbound frames to the in-flight prompt on `id` ALONE, so on a
+    /// crossing the agent's `session/request_permission` was consumed as the prompt RESULT: no
+    /// `result.stopReason` → `unwrap_or("end_turn")` → turn 2 returned Ok while the agent sat
+    /// blocked on a permission nobody would ever answer.
+    ///
+    /// FAILS BEFORE THE FIX: turn 2 returns with none of the post-permission output, because the
+    /// mock never gets an answer to the colliding request and so never emits the marker or the
+    /// prompt result. The turn nonetheless reports `Ok` — which is exactly the lie the defect
+    /// told, so the assertion is on the OUTPUT, not on the status.
+    #[test]
+    #[cfg(unix)]
+    fn agent_request_id_colliding_with_the_prompt_id_is_answered_not_swallowed() {
+        let dir = std::env::temp_dir().join(format!("wicked-core293-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "perm_id_collision");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // The prompt id turn 1 is about to use — the fixture asks exactly this many permissions
+        // so its counter lands on turn 2's prompt id.
+        let turn1_id = proc.next_id;
+
+        let turn1 = exec_turn_acp(
+            &mut proc,
+            "turn one",
+            &[],
+            noop,
+            Duration::from_secs(10),
+            Arc::clone(&maps),
+            "run-293",
+            0,
+            "claude-agent-acp",
+            &tx,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            turn1.status,
+            StepStatus::Ok,
+            "turn 1 is the control — every ask is below the prompt id, so it must pass even \
+             with the defect present: status={:?} output={:?}",
+            turn1.status,
+            turn1.output
+        );
+        assert_eq!(
+            proc.next_id,
+            turn1_id + 1,
+            "the client's prompt id must advance by exactly one per turn — the fixture's \
+             collision arithmetic depends on it"
+        );
+
+        let turn2 = exec_turn_acp(
+            &mut proc,
+            "turn two",
+            &[],
+            noop,
+            Duration::from_secs(10),
+            Arc::clone(&maps),
+            "run-293",
+            0,
+            "claude-agent-acp",
+            &tx,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            turn2.output.contains("PERMISSION_ANSWERED"),
+            "the permission request whose id EQUALS turn 2's prompt id must be answered as a \
+             REQUEST; if it is consumed as the prompt result the turn ends early and this marker \
+             never arrives. output={:?} status={:?}",
+            turn2.output,
+            turn2.status
+        );
+        assert_eq!(
+            turn2.status,
+            StepStatus::Ok,
+            "turn 2 must complete on the agent's real prompt result: output={:?}",
+            turn2.output
+        );
+        assert_eq!(
+            turn2.usage.as_ref().map(|u| u.input_tokens),
+            Some(2),
+            "usage must come from the REAL prompt result (inputTokens=2), not from a permission \
+             frame misread as one: {:?}",
+            turn2.usage
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#293 catch-all: an inbound REQUEST for a method this client does not implement gets a
+    /// JSON-RPC error response instead of being dropped. `fs/read_text_file` is the concrete case
+    /// — `fs: {}` advertises NO filesystem capability (both `readTextFile` and `writeTextFile`
+    /// default to false), so a conforming agent never asks; a non-conforming one must still not
+    /// be left blocked until the turn timeout.
+    #[test]
+    #[cfg(unix)]
+    fn unhandled_inbound_request_is_refused_rather_than_dropped() {
+        let dir = std::env::temp_dir().join(format!("wicked-core293-unk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "unknown_request");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(10),
+            maps,
+            "run-293-unk",
+            0,
+            "claude-agent-acp",
+            &tx,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            result
+                .output
+                .contains(&format!("REFUSED_{METHOD_NOT_FOUND_CODE}")),
+            "an unhandled request must be answered with JSON-RPC {METHOD_NOT_FOUND_CODE}; the \
+             mock only emits this marker once it has read that error frame. output={:?}",
+            result.output
+        );
+        assert_eq!(result.status, StepStatus::Ok, "output={:?}", result.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#293, second dispatcher: a `session/request_permission` arriving while the turn is
+    /// SUSPENDED on an elicitation must be answered. The `'elicit` sub-loop had no arm for it and
+    /// dropped it, blocking the agent exactly as hard as the id collision did.
+    ///
+    /// FAILS BEFORE THE FIX: the mock never receives the permission answer, exits non-zero, and
+    /// the turn ends with no `stopReason`.
+    #[test]
+    #[cfg(unix)]
+    fn permission_request_during_an_elicitation_is_answered_not_dropped() {
+        let dir = std::env::temp_dir().join(format!("wicked-core293-ep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "elicit_perm");
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let maps_clone = Arc::clone(&maps);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // Resolve the elicitation from a second thread so `'elicit` is genuinely suspended while
+        // the permission request arrives.
+        let deliver_thread = std::thread::spawn(move || {
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(100));
+                let pending = {
+                    let m = maps_clone.lock().unwrap_or_else(|p| p.into_inner());
+                    m.pending.keys().next().cloned()
+                };
+                if let Some(id) = pending {
+                    let mut m = maps_clone.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = m.deliver(
+                        "run-293-ep",
+                        &id,
+                        "accept".to_string(),
+                        Some(serde_json::json!("first")),
+                    );
+                    return;
+                }
+            }
+        });
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(15),
+            Arc::clone(&maps),
+            "run-293-ep",
+            1, // epoch > 0 + verified adapter ⇒ elicitation enabled, so 'elicit is entered
+            "claude-agent-acp",
+            &tx,
+            None,
+        )
+        .unwrap();
+        deliver_thread.join().unwrap();
+
+        assert!(
+            result.output.contains("PERM_DURING_ELICIT"),
+            "the suspended turn must still answer permission requests; the mock only emits this \
+             marker after it has read BOTH answers. output={:?} status={:?}",
+            result.output,
+            result.status
+        );
+        assert_eq!(result.status, StepStatus::Ok, "output={:?}", result.output);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unit-level statement of the same rule: a frame carrying BOTH a `method` and an id equal to
+    /// the one we are waiting on is a REQUEST, not a response.
+    #[test]
+    fn frame_with_method_is_never_a_response_even_on_a_colliding_id() {
+        let permission_request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "session/request_permission",
+            "params": {"sessionId": "s"}
+        });
+        assert!(
+            !is_response_to(&permission_request, 4),
+            "an agent REQUEST that happens to reuse our id must not be read as our response"
+        );
+
+        let real_response = serde_json::json!({
+            "jsonrpc": "2.0", "id": 4, "result": {"stopReason": "end_turn"}
+        });
+        assert!(is_response_to(&real_response, 4));
+        assert!(
+            !is_response_to(&real_response, 5),
+            "a response to a different id is not ours"
+        );
+
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/update", "params": {}
+        });
+        assert!(!is_response_to(&notification, 4));
+    }
+
+    /// The handshake dispatcher obeys the same rule: a colliding agent REQUEST is refused (so the
+    /// agent is not left blocked) and `rpc_expect` keeps waiting for the REAL response.
+    #[test]
+    fn rpc_expect_refuses_a_colliding_request_and_waits_for_the_real_response() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // A request that reuses the very id the handshake is waiting on.
+        tx.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"session/request_permission","params":{}}"#
+                .to_string(),
+        )
+        .unwrap();
+        // Then the genuine response to id 2.
+        tx.send(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-real"}}"#.to_string())
+            .unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let v = rpc_expect(&rx, &mut sink, 2, Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            v["result"]["sessionId"], "s-real",
+            "the colliding request must not be returned as the handshake response: {v}"
+        );
+
+        let written = std::str::from_utf8(&sink).unwrap().trim_end();
+        let refusal: serde_json::Value = serde_json::from_str(written)
+            .expect("the colliding request must be answered, not dropped");
+        assert_eq!(refusal["id"], 2);
+        assert_eq!(refusal["error"]["code"], METHOD_NOT_FOUND_CODE);
+    }
+
+    /// An unknown NOTIFICATION (method, no id) blocks nobody and must NOT draw an error response —
+    /// JSON-RPC forbids responding to a notification.
+    #[test]
+    fn rpc_expect_ignores_unknown_notifications_without_responding() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        tx.send(r#"{"jsonrpc":"2.0","method":"some/futureNotification","params":{}}"#.to_string())
+            .unwrap();
+        tx.send(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#.to_string())
+            .unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let v = rpc_expect(&rx, &mut sink, 1, Duration::from_secs(5)).unwrap();
+        assert_eq!(v["result"]["ok"], true);
+        assert!(
+            sink.is_empty(),
+            "a notification must never be responded to: {:?}",
+            std::str::from_utf8(&sink)
+        );
     }
 
     /// Test 37: `session/prompt` result usage replaces (not merges with) prior `usage_update` tokens
