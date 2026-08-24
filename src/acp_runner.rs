@@ -1715,9 +1715,30 @@ fn rpc_respond_error<W: Write>(
 /// the NEXT prompt went to an agent that was not listening (0 tools, 0 hooks, idle until the
 /// turn timeout).
 ///
-/// A frame carrying a `method` is NEVER a response, whatever its id says.
+/// A frame the agent ORIGINATED is never a response, whatever its id says.
 fn is_response_to(v: &Value, id: u64) -> bool {
-    v.get("method").is_none() && v.get("id").and_then(Value::as_u64) == Some(id)
+    agent_method(v).is_none() && v.get("id").and_then(Value::as_u64) == Some(id)
+}
+
+/// The `method` of a frame the AGENT originated — a request or a notification — or `None` when
+/// the frame is a response and must be matched on id instead.
+///
+/// The primary test is the presence of `method`: a JSON-RPC response never carries one. The
+/// `result`/`error` half is belt-and-braces against an adapter that sloppily ECHOES the method
+/// back on its own response. Without it, this fix would classify such a response as an unknown
+/// request, answer it with `Method not found`, and hang the very handshake it exists to protect —
+/// trading one wedge for another. A response MUST carry `result` or `error`; a request MUST NOT.
+/// When a frame contradicts itself, "it answers something" wins.
+///
+/// Deliberately NOT strengthened to "a response must carry result/error": a malformed bare
+/// `{"id":n}` has always been treated as a (useless) response and terminated the wait. Requiring
+/// `result`/`error` would turn that into a silent 2-hour hang — the failure mode this issue is
+/// about — so the loose reading is kept for frames that at least do not claim to be requests.
+fn agent_method(v: &Value) -> Option<&str> {
+    if v.get("result").is_some() || v.get("error").is_some() {
+        return None;
+    }
+    v.get("method").and_then(Value::as_str)
 }
 
 /// ACP adapters verified to correctly serialize tool execution across the
@@ -1856,7 +1877,7 @@ fn rpc_expect<W: Write>(
                 // notification — and is dispatched HERE, before the id comparison below
                 // (core#293). It is never the response we are waiting on, however its id
                 // happens to collide with ours.
-                if let Some(method) = v.get("method").and_then(Value::as_str) {
+                if let Some(method) = agent_method(&v) {
                     let req_id = v.get("id").cloned().unwrap_or(Value::Null);
                     if method == "elicitation/create" {
                         // Elicitation guard: a stray `elicitation/create` during handshake is
@@ -2344,7 +2365,7 @@ prior output you are reviewing, testing, or revising."
                                 // of the id comparison below (core#293) — and this sub-loop must
                                 // serve the SAME set of methods the main loop does, because a
                                 // suspended turn is exactly when the agent keeps working.
-                                if let Some(method) = v2.get("method").and_then(Value::as_str) {
+                                if let Some(method) = agent_method(&v2) {
                                     match method {
                                         // Second elicitation/create during suspension → cancel.
                                         "elicitation/create" => {
@@ -2485,7 +2506,7 @@ prior output you are reviewing, testing, or revising."
                 // handled here, ahead of the id comparison, so a colliding id can no longer make
                 // the id check swallow it. (`is_response_to` enforces the same rule from the other
                 // side; both are kept so neither alone is load-bearing.)
-                if let Some(method) = v.get("method").and_then(Value::as_str) {
+                if let Some(method) = agent_method(&v) {
                     match method {
                         "session/update" => {
                             handle_update(&v, emit, &mut output, &mut usage, &mut files, MAX_OUT);
@@ -7108,6 +7129,33 @@ else:
             "jsonrpc": "2.0", "method": "session/update", "params": {}
         });
         assert!(!is_response_to(&notification, 4));
+    }
+
+    /// The other side of the same rule: an adapter that sloppily ECHOES the method back on its
+    /// RESPONSE must still be understood as answering us. Tightening the classifier to "any
+    /// `method` ⇒ request" without this would refuse such a response as an unknown method and
+    /// hang the handshake — trading the core#293 wedge for a different one.
+    #[test]
+    fn a_response_that_echoes_its_method_is_still_a_response() {
+        let echoing = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "result": {"sessionId": "s"}
+        });
+        assert!(agent_method(&echoing).is_none());
+        assert!(is_response_to(&echoing, 2));
+
+        let echoing_error = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "session/new",
+            "error": {"code": -32000, "message": "nope"}
+        });
+        assert!(is_response_to(&echoing_error, 2));
+
+        // A bare `{"id":n}` carries no method, so it stays a (useless) response and still
+        // terminates the wait, exactly as before — never a silent hang.
+        let bare = serde_json::json!({"jsonrpc": "2.0", "id": 2});
+        assert!(is_response_to(&bare, 2));
     }
 
     /// The handshake dispatcher obeys the same rule: a colliding agent REQUEST is refused (so the
