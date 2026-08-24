@@ -2156,7 +2156,7 @@ prior output you are reviewing, testing, or revising."
                 };
 
                 // ── elicitation/create arm ─────────────────────────────────────────────
-                if v.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                if agent_method(&v) == Some("elicitation/create") {
                     let request_id = v.get("id").cloned().unwrap_or(Value::Null);
                     let schema = &v["params"]["requestedSchema"];
                     let message = v["params"]["message"].as_str().unwrap_or("");
