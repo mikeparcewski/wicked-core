@@ -1453,6 +1453,15 @@ fn start_acp_process(
     let form_enabled = ELICITATION_VERIFIED_ADAPTERS.contains(&config.binary.as_str());
     // `permission: true` says this client ANSWERS session/request_permission. Without it the
     // bridge never asks, which is exactly why the ACP path ran ungoverned (FINDING-060/062).
+    //
+    // `fs: {}` is DELIBERATELY EMPTY and stays empty (core#293 review point). ACP's
+    // `FileSystemCapability` is `{readTextFile: bool, writeTextFile: bool}`, both defaulting to
+    // false — so `{}` advertises NO filesystem capability, and a spec-conforming agent never sends
+    // `fs/read_text_file` or `fs/write_text_file`. That is why this client has no handler for
+    // them: it never claimed them. The alternative (implementing the two methods) would hand the
+    // agent an ungoverned read/write channel that bypasses the permission gate above — the
+    // opposite of what this path is for. A non-conforming agent that asks anyway now receives a
+    // JSON-RPC `Method not found` from the dispatcher's catch-all instead of being left blocked.
     let client_caps = if form_enabled {
         json!({"fs": {}, "terminal": false, "permission": true, "elicitation": {"form": {}}})
     } else {
@@ -1663,6 +1672,54 @@ fn rpc_respond<W: Write>(writer: &mut W, request_id: &Value, result: Value) -> a
     Ok(())
 }
 
+/// JSON-RPC 2.0 `Method not found`. Sent to any agent-originated REQUEST this client has no
+/// handler for, so the agent gets an answer instead of blocking forever (core#293).
+const METHOD_NOT_FOUND_CODE: i64 = -32601;
+
+/// Send a JSON-RPC 2.0 ERROR response to `request_id`.
+///
+/// The reason this exists (core#293): an inbound request whose `method` matches no arm used to be
+/// silently DROPPED. A JSON-RPC request blocks its sender until it is answered, so a dropped one
+/// wedges the agent for the whole turn timeout with no diagnostic anywhere. Answering with an
+/// error is the protocol-correct "I don't implement that" and lets the agent proceed. Any future
+/// ACP method therefore degrades to a refusal rather than a hang.
+fn rpc_respond_error<W: Write>(
+    writer: &mut W,
+    request_id: &Value,
+    code: i64,
+    message: &str,
+) -> anyhow::Result<()> {
+    // Guard: a null id is a JSON-RPC notification, never a request — do not respond.
+    if request_id.is_null() {
+        return Ok(());
+    }
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    });
+    writeln!(writer, "{msg}")?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Whether `v` is a JSON-RPC RESPONSE to the outbound request `id` we are waiting on.
+///
+/// THE `method` CHECK IS THE POINT (core#293). Matching on `id` alone conflates two opposite
+/// frame kinds: our own response (id, `result`/`error`, NO `method`) and an agent-originated
+/// REQUEST (id, `method`, `params`). The two id spaces are independent — the client counts
+/// `AcpProcess::next_id` from 2 and never resets it per turn, the bridge SDK counts its own
+/// requests from 0 — so they eventually cross. On a crossing, `session/request_permission` was
+/// consumed as the prompt RESULT: no `result.stopReason` → `unwrap_or("end_turn")` → the turn was
+/// declared complete while the agent sat blocked on a permission nobody would ever answer, and
+/// the NEXT prompt went to an agent that was not listening (0 tools, 0 hooks, idle until the
+/// turn timeout).
+///
+/// A frame carrying a `method` is NEVER a response, whatever its id says.
+fn is_response_to(v: &Value, id: u64) -> bool {
+    v.get("method").is_none() && v.get("id").and_then(Value::as_u64) == Some(id)
+}
+
 /// ACP adapters verified to correctly serialize tool execution across the
 /// `elicitation/create` suspension boundary (OQ-R-6). Only adapters on this list
 /// may receive `elicitation/create` via the allow-list guard in `exec_turn_acp`.
@@ -1795,15 +1852,33 @@ fn rpc_expect<W: Write>(
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                // Elicitation guard: a stray `elicitation/create` during handshake is
-                // immediately cancelled — it cannot be resolved (no maps context here)
-                // and must not block the handshake.
-                if v.get("method").and_then(Value::as_str) == Some("elicitation/create") {
+                // Anything carrying a `method` is agent-originated — a REQUEST or a
+                // notification — and is dispatched HERE, before the id comparison below
+                // (core#293). It is never the response we are waiting on, however its id
+                // happens to collide with ours.
+                if let Some(method) = v.get("method").and_then(Value::as_str) {
                     let req_id = v.get("id").cloned().unwrap_or(Value::Null);
-                    let _ = rpc_respond(stdin, &req_id, json!({"action":"cancel"}));
+                    if method == "elicitation/create" {
+                        // Elicitation guard: a stray `elicitation/create` during handshake is
+                        // immediately cancelled — it cannot be resolved (no maps context here)
+                        // and must not block the handshake.
+                        let _ = rpc_respond(stdin, &req_id, json!({"action":"cancel"}));
+                    } else if !req_id.is_null() {
+                        // Any OTHER inbound request during the handshake: refuse it explicitly.
+                        // There is no session yet and no gate context, so it cannot be served —
+                        // but dropping it would leave the agent blocked and stall the handshake
+                        // into a timeout that names nothing.
+                        let _ = rpc_respond_error(
+                            stdin,
+                            &req_id,
+                            METHOD_NOT_FOUND_CODE,
+                            &format!("wicked-core does not handle `{method}` during the handshake"),
+                        );
+                    }
+                    // Notifications (method, no id) are simply skipped.
                     continue;
                 }
-                if v.get("id").and_then(Value::as_u64) == Some(id) {
+                if is_response_to(&v, id) {
                     if let Some(err) = v.get("error") {
                         return Err(anyhow::Error::new(RpcServerError {
                             code: err.get("code").and_then(Value::as_i64),
@@ -1812,7 +1887,8 @@ fn rpc_expect<W: Write>(
                     }
                     return Ok(v);
                 }
-                // Skip notifications (they have "method" but no matching "id").
+                // A response to some OTHER outbound id (e.g. a call this loop already gave up
+                // on) — skip it silently; it blocks nobody.
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2264,23 +2340,76 @@ prior output you are reviewing, testing, or revising."
                                     Err(_) => continue 'elicit,
                                 };
 
-                                // Second elicitation/create during suspension → immediately cancel.
-                                if v2.get("method").and_then(Value::as_str)
-                                    == Some("elicitation/create")
-                                {
-                                    let nested_id = v2.get("id").cloned().unwrap_or(Value::Null);
-                                    let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-                                    let _ = rpc_respond(
-                                        &mut proc.stdin,
-                                        &nested_id,
-                                        json!({"action":"cancel"}),
-                                    );
+                                // Agent-originated frames are dispatched on `method` FIRST, ahead
+                                // of the id comparison below (core#293) — and this sub-loop must
+                                // serve the SAME set of methods the main loop does, because a
+                                // suspended turn is exactly when the agent keeps working.
+                                if let Some(method) = v2.get("method").and_then(Value::as_str) {
+                                    match method {
+                                        // Second elicitation/create during suspension → cancel.
+                                        "elicitation/create" => {
+                                            let nested_id =
+                                                v2.get("id").cloned().unwrap_or(Value::Null);
+                                            let _wl = write_lock
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            let _ = rpc_respond(
+                                                &mut proc.stdin,
+                                                &nested_id,
+                                                json!({"action":"cancel"}),
+                                            );
+                                        }
+                                        "session/update" => {
+                                            handle_update(
+                                                &v2,
+                                                emit,
+                                                &mut output,
+                                                &mut usage,
+                                                &mut files,
+                                                MAX_OUT,
+                                            );
+                                        }
+                                        // core#293: this arm did not exist. A permission request
+                                        // arriving while the turn was suspended on an elicitation
+                                        // was silently DROPPED, blocking the agent for the rest of
+                                        // the turn. Answered here with the same policy the main
+                                        // loop applies, via the same handler.
+                                        "session/request_permission" => {
+                                            answer_permission_request(
+                                                &mut proc.stdin,
+                                                &write_lock,
+                                                gate,
+                                                &v2,
+                                                &mut output,
+                                                MAX_OUT,
+                                            );
+                                        }
+                                        // Unknown request → explicit refusal; unknown
+                                        // notification (no id) → ignored.
+                                        other => {
+                                            let req_id =
+                                                v2.get("id").cloned().unwrap_or(Value::Null);
+                                            if !req_id.is_null() {
+                                                let _wl = write_lock
+                                                    .lock()
+                                                    .unwrap_or_else(|p| p.into_inner());
+                                                let _ = rpc_respond_error(
+                                                    &mut proc.stdin,
+                                                    &req_id,
+                                                    METHOD_NOT_FOUND_CODE,
+                                                    &format!(
+                                                        "wicked-core does not implement `{other}`"
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
                                     continue 'elicit;
                                 }
 
                                 // The prompt result arrived during the elicitation (the adapter decided
                                 // to finish without waiting for the elicitation response).
-                                if v2.get("id").and_then(Value::as_u64) == Some(id) {
+                                if is_response_to(&v2, id) {
                                     // Remove from maps if still registered (edge: result raced resolution).
                                     {
                                         let mut m = elicitation_maps
@@ -2310,20 +2439,7 @@ prior output you are reviewing, testing, or revising."
                                     }
                                     break 'elicit;
                                 }
-
-                                // session/update during elicitation → handle normally.
-                                if v2.get("method").and_then(Value::as_str)
-                                    == Some("session/update")
-                                {
-                                    handle_update(
-                                        &v2,
-                                        emit,
-                                        &mut output,
-                                        &mut usage,
-                                        &mut files,
-                                        MAX_OUT,
-                                    );
-                                }
+                                // A response to some OTHER outbound id — ignore it.
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'elicit,
                             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2362,7 +2478,67 @@ prior output you are reviewing, testing, or revising."
                 }
                 // ── end elicitation/create arm ─────────────────────────────────────────
 
-                if v.get("id").and_then(Value::as_u64) == Some(id) {
+                // ── agent-originated frames: dispatch on `method` BEFORE the id check ───
+                //
+                // core#293: everything below carries a `method`, which makes it a REQUEST or a
+                // notification FROM the agent — never the response to our `session/prompt`. It is
+                // handled here, ahead of the id comparison, so a colliding id can no longer make
+                // the id check swallow it. (`is_response_to` enforces the same rule from the other
+                // side; both are kept so neither alone is load-bearing.)
+                if let Some(method) = v.get("method").and_then(Value::as_str) {
+                    match method {
+                        "session/update" => {
+                            handle_update(&v, emit, &mut output, &mut usage, &mut files, MAX_OUT);
+                        }
+                        // The agent asking permission for a tool call. This is a REQUEST, not a
+                        // notification: it carries an `id` and blocks the agent until answered.
+                        // Before this arm existed the loop handled only notifications, so an
+                        // unanswered request would have hung the turn — which is why the
+                        // capability above had to stay off.
+                        "session/request_permission" => {
+                            answer_permission_request(
+                                &mut proc.stdin,
+                                &write_lock,
+                                gate,
+                                &v,
+                                &mut output,
+                                MAX_OUT,
+                            );
+                        }
+                        // Catch-all (core#293): a request this client does not implement gets an
+                        // explicit JSON-RPC error. Dropping it would block the agent until the
+                        // turn timeout with nothing naming why — the precise failure mode this
+                        // issue is about. A future ACP method now degrades to a refusal.
+                        other => {
+                            let req_id = v.get("id").cloned().unwrap_or(Value::Null);
+                            if !req_id.is_null() {
+                                let respond_err = {
+                                    let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+                                    rpc_respond_error(
+                                        &mut proc.stdin,
+                                        &req_id,
+                                        METHOD_NOT_FOUND_CODE,
+                                        &format!("wicked-core does not implement `{other}`"),
+                                    )
+                                    .err()
+                                };
+                                if let Some(e) = respond_err {
+                                    let note = format!(
+                                        "\n[wicked-core] could not refuse the unhandled request \
+                                         `{other}`: {e}. The agent is blocked on it and this turn \
+                                         will time out."
+                                    );
+                                    append_within_cap(&mut output, &note, MAX_OUT);
+                                }
+                            }
+                            // Unknown NOTIFICATIONS (method, no id) block nobody — ignore them.
+                        }
+                    }
+                    continue 'exec;
+                }
+
+                // ── no `method` ⇒ a RESPONSE. Only the one answering THIS prompt matters. ──
+                if is_response_to(&v, id) {
                     if let Some(err) = v.get("error") {
                         // JSON-RPC error response: surface it STRUCTURED so the caller can
                         // classify by CODE (crew#267: the bridge's -32000 auth refusal must
@@ -2394,42 +2570,7 @@ prior output you are reviewing, testing, or revising."
                     }
                     break 'exec;
                 }
-
-                if v.get("method").and_then(Value::as_str) == Some("session/update") {
-                    handle_update(&v, emit, &mut output, &mut usage, &mut files, MAX_OUT);
-                }
-
-                // The agent asking permission for a tool call. This is a REQUEST, not a
-                // notification: it carries an `id` and blocks the agent until answered. Before
-                // this, the loop handled only notifications, so an unanswered request would have
-                // hung the turn — which is why the capability above had to stay off.
-                if v.get("method").and_then(Value::as_str) == Some("session/request_permission") {
-                    if let Some(req_id) = v.get("id").cloned() {
-                        let params = v.get("params").cloned().unwrap_or(Value::Null);
-                        let result = match gate {
-                            // Governed: the SAME policy and the SAME audit records as the wrapped
-                            // path's PreToolUse hook.
-                            Some(g) => crate::acp_permission::permission_result(g, &params).0,
-                            // Ungoverned: permitted, as it has always been on this path — but said
-                            // out loud rather than left to a capability we quietly withheld.
-                            None => crate::acp_permission::allow_result(&params),
-                        };
-                        // NOT `let _ =`. A failed write leaves the agent blocked until the turn
-                        // times out, and the reason is the only thing that explains the stall —
-                        // dropping it turns a broken pipe into "the model was slow" (review).
-                        let respond_err = {
-                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-                            rpc_respond(&mut proc.stdin, &req_id, result).err()
-                        };
-                        if let Some(e) = respond_err {
-                            let note = format!(
-                                "\n[wicked-core] could not answer a permission request: {e}. The \
-                                 agent is blocked on it and this turn will time out."
-                            );
-                            append_within_cap(&mut output, &note, MAX_OUT);
-                        }
-                    }
-                }
+                // A response to some OTHER outbound id — nothing is waiting on it here.
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue 'exec,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'exec,
@@ -2482,6 +2623,48 @@ prior output you are reviewing, testing, or revising."
         files,
         tools: Vec::new(),
     })
+}
+
+/// Answer one `session/request_permission` REQUEST from the agent.
+///
+/// Factored out for core#293: the `'elicit` sub-loop had no permission arm at all, so a
+/// permission request arriving while a turn was suspended on an elicitation was silently dropped
+/// and the agent blocked until the turn timed out. One handler now serves both dispatchers so the
+/// two cannot drift apart again.
+///
+/// `gate` present ⇒ governed: the SAME policy and the SAME audit records as the wrapped path's
+/// PreToolUse hook. `gate` absent ⇒ permitted, as this path has always behaved — but said out loud
+/// rather than left to a capability we quietly withheld.
+fn answer_permission_request<W: Write>(
+    stdin: &mut W,
+    write_lock: &Mutex<()>,
+    gate: Option<&crate::acp_permission::AcpGate<'_>>,
+    frame: &Value,
+    output: &mut String,
+    max_out: usize,
+) {
+    let Some(req_id) = frame.get("id").cloned() else {
+        return; // a permission NOTIFICATION is not a thing; nothing to answer.
+    };
+    let params = frame.get("params").cloned().unwrap_or(Value::Null);
+    let result = match gate {
+        Some(g) => crate::acp_permission::permission_result(g, &params).0,
+        None => crate::acp_permission::allow_result(&params),
+    };
+    // NOT `let _ =`. A failed write leaves the agent blocked until the turn times out, and the
+    // reason is the only thing that explains the stall — dropping it turns a broken pipe into
+    // "the model was slow" (review).
+    let respond_err = {
+        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        rpc_respond(stdin, &req_id, result).err()
+    };
+    if let Some(e) = respond_err {
+        let note = format!(
+            "\n[wicked-core] could not answer a permission request: {e}. The agent is blocked on \
+             it and this turn will time out."
+        );
+        append_within_cap(output, &note, max_out);
+    }
 }
 
 /// Process one `session/update` notification — extract text chunks and usage.
