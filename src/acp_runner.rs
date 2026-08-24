@@ -1650,15 +1650,18 @@ fn rpc_send(
     Ok(())
 }
 
-/// Send a JSON-RPC 2.0 response to a `request_id` (which may be a string or
-/// number). The `id` field is echoed VERBATIM from the incoming request — NOT cast
+/// Send a JSON-RPC 2.0 response to a `request_id` (which may be a string, a number, or — see
+/// below — `null`). The `id` field is echoed VERBATIM from the incoming request — NOT cast
 /// to u64 — so string-typed request ids (common in ACP adapters) round-trip
 /// correctly. `result` is the response payload.
+///
+/// There is deliberately NO "null id ⇒ stay silent" guard here (Copilot review, core#293). A
+/// NOTIFICATION is a frame whose `id` member is ABSENT (JSON-RPC 2.0 §4.1); an EXPLICIT
+/// `"id": null` is a legal request id — the spec's own parse-error responses carry it — and its
+/// sender blocks until answered. Notifications are filtered structurally by the dispatchers via
+/// [`is_notification`], so every id that reaches this function belongs to a real request and is
+/// echoed as-is. A guard here would silently re-introduce the drop this PR exists to remove.
 fn rpc_respond<W: Write>(writer: &mut W, request_id: &Value, result: Value) -> anyhow::Result<()> {
-    // Guard: a null id is a JSON-RPC notification, never a request — do not respond.
-    if request_id.is_null() {
-        return Ok(());
-    }
     let msg = json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -1683,16 +1686,16 @@ const METHOD_NOT_FOUND_CODE: i64 = -32601;
 /// wedges the agent for the whole turn timeout with no diagnostic anywhere. Answering with an
 /// error is the protocol-correct "I don't implement that" and lets the agent proceed. Any future
 /// ACP method therefore degrades to a refusal rather than a hang.
+///
+/// Like [`rpc_respond`], this carries no null-id guard: `"id": null` is a request id, not a
+/// notification marker (see that function's docs), and JSON-RPC 2.0 §5.1 in fact REQUIRES an
+/// error response to echo a null id when the id could not be determined.
 fn rpc_respond_error<W: Write>(
     writer: &mut W,
     request_id: &Value,
     code: i64,
     message: &str,
 ) -> anyhow::Result<()> {
-    // Guard: a null id is a JSON-RPC notification, never a request — do not respond.
-    if request_id.is_null() {
-        return Ok(());
-    }
     let msg = json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -1739,6 +1742,90 @@ fn agent_method(v: &Value) -> Option<&str> {
         return None;
     }
     v.get("method").and_then(Value::as_str)
+}
+
+/// Whether `v` is a JSON-RPC 2.0 NOTIFICATION: agent-originated (it carries a `method`) AND its
+/// `id` member is ABSENT.
+///
+/// ABSENCE is the whole test (Copilot review, core#293). "A Notification is a Request object
+/// without an `id` member" (§4.1) — it is not "a request whose id is null". `"id": null` is a
+/// permitted request id, and the dispatchers used to derive ids with
+/// `v.get("id").cloned().unwrap_or(Value::Null)`, which flattened the two into one value: an
+/// agent that sent a real request with an explicit null id was classified as a notification,
+/// never answered, and left blocked for the whole turn timeout — the exact class of silent drop
+/// this issue removes. Testing the MEMBER instead of its value keeps them apart, so a
+/// notification draws no response and an explicit-null-id request draws one echoing `null`.
+fn is_notification(v: &Value) -> bool {
+    agent_method(v).is_some() && v.get("id").is_none()
+}
+
+/// The `id` an agent-originated frame must be ANSWERED on, or `None` when it is a notification
+/// and must not be answered at all.
+///
+/// The returned `Value` may itself be `Value::Null` — that is a request with an explicit null id,
+/// and it gets a response echoing `null`. Callers must NOT re-test the returned value for
+/// nullness; presence is the entire question and [`is_notification`] has already settled it.
+fn answerable_id(v: &Value) -> Option<&Value> {
+    if is_notification(v) {
+        return None;
+    }
+    v.get("id")
+}
+
+/// Answer an agent REQUEST and, when the write fails, SAY SO in the turn output instead of
+/// discarding the error (Copilot review, core#293).
+///
+/// A lost response leaves the agent blocked on that request until the turn times out, and the io
+/// error is the only thing that explains the stall — swallowing it turns a broken pipe into "the
+/// model was slow". `what` names the request in the note, e.g. "a permission request".
+fn respond_or_note<W: Write>(
+    stdin: &mut W,
+    write_lock: &Mutex<()>,
+    request_id: &Value,
+    result: Value,
+    what: &str,
+    output: &mut String,
+    max_out: usize,
+) {
+    let respond_err = {
+        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        rpc_respond(stdin, request_id, result).err()
+    };
+    note_write_failure(respond_err, what, output, max_out);
+}
+
+/// [`respond_or_note`] for the refusal path: send `Method not found` and surface a failed write
+/// rather than dropping it. `what` names the refused request.
+fn refuse_or_note<W: Write>(
+    stdin: &mut W,
+    write_lock: &Mutex<()>,
+    request_id: &Value,
+    message: &str,
+    what: &str,
+    output: &mut String,
+    max_out: usize,
+) {
+    let respond_err = {
+        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
+        rpc_respond_error(stdin, request_id, METHOD_NOT_FOUND_CODE, message).err()
+    };
+    note_write_failure(respond_err, what, output, max_out);
+}
+
+/// Append the "we could not answer, the agent is stuck" note for a failed response write.
+fn note_write_failure(
+    respond_err: Option<anyhow::Error>,
+    what: &str,
+    output: &mut String,
+    max_out: usize,
+) {
+    if let Some(e) = respond_err {
+        let note = format!(
+            "\n[wicked-core] could not answer {what}: {e}. The agent is blocked on it and this \
+             turn will time out."
+        );
+        append_within_cap(output, &note, max_out);
+    }
 }
 
 /// ACP adapters verified to correctly serialize tool execution across the
@@ -1878,25 +1965,41 @@ fn rpc_expect<W: Write>(
                 // (core#293). It is never the response we are waiting on, however its id
                 // happens to collide with ours.
                 if let Some(method) = agent_method(&v) {
-                    let req_id = v.get("id").cloned().unwrap_or(Value::Null);
-                    if method == "elicitation/create" {
+                    // A true NOTIFICATION (the `id` member is ABSENT) expects no answer — skip
+                    // it. Anything else is a REQUEST and gets answered below, INCLUDING one
+                    // whose id is an explicit `null`: that is a legal id, not a notification
+                    // marker, and its sender blocks until we reply (Copilot review, core#293).
+                    let Some(req_id) = answerable_id(&v).cloned() else {
+                        continue;
+                    };
+                    // A failed write during the handshake is fatal: the agent stays blocked on
+                    // this request, our own `initialize`/`session/new` will never be answered,
+                    // and the wait would expire as a bare "ACP timeout" naming nothing. Propagate
+                    // instead, so the handshake fails immediately with the io error and the
+                    // method that could not be answered (Copilot review).
+                    let written = if method == "elicitation/create" {
                         // Elicitation guard: a stray `elicitation/create` during handshake is
                         // immediately cancelled — it cannot be resolved (no maps context here)
                         // and must not block the handshake.
-                        let _ = rpc_respond(stdin, &req_id, json!({"action":"cancel"}));
-                    } else if !req_id.is_null() {
+                        rpc_respond(stdin, &req_id, json!({"action":"cancel"}))
+                    } else {
                         // Any OTHER inbound request during the handshake: refuse it explicitly.
                         // There is no session yet and no gate context, so it cannot be served —
                         // but dropping it would leave the agent blocked and stall the handshake
                         // into a timeout that names nothing.
-                        let _ = rpc_respond_error(
+                        rpc_respond_error(
                             stdin,
                             &req_id,
                             METHOD_NOT_FOUND_CODE,
                             &format!("wicked-core does not handle `{method}` during the handshake"),
-                        );
-                    }
-                    // Notifications (method, no id) are simply skipped.
+                        )
+                    };
+                    written.map_err(|e| {
+                        anyhow::anyhow!(
+                            "ACP handshake could not answer the agent's `{method}` request \
+                             (id={req_id}) while waiting for response id={id}: {e}"
+                        )
+                    })?;
                     continue;
                 }
                 if is_response_to(&v, id) {
@@ -2157,15 +2260,31 @@ prior output you are reviewing, testing, or revising."
 
                 // ── elicitation/create arm ─────────────────────────────────────────────
                 if agent_method(&v) == Some("elicitation/create") {
-                    let request_id = v.get("id").cloned().unwrap_or(Value::Null);
+                    // `elicitation/create` is a REQUEST — the agent blocks on the answer. If the
+                    // `id` member is ABSENT the frame is a notification and there is nobody to
+                    // answer, so raising a human prompt for it would only strand the human; skip
+                    // it. An explicit `"id": null` IS a request and is served normally
+                    // (Copilot review, core#293).
+                    let Some(request_id) = answerable_id(&v).cloned() else {
+                        continue 'exec;
+                    };
                     let schema = &v["params"]["requestedSchema"];
                     let message = v["params"]["message"].as_str().unwrap_or("");
 
                     // Guard 1: elicitation disabled for this epoch/adapter → immediate cancel.
                     if !elicitation_enabled {
-                        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-                        let _ =
-                            rpc_respond(&mut proc.stdin, &request_id, json!({"action":"cancel"}));
+                        // The turn CONTINUES after this cancel, so a lost write is not
+                        // best-effort: it leaves the agent blocked on an elicitation nobody will
+                        // ever answer. Surface it (Copilot review, core#293).
+                        respond_or_note(
+                            &mut proc.stdin,
+                            &write_lock,
+                            &request_id,
+                            json!({"action":"cancel"}),
+                            "an elicitation this adapter is not allowed to raise",
+                            &mut output,
+                            MAX_OUT,
+                        );
                         continue 'exec;
                     }
 
@@ -2173,11 +2292,14 @@ prior output you are reviewing, testing, or revising."
                     let (prop_name, prop_type) = match validate_elicitation_schema(schema) {
                         Some(v) => v,
                         None => {
-                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-                            let _ = rpc_respond(
+                            respond_or_note(
                                 &mut proc.stdin,
+                                &write_lock,
                                 &request_id,
                                 json!({"action":"cancel"}),
+                                "an elicitation with an unsupported schema",
+                                &mut output,
+                                MAX_OUT,
                             );
                             continue 'exec;
                         }
@@ -2202,11 +2324,15 @@ prior output you are reviewing, testing, or revising."
                         Some(r) => r,
                         None => {
                             // Epoch was cancelled (suppressed creation) — cancel and continue.
-                            let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-                            let _ = rpc_respond(
+                            // The turn continues, so a lost write blocks the agent: surface it.
+                            respond_or_note(
                                 &mut proc.stdin,
+                                &write_lock,
                                 &request_id,
                                 json!({"action":"cancel"}),
+                                "an elicitation raised on a cancelled epoch",
+                                &mut output,
+                                MAX_OUT,
                             );
                             continue 'exec;
                         }
@@ -2243,6 +2369,11 @@ prior output you are reviewing, testing, or revising."
                             elicitation_timed_out = true;
                             elicit_action = "cancel".to_string();
                             elicit_reason = "timeout".to_string();
+                            // `let _ =` is CORRECT here (Copilot review, core#293): the turn
+                            // deadline has already expired and this path unwinds into
+                            // `timed_out` regardless. The cancel is a courtesy to an adapter we
+                            // are about to abandon — a failed write changes no outcome and has
+                            // no reader, since the turn is already reported as a timeout.
                             let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                             let _ = rpc_respond(
                                 &mut proc.stdin,
@@ -2260,6 +2391,10 @@ prior output you are reviewing, testing, or revising."
                                 elicit_action = "cancel".to_string();
                                 elicit_reason = "teardown".to_string();
                                 drop(m);
+                                // Best-effort by design (Copilot review, core#293): the actor is
+                                // draining and this session is being torn down, so the adapter
+                                // is going away whether or not the cancel lands. Nothing would
+                                // read a surfaced error — the turn ends as "teardown".
                                 let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                                 let _ = rpc_respond(
                                     &mut proc.stdin,
@@ -2340,6 +2475,9 @@ prior output you are reviewing, testing, or revising."
                                 elicitation_timed_out = true;
                                 elicit_action = "cancel".to_string();
                                 elicit_reason = "teardown".to_string();
+                                // Best-effort by design (Copilot review, core#293): the epoch has
+                                // already been cleaned up and this path unwinds the turn as
+                                // "teardown"; a failed cancel changes nothing downstream.
                                 let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
                                 let _ = rpc_respond(
                                     &mut proc.stdin,
@@ -2368,17 +2506,24 @@ prior output you are reviewing, testing, or revising."
                                 if let Some(method) = agent_method(&v2) {
                                     match method {
                                         // Second elicitation/create during suspension → cancel.
+                                        // Only a REQUEST can be cancelled: an id-less
+                                        // notification has no reply address, while an explicit
+                                        // `"id": null` is a request and IS answered.
                                         "elicitation/create" => {
-                                            let nested_id =
-                                                v2.get("id").cloned().unwrap_or(Value::Null);
-                                            let _wl = write_lock
-                                                .lock()
-                                                .unwrap_or_else(|p| p.into_inner());
-                                            let _ = rpc_respond(
-                                                &mut proc.stdin,
-                                                &nested_id,
-                                                json!({"action":"cancel"}),
-                                            );
+                                            if let Some(nested_id) = answerable_id(&v2).cloned() {
+                                                // The turn continues after this cancel, so a lost
+                                                // write leaves the agent blocked — surface it.
+                                                respond_or_note(
+                                                    &mut proc.stdin,
+                                                    &write_lock,
+                                                    &nested_id,
+                                                    json!({"action":"cancel"}),
+                                                    "a nested elicitation raised during a \
+                                                     suspended turn",
+                                                    &mut output,
+                                                    MAX_OUT,
+                                                );
+                                            }
                                         }
                                         "session/update" => {
                                             handle_update(
@@ -2406,21 +2551,21 @@ prior output you are reviewing, testing, or revising."
                                             );
                                         }
                                         // Unknown request → explicit refusal; unknown
-                                        // notification (no id) → ignored.
+                                        // NOTIFICATION (the `id` member is absent) → ignored.
+                                        // An explicit `"id": null` is a request, so it is
+                                        // refused rather than dropped (Copilot review).
                                         other => {
-                                            let req_id =
-                                                v2.get("id").cloned().unwrap_or(Value::Null);
-                                            if !req_id.is_null() {
-                                                let _wl = write_lock
-                                                    .lock()
-                                                    .unwrap_or_else(|p| p.into_inner());
-                                                let _ = rpc_respond_error(
+                                            if let Some(req_id) = answerable_id(&v2).cloned() {
+                                                refuse_or_note(
                                                     &mut proc.stdin,
+                                                    &write_lock,
                                                     &req_id,
-                                                    METHOD_NOT_FOUND_CODE,
                                                     &format!(
                                                         "wicked-core does not implement `{other}`"
                                                     ),
+                                                    &format!("the unhandled request `{other}`"),
+                                                    &mut output,
+                                                    MAX_OUT,
                                                 );
                                             }
                                         }
@@ -2531,28 +2676,20 @@ prior output you are reviewing, testing, or revising."
                         // turn timeout with nothing naming why — the precise failure mode this
                         // issue is about. A future ACP method now degrades to a refusal.
                         other => {
-                            let req_id = v.get("id").cloned().unwrap_or(Value::Null);
-                            if !req_id.is_null() {
-                                let respond_err = {
-                                    let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-                                    rpc_respond_error(
-                                        &mut proc.stdin,
-                                        &req_id,
-                                        METHOD_NOT_FOUND_CODE,
-                                        &format!("wicked-core does not implement `{other}`"),
-                                    )
-                                    .err()
-                                };
-                                if let Some(e) = respond_err {
-                                    let note = format!(
-                                        "\n[wicked-core] could not refuse the unhandled request \
-                                         `{other}`: {e}. The agent is blocked on it and this turn \
-                                         will time out."
-                                    );
-                                    append_within_cap(&mut output, &note, MAX_OUT);
-                                }
+                            if let Some(req_id) = answerable_id(&v).cloned() {
+                                refuse_or_note(
+                                    &mut proc.stdin,
+                                    &write_lock,
+                                    &req_id,
+                                    &format!("wicked-core does not implement `{other}`"),
+                                    &format!("the unhandled request `{other}`"),
+                                    &mut output,
+                                    MAX_OUT,
+                                );
                             }
-                            // Unknown NOTIFICATIONS (method, no id) block nobody — ignore them.
+                            // Unknown NOTIFICATIONS — the `id` member ABSENT, per JSON-RPC 2.0
+                            // §4.1 — block nobody, so they are ignored. A request carrying an
+                            // explicit `"id": null` is NOT one of those and is refused above.
                         }
                     }
                     continue 'exec;
@@ -2664,7 +2801,10 @@ fn answer_permission_request<W: Write>(
     output: &mut String,
     max_out: usize,
 ) {
-    let Some(req_id) = frame.get("id").cloned() else {
+    // `request_id` — not a raw `get("id")` — so the "notification ⇒ no answer" rule is decided in
+    // ONE place: the `id` member being ABSENT means nothing to answer, while an explicit
+    // `"id": null` is a real request and is answered with a null-id response (Copilot review).
+    let Some(req_id) = answerable_id(frame).cloned() else {
         return; // a permission NOTIFICATION is not a thing; nothing to answer.
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
@@ -2675,17 +2815,15 @@ fn answer_permission_request<W: Write>(
     // NOT `let _ =`. A failed write leaves the agent blocked until the turn times out, and the
     // reason is the only thing that explains the stall — dropping it turns a broken pipe into
     // "the model was slow" (review).
-    let respond_err = {
-        let _wl = write_lock.lock().unwrap_or_else(|p| p.into_inner());
-        rpc_respond(stdin, &req_id, result).err()
-    };
-    if let Some(e) = respond_err {
-        let note = format!(
-            "\n[wicked-core] could not answer a permission request: {e}. The agent is blocked on \
-             it and this turn will time out."
-        );
-        append_within_cap(output, &note, max_out);
-    }
+    respond_or_note(
+        stdin,
+        write_lock,
+        &req_id,
+        result,
+        "a permission request",
+        output,
+        max_out,
+    );
 }
 
 /// Process one `session/update` notification — extract text chunks and usage.
@@ -6185,12 +6323,194 @@ sleep 30
         assert_eq!(parsed["result"]["action"], "cancel");
     }
 
-    /// `rpc_respond` is a no-op for a null id (JSON-RPC notifications must not be responded to).
+    /// SEMANTICS CHANGE (Copilot review, core#293). This test previously asserted the opposite —
+    /// `rpc_respond_ignores_null_id`: a null id was treated as "notification, stay silent".
+    ///
+    /// That conflated two different frames. JSON-RPC 2.0 §4.1 defines a notification as a request
+    /// with the `id` member ABSENT; `"id": null` is a permitted request id (§5.1 even REQUIRES
+    /// error responses to echo null when the id is undeterminable). Under the old rule an agent
+    /// that sent a real request with an explicit null id got no answer and blocked for the whole
+    /// turn — the same silent-drop class this PR removes. Notifications are now filtered
+    /// structurally by `answerable_id`/`is_notification` at the dispatchers, so the responders
+    /// answer every id they are handed, `null` included.
     #[test]
-    fn rpc_respond_ignores_null_id() {
+    fn rpc_respond_answers_an_explicit_null_id() {
         let mut buf: Vec<u8> = Vec::new();
-        rpc_respond(&mut buf, &serde_json::Value::Null, serde_json::json!({})).unwrap();
-        assert!(buf.is_empty(), "null id must produce no output");
+        rpc_respond(
+            &mut buf,
+            &serde_json::Value::Null,
+            serde_json::json!({"ok": true}),
+        )
+        .unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&buf).unwrap().trim_end())
+                .expect("an explicit null id is a request and must be answered");
+        assert_eq!(parsed["id"], serde_json::Value::Null, "id must echo null");
+        assert_eq!(parsed["result"]["ok"], true);
+
+        // Same for the refusal path.
+        let mut ebuf: Vec<u8> = Vec::new();
+        rpc_respond_error(
+            &mut ebuf,
+            &serde_json::Value::Null,
+            METHOD_NOT_FOUND_CODE,
+            "nope",
+        )
+        .unwrap();
+        let eparsed: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&ebuf).unwrap().trim_end()).unwrap();
+        assert_eq!(eparsed["id"], serde_json::Value::Null);
+        assert_eq!(eparsed["error"]["code"], METHOD_NOT_FOUND_CODE);
+    }
+
+    /// The classifier that keeps the two apart: ABSENCE of the `id` member, never its value.
+    #[test]
+    fn notification_is_absent_id_not_null_id() {
+        let notification = serde_json::json!({"jsonrpc":"2.0","method":"some/note","params":{}});
+        assert!(is_notification(&notification));
+        assert!(answerable_id(&notification).is_none());
+
+        let null_id_request =
+            serde_json::json!({"jsonrpc":"2.0","id":null,"method":"some/req","params":{}});
+        assert!(
+            !is_notification(&null_id_request),
+            "an explicit null id is a REQUEST, not a notification"
+        );
+        assert_eq!(
+            answerable_id(&null_id_request),
+            Some(&serde_json::Value::Null)
+        );
+
+        let numeric = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"some/req"});
+        assert!(!is_notification(&numeric));
+        assert_eq!(answerable_id(&numeric), Some(&serde_json::json!(7)));
+
+        // A RESPONSE is not agent-originated, so it is never a notification.
+        let response = serde_json::json!({"jsonrpc":"2.0","id":7,"result":{}});
+        assert!(!is_notification(&response));
+    }
+
+    /// End-to-end at the handshake dispatcher: a TRUE notification (id member absent) draws no
+    /// output, while a request carrying an EXPLICIT null id is answered — and in both cases the
+    /// wait continues until the real response arrives.
+    #[test]
+    fn rpc_expect_answers_explicit_null_id_but_ignores_true_notifications() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // 1. A true notification — no `id` member at all.
+        tx.send(r#"{"jsonrpc":"2.0","method":"some/futureNotification","params":{}}"#.to_string())
+            .unwrap();
+        // 2. A REQUEST whose id is explicitly null — must be answered, not dropped.
+        tx.send(
+            r#"{"jsonrpc":"2.0","id":null,"method":"some/futureRequest","params":{}}"#.to_string(),
+        )
+        .unwrap();
+        // 3. The genuine handshake response.
+        tx.send(r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s3"}}"#.to_string())
+            .unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let v = rpc_expect(&rx, &mut sink, 3, Duration::from_secs(5)).unwrap();
+        assert_eq!(v["result"]["sessionId"], "s3");
+
+        let written = std::str::from_utf8(&sink).unwrap();
+        let lines: Vec<&str> = written.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one frame must be written: the notification is ignored and the \
+             explicit-null-id request is refused — got {written:?}"
+        );
+        let refusal: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            refusal["id"],
+            serde_json::Value::Null,
+            "the refusal must echo the request's null id: {refusal}"
+        );
+        assert_eq!(refusal["error"]["code"], METHOD_NOT_FOUND_CODE);
+    }
+
+    /// A failed refusal write during the handshake is PROPAGATED, not discarded (Copilot review).
+    /// Swallowing it left the agent blocked and the handshake died in a timeout naming nothing.
+    #[test]
+    fn rpc_expect_propagates_a_failed_refusal_write() {
+        /// A writer whose every write fails, standing in for a closed adapter stdin.
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        tx.send(
+            r#"{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":{}}"#
+                .to_string(),
+        )
+        .unwrap();
+        tx.send(r#"{"jsonrpc":"2.0","id":4,"result":{"sessionId":"never"}}"#.to_string())
+            .unwrap();
+
+        let err = rpc_expect(&rx, &mut BrokenPipe, 4, Duration::from_secs(5))
+            .expect_err("a failed refusal write must fail the handshake immediately");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("session/request_permission") && msg.contains("closed"),
+            "the error must name the method and the io failure: {msg}"
+        );
+    }
+
+    /// The turn loop's counterpart of the same two rules, via the shared permission handler:
+    /// an explicit null id is answered, an absent id is not, and a failed write is NAMED in the
+    /// turn output instead of being discarded (Copilot review, core#293).
+    #[test]
+    fn permission_handler_answers_null_id_skips_notifications_and_notes_write_failures() {
+        let lock = Mutex::new(());
+        let mut output = String::new();
+
+        // 1. Explicit null id ⇒ a request; it must be answered with a null-id response.
+        let mut sink: Vec<u8> = Vec::new();
+        let frame = serde_json::json!({
+            "jsonrpc":"2.0","id":null,"method":"session/request_permission",
+            "params":{"options":[{"optionId":"allow","kind":"allow_once"}]}
+        });
+        answer_permission_request(&mut sink, &lock, None, &frame, &mut output, 4096);
+        let answered: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&sink).unwrap().trim_end())
+                .expect("an explicit null id must still be answered");
+        assert_eq!(answered["id"], serde_json::Value::Null);
+
+        // 2. `id` member ABSENT ⇒ a notification; nothing to answer.
+        let mut sink2: Vec<u8> = Vec::new();
+        let note_frame = serde_json::json!({
+            "jsonrpc":"2.0","method":"session/request_permission","params":{}
+        });
+        answer_permission_request(&mut sink2, &lock, None, &note_frame, &mut output, 4096);
+        assert!(sink2.is_empty(), "a notification must draw no response");
+
+        // 3. A failed write is surfaced in the output, not swallowed.
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        answer_permission_request(&mut BrokenPipe, &lock, None, &frame, &mut output, 4096);
+        assert!(
+            output.contains("could not answer a permission request") && output.contains("closed"),
+            "a lost permission response must be named in the output: {output:?}"
+        );
     }
 
     #[test]
