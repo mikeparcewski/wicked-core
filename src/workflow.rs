@@ -106,11 +106,21 @@ pub struct GovernanceContext {
     ///
     /// GATE-HOOK ONLY. Never hand this path to anything the worker controls.
     pub db_path: String,
-    /// ABSOLUTE path of the REPO-LOCAL code graph (`<repo_root>/.codegraph/estate.db`, spelled once at
-    /// `code_graph::CODE_GRAPH_DB_REL`) the worker's own estate MCP server opens — the one store it is
+    /// ABSOLUTE path of the code graph the worker's own estate MCP server opens — the one store it is
     /// allowed to write. `None` ⇒ the run targets no registered repo, or that repo has never been
     /// indexed, and the launcher then injects NO estate MCP at all rather than substituting
     /// [`Self::db_path`] or pointing at a database nothing has written (FINDING-069).
+    ///
+    /// TWO STORES CAN APPEAR HERE, and `actor::run_code_graph_db` chooses between them:
+    /// - the REPO-LOCAL graph (`<repo_root>/.codegraph/estate.db`, spelled once at
+    ///   `code_graph::CODE_GRAPH_DB_REL`) — the default, and the only one before crew#326;
+    /// - the run's PROJECT graph — one co-located database holding every member repo — when the
+    ///   launcher bound one and the engine could vouch for it (`actor::project_code_graph_db`).
+    ///
+    /// The project graph is SHARED: every concurrent run in the project opens the same file, and
+    /// this handle is writable. That is a wider blast radius than the repo-local case, where the
+    /// worst a worker could do to a graph was to its own repo's — see the write-scope note on
+    /// `execute_wrapped::repo_estate_mcp_parts`.
     ///
     /// `#[serde(default)]` so a `DispatchedTask` serialized by an older peer still deserializes — as
     /// `None`, i.e. no estate tools, which is the safe reading of "this peer never told me a repo".

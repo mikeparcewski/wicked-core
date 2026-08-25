@@ -1079,13 +1079,23 @@ fn resolve_estate_mcp_exe() -> String {
     "wicked-estate-mcp".to_string()
 }
 
-/// The `(command, args)` for the estate MCP server a governed worker should get, scoped to the
-/// repo's OWN graph (FINDING-122). `None` when there is no repo graph: a scratch or the daemon store
-/// is worse than nothing — tools that answer "not found" for a symbol the repo plainly has is how an
+/// The `(command, args)` for the estate MCP server a governed worker should get, over the graph the
+/// engine vouched for (FINDING-122). `None` when there is none: a scratch or the daemon store is
+/// worse than nothing — tools that answer "not found" for a symbol the repo plainly has is how an
 /// agent concludes the code does not exist (estate's R3), and handing over the daemon store is the
 /// FINDING-067 wipe. Shared by BOTH governed paths so the wrapped `settings.json` and the ACP
-/// `session/new` inject the SAME server against the SAME repo store; each caller formats its own
+/// `session/new` inject the SAME server against the SAME store; each caller formats its own
 /// protocol shape (claude's keyed object vs the ACP array).
+///
+/// WHICH graph this is, is decided upstream by `actor::run_code_graph_db`: the run repo's own, or —
+/// for a run filed into a project whose co-located graph the engine could verify — the PROJECT's.
+///
+/// WRITE SCOPE, unresolved. The handle is writable, and on the project path the file is shared by
+/// every concurrent run in the project. The repo-local case bounded the damage to the graph of the
+/// repo the worker was already editing; the project case does not. A worker that points the estate
+/// indexer at this `--db` (FINDING-067's exact behaviour) with only its own repo checked out gets
+/// the indexer's delete-sweep over the SIBLING repos' rows as well. Nothing here prevents that
+/// today — the binding is verified, the subsequent writes are not.
 pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(String, Vec<String>)> {
     code_graph_db
         .map(str::trim)
@@ -3764,5 +3774,283 @@ mod tests {
             !rules.iter().any(|r| r.starts_with("Read(")),
             "with no home there is no path to fence, and a rule claiming otherwise would be a lie: {rules:?}"
         );
+    }
+}
+
+/// END-TO-END: the project graph a launcher binds becomes the `--db` in the worker's real
+/// `settings.json`.
+///
+/// Every other test of this seam stops somewhere short of that. The unit tests call
+/// `actor::project_code_graph_db` directly; the proof harness stops at `repo_estate_mcp_parts`;
+/// `arm_input_governance_writes_a_pretool_settings_file_and_returns_env` starts from a
+/// hand-built `GovernanceContext`. None of them shows the value SURVIVING the whole trip, and the
+/// trip is where a binding gets dropped: `LaunchSpec` → actor → `AgentSession` → `dispatch_unit`
+/// → `run_code_graph_db` → `StepInput.governance` → `arm_input_governance` →
+/// `repo_estate_mcp_parts` → `mcpServers.wicked-estate.args` → the argv a worker is launched with.
+///
+/// This drives a REAL run through a REAL actor against a file-backed store (so governance arms),
+/// with a real registered git repo that has its OWN graph on disk — so a broken preference shows
+/// up as the repo graph rather than as nothing — and reads the answer out of the settings file the
+/// engine wrote.
+#[cfg(test)]
+mod project_graph_end_to_end_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use wicked_apps_core::{open_store, GraphWrite};
+    use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+    use wicked_council::{AgenticCli, CouncilTask};
+
+    struct StubDispatcher;
+    impl Dispatcher for StubDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
+            Some(Vote {
+                cli: cli.key.clone(),
+                recommendation: "x".into(),
+                top_risk: "none".into(),
+                change_my_mind: "no".into(),
+                disqualifier: None,
+                confidence: Confidence::default(),
+                provenance: "stub".into(),
+            })
+        }
+    }
+
+    fn cli(key: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: "unused {PROMPT}".into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+        }
+    }
+
+    /// The LAST hop, done for real: arm governance exactly as the wrapped path does and record the
+    /// `--db` the estate MCP server is given in the settings file the engine writes.
+    struct ArmingRunner {
+        mcp_db: Arc<Mutex<Vec<Option<String>>>>,
+    }
+    impl StepRunner for ArmingRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let gov = input
+                .governance
+                .clone()
+                .expect("a governed unit on a file-backed store must carry a governance context");
+            let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
+            let settings_db = match arm_input_governance(input, &gov, &mut argv) {
+                Ok(_) => {
+                    let settings: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&argv[2]).unwrap()).unwrap();
+                    settings["mcpServers"]["wicked-estate"]["args"][1]
+                        .as_str()
+                        .map(str::to_string)
+                }
+                Err(e) => panic!("arming failed: {e}"),
+            };
+            self.mcp_db.lock().unwrap().push(settings_db);
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "ok".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    fn git_repo(dir: &std::path::Path) {
+        let git = |args: &[&str]| {
+            use wicked_apps_core::spawn::HardenedCommand;
+            // spawn-audit: test-only — a throwaway fixture repo, hardened like every other spawn.
+            std::process::Command::new("git")
+                .hardened()
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("README.md"), "hello").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+    }
+
+    fn graph_with(path: &std::path::Path, labels: &[&str]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut g = open_store(Some(path.to_str().unwrap())).unwrap();
+        for label in labels {
+            g.set_file_digest(&format!("{label}/src/lib.rs"), "d1")
+                .unwrap();
+        }
+    }
+
+    fn wait_terminal(core: &crate::Core, run_id: &str) -> Option<crate::SessionStatus> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if let Ok(v) = core.sessions_detail() {
+                if let Some(s) = v.iter().find(|s| s.session.id == run_id) {
+                    if matches!(
+                        s.session.status,
+                        crate::SessionStatus::Completed
+                            | crate::SessionStatus::Failed
+                            | crate::SessionStatus::Cancelled
+                    ) {
+                        return Some(s.session.status);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        None
+    }
+
+    /// `project_graph` on the LaunchSpec ⇒ that database is the worker's estate `--db`. Omit it and
+    /// the very same run gets the repo's own graph — the before/after in one test, so a
+    /// preference that silently stopped working cannot pass as "the fallback is fine".
+    #[test]
+    fn the_bound_project_graph_reaches_the_workers_settings_json_as_its_estate_db() {
+        seed_probe_for_test(
+            &resolve_wicked_core_exe(),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
+        let dir = std::env::temp_dir().join(format!("wicked-pge2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let repo_root = dir.join("alpha");
+        git_repo(&repo_root);
+        // The run repo's OWN graph, on disk and healthy — so "bound to the project graph" is a
+        // CHOICE between two live stores, not the only answer available.
+        let repo_graph = repo_root.join(".codegraph").join("estate.db");
+        graph_with(&repo_graph, &["alpha"]);
+
+        // The project's co-located graph: the run's repo AND a sibling it could never see before.
+        let project_db = dir
+            .join("project-graphs")
+            .join("proj")
+            .join("code-graph.db");
+        graph_with(&project_db, &["alpha", "beta"]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let core = crate::Core::spawn_with_engine(
+            dir.join("estate.db").to_string_lossy().into_owned(),
+            Arc::new(StubDispatcher),
+            Arc::new(ArmingRunner {
+                mcp_db: seen.clone(),
+            }),
+        );
+        let repo = core
+            .register_repo(crate::RepoSpec {
+                name: "alpha".into(),
+                root_path: repo_root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            })
+            .unwrap();
+
+        let spec = |id: &str, pg: Option<crate::ProjectGraphBinding>| crate::LaunchSpec {
+            project_id: None,
+            problem: "Do the one task".into(),
+            clis: vec![cli("a")],
+            entity_mode: crate::EntityMode::Shared,
+            session_id: id.into(),
+            human_confirm: crate::HumanConfirm::None,
+            repo_ref: Some(repo.id.clone()),
+            workflow: None,
+            extra_write_roots: Vec::new(),
+            project_graph: pg,
+        };
+
+        // 1. BOUND.
+        core.launch_run(spec(
+            "pge2e-bound",
+            Some(crate::ProjectGraphBinding {
+                db_path: project_db.to_string_lossy().into_owned(),
+                repo_label: Some("alpha".into()),
+            }),
+        ))
+        .unwrap();
+        assert!(
+            wait_terminal(&core, "pge2e-bound").is_some(),
+            "the bound run never reached a terminal status"
+        );
+        let bound: Vec<Option<String>> = seen.lock().unwrap().drain(..).collect();
+        let want_project = std::fs::canonicalize(&project_db)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            !bound.is_empty(),
+            "no unit was dispatched, so nothing was proved"
+        );
+        for got in &bound {
+            assert_eq!(
+                got.as_deref(),
+                Some(want_project.as_str()),
+                "the worker's estate MCP must open the PROJECT's graph; settings.json said {got:?}"
+            );
+        }
+
+        // 2. UNBOUND — the identical run, minus the binding.
+        core.launch_run(spec("pge2e-unbound", None)).unwrap();
+        assert!(
+            wait_terminal(&core, "pge2e-unbound").is_some(),
+            "the unbound run never reached a terminal status"
+        );
+        let unbound: Vec<Option<String>> = seen.lock().unwrap().drain(..).collect();
+        let want_repo = repo_graph.to_string_lossy().into_owned();
+        assert!(!unbound.is_empty());
+        for got in &unbound {
+            assert_eq!(
+                got.as_deref(),
+                Some(want_repo.as_str()),
+                "with no binding the worker must get the repo's OWN graph, exactly as before"
+            );
+        }
+
+        // 3. REFUSED — a binding the engine cannot vouch for degrades to the repo graph, and never
+        //    to the operational store the run is being driven from.
+        core.launch_run(spec(
+            "pge2e-refused",
+            Some(crate::ProjectGraphBinding {
+                db_path: dir.join("estate.db").to_string_lossy().into_owned(),
+                repo_label: Some("alpha".into()),
+            }),
+        ))
+        .unwrap();
+        assert!(wait_terminal(&core, "pge2e-refused").is_some());
+        let refused: Vec<Option<String>> = seen.lock().unwrap().drain(..).collect();
+        assert!(!refused.is_empty());
+        for got in &refused {
+            assert_eq!(
+                got.as_deref(),
+                Some(want_repo.as_str()),
+                "a binding naming the engine's own store must degrade to the repo graph \
+                 (FINDING-067); settings.json said {got:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

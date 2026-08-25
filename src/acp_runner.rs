@@ -1528,8 +1528,9 @@ fn start_acp_process(
     }
 
     // `mcpServers` is required by the ACP spec — native ACP agents (copilot --acp)
-    // reject session/new with -32602 when it is absent; bridges ignore it. When the run has a repo
-    // graph, advertise the estate MCP server scoped to it (FINDING-122) — the ACP stdio-server shape
+    // reject session/new with -32602 when it is absent; bridges ignore it. When the run has a code
+    // graph the engine vouched for — its repo's own, or its project's (`actor::run_code_graph_db`)
+    // — advertise the estate MCP server over it (FINDING-122) — the ACP stdio-server shape
     // ({name,command,args,env}) of the same parts the wrapped path writes into settings.json. A
     // repo-less session keeps the empty array exactly as before.
     let mcp_servers = crate::execute_wrapped::repo_estate_mcp_parts(code_graph_db)
