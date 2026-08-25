@@ -3849,8 +3849,17 @@ mod project_graph_end_to_end_tests {
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
             let settings_db = match arm_input_governance(input, &gov, &mut argv) {
                 Ok(_) => {
+                    // FIND the settings path rather than indexing `argv[2]` (Copilot on #299).
+                    // The index is a guess about where arming inserted `--settings`; if arming
+                    // ever inserts elsewhere this reads the PROMPT as json and the test fails
+                    // with a parse error that says nothing about the real change.
+                    let settings_path = argv
+                        .iter()
+                        .position(|a| a == "--settings")
+                        .and_then(|i| argv.get(i + 1))
+                        .expect("arming must insert `--settings <path>` into the argv");
                     let settings: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(&argv[2]).unwrap()).unwrap();
+                        serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
                     settings["mcpServers"]["wicked-estate"]["args"][1]
                         .as_str()
                         .map(str::to_string)
@@ -3867,7 +3876,12 @@ mod project_graph_end_to_end_tests {
                 usage: None,
                 files: Vec::new(),
                 tools: Vec::new(),
-                governed: false,
+                // TRUE — this runner armed input governance, so it must report the unit as
+                // governed (Copilot on #299). Reporting `false` told the actor to skip
+                // governance evidence folding and verification, which is precisely the path
+                // this end-to-end test exists to exercise: a test that opts out of the
+                // machinery it is testing can only ever confirm the half that still runs.
+                governed: true,
             }
         }
     }
@@ -3876,13 +3890,23 @@ mod project_graph_end_to_end_tests {
         let git = |args: &[&str]| {
             use wicked_apps_core::spawn::HardenedCommand;
             // spawn-audit: test-only — a throwaway fixture repo, hardened like every other spawn.
-            std::process::Command::new("git")
+            let out = std::process::Command::new("git")
                 .hardened()
                 .arg("-C")
                 .arg(dir)
                 .args(args)
                 .output()
-                .unwrap()
+                .unwrap();
+            // Assert the git command SUCCEEDED, not merely that it launched (Copilot on #299).
+            // `.output().unwrap()` only unwraps the spawn; a missing binary or a permission
+            // problem then surfaces much later as a confusing assertion about graph contents
+            // instead of "git init failed, here is stderr".
+            assert!(
+                out.status.success(),
+                "git {args:?} failed in {dir:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
         };
         std::fs::create_dir_all(dir).unwrap();
         git(&["init", "-q"]);

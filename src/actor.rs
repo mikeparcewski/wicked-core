@@ -195,8 +195,13 @@ const GRAPH_BIND_WARN_CAP: usize = 1024;
 /// from success right up until a worker concludes that a sibling repo does not exist. The remedy
 /// differs per cause, so the cause is in the message rather than a generic "graph unavailable".
 fn warn_bind_refused(run_id: &str, db: &str, why: &str) {
+    // `{run_id:?}` / `{db:?}`, NOT `{}` (Copilot on #299). Both are launcher-supplied and a Unix
+    // path may legally contain control characters — a newline in a path would forge a second log
+    // line, and terminal escapes would render as control codes in an operator's console. Debug
+    // formatting escapes them and makes the value's extent unambiguous, which matters most for a
+    // message whose whole job is to tell an operator what they actually passed.
     let msg = format!(
-        "wicked-core: run {run_id} is NOT bound to the project code graph `{db}` — {why}. Its \
+        "wicked-core: run {run_id:?} is NOT bound to the project code graph {db:?} — {why}. Its \
          governed workers fall back to the run repo's OWN graph, or to no estate tools at all if \
          that repo has never been indexed."
     );
