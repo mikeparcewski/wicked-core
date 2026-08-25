@@ -23,10 +23,12 @@ on:
   # tag and watch it fail — which is exactly what happened twice for the aarch64-linux
   # leg, each time publishing nothing while four legs went green. A build you cannot
   # rehearse is a build you debug in production.
-  # No inputs: a manual run NEVER publishes. Publishing is gated on the ref being a
-  # `core-ts-v*` TAG, because that tag is where the version comes from — a publish from a
-  # branch has no version to publish AS (Copilot on #302). Dispatching against a tag ref
-  # still publishes, which is the one case where the version exists.
+  # Manual runs take no inputs; what they do depends entirely on the REF they run against:
+  #   - a branch  -> builds every matrix leg, publishes nothing (the rehearsal)
+  #   - a `core-ts-v*` tag -> builds and publishes, same as a tag push
+  # Publishing is gated on the ref alone because the tag is where the version comes from, so
+  # a branch has nothing to publish AS. There is deliberately no override input: it could only
+  # ever publish an unversioned build (Copilot on #302).
   workflow_dispatch:
 
 # `id-token: write` powers npm provenance attestations (--provenance) and OIDC trusted publishing.
