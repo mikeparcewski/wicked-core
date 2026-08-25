@@ -52,14 +52,21 @@ jobs:
           # Linux x64: native on ubuntu-latest.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-          # Linux arm64: cross-compiled with zig as the linker (cargo-zigbuild) — no Docker/QEMU.
-          # zig >= 0.14 is REQUIRED: rustc emits `--fix-cortex-a53-843419` for this target (an
-          # erratum workaround), and zig 0.13's linker rejects it outright —
-          # `error: unsupported linker arg: --fix-cortex-a53-843419`. 0.7.0 built because the
-          # rustc of the day did not pass it; nothing in this repo changed.
+          # Linux arm64: cross-compiled with the GNU cross-toolchain, NOT zig.
+          #
+          # rustc emits `--fix-cortex-a53-843419` for this target — a GNU binutils erratum flag.
+          # zig links with lld, which does not implement it and rejects unknown args outright
+          # (`error: unsupported linker arg: --fix-cortex-a53-843419`). That is not a version
+          # problem: 0.13 and 0.14.1 both fail identically, so no zig bump fixes it. 0.6.3 and
+          # 0.7.0 published because the rustc of the day did not pass the flag.
+          #
+          # `aarch64-linux-gnu-gcc` accepts it natively, being the toolchain the flag belongs to.
+          # Note `cargo-zigbuild` — installed here previously — filters unsupported args and would
+          # have absorbed this, but `napi build --zig` shells out to plain `cargo build` with a
+          # generated linker script, so it never ran.
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
-            cross: zig
+            cross: gnu
           # Windows x64: native MSVC on windows-latest.
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
@@ -83,18 +90,15 @@ jobs:
           rustup default stable
           rustup target add "${{ matrix.target }}"
 
-      # zig cross-toolchain only for the aarch64-linux leg.
-      - name: Set up zig
-        if: matrix.cross == 'zig'
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          # See the aarch64 note in the matrix: 0.13.0 rejects `--fix-cortex-a53-843419`.
-          version: 0.14.1
-
-      - name: Install cargo-zigbuild
-        if: matrix.cross == 'zig'
+      # GNU cross-toolchain for the aarch64-linux leg. Also provides the cross C compiler the
+      # native deps need (ring, libsqlite3-sys, zstd-sys, onig_sys, esaxx-rs all build C).
+      - name: Install the aarch64 GNU cross-toolchain
+        if: matrix.cross == 'gnu'
         shell: bash
-        run: cargo install cargo-zigbuild --locked
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       # --omit=optional: the platform packages in optionalDependencies aren't published yet (and we're
       # building them here, not consuming them). We only need the @napi-rs/cli devDependency.
@@ -106,8 +110,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.cross || '' }}" = "zig" ]; then
-            npx napi build --platform --release --target "${{ matrix.target }}" --zig
+          if [ "${{ matrix.cross || '' }}" = "gnu" ]; then
+            # Rust links through the cross gcc; cc-rs picks up CC_/CXX_ for the C deps.
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+            export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+            export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+            npx napi build --platform --release --target "${{ matrix.target }}"
           else
             npx napi build --platform --release --target "${{ matrix.target }}"
           fi
