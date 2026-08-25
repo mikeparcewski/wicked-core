@@ -367,9 +367,11 @@ fn project_code_graph_db(
             warn_bind_refused(
                 run_id,
                 db,
-                "there is no file at that path — the project graph has not been built yet, or was \
-                 deleted. Build it with POST /api/v1/projects/<id>/graph/refresh; launching a run \
-                 never indexes on its own",
+                "there is no file at that path — the project graph has not been built yet, was \
+                 deleted, or the store MOVED (the binding records where crew put the graph when \
+                 the run launched; it is re-checked every dispatch, so a relocated store falls \
+                 back here rather than opening something stale). Build or relocate it with \
+                 POST /api/v1/projects/<id>/graph/refresh; launching a run never indexes on its own",
             );
             return None;
         }
