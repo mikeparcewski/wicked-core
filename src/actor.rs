@@ -132,8 +132,10 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
     Some(crate::workflow::GovernanceContext {
         db_path: abs,
         // Deliberately not resolved here: this function only knows the process-wide store path, not
-        // which repo a run targets. `dispatch_unit` fills it in from the session's registered repo
-        // (`repo_code_graph_db`). Leaving it `None` is the safe default — no repo, no estate MCP.
+        // which repo a run targets nor which project it was filed into. `dispatch_unit` fills it in
+        // from the session (`run_code_graph_db`: the project's graph when the engine can vouch for
+        // one, else the registered repo's own). Leaving it `None` is the safe default — nothing
+        // vouched for, no estate MCP.
         code_graph_db: None,
         // Per-RUN, not process-wide: `dispatch_unit` fills this from the session (core#259).
         // Empty here means an ungoverned/standalone context widens nothing.
@@ -156,10 +158,342 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
 /// store in reach is the operational one, and a worker with a writable handle to it can delete the
 /// platform's entire state (FINDING-067). Fewer tools is a degraded run; a wiped store is a dead one,
 /// and a silently empty one is worse than both because it looks like an answer.
+///
+/// Still true after the project binding, because this stayed the LAST arm: [`run_code_graph_db`]
+/// tries `project_code_graph_db` first and falls through to here, so a `None` from this function is
+/// still the end of the chain and still means no estate MCP. Anything added in front of it must
+/// preserve that — a new arm appended AFTER this one would quietly turn every refusal above into a
+/// fallback onto something nobody vouched for.
 fn repo_code_graph_db(store: &dyn GraphStore, repo_ref: Option<&str>) -> Option<String> {
     let repo = crate::repo::get_repo(store, repo_ref?).ok().flatten()?;
     let path = crate::code_graph::existing_code_graph(std::path::Path::new(&repo.root_path))?;
     Some(path.to_string_lossy().into_owned())
+}
+
+thread_local! {
+    /// Project-graph refusals already reported on this actor thread. A refused binding is
+    /// re-evaluated on EVERY unit dispatch, so without this an operator whose graph was never
+    /// built reads the same paragraph once a step. Keyed on the whole message, so a binding that
+    /// later fails for a DIFFERENT reason still gets its own line.
+    static GRAPH_BIND_WARNED: std::cell::RefCell<HashSet<String>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// How many distinct refusal messages the dedup set remembers before it starts over.
+///
+/// The key carries the run id, so the set grows once per REFUSED RUN and never shrinks — on a
+/// daemon that stays up for weeks that is an unbounded hold on memory for the sole purpose of not
+/// repeating itself. A cap turns it into a bounded cache: on overflow it is emptied, so at worst an
+/// operator sees one already-seen paragraph again after a thousand distinct refusals. Repeating a
+/// line is a nuisance; growing without limit in the process that owns every run is not.
+const GRAPH_BIND_WARN_CAP: usize = 1024;
+
+/// Say — once — that a run is NOT getting the project graph its launcher bound, and why.
+///
+/// Silence is the wrong default here for the same reason it was wrong for ungoverned runs
+/// (council [3]/[13]): the fallback is a working run with NARROWER tools, which is indistinguishable
+/// from success right up until a worker concludes that a sibling repo does not exist. The remedy
+/// differs per cause, so the cause is in the message rather than a generic "graph unavailable".
+fn warn_bind_refused(run_id: &str, db: &str, why: &str) {
+    let msg = format!(
+        "wicked-core: run {run_id} is NOT bound to the project code graph `{db}` — {why}. Its \
+         governed workers fall back to the run repo's OWN graph, or to no estate tools at all if \
+         that repo has never been indexed."
+    );
+    GRAPH_BIND_WARNED.with(|w| {
+        let mut seen = w.borrow_mut();
+        if seen.len() >= GRAPH_BIND_WARN_CAP {
+            seen.clear();
+        }
+        if seen.insert(msg.clone()) {
+            eprintln!("{msg}");
+        }
+    });
+}
+
+/// Resolve `p` to a comparable absolute path: canonical when it exists, lexically absolute when it
+/// does not. A sidecar store that has not been created yet still has to be refusable by name.
+fn comparable_path(p: &str) -> String {
+    let path = std::path::Path::new(p);
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return c.to_string_lossy().into_owned();
+    }
+    if path.is_absolute() {
+        return p.to_string();
+    }
+    std::env::current_dir()
+        .map(|d| d.join(path).to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string())
+}
+
+/// Do two paths name the SAME FILE — the same bytes, not the same spelling?
+///
+/// `canonicalize` already collapses a SYMLINK, so `link -> store` compares equal by string. It does
+/// NOT collapse a HARD link: `ln store innocent-looking.db` makes two equally-real directory entries
+/// for one inode, each canonicalizing to itself, and a comparison of the two canonical paths says
+/// they are different files. They are not. A binding naming the second one would hand a worker a
+/// writable handle to the first one's bytes — FINDING-067 through the one door a path comparison
+/// cannot see. Device + inode is the identity the filesystem itself uses, so it is the identity
+/// this guard uses.
+///
+/// UNIX ONLY. The Windows equivalents (`volume_serial_number` / `file_index`) are still unstable in
+/// std, so there this returns `false` and the path comparison in [`is_operational_store`] stands
+/// alone. The residual gap is an NTFS hard link planted inside the daemon's own state directory.
+#[cfg(unix)]
+fn is_same_file(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        // An unreadable side proves nothing either way; the caller's path tests still apply.
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_same_file(_a: &str, _b: &str) -> bool {
+    false
+}
+
+/// The sidecar suffixes the engine hangs off its store base — `crate::memory::mem_path`,
+/// `crate::knowledge` and `crate::event_log::log_root` each spell one. Named here ONLY for the
+/// hard-link identity test, which needs concrete paths to `stat`; the by-name refusal below stays
+/// the open-ended `<base>.` prefix so a sidecar added later is refused without touching this list.
+const SIDECAR_SUFFIXES: &[&str] = &[".mem", ".knowledge", ".events"];
+
+/// Is `candidate` the engine's OWN operational store, or one of its sidecars?
+///
+/// `operational` is the actor's store spec. [`sidecar_base`] turns it into the filesystem base the
+/// `.mem` / `.knowledge` / `.events` sidecars hang off — including for a `postgres://` store, whose
+/// graph is remote but whose sidecars are still local files a worker could delete.
+///
+/// Two independent tests, because either alone has a blind spot. BY NAME: the trailing `.` prefix
+/// test is deliberately WIDER than the three sidecars named today — a sidecar added later would
+/// otherwise be handed out until someone remembered to extend the list, and the cost of
+/// over-refusing (`core.db.backup` say) is a run with narrower tools, while the cost of
+/// under-refusing is FINDING-067 — a worker with a writable handle to the platform's whole state,
+/// which deleted 833 nodes including the run that triggered it. BY IDENTITY: [`is_same_file`],
+/// because a hard link is a second true name for the same inode and no name-based test can see it.
+/// Wrong in the safe direction on purpose, twice.
+fn is_operational_store(candidate: &str, operational: &str) -> bool {
+    let base = comparable_path(&sidecar_base(operational));
+    if candidate == base || candidate == comparable_path(operational) {
+        return true;
+    }
+    // Identity, not spelling. Checked against the store itself and each sidecar that exists.
+    if is_same_file(candidate, &base) || is_same_file(candidate, operational) {
+        return true;
+    }
+    if SIDECAR_SUFFIXES
+        .iter()
+        .any(|s| is_same_file(candidate, &format!("{base}{s}")))
+    {
+        return true;
+    }
+    candidate.starts_with(&format!("{base}."))
+}
+
+/// The PROJECT's co-located code graph for this run, when — and only when — the engine can VOUCH
+/// for it. `None` means "fall back to the per-repo graph", never "the launcher was wrong to ask".
+///
+/// # Why this verifies instead of trusting
+///
+/// [`crate::project::ProjectGraphBinding`] explains why the LAUNCHER supplies the path: it owns the
+/// project graph's location, membership and labelling, and an engine that re-derived them would
+/// drift from it. But a supplied path is an ASSERTION, and this is the value that becomes the
+/// governed worker's estate MCP `--db` — the store its SearchEntity / BlastRadius / TraverseGraph
+/// answer from, with a handle that can write. Both of this seam's standing findings are reachable
+/// through a bad one: hand over the operational store and a worker can wipe the platform
+/// (FINDING-067); hand over a database that does not describe this repo and every query answers
+/// "nothing here" about code sitting in the worktree (FINDING-069). So every arm below is a
+/// refusal backed by something read off the disk, not off the launch options.
+///
+/// # The arms
+///
+/// 1. **Not absolute** — the worker's `cwd` is its worktree, so a relative path opens a different
+///    store, or a freshly-created empty one. (Finding #6, the same rule `in_process_governance`
+///    applies to the governance db.)
+/// 2. **Not an existing file** — the project graph was never built, or was deleted. Creates
+///    nothing, exactly like [`crate::code_graph::existing_code_graph`]: "no graph" and "graph right
+///    here" must never be the same value again.
+/// 3. **The operational store** — see [`is_operational_store`].
+/// 4. **Holds no indexed files** — an empty database is worse than no tools, because it looks like
+///    an answer. This is the FINDING-069 check generalised: existence is necessary, not sufficient,
+///    since a crashed or interrupted index leaves a real file behind with a schema and no rows.
+/// 5. **Does not hold THIS RUN'S repo** — the sharpest case, and the reason `repo_label` is on the
+///    wire at all. A project graph that holds `wicked-crew` but not `wicked-core` is a perfectly
+///    healthy database, and binding it to a run working in `wicked-core` would give that worker
+///    tools that confidently deny the existence of the function under its cursor. Narrower and
+///    true beats broader and lying, so the run falls back to its own repo's graph.
+///
+/// Note what is NOT an arm: a graph missing some OTHER member repo, or one indexed at an older
+/// commit. Both are bound. A graph holding this run's repo is a strict superset of the per-repo
+/// graph on the axis that matters — the worker's own code is described truthfully — and refusing on
+/// partial membership would hand back a NARROWER store on the grounds that a wider one was not
+/// wide enough. Staleness is not an arm either: every code graph is stale the moment it is written,
+/// the per-repo graph this falls back to has exactly the same drift with no check at all, and
+/// gating on it would disqualify the project graph after a single commit while buying no safety.
+///
+/// # Cost
+///
+/// One read-only SQLite open plus `SELECT path FROM files` per unit dispatch, re-done rather than
+/// cached because the file can be deleted or rebuilt mid-run and a cached "vouched" would outlive
+/// the evidence for it. That is milliseconds against a dispatch that spawns an agentic CLI, and it
+/// keeps this function's answer as fresh as `repo_code_graph_db`'s `is_file()`.
+fn project_code_graph_db(
+    binding: Option<&crate::project::ProjectGraphBinding>,
+    repo_ref: Option<&str>,
+    operational_db: Option<&str>,
+    run_id: &str,
+) -> Option<String> {
+    let binding = binding?;
+    let db = binding.db_path.trim();
+    if db.is_empty() {
+        return None;
+    }
+
+    if !std::path::Path::new(db).is_absolute() {
+        warn_bind_refused(
+            run_id,
+            db,
+            "the path is not absolute, and a governed worker runs with cwd = its own worktree, so \
+             it would resolve to a different store than the launcher meant",
+        );
+        return None;
+    }
+
+    let resolved = match std::fs::canonicalize(db) {
+        Ok(p) if p.is_file() => p.to_string_lossy().into_owned(),
+        _ => {
+            warn_bind_refused(
+                run_id,
+                db,
+                "there is no file at that path — the project graph has not been built yet, was \
+                 deleted, or the store MOVED (the binding records where crew put the graph when \
+                 the run launched; it is re-checked every dispatch, so a relocated store falls \
+                 back here rather than opening something stale). Build or relocate it with \
+                 POST /api/v1/projects/<id>/graph/refresh; launching a run never indexes on its own",
+            );
+            return None;
+        }
+    };
+
+    // No known operational store ⇒ no way to prove this is not it ⇒ refuse. The actor arms
+    // `GOV_DB_PATH` before it serves a single command, so on the dispatch path this is always
+    // known; failing closed costs nothing there and keeps the FINDING-067 guard from being
+    // quietly skippable by any future caller that forgets to pass it.
+    let Some(operational) = operational_db else {
+        warn_bind_refused(
+            run_id,
+            db,
+            "the engine's own store path is unknown here, so it cannot prove this binding is not \
+             that store — a writable handle to it lets a worker delete the platform's state \
+             (FINDING-067)",
+        );
+        return None;
+    };
+    if is_operational_store(&resolved, operational) {
+        warn_bind_refused(
+            run_id,
+            db,
+            "it IS the engine's operational store (or one of its sidecars) — a worker holding a \
+             writable handle to that store can delete the platform's entire state (FINDING-067)",
+        );
+        return None;
+    }
+
+    let store = match wicked_apps_core::open_store_ro(Some(&resolved)) {
+        Ok(s) => s,
+        Err(e) => {
+            warn_bind_refused(
+                run_id,
+                db,
+                &format!("it could not be opened read-only ({e})"),
+            );
+            return None;
+        }
+    };
+    let files = match store.indexed_files() {
+        Ok(f) => f,
+        Err(e) => {
+            warn_bind_refused(
+                run_id,
+                db,
+                &format!("its indexed-file list could not be read ({e})"),
+            );
+            return None;
+        }
+    };
+    if files.is_empty() {
+        warn_bind_refused(
+            run_id,
+            db,
+            "it holds no indexed files. An EMPTY graph is worse than no graph: every query answers \
+             \"nothing here\" about code that plainly exists, which is how an agent concludes the \
+             code is not there (FINDING-069)",
+        );
+        return None;
+    }
+
+    // A repo-less run has no own-repo to be wrong about, so a non-empty graph is all there is to
+    // check. A run that TARGETS a repo must find that repo in there.
+    if repo_ref.is_some() {
+        let label = binding.repo_label.as_deref().unwrap_or_default().trim();
+        if label.is_empty() {
+            warn_bind_refused(
+                run_id,
+                db,
+                "the binding carries no repo label for a run that targets a repo, so the engine \
+                 cannot check that the graph describes the code the worker will edit",
+            );
+            return None;
+        }
+        // wicked-estate namespaces a co-located repo's paths as `<label>/…`, so this is the whole
+        // membership test. A project graph built WITHOUT `--repo` labels has unprefixed paths and
+        // fails here too — correct, because an unlabelled graph cannot be attributed to a repo.
+        let prefix = format!("{label}/");
+        if !files.iter().any(|f| f.starts_with(&prefix)) {
+            warn_bind_refused(
+                run_id,
+                db,
+                &format!(
+                    "it does not hold this run's own repo (no files under the label `{label}`) — \
+                     most likely the repo was attached to the project after the last refresh. \
+                     Binding it would give the worker tools that deny the existence of the code in \
+                     its own worktree, so the narrower per-repo graph is used instead"
+                ),
+            );
+            return None;
+        }
+    }
+
+    Some(resolved)
+}
+
+/// The code graph a governed WORKER's estate MCP opens for this run: the project's co-located graph
+/// when the engine can vouch for it, else the run repo's own.
+///
+/// The fallback direction is the doctrine of this whole seam, restated: NARROWER AND TRUE beats
+/// WIDER AND WRONG, and both beat handing over a store the engine cannot vouch for.
+///
+/// Deliberately NOT used for the coverage validator (`repo_code_graph_db` at the
+/// `apply_and_finish_unit` call site keeps that job). Coverage is a GATE: it counts behaviour-bearing
+/// nodes to decide whether a phase did its work. Measuring that over a graph containing sibling
+/// repos would let repo B's annotations satisfy a criterion pinned to repo A — a gate that gets
+/// easier to pass the more repos a project has. The worker's READ tools want the widest truthful
+/// view; the evaluator's MEASUREMENT wants exactly the repo under test. Same value, two jobs, and
+/// only one of them should widen.
+fn run_code_graph_db(
+    store: &dyn GraphStore,
+    session: &AgentSession,
+    operational_db: Option<&str>,
+) -> Option<String> {
+    project_code_graph_db(
+        session.project_graph.as_ref(),
+        session.repo_ref.as_deref(),
+        operational_db,
+        &session.id,
+    )
+    .or_else(|| repo_code_graph_db(store, session.repo_ref.as_deref()))
 }
 
 /// The FILESYSTEM base the per-core sidecars hang off: `<base>.mem`, `<base>.knowledge` and
@@ -484,6 +818,9 @@ pub(crate) fn run(
                     workflow,
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
                     extra_write_roots: _, // legacy sync path widens nothing (core#259)
+                    // Legacy path has no repo and therefore no project graph to bind; it also
+                    // never reaches the governed dispatch that would read one.
+                    project_graph: _,
                 } = spec;
                 // Legacy straight-through path: runs to completion on this thread (stub = fast).
                 let res = pipeline::run_session(
@@ -633,6 +970,7 @@ pub(crate) fn run(
                         workdir: None, // resolved off-thread; updated in WorktreeReady
                         repo_ref: repo_ref.clone(),
                         extra_write_roots: spec.extra_write_roots.clone(),
+                        project_graph: spec.project_graph.clone(),
                         archived_at: None,
                         archive_note: None,
                     };
@@ -710,6 +1048,7 @@ pub(crate) fn run(
                     repo_ref,
                     workdir,
                     spec.extra_write_roots.clone(),
+                    spec.project_graph.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
@@ -868,6 +1207,7 @@ pub(crate) fn run(
                     repo_ref.clone(),
                     workdir.clone(),
                     spec.extra_write_roots.clone(),
+                    spec.project_graph.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
                     Some(&registry),
@@ -2636,6 +2976,7 @@ pub(crate) fn launch_run_inner(
         repo_ref,
         workdir,
         spec.extra_write_roots.clone(),
+        spec.project_graph.clone(),
         spec.workflow.as_deref(),
         dispatcher,
         &mut |ev| emit(subscribers, ev),
@@ -3679,6 +4020,12 @@ fn apply_step_result(
     //
     // No fallback to the actor's store: without a repo there is no graph to measure, and the validator
     // script fails closed on a missing carrier, which is the correct outcome for a pinned phase.
+    //
+    // And NO widening to the project graph either, even for a run bound to one. This is the
+    // EVALUATOR's store, and coverage counts behaviour-bearing nodes to decide whether a phase did
+    // its work: measured over a graph holding sibling repos, repo B's annotations would help repo
+    // A's criterion pass, so the gate would get easier the more repos a project has. The worker's
+    // read tools widen (`run_code_graph_db` at the dispatch site); the measurement must not.
     let coverage_db = repo_code_graph_db(store, session.repo_ref.as_deref());
     let outcome = pipeline::apply_and_finish_unit(
         store,
@@ -4297,7 +4644,15 @@ fn dispatch_unit(
         // The repo-local graph is resolved HERE (the actor thread holds the store; the worker does not)
         // so the worker's estate tools never need — and never get — the operational store.
         governance: in_process_governance().map(|g| crate::workflow::GovernanceContext {
-            code_graph_db: repo_code_graph_db(store, session.repo_ref.as_deref()),
+            // The PROJECT's graph when the run is bound to one the engine can vouch for, else this
+            // repo's own — see `run_code_graph_db`. The operational store path comes from the
+            // actor's thread-local so the FINDING-067 guard has something to compare against; this
+            // closure runs on the actor thread, where it is always armed.
+            code_graph_db: run_code_graph_db(
+                store,
+                &session,
+                GOV_DB_PATH.with(|c| c.borrow().clone()).as_deref(),
+            ),
             // From the SESSION, so a resume/redrive re-arms exactly the boundary the launch
             // declared and validated (core#259).
             extra_write_roots: session.extra_write_roots.clone(),
@@ -5439,6 +5794,7 @@ mod gate_pause_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         }
@@ -5600,6 +5956,7 @@ mod terminal_gate_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -5730,6 +6087,7 @@ mod substance_gate_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -5952,6 +6310,7 @@ mod seat_failover_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -6583,6 +6942,7 @@ mod def_gate_disclosure_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -6679,6 +7039,7 @@ mod def_gate_disclosure_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -6929,6 +7290,7 @@ mod terminal_worktree_reap_tests {
             workdir: Some(wt.to_string_lossy().to_string()),
             repo_ref: Some(entry.id),
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -7070,6 +7432,7 @@ mod terminal_worktree_reap_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };
@@ -7162,6 +7525,7 @@ mod worker_code_graph_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         }
@@ -7349,6 +7713,741 @@ mod worker_code_graph_tests {
     }
 }
 
+/// WHICH graph a governed worker's estate MCP opens when the run is filed into a project — and,
+/// mostly, when it refuses to open the one it was handed.
+///
+/// Every test here is a degradation case, because the interesting half of this seam is the refusals:
+/// binding the right graph buys a wider view, but binding a wrong one costs either the platform's
+/// state (FINDING-067) or the worker's belief that its own code exists (FINDING-069).
+#[cfg(test)]
+mod project_graph_binding_tests {
+    use super::*;
+    use crate::project::ProjectGraphBinding;
+    use crate::repo::{RepoEntry, REPO_ENTRY};
+    use wicked_apps_core::{open_store, GraphWrite, ToNode};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wicked-pgtest-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn register(store: &mut dyn GraphStore, id: &str, root: &std::path::Path) {
+        let entry = RepoEntry {
+            id: id.into(),
+            name: id.into(),
+            root_path: root.to_string_lossy().into_owned(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+        };
+        crate::domain::put_node(store, entry.to_node()).unwrap();
+        assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
+    }
+
+    /// A real estate database holding `labels`, each namespaced the way `index --repo <label>` does.
+    /// `set_file_digest` is the indexer-only call that creates a `files` row, which is exactly what
+    /// `indexed_files()` reads — so this builds the evidence the verification actually consults
+    /// rather than a fixture shaped like it.
+    fn graph_with(path: &std::path::Path, labels: &[&str]) {
+        let mut g = open_store(Some(path.to_str().unwrap())).unwrap();
+        for label in labels {
+            g.set_file_digest(&format!("{label}/src/lib.rs"), "d1")
+                .unwrap();
+            g.set_file_digest(&format!("{label}/src/main.rs"), "d2")
+                .unwrap();
+        }
+    }
+
+    /// An estate database that opens fine and knows nothing — a crashed or interrupted index.
+    fn empty_graph(path: &std::path::Path) {
+        let _ = open_store(Some(path.to_str().unwrap())).unwrap();
+    }
+
+    /// A minimal executing session; each test overrides only the two fields this seam reads.
+    fn session_fixture() -> AgentSession {
+        AgentSession {
+            id: "run-fixture".into(),
+            workflow_id: "wf-run-fixture".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: Vec::new(),
+            status: SessionStatus::Executing,
+            human_confirm: crate::domain::HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+        }
+    }
+
+    fn bind(db: &std::path::Path, label: Option<&str>) -> ProjectGraphBinding {
+        ProjectGraphBinding {
+            db_path: db.to_string_lossy().into_owned(),
+            repo_label: label.map(str::to_string),
+        }
+    }
+
+    /// An operational store path that is a real file, so the FINDING-067 comparison has both sides.
+    fn operational(dir: &std::path::Path) -> String {
+        let p = dir.join("core.db");
+        let _ = open_store(Some(p.to_str().unwrap())).unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// The operational store AS FINDING-067 ACTUALLY FOUND IT: a governed worker had already
+    /// pointed the estate indexer at it, so it holds `files` rows under the run's own label.
+    ///
+    /// This distinction is the whole reason the guard exists, and testing against an EMPTY
+    /// operational store tests nothing: the empty-graph arm refuses it first, so the FINDING-067
+    /// arm can be deleted outright and the assertion still passes. Verified by mutation — with
+    /// `is_operational_store` forced to `false`, every test in this module using a pristine
+    /// `operational()` stayed green. Seeded, the refusal has only one possible author.
+    fn operational_that_was_indexed_into(dir: &std::path::Path, label: &str) -> String {
+        let p = dir.join("core.db");
+        let mut g = open_store(Some(p.to_str().unwrap())).unwrap();
+        g.set_file_digest(&format!("{label}/src/lib.rs"), "d1")
+            .unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// THE POINT OF THE CHANGE: a run in a project whose graph holds its repo gets the PROJECT's
+    /// database, and every co-located sibling comes with it.
+    #[test]
+    fn a_run_whose_project_graph_holds_its_repo_is_bound_to_the_project_graph() {
+        let dir = scratch("bound");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-core", "wicked-crew"]);
+        let op = operational(&dir);
+
+        let got = project_code_graph_db(
+            Some(&bind(&db, Some("wicked-core"))),
+            Some("wicked-core"),
+            Some(&op),
+            "r1",
+        );
+
+        assert_eq!(
+            got.as_deref(),
+            Some(
+                std::fs::canonicalize(&db)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "the worker must get the PROJECT's graph, not the run repo's own"
+        );
+        // And it is genuinely multi-repo: the sibling the run does not target is in there too, which
+        // is the whole reason to prefer it.
+        let g = wicked_apps_core::open_store_ro(got.as_deref()).unwrap();
+        let files = g.indexed_files().unwrap();
+        assert!(
+            files.iter().any(|f| f.starts_with("wicked-crew/")),
+            "the bound graph should carry the sibling repo's files: {files:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STALE — the run's repo was attached to the project after the last refresh.
+    ///
+    /// The graph is perfectly healthy and holds a different repo. Binding it would hand a worker
+    /// editing `wicked-core` a set of tools that answer "no such symbol" for everything in front of
+    /// it, which is FINDING-069's failure arriving through a door FINDING-069 did not close.
+    #[test]
+    fn a_project_graph_missing_this_runs_own_repo_is_refused() {
+        let dir = scratch("stale");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-crew"]); // wicked-core attached since the last refresh
+        let op = operational(&dir);
+
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&db, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r2",
+            ),
+            None,
+            "a graph that does not describe the worker's own repo must not be bound"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PARTIAL — the graph holds this run's repo but is missing another member.
+    ///
+    /// Bound anyway, and deliberately so: it is a strict superset of the per-repo graph on the axis
+    /// that matters. Refusing here would return a NARROWER store because a wider one was not wide
+    /// enough, which is the opposite of the trade this seam makes everywhere else.
+    #[test]
+    fn a_project_graph_missing_some_other_member_is_still_bound() {
+        let dir = scratch("partial");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-core"]); // wicked-crew is a member but not yet indexed
+        let op = operational(&dir);
+
+        assert!(
+            project_code_graph_db(
+                Some(&bind(&db, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r3",
+            )
+            .is_some(),
+            "partial membership is a narrower answer, not a wrong one"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ABSENT — the project graph was never built. A launch does not index (that would make
+    /// launching a run a silent N-repo indexing job), so this is the common first-run state.
+    #[test]
+    fn a_project_graph_that_was_never_built_is_refused() {
+        let dir = scratch("absent");
+        let op = operational(&dir);
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&dir.join("code-graph.db"), Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r4",
+            ),
+            None
+        );
+        // Saying no did not create it. A resolver that creates as it reads is how the empty
+        // database appeared the first time.
+        assert!(!dir.join("code-graph.db").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EMPTY — the file exists, opens, and holds nothing. Worse than no tools, because it looks
+    /// like an answer.
+    ///
+    /// Asserted for a REPO-LESS run on purpose. For a repo run the label arm refuses an empty graph
+    /// anyway (nothing starts with `<label>/`), so `files.is_empty()` could be deleted and a repo
+    /// -flavoured version of this test would stay green — verified by mutation. A repo-less run
+    /// skips the label arm entirely, so this arm is the only thing standing between it and an
+    /// empty store, and that is the shape this pins.
+    #[test]
+    fn a_graph_that_holds_no_indexed_files_is_refused() {
+        let dir = scratch("empty");
+        let db = dir.join("code-graph.db");
+        empty_graph(&db);
+        let op = operational(&dir);
+
+        assert_eq!(
+            project_code_graph_db(Some(&bind(&db, None)), None, Some(&op), "r5"),
+            None,
+            "an empty graph must never be bound, least of all to the run with no label arm in \
+             front of it (FINDING-069)"
+        );
+        // …and a repo run is refused too, by whichever arm gets there first.
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&db, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r5b",
+            ),
+            None,
+            "an empty graph must never be bound (FINDING-069)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING-067. The one refusal that is about damage rather than accuracy: a worker with a
+    /// writable handle to the engine's own store can delete the platform's state, including the run
+    /// that is holding the handle.
+    #[test]
+    fn the_engines_operational_store_is_refused_as_a_project_graph() {
+        let dir = scratch("finding067");
+        // Seeded so the earlier arms CANNOT be what refuses: this store is non-empty and holds files
+        // under this run's own label, i.e. it passes every check except the one under test.
+        let op = operational_that_was_indexed_into(&dir, "wicked-core");
+
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(std::path::Path::new(&op), Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r6",
+            ),
+            None,
+            "the operational store must never be handed to a worker"
+        );
+
+        // Its sidecars are refused on the same grounds — they are local files holding the platform's
+        // memory and knowledge whether the graph itself is sqlite or postgres. Seeded for the same
+        // reason: an empty sidecar would be refused by the empty-graph arm regardless.
+        let mem = format!("{op}.mem");
+        {
+            let mut g = open_store(Some(&mem)).unwrap();
+            g.set_file_digest("wicked-core/src/lib.rs", "d1").unwrap();
+        }
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(std::path::Path::new(&mem), Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r7",
+            ),
+            None,
+            "a sidecar of the operational store is still the operational store"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A HARD LINK to the operational store is still the operational store.
+    ///
+    /// `canonicalize` resolves symlinks, which is why the test above it passes — but a hard link is
+    /// a second equally-real directory entry for the same inode, and it canonicalizes to ITSELF.
+    /// Before [`is_same_file`] this bound: the engine handed the worker a writable handle to the
+    /// platform's operational store under an innocent name, which is FINDING-067 exactly.
+    #[test]
+    #[cfg(unix)]
+    fn a_hard_link_to_the_operational_store_is_refused_too() {
+        let dir = scratch("hardlink067");
+        let op = operational_that_was_indexed_into(&dir, "wicked-core");
+        let link = dir.join("looks-like-a-project-graph.db");
+        std::fs::hard_link(&op, &link).unwrap();
+
+        // The repo run: arms 4 and 5 both pass (the store is non-empty and holds `wicked-core/`),
+        // so only the FINDING-067 arm can refuse this.
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&link, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r6a",
+            ),
+            None,
+            "a hard link is a second name for the same inode, not a different file"
+        );
+        // And the repo-LESS run, which skips the label arm entirely and is therefore the case with
+        // the least standing between a bad path and a writable handle.
+        assert_eq!(
+            project_code_graph_db(Some(&bind(&link, None)), None, Some(&op), "r6b"),
+            None,
+            "a repo-less run has fewer arms in front of it, not a weaker FINDING-067 guard"
+        );
+
+        // A hard link to a SIDECAR is refused on the same identity grounds.
+        let mem = format!("{op}.mem");
+        {
+            let mut g = open_store(Some(&mem)).unwrap();
+            g.set_file_digest("wicked-core/src/lib.rs", "d1").unwrap();
+        }
+        let mem_link = dir.join("also-innocent.db");
+        std::fs::hard_link(&mem, &mem_link).unwrap();
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&mem_link, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r6c",
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlink is not a way around the FINDING-067 guard: both sides are canonicalized, so the
+    /// comparison is between the files, not between the names used to reach them.
+    #[test]
+    fn a_symlink_to_the_operational_store_is_refused_too() {
+        let dir = scratch("symlink067");
+        // Seeded, so the empty-graph and label arms cannot be what refuses this.
+        let op = operational_that_was_indexed_into(&dir, "wicked-core");
+        let link = dir.join("innocent-looking.db");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&op, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&op, &link).unwrap();
+
+        #[cfg(unix)]
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&link, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r8",
+            ),
+            None,
+            "canonicalization must see through the symlink to the store underneath"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative path would resolve against the WORKER's cwd — its own worktree — so it names a
+    /// different store than the launcher meant, or brings an empty one into being. Same rule
+    /// `in_process_governance` applies to the governance db (finding #6).
+    ///
+    /// The relative path here resolves to a PERFECTLY HEALTHY graph from this process's cwd. That
+    /// is the whole point: a relative path that resolves to nothing is refused by the
+    /// does-it-exist arm, so pointing at a non-existent one would let `is_absolute` be deleted with
+    /// the test still green (verified by mutation). Only a relative path that WOULD have worked
+    /// puts the absolute-path arm on the hook.
+    #[test]
+    fn a_relative_path_is_refused() {
+        let dir = scratch("relative");
+        let op = operational(&dir);
+
+        // Build the graph under this process's cwd so the relative spelling really does resolve.
+        // Cargo runs test binaries with cwd = the package root; if that ever stops being true the
+        // relative path resolves to nothing and this falls back to asserting the weaker arm.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = std::path::Path::new("target").join("wicked-pgtest-relative-arm");
+        std::fs::create_dir_all(cwd.join(&rel)).unwrap();
+        let rel_db = rel.join("code-graph.db");
+        graph_with(&cwd.join(&rel_db), &["wicked-core"]);
+        assert!(
+            cwd.join(&rel_db).is_file(),
+            "fixture must exist for this test to mean anything"
+        );
+
+        assert_eq!(
+            project_code_graph_db(
+                Some(&ProjectGraphBinding {
+                    db_path: rel_db.to_string_lossy().into_owned(),
+                    repo_label: Some("wicked-core".into()),
+                }),
+                Some("wicked-core"),
+                Some(&op),
+                "r9",
+            ),
+            None,
+            "a relative path is refused even when it happens to resolve here — the WORKER's cwd is \
+             not this one"
+        );
+
+        let _ = std::fs::remove_dir_all(cwd.join(&rel));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A DIRECTORY sitting where the graph should be. `canonicalize` succeeds — it is a real path —
+    /// so the not-an-existing-file arm's `Err` branch never sees it and the `is_file()` predicate
+    /// is what refuses; handing a directory to the estate MCP as `--db` is how an empty database
+    /// gets created where a graph was expected.
+    ///
+    /// Honest about its own strength: deleting `is_file()` does NOT fail this test, because
+    /// `open_store_ro` then refuses the directory a few lines later with a different message.
+    /// `is_file()` is defence in depth, not the only thing standing here; what this pins is the
+    /// OUTCOME — a directory is never bound — which is the part that must not regress.
+    #[test]
+    fn a_directory_where_the_graph_should_be_is_refused() {
+        let dir = scratch("dir-not-file-project");
+        let db = dir.join("code-graph.db");
+        std::fs::create_dir_all(&db).unwrap();
+        let op = operational(&dir);
+
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&db, Some("wicked-core"))),
+                Some("wicked-core"),
+                Some(&op),
+                "r9b",
+            ),
+            None,
+            "a directory is not a graph, however canonical its path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run that targets a repo but arrives with no label cannot be checked, and an unverifiable
+    /// binding is exactly what the verification exists to stop. Fails closed.
+    #[test]
+    fn a_repo_run_with_no_label_is_refused_even_when_the_graph_is_healthy() {
+        let dir = scratch("nolabel");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-core"]);
+        let op = operational(&dir);
+
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&db, None)),
+                Some("wicked-core"),
+                Some(&op),
+                "r10"
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repo-LESS run has no own-repo to be wrong about, so a non-empty graph is all there is to
+    /// check and it gets bound. (Today such a run gets nothing at all.)
+    #[test]
+    fn a_repoless_run_needs_only_a_non_empty_graph() {
+        let dir = scratch("repoless");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-core"]);
+        let op = operational(&dir);
+
+        assert!(project_code_graph_db(Some(&bind(&db, None)), None, Some(&op), "r11").is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no operational store path there is no way to prove the binding is NOT that store, so the
+    /// FINDING-067 guard cannot run — and a guard that cannot run must not be treated as passed.
+    #[test]
+    fn an_unknown_operational_store_fails_closed() {
+        let dir = scratch("noop");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-core"]);
+
+        assert_eq!(
+            project_code_graph_db(
+                Some(&bind(&db, Some("wicked-core"))),
+                Some("wicked-core"),
+                None,
+                "r12"
+            ),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No binding at all is the pre-change world, byte for byte: `repo_code_graph_db` decides, and
+    /// every one of its `None` arms still means NO estate tools.
+    #[test]
+    fn an_unbound_run_falls_through_to_the_per_repo_graph() {
+        let dir = scratch("fallthrough");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = dir.join("repo");
+        let repo_graph = root.join(".codegraph").join("estate.db");
+        std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
+        std::fs::write(&repo_graph, b"a file is all this arm checks for").unwrap();
+        register(&mut store, "wicked-core", &root);
+        let op = operational(&dir);
+
+        let session = AgentSession {
+            repo_ref: Some("wicked-core".into()),
+            project_graph: None,
+            ..session_fixture()
+        };
+        assert_eq!(
+            run_code_graph_db(&store, &session, Some(&op)).as_deref(),
+            Some(repo_graph.to_string_lossy().as_ref()),
+            "an unbound run must behave exactly as it did before this change"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE HEADLINE, at the seam that decides it: when BOTH graphs exist and both are usable, the
+    /// run gets the PROJECT's.
+    ///
+    /// Every other test here reaches `project_code_graph_db` directly or arranges for it to refuse,
+    /// so none of them can tell a working preference from an inverted one — swapping the two arms
+    /// of `run_code_graph_db` left the whole module green (verified by mutation). This is the only
+    /// assertion that fails if the change stops doing the thing it exists to do.
+    #[test]
+    fn the_project_graph_wins_over_a_perfectly_good_per_repo_graph() {
+        let dir = scratch("precedence");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = dir.join("repo");
+        let repo_graph = root.join(".codegraph").join("estate.db");
+        std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
+        graph_with(&repo_graph, &["wicked-core"]);
+        register(&mut store, "wicked-core", &root);
+
+        let project_db = dir.join("code-graph.db");
+        graph_with(&project_db, &["wicked-core", "wicked-crew"]);
+        let op = operational(&dir);
+
+        let session = AgentSession {
+            repo_ref: Some("wicked-core".into()),
+            project_graph: Some(bind(&project_db, Some("wicked-core"))),
+            ..session_fixture()
+        };
+        assert_eq!(
+            run_code_graph_db(&store, &session, Some(&op)).as_deref(),
+            Some(
+                std::fs::canonicalize(&project_db)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "a vouched-for project graph must beat the run repo's own — that is the change"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE FALLBACK, end to end: a run bound to a project graph that does not hold its repo still
+    /// gets its OWN repo's graph. Narrower and true, rather than wider and wrong — and never
+    /// nothing when a truthful narrower store exists.
+    #[test]
+    fn a_refused_binding_falls_back_to_the_runs_own_repo_graph() {
+        let dir = scratch("fallback");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = dir.join("repo");
+        let repo_graph = root.join(".codegraph").join("estate.db");
+        std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
+        std::fs::write(&repo_graph, b"the run repo's own graph").unwrap();
+        register(&mut store, "wicked-core", &root);
+
+        let project_db = dir.join("code-graph.db");
+        graph_with(&project_db, &["wicked-crew"]); // holds a sibling, not this run's repo
+        let op = operational(&dir);
+
+        let session = AgentSession {
+            repo_ref: Some("wicked-core".into()),
+            project_graph: Some(bind(&project_db, Some("wicked-core"))),
+            ..session_fixture()
+        };
+        assert_eq!(
+            run_code_graph_db(&store, &session, Some(&op)).as_deref(),
+            Some(repo_graph.to_string_lossy().as_ref()),
+            "a refused project binding must degrade to the per-repo graph, not to nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// …and when the run's own repo has never been indexed either, the answer is still NO ESTATE
+    /// TOOLS. The project binding adds a preference in front of that decision; it does not create a
+    /// new way to end up holding a store nobody vouched for.
+    #[test]
+    fn a_refused_binding_on_an_unindexed_repo_still_ships_no_estate_mcp() {
+        let dir = scratch("fallback-none");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        register(&mut store, "wicked-core", &root);
+
+        let project_db = dir.join("code-graph.db");
+        graph_with(&project_db, &["wicked-crew"]);
+        let op = operational(&dir);
+
+        let session = AgentSession {
+            repo_ref: Some("wicked-core".into()),
+            project_graph: Some(bind(&project_db, Some("wicked-core"))),
+            ..session_fixture()
+        };
+        assert_eq!(run_code_graph_db(&store, &session, Some(&op)), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PROOF HARNESS — the same seam, driven against databases a REAL `wicked-estate` built.
+    ///
+    /// Ignored by default because it needs artifacts `proof/prove.sh` creates and passes in by env;
+    /// the tests above cover the same arms hermetically. What this adds is that the graphs are the
+    /// real thing — indexed by the installed binary, with real symbols under real `--repo` labels —
+    /// so the label-prefix check is exercised against wicked-estate's actual path spelling rather
+    /// than against a fixture that agrees with my reading of it.
+    ///
+    /// Prints the exact `(command, args)` `repo_estate_mcp_parts` hands the worker for each case.
+    #[test]
+    #[ignore = "proof harness — run via proof/prove.sh, which builds the real graphs it needs"]
+    fn proof_worker_mcp_db_per_case() {
+        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        let project_db = env("WICKED_PROOF_PROJECT_DB");
+        let empty_db = env("WICKED_PROOF_EMPTY_DB");
+        let operational = env("WICKED_PROOF_OPERATIONAL_DB");
+        let repo_root = env("WICKED_PROOF_REPO_ROOT");
+        let own = env("WICKED_PROOF_OWN_LABEL");
+        let absent = env("WICKED_PROOF_ABSENT_LABEL");
+        assert!(
+            !project_db.is_empty() && !operational.is_empty() && !repo_root.is_empty(),
+            "proof harness needs WICKED_PROOF_* env — run it through proof/prove.sh"
+        );
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register(&mut store, "own-repo", std::path::Path::new(&repo_root));
+
+        let session = |pg: Option<ProjectGraphBinding>| AgentSession {
+            repo_ref: Some("own-repo".into()),
+            project_graph: pg,
+            ..session_fixture()
+        };
+        let cases: Vec<(&str, AgentSession)> = vec![
+            (
+                "BOUND: project graph holds this run's repo",
+                session(Some(bind(std::path::Path::new(&project_db), Some(&own)))),
+            ),
+            (
+                "STALE: project graph does not hold this run's repo",
+                session(Some(bind(std::path::Path::new(&project_db), Some(&absent)))),
+            ),
+            (
+                "ABSENT: project graph never built",
+                session(Some(bind(
+                    std::path::Path::new("/nonexistent/code-graph.db"),
+                    Some(&own),
+                ))),
+            ),
+            (
+                "EMPTY: project graph exists and holds nothing",
+                session(Some(bind(std::path::Path::new(&empty_db), Some(&own)))),
+            ),
+            (
+                "FINDING-067: binding names the engine's operational store",
+                session(Some(bind(std::path::Path::new(&operational), Some(&own)))),
+            ),
+            ("UNBOUND: no project graph on the session", session(None)),
+        ];
+
+        println!("\n=== worker estate MCP, per case ===");
+        for (name, s) in cases {
+            let db = run_code_graph_db(&store, &s, Some(&operational));
+            match crate::execute_wrapped::repo_estate_mcp_parts(db.as_deref()) {
+                Some((_exe, args)) => {
+                    println!("{name}\n    --db {}\n", args[1]);
+                }
+                None => println!("{name}\n    NO estate MCP (no vouched-for graph)\n"),
+            }
+        }
+    }
+
+    /// The bound path is what `repo_estate_mcp_parts` turns into the worker's `--db` argument. This
+    /// is the seam the whole change exists to move, so it is asserted rather than assumed.
+    #[test]
+    fn the_bound_path_becomes_the_workers_estate_mcp_db_argument() {
+        let dir = scratch("mcp-args");
+        let db = dir.join("code-graph.db");
+        graph_with(&db, &["wicked-core"]);
+        let op = operational(&dir);
+
+        let bound = project_code_graph_db(
+            Some(&bind(&db, Some("wicked-core"))),
+            Some("wicked-core"),
+            Some(&op),
+            "r13",
+        );
+        let (_exe, args) = crate::execute_wrapped::repo_estate_mcp_parts(bound.as_deref())
+            .expect("a vouched-for graph must produce an estate MCP server");
+        assert_eq!(args[0], "--db");
+        assert_eq!(
+            args[1],
+            std::fs::canonicalize(&db).unwrap().to_string_lossy()
+        );
+
+        // And a refused binding produces no server at all — not a server over some other store.
+        assert!(crate::execute_wrapped::repo_estate_mcp_parts(None).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Layer-3 governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
 #[cfg(test)]
 mod phase_boundary_governance_tests {
@@ -7392,6 +8491,7 @@ mod phase_boundary_governance_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         };

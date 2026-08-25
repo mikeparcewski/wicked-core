@@ -843,6 +843,10 @@ fn launch_from_event(
         // Bus launches declare no deliverable roots in v1 (core#259) — the boundary stays the
         // unit cwd. Wire through `req.args` only with launch-side validation, never implicitly.
         extra_write_roots: Vec::new(),
+        // No project filing on this path (above), so there is no project whose graph to bind:
+        // workers get the run repo's own graph. Binding one would mean minting an estate label
+        // here, and the label rule belongs to whoever owns the project graph — not the bus bridge.
+        project_graph: None,
     };
 
     let (reply, rx) = channel();

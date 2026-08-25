@@ -36,6 +36,42 @@ pub const DEFAULT_PROJECT_ID: &str = "default";
 /// The `member_kind` the engine attaches at launch (ADR §2.2).
 pub const MEMBER_KIND_RUN: &str = "crew.run";
 
+/// WHERE a project's co-located code graph lives, and what THIS RUN'S repo is called inside it.
+///
+/// # Why the launcher supplies this instead of the engine deriving it
+///
+/// The project graph is a CREW artifact. Crew decides its location
+/// (`~/.wicked-crew/project-graphs/<projectId>/code-graph.db`, overridable), which member repos go
+/// in it, when it is refreshed, and — because wicked-estate binds a label to a repo permanently —
+/// what each repo is LABELLED as inside it. For the engine to derive the path it would have to
+/// re-implement all four, and the two implementations would drift the moment crew moved the
+/// directory or changed the label rule. That is not hypothetical: the per-repo graph path already
+/// reached five spellings across crew against a sixth in this engine, and the symptom was graph
+/// queries answering "nothing found" about a repo full of code.
+///
+/// So the launcher OWNS the location and the naming. It does not own whether the run gets the
+/// store: the engine refuses any binding it cannot verify against the database itself
+/// ([`crate::actor`]'s `project_code_graph_db`), because a path is an assertion and the FINDING-067
+/// store-wipe and the FINDING-069 empty-graph are both reachable through one. Crew says WHERE;
+/// the engine decides WHETHER. Neither trusts the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ProjectGraphBinding {
+    /// ABSOLUTE path to the project's co-located graph. Absolute because the governed worker runs
+    /// with `cwd` = its worktree, so a relative path would open a different (or empty) store than
+    /// the launcher meant — the same finding (#6) that made `in_process_governance` canonicalize.
+    pub db_path: String,
+    /// The wicked-estate label the RUN'S OWN repo carries inside `db_path`, which is how the engine
+    /// checks the graph actually describes the code the worker is about to edit: estate namespaces
+    /// a co-located repo's paths as `<label>/…`, so "does this graph know my repo" is answerable
+    /// from the file list without a label registry the engine's estate crate does not expose.
+    ///
+    /// `None` only for a repo-less run, where there is no own-repo to be wrong about. A run that
+    /// TARGETS a repo and arrives with no label is refused rather than bound: an unverifiable
+    /// binding is exactly the case the verification exists for.
+    #[serde(default)]
+    pub repo_label: Option<String>,
+}
+
 /// Project lifecycle: `active ⇄ archived`, no hard delete (ADR §1.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

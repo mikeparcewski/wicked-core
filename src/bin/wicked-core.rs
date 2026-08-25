@@ -392,6 +392,8 @@ fn main() {
                 workflow: flag(&args, "--workflow"),
                 project_id: flag(&args, "--project"),
                 extra_write_roots: Vec::new(),
+                // Stub self-test path — no worker, so nothing would read a graph anyway.
+                project_graph: None,
             });
             println!(
                 "launched {sid} — STUB self-test path (deterministic stub output, no real CLI, no gates); \
@@ -695,6 +697,13 @@ fn run_interactive(core: &Core, args: &[String]) {
         workflow: flag(args, "--workflow"),
         project_id: flag(args, "--project"),
         extra_write_roots: Vec::new(),
+        // `--project` files the run; it does NOT bind a project graph, and this CLI deliberately
+        // has no flag that would. The graph's location, its membership and its estate labels are
+        // the launcher's to know (see `project::ProjectGraphBinding`), and an operator CLI that
+        // guessed `~/.wicked-crew/project-graphs/…` would be the sixth spelling of a path the
+        // engine does not own. A run launched here gets its own repo's graph; launch through
+        // crew's API to get the project's.
+        project_graph: None,
     }) {
         Ok(id) => id,
         Err(e) => {

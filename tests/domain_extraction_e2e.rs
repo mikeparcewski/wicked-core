@@ -343,6 +343,7 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         repo_ref: Some(repo_ref.into()),
         workflow: Some("domain-extraction".into()),
         extra_write_roots: Vec::new(),
+        project_graph: None,
     })
     .expect("launch domain-extraction");
 }

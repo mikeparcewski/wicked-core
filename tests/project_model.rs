@@ -87,6 +87,7 @@ fn spec(session_id: &str, hc: HumanConfirm, project_id: Option<String>) -> Launc
         workflow: None,
         project_id,
         extra_write_roots: Vec::new(),
+        project_graph: None,
     }
 }
 

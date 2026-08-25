@@ -66,6 +66,7 @@ pub fn run_session(
         None,                              // sync path has no registered repo
         None,
         Vec::new(), // sync path declares no extra write roots (core#259)
+        None,       // …and no repo (above) ⇒ no project graph to bind
         workflow,
         &dispatcher,
         emit,
@@ -353,6 +354,11 @@ pub(crate) fn pre_distribute(
     // Launcher-declared extra write roots (core#259), already validated at launch; persisted on
     // the session so resume/redrive re-arms the boundary the launch declared.
     extra_write_roots: Vec<String>,
+    // The launcher's project-graph binding, persisted on the session for the same reason: a resume
+    // re-enters with no LaunchSpec, and a run whose tools silently narrow from the whole project to
+    // one repo halfway through is worse than one that never had them. VERIFIED at dispatch, never
+    // here — see `actor::project_code_graph_db`.
+    project_graph: Option<crate::project::ProjectGraphBinding>,
     workflow: Option<&str>,
     emit: &mut dyn FnMut(CoreEvent),
     workflow_registry: Option<&crate::workflow::WorkflowRegistry>,
@@ -470,6 +476,7 @@ pub(crate) fn pre_distribute(
         workdir,
         repo_ref,
         extra_write_roots,
+        project_graph,
         archived_at: None,
         archive_note: None,
     };
@@ -657,6 +664,7 @@ pub(crate) fn plan_and_distribute(
     repo_ref: Option<String>,
     workdir: Option<String>,
     extra_write_roots: Vec<String>,
+    project_graph: Option<crate::project::ProjectGraphBinding>,
     workflow: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
@@ -678,6 +686,7 @@ pub(crate) fn plan_and_distribute(
         repo_ref,
         workdir,
         extra_write_roots,
+        project_graph,
         workflow,
         emit,
         workflow_registry,
@@ -1534,6 +1543,7 @@ mod resolve_tests {
             None,
             None,
             Vec::new(),
+            None,
             Some("feature"),
             &mut |_| {},
             Some(&registry),
@@ -1655,6 +1665,7 @@ mod resolve_tests {
             Some(repo.id.clone()),
             None,
             Vec::new(),
+            None,
             Some(&id),
             &mut |_| {},
             Some(&registry),

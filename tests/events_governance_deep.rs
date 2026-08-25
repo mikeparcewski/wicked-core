@@ -158,6 +158,7 @@ fn validation_pin_attached_fires_for_a_pinned_validator_unit() {
         repo_ref: None,
         workflow: Some("gated-test".into()),
         extra_write_roots: Vec::new(),
+        project_graph: None,
     })
     .expect("launch");
 
@@ -233,6 +234,7 @@ fn tool_executor_dispatched_fires_for_a_tool_phase() {
         repo_ref: None,
         workflow: Some("tool-test".into()),
         extra_write_roots: Vec::new(),
+        project_graph: None,
     })
     .expect("launch");
 
