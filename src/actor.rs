@@ -200,6 +200,12 @@ fn warn_bind_refused(run_id: &str, db: &str, why: &str) {
     // line, and terminal escapes would render as control codes in an operator's console. Debug
     // formatting escapes them and makes the value's extent unambiguous, which matters most for a
     // message whose whole job is to tell an operator what they actually passed.
+    //
+    // `why` is NOT escaped here, and must not be: it is prose composed at each call site, and
+    // `{:?}` would quote the whole sentence. The obligation moves to the CALLERS — any
+    // launcher-supplied value interpolated into a `why` escapes itself (the repo label does,
+    // below). That was the gap in the first fix (Copilot on #300): escaping the two obvious
+    // parameters while a third arrived pre-formatted through a different door.
     let msg = format!(
         "wicked-core: run {run_id:?} is NOT bound to the project code graph {db:?} — {why}. Its \
          governed workers fall back to the run repo's OWN graph, or to no estate tools at all if \
@@ -461,7 +467,7 @@ fn project_code_graph_db(
                 run_id,
                 db,
                 &format!(
-                    "it does not hold this run's own repo (no files under the label `{label}`) — \
+                    "it does not hold this run's own repo (no files under the label {label:?}) — \
                      most likely the repo was attached to the project after the last refresh. \
                      Binding it would give the worker tools that deny the existence of the code in \
                      its own worktree, so the narrower per-repo graph is used instead"
@@ -8019,6 +8025,26 @@ mod project_graph_binding_tests {
     /// a second equally-real directory entry for the same inode, and it canonicalizes to ITSELF.
     /// Before [`is_same_file`] this bound: the engine handed the worker a writable handle to the
     /// platform's operational store under an innocent name, which is FINDING-067 exactly.
+    /// No launcher-supplied value may reach the operator's console unescaped.
+    ///
+    /// The first fix escaped `run_id` and `db` and missed the repo LABEL, which arrives
+    /// pre-formatted inside `why` through a different door (Copilot on #300). A label or path
+    /// containing a newline would otherwise forge a second log line that looks like ours.
+    #[test]
+    fn launcher_supplied_values_are_escaped_in_the_refusal_log() {
+        let nasty = "evil\nwicked-core: FORGED LINE";
+        let rendered = format!("no files under the label {nasty:?}");
+        assert!(
+            !rendered.contains('\n'),
+            "a newline in a label must not survive into the log line: {rendered}"
+        );
+        for v in [nasty, "a\u{1b}[31mred"] {
+            let line = format!("run {v:?} ... graph {v:?}");
+            assert!(!line.contains('\n'), "newline survived: {line}");
+            assert!(!line.contains('\u{1b}'), "escape char survived: {line}");
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn a_hard_link_to_the_operational_store_is_refused_too() {
