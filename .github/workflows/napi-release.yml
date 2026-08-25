@@ -110,7 +110,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # binutils-aarch64-linux-gnu is named EXPLICITLY even though gcc-aarch64-linux-gnu
+          # pulls it in transitively (Copilot on #302): the build exports
+          # AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar, so `ar` is a tool this workflow
+          # depends on BY NAME. Relying on someone else's dependency graph for it means a
+          # future gcc packaging change breaks the release leg with a missing-binary error.
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
 
       # --omit=optional: the platform packages in optionalDependencies aren't published yet (and we're
       # building them here, not consuming them). We only need the @napi-rs/cli devDependency.
