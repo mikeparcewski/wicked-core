@@ -31,10 +31,13 @@ on:
   # ever publish an unversioned build (Copilot on #302).
   workflow_dispatch:
 
-# `id-token: write` powers npm provenance attestations (--provenance) and OIDC trusted publishing.
+# Least privilege at the workflow level: `contents: read` only. `id-token: write` — the OIDC
+# credential that powers npm provenance and trusted publishing — is granted on the PUBLISH job
+# alone (Copilot on #302). It used to sit here, which was tolerable while a tag was the only
+# trigger; adding `workflow_dispatch` means any branch rehearsal would otherwise mint a
+# publishing token for the BUILD job, which never needs one.
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: napi-release-${{ github.ref }}
@@ -155,6 +158,10 @@ jobs:
   publish:
     name: publish to npm
     needs: build
+    # The ONLY job that needs the OIDC publishing credential.
+    permissions:
+      contents: read
+      id-token: write
     # Publish ONLY from a `core-ts-v*` tag ref — the tag is where the version comes from, so
     # a branch has nothing to publish as. There is deliberately no override input: an escape
     # hatch here publishes an unversioned build, and the rehearsal this trigger exists for
