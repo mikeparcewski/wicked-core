@@ -18,6 +18,18 @@ on:
   push:
     tags:
       - 'core-ts-v*'
+  # Dry run: build every matrix leg WITHOUT publishing. This workflow was previously
+  # tag-only, so the only way to learn whether a cross-compile change worked was to cut a
+  # tag and watch it fail — which is exactly what happened twice for the aarch64-linux
+  # leg, each time publishing nothing while four legs went green. A build you cannot
+  # rehearse is a build you debug in production.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to npm (leave false to only verify the builds)'
+        required: false
+        default: false
+        type: boolean
 
 # `id-token: write` powers npm provenance attestations (--provenance) and OIDC trusted publishing.
 permissions:
@@ -135,6 +147,9 @@ jobs:
   publish:
     name: publish to npm
     needs: build
+    # A tag publishes; a manual run publishes only when explicitly asked. The default is a
+    # rehearsal, so the safe thing is what happens when you forget to choose.
+    if: startsWith(github.ref, 'refs/tags/core-ts-v') || inputs.publish
     runs-on: ubuntu-latest
     defaults:
       run:
