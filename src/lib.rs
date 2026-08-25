@@ -105,8 +105,8 @@ pub use pipeline::SessionResult;
 pub use plan::plan_from_def;
 pub use project::{
     get_project, list_members, list_projects, member_projects, members_of_kind, MemberSpec,
-    Project, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID, MEMBER_KIND_RUN,
-    PROJECT, PROJECT_MEMBER,
+    Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
+    MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
 pub use repo::{coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoSpec};
 pub use repo_intel::{
@@ -162,6 +162,15 @@ pub struct LaunchSpec {
     /// ([`crate::path_policy::validate_extra_write_roots`]) — an invalid root fails the launch
     /// loudly with no session persisted. Empty for runs that deliver inside their own workdir.
     pub extra_write_roots: Vec<String>,
+    /// The PROJECT code graph this run's governed workers should query instead of the run repo's
+    /// own graph — the launcher's answer to "where is this project's graph, and what is this run's
+    /// repo called in it" ([`crate::project::ProjectGraphBinding`]).
+    ///
+    /// A HINT, not an instruction. The engine verifies it against the database before any worker
+    /// sees it and falls back to the per-repo graph when it cannot vouch for it, so an unusable or
+    /// hostile value degrades the run's tools instead of widening its blast radius. `None` ⇒ the
+    /// per-repo graph, unchanged.
+    pub project_graph: Option<crate::project::ProjectGraphBinding>,
 }
 
 /// Resolve the council roster from the registry (built-ins merged with the user's

@@ -161,6 +161,24 @@ impl Dispatcher for StubDispatcher {
 
 // ── the launch spec, as a JS object ───────────────────────────────────────────
 
+/// WHERE this run's project keeps its co-located code graph, and what this run's repo is called
+/// inside it. Set on [`LaunchOptions::project_graph`] by a launcher that owns a project graph.
+///
+/// The two fields are one fact and travel together: a path with no label cannot be checked against
+/// the repo the run targets, and a label with no path names nothing. Sending them as separate
+/// optional fields would make "half-specified" expressible, and the half that goes missing is the
+/// one that turns the verification off.
+#[napi(object)]
+pub struct ProjectGraphOptions {
+    /// ABSOLUTE path to the project's code graph (crew: `~/.wicked-crew/project-graphs/<id>/code-graph.db`).
+    pub db_path: String,
+    /// The wicked-estate label this run's repo is indexed under in that graph. REQUIRED whenever
+    /// `repoRef` is set — the engine uses it to confirm the graph actually describes the code the
+    /// worker will edit, and refuses the binding (falling back to the per-repo graph) when it
+    /// cannot. Omit only for a repo-less run.
+    pub repo_label: Option<String>,
+}
+
 /// Options for [`Core::launch_run`]. `clisJson` is a JSON array of `AgenticCli` seats (the council
 /// roster); `Core.registryRoster()` returns the production roster ready to pass here.
 #[napi(object)]
@@ -190,6 +208,16 @@ pub struct LaunchOptions {
     /// and outside the engine's config/pin tree — an invalid root REJECTS the launch with no
     /// session persisted. Omit for runs that deliver inside their own workdir.
     pub extra_write_roots: Option<Vec<String>>,
+    /// The PROJECT code graph this run's governed workers should query, instead of the run repo's
+    /// own graph — one database holding every member repo of the project, so a worker's
+    /// SearchEntity / BlastRadius / TraverseGraph can see the whole project rather than one repo.
+    ///
+    /// A HINT the engine VERIFIES before any worker sees it: absolute, an existing file, not the
+    /// engine's own operational store, non-empty, and actually holding `repoLabel`'s repo. A
+    /// binding that fails any of those degrades the run to the per-repo graph (with a reason on
+    /// stderr) rather than failing the launch — the graph is a capability, and losing it should
+    /// cost tools, not the run. Omit for the per-repo behaviour, unchanged.
+    pub project_graph: Option<ProjectGraphOptions>,
 }
 
 fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
@@ -212,6 +240,10 @@ fn build_spec(o: LaunchOptions) -> napi::Result<LaunchSpec> {
         workflow: o.workflow,
         project_id: o.project_id,
         extra_write_roots: o.extra_write_roots.unwrap_or_default(),
+        project_graph: o.project_graph.map(|g| wicked_core::ProjectGraphBinding {
+            db_path: g.db_path,
+            repo_label: g.repo_label,
+        }),
     })
 }
 

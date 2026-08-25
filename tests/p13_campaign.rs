@@ -619,6 +619,7 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         workdir: None,
         repo_ref: None,
         extra_write_roots: Vec::new(),
+        project_graph: None,
         archived_at: None,
         archive_note: None,
     }

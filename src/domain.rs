@@ -114,6 +114,15 @@ pub struct AgentSession {
     /// older sessions deserialize with no extra roots, i.e. the pre-#259 boundary.
     #[serde(default)]
     pub extra_write_roots: Vec<String>,
+    /// The project code graph the launcher bound this run to, if any (see
+    /// [`crate::project::ProjectGraphBinding`]). Persisted on the session for the same reason
+    /// `extra_write_roots` is (core#259): a resume/redrive re-enters through the actor with no
+    /// `LaunchSpec` in hand, so a binding held only in the launcher's memory would silently
+    /// narrow a half-finished run's tools from the whole project back to one repo between two of
+    /// its own units. `#[serde(default)]` for back-compat: older sessions deserialize unbound,
+    /// i.e. the pre-change per-repo behaviour.
+    #[serde(default)]
+    pub project_graph: Option<crate::project::ProjectGraphBinding>,
     /// When the operator ARCHIVED this run (crew#265) — a write-off, not a delete: the run and
     /// every artifact stay fully readable (same retire-not-delete contract as retired policies,
     /// FINDING-038), but default run listings exclude it. Only a TERMINAL run can be archived.
@@ -617,6 +626,7 @@ mod tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            project_graph: None,
             archived_at: None,
             archive_note: None,
         }
