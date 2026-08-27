@@ -368,10 +368,45 @@ fn boundary_denial_with(
 /// A read is never refused: a design phase must read the code it is designing against.
 ///
 /// Returns the operator-facing reason, or `None` when the call is in scope.
+/// Reduce a tool-call path to the form [`crate::actor::is_documentation_change`] was written for:
+/// a path RELATIVE to the unit's worktree.
+///
+/// This is load-bearing, not tidiness. That predicate asks whether ANY directory segment is `docs`
+/// or `.product`, because git hands it repo-relative paths. The gate hands it the ABSOLUTE
+/// tool-call path, so every ancestor of the worktree got judged too — and a checkout living under
+/// any directory named `docs` or `.product` silently turned the whole phase-scope gate OFF:
+///
+///   /Users/me/docs/projects/studio/src/board/attentionReason.ts  -> "documentation", allowed
+///   /home/ci/.product/checkout/src/lib.rs                        -> "documentation", allowed
+///
+/// A gate that is off for some checkout layouts and on for others is worse than no gate, because
+/// nothing says which you have. Stripping the worktree prefix first makes the answer depend only
+/// on the path INSIDE the repo, which is the only part the phase actually chose.
+///
+/// A path outside the worktree is judged on its filename alone: the filesystem boundary has
+/// already refused it, and borrowing "documentation" from an ancestor we do not own is exactly the
+/// bypass above.
+fn scope_relative(path: &str, cwd: &std::path::Path) -> String {
+    let p = std::path::Path::new(path);
+    if p.is_relative() {
+        return path.to_string();
+    }
+    match p.strip_prefix(cwd) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        // Outside the worktree: keep the file name only, so no ancestor segment can grant it
+        // documentation status.
+        Err(_) => p
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string()),
+    }
+}
+
 pub(crate) fn phase_scope_denial(
     pre_build_scope: bool,
     context: &serde_json::Value,
     tool: &str,
+    cwd: &std::path::Path,
 ) -> Option<String> {
     if !pre_build_scope || !WRITE_TOOLS.contains(&tool) {
         return None;
@@ -380,7 +415,7 @@ pub(crate) fn phase_scope_denial(
         .get("path")
         .and_then(serde_json::Value::as_str)
         .filter(|p| !p.trim().is_empty())?;
-    if crate::actor::is_documentation_change(path) {
+    if crate::actor::is_documentation_change(&scope_relative(path, cwd)) {
         return None;
     }
     // A refusal the worker cannot act on is not a refusal, it is a wall (FINDING-066): name the
@@ -734,7 +769,13 @@ pub(crate) fn evaluate_tool_call(
         Some(b) => b.pre_build_scope,
         None => pre_build_scope_from_env(),
     };
-    if let Some(reason) = phase_scope_denial(pre_build_scope, context, tool) {
+    // The worktree the path must be judged against: explicit on the in-process carrier, the
+    // process cwd on the subprocess one — the same split the roots use just above.
+    let scope_cwd = match boundary {
+        Some(b) => b.cwd.clone(),
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    };
+    if let Some(reason) = phase_scope_denial(pre_build_scope, context, tool, &scope_cwd) {
         append_phase_scope_deny(decisions_path, scope, phase, &reason);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
@@ -3132,7 +3173,7 @@ mod phase_scope_tests {
             ("Write", "docs.ts"), // a FILE named docs is code; only a docs/ DIRECTORY is not
         ] {
             assert!(
-                phase_scope_denial(true, &ctx(path), tool).is_some(),
+                phase_scope_denial(true, &ctx(path), tool, std::path::Path::new("/wt")).is_some(),
                 "a pre-build phase must not `{tool}` `{path}`"
             );
         }
@@ -3146,11 +3187,70 @@ mod phase_scope_tests {
             ("Write", "spec.rst"),
         ] {
             assert_eq!(
-                phase_scope_denial(true, &ctx(path), tool),
+                phase_scope_denial(true, &ctx(path), tool, std::path::Path::new("/wt")),
                 None,
                 "a pre-build phase MUST be able to `{tool}` its deliverable `{path}`"
             );
         }
+    }
+
+    /// The bypass this gate shipped with, pinned in both directions.
+    ///
+    /// `is_documentation_change` asks whether ANY directory segment is `docs` or `.product`,
+    /// because git hands it repo-relative paths. The gate hands it the ABSOLUTE tool-call path,
+    /// so every ancestor of the worktree was judged too — and a checkout under a directory named
+    /// `docs` or `.product` silently disabled the whole gate. Found by adversarial verification,
+    /// not by review: the code reads correctly, the predicate is reused as intended, and the CI
+    /// suite was green. Only probing the shipped function with a realistic absolute path shows it.
+    #[test]
+    fn an_ancestor_directory_cannot_grant_documentation_status() {
+        let wt = std::path::Path::new("/Users/me/docs/projects/studio");
+        // Production code inside a worktree that merely LIVES under a `docs` ancestor is still
+        // production code. Before the fix every one of these returned None — allowed.
+        for path in [
+            "/Users/me/docs/projects/studio/src/board/attentionReason.ts",
+            "/Users/me/docs/projects/studio/package.json",
+            "/Users/me/docs/projects/studio/src/lib.rs",
+        ] {
+            assert!(
+                phase_scope_denial(true, &ctx(path), "Write", wt).is_some(),
+                "`{path}` is production code; the `docs` ANCESTOR must not exempt it"
+            );
+        }
+        // Same shape for `.product`, the other segment the predicate honours.
+        let ci = std::path::Path::new("/home/ci/.product/checkout");
+        assert!(
+            phase_scope_denial(
+                true,
+                &ctx("/home/ci/.product/checkout/src/lib.rs"),
+                "Write",
+                ci
+            )
+            .is_some(),
+            "a `.product` ANCESTOR must not exempt production code either"
+        );
+        // The other direction, which matters just as much: a real deliverable INSIDE the worktree
+        // is still allowed once the prefix is stripped. A fix that denied these would be worse
+        // than the bypass, because it would stop a pre-build phase doing its actual job.
+        for path in [
+            "/Users/me/docs/projects/studio/docs/architecture/overview.html",
+            "/Users/me/docs/projects/studio/.product/DES-EXEC-001.md",
+            "/Users/me/docs/projects/studio/DESIGN.md",
+        ] {
+            assert_eq!(
+                phase_scope_denial(true, &ctx(path), "Write", wt),
+                None,
+                "`{path}` IS the phase's deliverable and must stay writable"
+            );
+        }
+        // Outside the worktree entirely: judged on the filename alone, so an ancestor we do not
+        // own cannot lend it documentation status. (The filesystem boundary refuses these first;
+        // this is defence in depth, not the primary control.)
+        assert!(
+            phase_scope_denial(true, &ctx("/somewhere/docs/evil/src/main.rs"), "Write", wt)
+                .is_some(),
+            "a path outside the worktree must not borrow `docs` from an ancestor"
+        );
     }
 
     /// The scope is a property of the PHASE, not a blanket ban. Off the marker, every write above
@@ -3158,7 +3258,10 @@ mod phase_scope_tests {
     #[test]
     fn a_phase_that_is_not_pre_build_is_never_scope_denied() {
         for path in ["src/lib.rs", "package.json", "tests/x.test.ts"] {
-            assert_eq!(phase_scope_denial(false, &ctx(path), "Write"), None);
+            assert_eq!(
+                phase_scope_denial(false, &ctx(path), "Write", std::path::Path::new("/wt")),
+                None
+            );
         }
     }
 
@@ -3168,31 +3271,61 @@ mod phase_scope_tests {
     /// which is exactly why `actor::phase_scope_warning` stays live as the completion backstop.
     #[test]
     fn reads_and_shell_writes_are_outside_this_gates_reach() {
-        assert_eq!(phase_scope_denial(true, &ctx("src/lib.rs"), "Read"), None);
-        assert_eq!(phase_scope_denial(true, &ctx("src/lib.rs"), "Grep"), None);
+        assert_eq!(
+            phase_scope_denial(
+                true,
+                &ctx("src/lib.rs"),
+                "Read",
+                std::path::Path::new("/wt")
+            ),
+            None
+        );
+        assert_eq!(
+            phase_scope_denial(
+                true,
+                &ctx("src/lib.rs"),
+                "Grep",
+                std::path::Path::new("/wt")
+            ),
+            None
+        );
         assert_eq!(
             phase_scope_denial(
                 true,
                 &json!({"command": "cat > src/lib.rs <<'EOF'\nx\nEOF", "path": null}),
-                "Bash"
+                "Bash",
+                std::path::Path::new("/wt")
             ),
             None,
             "a shell write carries no path argument — the completion-path warning catches it"
         );
         // A write tool with no usable path is not a judgeable call.
         assert_eq!(
-            phase_scope_denial(true, &json!({"path": null}), "Write"),
+            phase_scope_denial(
+                true,
+                &json!({"path": null}),
+                "Write",
+                std::path::Path::new("/wt")
+            ),
             None
         );
-        assert_eq!(phase_scope_denial(true, &ctx("   "), "Write"), None);
+        assert_eq!(
+            phase_scope_denial(true, &ctx("   "), "Write", std::path::Path::new("/wt")),
+            None
+        );
     }
 
     /// A refusal the worker cannot act on is a wall, not a gate (FINDING-066). The reason has to
     /// carry the file, the rule, and the way forward.
     #[test]
     fn the_refusal_names_the_file_the_rule_and_the_way_forward() {
-        let reason = phase_scope_denial(true, &ctx("src/board/attentionReason.ts"), "Write")
-            .expect("this is the reported write");
+        let reason = phase_scope_denial(
+            true,
+            &ctx("src/board/attentionReason.ts"),
+            "Write",
+            std::path::Path::new("/wt"),
+        )
+        .expect("this is the reported write");
         assert!(reason.contains("src/board/attentionReason.ts"), "{reason}");
         assert!(reason.contains("PRE-BUILD"), "{reason}");
         assert!(reason.contains(".md"), "names where it MAY write: {reason}");
