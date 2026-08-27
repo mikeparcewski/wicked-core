@@ -134,6 +134,82 @@ impl StepRunner for FailFirstGoverned {
     }
 }
 
+/// core#292 — the SAME failure, from a seat whose CLI has no input-governance adapter.
+///
+/// The gate-hook injection is claude-only (`execute_wrapped`: `(Some(_), false) => …
+/// GovernanceUnenforced`), so a campaign unit dispatched to codex/agy/pi comes back with
+/// `StepOutput.governed == false` even though the run itself is governance-armed. Everything else
+/// is byte-identical to `FailFirstGoverned` — same worker-originated failure message, same
+/// success on the second dispatch — so the ONLY variable under test is the flag.
+struct FailFirstUngovernedSeat {
+    calls: AtomicU32,
+}
+impl StepRunner for FailFirstUngovernedSeat {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: if n == 0 {
+                "(cli `agy` exited 1) timeout waiting for response".into()
+            } else {
+                "ok".to_string()
+            },
+            status: if n == 0 {
+                StepStatus::Failed
+            } else {
+                StepStatus::Ok
+            },
+            usage: None,
+            files: vec![],
+            tools: Vec::new(),
+            // The FINDING-063 disclosure shape: governed campaign unit, unenforceable seat.
+            governed: false,
+        }
+    }
+}
+
+/// core#292. Field evidence: three governed runs died at one worker failure each (`agy exited 1`
+/// ×2, `codex exited 1`) with healthy seats idle. The ladder's condition was `output.governed`,
+/// which means "the runner armed the input-governance hook" — true only for claude — so failover
+/// armed for exactly the seat that does not exhibit the exit-1/timeout failure mode, and never for
+/// the ones that do. Phase idempotency (the ladder's actual justification) is a property of the
+/// campaign phase, not of which CLI can host a PreToolUse hook.
+#[test]
+fn an_ungoverned_seat_worker_error_also_fails_over() {
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        Arc::new(FailFirstUngovernedSeat {
+            calls: AtomicU32::new(0),
+        }),
+    );
+    let ev = core.subscribe();
+    core.launch_run(spec("failover-ungoverned", vec![cli("a"), cli("b")]))
+        .expect("launch");
+
+    let collected = drain_until_terminal(&ev, "failover-ungoverned");
+
+    let failed_over = collected.iter().any(|e| {
+        matches!(e,
+        CoreEvent::StepFailed { session, detail, .. }
+            if session == "failover-ungoverned" && detail.contains("failing over to"))
+    });
+    assert!(
+        failed_over,
+        "a worker-originated failure on a seat with no gate-hook adapter must ALSO fail over — \
+         the ladder is keyed to phase idempotency, not to input governance, got: {collected:?}"
+    );
+    assert!(
+        collected.iter().any(|e| matches!(
+            e,
+            CoreEvent::SessionCompleted { session, .. } if session == "failover-ungoverned"
+        )),
+        "the run must COMPLETE on the failover seat, not die on the first seat's error"
+    );
+}
+
 /// THE crew#277 shape: a two-seat roster, the first worker dies on a seat-level error, the run
 /// must fail over to the other seat and COMPLETE — not die with verified work behind it.
 #[test]
