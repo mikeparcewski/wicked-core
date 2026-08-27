@@ -3121,7 +3121,6 @@ mod excerpt_tests {
         s
     }
 
-    #[test]
     /// The call sites, not just the helper.
     ///
     /// The original crew#322 fix added `bounded_excerpt` and five unit tests OF THAT HELPER.
@@ -3185,6 +3184,7 @@ mod excerpt_tests {
         assert!(out.len() < raw.len(), "it must actually be bounded");
     }
 
+    #[test]
     fn bounded_excerpt_keeps_both_ends() {
         let raw = transcript();
         let out = bounded_excerpt(&raw, 150, 250);
