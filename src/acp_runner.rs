@@ -1105,6 +1105,51 @@ fn death_context(proc: &AcpProcess) -> String {
 /// FINDING-060 happened.
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
+/// The governed unit's filesystem boundary for the IN-PROCESS carrier, mirroring what the wrapped
+/// launcher arms by environment (core#260): WRITE = unit cwd FIRST, then the launch-validated
+/// `extra_write_roots`; READ = the shared assembly (skill/plugin dir + repo root + the
+/// launch-validated `extra_read_roots`, core#294). Built HERE, on the runner with the governance
+/// context in hand — the in-process evaluation cannot read it from any env.
+///
+/// A FUNCTION, not an expression inlined in `exec_turn_inner`, because "the two carriers cannot
+/// diverge" is a claim someone has to be able to TEST. `the_two_carriers_arm_the_same_boundary`
+/// pins this output against `execute_wrapped`'s `armed_write_roots` / `assemble_read_roots` for
+/// the same `GovernanceContext`; while the boundary was assembled inline, that assertion had
+/// nothing to call and the divergence went unnoticed by the whole suite.
+fn in_process_boundary(
+    unit_cwd: &std::path::Path,
+    g: &crate::workflow::GovernanceContext,
+) -> crate::gate_hook::BoundaryCtx {
+    crate::gate_hook::BoundaryCtx {
+        roots: crate::path_policy::AllowedRoots {
+            write: std::iter::once(unit_cwd.to_path_buf())
+                .chain(g.extra_write_roots.iter().map(std::path::PathBuf::from))
+                .collect(),
+            read: crate::execute_wrapped::assemble_read_roots(
+                g.code_graph_db.as_deref(),
+                &g.extra_read_roots,
+            ),
+        },
+        cwd: unit_cwd.to_path_buf(),
+        // The same HOME the worker subprocess inherits — captured once here so the in-process
+        // judgement's `~` expansion and `~/.claude` carve-out cannot diverge from the wrapped
+        // carrier's (Copilot).
+        home: std::env::var_os("HOME").map(std::path::PathBuf::from),
+        // The operator's alternate agent-state home (core#272) — but ONLY when the FINDING-061
+        // escape hatch says the worker actually inherits the operator's configuration. In the
+        // default mode `start_acp_process` points the worker at an engine-minted config dir
+        // (under the OS temp, which the core#264 carve-out already tolerates); carving out the
+        // DAEMON's CLAUDE_CONFIG_DIR there would downgrade writes into a tree the worker has no
+        // business in (Copilot). Validated: an empty/relative/root value must not steer an
+        // advisory carve-out.
+        claude_config_dir: std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV)
+            .is_some()
+            .then(|| std::env::var_os(CLAUDE_CONFIG_DIR_ENV))
+            .flatten()
+            .and_then(|v| crate::gate_hook::valid_config_home(&v)),
+    }
+}
+
 /// Decide the [`CLAUDE_CONFIG_DIR_ENV`] override for an ACP worker spawn — `None` means inherit
 /// the operator's own configuration (the explicit escape hatch only).
 ///
@@ -3807,42 +3852,7 @@ impl AcpStepRunner {
                     });
                     return fallback_with_warning(reason, input, emit, &self.fallback);
                 }
-                // The unit's filesystem boundary, mirroring what the wrapped launcher arms by
-                // env (core#260): WRITE = unit cwd + the launch-validated extra roots; READ =
-                // the shared assembly (skills dir + repo root + the launch-validated read-only
-                // roots, core#294). Built HERE, on the runner with the governance context in
-                // hand — the in-process evaluation cannot read it from any env.
-                let boundary = crate::gate_hook::BoundaryCtx {
-                    roots: crate::path_policy::AllowedRoots {
-                        write: std::iter::once(unit_cwd.clone())
-                            .chain(g.extra_write_roots.iter().map(std::path::PathBuf::from))
-                            .collect(),
-                        read: crate::execute_wrapped::assemble_read_roots(
-                            g.code_graph_db.as_deref(),
-                            &g.extra_read_roots,
-                        ),
-                    },
-                    cwd: unit_cwd.clone(),
-                    // The same HOME the worker subprocess inherits — captured once here so the
-                    // in-process judgement's `~` expansion and `~/.claude` carve-out cannot
-                    // diverge from the wrapped carrier's (Copilot).
-                    home: std::env::var_os("HOME").map(std::path::PathBuf::from),
-                    // The operator's alternate agent-state home (core#272) — but ONLY when the
-                    // FINDING-061 escape hatch says the worker actually inherits the operator's
-                    // configuration. In the default mode `start_acp_process` points the worker
-                    // at an engine-minted config dir (under the OS temp, which the core#264
-                    // carve-out already tolerates); carving out the DAEMON's CLAUDE_CONFIG_DIR
-                    // there would downgrade writes into a tree the worker has no business in
-                    // (Copilot). Validated: an empty/relative/root value must not steer an
-                    // advisory carve-out.
-                    claude_config_dir: std::env::var_os(
-                        crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
-                    )
-                    .is_some()
-                    .then(|| std::env::var_os(CLAUDE_CONFIG_DIR_ENV))
-                    .flatten()
-                    .and_then(|v| crate::gate_hook::valid_config_home(&v)),
-                };
+                let boundary = in_process_boundary(&unit_cwd, g);
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
             _ => None,
@@ -8005,5 +8015,121 @@ else:
             "active_workers entry must be removed after EpochCleanup::drop (no leak)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#260 × core#294 — THE TWO CARRIERS ARM THE SAME BOUNDARY.
+    ///
+    /// A governed unit's filesystem boundary reaches the worker two ways: the wrapped launcher
+    /// env-joins it into `WICKED_WRITE_ROOTS`/`WICKED_READ_ROOTS`, and the ACP path hands it to the
+    /// in-process `BoundaryCtx` (which cannot read those env vars — it evaluates on the runner).
+    /// The PR that added `extra_read_roots` claimed the two "cannot diverge" because they share the
+    /// assembly helpers. Sharing was true; ENFORCEMENT was not — replacing the in-process read
+    /// assembly with a divergent one left the entire suite green, which means a governed ACP unit
+    /// could have silently judged reads against a boundary the operator never declared.
+    ///
+    /// This pins the invariant the summary asserted: for ONE `GovernanceContext` and ONE unit cwd,
+    /// the in-process carrier's write/read lists equal what the env carrier arms — extras included,
+    /// in the same ORDER (order is load-bearing: the engine-derived roots lead, the
+    /// launcher-declared extras land last, both halves).
+    ///
+    /// Mutations that must turn this red:
+    ///   - `in_process_boundary`: `&g.extra_read_roots` → `&[]` (or any other list) — the READ
+    ///     assert fails, naming the declared root the ACP worker would not have been able to read.
+    ///   - `in_process_boundary`: drop the `.chain(g.extra_write_roots …)` — the WRITE assert fails.
+    ///   - swap the two `.chain`/`extend` orders in either assembly — the order asserts fail.
+    #[test]
+    fn the_two_carriers_arm_the_same_boundary() {
+        use std::path::PathBuf;
+
+        // Both sides of the comparison read `$HOME` (the skill/plugin root rides the read
+        // assembly), so this test must not straddle another test's one-time `set_var("HOME")` —
+        // the sibling helpers only set it when it is UNSET, so ensuring it is set here closes the
+        // window rather than opening a new one. `$HOME` is unset on Windows, which is the only
+        // platform where the window exists at all.
+        if std::env::var_os("HOME").is_none() {
+            let d = std::env::temp_dir().join(format!("wicked-carriers-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            std::env::set_var("HOME", d);
+        }
+
+        let cwd = PathBuf::from(if cfg!(windows) {
+            r"C:\wicked-294\unit-cwd"
+        } else {
+            "/wicked-294/unit-cwd"
+        });
+        let (repo, inbox, reference) = if cfg!(windows) {
+            (
+                r"C:\wicked-294\repo",
+                r"C:\wicked-294\inbox",
+                r"C:\wicked-294\reference",
+            )
+        } else {
+            (
+                "/wicked-294/repo",
+                "/wicked-294/inbox",
+                "/wicked-294/reference",
+            )
+        };
+        // A context that exercises BOTH declared widenings at once, so a carrier that drops either
+        // one is caught by this single test rather than by whichever assert happens to run first.
+        let g = crate::workflow::GovernanceContext {
+            db_path: "/unused/gate.db".into(),
+            code_graph_db: Some(format!("{repo}/.codegraph/estate.db")),
+            extra_write_roots: vec![inbox.to_string()],
+            extra_read_roots: vec![reference.to_string()],
+        };
+
+        let in_process = in_process_boundary(&cwd, &g);
+
+        // What the WRAPPED launcher puts on the wire, read back through the same split the worker's
+        // gate-hook performs — so this compares delivered boundaries, not two calls to one helper.
+        let env_write: Vec<PathBuf> = std::env::split_paths(
+            &crate::execute_wrapped::armed_write_roots(&cwd, &g.extra_write_roots),
+        )
+        .collect();
+        let env_read = crate::execute_wrapped::assemble_read_roots(
+            g.code_graph_db.as_deref(),
+            &g.extra_read_roots,
+        );
+
+        assert_eq!(
+            in_process.roots.write, env_write,
+            "the in-process WRITE boundary must be exactly what the wrapped launcher arms by env —              a governed ACP unit and a governed wrapped unit of the same run must not be judged              against different write roots (core#260)"
+        );
+        assert_eq!(
+            in_process.roots.read, env_read,
+            "the in-process READ boundary must be exactly what the wrapped launcher arms by env —              otherwise the launch-declared grounding (core#294) reaches a wrapped worker and              silently does not reach an ACP one"
+        );
+
+        // The invariant is about CONTENT, and these two asserts are what make the equality above
+        // mean something: an assembly that returned an empty list on both sides would satisfy
+        // `assert_eq!` and prove nothing.
+        assert!(
+            in_process.roots.read.contains(&PathBuf::from(reference)),
+            "the launch-declared read root must actually be in the in-process boundary: {:?}",
+            in_process.roots.read
+        );
+        assert_eq!(
+            in_process.roots.read.last(),
+            Some(&PathBuf::from(reference)),
+            "the launcher-declared read root lands LAST — what the engine derived for itself is \
+             never displaced by what a launcher declared"
+        );
+        assert_eq!(
+            in_process.roots.write.first(),
+            Some(&cwd),
+            "the unit cwd leads the write list, on both carriers"
+        );
+        assert!(
+            in_process.roots.write.contains(&PathBuf::from(inbox)),
+            "the launch-declared write root must survive into the in-process boundary too: {:?}",
+            in_process.roots.write
+        );
+        // And the halves stay separate: a READ declaration must not have widened the WRITE list.
+        assert!(
+            !in_process.roots.write.contains(&PathBuf::from(reference)),
+            "a declared READ root must never appear on the write list — that inversion is the \
+             whole defect core#294 closes"
+        );
     }
 }

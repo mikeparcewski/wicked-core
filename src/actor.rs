@@ -8656,6 +8656,202 @@ mod phase_boundary_governance_tests {
     }
 }
 
+/// core#259 / core#294 — the launch-time boundary judgement on the OTHER entry point.
+///
+/// A run can be launched two ways, and both must judge a declared boundary before anything is
+/// planned or persisted: `Command::LaunchRun` (the interactive/daemon path, covered end-to-end by
+/// `tests/extra_read_roots.rs` through `Core::launch_run`) and [`launch_run_inner`] called
+/// DIRECTLY — the campaign driver's node launcher (`campaign::dispatch`, DES §4) and every future
+/// in-process launcher.
+///
+/// Only the first was covered. Deleting the read validation from `launch_run_inner` left the whole
+/// suite green, which means the campaign entry point could have silently armed an unjudged
+/// boundary — the exact asymmetry a "validated at BOTH launch entry points" claim rules out.
+/// Campaign nodes happen to declare no extra roots today (`RunSpec::to_launch_spec` hardcodes
+/// empty), so this is a guard on the seam, not a live bug: the day a campaign node grows a
+/// declaration, the judgement must already be there.
+#[cfg(test)]
+mod launch_inner_boundary_validation_tests {
+    use super::*;
+    use crate::workflow::WorkflowRegistry;
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::open_store;
+    use wicked_council::types::{
+        AgenticCli, Category, Confidence, Dispatcher as CouncilDispatcher, InputMode, Vote,
+    };
+    use wicked_council::CouncilTask;
+
+    struct StubDispatcher;
+    impl CouncilDispatcher for StubDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _t: &CouncilTask) -> Option<Vote> {
+            Some(Vote {
+                cli: cli.key.clone(),
+                recommendation: "x".into(),
+                top_risk: "none".into(),
+                change_my_mind: "no".into(),
+                disqualifier: None,
+                confidence: Confidence::default(),
+                provenance: "stub".into(),
+            })
+        }
+    }
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> crate::workflow::StepOutput {
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "ok".into(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    fn cli(key: &str) -> AgenticCli {
+        AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: "unused {PROMPT}".into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+        }
+    }
+
+    fn spec(session_id: &str, read: Vec<String>, write: Vec<String>) -> LaunchSpec {
+        LaunchSpec {
+            problem: "Draft the overview. Review the draft".into(),
+            clis: vec![cli("a")],
+            entity_mode: EntityMode::Shared,
+            session_id: session_id.into(),
+            human_confirm: crate::domain::HumanConfirm::All, // pause at unit 0; this is a LAUNCH test
+            repo_ref: None,
+            workflow: None,
+            project_id: None,
+            extra_write_roots: write,
+            extra_read_roots: read,
+            project_graph: None,
+        }
+    }
+
+    /// Run one `launch_run_inner` against a throwaway in-memory store, returning its result and
+    /// whether a session for `run_id` survives in the store afterwards.
+    fn launch(spec: LaunchSpec) -> (anyhow::Result<String>, bool) {
+        let run_id = spec.session_id.clone();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let (tx, _rx) = channel::<Command>();
+        let mut in_flight = HashSet::new();
+        let registry = WorkflowRegistry::with_defaults();
+        let res = launch_run_inner(
+            &mut store,
+            &mut subs,
+            &dispatcher,
+            &runner,
+            &tx,
+            &mut in_flight,
+            spec,
+            &registry,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        let persisted = crate::domain::get_session(&store, &run_id)
+            .ok()
+            .flatten()
+            .is_some();
+        (res, persisted)
+    }
+
+    /// `$HOME` is the prerequisite the validation fails CLOSED without, and it is unset on Windows.
+    /// Give the process one only when it has none, so the accept assert judges the ROOT.
+    fn ensure_home() {
+        if std::env::var_os("HOME").is_none() {
+            let d = std::env::temp_dir().join(format!("wicked-lri-home-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            std::env::set_var("HOME", d);
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wicked-lri-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::canonicalize(&d).unwrap()
+    }
+
+    /// Mutation: delete the `validate_extra_read_roots` call from `launch_run_inner` → the first
+    /// two asserts fail. Delete `validate_extra_write_roots` → the write asserts fail. Make either
+    /// return `Err` unconditionally → the accept assert fails.
+    #[test]
+    fn launch_run_inner_judges_declared_roots_before_it_persists_anything() {
+        ensure_home();
+
+        // READ: an unusable (relative) root refuses the launch, with NO session written.
+        let (res, persisted) = launch(spec("lri-bad-read", vec!["relative/ref".into()], vec![]));
+        let err = res
+            .expect_err("a relative read root must refuse the launch")
+            .to_string();
+        assert!(
+            err.contains("read root") && err.contains("not absolute"),
+            "the refusal must name WHICH declaration failed and why: {err}"
+        );
+        assert!(
+            !persisted,
+            "a refused launch must persist NO session — a live run whose grounding silently did \
+             not happen is worse than no run"
+        );
+
+        // WRITE: the same entry point still judges the original half (core#259), so a mutation
+        // that deletes one call cannot be mistaken for the other.
+        let (res, persisted) = launch(spec("lri-bad-write", vec![], vec!["relative/inbox".into()]));
+        let err = res
+            .expect_err("a relative write root must refuse the launch")
+            .to_string();
+        assert!(
+            err.contains("write root") && err.contains("not absolute"),
+            "the write refusal must name its own declaration kind: {err}"
+        );
+        assert!(
+            !persisted,
+            "a refused write-root launch persists no session either"
+        );
+
+        // ACCEPT: an absolute reference tree outside the pin tree gets through — the guard is a
+        // JUDGEMENT, not a blanket refusal of every declared root.
+        let reference = scratch("ref");
+        let (res, persisted) = launch(spec(
+            "lri-ok-read",
+            vec![reference.to_string_lossy().into_owned()],
+            vec![],
+        ));
+        assert!(
+            res.is_ok(),
+            "an absolute reference root outside the pin tree must be admitted: {:?}",
+            res.err()
+        );
+        assert!(persisted, "an admitted launch does persist its session");
+        let _ = std::fs::remove_dir_all(&reference);
+    }
+}
+
 #[cfg(test)]
 mod environment_refusal_tests {
     use super::environment_refusal;

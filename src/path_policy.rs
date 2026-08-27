@@ -194,8 +194,32 @@ pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
 /// Symlink-resolved with the same [`resolve_symlinks`] the boundary check uses, so a root reached
 /// through `/tmp`→`/private/tmp` (or a symlinked config dir) cannot dodge the comparison.
 pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
-    validate_extra_roots(roots, home, "write")
+    validate_extra_roots(roots, home, "write", WRITE_CONFIG_TREE_REASON)
 }
+
+/// Why a declared WRITE root overlapping the engine config tree is refused: it IS FINDING-098 — a
+/// governed worker with write access to `~/.config/wicked-core` can edit the gate pin and the
+/// workflow overlay that judge its own work, so the gate stops being a gate.
+const WRITE_CONFIG_TREE_REASON: &str =
+    "a governed worker could rewrite the pin that gates its own work (FINDING-098)";
+
+/// Why a declared READ root overlapping the engine config tree is refused — and it is NOT
+/// FINDING-098 (Copilot, PR #305). [`check`] tests a write against the write list only, so a
+/// declared read root confers no write power whatever: the pin stays unwritable and the escape
+/// stays closed. The refusal is about DISCLOSURE, and an operator debugging one must be told the
+/// real reason rather than a rationale borrowed from the write half.
+///
+/// One sentence covers both containment directions, because both end in the same place: a root
+/// INSIDE the config tree reads the pins directly, and a root that CONTAINS it (`~`, `/`) reads
+/// them along with everything else — which is also not "grounded in X" in any sense, it is blanket
+/// read access wearing a grounding declaration's clothes.
+///
+/// It deliberately does NOT mention FINDING-098, even to disclaim it: an operator who greps the
+/// refusal for that id must not find it here, because nothing about a read root is that escape.
+const READ_CONFIG_TREE_REASON: &str =
+    "a governed worker could READ the gate pins, policies and workflow overlays that judge its \
+     own work — writes into that tree stay denied either way, so what is refused here is \
+     disclosure of the engine's own configuration, not write access to it";
 
 /// Validate launcher-declared extra READ roots at LAUNCH time (core#294) — the read-only mirror of
 /// [`validate_extra_write_roots`].
@@ -208,14 +232,25 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
 /// containment test also refuses the roots that would make the boundary meaningless in the other
 /// direction: `~` and `/` CONTAIN the config tree, and a read root of `/` is a boundary that
 /// allows every read there is. "Grounded in X" is a statement about X, not about the filesystem.
+///
+/// The RULE is shared; the REASON is not. A refusal that reused the write half's wording told the
+/// operator a read root would let a worker "rewrite the pin", which is false — see
+/// [`READ_CONFIG_TREE_REASON`].
 pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
-    validate_extra_roots(roots, home, "read")
+    validate_extra_roots(roots, home, "read", READ_CONFIG_TREE_REASON)
 }
 
 /// The shared judgement behind [`validate_extra_write_roots`] and [`validate_extra_read_roots`].
 /// ONE rule set, so the read mirror cannot drift into a weaker gate than the write original —
-/// `kind` only spells the failure, never changes what passes.
-fn validate_extra_roots(roots: &[String], home: Option<&Path>, kind: &str) -> Result<(), String> {
+/// `kind` and `config_tree_reason` only spell the failure, never change what passes. The reason is
+/// a parameter rather than a `match kind` so a new caller cannot forget it and silently inherit
+/// somebody else's rationale, which is exactly how the read half came to claim FINDING-098.
+fn validate_extra_roots(
+    roots: &[String],
+    home: Option<&Path>,
+    kind: &str,
+    config_tree_reason: &str,
+) -> Result<(), String> {
     if roots.is_empty() {
         return Ok(());
     }
@@ -243,8 +278,8 @@ fn validate_extra_roots(roots: &[String], home: Option<&Path>, kind: &str) -> Re
             || resolved_is_within(&config_tree, &resolved)
         {
             return Err(format!(
-                "extra {kind} root {raw} would expose the engine config tree ({}) — a governed \
-                 worker could rewrite the pin that gates its own work (FINDING-098); refused",
+                "extra {kind} root {raw} would expose the engine config tree ({}) — \
+                 {config_tree_reason}; refused",
                 config_tree.display()
             ));
         }
@@ -447,6 +482,9 @@ mod tests {
     /// A read root is still a widening of the same boundary: `~` (which CONTAINS the pin tree) and
     /// a relative root are refused exactly as they are for writes, and a no-HOME launch fails
     /// closed. Mutation: make `validate_extra_read_roots` return `Ok(())` → all three asserts fail.
+    ///
+    /// The same rule, a DIFFERENT reason (Copilot, PR #305): see
+    /// `a_refused_read_root_is_given_the_read_half_s_actual_reason`.
     #[test]
     fn extra_read_roots_are_judged_by_the_same_rules_as_write_roots() {
         let home = scratch("xrr_home");
@@ -468,10 +506,69 @@ mod tests {
         // the whole filesystem" shape the boundary exists to refuse.
         let e = validate_extra_read_roots(&[home.to_string_lossy().into_owned()], Some(&home))
             .expect_err("a read root containing the pin tree must be refused");
-        assert!(e.contains("FINDING-098"), "names the escape: {e}");
+        assert!(
+            e.contains("engine config tree"),
+            "names what the root would expose: {e}"
+        );
 
         let e = validate_extra_read_roots(&[reference.to_string_lossy().into_owned()], None)
             .expect_err("no HOME must refuse the widening, never wave it through");
         assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
+    }
+
+    /// A REFUSAL IS AN EXPLANATION (Copilot, PR #305). The read half reused the write half's
+    /// message, so an operator who declared `extraReadRoots: ["~"]` was told a governed worker
+    /// "could rewrite the pin that gates its own work (FINDING-098)". That is false for a read
+    /// root — `check` tests a write against the write list only, so the declaration confers no
+    /// write power at all — and it points the operator at the wrong problem: the real one is
+    /// DISCLOSURE of the engine's own gate pins, policies and workflow overlays.
+    ///
+    /// Both halves are asserted, because the fix is only real if the two messages DIFFER: the
+    /// write refusal must keep naming FINDING-098 (it genuinely is that escape), and the read
+    /// refusal must never claim it.
+    ///
+    /// Mutation: point `validate_extra_read_roots` back at `WRITE_CONFIG_TREE_REASON` → the
+    /// "must not claim" assert fails. Point the write half at the read reason → the write asserts
+    /// fail.
+    #[test]
+    fn a_refused_read_root_is_given_the_read_half_s_actual_reason() {
+        let home = scratch("reason_home");
+        let declared = home.to_string_lossy().into_owned();
+
+        // The SAME declaration through both halves — the messages must differ because the roots
+        // differ in what they grant, not because the inputs differ.
+        let read = validate_extra_read_roots(std::slice::from_ref(&declared), Some(&home))
+            .expect_err("a read root containing the pin tree is refused");
+        let write = validate_extra_write_roots(std::slice::from_ref(&declared), Some(&home))
+            .expect_err("a write root containing the pin tree is refused");
+
+        // The write half's reason is TRUE for writes and must survive.
+        assert!(
+            write.contains("FINDING-098") && write.contains("rewrite the pin"),
+            "the write refusal still names the escape it really is: {write}"
+        );
+
+        // The read half must not borrow it. This is the finding.
+        assert!(
+            !read.contains("FINDING-098"),
+            "a READ root cannot reopen FINDING-098 — writes are denied against the write list \
+             alone — so the refusal must not cite it: {read}"
+        );
+        assert!(
+            !read.contains("rewrite"),
+            "nothing a read root grants can rewrite anything: {read}"
+        );
+        // …and it must say what IS true, or an accurate-but-empty message would pass the two
+        // negative asserts above.
+        assert!(
+            read.contains("READ") && read.contains("gate pins"),
+            "the read refusal must name the real consequence — the worker reading the \
+             configuration that judges it: {read}"
+        );
+        assert!(
+            read.contains("writes into that tree stay denied"),
+            "and must tell the operator what is NOT at stake, so they do not go hunting for a \
+             write escape that cannot happen: {read}"
+        );
     }
 }

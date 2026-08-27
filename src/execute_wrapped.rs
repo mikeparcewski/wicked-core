@@ -929,7 +929,10 @@ impl WrappedCliStepRunner {
 /// the pin tree, so this join cannot introduce a root the launch did not judge. When a root cannot
 /// be joined (it contains the platform's PATH separator), falls back to the NARROW cwd-only
 /// boundary — dropping the widening is a degraded run; dropping the boundary would be an escape.
-fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
+///
+/// `pub(crate)` so the ACP side can assert its in-process carrier arms the SAME write list this
+/// env carrier does (`acp_runner::tests::the_two_carriers_arm_the_same_boundary`).
+pub(crate) fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
     // No extras ⇒ the pre-#259 boundary, byte-identical — and no join_paths round-trip that
     // could misattribute a separator-collision in the CWD to the (empty) extras (Copilot).
     if extras.is_empty() {
