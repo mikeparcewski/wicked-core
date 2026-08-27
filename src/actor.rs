@@ -3066,6 +3066,28 @@ pub(crate) fn resume_run_inner(
     ) {
         return Ok(session.status);
     }
+    // core#290 — RE-PROVISION FIRST, before anything mutates the run. A resume of a FAILED run is
+    // re-entering a workdir the failure itself may have reaped (see `reprovision_reaped_worktree`).
+    // Done here, ahead of the crew#277 cursor reset and the R1 guard, so a re-provision that CANNOT
+    // succeed (repo deregistered, `git worktree add` refused) surfaces as an error to the caller
+    // with the run still terminal and still resumable, rather than after the status has already
+    // been flipped to `Executing` with no worker behind it.
+    //
+    // Pre-execution statuses (Planning/Distributing) are skipped because the R1 guard below FAILS
+    // them and reaps their worktree — re-provisioning a checkout two blocks before it is reaped is
+    // waste, and worse, a re-provision that could not succeed would return Err where R1 owes the
+    // caller a deterministic `Failed`. NOT because their workdir is unresolved: `launch_run_inner`
+    // calls `resolve_workdir` BEFORE `plan_and_distribute`, so the `Planning` stub that path
+    // persists already carries a resolved workdir (src/actor.rs, src/pipeline.rs). The other launch
+    // path, `pipeline::run_session`, binds no repo at all and so has no workdir either way.
+    let session = if matches!(
+        session.status,
+        SessionStatus::Planning | SessionStatus::Distributing
+    ) {
+        session
+    } else {
+        reprovision_reaped_worktree(store, session)?
+    };
     // crew#277: a FAILED run resumes from its cursor unit instead of no-opping — three dogfood
     // runs each burned three verified, gate-approved phases because a seat-level worker error at
     // one unit had no recovery short of a full relaunch. Reset the cursor unit for re-dispatch
@@ -4195,6 +4217,81 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
     std::thread::spawn(move || {
         let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
     });
+}
+
+/// core#290 — the other half of [`reap_terminal_worktree`]: give a resuming run its worktree BACK.
+///
+/// The reap-on-fail and resume contracts collided. `fail_run` reaps a FAILED run's worktree when it
+/// is clean (FINDING-003), and the startup orphan reaper re-applies the same rule to every terminal
+/// run; crew#277 then made a FAILED run RESUMABLE from its cursor — failed runs are precisely the
+/// resumable ones. But `session.workdir` is a persisted ABSOLUTE path that `dispatch_unit` copies
+/// verbatim into `StepInput` (and from there into the worker's `current_dir`), and nothing on the
+/// resume path re-created the directory. Every retry therefore spawned into a path that no longer
+/// existed: run `5a9a2d65` died with `failed to spawn "bash": No such file or directory` on each
+/// attempt — an error that names the binary while the missing cwd is the cause, so the run looked
+/// unrecoverable when the work was sitting safely on its branch.
+///
+/// That branch is the fix. The reap never deletes `wicked/<run_id>` (the checkout is scaffolding,
+/// the branch is the record), so re-adding a worktree from it restores exactly the state the failed
+/// run landed — which is what [`crate::repo::create_worktree`] does when the branch already exists.
+/// The resolved path is persisted because it need not equal the recorded one: a pre-crew#276 run
+/// recorded `.wicked/worktrees/<id>` and re-provisions under `wicked-worktrees/<id>`.
+///
+/// A workdir that is still a LIVE worktree is left untouched; anything else is re-provisioned.
+///
+/// The test is [`crate::repo::is_live_worktree`], not `is_dir()` — FINDING-059's lesson, which
+/// `create_worktree` already learned, applied one level up. A reap is not always all-or-nothing:
+/// `remove_worktree` falls back to `remove_dir_all`, a partial removal leaves the directory SHELL
+/// behind, and the `git worktree prune` that follows then deregisters the admin entry *because* the
+/// path no longer has a `.git` file. `is_dir()` accepts that shell and returns it as a valid
+/// checkout, so the resume would re-dispatch into a directory that is not a boundary at all — the
+/// failure FINDING-059 measured, where a worker handed an "empty, unregistered directory" decided to
+/// work in the parent repo instead and wrote 297 lines onto the operator's real `master`. A run that
+/// resumes into a shell also fails LATER and further from the cause than one that never left here.
+///
+/// So a non-live workdir goes through `create_worktree`, which is exactly the code that knows how to
+/// resolve that state: an empty shell is cleared, pruned, and re-added from the branch; a non-empty
+/// one of unknown provenance is refused loudly, here, where the cause is still legible.
+fn reprovision_reaped_worktree(
+    store: &mut dyn GraphStore,
+    session: crate::domain::AgentSession,
+) -> anyhow::Result<crate::domain::AgentSession> {
+    let (Some(repo_id), Some(workdir)) = (session.repo_ref.clone(), session.workdir.clone()) else {
+        return Ok(session);
+    };
+    if crate::repo::is_live_worktree(std::path::Path::new(&workdir)) {
+        return Ok(session);
+    }
+    let repo = crate::repo::get_repo(&*store, &repo_id)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "cannot restore the worktree for run {}: repo {repo_id} is no longer registered",
+            session.id
+        )
+    })?;
+    let wt = crate::repo::create_worktree(&repo.root_path, &session.id).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot restore the reaped worktree for run {} from branch wicked/{}: {e}",
+            session.id,
+            session.id
+        )
+    })?;
+    let mut session = session;
+    let restored = wt.to_string_lossy().to_string();
+    // Name what was actually found: "gone" and "a directory that is no longer a worktree" are
+    // different repairs, and an operator reading this line is diagnosing which reap left what.
+    let was = if std::path::Path::new(&workdir).exists() {
+        "is no longer a live worktree"
+    } else {
+        "is gone"
+    };
+    eprintln!(
+        "wicked-core: run {} resumed with its worktree reaped ({workdir} {was}); re-created it \
+         at {restored} from branch wicked/{} (core#290)",
+        session.id, session.id
+    );
+    session.workdir = Some(restored);
+    put_node(store, session.to_node())?;
+    Ok(session)
 }
 
 /// Split every session on the store into LIVE (non-terminal — may resume, keeps its worktree) and
@@ -7376,6 +7473,293 @@ mod terminal_worktree_reap_tests {
         assert!(
             branch_exists(&root, "wicked/r-fail"),
             "failure keeps the branch as the record of what was attempted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#290 — THE REAP/RESUME COLLISION. The test above pins that `fail_run` reaps a failed
+    /// run's clean worktree; crew#277 then made a FAILED run RESUMABLE from its cursor. The
+    /// session's `workdir` is a persisted ABSOLUTE path that `dispatch_unit` copies straight into
+    /// `StepInput` → the worker's `current_dir`, and nothing re-provisions it — so every resume
+    /// after that reap re-dispatched into a directory that no longer exists and died with
+    /// `failed to spawn "bash": No such file or directory` (the spawn error blames the binary; the
+    /// missing cwd is the cause). The reap deliberately keeps the `wicked/<run_id>` branch, so the
+    /// work IS recoverable: this drives the real FAIL → REAP → RESUME sequence and pins that the
+    /// resume re-creates the worktree from that branch, landed work included.
+    ///
+    /// Falsified by deleting the `reprovision_reaped_worktree` call in `resume_run_inner`: the
+    /// run still resumes to `Executing`, but the workdir assertion fails on a path that is gone.
+    #[test]
+    fn a_resume_after_the_fail_reap_reprovisions_the_worktree_from_the_branch() {
+        use crate::domain::{UnitStatus, WorkUnit};
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "reresume", "r-reresume");
+
+        // The work the failed run LANDED, committed on `wicked/r-reresume`. The reap keeps the
+        // branch and drops the checkout, so this file is what a genuine re-provision restores —
+        // an empty directory at the right path would pass a bare `is_dir()` and still lose it.
+        std::fs::write(wt.join("landed.txt"), "phase 1 output\n").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "phase 1"][..]] {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&wt)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed in the worktree");
+        }
+
+        // The cursor unit the resume re-dispatches (crew#277's shape: a worker-originated
+        // terminal failure at unit 1).
+        let mut unit = WorkUnit::pending("r-reresume:u1", "r-reresume", 1, "work");
+        unit.assigned_cli = Some("claude".into());
+        unit.status = UnitStatus::Rejected;
+        unit.denial_reason = Some(format!(
+            "{WORKER_FAILURE_MARKER} 1: (cli `claude` exited 1)"
+        ));
+        put_node(&mut store, unit.to_node()).unwrap();
+
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut session = crate::domain::get_session(&store, "r-reresume")
+            .unwrap()
+            .unwrap();
+        fail_run(&mut store, &mut subs, &runner, &tx, &mut session, 1);
+        wait_gone(&wt); // the reap really happened — this is the state a resume walks into
+
+        let mut in_flight = HashSet::new();
+        let status = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r-reresume",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            SessionStatus::Executing,
+            "a failed run resumes from its cursor (crew#277)"
+        );
+
+        let session = crate::domain::get_session(&store, "r-reresume")
+            .unwrap()
+            .unwrap();
+        let workdir = session
+            .workdir
+            .clone()
+            .expect("a repo-bound run keeps a workdir across the resume");
+        assert!(
+            Path::new(&workdir).is_dir(),
+            "the resume re-dispatched into {workdir}, which does not exist — the worker gets that \
+             path as its cwd and every retry dies with `failed to spawn \"bash\": No such file or \
+             directory` (core#290)"
+        );
+        assert!(
+            Path::new(&workdir).join("landed.txt").is_file(),
+            "the re-provisioned worktree must be checked out from wicked/r-reresume, carrying the \
+             work the failed run landed — an empty directory is not a recovery"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Put a failed run on the store with the cursor unit a crew#277 resume re-dispatches, WITHOUT
+    /// going through `fail_run`. `fail_run` reaps on a background thread, and these two tests build
+    /// a specific on-disk shape afterwards — racing that thread would decide the test's outcome.
+    /// Returns the repo root and the worktree path.
+    fn failed_run_awaiting_resume(
+        store: &mut dyn GraphStore,
+        name: &str,
+        run_id: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use crate::domain::{UnitStatus, WorkUnit};
+        let (root, wt) = seeded_with_status(store, name, run_id, SessionStatus::Failed);
+        let mut unit = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
+        unit.assigned_cli = Some("claude".into());
+        unit.status = UnitStatus::Rejected;
+        unit.denial_reason = Some(format!(
+            "{WORKER_FAILURE_MARKER} 1: (cli `claude` exited 1)"
+        ));
+        put_node(store, unit.to_node()).unwrap();
+        (root, wt)
+    }
+
+    /// Commit `landed.txt` inside `wt` so `wicked/<run_id>` carries work a re-provision must restore.
+    fn commit_landed_work(wt: &Path) {
+        std::fs::write(wt.join("landed.txt"), "phase 1 output\n").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "phase 1"][..]] {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(wt)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed in the worktree");
+        }
+    }
+
+    /// Reduce `wt` to the shape a PARTIAL removal leaves: the directory survives, its `.git` FILE
+    /// does not. `remove_worktree` falls back to `remove_dir_all`, which can die part-way (a busy
+    /// file, a permissions error, an interrupted process), and the `git worktree prune` that both
+    /// reap paths run next then deregisters the admin entry *precisely because* the path lost its
+    /// `.git`. `keep` decides whether anything is left inside — the two halves of `create_worktree`'s
+    /// recovery rule (an empty shell is repairable; a directory of unknown provenance is not).
+    fn break_into_directory_shell(root: &Path, wt: &Path, keep: &[&str]) {
+        for entry in std::fs::read_dir(wt).unwrap() {
+            let p = entry.unwrap().path();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            if keep.contains(&name.as_str()) {
+                continue;
+            }
+            if p.is_dir() {
+                std::fs::remove_dir_all(&p).unwrap();
+            } else {
+                std::fs::remove_file(&p).unwrap();
+            }
+        }
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(["worktree", "prune"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git worktree prune failed");
+        // The premise both tests rest on: this still passes `is_dir()`, and is not a worktree.
+        assert!(
+            wt.is_dir() && !wt.join(".git").exists(),
+            "the shell must survive as a directory with no `.git`: {}",
+            wt.display()
+        );
+        assert!(
+            !crate::repo::is_live_worktree(wt),
+            "a directory with no `.git` file is not a live worktree: {}",
+            wt.display()
+        );
+    }
+
+    /// core#290 / PR #303 review — A DIRECTORY IS NOT A WORKTREE. The re-provision above tested the
+    /// recorded workdir with `Path::is_dir()`, so it treated any surviving directory as a usable
+    /// checkout and returned early. But a reap is not all-or-nothing: a partial `remove_dir_all`
+    /// plus the `worktree prune` that follows leaves a directory SHELL with no `.git` file and no
+    /// admin entry — it stats as a directory and is not a worktree. `is_dir()` waves that through,
+    /// and the resume then re-dispatches into it: the worker's cwd is not an isolated boundary, the
+    /// branch's work is not there, and the run fails somewhere downstream of the actual cause. It is
+    /// FINDING-059 one level up — the finding where a worker handed an "empty, unregistered
+    /// directory" worked in the parent repo instead and wrote 297 lines onto the operator's `master`.
+    ///
+    /// Falsified by reverting the check to `if std::path::Path::new(&workdir).is_dir()`:
+    ///
+    ///   the resume accepted .../wicked-worktrees/r-shell as a workdir, but it is a directory
+    ///   shell, not a git worktree — a partial reap left it with no `.git` file, so the worker
+    ///   gets a cwd that is not an isolated checkout (core#290 / PR #303)
+    #[test]
+    fn a_resume_rebuilds_a_workdir_that_survived_as_a_directory_but_not_as_a_worktree() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = failed_run_awaiting_resume(&mut store, "shell", "r-shell");
+        commit_landed_work(&wt);
+        // The exact broken shape: an EMPTY shell — the repairable half of the rule.
+        break_into_directory_shell(&root, &wt, &[]);
+
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let status = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r-shell",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(status, SessionStatus::Executing);
+
+        let workdir = crate::domain::get_session(&store, "r-shell")
+            .unwrap()
+            .unwrap()
+            .workdir
+            .expect("a repo-bound run keeps a workdir across the resume");
+        assert!(
+            crate::repo::is_live_worktree(Path::new(&workdir)),
+            "the resume accepted {workdir} as a workdir, but it is a directory shell, not a git \
+             worktree — a partial reap left it with no `.git` file, so the worker gets a cwd that \
+             is not an isolated checkout (core#290 / PR #303)"
+        );
+        assert!(
+            Path::new(&workdir).join("landed.txt").is_file(),
+            "re-adding the worktree from wicked/r-shell must restore the work the failed run \
+             landed; the shell the resume was handed did not carry it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the same rule, and the reason the check belongs HERE rather than downstream:
+    /// a shell that still holds files is a directory of unknown provenance, and `create_worktree`
+    /// refuses to call it an isolated checkout. The resume must surface that refusal at the cause —
+    /// as an `Err` to the caller with the run STILL `Failed` and still resumable, which is what the
+    /// re-provision's placement ahead of the cursor reset buys. Under `is_dir()` this run resumed to
+    /// `Executing` with a worker pointed at a non-checkout and no error anywhere.
+    ///
+    /// Falsified by reverting the check to `is_dir()`: the resume returns `Ok(Executing)` and the
+    /// `expect` on the error fires.
+    #[test]
+    fn a_resume_into_a_non_worktree_directory_errors_with_the_run_still_resumable() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = failed_run_awaiting_resume(&mut store, "shellfull", "r-shellfull");
+        commit_landed_work(&wt);
+        // Same broken shape, but something survived inside it — unrecoverable, must be refused.
+        break_into_directory_shell(&root, &wt, &["landed.txt"]);
+
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let err = resume_run_inner(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r-shellfull",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .expect_err(
+            "resuming into a directory that is not a git worktree must fail HERE, where the cause \
+             is legible — not hand the worker a non-checkout and fail somewhere downstream",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is not a git worktree"),
+            "the error must name the real cause; got: {msg}"
+        );
+
+        let session = crate::domain::get_session(&store, "r-shellfull")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.status,
+            SessionStatus::Failed,
+            "the re-provision runs BEFORE the cursor reset precisely so a failure leaves the run \
+             terminal and resumable, not `Executing` with no worker behind it"
+        );
+        assert!(
+            !in_flight.contains("r-shellfull"),
+            "a run that never dispatched must not be marked in-flight — it would refuse the next \
+             resume with RunBusy"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
