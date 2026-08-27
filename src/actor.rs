@@ -2725,7 +2725,10 @@ pub(crate) fn run(
                     }
                     TriageDecision::Fail(reason) => {
                         unit.status = crate::domain::UnitStatus::Rejected;
-                        let excerpt: String = failure_excerpt.chars().take(400).collect();
+                        // Head+TAIL, never head-only: the worker's operative line is its last
+                        // (crew#322). `failure_excerpt` is itself already head+tail-bounded, so
+                        // this second bound still ends on the real end of the transcript.
+                        let excerpt: String = failure_detail_excerpt(&failure_excerpt);
                         unit.denial_reason = Some(format!(
                             "Worker FAILED on unit {ord} (triage: {reason}): {excerpt}"
                         ));
@@ -3037,6 +3040,145 @@ pub(crate) fn launch_run_inner(
 /// the same seat even when an EARLIER attempt left entries in `worker_failed_clis`
 /// (Copilot review on #286).
 pub(crate) const WORKER_FAILURE_MARKER: &str = "Worker FAILED on unit";
+
+/// Chars kept from the HEAD of the excerpt that rides `denial_reason` / `StepFailed.detail`.
+const DETAIL_EXCERPT_HEAD: usize = 150;
+/// Chars kept from the TAIL of that excerpt. Bigger than the head on purpose: the operative
+/// line of a failing step is its LAST one.
+const DETAIL_EXCERPT_TAIL: usize = 250;
+/// Chars kept from the HEAD of the excerpt handed to the triage judge.
+const TRIAGE_EXCERPT_HEAD: usize = 450;
+/// Chars kept from the TAIL of the excerpt handed to the triage judge.
+const TRIAGE_EXCERPT_TAIL: usize = 750;
+/// Chars kept from the HEAD of the excerpt recorded by the non-triage worker-failure path.
+const FAILURE_EXCERPT_HEAD: usize = 300;
+/// Chars kept from the TAIL of that excerpt.
+const FAILURE_EXCERPT_TAIL: usize = 500;
+
+/// A bounded excerpt of `raw` that keeps BOTH ends — `head` chars, an elision marker, `tail`
+/// chars — never a head-only prefix.
+///
+/// Head-only truncation loses the one line that matters. Every failure message a step author
+/// writes on purpose is the LAST line before a nonzero exit (`wicked-crew`'s
+/// `packages/crew/src/core/deliver.ts` prints "nothing to deliver — the run produced no
+/// committed change …" there), and a transcript is warnings-then-verdict far more often than
+/// verdict-then-warnings. `wicked-crew`'s `src/api/unit-output.ts` documents `denial_reason`
+/// to consumers as a head+tail excerpt; this function is what makes that true on EVERY path
+/// rather than only the non-triage one (crew#322).
+///
+/// Counts chars, not bytes, so the cut never splits a multi-byte character.
+fn bounded_excerpt(raw: &str, head: usize, tail: usize) -> String {
+    let n = raw.chars().count();
+    let cap = head.saturating_add(tail);
+    if n <= cap {
+        return raw.to_string();
+    }
+    let head_s: String = raw.chars().take(head).collect();
+    let tail_s: String = raw.chars().skip(n - tail).collect();
+    format!("{head_s}\n[… {} chars elided …]\n{tail_s}", n - cap)
+}
+
+/// The excerpt handed to the agent triage judge and carried on
+/// [`Command::FailureTriageReady`] — the judge reads the worker's own words, so it must see
+/// the end of the transcript, not just its opening.
+fn triage_judge_excerpt(raw: &str) -> String {
+    bounded_excerpt(raw.trim(), TRIAGE_EXCERPT_HEAD, TRIAGE_EXCERPT_TAIL)
+}
+
+/// The excerpt that rides a unit's `denial_reason` and `StepFailed.detail`. Applied to an
+/// already-bounded [`triage_judge_excerpt`] this still yields the true tail of the worker's
+/// output, because a head+tail excerpt of a head+tail excerpt keeps the original tail.
+fn failure_detail_excerpt(raw: &str) -> String {
+    bounded_excerpt(raw, DETAIL_EXCERPT_HEAD, DETAIL_EXCERPT_TAIL)
+}
+
+#[cfg(test)]
+mod excerpt_tests {
+    use super::*;
+
+    /// The exact line `wicked-crew`'s deliver step prints as the LAST line before `exit 1`
+    /// (`packages/crew/src/core/deliver.ts`) — the message crew#318 went to the trouble of
+    /// computing, and the one crew#322 reported was being cut off.
+    const HONESTY_LINE: &str = "deliver: nothing to deliver — the run produced no committed \
+                                change ($B is not ahead of $D); nothing was pushed";
+
+    /// A worker transcript shaped like a real one: a long wall of warnings, verdict last.
+    fn transcript() -> String {
+        let mut s = String::new();
+        for i in 0..80 {
+            s.push_str(&format!(
+                "warn: tsconfig path alias #{i} could not be resolved\n"
+            ));
+        }
+        s.push_str(HONESTY_LINE);
+        s
+    }
+
+    #[test]
+    fn bounded_excerpt_keeps_both_ends() {
+        let raw = transcript();
+        let out = bounded_excerpt(&raw, 150, 250);
+        assert!(
+            out.starts_with("warn: tsconfig path alias #0"),
+            "head kept: {out}"
+        );
+        assert!(out.ends_with(HONESTY_LINE), "tail kept: {out}");
+        assert!(out.contains("chars elided"), "elision marked: {out}");
+    }
+
+    #[test]
+    fn short_output_is_returned_whole() {
+        let raw = "boom";
+        assert_eq!(bounded_excerpt(raw, 150, 250), "boom");
+        assert!(!bounded_excerpt(raw, 150, 250).contains("elided"));
+    }
+
+    #[test]
+    fn bounded_excerpt_never_splits_a_multibyte_char() {
+        let raw: String = "é🌱".repeat(500);
+        let out = bounded_excerpt(&raw, 150, 250);
+        // Would have panicked on a byte-sliced implementation; also proves the counts are chars.
+        assert!(out.chars().count() < raw.chars().count());
+        assert!(out.ends_with('🌱'));
+    }
+
+    /// crew#322: the human-present agent-triage path used to head-truncate — `take(1200)` of the
+    /// transcript, then `take(400)` of that — so a message written as the last line before
+    /// `exit 1` never reached `denial_reason`. This walks the SAME two stages the triage path
+    /// walks (`triage_judge_excerpt` at dispatch, `failure_detail_excerpt` on
+    /// `TriageDecision::Fail`) and asserts the operative line survives both.
+    #[test]
+    fn triage_denial_reason_keeps_the_last_line_of_the_transcript() {
+        let raw = transcript();
+        assert!(
+            raw.chars().count() > TRIAGE_EXCERPT_HEAD + TRIAGE_EXCERPT_TAIL,
+            "fixture must exceed the triage bound or it proves nothing"
+        );
+
+        // Stage 1: what rides Command::FailureTriageReady.
+        let judge_excerpt = triage_judge_excerpt(&raw);
+        assert!(
+            judge_excerpt.contains(HONESTY_LINE),
+            "the triage judge must see the worker's verdict, got: {judge_excerpt}"
+        );
+
+        // Stage 2: what TriageDecision::Fail records as denial_reason / StepFailed.detail.
+        let excerpt = failure_detail_excerpt(&judge_excerpt);
+        let denial_reason = format!("{WORKER_FAILURE_MARKER} 3 (triage: nonzero exit): {excerpt}");
+        assert!(
+            denial_reason.contains(HONESTY_LINE),
+            "denial_reason must carry the run's own reason, got: {denial_reason}"
+        );
+    }
+
+    /// The non-triage worker-failure path keeps the same guarantee (unchanged behaviour, now
+    /// sharing one implementation with the triage path).
+    #[test]
+    fn non_triage_failure_path_keeps_the_last_line() {
+        let out = bounded_excerpt(&transcript(), FAILURE_EXCERPT_HEAD, FAILURE_EXCERPT_TAIL);
+        assert!(out.contains(HONESTY_LINE), "got: {out}");
+    }
+}
 
 /// The body of `Command::ResumeRun` (also the campaign driver's crash-resume re-attach, DES §6).
 /// Re-advances from the persisted cursor. A terminal run is a no-op (returns its status).
@@ -3737,7 +3879,9 @@ fn apply_step_result(
                 if !human_present {
                     // No operator to ask — fall through to the standard fail contract.
                 } else {
-                    let raw_excerpt: String = output.output.trim().chars().take(300).collect();
+                    // Head+TAIL (crew#322): a refusal prints its reason last, so head-only
+                    // truncation cuts the one sentence the operator is being asked about.
+                    let raw_excerpt: String = failure_detail_excerpt(output.output.trim());
                     unit.denial_reason = Some(format!(
                         "environment refused ({}): {raw_excerpt}",
                         refusal.reason
@@ -3767,14 +3911,14 @@ fn apply_step_result(
                 // `FailureTriageReady` and the run stays Executing meanwhile.
                 // StepFailed fires IMMEDIATELY — it signals the worker failure, not the
                 // run's fate (which triage now decides), preserving the event contract.
-                let failure_excerpt: String = output.output.trim().chars().take(1200).collect();
+                let failure_excerpt: String = triage_judge_excerpt(&output.output);
                 emit(
                     subscribers,
                     CoreEvent::StepFailed {
                         session: run_id.clone(),
                         ord,
                         attempt: output.attempt,
-                        detail: failure_excerpt.chars().take(400).collect(),
+                        detail: failure_detail_excerpt(&failure_excerpt),
                         failure_kind: crate::event::StepFailureKind::WorkerError,
                     },
                 );
@@ -3924,14 +4068,7 @@ fn apply_step_result(
         // only — fatal lines come LAST by convention (a tool that prints N warnings then the
         // refusal would otherwise surface as 400 chars of warnings with the actual reason cut).
         let raw = output.output.trim();
-        let n = raw.chars().count();
-        let raw_snippet: String = if n <= 800 {
-            raw.to_string()
-        } else {
-            let head: String = raw.chars().take(300).collect();
-            let tail: String = raw.chars().skip(n - 500).collect();
-            format!("{head}\n[… {} chars elided …]\n{tail}", n - 800)
-        };
+        let raw_snippet: String = bounded_excerpt(raw, FAILURE_EXCERPT_HEAD, FAILURE_EXCERPT_TAIL);
         unit.denial_reason = Some(if raw.is_empty() {
             format!("Worker FAILED on unit {ord} (no output)")
         } else {
