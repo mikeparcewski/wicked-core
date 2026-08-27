@@ -6710,7 +6710,11 @@ mod deliverable_floor_tests {
     /// reintroduce the split by forgetting to copy a check it does not have to copy.
     #[test]
     fn the_deliverable_floor_has_exactly_one_call_site_and_it_is_runner_independent() {
-        // Needles by concatenation so this test's own text cannot satisfy the search.
+        // Needle by concatenation so this test's own text cannot satisfy the search — which is
+        // also what lets the count run over the WHOLE file. Deliberately NOT stripping test
+        // modules first: every one of these files interleaves `#[cfg(test)]` modules with
+        // production code (actor.rs alone has 18), so splitting on the FIRST one would leave
+        // thousands of production lines unscanned and a re-added call site could hide there.
         let call = format!("missing{}deliverables(", "_");
         let sources: [(&str, &str); 4] = [
             ("actor.rs", include_str!("actor.rs")),
@@ -6719,15 +6723,15 @@ mod deliverable_floor_tests {
             ("cli_runner.rs", include_str!("cli_runner.rs")),
         ];
         for (name, src) in sources {
-            // Strip test modules: a `#[cfg(test)]` fixture naming the helper is not a call site.
-            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-            let hits = prod.matches(call.as_str()).count();
+            let hits = src.matches(call.as_str()).count();
             let expected = usize::from(name == "actor.rs");
             assert_eq!(
                 hits, expected,
-                "{name} has {hits} deliverable-floor call site(s), expected {expected} — the \
+                "{name} names the deliverable floor {hits} time(s), expected {expected} — the \
                  floor must be consulted at the runner-independent fold and NOWHERE else, or \
-                 'done' is re-derived on some runners and asserted on others (core#297 §1)"
+                 'done' is re-derived on some runners and asserted on others (core#297 §1). \
+                 A test needing the helper should call it via `path_policy` under its own name, \
+                 not re-spell this one."
             );
         }
         // …and the one site must sit in the fold, after the substance gate, where the unit and

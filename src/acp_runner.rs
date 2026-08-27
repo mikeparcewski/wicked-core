@@ -4391,23 +4391,24 @@ mod tests {
     #[test]
     fn the_deliverable_floor_never_reaches_the_retry_or_failover_classifiers() {
         // No runner constructs a missing-deliverable failure any more — the audit that keeps it
-        // that way lives in `actor::deliverable_floor_tests`. Here: prove the classifiers hold no
+        // that way lives in `actor::deliverable_floor_tests`. Here: prove this file holds no
         // deliverable-shaped special case, so nobody re-adds one instead of keeping the floor at
-        // the fold. Needle by concatenation so this test's own text cannot satisfy the search.
-        let src = include_str!("acp_runner.rs");
-        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        // the fold. Both needles are built by CONCATENATION so this test's own text cannot satisfy
+        // the search — which is what lets the scan cover the WHOLE file rather than a
+        // `#[cfg(test)]`-truncated prefix (this file interleaves test modules with production
+        // code, so a prefix scan would leave thousands of production lines unread).
         let needle = format!("did not produce its {}", "declared deliverable");
         assert!(
-            !prod.contains(needle.as_str()),
-            "a substring carve-out for the deliverable floor is back in acp_runner's production \
-             code — the floor belongs at the fold, where it is a status, not a sentence to grep"
+            !include_str!("acp_runner.rs").contains(needle.as_str()),
+            "a substring carve-out for the deliverable floor is back in acp_runner — the floor \
+             belongs at the fold, where it is a STATUS, not a sentence to grep out of \
+             worker-controlled output"
         );
         // And the classifiers judge the INFRASTRUCTURAL shape only: prose that merely mentions a
         // deliverable is neither transient nor worker-originated, with or without a carve-out.
-        let prose =
-            "unit u3 reported done but did not produce its declared deliverable(s): rg.json";
-        assert!(!is_transient_cli_failure(prose));
-        assert!(!is_worker_originated_failure(prose));
+        let prose = format!("unit u3 reported done but {needle}(s): rg.json");
+        assert!(!is_transient_cli_failure(&prose));
+        assert!(!is_worker_originated_failure(&prose));
     }
 
     /// core#282 — the failover ladder's classifier. Timeouts are WORKER-originated (the seat
