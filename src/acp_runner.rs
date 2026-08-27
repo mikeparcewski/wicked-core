@@ -2956,19 +2956,22 @@ fn parse_result_usage(u: &Value) -> Option<Usage> {
 /// nonzero CLI exit (a governance tool-deny is handled inside claude, not as a process failure) — so
 /// the nonzero-exit / could-not-run failure is retried a bounded number of times before the unit
 /// fails closed. Governed phases are idempotent (estate annotations upsert; a re-run re-derives), so
-/// a retry is safe. A DETERMINISTIC failure (a missing declared deliverable, FINDING-101) is NOT
-/// retried — a re-run cannot conjure the artifact.
+/// a retry is safe.
 const MAX_TRANSIENT_RETRIES: u32 = 2;
 
 /// Whether a FAILED single-shot output looks like an infrastructural/transient CLI failure (worth a
 /// retry) rather than a deterministic one. Pure, so the policy is falsifiable without a `StepInput`
 /// fixture. Matches the wrapped runner's own nonzero-exit / could-not-run messages
 /// (`execute_wrapped.rs`) plus the network signatures a `claude -p` prints on an API/connection drop.
+///
+/// A missing declared deliverable (FINDING-101) used to need an explicit substring exclusion here,
+/// because the wrapped runner reported it as a synthetic `StepStatus::Failed` carrying an English
+/// sentence, and retrying a deterministic incompleteness burns budget to fail identically. core#297
+/// removed the need: the floor moved to the runner-independent fold in `actor::apply_step_result`,
+/// which rejects the unit DIRECTLY and never produces a failed `StepOutput` for any classifier to
+/// read. Structural, not string-sniffed — and it closes the small hole where a worker printing that
+/// sentence into its own transcript could reclassify its own failure.
 pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
-    // FINDING-101 incompleteness is deterministic — a retry cannot produce the missing deliverable.
-    if output.contains("did not produce its declared deliverable") {
-        return false;
-    }
     let o = output.to_ascii_lowercase();
     o.contains("exited") // the wrapped runner's "(cli `x` exited N) …" nonzero-exit message
         || o.contains("could not run")
@@ -2986,8 +2989,9 @@ pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
 /// Whether a FAILED output is WORKER-ORIGINATED — the CLI process itself failed (nonzero exit,
 /// spawn failure, connection drop, or the harness killed it at a deadline) rather than the WORK
 /// being judged bad (a judged rejection surfaces as exit-0 plus a downstream gate deny, never as
-/// one of these shapes; the deterministic FINDING-101 missing-deliverable failure is excluded
-/// explicitly — a different seat re-running the same prompt is not what conjures a deliverable).
+/// one of these shapes). The FINDING-101 missing-deliverable case no longer needs the substring
+/// exclusion it once carried here — see [`is_transient_cli_failure`] for why core#297 made it
+/// structural.
 ///
 /// Superset of [`is_transient_cli_failure`], adding the TIMEOUT signatures. A timeout is
 /// deliberately NOT in the transient set: a same-seat in-runner retry would silently burn another
@@ -2996,9 +3000,6 @@ pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
 /// timed out twice on the same unit because the timeout shape never entered the ladder, so the
 /// engine re-dispatched the same seat until the run died.
 pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
-    if output.contains("did not produce its declared deliverable") {
-        return false;
-    }
     if is_transient_cli_failure(output) {
         return true;
     }
@@ -4374,22 +4375,39 @@ mod tests {
         ] {
             assert!(is_transient_cli_failure(t), "should be transient: {t:?}");
         }
-        // FINDING-101 incompleteness is DETERMINISTIC — a retry cannot conjure the artifact, so it
-        // must NOT be classified transient (else a real gap burns retries and still fails). The
-        // deliverable phrase takes PRECEDENCE even when the message also carries a transient-looking
-        // marker: this string contains "exited", yet the exclusion must still win — drop the
-        // exclusion and this case flips to transient, failing here.
-        assert!(
-            !is_transient_cli_failure(
-                "unit u3 reported done but did not produce its declared deliverable(s): rg.json \
-                 (cli `claude` exited 1)"
-            ),
-            "a missing declared deliverable is deterministic, not transient — even with a marker"
-        );
         // A plain evaluator-style rejection with no infrastructural marker is not retried.
         assert!(!is_transient_cli_failure(
             "the requirement claim is content-free"
         ));
+    }
+
+    /// core#297 — the FINDING-101 missing-deliverable case is kept out of BOTH classifiers
+    /// STRUCTURALLY, not by the substring exclusion they used to carry. A missing deliverable is a
+    /// deterministic incompleteness: neither an in-runner retry nor a different seat can conjure
+    /// the artifact, so it must reach neither ladder. The floor now rejects the unit directly at
+    /// the fold (`actor::apply_step_result`) and no runner ever produces a failed `StepOutput` for
+    /// it, so there is nothing for these classifiers to misread — which also closes the hole where
+    /// a WORKER printing that sentence into its own transcript could reclassify its own failure.
+    #[test]
+    fn the_deliverable_floor_never_reaches_the_retry_or_failover_classifiers() {
+        // No runner constructs a missing-deliverable failure any more — the audit that keeps it
+        // that way lives in `actor::deliverable_floor_tests`. Here: prove the classifiers hold no
+        // deliverable-shaped special case, so nobody re-adds one instead of keeping the floor at
+        // the fold. Needle by concatenation so this test's own text cannot satisfy the search.
+        let src = include_str!("acp_runner.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let needle = format!("did not produce its {}", "declared deliverable");
+        assert!(
+            !prod.contains(needle.as_str()),
+            "a substring carve-out for the deliverable floor is back in acp_runner's production \
+             code — the floor belongs at the fold, where it is a status, not a sentence to grep"
+        );
+        // And the classifiers judge the INFRASTRUCTURAL shape only: prose that merely mentions a
+        // deliverable is neither transient nor worker-originated, with or without a carve-out.
+        let prose =
+            "unit u3 reported done but did not produce its declared deliverable(s): rg.json";
+        assert!(!is_transient_cli_failure(prose));
+        assert!(!is_worker_originated_failure(prose));
     }
 
     /// core#282 — the failover ladder's classifier. Timeouts are WORKER-originated (the seat
@@ -4419,12 +4437,6 @@ mod tests {
         ] {
             assert!(is_worker_originated_failure(t), "transient ⊂ worker: {t:?}");
         }
-        // The FINDING-101 deterministic exclusion wins even when the message carries a
-        // timeout-looking marker — a different seat re-running cannot conjure the artifact.
-        assert!(!is_worker_originated_failure(
-            "unit u3 reported done but did not produce its declared deliverable(s): rg.json \
-             (the build step timed out)"
-        ));
         // A judged, work-level rejection has no worker signature at all.
         assert!(!is_worker_originated_failure(
             "the requirement claim is content-free"
@@ -4457,7 +4469,7 @@ mod tests {
             transient,
             0
         ));
-        // Never retry a success, a cancel (our own timeout), or a deterministic/non-transient failure.
+        // Never retry a success, a cancel (our own timeout), or a non-transient failure.
         assert!(!should_retry_worker(true, StepStatus::Ok, transient, 0));
         assert!(!should_retry_worker(
             true,
@@ -4468,7 +4480,7 @@ mod tests {
         assert!(!should_retry_worker(
             true,
             StepStatus::Failed,
-            "did not produce its declared deliverable(s): rg.json",
+            "the requirement claim is content-free",
             0
         ));
     }
