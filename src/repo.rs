@@ -316,7 +316,11 @@ fn ensure_worktrees_excluded(repo_root: &str) {
 /// inside it resolves. Both are checked: the file alone can outlive the admin entry that gives it
 /// meaning, and `rev-parse` alone succeeds anywhere beneath the parent repo — including an empty
 /// `.wicked/worktrees/<id>/`, which is exactly the case this exists to reject.
-fn is_live_worktree(wt: &Path) -> bool {
+///
+/// `pub(crate)` because the resume path needs the same test: `reprovision_reaped_worktree` decides
+/// whether a run's recorded workdir still IS a checkout, and a `is_dir()` there re-opens FINDING-059
+/// one level up from where [`create_worktree`] closed it.
+pub(crate) fn is_live_worktree(wt: &Path) -> bool {
     if !wt.join(".git").is_file() {
         return false;
     }
