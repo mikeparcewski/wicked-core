@@ -8780,14 +8780,22 @@ mod launch_inner_boundary_validation_tests {
         (res, persisted)
     }
 
-    /// `$HOME` is the prerequisite the validation fails CLOSED without, and it is unset on Windows.
-    /// Give the process one only when it has none, so the accept assert judges the ROOT.
-    fn ensure_home() {
-        if std::env::var_os("HOME").is_none() {
-            let d = std::env::temp_dir().join(format!("wicked-lri-home-{}", std::process::id()));
-            std::fs::create_dir_all(&d).unwrap();
-            std::env::set_var("HOME", d);
-        }
+    /// Whether the ACCEPT half of the root-validation test can run here.
+    ///
+    /// The accept assert needs a `$HOME`, because the validation fails CLOSED without one. An
+    /// earlier revision manufactured one with `set_var("HOME", ...)`. That was the wrong tool:
+    /// `set_var` mutates the whole lib-test process, `$HOME` is ALWAYS unset on Windows so it
+    /// always fired, and `gate_hook`'s `dirs_config_workflow()` then resolved the governance pin
+    /// under the system temp dir — where the core#264 carve-out downgrades a write denial from
+    /// fatal to advisory. That turned `the_governance_pin_is_outside_the_boundary` red on Windows
+    /// CI while every other platform stayed green: a test reaching across the process to break an
+    /// unrelated one.
+    ///
+    /// The REFUSE halves need no `$HOME` and always run — they are what this test is really for.
+    /// The accept half is skipped where the prerequisite genuinely is not there, which is honest
+    /// about the platform instead of faking the environment out from under everyone else.
+    fn home_available() -> bool {
+        std::env::var_os("HOME").is_some()
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -8802,8 +8810,6 @@ mod launch_inner_boundary_validation_tests {
     /// return `Err` unconditionally → the accept assert fails.
     #[test]
     fn launch_run_inner_judges_declared_roots_before_it_persists_anything() {
-        ensure_home();
-
         // READ: an unusable (relative) root refuses the launch, with NO session written.
         let (res, persisted) = launch(spec("lri-bad-read", vec!["relative/ref".into()], vec![]));
         let err = res
@@ -8836,6 +8842,13 @@ mod launch_inner_boundary_validation_tests {
 
         // ACCEPT: an absolute reference tree outside the pin tree gets through — the guard is a
         // JUDGEMENT, not a blanket refusal of every declared root.
+        //
+        // Needs a real `$HOME` (the validation fails closed without one) and must not manufacture
+        // it — see `home_available`. Where there is none, the refuse halves above have already
+        // done this test's main job.
+        if !home_available() {
+            return;
+        }
         let reference = scratch("ref");
         let (res, persisted) = launch(spec(
             "lri-ok-read",

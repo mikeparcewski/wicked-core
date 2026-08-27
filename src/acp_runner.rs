@@ -8041,16 +8041,17 @@ else:
     fn the_two_carriers_arm_the_same_boundary() {
         use std::path::PathBuf;
 
-        // Both sides of the comparison read `$HOME` (the skill/plugin root rides the read
-        // assembly), so this test must not straddle another test's one-time `set_var("HOME")` —
-        // the sibling helpers only set it when it is UNSET, so ensuring it is set here closes the
-        // window rather than opening a new one. `$HOME` is unset on Windows, which is the only
-        // platform where the window exists at all.
-        if std::env::var_os("HOME").is_none() {
-            let d = std::env::temp_dir().join(format!("wicked-carriers-{}", std::process::id()));
-            std::fs::create_dir_all(&d).unwrap();
-            std::env::set_var("HOME", d);
-        }
+        // Deliberately does NOT touch `$HOME`. An earlier revision set it when unset, reasoning
+        // that this "closes the window rather than opening a new one". That was backwards: on
+        // Windows `$HOME` is ALWAYS unset, so it always fired, and `set_var` mutates the whole
+        // lib-test process. `gate_hook`'s `dirs_config_workflow()` then computed the governance
+        // pin under the system temp dir, where the core#264 carve-out downgrades a write denial
+        // from fatal to advisory — turning `the_governance_pin_is_outside_the_boundary` red on
+        // Windows CI while every other platform stayed green.
+        //
+        // This test does not need it: BOTH sides of the comparison derive their plugin root from
+        // the same `$HOME`, so they agree whether it is set or not. What it asserts is that the
+        // two carriers match each other, not what they resolve to.
 
         let cwd = PathBuf::from(if cfg!(windows) {
             r"C:\wicked-294\unit-cwd"
