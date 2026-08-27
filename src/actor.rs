@@ -3874,9 +3874,28 @@ fn apply_step_result(
         // standard fail contract (core#282: the previous attempt-counted ladder could re-pick
         // an already-failed seat and let one deterministically-failing seat wedge the phase;
         // the ladder is now bounded by roster size, not an attempt cap).
-        // Governed units only: their phases are idempotent (the same argument that gates the
-        // wrapped runner's transient retry); the engine's own internal calls are not.
-        if output.governed && crate::acp_runner::is_worker_originated_failure(&output.output) {
+        //
+        // KEYED TO PHASE IDEMPOTENCY, NOT TO INPUT GOVERNANCE (core#292). This condition was
+        // `output.governed`, which is NOT "is a campaign phase" — it is the wrapped runner's
+        // assertion that it armed the PreToolUse gate-hook, and that adapter is claude-only
+        // (`execute_wrapped`: a governed unit on any other CLI emits `GovernanceUnenforced` and
+        // returns `governed: false`, the FINDING-063 disclosure). So the ladder armed for exactly
+        // one seat and never for codex/agy/pi — the seats that actually exhibit the exit-1 /
+        // timeout failure mode it was built for. Field evidence: three consecutive governed runs
+        // died at one worker failure each (`agy exited 1` ×2, `codex exited 1`) with healthy seats
+        // idle. The ladder's justification is that the PHASE is idempotent (a re-run re-derives;
+        // estate annotations upsert) — a property of the campaign phase, not of which CLI can host
+        // a hook. Every output reaching this reducer IS a campaign phase: the engine's own internal
+        // calls (agent-judge, validator authoring, triage) invoke the runner DIRECTLY and never
+        // post `ApplyStepResult`, so the flag was never what excluded them. `output.governed` keeps
+        // its real meaning below (the evidence-integrity fold + the substance gate).
+        //
+        // Tool-executor units are excluded: `dispatch_unit` re-runs the unit's fixed `tool_cmd`
+        // regardless of the seat, so "fail over to the next seat" would just re-run the same
+        // command N times. Failover moves WORK between agents; there is no agent here.
+        if unit.tool_cmd.is_none()
+            && crate::acp_runner::is_worker_originated_failure(&output.output)
+        {
             let failed_cli = unit
                 .assigned_cli
                 .clone()
