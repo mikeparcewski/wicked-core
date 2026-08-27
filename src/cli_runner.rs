@@ -422,8 +422,13 @@ fn bus_request_agent_verdict(
 /// Concatenate the readable declared deliverables (each a path relative to `workdir`) into one blob for
 /// the agent judge, each headed by its filename. `None` if none are readable.
 ///
-/// Only worktree-relative, non-escaping deliverables are read — the SAME constraint the deterministic
-/// floor (`missing_deliverables`, execute_wrapped.rs) enforces. A `required_deliverables` list comes from
+/// Only worktree-relative, non-escaping deliverables are read. That is NARROWER than the deterministic
+/// floor ([`crate::path_policy::missing_deliverables`]), which since core#297 §3 also resolves a
+/// deliverable inside a declared `extra_write_roots` entry — deliberately so. The floor only asks
+/// whether a path EXISTS; this reads the file's CONTENT into a judge prompt, and content from outside
+/// the worktree is exactly the exfiltration the three fences below exist to stop. A deliverable in a
+/// write root is therefore still floored (it must exist) but not fed to the judge. A `required_deliverables`
+/// list comes from
 /// a WorkflowDef (arbitrary author data) and the worker itself writes the files, so the judge input must
 /// never pull content from OUTSIDE the worktree. Three fences, all fail-closed (skip on violation):
 ///

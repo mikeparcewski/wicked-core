@@ -4014,6 +4014,74 @@ fn apply_step_result(
         ));
     }
 
+    // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
+    // A phase that declared `required_deliverables` may not fold Ok while its own declared
+    // evidence is absent. This is the file-shaped sibling of the substance gate above: the
+    // substance gate asks "did this phase leave ANY trace", this one asks "did it leave the
+    // specific trace it promised". Both re-derive done from evidence rather than from the
+    // worker's claim.
+    //
+    // WHY IT LIVES HERE (core#297 §1). It used to be enforced inside `execute_wrapped`, so the
+    // gate applied on the wrapped-CLI path and nowhere else — the ACP runner parsed
+    // `required_deliverables` and never read it, which is the path a real `claude` seat takes
+    // and the path every governed dogfood run used. A gate whose presence depends on which seat
+    // the run happened to resolve to is worse than no gate, because it is believed. Every runner
+    // posts its result into THIS fold, so enforcing it here is runner-independent by
+    // construction: a new runner inherits the floor without having to remember to copy it.
+    //
+    // NOT scoped to governed units, unlike the substance gate. `required_deliverables` is the
+    // WORKFLOW AUTHOR's own promise about this phase, not a governance policy imposed on it; the
+    // wrapped path enforced it for every unit, and narrowing it while moving it would quietly
+    // delete coverage under cover of a refactor.
+    if !unit.required_deliverables.is_empty() {
+        // The unit's cwd: its worktree when the run is bound to one, else the same per-run
+        // sandbox the runners resolve to for an unbound run (`sandbox_root`, one definition).
+        let cwd = session
+            .workdir
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(&run_id));
+        if let Some(missing) = crate::path_policy::missing_deliverables(
+            &unit.required_deliverables,
+            &cwd,
+            // core#297 §3: a deliverable may also live in a root the LAUNCH declared and
+            // validated. Without this an unbound run — every crew interactive seam — has no
+            // spelling of the field that resolves, so it declares nothing at all.
+            &session.extra_write_roots,
+        ) {
+            let why = format!(
+                "phase reported done but did not produce its declared deliverable(s): {missing}"
+            );
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(why.clone());
+            put_node(store, unit.to_node())?;
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: why,
+                    // Core's veto over a HEALTHY worker — the CLI ran and exited Ok. Kinding this
+                    // WorkerError would make seat-failover punish a seat for a workflow's own
+                    // unmet promise, retrying it across the whole roster to fail identically.
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                },
+            );
+            let phase = crate::scope::unit_phase(ord);
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+            return Ok(fail_run(
+                store,
+                subscribers,
+                runner,
+                self_tx,
+                &mut session,
+                ord,
+            ));
+        }
+    }
+
     let cli_keys = session.clis.clone();
     let entity_mode = session.entity_mode;
     let workflow_id = session.workflow_id.clone();
@@ -6260,6 +6328,424 @@ mod substance_gate_tests {
             unit.denial_reason.as_deref(),
             Some(NO_SUBSTANCE),
             "200 trimmed chars of prose must clear the substance gate"
+        );
+    }
+}
+
+/// core#297 §1 + §3 — the DELIVERABLE FLOOR, at the one site every runner passes through.
+///
+/// `required_deliverables` used to be read by the WRAPPED runner only, so whether a declared
+/// artifact was verified depended on which seat the run happened to resolve to: the ACP path (what
+/// a real `claude` seat takes, and what every governed dogfood run used) parsed the field and
+/// never looked at it. These tests drive `apply_step_result` — the fold EVERY runner posts its
+/// result into — so they hold for the ACP path, the wrapped path, and the tool-executor path
+/// alike, and none of them constructs a runner at all.
+///
+/// §3 is the other half: an UNBOUND run (`workdir: None`) whose deliverable lives in a declared
+/// `extra_write_roots` entry had no spelling that worked — relative resolved against the sandbox,
+/// absolute was unverifiable by construction. Deliverables now resolve against the declared write
+/// roots as well as the cwd.
+#[cfg(test)]
+mod deliverable_floor_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{PhaseRole, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wicked-deliv-actor-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Long enough that the PHASE SUBSTANCE GATE cannot fire — these tests are about the
+    /// deliverable floor, and a short output would reject for the other reason entirely.
+    fn prose() -> String {
+        "the phase wrote a long and entirely plausible narration of its work. ".repeat(6)
+    }
+
+    /// One Executing session at cursor 0 over a single Creator unit declaring `deliverables`.
+    fn seed(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        workdir: Option<String>,
+        write_roots: Vec<String>,
+        deliverables: Vec<String>,
+    ) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir,
+            repo_ref: None,
+            extra_write_roots: write_roots,
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
+        u.role = PhaseRole::Creator;
+        u.status = UnitStatus::Distributed;
+        u.required_deliverables = deliverables;
+        put_node(store, u.to_node()).unwrap();
+        wicked_orchestration::register_workflow(
+            store,
+            format!("wf-{run_id}"),
+            "p",
+            &[(format!("wf-{run_id}:unit-1"), "build the feature")],
+        )
+        .unwrap();
+    }
+
+    /// Fold an Ok result for the seeded unit. Ungoverned on purpose: the declared-deliverable
+    /// promise belongs to the WORKFLOW AUTHOR, not to the governance layer, so the floor must
+    /// hold without governance armed — and an ungoverned fold otherwise completes cleanly
+    /// (`substance_gate_tests::an_ungoverned_short_ok_fold_still_completes`), which makes
+    /// "Rejected" unambiguous evidence that THIS gate fired.
+    fn fold(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+    ) -> (AgentSession, WorkUnit) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: prose(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .remove(0);
+        (session, unit)
+    }
+
+    /// THE REPRODUCTION (§1). A unit declares `required_deliverables` and reports Ok having
+    /// produced nothing. Before core#297 this folded to `Done` on every path but the wrapped
+    /// runner's; now the shared fold rejects it and NAMES the artifact that never arrived.
+    #[test]
+    fn a_declared_deliverable_absent_from_the_worktree_rejects_the_unit() {
+        let wd = tmp("absent");
+        let run_id = format!("deliv-absent-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            Some(wd.to_string_lossy().into_owned()),
+            Vec::new(),
+            vec!["report.json".into()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(
+            unit.status,
+            UnitStatus::Rejected,
+            "a unit that did not produce its declared deliverable must not fold as Done"
+        );
+        let why = unit.denial_reason.unwrap_or_default();
+        assert!(
+            why.contains("report.json"),
+            "the denial must name the artifact that never arrived: {why}"
+        );
+        assert_eq!(session.status, SessionStatus::Failed);
+        // The EVENT, not just the node: a studio tailing the stream is where an operator learns
+        // why the run stopped, so the detail must carry the same named artifact.
+        let veto_event = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
+            matches!(
+                ev,
+                CoreEvent::StepFailed { detail, failure_kind, .. }
+                    if failure_kind == crate::event::StepFailureKind::SubstanceRejected
+                        && detail.contains("report.json")
+            )
+        });
+        assert!(
+            veto_event,
+            "the standard failure path must emit StepFailed naming the missing deliverable, \
+             kinded SubstanceRejected — CORE's veto over a HEALTHY worker, never WorkerError \
+             (which drives seat failover across the whole roster to fail identically)"
+        );
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    /// The other direction: the same unit, the same declaration, with the file actually there.
+    #[test]
+    fn a_declared_deliverable_present_in_the_worktree_folds_ok() {
+        let wd = tmp("present");
+        std::fs::write(wd.join("report.json"), "{}").unwrap();
+        let run_id = format!("deliv-present-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            Some(wd.to_string_lossy().into_owned()),
+            Vec::new(),
+            vec!["report.json".into()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
+        assert_eq!(session.status, SessionStatus::Completed);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    /// The CWD DERIVATION for an unbound run: with `workdir: None` the fold must look in the same
+    /// per-run sandbox THE RUNNERS resolve to, not in some other directory of its own. Two
+    /// assertions, because either half can drift alone: the runner-facing `sandbox_for(input)` and
+    /// the actor-facing `sandbox_root(run_id)` must name the same directory, and a plain relative
+    /// deliverable written into it must then resolve through the fold.
+    #[test]
+    fn an_unbound_runs_deliverable_resolves_against_the_per_run_sandbox() {
+        let run_id = format!("deliv-sandbox-{}", std::process::id());
+        let sandbox = crate::execute_wrapped::sandbox_root(&run_id);
+        // The runners' own spelling, from a StepInput — if `sandbox_for` ever stops agreeing with
+        // `sandbox_root`, the fold starts checking a directory no worker ever wrote to and the
+        // floor fails every unbound run that honestly produced its deliverable.
+        let probe = StepInput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "t"),
+            workflow_id: format!("wf-{run_id}"),
+            entity_mode: EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+        };
+        assert_eq!(
+            crate::execute_wrapped::sandbox_for(&probe),
+            sandbox,
+            "the runner's sandbox and the fold's sandbox must be one directory"
+        );
+        let _ = std::fs::remove_dir_all(&sandbox);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::write(sandbox.join("report.json"), "{}").unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            Vec::new(),
+            vec!["report.json".into()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
+        assert_eq!(session.status, SessionStatus::Completed);
+        let _ = std::fs::remove_dir_all(&sandbox);
+    }
+
+    /// §3, the shape every crew interactive seam has: UNBOUND run (`workdir: None` ⇒ cwd is the
+    /// throwaway sandbox), deliverable written into a per-run inbox declared as an
+    /// `extra_write_roots` entry. Absolute-in-a-declared-root now resolves; before core#297 there
+    /// was no spelling of the field that could work.
+    #[test]
+    fn an_unbound_run_may_declare_a_deliverable_inside_a_declared_write_root() {
+        let inbox = tmp("inbox-ok");
+        let deliverable = inbox.join("hand-off.md");
+        std::fs::write(&deliverable, "the answer").unwrap();
+        let run_id = format!("deliv-root-ok-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec![deliverable.to_string_lossy().into_owned()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
+        assert_eq!(session.status, SessionStatus::Completed);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// …and the widening is a RESOLUTION rule, not an amnesty: the same declaration with nothing
+    /// written into the inbox still rejects.
+    #[test]
+    fn a_write_root_deliverable_that_was_never_written_still_rejects() {
+        let inbox = tmp("inbox-empty");
+        let deliverable = inbox.join("hand-off.md");
+        let run_id = format!("deliv-root-miss-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec![deliverable.to_string_lossy().into_owned()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(session.status, SessionStatus::Failed);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// The boundary holds: an absolute deliverable OUTSIDE every declared write root stays
+    /// unverifiable-and-therefore-missing even when the file plainly exists. Otherwise a workflow
+    /// could point the floor at any pre-existing file on the box and always pass.
+    #[test]
+    fn an_absolute_deliverable_outside_every_declared_root_is_still_unverifiable() {
+        let elsewhere = tmp("elsewhere");
+        let file = elsewhere.join("already-here.md");
+        std::fs::write(&file, "not this run's work").unwrap();
+        let inbox = tmp("inbox-other");
+        let run_id = format!("deliv-outside-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            None,
+            vec![inbox.to_string_lossy().into_owned()],
+            vec![file.to_string_lossy().into_owned()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(
+            unit.status,
+            UnitStatus::Rejected,
+            "an existing file outside the run's declared boundary is not this run's evidence"
+        );
+        assert_eq!(session.status, SessionStatus::Failed);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// A unit declaring NOTHING is untouched by any of this.
+    #[test]
+    fn a_unit_declaring_no_deliverables_folds_ok() {
+        let wd = tmp("none");
+        let run_id = format!("deliv-none-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            Some(wd.to_string_lossy().into_owned()),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(session.status, SessionStatus::Completed);
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    /// CALL-SITE AUDIT — the invariant §1 is actually about: EXACTLY ONE site consults the
+    /// declared deliverables, and it is the runner-independent fold. A future runner cannot
+    /// reintroduce the split by forgetting to copy a check it does not have to copy.
+    #[test]
+    fn the_deliverable_floor_has_exactly_one_call_site_and_it_is_runner_independent() {
+        // Needles by concatenation so this test's own text cannot satisfy the search.
+        let call = format!("missing{}deliverables(", "_");
+        let sources: [(&str, &str); 4] = [
+            ("actor.rs", include_str!("actor.rs")),
+            ("execute_wrapped.rs", include_str!("execute_wrapped.rs")),
+            ("acp_runner.rs", include_str!("acp_runner.rs")),
+            ("cli_runner.rs", include_str!("cli_runner.rs")),
+        ];
+        for (name, src) in sources {
+            // Strip test modules: a `#[cfg(test)]` fixture naming the helper is not a call site.
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let hits = prod.matches(call.as_str()).count();
+            let expected = usize::from(name == "actor.rs");
+            assert_eq!(
+                hits, expected,
+                "{name} has {hits} deliverable-floor call site(s), expected {expected} — the \
+                 floor must be consulted at the runner-independent fold and NOWHERE else, or \
+                 'done' is re-derived on some runners and asserted on others (core#297 §1)"
+            );
+        }
+        // …and the one site must sit in the fold, after the substance gate, where the unit and
+        // the session's workdir + write roots are both in hand.
+        let actor = include_str!("actor.rs");
+        let body = actor
+            .split("fn apply_step_result")
+            .nth(1)
+            .and_then(|b| b.split("\nfn fail_run").next())
+            .expect("apply_step_result is still a top-level fn ending before fail_run");
+        assert!(
+            body.contains(call.as_str()),
+            "the deliverable floor is no longer inside apply_step_result"
+        );
+        assert!(
+            body.contains("extra_write_roots"),
+            "the floor must resolve deliverables against the run's DECLARED write roots too, \
+             or an unbound run cannot spell its own deliverable (core#297 §3)"
         );
     }
 }
