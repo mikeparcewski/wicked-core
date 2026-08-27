@@ -3042,6 +3042,13 @@ pub(crate) fn launch_run_inner(
 pub(crate) const WORKER_FAILURE_MARKER: &str = "Worker FAILED on unit";
 
 /// Chars kept from the HEAD of the excerpt that rides `denial_reason` / `StepFailed.detail`.
+/// The ElicitationFailed denial budget, split head+tail like the others. Total is the 800 this
+/// path has always carried; only the SHAPE changes, weighted toward the tail because that is
+/// where an elicitation says why it could not finish.
+const ELICITATION_EXCERPT_HEAD: usize = 300;
+/// See [`ELICITATION_EXCERPT_HEAD`].
+const ELICITATION_EXCERPT_TAIL: usize = 500;
+
 const DETAIL_EXCERPT_HEAD: usize = 150;
 /// Chars kept from the TAIL of that excerpt. Bigger than the head on purpose: the operative
 /// line of a failing step is its LAST one.
@@ -3115,6 +3122,69 @@ mod excerpt_tests {
     }
 
     #[test]
+    /// The call sites, not just the helper.
+    ///
+    /// The original crew#322 fix added `bounded_excerpt` and five unit tests OF THAT HELPER.
+    /// Adversarial verification then reverted all five CALL SITES to their pre-fix head-only
+    /// expressions — fully restoring the defect — and not one of 571 tests went red. Testing a
+    /// helper in isolation proves the helper works; it says nothing about whether the buggy path
+    /// still calls it. That is the difference between a fix and a fix that is proven.
+    ///
+    /// This scans the module source for head-only truncation. The ONLY legitimate one is inside
+    /// `bounded_excerpt` itself, which is how it builds its head half. Any other
+    /// `chars().take(N)` in this file is the defect coming back.
+    #[test]
+    fn no_denial_path_head_truncates_behind_the_helpers_back() {
+        // Scan PRODUCTION code only. This test's own filter literals contain the pattern, so a
+        // whole-file scan flags itself — the same false-positive the studio font-wait guard hit.
+        let full = include_str!("actor.rs");
+        let src = full.split("#[cfg(test)]").next().unwrap_or(full);
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .map(|(i, l)| (i + 1, l.trim()))
+            // The helper's own head half, and this test's own prose describing the pattern.
+            .filter(|(_, l)| l.contains("chars()") && l.contains(".take(") && !l.starts_with("//"))
+            .filter(|(_, l)| !l.starts_with("let head_s: String = raw.chars().take(head)"))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "head-only truncation outside `bounded_excerpt` — an operator loses the END of the \
+             transcript, which is where the worker says what actually went wrong (crew#322). \
+             Use `bounded_excerpt`/`triage_judge_excerpt`/`failure_detail_excerpt`:\n{}",
+            offenders
+                .iter()
+                .map(|(n, l)| format!("  actor.rs:{n}: {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// The ElicitationFailed denial the first pass missed: it set `denial_reason` from a head-only
+    /// `chars().take(800)`, the very shape crew#322 is about. Pinned by behaviour, not by source.
+    #[test]
+    fn an_elicitation_denial_keeps_the_end_of_the_transcript() {
+        let raw = format!(
+            "elicitation opened\n{}\nno human response within the window on host build-07",
+            "filler line\n".repeat(200)
+        );
+        let out = bounded_excerpt(
+            raw.trim(),
+            ELICITATION_EXCERPT_HEAD,
+            ELICITATION_EXCERPT_TAIL,
+        );
+        assert!(
+            out.contains("host build-07"),
+            "the operative end of an elicitation failure must survive truncation; got:\n{out}"
+        );
+        assert!(
+            out.contains("elicitation opened"),
+            "the head must survive too"
+        );
+        assert!(out.len() < raw.len(), "it must actually be bounded");
+    }
+
     fn bounded_excerpt_keeps_both_ends() {
         let raw = transcript();
         let out = bounded_excerpt(&raw, 150, 250);
@@ -3776,7 +3846,14 @@ fn apply_step_result(
         let detail = if output.output.trim().is_empty() {
             "ACP elicitation ended before a human response could be applied".to_string()
         } else {
-            output.output.trim().chars().take(800).collect()
+            // Head+TAIL, never head-only (crew#322). This is a denial_reason like the triage
+            // ones below, and an elicitation transcript ends on the reason it could not be
+            // completed — head-only truncation cuts exactly that off.
+            bounded_excerpt(
+                output.output.trim(),
+                ELICITATION_EXCERPT_HEAD,
+                ELICITATION_EXCERPT_TAIL,
+            )
         };
         unit.denial_reason = Some(detail.clone());
         put_node(store, unit.to_node())?;
