@@ -1913,6 +1913,7 @@ mod tests {
                 db_path: "/abs/estate.db".into(),
                 code_graph_db: Some("/abs/repo/.codegraph/estate.db".into()),
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,

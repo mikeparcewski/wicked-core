@@ -3809,9 +3809,9 @@ impl AcpStepRunner {
                 }
                 // The unit's filesystem boundary, mirroring what the wrapped launcher arms by
                 // env (core#260): WRITE = unit cwd + the launch-validated extra roots; READ =
-                // the shared evidence-derived assembly (skills dir + repo root). Built HERE, on
-                // the runner with the governance context in hand — the in-process evaluation
-                // cannot read it from any env.
+                // the shared assembly (skills dir + repo root + the launch-validated read-only
+                // roots, core#294). Built HERE, on the runner with the governance context in
+                // hand — the in-process evaluation cannot read it from any env.
                 let boundary = crate::gate_hook::BoundaryCtx {
                     roots: crate::path_policy::AllowedRoots {
                         write: std::iter::once(unit_cwd.clone())
@@ -3819,6 +3819,7 @@ impl AcpStepRunner {
                             .collect(),
                         read: crate::execute_wrapped::assemble_read_roots(
                             g.code_graph_db.as_deref(),
+                            &g.extra_read_roots,
                         ),
                     },
                     cwd: unit_cwd.clone(),
@@ -5832,6 +5833,7 @@ sleep 30
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             }),
             prior_outputs: Vec::new(),
             elicitation_epoch: 0,

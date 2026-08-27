@@ -136,6 +136,22 @@ pub struct GovernanceContext {
     /// for tasks from older peers) means the boundary stays exactly the unit cwd.
     #[serde(default)]
     pub extra_write_roots: Vec<String>,
+    /// ADDITIONAL absolute READ-ONLY roots the LAUNCHER declared for this run (core#294) — the
+    /// mirror of [`Self::extra_write_roots`], for grounding a run in content it must NOT be able
+    /// to change: a reference repo, a spec directory, a design corpus.
+    ///
+    /// Joined onto `WICKED_READ_ROOTS` (and the ACP carrier's in-process read set) alongside the
+    /// evidence-derived roots, so `boundary_denial` admits READS there and nothing else — a WRITE
+    /// into one of these roots is still refused, because [`crate::path_policy::check`] tests a
+    /// write against the write list ONLY. That is the whole point: before this existed, the only
+    /// launch-declared lever was `extra_write_roots`, so "let the worker read the repo" could only
+    /// be spelled "let the worker rewrite the repo".
+    ///
+    /// Validated at launch by [`crate::path_policy::validate_extra_read_roots`] — the same rules
+    /// as the write half. Empty (the default, and the deserialization fallback for tasks from
+    /// older peers) means the read boundary stays exactly the evidence-derived assembly.
+    #[serde(default)]
+    pub extra_read_roots: Vec<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

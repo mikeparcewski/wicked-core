@@ -114,6 +114,14 @@ pub struct AgentSession {
     /// older sessions deserialize with no extra roots, i.e. the pre-#259 boundary.
     #[serde(default)]
     pub extra_write_roots: Vec<String>,
+    /// Launcher-declared extra READ-ONLY roots for the run (core#294) — the mirror of
+    /// `extra_write_roots`, persisted for exactly the same reason: a resume/redrive re-enters
+    /// through the actor with no `LaunchSpec` in hand, and a run that could read its reference
+    /// corpus before a restart and not after would fail halfway through for reasons no operator
+    /// could see. `#[serde(default)]` for back-compat: older sessions deserialize with no extra
+    /// read roots, i.e. the pre-#294 boundary.
+    #[serde(default)]
+    pub extra_read_roots: Vec<String>,
     /// The project code graph the launcher bound this run to, if any (see
     /// [`crate::project::ProjectGraphBinding`]). Persisted on the session for the same reason
     /// `extra_write_roots` is (core#259): a resume/redrive re-enters through the actor with no
@@ -626,6 +634,7 @@ mod tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -639,6 +648,42 @@ mod tests {
         assert_eq!(
             s, back,
             "AgentSession must survive a node round-trip losslessly"
+        );
+    }
+
+    /// core#294 — the read roots a launch declared must SURVIVE the session, for the same reason
+    /// the write roots do: a resume/redrive re-enters through the actor with no `LaunchSpec` in
+    /// hand, so a boundary held only in the launcher's memory would silently un-ground a run
+    /// halfway through. Both halves are asserted independently — a mirror that quietly persisted
+    /// only one of them is exactly the drift this test exists to catch. The second half is the
+    /// back-compat contract: a session written before the field existed still loads, as a run
+    /// with no extra read roots (the pre-#294 boundary), not as an unreadable node.
+    #[test]
+    fn a_session_persists_both_root_declarations_and_older_ones_still_load() {
+        let mut s = sample_session();
+        s.extra_write_roots = vec!["/abs/drafts-inbox".to_string()];
+        s.extra_read_roots = vec!["/abs/reference-repo".to_string()];
+
+        let back = AgentSession::from_node(&s.to_node()).expect("from_node");
+        assert_eq!(
+            back.extra_read_roots,
+            vec!["/abs/reference-repo".to_string()],
+            "a resume must re-arm the READ boundary the launch declared"
+        );
+        assert_eq!(
+            back.extra_write_roots,
+            vec!["/abs/drafts-inbox".to_string()],
+            "…without disturbing the WRITE half"
+        );
+
+        // A pre-#294 session: the key is simply absent from the persisted metadata.
+        let mut node = s.to_node();
+        node.metadata.remove("extra_read_roots");
+        let legacy = AgentSession::from_node(&node)
+            .expect("a session stored before extra_read_roots existed must still load");
+        assert!(
+            legacy.extra_read_roots.is_empty(),
+            "an older session loads at the pre-#294 boundary, not with invented roots"
         );
     }
 

@@ -140,6 +140,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         // Per-RUN, not process-wide: `dispatch_unit` fills this from the session (core#259).
         // Empty here means an ungoverned/standalone context widens nothing.
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
     })
 }
 
@@ -829,6 +830,7 @@ pub(crate) fn run(
                     workflow,
                     project_id: _, // legacy path predates projects; filing rides LaunchRun only
                     extra_write_roots: _, // legacy sync path widens nothing (core#259)
+                    extra_read_roots: _, // ...nor reads (core#294)
                     // Legacy path has no repo and therefore no project graph to bind; it also
                     // never reaches the governed dispatch that would read one.
                     project_graph: _,
@@ -898,6 +900,14 @@ pub(crate) fn run(
                     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                     crate::path_policy::validate_extra_write_roots(
                         &spec.extra_write_roots,
+                        home.as_deref(),
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                    // The READ mirror (core#294) is judged at the same moment, by the same rules:
+                    // an unusable read root must fail the launch, not silently arm a boundary the
+                    // operator believes grounds the run.
+                    crate::path_policy::validate_extra_read_roots(
+                        &spec.extra_read_roots,
                         home.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
@@ -981,6 +991,7 @@ pub(crate) fn run(
                         workdir: None, // resolved off-thread; updated in WorktreeReady
                         repo_ref: repo_ref.clone(),
                         extra_write_roots: spec.extra_write_roots.clone(),
+                        extra_read_roots: spec.extra_read_roots.clone(),
                         project_graph: spec.project_graph.clone(),
                         archived_at: None,
                         archive_note: None,
@@ -1059,6 +1070,7 @@ pub(crate) fn run(
                     repo_ref,
                     workdir,
                     spec.extra_write_roots.clone(),
+                    spec.extra_read_roots.clone(),
                     spec.project_graph.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
@@ -1218,6 +1230,7 @@ pub(crate) fn run(
                     repo_ref.clone(),
                     workdir.clone(),
                     spec.extra_write_roots.clone(),
+                    spec.extra_read_roots.clone(),
                     spec.project_graph.clone(),
                     spec.workflow.as_deref(),
                     &mut |ev| emit(&mut subscribers, ev),
@@ -2974,6 +2987,8 @@ pub(crate) fn launch_run_inner(
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         crate::path_policy::validate_extra_write_roots(&spec.extra_write_roots, home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
+        crate::path_policy::validate_extra_read_roots(&spec.extra_read_roots, home.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
     }
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
@@ -2987,6 +3002,7 @@ pub(crate) fn launch_run_inner(
         repo_ref,
         workdir,
         spec.extra_write_roots.clone(),
+        spec.extra_read_roots.clone(),
         spec.project_graph.clone(),
         spec.workflow.as_deref(),
         dispatcher,
@@ -4667,6 +4683,7 @@ fn dispatch_unit(
             // From the SESSION, so a resume/redrive re-arms exactly the boundary the launch
             // declared and validated (core#259).
             extra_write_roots: session.extra_write_roots.clone(),
+            extra_read_roots: session.extra_read_roots.clone(),
             ..g
         }),
         prior_outputs,
@@ -5805,6 +5822,7 @@ mod gate_pause_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -5967,6 +5985,7 @@ mod terminal_gate_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -6098,6 +6117,7 @@ mod substance_gate_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -6321,6 +6341,7 @@ mod seat_failover_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -6953,6 +6974,7 @@ mod def_gate_disclosure_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -7050,6 +7072,7 @@ mod def_gate_disclosure_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -7301,6 +7324,7 @@ mod terminal_worktree_reap_tests {
             workdir: Some(wt.to_string_lossy().to_string()),
             repo_ref: Some(entry.id),
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -7443,6 +7467,7 @@ mod terminal_worktree_reap_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -7536,6 +7561,7 @@ mod worker_code_graph_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -7792,6 +7818,7 @@ mod project_graph_binding_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,
@@ -8522,6 +8549,7 @@ mod phase_boundary_governance_tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,

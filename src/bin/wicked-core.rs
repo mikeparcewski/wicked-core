@@ -392,6 +392,7 @@ fn main() {
                 workflow: flag(&args, "--workflow"),
                 project_id: flag(&args, "--project"),
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
                 // Stub self-test path — no worker, so nothing would read a graph anyway.
                 project_graph: None,
             });
@@ -697,6 +698,7 @@ fn run_interactive(core: &Core, args: &[String]) {
         workflow: flag(args, "--workflow"),
         project_id: flag(args, "--project"),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         // `--project` files the run; it does NOT bind a project graph, and this CLI deliberately
         // has no flag that would. The graph's location, its membership and its estate labels are
         // the launcher's to know (see `project::ProjectGraphBinding`), and an operator CLI that

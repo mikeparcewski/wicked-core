@@ -2801,12 +2801,26 @@ mod boundary_tests {
             "the ONLY widening must be the launch-validated extra_write_roots riding the \
              governance context — not env, not the unit, not the workflow def"
         );
+        // core#294 — the READ half is armed the same way: the launch-declared read-only roots
+        // must ride the SHARED assembly, so the wrapped and ACP carriers cannot disagree about
+        // what this run is grounded in. Dropping the extras here silently returns the launcher to
+        // "readable only by also being writable", which is the gap #294 closed.
+        assert!(
+            launcher.contains("assemble_read_roots(g.code_graph_db.as_deref(), &g.extra_read_roots)"),
+            "execute_wrapped no longer feeds the launch-declared read roots into {READ_ROOTS_ENV}, \
+             so grounding a run in a tree it may not write is impossible again (core#294)"
+        );
         // The launch side must actually judge those extras — remove the validation and the
         // widening becomes an unvetted door straight past FINDING-098.
         let launch = include_str!("actor.rs");
         assert!(
             launch.contains("validate_extra_write_roots"),
             "the launch path no longer validates extra write roots against the pin tree"
+        );
+        assert!(
+            launch.contains("validate_extra_read_roots"),
+            "the launch path no longer validates extra READ roots (core#294) — an unjudged read \
+             root is a launch-time widening nobody vetted"
         );
         // The worker's scratch is pointed INSIDE the boundary (core#264) — removing the TMPDIR
         // arming silently reintroduces the advisory-deny noise (and, before #264, the fatal

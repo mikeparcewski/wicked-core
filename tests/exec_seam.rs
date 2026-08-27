@@ -99,6 +99,7 @@ fn spec(session_id: &str) -> LaunchSpec {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     }
 }
@@ -498,6 +499,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         repo_ref: None,
         workflow: Some("bug".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch bug workflow");

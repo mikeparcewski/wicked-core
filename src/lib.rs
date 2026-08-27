@@ -162,6 +162,19 @@ pub struct LaunchSpec {
     /// ([`crate::path_policy::validate_extra_write_roots`]) — an invalid root fails the launch
     /// loudly with no session persisted. Empty for runs that deliver inside their own workdir.
     pub extra_write_roots: Vec<String>,
+    /// ADDITIONAL absolute READ-ONLY roots for this run (core#294) — the mirror of
+    /// [`Self::extra_write_roots`], for grounding a run in content it must NOT be able to change:
+    /// a reference repo, a spec directory, a design corpus. Widens the governed units' READ
+    /// boundary (`WICKED_READ_ROOTS`) by exactly these roots; writes into them stay denied.
+    ///
+    /// The gap this closes: before it existed, the only launch-declared widening was
+    /// `extra_write_roots`, so "let this run read the repo without binding its worktree" could
+    /// only be spelled by granting WRITE access to the repo (crew#311 → core#293).
+    ///
+    /// Validated at launch by [`crate::path_policy::validate_extra_read_roots`] — same rules as
+    /// the write half: absolute, and outside the engine's config/pin tree. An invalid root fails
+    /// the launch loudly with no session persisted. Empty for runs that need no outside reads.
+    pub extra_read_roots: Vec<String>,
     /// The PROJECT code graph this run's governed workers should query instead of the run repo's
     /// own graph — the launcher's answer to "where is this project's graph, and what is this run's
     /// repo called in it" ([`crate::project::ProjectGraphBinding`]).

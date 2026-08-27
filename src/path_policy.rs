@@ -194,6 +194,28 @@ pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
 /// Symlink-resolved with the same [`resolve_symlinks`] the boundary check uses, so a root reached
 /// through `/tmp`→`/private/tmp` (or a symlinked config dir) cannot dodge the comparison.
 pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
+    validate_extra_roots(roots, home, "write")
+}
+
+/// Validate launcher-declared extra READ roots at LAUNCH time (core#294) — the read-only mirror of
+/// [`validate_extra_write_roots`].
+///
+/// Identical rules, and deliberately so: a read root is still a launch-time widening of the same
+/// boundary, so it gets the same launch-time judgement rather than a parallel, weaker one. The
+/// absolute rule is unchanged in force (a relative read root binds to the launcher's incidental
+/// cwd, so it names no tree anyone declared). The pin-tree rule is *narrower in consequence* — a
+/// read cannot rewrite the gate the way FINDING-098's write could — but it is kept because the
+/// containment test also refuses the roots that would make the boundary meaningless in the other
+/// direction: `~` and `/` CONTAIN the config tree, and a read root of `/` is a boundary that
+/// allows every read there is. "Grounded in X" is a statement about X, not about the filesystem.
+pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
+    validate_extra_roots(roots, home, "read")
+}
+
+/// The shared judgement behind [`validate_extra_write_roots`] and [`validate_extra_read_roots`].
+/// ONE rule set, so the read mirror cannot drift into a weaker gate than the write original —
+/// `kind` only spells the failure, never changes what passes.
+fn validate_extra_roots(roots: &[String], home: Option<&Path>, kind: &str) -> Result<(), String> {
     if roots.is_empty() {
         return Ok(());
     }
@@ -202,18 +224,17 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
         // No HOME ⇒ the pin tree cannot be located, so containment cannot be proven either way.
         // Fail CLOSED: refuse the widening rather than arm roots we cannot judge.
         None => {
-            return Err(
-                "extra write roots need $HOME to validate against the engine config tree; \
+            return Err(format!(
+                "extra {kind} roots need $HOME to validate against the engine config tree; \
                  refusing to widen the boundary without it"
-                    .to_string(),
-            )
+            ))
         }
     };
     for raw in roots {
         let p = Path::new(raw);
         if !p.is_absolute() {
             return Err(format!(
-                "extra write root is not absolute: {raw} (a relative root binds to the \
+                "extra {kind} root is not absolute: {raw} (a relative root binds to the \
                  launcher's incidental cwd, not a declared destination)"
             ));
         }
@@ -222,7 +243,7 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
             || resolved_is_within(&config_tree, &resolved)
         {
             return Err(format!(
-                "extra write root {raw} would expose the engine config tree ({}) — a governed \
+                "extra {kind} root {raw} would expose the engine config tree ({}) — a governed \
                  worker could rewrite the pin that gates its own work (FINDING-098); refused",
                 config_tree.display()
             ));
@@ -418,6 +439,38 @@ mod tests {
 
         // Roots present but no HOME to judge against → fail CLOSED, not open.
         let e = validate_extra_write_roots(&[inbox.to_string_lossy().into_owned()], None)
+            .expect_err("no HOME must refuse the widening, never wave it through");
+        assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
+    }
+
+    /// core#294 — the READ mirror gets the SAME launch-time judgement, not a weaker parallel one.
+    /// A read root is still a widening of the same boundary: `~` (which CONTAINS the pin tree) and
+    /// a relative root are refused exactly as they are for writes, and a no-HOME launch fails
+    /// closed. Mutation: make `validate_extra_read_roots` return `Ok(())` → all three asserts fail.
+    #[test]
+    fn extra_read_roots_are_judged_by_the_same_rules_as_write_roots() {
+        let home = scratch("xrr_home");
+        let reference = scratch("xrr_ref");
+
+        validate_extra_read_roots(&[], None).expect("empty roots need no validation");
+        validate_extra_read_roots(&[reference.to_string_lossy().into_owned()], Some(&home))
+            .expect("a reference tree outside the pin tree must be admitted");
+
+        let e = validate_extra_read_roots(&["relative/ref".to_string()], Some(&home))
+            .expect_err("a relative read root must be refused");
+        assert!(e.contains("not absolute"), "names the failure: {e}");
+        assert!(
+            e.contains("read"),
+            "the message must name the ROOT KIND: {e}"
+        );
+
+        // The home dir CONTAINS the pin tree — as a read root it is also the "ground this run in
+        // the whole filesystem" shape the boundary exists to refuse.
+        let e = validate_extra_read_roots(&[home.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("a read root containing the pin tree must be refused");
+        assert!(e.contains("FINDING-098"), "names the escape: {e}");
+
+        let e = validate_extra_read_roots(&[reference.to_string_lossy().into_owned()], None)
             .expect_err("no HOME must refuse the widening, never wave it through");
         assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
     }

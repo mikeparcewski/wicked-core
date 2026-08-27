@@ -304,6 +304,7 @@ fn a_denied_tool_call_fails_the_session() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .unwrap();
@@ -346,6 +347,7 @@ fn a_shell_hostile_session_id_is_rejected_at_launch() {
             repo_ref: None,
             workflow: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
         });
         assert!(

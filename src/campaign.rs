@@ -78,6 +78,7 @@ impl RunSpec {
             project_id: None,
             // Campaign runs deliver inside their worktrees; no widening (core#259).
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             // Unfiled (above) ⇒ no project graph. A campaign node's workers see their own repo,
             // which is what a campaign fans out over anyway.
             project_graph: None,
