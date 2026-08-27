@@ -136,11 +136,17 @@ impl StepRunner for FailFirstGoverned {
 
 /// core#292 — the SAME failure, from a seat whose CLI has no input-governance adapter.
 ///
-/// The gate-hook injection is claude-only (`execute_wrapped`: `(Some(_), false) => …
-/// GovernanceUnenforced`), so a campaign unit dispatched to codex/agy/pi comes back with
-/// `StepOutput.governed == false` even though the run itself is governance-armed. Everything else
-/// is byte-identical to `FailFirstGoverned` — same worker-originated failure message, same
-/// success on the second dispatch — so the ONLY variable under test is the flag.
+/// The gate-hook injection is claude-only — see `execute_wrapped`, where the
+/// `(Some(_), false)` arm yields `GovernanceUnenforced` — so a campaign unit dispatched to
+/// codex/agy/pi comes back with `StepOutput.governed == false` even though the run itself is
+/// governance-armed.
+///
+/// This is NOT byte-identical to `FailFirstGoverned`; it differs in the failure message, in
+/// structure, and in returning `governed: false` on BOTH outputs. That last one is deliberate and
+/// worth knowing: setting `governed: true` on the SUCCESS output trips the phase-substance gate,
+/// because the 2-char "ok" body is too thin for a governed unit. What isolates the variable is not
+/// textual sameness but a control — on unmodified `main`, flipping only the failing output's
+/// `governed` flag turns this test green, and flipping it back turns it red.
 struct FailFirstUngovernedSeat {
     calls: AtomicU32,
 }
