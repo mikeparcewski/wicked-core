@@ -239,11 +239,17 @@ pub struct WorkUnit {
     /// behavior). `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub validator: Option<crate::validator::DeterministicValidator>,
-    /// Files this unit's phase DECLARED it must produce, relative to the worktree (FINDING-101).
-    /// Carried from `PhaseDef::required_deliverables`, which was parsed and never read — so every
-    /// workflow could promise artifacts nothing checked. The completion path verifies these exist
-    /// before the unit may report Ok, which is the same rule the rest of the engine applies: done
-    /// is re-derived from evidence, not asserted.
+    /// Files this unit's phase DECLARED it must produce (FINDING-101). Carried from
+    /// `PhaseDef::required_deliverables`, which was parsed and never read — so every workflow could
+    /// promise artifacts nothing checked. Verified before the unit may report Ok, which is the same
+    /// rule the rest of the engine applies: done is re-derived from evidence, not asserted.
+    ///
+    /// Resolved against the unit's worktree (or its per-run sandbox when the run is unbound) AND
+    /// against the run's declared `extra_write_roots` — see
+    /// [`crate::path_policy::missing_deliverables`] for the rules. Enforced at the
+    /// runner-independent fold in `actor::apply_step_result`, NOT in any runner: it lived in the
+    /// wrapped runner alone until core#297, which made the gate's presence depend on which seat the
+    /// run resolved to.
     #[serde(default)]
     pub required_deliverables: Vec<String>,
     /// The exact command this unit runs when `PhaseExecutor::Tool` (carried from the phase def).

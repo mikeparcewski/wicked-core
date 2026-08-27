@@ -467,6 +467,9 @@ pub struct PhaseDef {
     #[serde(default)]
     pub verified_evidence: bool,
     /// Deliverables that MUST be present for the structural gate check (fail-closed if missing).
+    /// A path in the unit's worktree — or, for an unbound run, in one of the launch-declared
+    /// `extra_write_roots` (core#297 §3). See [`crate::domain::WorkUnit::required_deliverables`],
+    /// which this is copied onto at plan time, for where the check runs and why.
     #[serde(default)]
     pub required_deliverables: Vec<String>,
     /// Phase ids in the same workflow that must complete before this one (intra-workflow DAG).

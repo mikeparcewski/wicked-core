@@ -231,6 +231,73 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
     Ok(())
 }
 
+/// The declared deliverables a unit did NOT produce, or `None` if all are present (FINDING-101,
+/// widened by core#297 §3).
+///
+/// A deliverable counts as produced if it exists as a file OR a directory (a phase may declare a
+/// directory of outputs). Checking existence is the whole point — this is a SUBSTANCE check, the
+/// opposite of the presence-shaped gates this campaign keeps filing: the phase said it would
+/// produce X, so require X, not a status code claiming it did.
+///
+/// # Where a deliverable may live
+///
+/// `cwd` is the unit's own working directory (its worktree, or the per-run sandbox for an unbound
+/// run). `write_roots` is the run's launch-validated
+/// [`crate::workflow::GovernanceContext::extra_write_roots`] — the boundary the launcher DECLARED
+/// this run may write outside its cwd, already vetted by [`validate_extra_write_roots`].
+///
+/// Both are searched, because searching only `cwd` left an unbound run with no working spelling at
+/// all (core#297 §3): every crew interactive seam omits `repoRef` on purpose, so its cwd is a
+/// throwaway sandbox while its actual deliverable is a file in a per-run inbox declared as a write
+/// root. Relative resolved against the sandbox; absolute was rejected by construction. A run that
+/// cannot honestly declare what it must produce declares nothing, which is how a floor dies.
+///
+/// # What stays unverifiable
+///
+/// Widening to the DECLARED roots is a resolution rule, not an amnesty. Fail-closed in both
+/// remaining directions, because "the engine could not locate it" is not evidence a phase
+/// completed:
+///
+/// - An ABSOLUTE deliverable must resolve inside one of the declared roots. Without that clause a
+///   workflow could aim the floor at any pre-existing file on the box (`/etc/hosts`) and pass
+///   forever — and this run never had permission to create it anyway.
+/// - A `..`-escaping RELATIVE deliverable is refused outright rather than resolved-then-checked:
+///   its target depends on which base it is joined to, so the same declaration would name
+///   different files per root, and a floor whose subject is ambiguous is not a floor.
+///
+/// Symlink-resolved with the same [`resolve_symlinks`] the boundary check uses, so a root reached
+/// through `/tmp`→`/private/tmp` cannot dodge the containment test (macOS temp dirs are exactly
+/// that symlink, so this is the common case, not the exotic one).
+pub(crate) fn missing_deliverables(
+    declared: &[String],
+    cwd: &Path,
+    write_roots: &[String],
+) -> Option<String> {
+    let missing: Vec<&str> = declared
+        .iter()
+        .filter(|d| !d.trim().is_empty())
+        .filter(|d| !deliverable_exists(d, cwd, write_roots))
+        .map(String::as_str)
+        .collect();
+    (!missing.is_empty()).then(|| missing.join(", "))
+}
+
+/// One deliverable's presence test — see [`missing_deliverables`] for the rules and why.
+fn deliverable_exists(declared: &str, cwd: &Path, write_roots: &[String]) -> bool {
+    let p = Path::new(declared);
+    if p.is_absolute() {
+        let resolved = resolve_symlinks(p);
+        return write_roots
+            .iter()
+            .any(|r| resolved_is_within(&resolved, Path::new(r)))
+            && p.exists();
+    }
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        return false;
+    }
+    cwd.join(p).exists() || write_roots.iter().any(|r| Path::new(r).join(p).exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +487,167 @@ mod tests {
         let e = validate_extra_write_roots(&[inbox.to_string_lossy().into_owned()], None)
             .expect_err("no HOME must refuse the widening, never wave it through");
         assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
+    }
+}
+
+/// The DELIVERABLE FLOOR's resolution rules (FINDING-101, core#297 §3). The floor's WIRING — that
+/// the runner-independent fold consults it and rejects on a miss — is proved in
+/// `crate::actor::deliverable_floor_tests`; these cover the rules themselves.
+#[cfg(test)]
+mod deliverables_tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "wicked-deliv-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn no_declared_deliverables_is_always_satisfied() {
+        let d = tmp("empty");
+        assert!(missing_deliverables(&[], &d, &[]).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_declared_file_that_exists_passes_and_one_that_does_not_is_named() {
+        let d = tmp("named");
+        std::fs::write(d.join("coverage-report.json"), "{}").unwrap();
+        assert!(missing_deliverables(&["coverage-report.json".into()], &d, &[]).is_none());
+        let miss = missing_deliverables(
+            &["coverage-report.json".into(), "domain-model.json".into()],
+            &d,
+            &[],
+        )
+        .expect("the absent deliverable must be reported");
+        assert!(miss.contains("domain-model.json"), "{miss}");
+        assert!(
+            !miss.contains("coverage-report.json"),
+            "the present one must not be named: {miss}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_declared_directory_of_outputs_counts_as_produced() {
+        let d = tmp("dir");
+        std::fs::create_dir_all(d.join(".wicked/domain")).unwrap();
+        assert!(missing_deliverables(&[".wicked/domain".into()], &d, &[]).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A deliverable the engine cannot locate is not evidence the phase completed — with NO
+    /// declared write roots, an absolute path or a `..` escape is reported missing, never
+    /// silently skipped.
+    #[test]
+    fn an_unverifiable_deliverable_is_reported_missing_not_skipped() {
+        let d = tmp("unverifiable");
+        std::fs::write(d.join("real.json"), "{}").unwrap();
+        assert!(missing_deliverables(&["/etc/passwd".into()], &d, &[]).is_some());
+        assert!(missing_deliverables(&["../escape.json".into()], &d, &[]).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// core#297 §3, the unbound-run shape: cwd is a throwaway sandbox, the deliverable is an
+    /// ABSOLUTE path inside a declared write root. It resolves when written and is reported when
+    /// not — the widening is a resolution rule, not an amnesty.
+    #[test]
+    fn an_absolute_deliverable_resolves_inside_a_declared_write_root() {
+        let sandbox = tmp("sandbox");
+        let inbox = tmp("inbox");
+        let file = inbox.join("hand-off.md");
+
+        assert!(
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)]).is_some(),
+            "declared but never written is still missing"
+        );
+        std::fs::write(&file, "the answer").unwrap();
+        assert!(
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)]).is_none(),
+            "an absolute deliverable inside a DECLARED root is verifiable"
+        );
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// The containment clause is what keeps the widening honest: an existing file OUTSIDE every
+    /// declared root stays missing. Without it a workflow could aim the floor at `/etc/hosts` and
+    /// pass forever — and the run never had permission to create that file anyway.
+    #[test]
+    fn an_absolute_deliverable_outside_every_declared_root_stays_missing() {
+        let sandbox = tmp("sandbox-out");
+        let inbox = tmp("inbox-out");
+        let elsewhere = tmp("elsewhere-out");
+        let file = elsewhere.join("already-here.md");
+        std::fs::write(&file, "not this run's work").unwrap();
+
+        assert!(
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&inbox)]).is_some(),
+            "an existing file outside every declared root is not this run's evidence"
+        );
+        // …and it is admitted the moment the launcher actually declares that root.
+        assert!(
+            missing_deliverables(&[s(&file)], &sandbox, &[s(&elsewhere)]).is_none(),
+            "declaring the root is exactly what makes it verifiable"
+        );
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _ = std::fs::remove_dir_all(&inbox);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A RELATIVE deliverable searches the cwd first and the declared roots after, so a workflow
+    /// can name `hand-off.md` once and have it resolve whether the run is bound to a repo or not.
+    #[test]
+    fn a_relative_deliverable_also_resolves_against_a_declared_write_root() {
+        let sandbox = tmp("sandbox-rel");
+        let inbox = tmp("inbox-rel");
+        assert!(
+            missing_deliverables(&["hand-off.md".into()], &sandbox, &[s(&inbox)]).is_some(),
+            "absent from both the cwd and the declared root"
+        );
+        std::fs::write(inbox.join("hand-off.md"), "x").unwrap();
+        assert!(
+            missing_deliverables(&["hand-off.md".into()], &sandbox, &[s(&inbox)]).is_none(),
+            "a relative deliverable resolves against the declared root too"
+        );
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// A `..` escape stays refused even WITH declared roots: its target depends on which base it
+    /// is joined to, so the same declaration would name a different file per root. A floor whose
+    /// subject is ambiguous is not a floor.
+    #[test]
+    fn a_parent_escaping_relative_deliverable_is_refused_even_with_declared_roots() {
+        let sandbox = tmp("sandbox-esc");
+        let inbox = tmp("inbox-esc");
+        let sibling = inbox.parent().unwrap().join("escape.json");
+        std::fs::write(&sibling, "{}").unwrap();
+        assert!(
+            missing_deliverables(&["../escape.json".into()], &sandbox, &[s(&inbox)]).is_some(),
+            "a `..` escape is ambiguous by construction and must stay unverifiable"
+        );
+        let _ = std::fs::remove_file(&sibling);
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let _ = std::fs::remove_dir_all(&inbox);
+    }
+
+    /// Whitespace-only entries are not declarations — they are formatting, and must not be
+    /// reported as a missing artifact named "  ".
+    #[test]
+    fn a_blank_declaration_is_ignored() {
+        let d = tmp("blank");
+        assert!(missing_deliverables(&["   ".into(), "".into()], &d, &[]).is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

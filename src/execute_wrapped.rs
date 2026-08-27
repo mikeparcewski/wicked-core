@@ -849,31 +849,15 @@ impl WrappedCliStepRunner {
                             input.unit.id
                         );
                     }
-                    // FINDING-101. A phase declared what it must produce (`required_deliverables`);
-                    // until now that was parsed and never read, so every workflow could promise
-                    // artifacts nothing verified. Same rule as above: a unit may not claim Ok while
-                    // its own declared evidence is absent. Unlike still-running work (a maybe), a
-                    // MISSING declared deliverable is a definite incompleteness, so this FAILS the
-                    // unit rather than merely noting it.
-                    if let Some(missing) =
-                        missing_deliverables(&input.unit.required_deliverables, &cwd)
-                    {
-                        (
-                            StepStatus::Failed,
-                            format!(
-                                "{out}\n[wicked-core] unit {} reported done but did not produce its \
-                                 declared deliverable(s): {missing}. The phase promised these in \
-                                 required_deliverables and the worktree does not contain them \
-                                 (FINDING-101).",
-                                input.unit.id
-                            ),
-                            usage,
-                            files,
-                            tools,
-                        )
-                    } else {
-                        (StepStatus::Ok, out, usage, files, tools)
-                    }
+                    // FINDING-101's deliverable floor USED to live here, and that was the bug
+                    // (core#297 §1): a check that only the WRAPPED runner performs makes "did this
+                    // phase produce what it promised" depend on which seat the run resolved to —
+                    // the ACP path (a real `claude` seat; every governed dogfood run) parsed
+                    // `required_deliverables` and never read it. It now runs once, at the
+                    // runner-independent fold in `actor::apply_step_result`, where the unit and the
+                    // session's workdir + declared write roots are all in hand. Do NOT re-add it
+                    // here: two sites is how the split came back.
+                    (StepStatus::Ok, out, usage, files, tools)
                 }
                 // A timeout still surfaces the tools that DID run before the kill — this is exactly
                 // when an operator needs to see what a hung unit was doing (FINDING-046).
@@ -945,41 +929,18 @@ fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
 
 /// A per-run temp sandbox for repo-less runs (so a real CLI never edits the orchestrator's own tree).
 pub(crate) fn sandbox_for(input: &StepInput) -> PathBuf {
-    std::env::temp_dir()
-        .join("wicked-core-sandbox")
-        .join(&input.run_id)
+    sandbox_root(&input.run_id)
 }
 
-/// The declared deliverables a unit did NOT produce in its worktree, or `None` if all are present
-/// (FINDING-101).
-///
-/// A deliverable is a path relative to the worktree; it counts as produced if it exists as a file
-/// OR a directory (a phase may declare a directory of outputs). Checking existence is the whole
-/// point — this is a SUBSTANCE check, the opposite of the presence-shaped gates this campaign keeps
-/// filing: the phase said it would produce X, so require X, not a status code claiming it did.
-///
-/// Absolute or `..`-escaping deliverables are treated as declared-but-unverifiable and REPORTED as
-/// missing rather than silently skipped: a deliverable the engine cannot locate inside the worktree
-/// is not evidence the phase completed, and a workflow author who wrote one should hear about it.
-fn missing_deliverables(declared: &[String], worktree: &Path) -> Option<String> {
-    let missing: Vec<&str> = declared
-        .iter()
-        .filter(|rel| !rel.trim().is_empty())
-        .filter(|rel| {
-            let p = Path::new(rel.as_str());
-            // Only worktree-relative, non-escaping paths are verifiable here. Anything else cannot
-            // be confirmed as this unit's evidence, so it counts as not-produced.
-            if p.is_absolute()
-                || p.components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                return true;
-            }
-            !worktree.join(p).exists()
-        })
-        .map(String::as_str)
-        .collect();
-    (!missing.is_empty()).then(|| missing.join(", "))
+/// [`sandbox_for`] keyed by run id alone — the spelling the ACTOR needs. The deliverable floor
+/// (core#297) runs at the runner-independent fold, which holds a session rather than a
+/// [`StepInput`]; deriving the sandbox path there from a COPY of this join would be the classic
+/// two-definitions-one-truth bug, where a change here silently stops the floor from finding the
+/// files an unbound run actually wrote.
+pub(crate) fn sandbox_root(run_id: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join("wicked-core-sandbox")
+        .join(run_id)
 }
 
 /// The `PreToolUse` hook command — the exe path quoted for the platform's shell so a `$`/backtick/space
@@ -1911,88 +1872,6 @@ pub(crate) fn build_argv(invocation: &str, prompt: &str, skills: &[String]) -> V
         argv.push(prompt.to_string());
     }
     argv
-}
-
-#[cfg(test)]
-mod deliverables_tests {
-    use super::*;
-
-    fn wt() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "wicked-deliv-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    }
-
-    #[test]
-    fn no_declared_deliverables_is_always_satisfied() {
-        assert!(missing_deliverables(&[], &wt()).is_none());
-    }
-
-    #[test]
-    fn a_declared_file_that_exists_passes_and_one_that_does_not_is_named() {
-        let d = wt();
-        std::fs::write(d.join("coverage-report.json"), "{}").unwrap();
-        assert!(missing_deliverables(&["coverage-report.json".into()], &d).is_none());
-        let miss = missing_deliverables(
-            &["coverage-report.json".into(), "domain-model.json".into()],
-            &d,
-        )
-        .expect("the absent deliverable must be reported");
-        assert!(miss.contains("domain-model.json"), "{miss}");
-        assert!(
-            !miss.contains("coverage-report.json"),
-            "the present one must not be named: {miss}"
-        );
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn a_declared_directory_of_outputs_counts_as_produced() {
-        let d = wt();
-        std::fs::create_dir_all(d.join(".wicked/domain")).unwrap();
-        assert!(missing_deliverables(&[".wicked/domain".into()], &d).is_none());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// A deliverable the engine cannot locate inside the worktree is not evidence the phase
-    /// completed — an absolute path or a `..` escape is reported missing, never silently skipped.
-    #[test]
-    fn an_unverifiable_deliverable_is_reported_missing_not_skipped() {
-        let d = wt();
-        std::fs::write(d.join("real.json"), "{}").unwrap();
-        assert!(missing_deliverables(&["/etc/passwd".into()], &d).is_some());
-        assert!(missing_deliverables(&["../escape.json".into()], &d).is_some());
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    /// CALL-SITE AUDIT. The tests above exercise the helper; none proves the completion path
-    /// consults it. That gap has slipped through repeatedly this campaign, so assert the wiring —
-    /// and that it FAILS the unit (a missing declared deliverable is a definite incompleteness),
-    /// not merely notes it as still-running does.
-    #[test]
-    fn the_completion_path_fails_a_unit_missing_its_deliverables() {
-        let src = include_str!("execute_wrapped.rs");
-        let ok_arm = src
-            .split("Ok((0, out, _, usage, files, tools))")
-            .nth(1)
-            .expect("the exit-0 arm still exists");
-        let window = &ok_arm[..ok_arm.len().min(2600)];
-        // Needle by concatenation so this assertion's own text cannot satisfy it.
-        let call = format!("missing{}deliverables(", "_");
-        assert!(
-            window.contains(&call),
-            "the exit-0 arm does not check declared deliverables (FINDING-101)"
-        );
-        assert!(
-            window.contains("StepStatus::Failed"),
-            "a missing deliverable must FAIL the unit, not pass it with a note"
-        );
-    }
 }
 
 #[cfg(test)]
