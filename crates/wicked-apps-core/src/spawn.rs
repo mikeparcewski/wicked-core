@@ -79,6 +79,10 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
     // exactly where the fence is. The launcher sets them deliberately on the governed child.
     "WICKED_WRITE_ROOTS",
     "WICKED_READ_ROOTS",
+    // The unit's PHASE SCOPE (core#296) — the flag that refuses a pre-build phase's write to a
+    // non-documentation path. Inherited at an unrelated spawn site it would scope a phase that is
+    // supposed to write code away from writing it, which is the INVERSE failure and a louder one.
+    "WICKED_PRE_BUILD_SCOPE",
 ];
 
 /// Chainable environment hardening for [`Command`].

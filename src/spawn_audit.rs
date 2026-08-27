@@ -225,6 +225,9 @@ mod tests {
             // worktree onto an unrelated child; observing them tells a worker where the fence is.
             crate::gate_hook::WRITE_ROOTS_ENV,
             crate::gate_hook::READ_ROOTS_ENV,
+            // The unit's phase scope (core#296). Inheriting it scopes an unrelated child away from
+            // writing code; observing it tells a worker which gate it is under.
+            crate::gate_hook::PRE_BUILD_SCOPE_ENV,
         ] {
             assert!(
                 ENGINE_INTERNAL_ENV.contains(&name),

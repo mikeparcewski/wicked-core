@@ -25,7 +25,16 @@ const INSTRUCTION_SEP: &str = " ||| ";
 
 /// The recognizable head of the engine-side scope preamble (core#283) — a const so the tests that
 /// assert its presence/absence and any operator grepping a prompt share one spelling.
-pub(crate) const PHASE_SCOPE_PREFIX: &str = "PHASE SCOPE (enforced):";
+///
+/// It used to read `PHASE SCOPE (enforced):` and that word was FALSE (core#296): a prompt cannot
+/// enforce itself, and run `d1bc72c2` proved it — a `design` unit carrying this exact preamble wrote
+/// `src/board/attentionReason.ts` before the build phase ran, and the governance hook watched both
+/// writes go by with `decision=allow`. A prompt string that claims enforcement is worse than one
+/// that doesn't, because the claim is what stops anyone looking for the missing gate. The word is
+/// gone from the prompt and the enforcement now lives where enforcement can live: the gate refuses
+/// a pre-build phase's non-documentation Write/Edit before the tool call runs — see
+/// [`crate::gate_hook::phase_scope_denial`], reached from `evaluate_tool_call` on both carriers.
+pub(crate) const PHASE_SCOPE_PREFIX: &str = "PHASE SCOPE:";
 
 /// The scope preamble injected into the UNIT PROMPT of every PRE-BUILD, non-creator phase
 /// (core#283). Phase-role scope was a suggestion: a Neutral pre-build phase (e.g. `feature`'s
@@ -35,6 +44,11 @@ pub(crate) const PHASE_SCOPE_PREFIX: &str = "PHASE SCOPE (enforced):";
 /// (role + `executes_code` + declaration order), never hardcoded per workflow id and never left to
 /// workflow prose. Single-line by construction: the description IS the PTY prompt
 /// (see [`INSTRUCTION_SEP`]).
+///
+/// This is the PROMPT half and nothing more — it TELLS the worker the scope, it does not hold it to
+/// it (core#296). The holding is [`crate::gate_hook::phase_scope_denial`], which refuses the
+/// non-documentation write itself; the deny message names the same rule this sentence states, so a
+/// worker that ignores the prompt still gets a legible reason at the tool call.
 fn phase_scope_preamble(phase_id: &str) -> String {
     format!(
         "{PHASE_SCOPE_PREFIX} this is the {phase_id} phase. Produce this phase's deliverable only \
@@ -124,13 +138,15 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
                 description.push_str(INSTRUCTION_SEP);
                 description.push_str(instr);
             }
-            // core#283 PHASE-ROLE SCOPE, the enforced half. Prompt-level discipline proved
-            // insufficient twice, so the planner itself injects the scope preamble into the unit
-            // prompt of every phase that (a) plays neither Creator nor Evaluator, (b) runs BEFORE
-            // the first `executes_code` Creator phase, and (c) is agent-executed (a Tool phase's
-            // description is argv context, never a prompt). Threaded ALONGSIDE the instructions
-            // fold above (same single-line separator, appended after — the shared intent and the
-            // phase's own slice still lead), so authored instructions are never clobbered.
+            // core#283 PHASE-ROLE SCOPE, the PROMPT half (core#296 — it was called "the enforced
+            // half" here, and it enforced nothing; the enforcement is the gate, below). Prompt-level
+            // discipline proved insufficient twice, so the planner itself injects the scope preamble
+            // into the unit prompt of every phase that (a) plays neither Creator nor Evaluator,
+            // (b) runs BEFORE the first `executes_code` Creator phase, and (c) is agent-executed (a
+            // Tool phase's description is argv context, never a prompt). Threaded ALONGSIDE the
+            // instructions fold above (same single-line separator, appended after — the shared
+            // intent and the phase's own slice still lead), so authored instructions are never
+            // clobbered.
             let pre_build_scope = first_code_creator.is_some_and(|b| i < b)
                 && !matches!(
                     phase.role,
@@ -175,9 +191,14 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());
             }
-            // core#283, the marker for the observability half: the completion path warns (never
-            // denies) when a pre-build phase's worktree contribution touches non-documentation
-            // files — see `actor::phase_scope_warning`.
+            // The marker BOTH other halves read. core#283 gave it one consumer — the completion
+            // path's after-the-fact warning (`actor::phase_scope_warning`, still live: it catches
+            // what the gate cannot see, e.g. a `Bash` heredoc). core#296 gave it the one that
+            // actually holds the scope: the launcher rides it to the governance gate
+            // (`gate_hook::PRE_BUILD_SCOPE_ENV` on the hook-subprocess carrier,
+            // `BoundaryCtx::pre_build_scope` in-process), which REFUSES a non-documentation
+            // Write/Edit before it lands. One field, so the prompt, the gate and the warning can
+            // never disagree about which phases are pre-build.
             unit.pre_build_scope = pre_build_scope;
             unit
         })
@@ -479,7 +500,7 @@ mod tests {
         assert!(units.iter().all(|u| !u.description.is_empty()));
     }
 
-    /// core#283, the enforced half, asserted against the SHIPPED `feature` def (the workflow the
+    /// core#283, the PROMPT half, asserted against the SHIPPED `feature` def (the workflow the
     /// collapse was proven on — its `design` phase received the same problem statement as `build`
     /// and implemented the entire deliverable, twice, once THROUGH an explicit prompt-level
     /// discipline paragraph). The scope preamble must land on exactly the pre-build non-creator
@@ -518,9 +539,20 @@ mod tests {
                 "the preamble must stay single-line (the PTY runner submits on the first newline): {}",
                 u.description
             );
+            // core#296. The preamble used to announce itself as `PHASE SCOPE (enforced):` while
+            // enforcing nothing — run d1bc72c2's `design` unit wrote `src/board/attentionReason.ts`
+            // under that exact header and the hook allowed it. A prompt cannot enforce itself; the
+            // word is what stopped anyone from looking for the gate that was missing.
+            assert!(
+                !u.description.to_ascii_lowercase().contains("enforced"),
+                "the prompt must not CLAIM enforcement — enforcement is the gate \
+                 (`gate_hook::phase_scope_denial`), not this sentence: {}",
+                u.description
+            );
             assert!(
                 u.pre_build_scope,
-                "`{id}` must be marked for the completion-path warning (the observability half)"
+                "`{id}` must carry the marker the GATE reads (core#296) and the completion-path \
+                 warning reads (core#283) — an unmarked phase is scoped in prose only"
             );
         }
         // build (Creator), adversarial-review (Evaluator), and the POST-build neutral phases: no

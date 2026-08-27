@@ -271,12 +271,18 @@ pub struct WorkUnit {
     pub depends_on: Vec<String>,
     /// TRUE when this unit's backing phase is a PRE-BUILD, NON-CREATOR rung of a def that later
     /// runs an `executes_code` Creator phase (core#283) — set at plan time from def DATA (role +
-    /// `executes_code` + declaration order), the same way stage/role/gate flow from the def. It
-    /// marks the phases whose prompt carries the plan-time PHASE SCOPE preamble; the completion
-    /// path reads it to fire the observability half (a non-documentation worktree contribution
-    /// records a WARNING onto [`Self::scope_warnings`] — never a deny). `#[serde(default)]` +
-    /// skip-if-false: pre-existing units deserialize, and unmarked units serialize byte-identical
-    /// to before the field existed.
+    /// `executes_code` + declaration order), the same way stage/role/gate flow from the def.
+    ///
+    /// Three consumers, ONE marker, so they cannot disagree about which phases are pre-build:
+    /// * the plan-time PHASE SCOPE preamble on this unit's prompt ([`crate::plan`]);
+    /// * **the GATE** (core#296) — the launcher rides this flag to the governance hook
+    ///   (`WICKED_PRE_BUILD_SCOPE` on the subprocess carrier, `BoundaryCtx::pre_build_scope`
+    ///   in-process) and `evaluate_tool_call` REFUSES a `Write`/`Edit` to a non-documentation path;
+    /// * the completion path's after-the-fact WARNING onto [`Self::scope_warnings`], which still
+    ///   catches what a tool-call gate structurally cannot see (a `Bash` heredoc, a `git apply`).
+    ///
+    /// `#[serde(default)]` + skip-if-false: pre-existing units deserialize, and unmarked units
+    /// serialize byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pre_build_scope: bool,
     /// Operator-visible WARNINGS the completion path recorded WITHOUT denying (core#283): today,

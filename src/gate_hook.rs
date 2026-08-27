@@ -119,6 +119,32 @@ pub const WRITE_ROOTS_ENV: &str = "WICKED_WRITE_ROOTS";
 /// believed.
 pub const READ_ROOTS_ENV: &str = "WICKED_READ_ROOTS";
 
+/// Set to `1` by the launcher when the governed unit's backing phase is a PRE-BUILD, non-creator
+/// rung ([`crate::domain::WorkUnit::pre_build_scope`]) — the flag that turns the phase's declared
+/// scope from prose into a gate (core#296). Rides env for exactly the reason
+/// [`WRITE_ROOTS_ENV`] does: the hook is a grandchild of the worker CLI, so its own environment is
+/// the only channel that reaches it.
+///
+/// UNSET is the honest "not a pre-build phase / no phase scope declared" state, which is also what
+/// a standalone `gate-hook` invocation sees. Parsed STRICTLY (`1`/`true`) rather than
+/// "any non-empty value": the launcher sets exactly `1`, and an inherited junk value must not
+/// silently scope a build phase away from building — which would be the inverse failure, and a
+/// louder one than the one this closes.
+pub const PRE_BUILD_SCOPE_ENV: &str = "WICKED_PRE_BUILD_SCOPE";
+
+/// The PURE half of the [`PRE_BUILD_SCOPE_ENV`] read, so the parse can be tested without mutating
+/// process-global env (which Rust's threaded test runner shares with every other test, and with any
+/// subprocess they spawn).
+fn parse_pre_build_scope(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("1") || s.eq_ignore_ascii_case("true"))
+}
+
+/// Read [`PRE_BUILD_SCOPE_ENV`] off the hook subprocess's own environment.
+fn pre_build_scope_from_env() -> bool {
+    parse_pre_build_scope(std::env::var_os(PRE_BUILD_SCOPE_ENV).as_deref())
+}
+
 /// The unit's filesystem boundary, or `None` when the launcher armed no roots.
 ///
 /// `None` is NOT "allow everything" — it is "no boundary was configured", which is the honest state
@@ -203,6 +229,17 @@ pub(crate) struct BoundaryCtx {
     /// core#235 carve-out hardcoded to `home/.claude` turned that same benign write class fatal
     /// again. `None` ⇒ fall back to `home/.claude`.
     pub claude_config_dir: Option<std::path::PathBuf>,
+    /// The unit's PHASE SCOPE (core#296): TRUE when this unit's backing phase is a PRE-BUILD,
+    /// non-creator rung, carried from [`crate::domain::WorkUnit::pre_build_scope`]. It rides HERE,
+    /// alongside the filesystem roots, because it is the same KIND of fact — a boundary the unit
+    /// was given, judged before any policy — and because the in-process carrier has no env to read
+    /// it from (the daemon's environment belongs to the daemon; that asymmetry is what core#260
+    /// closed for the roots and this field closes for the scope).
+    ///
+    /// FALSE is the honest default for every other phase: a build phase must write code, and a
+    /// boundary that scoped the creator away from creating would be a worse bug than the one the
+    /// scope exists to stop.
+    pub pre_build_scope: bool,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -299,6 +336,62 @@ fn boundary_denial_with(
     }
 
     None
+}
+
+/// Refuse a PRE-BUILD phase's write to a NON-DOCUMENTATION path (core#296).
+///
+/// # The gap this closes
+///
+/// A pre-build, non-creator phase (`feature`'s `clarify`/`design`, `bug`'s `triage`/`reproduce`, …)
+/// declares a scope: produce the analysis/design/plan, leave implementation to the build phase. That
+/// scope shipped as a PROMPT — a preamble that even called itself `(enforced)`. On run `d1bc72c2`
+/// the `design` unit wrote `src/board/attentionReason.ts` and `tests/attentionReason.test.ts`
+/// *before* the creator phase ran; the hook SAW both calls and returned `allow`, because the only
+/// path question it asked was "is this inside the unit's roots" — and the worktree is inside them,
+/// so `allow` was the correct answer to the wrong question. Phase scope is a SECOND boundary,
+/// orthogonal to the filesystem one: *where* may this unit write is answered by
+/// [`boundary_denial_with`]; *what kind of file* may THIS PHASE write is answered here.
+///
+/// # Why it is shaped this way
+///
+/// It rides the machinery that already ships rather than growing the `wicked-governance`
+/// Policy/Trigger vocabulary, which would need a new trigger kind to express "phase role × path
+/// class" and would put an engine invariant into operator-editable policy data. The inputs are both
+/// existing: [`crate::domain::WorkUnit::pre_build_scope`] (def-derived at plan time) and
+/// [`crate::actor::is_documentation_change`] (the core#283 heuristic).
+///
+/// # Scope of the claim
+///
+/// This covers the path-bearing WRITE tools ([`WRITE_TOOLS`]) and nothing else — the same honest
+/// limit [`crate::path_policy`] states for itself. A `Bash` heredoc or a `git apply` still gets
+/// through, which is why `actor::phase_scope_warning` stays live as the completion-path backstop.
+/// A read is never refused: a design phase must read the code it is designing against.
+///
+/// Returns the operator-facing reason, or `None` when the call is in scope.
+pub(crate) fn phase_scope_denial(
+    pre_build_scope: bool,
+    context: &serde_json::Value,
+    tool: &str,
+) -> Option<String> {
+    if !pre_build_scope || !WRITE_TOOLS.contains(&tool) {
+        return None;
+    }
+    let path = context
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.trim().is_empty())?;
+    if crate::actor::is_documentation_change(path) {
+        return None;
+    }
+    // A refusal the worker cannot act on is not a refusal, it is a wall (FINDING-066): name the
+    // rule, the file, and the two ways forward — write the deliverable as documentation, or leave
+    // the implementation to the phase whose job it is.
+    Some(format!(
+        "phase scope: this is a PRE-BUILD phase, whose deliverable is analysis/design/plan — \
+         `{tool}` to `{path}` is production code, not documentation. Allowed here: `.md`/`.txt`/\
+         `.rst` files, and anything under a `docs/` or `.product/` directory. Implementation \
+         belongs to the later build phase; describe it in this phase's deliverable instead."
+    ))
 }
 
 /// Tokenize a Bash command on whitespace AND the control operators `;`, `(`, `)` — but ONLY when those
@@ -626,6 +719,23 @@ pub(crate) fn evaluate_tool_call(
         // Bash write-escape (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See
         // `boundary_denial` / `append_boundary_deny`.
         append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
+        eprintln!("wicked-governance: DENY ({reason})");
+        return 2;
+    }
+
+    // PHASE SCOPE — the SECOND boundary (core#296), judged next and for the same reasons the
+    // filesystem one is judged first: it needs no policy store, and a call that has left its
+    // phase's scope has already left "here". The two are orthogonal — the filesystem boundary asks
+    // WHERE this unit may write (and the worktree is inside its own roots, which is why run
+    // d1bc72c2's recon-phase write to `src/board/attentionReason.ts` was correctly `allow`ed by it);
+    // this asks WHAT KIND of file THIS PHASE may write. The flag is per-unit state, so it arrives
+    // by the same route the roots do: explicit on the in-process carrier, env on the subprocess one.
+    let pre_build_scope = match boundary {
+        Some(b) => b.pre_build_scope,
+        None => pre_build_scope_from_env(),
+    };
+    if let Some(reason) = phase_scope_denial(pre_build_scope, context, tool) {
+        append_phase_scope_deny(decisions_path, scope, phase, &reason);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -972,16 +1082,70 @@ fn append_infra_deny(decisions_path: &str, scope: &str, phase: &str, reason: &st
 const BOUNDARY_EVALUATOR: &str = "wicked-governance-boundary";
 /// Claim-id prefix for a boundary deny that STAYS unit-fatal: a WRITE outside the sandbox (an escape
 /// attempt — e.g. the FINDING-098 pin-rewrite). This is the DEFAULT-FATAL prefix, and it is fatal by
-/// omission rather than by enumeration: `is_advisory_boundary_read_deny` is an allowlist that fires
-/// ONLY for [`BOUNDARY_READ_DENY_PREFIX`], so a claim carrying this prefix — or any other deny the
-/// fold/drain ever sees — is treated as fatal. `append_boundary_deny` reaches here whenever
-/// `is_write` is set; there is no third writer-side category.
+/// omission rather than by enumeration: `is_advisory_deny` is an allowlist that fires ONLY for
+/// [`BOUNDARY_READ_DENY_PREFIX`] and [`PHASE_SCOPE_DENY_PREFIX`], so a claim carrying this prefix —
+/// or any other deny the fold/drain ever sees — is treated as fatal. `append_boundary_deny` reaches
+/// here whenever `is_write` is set; there is no third writer-side category.
 const BOUNDARY_WRITE_DENY_PREFIX: &str = "boundary-deny:";
 /// Claim-id prefix for an ADVISORY boundary deny: a READ outside the sandbox. The tool-call is STILL
 /// blocked (the worker never reads the file), but a blocked read leaks nothing and the worker adapts,
 /// so it is recorded for audit and does NOT fail the unit (P8 #10 / core#219). Whether the blocked
 /// read MATTERED is decided by the unit's own output gate, not by the containment event.
 const BOUNDARY_READ_DENY_PREFIX: &str = "boundary-read-deny:";
+
+/// The evaluator identity stamped on a PHASE-SCOPE deny (core#296). Distinct from
+/// [`BOUNDARY_EVALUATOR`] on purpose: the two answer different questions (WHERE may this unit write
+/// vs WHAT KIND of file may this PHASE write), and an operator reading the log has to be able to
+/// tell "the recon phase tried to write code" from "something reached outside the worktree"
+/// WITHOUT reading the prose — filing the second under the first is the mislabelling
+/// [`append_boundary_deny`]'s own doc argues against.
+const PHASE_SCOPE_EVALUATOR: &str = "wicked-governance-phase-scope";
+/// The rule id carried in the claim's `policy_ids`, so the denying rule has a NAME an operator can
+/// grep, alert on, and cite — the concrete thing missing from run d1bc72c2, whose hook records read
+/// `decision=allow, denyingPolicy=None`. Engine-owned (`engine:` prefix) rather than a
+/// `wicked-governance` policy row: it is a structural property of the workflow def, not something an
+/// operator authors or edits per run.
+pub(crate) const PHASE_SCOPE_RULE_ID: &str = "engine:pre-build-scope";
+/// Claim-id prefix for a phase-scope deny. ADVISORY, for the same reason a blocked out-of-boundary
+/// READ is (core#219): the harmful thing — production code appearing before the build phase — was
+/// PREVENTED, the worker is told exactly how to proceed, and it adapts. Failing the unit on the
+/// first refused `Write` would conflate prevention with violation, and would turn every design
+/// phase that reaches for a `.ts` file into a failed run — which is how a control gets switched
+/// off, and a control that is off is worse than none because it is believed
+/// ([`crate::path_policy`]'s module doc). What the phase actually produced is judged by its own
+/// output gate and required deliverables, not by this containment event.
+const PHASE_SCOPE_DENY_PREFIX: &str = "phase-scope-deny:";
+
+/// Record a PHASE-SCOPE block: a pre-build phase's `Write`/`Edit` to a non-documentation path
+/// (core#296). The caller has already exited 2 — the tool call never runs. This is what makes the
+/// refusal legible afterwards: `criteria` states the rule, `policy_ids` names it
+/// ([`PHASE_SCOPE_RULE_ID`]), `obligations` carries the same actionable sentence the worker saw.
+///
+/// `policy_ids` is what closes the reported gap most directly: [`collect_hook_decisions`] reports
+/// the first id of a Deny as `denying_policy`, so `GovernanceHookFired` for this refusal reads
+/// `decision=deny, denyingPolicy=engine:pre-build-scope` where run d1bc72c2's read
+/// `decision=allow, denyingPolicy=None`. The event's `tool_name` still shows `(unknown)` here, as
+/// it does for every pre-policy block: the tool-call annotation is written further down
+/// [`evaluate_tool_call`], after the boundary and scope checks have already returned. The tool and
+/// the path are in the `reason` either way, so the record names them — this is a shape shared with
+/// [`append_boundary_deny`], not a new hole.
+fn append_phase_scope_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str) {
+    let claim = ConformanceClaim {
+        // Keyed on `phase` only, for the same reason `append_infra_deny` is: `scope` embeds `/`
+        // and would make an unbounded claim symbol.
+        claim_id: format!("{PHASE_SCOPE_DENY_PREFIX}{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec![PHASE_SCOPE_RULE_ID.to_string()],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string()],
+        evaluated_context_ref: "sha256:phase-scope".to_string(),
+        criteria: format!("phase scope (advisory: blocked, worker continues): {reason}"),
+        evaluator_identity: PHASE_SCOPE_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    let _ = append_decision(Path::new(decisions_path), &claim);
+}
 
 /// Record a filesystem-boundary block. `fatal` picks whether it ABORTS the unit (a write/escape) or
 /// is ADVISORY (a read probe, or a benign write into the worker's own `~/.claude` tree — core#235).
@@ -1017,16 +1181,26 @@ fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: 
     let _ = append_decision(Path::new(decisions_path), &claim);
 }
 
-/// Whether a Deny claim is an ADVISORY boundary READ block — recorded for audit but NOT unit-fatal.
-/// A blocked read is containment SUCCEEDING (the read was prevented, nothing leaked, the worker
-/// adapts); failing the whole unit for it conflates prevention with violation (P8 #10 / core#219).
-/// Requires BOTH the boundary evaluator identity AND the read prefix, so a policy deny or a write
-/// escape can never be mistaken for advisory. The worker cannot forge this: the decisions log lives
-/// outside its write boundary and is written only by the gate-hook.
-fn is_advisory_boundary_read_deny(claim: &ConformanceClaim) -> bool {
-    claim.decision == Decision::Deny
-        && claim.evaluator_identity == BOUNDARY_EVALUATOR
-        && claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX)
+/// Whether a Deny claim is ADVISORY — recorded for audit but NOT unit-fatal. Two members, both
+/// cases of containment SUCCEEDING rather than of a unit misbehaving beyond recovery:
+///
+/// * a blocked out-of-boundary READ — the read was prevented, nothing leaked, the worker adapts;
+///   failing the whole unit for it conflates prevention with violation (P8 #10 / core#219);
+/// * a blocked PHASE-SCOPE write (core#296) — the production-code write a pre-build phase had no
+///   business making never landed, and the worker was handed the two ways forward.
+///
+/// An ALLOWLIST keyed on BOTH the evaluator identity AND the claim-id prefix, so a policy deny, a
+/// boundary write escape, or an infra deny can never be mistaken for advisory; anything the
+/// fold/drain has not been taught here is fatal by omission. The worker cannot forge either: the
+/// decisions log lives outside its write boundary and is written only by the gate-hook.
+fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
+    if claim.decision != Decision::Deny {
+        return false;
+    }
+    (claim.evaluator_identity == BOUNDARY_EVALUATOR
+        && claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX))
+        || (claim.evaluator_identity == PHASE_SCOPE_EVALUATOR
+            && claim.claim_id.starts_with(PHASE_SCOPE_DENY_PREFIX))
 }
 
 /// If `v` is an armed-marker object, the phase it marks; else `None`. Checks the ROOT key
@@ -1250,13 +1424,12 @@ pub fn fold_input_denial(
         }
         has_claim_lines = true;
         conform(store, &claim)?;
-        // An ADVISORY boundary READ deny is recorded (conform above, for audit) but does NOT fail the
-        // unit: the read was blocked, nothing leaked, and the worker adapts — whether the missing file
-        // mattered is judged by the unit's OUTPUT gate, not this containment event (P8 #10 / core#219).
-        if denial.is_none()
-            && claim.decision == Decision::Deny
-            && !is_advisory_boundary_read_deny(&claim)
-        {
+        // An ADVISORY deny — an out-of-boundary READ (P8 #10 / core#219) or a PHASE-SCOPE write
+        // (core#296) — is recorded (conform above, for audit) but does NOT fail the unit: the call
+        // was blocked, nothing landed or leaked, and the worker adapts. Whether the blocked call
+        // MATTERED is judged by the unit's OUTPUT gate and its required deliverables, not by this
+        // containment event.
+        if denial.is_none() && claim.decision == Decision::Deny && !is_advisory_deny(&claim) {
             denial = Some(format!(
                 "input governance denied a tool-call in {phase} (claim {})",
                 claim.claim_id
@@ -1354,21 +1527,22 @@ pub fn apply_hook_decisions(
     for (phase_name, claims) in &by_phase {
         let phase_id = format!("{workflow_id}:{phase_name}");
         ensure_phase_at_gate(store, &phase_id, &workflow_id, phase_name)?;
-        // Advisory boundary READ denies are audit-only (conform()'d in Pass 1) and never veto the
-        // input-governance gate (P8 #10 / core#219) — exclude them from the deny-dominating verdict at
-        // every tier. A phase whose ONLY claims are advisory has nothing gate-affecting to resolve, so
-        // it is skipped (no spurious veto).
+        // Advisory denies — out-of-boundary READs (P8 #10 / core#219) and PHASE-SCOPE writes
+        // (core#296) — are audit-only (conform()'d in Pass 1) and never veto the input-governance
+        // gate; exclude them from the deny-dominating verdict at every tier. A phase whose ONLY
+        // claims are advisory has nothing gate-affecting to resolve, so it is skipped (no spurious
+        // veto).
         let verdict = match claims
             .iter()
-            .filter(|c| !is_advisory_boundary_read_deny(c))
+            .filter(|c| !is_advisory_deny(c))
             .find(|c| c.decision == Decision::Deny)
             .or_else(|| {
                 claims
                     .iter()
-                    .filter(|c| !is_advisory_boundary_read_deny(c))
+                    .filter(|c| !is_advisory_deny(c))
                     .find(|c| c.decision == Decision::AllowWithConditions)
             })
-            .or_else(|| claims.iter().find(|c| !is_advisory_boundary_read_deny(c)))
+            .or_else(|| claims.iter().find(|c| !is_advisory_deny(c)))
         {
             Some(v) => v,
             None => continue,
@@ -2036,6 +2210,89 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(gov_run_dir("advisory-drain"));
+    }
+
+    /// core#296, the fold's side of the phase-scope gate. The tool call is already blocked by the
+    /// time this runs; what is on trial here is what the block DOES to the unit. Three properties,
+    /// all of which the run-level behaviour depends on:
+    ///
+    /// * the claim survives `conform` — it carries a synthetic `engine:` policy id that has no
+    ///   Policy node behind it, and a conform failure would turn a refused write into a hard unit
+    ///   error, which is the opposite of "the worker adapts";
+    /// * it is DURABLE — the refusal is evidence, not a log line;
+    /// * it is ADVISORY — it neither fails the unit nor vetoes the phase gate, so a design phase
+    ///   that reached for a `.ts` file gets refused, is told why, and still finishes its own
+    ///   deliverable. And it must not MASK a co-occurring fatal deny.
+    #[test]
+    fn a_phase_scope_deny_is_durable_advisory_and_masks_nothing() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("phasescope-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+
+        // (a) marker + hook-fired + ONLY a phase-scope deny → the unit is NOT failed.
+        let p0 = decisions_path_for(&run_id, 0);
+        write_armed_marker(&p0, "unit-2").unwrap();
+        write_hook_fired(&p0, "unit-2");
+        // Written by the REAL production path, so the prefix/evaluator/policy-id wiring is what is
+        // under test — not a hand-forged claim that happens to match.
+        append_phase_scope_deny(
+            p0.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "phase scope: this is a PRE-BUILD phase … `Write` to `src/board/attentionReason.ts`",
+        );
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-2", true).unwrap(),
+            None,
+            "a refused pre-build write blocks the CALL, it does not fail the UNIT"
+        );
+        assert_eq!(
+            count_claims(&store, "phase-scope-deny:unit-2").unwrap(),
+            1,
+            "the refusal must be durable evidence, not just an exit code"
+        );
+
+        // (b) MIXED: a phase-scope deny alongside a real POLICY deny → still DENIED. The advisory
+        // downgrade must never swallow a co-occurring fatal claim.
+        let p1 = decisions_path_for(&run_id, 1);
+        write_armed_marker(&p1, "unit-2").unwrap();
+        append_phase_scope_deny(
+            p1.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "phase scope: … `Write` to `src/lib.rs`",
+        );
+        let mut policy_deny = allow_claim("POL-042", "unit-2");
+        policy_deny.decision = Decision::Deny;
+        append_decision(&p1, &policy_deny).unwrap();
+        assert!(
+            fold_input_denial(&mut store, &run_id, 1, "unit-2", true)
+                .unwrap()
+                .is_some(),
+            "a phase-scope deny does not mask a co-occurring policy deny"
+        );
+
+        // (c) The phase-gate drain: a phase whose only Deny is a phase-scope block must not veto.
+        let p2 = decisions_path_for(&run_id, 2);
+        append_decision(&p2, &allow_claim("drain-allow", "design")).unwrap();
+        append_phase_scope_deny(
+            p2.to_str().unwrap(),
+            "wf/design",
+            "design",
+            "phase scope: … `Edit` to `src/lib.rs`",
+        );
+        let summary = apply_hook_decisions(&mut store, "phasescope-drain", &p2).unwrap();
+        assert_eq!(
+            summary.denied, 0,
+            "a phase-scope deny does not veto the phase gate on drain"
+        );
+        assert_eq!(
+            summary.applied, 2,
+            "both the allow and the phase-scope deny conform as durable evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(gov_run_dir("phasescope-drain"));
     }
 
     #[test]
@@ -2845,5 +3102,205 @@ mod boundary_tests {
     fn dirs_config_workflow() -> String {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         format!("{home}/.config/wicked-core/workflows/domain-extraction.json")
+    }
+}
+
+/// core#296 — PHASE SCOPE, the second boundary. The filesystem boundary above answers WHERE a unit
+/// may write; these answer WHAT KIND of file a given PHASE may write. Every case here sits INSIDE
+/// the unit's own worktree, which is precisely why the filesystem boundary had nothing to say about
+/// the reported failure.
+#[cfg(test)]
+mod phase_scope_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ctx(path: &str) -> serde_json::Value {
+        json!({ "path": path })
+    }
+
+    /// The rule, judged case by case in BOTH directions. `Some` = the write is refused.
+    #[test]
+    fn a_pre_build_phase_may_write_documentation_and_nothing_else() {
+        // Refused: production code, config, lockfiles, assets — all reachable through a path-bearing
+        // write tool, all things a recon/design phase has no business producing.
+        for (tool, path) in [
+            ("Write", "src/board/attentionReason.ts"), // run d1bc72c2, verbatim
+            ("Write", "tests/attentionReason.test.ts"), // its sibling, same run
+            ("Edit", "src/lib.rs"),
+            ("NotebookEdit", "analysis/run.ipynb"),
+            ("Write", "package.json"),
+            ("Write", "docs.ts"), // a FILE named docs is code; only a docs/ DIRECTORY is not
+        ] {
+            assert!(
+                phase_scope_denial(true, &ctx(path), tool).is_some(),
+                "a pre-build phase must not `{tool}` `{path}`"
+            );
+        }
+        // Allowed: the phase's own deliverable. A gate that refused this would stop the phase doing
+        // the one job it exists for, which is how a control gets switched off.
+        for (tool, path) in [
+            ("Write", "DESIGN.md"),
+            ("Write", "docs/architecture/overview.html"),
+            ("Edit", ".product/DES-EXEC-001.md"),
+            ("Write", "./notes.TXT"),
+            ("Write", "spec.rst"),
+        ] {
+            assert_eq!(
+                phase_scope_denial(true, &ctx(path), tool),
+                None,
+                "a pre-build phase MUST be able to `{tool}` its deliverable `{path}`"
+            );
+        }
+    }
+
+    /// The scope is a property of the PHASE, not a blanket ban. Off the marker, every write above
+    /// is permitted — scoping a Creator away from creating is the inverse failure, and a worse one.
+    #[test]
+    fn a_phase_that_is_not_pre_build_is_never_scope_denied() {
+        for path in ["src/lib.rs", "package.json", "tests/x.test.ts"] {
+            assert_eq!(phase_scope_denial(false, &ctx(path), "Write"), None);
+        }
+    }
+
+    /// The honest limit, stated as a test so nobody reports this as confinement. It judges the
+    /// path-bearing WRITE tools and nothing else: a READ is never refused (a design phase must read
+    /// the code it designs against), and a `Bash` heredoc carries no `path` for the gate to see —
+    /// which is exactly why `actor::phase_scope_warning` stays live as the completion backstop.
+    #[test]
+    fn reads_and_shell_writes_are_outside_this_gates_reach() {
+        assert_eq!(phase_scope_denial(true, &ctx("src/lib.rs"), "Read"), None);
+        assert_eq!(phase_scope_denial(true, &ctx("src/lib.rs"), "Grep"), None);
+        assert_eq!(
+            phase_scope_denial(
+                true,
+                &json!({"command": "cat > src/lib.rs <<'EOF'\nx\nEOF", "path": null}),
+                "Bash"
+            ),
+            None,
+            "a shell write carries no path argument — the completion-path warning catches it"
+        );
+        // A write tool with no usable path is not a judgeable call.
+        assert_eq!(
+            phase_scope_denial(true, &json!({"path": null}), "Write"),
+            None
+        );
+        assert_eq!(phase_scope_denial(true, &ctx("   "), "Write"), None);
+    }
+
+    /// A refusal the worker cannot act on is a wall, not a gate (FINDING-066). The reason has to
+    /// carry the file, the rule, and the way forward.
+    #[test]
+    fn the_refusal_names_the_file_the_rule_and_the_way_forward() {
+        let reason = phase_scope_denial(true, &ctx("src/board/attentionReason.ts"), "Write")
+            .expect("this is the reported write");
+        assert!(reason.contains("src/board/attentionReason.ts"), "{reason}");
+        assert!(reason.contains("PRE-BUILD"), "{reason}");
+        assert!(reason.contains(".md"), "names where it MAY write: {reason}");
+        assert!(reason.contains("docs/"), "{reason}");
+        assert!(reason.contains("build phase"), "{reason}");
+    }
+
+    /// The env carrier's PARSE, tested purely — the launcher sets exactly `1`, and an inherited
+    /// junk value must never scope a build phase away from building.
+    #[test]
+    fn the_env_flag_is_parsed_strictly() {
+        use std::ffi::OsStr;
+        for on in ["1", "true", "TRUE", "True"] {
+            assert!(parse_pre_build_scope(Some(OsStr::new(on))), "{on:?}");
+        }
+        for off in ["", "0", "false", "yes", "on", "2", "1 "] {
+            assert!(!parse_pre_build_scope(Some(OsStr::new(off))), "{off:?}");
+        }
+        assert!(
+            !parse_pre_build_scope(None),
+            "UNSET is the honest `no phase scope declared` state (a standalone gate-hook, a \
+             build phase) and must not read as ON"
+        );
+    }
+
+    /// An advisory deny, NOT a unit-fatal one: the harmful thing was prevented and the worker was
+    /// told how to proceed, so it adapts and the run continues. The allowlist is keyed on BOTH the
+    /// evaluator identity and the claim-id prefix, so nothing else can borrow the downgrade.
+    #[test]
+    fn a_phase_scope_deny_is_advisory_and_only_a_real_one_is() {
+        let claim = |id: &str, evaluator: &str, decision: Decision| ConformanceClaim {
+            claim_id: id.to_string(),
+            scope: "unit".to_string(),
+            phase: "unit-2".to_string(),
+            policy_ids: vec![PHASE_SCOPE_RULE_ID.to_string()],
+            decision,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:phase-scope".to_string(),
+            criteria: String::new(),
+            evaluator_identity: evaluator.to_string(),
+            evaluated_at: crate::clock::eval_now(),
+        };
+        assert!(is_advisory_deny(&claim(
+            "phase-scope-deny:unit-2",
+            PHASE_SCOPE_EVALUATOR,
+            Decision::Deny
+        )));
+        // A POLICY deny that merely borrows the claim-id shape is still fatal — and so is a
+        // boundary escape that borrows the evaluator identity.
+        assert!(!is_advisory_deny(&claim(
+            "phase-scope-deny:unit-2",
+            "wicked-governance",
+            Decision::Deny
+        )));
+        assert!(!is_advisory_deny(&claim(
+            "boundary-deny:unit-2",
+            PHASE_SCOPE_EVALUATOR,
+            Decision::Deny
+        )));
+        assert!(!is_advisory_deny(&claim(
+            "phase-scope-deny:unit-2",
+            PHASE_SCOPE_EVALUATOR,
+            Decision::Allow
+        )));
+    }
+
+    /// CALL-SITE AUDIT — the lesson this campaign has re-learned three times (FINDING-091/093, and
+    /// the boundary's own `run_gate_hook_actually_consults_the_boundary`). Every test above calls
+    /// `phase_scope_denial` DIRECTLY, so all of them stay green if the call is deleted from the
+    /// evaluator or the launcher stops arming the flag — leaving a live, unreachable helper, which
+    /// is indistinguishable from the prompt-only scope this issue is about.
+    #[test]
+    fn both_carriers_actually_consult_the_phase_scope() {
+        let src = include_str!("gate_hook.rs");
+        let body = src
+            .split("pub(crate) fn evaluate_tool_call")
+            .nth(1)
+            .and_then(|b| b.split("\n/// ").next())
+            .expect("evaluate_tool_call is still a top-level fn");
+        assert!(
+            body.contains("phase_scope_denial("),
+            "evaluate_tool_call no longer consults the phase scope — the helper is live and \
+             unreachable, which is the core#296 failure exactly: a scope that exists only as prose"
+        );
+        assert!(
+            body.contains("b.pre_build_scope") && body.contains("pre_build_scope_from_env()"),
+            "both carriers must supply the flag: the in-process one from BoundaryCtx, the hook \
+             subprocess from its env. A carrier that skipped it would run unscoped while the other \
+             enforced — the core#260 asymmetry, reopened on a new axis"
+        );
+        // The launcher half. Without it the flag is set nowhere, `pre_build_scope_from_env` is
+        // always false, and every wrapped-path pre-build unit is unscoped — silently, because
+        // "unset" is a legitimate state for a build phase.
+        let launcher = include_str!("execute_wrapped.rs");
+        assert!(
+            launcher.contains("PRE_BUILD_SCOPE_ENV"),
+            "execute_wrapped no longer arms {PRE_BUILD_SCOPE_ENV} on the governed child"
+        );
+        assert!(
+            launcher.contains("input.unit.pre_build_scope"),
+            "the flag must come from the UNIT (def-derived at plan time), not from a workflow id, \
+             an env var, or anything the worker controls"
+        );
+        // The ACP half — the carrier the reported run actually used.
+        let acp = include_str!("acp_runner.rs");
+        assert!(
+            acp.contains("pre_build_scope: input.unit.pre_build_scope"),
+            "the ACP runner no longer carries the unit's phase scope into its BoundaryCtx"
+        );
     }
 }

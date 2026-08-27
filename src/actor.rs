@@ -4958,8 +4958,15 @@ pub(crate) fn worktree_contribution_files(workdir: &str) -> Vec<String> {
 /// extensions (`.md` / `.txt` / `.rst`, case-insensitive) and for anything whose directory path
 /// passes through `docs/` or `.product/` (any segment — the per-product artifact conventions).
 /// Everything else — source, config, lockfiles, assets — counts as a production change that a
-/// pre-build phase has no business making. A heuristic, deliberately small: it feeds an
-/// operator-visible WARNING (never a deny), so a borderline misread costs a sentence, not a run.
+/// pre-build phase has no business making.
+///
+/// Deliberately small, and now load-bearing in TWO places, which is why it stays one function:
+/// the completion-path warning below, and the core#296 GATE
+/// ([`crate::gate_hook::phase_scope_denial`]) that refuses a pre-build phase's non-documentation
+/// `Write`/`Edit` outright. On the gate side a borderline misread costs one refused tool call with
+/// a legible reason the worker can act on (write the deliverable as `.md`, or hand implementation
+/// to the build phase) — never the run, because that deny is ADVISORY: blocked and audited, not
+/// unit-fatal.
 pub(crate) fn is_documentation_change(path: &str) -> bool {
     // Normalize: git emits `/` but a caller-supplied path may be Windows-shaped.
     let norm = path.trim().replace('\\', "/");
@@ -4974,13 +4981,24 @@ pub(crate) fn is_documentation_change(path: &str) -> bool {
     segments.iter().any(|s| *s == "docs" || *s == ".product")
 }
 
-/// core#283, the OBSERVABILITY half of phase-role scope: `Some(warning)` iff `unit` is a
-/// PRE-BUILD, non-creator phase (the plan-time `pre_build_scope` marker, derived from def data —
-/// see `plan::plan_from_def`) whose worktree contribution touches any NON-documentation file per
+/// The RESIDUAL half of phase-role scope: `Some(warning)` iff `unit` is a PRE-BUILD, non-creator
+/// phase (the plan-time `pre_build_scope` marker, derived from def data — see
+/// `plan::plan_from_def`) whose worktree contribution touches any NON-documentation file per
 /// [`is_documentation_change`]. The caller records the warning as gate evidence on the unit
-/// (visible to operators) and must NOT deny on it: the enforced half is the plan-time prompt
-/// preamble; this half makes a breach OBSERVABLE instead of silent — prompt-level discipline
-/// alone was proven insufficient, and a hard deny here would turn a heuristic into a gate.
+/// (visible to operators) and still does NOT deny on it.
+///
+/// core#283 shipped this as the ONLY half that looked at files, next to a prompt preamble that
+/// merely claimed enforcement; its doc said the caller "must NOT deny on it" because a hard deny
+/// HERE — at completion, over a whole-worktree diff, after the work exists — would fail a unit for
+/// a heuristic misread. That reasoning is unchanged and this function still must not deny.
+///
+/// What changed is that the enforcement moved to where it belongs (core#296): the governance gate
+/// refuses the offending `Write`/`Edit` at the tool call, before anything lands
+/// ([`crate::gate_hook::phase_scope_denial`]). So this is no longer "the observability half" of a
+/// prompt — it is the BACKSTOP for what a tool-call gate structurally cannot see: a `Bash`
+/// heredoc, a `git apply`, an ungoverned unit, a non-claude CLI with no gate-hook adapter. When
+/// this fires on a governed claude unit, either one of those routes was used or the gate has a
+/// hole; either way the operator sees the file names.
 pub(crate) fn phase_scope_warning(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&str>,
