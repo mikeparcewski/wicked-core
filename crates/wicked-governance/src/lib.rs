@@ -27,6 +27,7 @@ mod conformance;
 mod domain;
 mod domain_model;
 mod engine;
+mod fanout;
 mod ingest;
 mod markdown;
 mod schemas;
@@ -59,6 +60,16 @@ pub use ingest::{
 // MarkdownAdapter — frontmattered docs as a rule source on the same SourceAdapter seam
 // (AW-3 / arch-R1); all output still materializes through `normalize_bundle`.
 pub use markdown::MarkdownAdapter;
+
+// Fan-out contract across the deliberate store split (AW-5 / arch-R3): one manifest keyed on
+// PAT-/POL- ids → enforcement copy + discovery graph copies + knowledge rationale chunk, each
+// smoke-verified through the read path a governed run uses. `scope: workspace` = the AW-6
+// replicate-to-every-repo decision (DES-OUTGOV-008).
+pub use fanout::{
+    fanout, load_ruleset, rationale_chunk, rationale_chunk_id, EnforcementLane, EnforcementTarget,
+    FanoutManifest, FanoutScope, FanoutTargets, LaneTarget, PolicyEntry, RuleEntry, RulesetLoad,
+    FANOUT_MANIFEST_VERSION, KNOWLEDGE_CHUNK_PREFIX,
+};
 
 // The governance schema bundle — owner copies embedded from `schemas/` (AW-2 / arch-R10).
 pub use schemas::{

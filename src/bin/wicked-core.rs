@@ -23,6 +23,14 @@
 //!   wicked-core rules ingest <dir>               # populate governance policies (deny) + conformance
 //!       # rules (recall→obligation) into the store: <dir>/policies/*.json + <dir>/rules/*.json +
 //!       # frontmattered markdown rule docs anywhere under <dir> (AW-3 MarkdownAdapter)
+//!   wicked-core rules fanout <dir> \              # fan ONE ruleset out across the deliberate store
+//!       (--enforcement-db F | --enforcement-crew-api URL) \      # split (AW-5): enforcement copy
+//!       --discovery-db F [--discovery-db F]... \  # + discovery graph copies (one per live repo
+//!       --knowledge-db F [--knowledge-db F]... \  #   under --scope workspace) + knowledge rationale
+//!       [--scope repo|workspace] [--knowledge-scope S] [--manifest OUT.json]
+//!       # Every cli lane is smoke-verified against the SAME db a worker is handed; the manifest
+//!       # (keyed on PAT-/POL- ids) is the receipt. A daemon-held store is NEVER CLI-written:
+//!       # --enforcement-crew-api records the pending transport + emits the POST payload instead.
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -135,6 +143,20 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
         "wicked-core gate-hook [--protocol-version]\n  \
          The PreToolUse hook. Arguments travel by environment variable; `--protocol-version` prints \
          the handshake the engine checks before arming a run.",
+    ),
+    (
+        "rules",
+        "wicked-core rules ingest <dir> [--db <F>]\n  \
+         Populate ONE store with governance policies (deny) + conformance rules (recall→obligation): \
+         <dir>/policies/*.json + <dir>/rules/*.json + frontmattered markdown docs. WRITES to the store.\n\
+         wicked-core rules fanout <dir> (--enforcement-db <F> | --enforcement-crew-api <URL>) \
+         --discovery-db <F>... --knowledge-db <F>... [--scope repo|workspace] [--knowledge-scope <S>] \
+         [--manifest <OUT.json>]\n  \
+         Fan ONE ruleset out across the deliberate store split (AW-5): enforcement copy + discovery \
+         graph copies (one per live repo under --scope workspace) + knowledge rationale chunks, each \
+         cli lane smoke-verified against the worker-visible db. A daemon-held store is NEVER \
+         CLI-written: --enforcement-crew-api records the pending transport + emits the POST payload. \
+         WRITES to every cli lane store.",
     ),
 ];
 
@@ -288,6 +310,11 @@ fn main() {
         // the output guardrail has something to deny/recall against (core#26). Opens the store directly.
         Some("rules") if args.get(2).map(String::as_str) == Some("ingest") => {
             return rules_ingest_cmd(&args)
+        }
+        // `rules fanout <dir>` fans one ruleset out across the deliberate store split (AW-5):
+        // enforcement + discovery + knowledge lanes, each smoke-verified; the manifest is the receipt.
+        Some("rules") if args.get(2).map(String::as_str) == Some("fanout") => {
+            return rules_fanout_cmd(&args)
         }
         _ => {}
     }
@@ -1250,6 +1277,280 @@ fn rules_ingest_cmd(args: &[String]) {
         "rules ingest: registered {n_policies} policies + {n_rules} conformance rules \
          (+ {n_schemas} schema nodes) from {dir}"
     );
+}
+
+/// Every value of a repeatable `--flag` (in argv order).
+fn flag_all(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == name {
+            if let Some(v) = args.get(i + 1) {
+                out.push(v.clone());
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Lexically normalize a path (resolve `.`/`..` without touching the filesystem — lane dbs may not
+/// exist yet), absolutized against the cwd.
+fn normalize_lexical(path: &str) -> std::path::PathBuf {
+    use std::path::Component;
+    let p = std::path::Path::new(path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(p)
+    };
+    let mut out = std::path::PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The crew daemon's state home when `path` resolves inside it, else `None`. A store under
+/// `~/.wicked-crew` is daemon-held BY LOCATION: the single-writer actor owns it, and a second
+/// OS-process writer is the exact two-writer hazard the gate-hook architecture removed. This is a
+/// guard against the obvious accident, not a security boundary — the contract (never CLI against a
+/// daemon store) is DES-OUTGOV-008's.
+fn daemon_fenced(path: &str) -> Option<String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)?;
+    let fence = normalize_lexical(&home.join(".wicked-crew").to_string_lossy());
+    let target = normalize_lexical(path);
+    target
+        .starts_with(&fence)
+        .then(|| fence.to_string_lossy().into_owned())
+}
+
+/// `wicked-core rules fanout <dir> …` — the AW-5 fan-out contract across the deliberate store
+/// split (arch-R3; decision record `.product/DES-OUTGOV-008-fanout-placement.md`). One ruleset
+/// (`rules ingest` layout) fans out to (a) the enforcement store the gate hook reads, (b) every
+/// discovery graph the workers' estate MCP binds (one per live repo under `--scope workspace`,
+/// the AW-6 replicate-to-every-repo decision), and (c) a knowledge rationale chunk per rule.
+/// Every cli lane is smoke-verified against a FRESH handle on the same `--db` a worker is handed;
+/// the manifest keyed on PAT-/POL- ids is written only when every cli lane verified (fail-loud).
+///
+/// A daemon-held store is NEVER CLI-written: `--enforcement-crew-api` records the pending
+/// transport in the manifest and emits the `{policies, rules}` payload for
+/// `POST /api/v1/governance/{policies,rules}` next to the manifest; any lane path under
+/// `~/.wicked-crew` is refused outright.
+fn rules_fanout_cmd(args: &[String]) {
+    // The <dir> is the first NON-FLAG token after `rules fanout` (index 3+); only KNOWN
+    // value-taking flags consume a following value (same shape as `rules ingest`).
+    const VALUE_FLAGS: &[&str] = &[
+        "--dir",
+        "--manifest",
+        "--scope",
+        "--enforcement-db",
+        "--enforcement-crew-api",
+        "--discovery-db",
+        "--knowledge-db",
+        "--knowledge-scope",
+    ];
+    let positional_dir = || -> Option<String> {
+        let mut i = 3;
+        while i < args.len() {
+            let a = &args[i];
+            if a.starts_with("--") {
+                let has_value = VALUE_FLAGS.contains(&a.as_str())
+                    && args.get(i + 1).is_some_and(|v| !v.starts_with("--"));
+                i += if has_value { 2 } else { 1 };
+            } else {
+                return Some(a.clone());
+            }
+        }
+        None
+    };
+    let dir = match flag(args, "--dir").or_else(positional_dir) {
+        Some(d) => d,
+        None => {
+            fail(
+                "rules fanout requires a ruleset directory: wicked-core rules fanout <dir> \
+                 (--enforcement-db F | --enforcement-crew-api URL) --discovery-db F... \
+                 --knowledge-db F... [--scope repo|workspace] [--manifest OUT.json]",
+            );
+            return;
+        }
+    };
+    // Reject flag-shaped values (a missing value makes `flag` return the NEXT flag) — same guards
+    // as `rules ingest`, because a mis-parsed lane path writes the wrong store and reports success.
+    for name in VALUE_FLAGS {
+        for v in flag_all(args, name) {
+            if v.starts_with("--") {
+                fail(&format!(
+                    "rules fanout: {name} has no value (resolved to {v:?}) — refusing a \
+                     flag-shaped argument"
+                ));
+                return;
+            }
+        }
+    }
+    if dir.starts_with("--") {
+        fail(&format!(
+            "rules fanout: --dir has no value (resolved to {dir:?}) — refusing a flag-shaped \
+             directory"
+        ));
+        return;
+    }
+
+    let scope = match flag(args, "--scope").as_deref() {
+        None | Some("repo") => wicked_governance::FanoutScope::Repo,
+        Some("workspace") => wicked_governance::FanoutScope::Workspace,
+        Some(other) => {
+            fail(&format!(
+                "rules fanout: --scope must be `repo` or `workspace`, got {other:?} (fail-loud — \
+                 a typo'd scope must not silently narrow a workspace fan-out)"
+            ));
+            return;
+        }
+    };
+
+    let enforcement_db = flag(args, "--enforcement-db");
+    let enforcement_api = flag(args, "--enforcement-crew-api");
+    let enforcement = match (&enforcement_db, &enforcement_api) {
+        (Some(db), None) => wicked_governance::EnforcementTarget::Cli { db: db.clone() },
+        (None, Some(url)) => wicked_governance::EnforcementTarget::CrewApi { url: url.clone() },
+        (Some(_), Some(_)) => {
+            fail(
+                "rules fanout: --enforcement-db and --enforcement-crew-api are mutually \
+                 exclusive — a store is either offline (cli-written) or daemon-held (crew API), \
+                 never both",
+            );
+            return;
+        }
+        (None, None) => {
+            fail(
+                "rules fanout: an enforcement target is required — --enforcement-db <path> for an \
+                 offline store, or --enforcement-crew-api <url> for a store a crew daemon holds",
+            );
+            return;
+        }
+    };
+
+    let discovery_dbs = flag_all(args, "--discovery-db");
+    let knowledge_dbs = flag_all(args, "--knowledge-db");
+
+    // NEVER the CLI against a daemon-held store — in ANY lane. The enforcement lane has the
+    // crew-api transport as its sanctioned alternative; a discovery/knowledge path under the
+    // daemon home is simply a wrong target.
+    let mut fenced: Vec<&String> = Vec::new();
+    if let Some(db) = &enforcement_db {
+        fenced.push(db);
+    }
+    fenced.extend(discovery_dbs.iter());
+    fenced.extend(knowledge_dbs.iter());
+    for path in fenced {
+        if let Some(fence) = daemon_fenced(path) {
+            fail(&format!(
+                "rules fanout: {path:?} resolves under the crew daemon's state home ({fence}) — a \
+                 daemon-held store is never CLI-written (single-writer invariant); use \
+                 --enforcement-crew-api and POST the emitted payload instead"
+            ));
+            return;
+        }
+    }
+
+    let targets = wicked_governance::FanoutTargets {
+        scope,
+        enforcement,
+        discovery_dbs,
+        knowledge_dbs,
+        knowledge_scope: flag(args, "--knowledge-scope")
+            .unwrap_or_else(|| "wiki:governance".to_string()),
+    };
+
+    let load = match wicked_governance::load_ruleset(std::path::Path::new(&dir)) {
+        Ok(l) => l,
+        Err(e) => {
+            fail(&format!("rules fanout: {e}"));
+            return;
+        }
+    };
+    let manifest = match wicked_governance::fanout(&load, &targets, &dir, now_secs()) {
+        Ok(m) => m,
+        Err(e) => {
+            fail(&format!("rules fanout: {e}"));
+            return;
+        }
+    };
+
+    let manifest_path = flag(args, "--manifest").unwrap_or_else(|| "fanout-manifest.json".into());
+    let json = match serde_json::to_string_pretty(&manifest) {
+        Ok(j) => j,
+        Err(e) => {
+            fail(&format!("rules fanout: serialize manifest: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&manifest_path, json) {
+        fail(&format!("rules fanout: cannot write {manifest_path}: {e}"));
+        return;
+    }
+
+    println!(
+        "rules fanout: {} conformance rules + {} policies from {dir}",
+        manifest.rules.len(),
+        manifest.policies.len()
+    );
+    println!(
+        "  enforcement [{}] {} — {}",
+        manifest.enforcement.transport,
+        manifest.enforcement.target,
+        if manifest.enforcement.verified {
+            "VERIFIED"
+        } else {
+            "PENDING (crew API)"
+        }
+    );
+    for lane in &manifest.discovery {
+        println!("  discovery   {} — VERIFIED", lane.db);
+    }
+    for lane in &manifest.knowledge {
+        println!("  knowledge   {} — VERIFIED", lane.db);
+    }
+    println!("  manifest → {manifest_path}");
+
+    // A daemon-held enforcement store gets its copies over the crew API: emit the payload the
+    // operator POSTs, next to the manifest, so "the enforcement copy" exists concretely even
+    // though this process could not write it.
+    if let wicked_governance::EnforcementTarget::CrewApi { url } = &targets.enforcement {
+        let payload_path = format!("{manifest_path}.crew-payload.json");
+        let payload = serde_json::json!({
+            "policies": load.policies,
+            "rules": load.rules,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(j) => {
+                if let Err(e) = std::fs::write(&payload_path, j) {
+                    fail(&format!("rules fanout: cannot write {payload_path}: {e}"));
+                    return;
+                }
+            }
+            Err(e) => {
+                fail(&format!("rules fanout: serialize crew payload: {e}"));
+                return;
+            }
+        }
+        println!(
+            "  enforcement lane is PENDING: POST {payload_path} to {url}/governance/policies and \
+             {url}/governance/rules, then verify via GET {url}/governance/rules/preview"
+        );
+    }
 }
 
 fn fail(msg: &str) {

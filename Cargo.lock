@@ -3499,6 +3499,7 @@ dependencies = [
  "uuid",
  "wicked-apps-core",
  "wicked-estate-core",
+ "wicked-estate-knowledge",
  "wicked-estate-store",
 ]
 
