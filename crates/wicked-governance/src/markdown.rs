@@ -541,9 +541,9 @@ fn parse_rules_section(
                 anyhow::bail!("line {line_no}: duplicate rule id {id:?} within this doc (INV-C3)");
             }
             current = Some((id, caps[2].to_string(), caps[3].trim().to_string()));
-        } else if l.starts_with("  ") && current.is_some() {
-            // Continuation line: joined with a space onto the open statement.
-            let cur = current.as_mut().expect("checked");
+        } else if let (true, Some(cur)) = (l.starts_with("  "), current.as_mut()) {
+            // Continuation line: joined with a space onto the open statement. An indented line
+            // with NO open item falls through to the fail-loud arm below.
             if !cur.2.is_empty() {
                 cur.2.push(' ');
             }
