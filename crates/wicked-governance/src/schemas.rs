@@ -25,14 +25,69 @@ pub fn schema_bundle_version() -> &'static str {
     BUNDLE_VERSION_RAW.trim()
 }
 
-/// Every schema in the bundle as `(file_name, contents)` — lets callers (tests, future graph
-/// registration per schemas/README.md TODO) iterate without hardcoding the roster twice.
+/// Every schema in the bundle as `(file_name, contents)` — lets callers (tests, graph
+/// registration below) iterate without hardcoding the roster twice.
 pub const SCHEMA_BUNDLE: [(&str, &str); 4] = [
     ("conformance-rules.schema.json", CONFORMANCE_RULES_SCHEMA),
     ("domain-model.schema.json", DOMAIN_MODEL_SCHEMA),
     ("coverage.schema.json", COVERAGE_SCHEMA),
     ("vocabulary.schema.json", VOCABULARY_SCHEMA),
 ];
+
+/// Node kind + synthetic-symbol namespace for schema-document nodes (the schemas/README.md AW-3
+/// seam). `NodeKind::Other(GOVERNANCE_SCHEMA)` for now — a first-class const in wicked-apps-core
+/// (beside `POLICY`/`CONFORMANCE_CLAIM`) belongs to the apps-core consts pass (AW-12/AW-19).
+pub const GOVERNANCE_SCHEMA: &str = "governance_schema";
+
+/// Register the schema bundle on the graph: one node per schema file, **keyed by `$id`**
+/// (version-addressed — a contract bump mints a NEW node, so a `Rule` can point at the exact
+/// contract it was validated under), carrying the per-schema contract version + the bundle
+/// version. Idempotent (same `$id` upserts the same synthetic symbol). Fails loud if an owner
+/// copy is corrupt — a governance store must never carry a schema node it cannot re-derive.
+pub fn register_schema_nodes(
+    store: &mut dyn wicked_apps_core::GraphStore,
+) -> anyhow::Result<usize> {
+    use wicked_apps_core::{
+        synthetic_symbol, Language, Location, Node, NodeKind, Span, SYMBOL_SCHEME,
+    };
+    let mut nodes = Vec::with_capacity(SCHEMA_BUNDLE.len());
+    for (file, raw) in SCHEMA_BUNDLE {
+        let schema: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+            anyhow::anyhow!("schema {file} is not valid JSON (owner copy corrupt): {e}")
+        })?;
+        let id = schema["$id"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("schema {file} has no string $id"))?;
+        let contract_version = id
+            .rsplit('/')
+            .next()
+            .filter(|seg| seg.split('.').count() == 3)
+            .ok_or_else(|| {
+                anyhow::anyhow!("schema {file} $id {id:?} does not end in a /x.y.z segment")
+            })?;
+        let mut node = Node::new(
+            synthetic_symbol(GOVERNANCE_SCHEMA, id),
+            NodeKind::Other(GOVERNANCE_SCHEMA.to_string()),
+            id.to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(format!("{GOVERNANCE_SCHEMA}/{file}"), Span::ZERO),
+        );
+        node.metadata.insert("file".into(), file.into());
+        node.metadata.insert("schema_id".into(), id.into());
+        node.metadata
+            .insert("contract_version".into(), contract_version.into());
+        node.metadata
+            .insert("bundle_version".into(), schema_bundle_version().into());
+        if let Some(title) = schema["title"].as_str() {
+            node.metadata.insert("title".into(), title.into());
+        }
+        nodes.push(node);
+    }
+    store.begin_batch()?;
+    store.upsert_nodes(&nodes)?;
+    store.commit_batch()?;
+    Ok(nodes.len())
+}
 
 #[cfg(test)]
 mod tests {
@@ -139,5 +194,41 @@ mod tests {
             "1.0.0",
             "domain-model contract version moved — update domain_model.rs callers + this pin together"
         );
+    }
+
+    /// The schemas/README.md AW-3 seam: one node per schema file, keyed by `$id`, carrying the
+    /// contract version + bundle version — idempotent under re-registration.
+    #[test]
+    fn register_schema_nodes_mints_one_node_per_schema_keyed_by_id() {
+        use wicked_apps_core::{synthetic_symbol, GraphRead, NodeKind, SqliteStore};
+        let mut store = SqliteStore::in_memory().unwrap();
+        assert_eq!(register_schema_nodes(&mut store).unwrap(), 4);
+        // Idempotent: a re-run upserts the same $id-keyed symbols, never duplicates.
+        assert_eq!(register_schema_nodes(&mut store).unwrap(), 4);
+        let query = wicked_estate_core::SymbolQuery {
+            kinds: vec![NodeKind::Other(GOVERNANCE_SCHEMA.to_string())],
+            ..Default::default()
+        };
+        let nodes = store.find_symbols(&query).unwrap();
+        assert_eq!(nodes.len(), 4, "one node per schema file, no dupes");
+        for node in &nodes {
+            let id = node.metadata["schema_id"].as_str().expect("schema_id");
+            assert_eq!(
+                node.symbol,
+                synthetic_symbol(GOVERNANCE_SCHEMA, id),
+                "keyed by $id"
+            );
+            assert_eq!(
+                node.metadata["bundle_version"].as_str(),
+                Some(schema_bundle_version())
+            );
+            let cv = node.metadata["contract_version"]
+                .as_str()
+                .expect("contract_version");
+            assert!(
+                id.ends_with(cv),
+                "$id {id:?} carries its contract version {cv:?}"
+            );
+        }
     }
 }

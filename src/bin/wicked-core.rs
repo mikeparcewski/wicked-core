@@ -21,7 +21,8 @@
 //!   wicked-core seed-domain-validators           # seed the deterministic coverage validator the
 //!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
 //!   wicked-core rules ingest <dir>               # populate governance policies (deny) + conformance
-//!       # rules (recall→obligation) into the store: <dir>/policies/*.json + <dir>/rules/*.json
+//!       # rules (recall→obligation) into the store: <dir>/policies/*.json + <dir>/rules/*.json +
+//!       # frontmattered markdown rule docs anywhere under <dir> (AW-3 MarkdownAdapter)
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -1003,9 +1004,17 @@ fn coverage_cmd(args: &[String]) {
 /// (`output-gate-hook`) has real rules to enforce (core#26, DES-OUTGOV-006). Layout:
 ///   <dir>/policies/*.json  — each a `Policy` or `[Policy]` → register_policy (deny on a matching output)
 ///   <dir>/rules/*.json     — conformance-rule bundles → ingest_from + register_rule (recall→obligation)
-/// FAIL-LOUD: a malformed/unreadable file errors (never a partial silent load); an EMPTY effective load
-/// (0 policies + 0 rules) errors (a silent no-op population would read as "governed" while enforcing
-/// nothing). A missing `policies/` or `rules/` subdir is tolerated (a ruleset may carry only one kind).
+///   <dir>/**/*.md          — frontmattered markdown rule docs (AW-3 `MarkdownAdapter`: YAML
+///                            frontmatter + `## Rules` items) → the SAME ingest_from/normalize_bundle
+///                            path + register_rule; a `.md` without a leading `---` fence is not a
+///                            rule doc and is not claimed
+/// FAIL-LOUD: a malformed/unreadable file errors (never a partial silent load — a malformed markdown
+/// doc names its path + reason); a rule id colliding across the JSON and markdown lanes errors (both
+/// map to `conformance_rule/<id>`, so the later write would silently clobber the earlier); an EMPTY
+/// effective load (0 policies + 0 rules) errors (a silent no-op population would read as "governed"
+/// while enforcing nothing). A missing `policies/` or `rules/` subdir is tolerated (a ruleset may
+/// carry only one kind). A successful ingest also registers the 4 governance schema-document nodes
+/// (keyed by `$id`) so rules can reference the contract they were validated under.
 fn rules_ingest_cmd(args: &[String]) {
     // The <dir> is the first NON-FLAG token after `rules ingest` (index 3+). Only the KNOWN value-taking
     // flags (`--db`/`--dir`) consume a following value; any other `--token` is skipped alone (not blindly
@@ -1065,14 +1074,19 @@ fn rules_ingest_cmd(args: &[String]) {
     let root = std::path::Path::new(&dir);
     let mut n_policies = 0usize;
     let mut n_rules = 0usize;
+    // Rule ids seen across BOTH conformance lanes (JSON bundles + markdown docs). ingest_from
+    // enforces INV-C3 within each adapter; this set extends it across the two, because a
+    // cross-lane duplicate would silently overwrite at register (same `conformance_rule/<id>`).
+    let mut seen_rule_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Conformance rules (recall→obligation).
+    // Conformance rules (recall→obligation), JSON lane.
     let rules_dir = root.join("rules");
     if rules_dir.is_dir() {
         let adapter = wicked_governance::FilesystemAdapter::new(&rules_dir);
         match wicked_governance::ingest_from(&adapter) {
             Ok(rules) => {
                 for r in &rules {
+                    seen_rule_ids.insert(r.id.clone());
                     if let Err(e) = wicked_governance::register_rule(&mut store, r) {
                         fail(&format!(
                             "rules ingest: register conformance rule {} failed: {e}",
@@ -1086,6 +1100,42 @@ fn rules_ingest_cmd(args: &[String]) {
             Err(e) => {
                 fail(&format!(
                     "rules ingest: reading conformance rules under {rules_dir:?}: {e}"
+                ));
+                return;
+            }
+        }
+    }
+
+    // Conformance rules, markdown lane (AW-3): frontmattered `*.md` docs anywhere under <dir>,
+    // through the SAME normalize_bundle fail-closed path (one parse convention, no second path).
+    {
+        let adapter = wicked_governance::MarkdownAdapter::new(root);
+        match wicked_governance::ingest_from(&adapter) {
+            Ok(rules) => {
+                for r in &rules {
+                    if !seen_rule_ids.insert(r.id.clone()) {
+                        fail(&format!(
+                            "rules ingest: rule id {:?} appears in BOTH a rules/*.json bundle and a \
+                             markdown doc ({}) — the later write would silently overwrite the earlier \
+                             at conformance_rule/<id>; refusing (fail-loud)",
+                            r.id,
+                            r.provenance.reference.as_deref().unwrap_or("?")
+                        ));
+                        return;
+                    }
+                    if let Err(e) = wicked_governance::register_rule(&mut store, r) {
+                        fail(&format!(
+                            "rules ingest: register conformance rule {} (markdown) failed: {e}",
+                            r.id
+                        ));
+                        return;
+                    }
+                    n_rules += 1;
+                }
+            }
+            Err(e) => {
+                fail(&format!(
+                    "rules ingest: reading markdown rule docs under {root:?}: {e}"
                 ));
                 return;
             }
@@ -1180,12 +1230,25 @@ fn rules_ingest_cmd(args: &[String]) {
     if n_policies == 0 && n_rules == 0 {
         fail(&format!(
             "rules ingest: NO policies or conformance rules found under {dir} (expected \
-             <dir>/policies/*.json and/or <dir>/rules/*.json) — refusing an empty population (fail-loud)"
+             <dir>/policies/*.json, <dir>/rules/*.json, and/or frontmattered markdown rule docs \
+             with a `## Rules` section) — refusing an empty population (fail-loud)"
         ));
         return;
     }
+    // A successful ingest also registers the governance schema-document nodes (one per schema
+    // file, keyed by $id — schemas/README.md AW-3 seam), so the store's rules can reference the
+    // contract version they were validated under. After the empty-population check: a refused
+    // ingest must not leave a half-populated store.
+    let n_schemas = match wicked_governance::register_schema_nodes(&mut store) {
+        Ok(n) => n,
+        Err(e) => {
+            fail(&format!("rules ingest: register schema nodes failed: {e}"));
+            return;
+        }
+    };
     println!(
-        "rules ingest: registered {n_policies} policies + {n_rules} conformance rules from {dir}"
+        "rules ingest: registered {n_policies} policies + {n_rules} conformance rules \
+         (+ {n_schemas} schema nodes) from {dir}"
     );
 }
 

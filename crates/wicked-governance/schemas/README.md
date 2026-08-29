@@ -55,12 +55,16 @@ in a consumer's vendored copy — re-vendor from here.
   in the archive) was NOT carried over — JS consumers vendor bytes from here
   until/unless a package is published from this owner.
 
-## TODO — register schema nodes in the graph (AW-3 follow-on)
+## Schema nodes in the graph (AW-3 — done)
 
-arch-R10 also calls for registering each schema as a graph node so rules can
-reference their schema version. No registration mechanism exists yet (no
-`SCHEMA` node-kind const in `wicked-apps-core`, no ingest path for schema
-documents) — deliberately NOT invented here. The AW-3 MarkdownAdapter /
-`SourceAdapter` work should add it: one node per schema file, keyed by
-`$id`, carrying the contract version + bundle version, so `Rule` nodes can point
-at the schema contract they were validated under.
+arch-R10's graph-registration half landed with AW-3:
+`wicked_governance::register_schema_nodes` (in `src/schemas.rs`) mints one node
+per schema file — `NodeKind::Other("governance_schema")`, synthetic symbol keyed
+by the schema's **`$id`** (version-addressed: a contract bump mints a new node),
+metadata carrying `file`, `schema_id`, `contract_version`, `bundle_version`, and
+`title` — so `Rule` nodes can point at the exact contract they were validated
+under. `wicked-core rules ingest` registers/refreshes them on every successful
+ingest. One residue stays deliberately open: `governance_schema` rides
+`NodeKind::Other(...)` because node-kind consts live in `wicked-apps-core`,
+whose consts pass belongs to AW-12/AW-19 — promote it to a first-class const
+there when that lane lands.

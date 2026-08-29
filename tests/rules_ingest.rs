@@ -342,3 +342,75 @@ fn policies_only_ruleset_works() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("1 policies + 0 conformance rules"));
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn markdown_docs_ingest_alongside_json_lanes() {
+    // AW-3: a frontmattered markdown rule doc anywhere under <dir> ingests through the SAME
+    // normalize_bundle path; the summary counts it and the schema-document nodes register.
+    let base = scratch("mdlane");
+    let db = base.join("estate.db");
+    let db_s = db.to_str().unwrap().to_string();
+    let ruleset = write_ruleset(&base); // JSON lanes: 1 policy + PAT-001
+    std::fs::create_dir_all(ruleset.join("docs")).unwrap();
+    std::fs::write(
+        ruleset.join("docs/doctrine.md"),
+        "---\nid: doctrine\ntitle: Doctrine\n---\n\n## Rules\n\n- POL-200 (critical): governed statement.\n",
+    )
+    .unwrap();
+    let out = ingest(&db_s, &ruleset);
+    assert!(
+        out.status.success(),
+        "markdown lane ingests: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("1 policies + 2 conformance rules (+ 4 schema nodes)"),
+        "JSON + markdown rules both counted, schema nodes registered: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_rule_id_colliding_across_json_and_markdown_lanes_fails_loud() {
+    // The SAME id in rules/*.json and a markdown doc would silently overwrite at register
+    // (both map to conformance_rule/<id>) — the CLI must refuse.
+    let base = scratch("mddup");
+    let db = base.join("estate.db");
+    let db_s = db.to_str().unwrap().to_string();
+    let ruleset = write_ruleset(&base); // JSON lane already carries PAT-001
+    std::fs::write(
+        ruleset.join("dup.md"),
+        "---\nid: dup\ntitle: Dup\n---\n\n## Rules\n\n- PAT-001 (error): same id as the JSON lane.\n",
+    )
+    .unwrap();
+    let out = ingest(&db_s, &ruleset);
+    assert!(!out.status.success(), "cross-lane duplicate must fail loud");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("PAT-001") && stderr.contains("markdown"),
+        "names the id and the colliding lane: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_malformed_markdown_doc_fails_the_ingest_with_path_and_reason() {
+    let base = scratch("mdbad");
+    let db = base.join("estate.db");
+    let db_s = db.to_str().unwrap().to_string();
+    let ruleset = write_ruleset(&base);
+    std::fs::write(
+        ruleset.join("broken.md"),
+        "---\nid: broken\ntitle: Broken\nnot_a_known_key: x\n---\n",
+    )
+    .unwrap();
+    let out = ingest(&db_s, &ruleset);
+    assert!(!out.status.success(), "malformed doc must fail the ingest");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("broken.md") && stderr.contains("not_a_known_key"),
+        "per-file path + reason: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
