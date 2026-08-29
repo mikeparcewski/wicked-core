@@ -31,6 +31,14 @@
 //!       # Every cli lane is smoke-verified against the SAME db a worker is handed; the manifest
 //!       # (keyed on PAT-/POL- ids) is the receipt. A daemon-held store is NEVER CLI-written:
 //!       # --enforcement-crew-api records the pending transport + emits the POST payload instead.
+//!   wicked-core rules relink [--ambiguity-cap N] [--json]   # re-derive rule→code Governs edges from
+//!       # qualified symbol_refs at the current epoch (AW-9) — run after every `wicked-estate index`;
+//!       # unresolvable refs are REPORTED as drift, never dropped. With --knowledge/--xedge (or
+//!       # $WICKED_KNOWLEDGE_DB/$WICKED_XEDGE_DB) also writes knowledge→code about-xedges
+//!       # (the knowledge.relate_code seam) for docs ingested into the knowledge domain
+//!   wicked-core rules drift [--dir <docs>] [--json]  # report the residue re-ingest can't self-heal
+//!       # (AW-10): orphaned / uningested / unresolvable / unlinked / extraneous; read-only; exits 3
+//!       # when residue is found (0 clean, 1 operational error) — run with the same --dir as ingest
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -315,6 +323,16 @@ fn main() {
         // enforcement + discovery + knowledge lanes, each smoke-verified; the manifest is the receipt.
         Some("rules") if args.get(2).map(String::as_str) == Some("fanout") => {
             return rules_fanout_cmd(&args)
+        }
+        // `rules relink` re-derives rule→code Governs edges from qualified symbol_refs (AW-9). Like
+        // ingest it opens the store directly as a brief sole writer — never via the actor.
+        Some("rules") if args.get(2).map(String::as_str) == Some("relink") => {
+            return rules_relink_cmd(&args)
+        }
+        // `rules drift` reports what re-ingest can't self-heal (AW-10). Strictly read-only, so it
+        // opens the store with open_store_ro and can run beside a live single-writer daemon.
+        Some("rules") if args.get(2).map(String::as_str) == Some("drift") => {
+            return rules_drift_cmd(&args)
         }
         _ => {}
     }
@@ -1556,4 +1574,232 @@ fn rules_fanout_cmd(args: &[String]) {
 fn fail(msg: &str) {
     eprintln!("{msg}");
     std::process::exit(1);
+}
+
+/// Parse `--ambiguity-cap N` (default [`wicked_governance::DEFAULT_AMBIGUITY_CAP`]). Fail-loud on
+/// junk: a typo'd cap silently defaulting would change which refs fan.
+fn ambiguity_cap(args: &[String]) -> usize {
+    match flag(args, "--ambiguity-cap") {
+        None => wicked_governance::DEFAULT_AMBIGUITY_CAP,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if n >= 1 => n,
+            _ => {
+                fail(&format!(
+                    "--ambiguity-cap must be a positive integer, got {v:?}"
+                ));
+                unreachable!("fail exits");
+            }
+        },
+    }
+}
+
+/// `wicked-core rules relink [--db F] [--ambiguity-cap N] [--json] [--knowledge K --xedge X]` —
+/// the AW-9 relink pass: re-derive rule→code `Governs` edges from qualified `symbol_ref`s at the
+/// current epoch. Designed to run AFTER EVERY `wicked-estate index` (and as a crew workflow step):
+/// a full re-extract re-mints code ids and prunes the old edges, and this pass is what makes the
+/// links survive — durable-by-name, derived-by-id. Unresolvable refs are printed as drift and kept
+/// in the report; the rule metadata is never touched. Exit 0 unless the pass itself fails —
+/// residue gating is `rules drift`'s job.
+fn rules_relink_cmd(args: &[String]) {
+    let cap = ambiguity_cap(args);
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules relink: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    let mut store = match wicked_apps_core::open_store(Some(&resolved_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules relink: open store failed: {e}"));
+            return;
+        }
+    };
+
+    let report = match wicked_governance::relink(&mut store, cap, now_secs()) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("rules relink: {e}"));
+            return;
+        }
+    };
+
+    // The knowledge.relate_code half — ONLY where the seam exists (AW-9 second clause). Both
+    // stores are needed (the about-edge lives in the xedge overlay, the chunk in the knowledge
+    // store); a half-configured seam fails loud rather than silently skipping the other half.
+    let knowledge_path = flag(args, "--knowledge").or_else(|| env_nonempty("WICKED_KNOWLEDGE_DB"));
+    let xedge_path = flag(args, "--xedge").or_else(|| env_nonempty("WICKED_XEDGE_DB"));
+    let knowledge_report = match (&knowledge_path, &xedge_path) {
+        (Some(k), Some(x)) => {
+            let engine = match wicked_estate_knowledge::KnowledgeEngine::open(k) {
+                Ok(e) => e,
+                Err(e) => {
+                    fail(&format!("rules relink: open knowledge store {k:?}: {e}"));
+                    return;
+                }
+            };
+            let xedge = match wicked_estate_knowledge::XedgeStore::open(x) {
+                Ok(s) => s,
+                Err(e) => {
+                    fail(&format!("rules relink: open xedge overlay {x:?}: {e}"));
+                    return;
+                }
+            };
+            match wicked_governance::relate_linked_rules(&engine, &xedge, &report.linked) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    fail(&format!("rules relink: knowledge relate failed: {e}"));
+                    return;
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            fail(
+                "rules relink: the knowledge seam needs BOTH --knowledge and --xedge (or \
+                 $WICKED_KNOWLEDGE_DB and $WICKED_XEDGE_DB) — refusing a half-configured seam",
+            );
+            return;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        let out = serde_json::json!({
+            "relink": report,
+            "knowledge": match &knowledge_report {
+                Some(r) => serde_json::to_value(r).expect("report serializes"),
+                None => serde_json::json!({ "skipped": "no knowledge/xedge store supplied" }),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&out).expect("json"));
+        return;
+    }
+
+    println!(
+        "rules relink: {} rule(s) linked ({} Governs edge(s) re-derived), {} with refs of {} \
+         seen, {} retired skipped",
+        report.linked.len(),
+        report.edges_written,
+        report.rules_with_ref,
+        report.rules_seen,
+        report.skipped_retired
+    );
+    for finding in &report.drift {
+        // Drift is REPORTED, never dropped: the ref stays on the rule for the next pass.
+        eprintln!(
+            "  DRIFT {}: symbol_ref {:?} — {:?}",
+            finding.rule_id, finding.symbol_ref, finding.failure
+        );
+    }
+    match &knowledge_report {
+        None => println!("  knowledge: skipped (no --knowledge/--xedge store supplied)"),
+        Some(k) => {
+            println!(
+                "  knowledge: {} about-xedge(s) written; {} doc(s) not in the knowledge store",
+                k.links_written.len(),
+                k.unmatched_docs.len()
+            );
+            for doc in &k.unmatched_docs {
+                eprintln!("    not ingested into knowledge: {doc}");
+            }
+        }
+    }
+}
+
+/// `wicked-core rules drift [--db F] [--dir <docs>] [--ambiguity-cap N] [--json]` — the AW-10
+/// drift report: the residue an idempotent on-merge re-ingest cannot self-heal. Read-only (the
+/// store opens with `open_store_ro`, safe beside the live daemon). Exit codes: 0 clean, 3 residue
+/// found, 1 operational error — so a CI job can gate on it directly.
+fn rules_drift_cmd(args: &[String]) {
+    let cap = ambiguity_cap(args);
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules drift: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    let docs_dir = flag(args, "--dir");
+    if let Some(d) = &docs_dir {
+        if d.starts_with("--") {
+            fail(&format!(
+                "rules drift: --dir has no value (resolved to {d:?})"
+            ));
+            return;
+        }
+    }
+    let store = match wicked_apps_core::open_store_ro(Some(&resolved_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules drift: open store read-only failed: {e}"));
+            return;
+        }
+    };
+
+    let report = match wicked_governance::drift(
+        &store,
+        docs_dir.as_deref().map(std::path::Path::new),
+        cap,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("rules drift: {e}"));
+            return;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("report serializes")
+        );
+    } else {
+        println!(
+            "rules drift: {} rule(s) checked, {} doc(s) scanned{}",
+            report.rules_checked,
+            report.docs_scanned,
+            if report.docs_checked {
+                ""
+            } else {
+                " (no --dir: doc checks skipped)"
+            }
+        );
+        for o in &report.orphaned {
+            eprintln!("  ORPHANED {} ← {} ({:?})", o.rule_id, o.doc_path, o.reason);
+        }
+        for u in &report.uningested {
+            eprintln!(
+                "  UNINGESTED {} in {} ({:?})",
+                u.rule_id, u.doc_path, u.reason
+            );
+        }
+        for f in &report.unresolvable {
+            eprintln!(
+                "  UNRESOLVABLE {}: symbol_ref {:?} — {:?}",
+                f.rule_id, f.symbol_ref, f.failure
+            );
+        }
+        for u in &report.unlinked {
+            eprintln!(
+                "  UNLINKED {}: {:?} resolves but has no Governs edge — run `rules relink`",
+                u.rule_id, u.symbol_ref
+            );
+        }
+        for x in &report.extraneous {
+            eprintln!(
+                "  EXTRANEOUS {} governs {} beyond its current resolution",
+                x.rule_id, x.target
+            );
+        }
+        if !report.has_residue() {
+            println!("  clean — nothing to heal");
+        }
+    }
+
+    // Exit 3 = residue (distinct from 1 = operational error and the gates' 2 = deny), so CI can
+    // tell "the check could not run" from "the check ran and found drift".
+    if report.has_residue() {
+        std::process::exit(3);
+    }
 }

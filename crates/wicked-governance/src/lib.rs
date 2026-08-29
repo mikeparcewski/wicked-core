@@ -26,11 +26,15 @@
 mod conformance;
 mod domain;
 mod domain_model;
+mod drift;
 mod engine;
 pub mod events;
 mod fanout;
 mod ingest;
+mod knowledge_link;
 mod markdown;
+mod provenance;
+mod relink;
 mod schemas;
 
 pub use domain::{Effect, Policy, Severity, Trigger};
@@ -80,6 +84,31 @@ pub use fanout::{
     FanoutManifest, FanoutScope, FanoutTargets, LaneTarget, PolicyEntry, RuleEntry, RulesetLoad,
     FANOUT_MANIFEST_VERSION, KNOWLEDGE_CHUNK_PREFIX,
 };
+
+// Relink pass — rule→code links durable-by-name, derived-by-id (AW-9 / arch-R6): `rules relink`
+// re-derives native Governs edges from qualified symbol_refs after every index.
+pub use relink::{
+    parse_symbol_ref, relink, LinkedRule, LinkedTarget, QualifiedRef, RefFailure, RefScope,
+    RelinkFinding, RelinkReport, DEFAULT_AMBIGUITY_CAP, RELINK_ANNOTATION_KEY,
+    RELINK_ANNOTATION_TYPE,
+};
+
+// Provenance carriage — digest-bearing refs + the per-run last_verified stamp (AW-10 / arch-R7).
+pub use provenance::{
+    format_provenance_ref, git_blob_sha1, parse_provenance_ref, stamp_provenance, ParsedRef,
+    PROVENANCE_ANNOTATION_KEY, PROVENANCE_ANNOTATION_TYPE,
+};
+
+// Drift detection — the residue idempotent re-ingest cannot self-heal (AW-10 / arch-R7):
+// orphaned / uningested / unresolvable, plus unlinked (relink heals) and extraneous edges.
+pub use drift::{
+    drift, DriftReport, ExtraneousEdge, OrphanReason, OrphanedRule, UningestReason, UningestedRule,
+    UnlinkedRule,
+};
+
+// The knowledge.relate_code half of relink — about-xedges from wiki chunks to the same resolved
+// symbols, where the knowledge + xedge stores exist (AW-9 / arch-R6 second clause).
+pub use knowledge_link::{relate_linked_rules, KnowledgeLink, KnowledgeLinkReport};
 
 // The governance schema bundle — owner copies embedded from `schemas/` (AW-2 / arch-R10).
 pub use schemas::{

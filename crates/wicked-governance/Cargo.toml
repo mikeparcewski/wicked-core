@@ -10,12 +10,17 @@ publish = false
 wicked-apps-core = { path = "../wicked-apps-core" }
 wicked-estate-core = "0.14.3"
 wicked-estate-store = "0.14.3"
-# The fan-out's knowledge lane (AW-5 / arch-R3): rationale chunks written + smoke-verified through
-# the SAME engine the estate MCP's knowledge.recall serves. Same 0.14.x line as the store deps.
+# The fan-out's knowledge lane (AW-5) + the knowledge.relate_code seam for relink (AW-9):
+# rationale chunks + about-xedges through the SAME engine the estate MCP serves. Cargo unifies
+# the 0.14 line to one version.
 wicked-estate-knowledge = "0.14.5"
+wicked-estate-overlay = "0.14.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 sha2 = "0.10"
+# git BLOB sha for rule provenance (`<path>@<git sha>#<id>`, AW-10) — computed in-process so
+# ingest works outside a git checkout and needs no subprocess.
+sha1 = "0.10"

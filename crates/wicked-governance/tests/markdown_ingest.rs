@@ -6,8 +6,8 @@ use std::path::PathBuf;
 
 use wicked_apps_core::{GraphRead, NodeKind, SqliteStore};
 use wicked_governance::{
-    ingest_from, recall_rules, register_rule, register_schema_nodes, ConfSeverity, MarkdownAdapter,
-    RuleQuery,
+    ingest_from, parse_provenance_ref, recall_rules, register_rule, register_schema_nodes,
+    ConfSeverity, MarkdownAdapter, RuleQuery,
 };
 
 /// Redirect the emit outbox spool to a per-process temp file: `register_rule`'s fire-and-forget
@@ -66,16 +66,22 @@ fn fixture_corpus_ingests_to_rule_nodes_end_to_end() {
     let pat = recalled.iter().find(|r| r.id == "PAT-001").unwrap();
     assert_eq!(pat.targets.language.as_deref(), Some("rust"));
     assert_eq!(pat.provenance.source, "markdown");
-    assert_eq!(
-        pat.provenance.reference.as_deref(),
-        Some("agent-behavior.md#PAT-001")
-    );
+    // The ref is the AW-10 digest-bearing form: `<root-relative path>@<git blob sha>#<id>`.
+    let parsed = parse_provenance_ref(pat.provenance.reference.as_deref().unwrap());
+    assert_eq!(parsed.path, "agent-behavior.md");
+    assert_eq!(parsed.anchor.as_deref(), Some("PAT-001"));
+    let sha = parsed
+        .sha
+        .expect("the ref carries the doc's content digest");
+    assert_eq!(sha.len(), 40, "a git blob sha-1: {sha}");
     let pol100 = recalled.iter().find(|r| r.id == "POL-100").unwrap();
+    let parsed = parse_provenance_ref(pol100.provenance.reference.as_deref().unwrap());
     assert_eq!(
-        pol100.provenance.reference.as_deref(),
-        Some("nested/event-grammar.md#POL-100"),
+        parsed.path, "nested/event-grammar.md",
         "nested docs keep root-relative, forward-slash refs"
     );
+    assert_eq!(parsed.anchor.as_deref(), Some("POL-100"));
+    assert!(parsed.sha.is_some());
 }
 
 #[test]
