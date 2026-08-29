@@ -235,17 +235,27 @@ impl FromNode for ConformanceRule {
 /// metadata; the `rule → symbol` Governs edge is emitted later by PR-C's recall→gate step, once
 /// `symbol_ref` resolves to a REAL indexed symbol — an edge to a synthetic placeholder here would
 /// dangle and be pruned by `compact` (review finding), so PR-B persists the node only.
+///
+/// After the commit, a COARSE fire-and-forget [`crate::events::EV_RULE_INGESTED`] event goes out
+/// through the shared emit seam (AW-22 / arch-R24) — a bus failure must NOT fail registration;
+/// the durable record is the rule node just committed.
 pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyhow::Result<()> {
     rule.validate()?;
     store.begin_batch()?;
     store.upsert_nodes(&[rule.to_node()])?;
     store.commit_batch()?;
+    let _ = crate::events::emit_rule_ingested(rule);
     Ok(())
 }
 
 /// Withdraw `id` from recall. Returns `false` if no such rule exists.
 ///
 /// Retire, not delete — see [`crate::engine::retire_policy`] for why the node has to survive.
+///
+/// On an ACTUAL state change (active → retired), a COARSE fire-and-forget
+/// [`crate::events::EV_RULE_RETIRED`] event goes out after the commit (AW-22 / arch-R24) — the
+/// wave-5 propagation trigger. Retiring an already-retired rule reports success but emits
+/// nothing: no state change, no event.
 pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool> {
     // O(1) by synthetic symbol rather than a scan-and-filter over every rule node — see
     // [`crate::engine::retire_policy`].
@@ -273,6 +283,7 @@ pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool>
     store.begin_batch()?;
     store.upsert_nodes(std::slice::from_ref(&rule.to_node()))?;
     store.commit_batch()?;
+    let _ = crate::events::emit_rule_retired(&rule);
     Ok(true)
 }
 

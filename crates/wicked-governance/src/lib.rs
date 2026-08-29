@@ -27,6 +27,7 @@ mod conformance;
 mod domain;
 mod domain_model;
 mod engine;
+pub mod events;
 mod fanout;
 mod ingest;
 mod markdown;
@@ -55,6 +56,15 @@ pub use domain_model::{
 pub use ingest::{
     ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,
     NoopFramework, SourceAdapter, StubAdapter,
+};
+
+// Wiki-lifecycle events on the bus (AW-22 / arch-R24): `wicked.estate.rule.ingested/retired`
+// fire from register_rule/retire_rule; `wicked.estate.doc.drifted` is the exported seam the
+// AW-10 drift tooling calls. See `events` module docs for the AW-21/AW-24 trigger contract.
+pub use events::{
+    doc_drifted_event, emit_doc_drifted, emit_rule_ingested, emit_rule_retired,
+    rule_ingested_event, rule_retired_event, DocDrift, EV_DOC_DRIFTED, EV_RULE_INGESTED,
+    EV_RULE_RETIRED, WIKI_LIFECYCLE_EVENTS,
 };
 
 // MarkdownAdapter — frontmattered docs as a rule source on the same SourceAdapter seam
