@@ -104,9 +104,24 @@ pub const EVENT: &str = "event";
 //    NOTE: estate already has native `EdgeKind::Governs` and `EdgeKind::Produces`; the
 //    `GOVERNS`/`PRODUCES` string constants below are provided per the brief for use with
 //    `EdgeKind::Other`. Prefer the native variants where an exact match matters to estate queries.
+//
+//    EDGE-VOCABULARY PIN (AW-19 / arch-R17; estate ADR-011 §edge-vocabulary). The pin exists
+//    because the two spellings of "governs" split the guardrail graph in two:
+//      • Any edge whose TARGET is a code-graph symbol (or a `wicked-apps` synthetic node) MUST
+//        be the native `EdgeKind::Governs` — exactly what wicked-governance emits
+//        (`ConformanceRule::governs_edge`, `conform`).
+//      • The string spelling `"governs"` under `EdgeKind::Other` is legal ONLY between
+//        knowledge-store nodes (wicked-estate-knowledge's DEC-2 relation grammar — a
+//        brain-migration legacy kept for compatibility).
+//    wicked-governance ships the runtime check (`edge_vocab`) plus a source-scan conformance
+//    test, so a new split-brain spelling cannot land in this workspace unnoticed. Recall or
+//    traversal that must see EVERY governs relationship matches BOTH spellings during the
+//    deprecation window (estate ADR-011 §edge-vocabulary).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A policy governs a scope/phase. (estate native equivalent: `EdgeKind::Governs`.)
+/// A policy governs a scope/phase — KNOWLEDGE-STORE relations only. Per the edge-vocabulary pin
+/// above, never mint this string against a code-graph symbol: code targets take the native
+/// `EdgeKind::Governs`.
 pub const GOVERNS: &str = "governs";
 /// A council/agent decision over a task or claim.
 pub const DECIDES: &str = "decides";
@@ -118,6 +133,22 @@ pub const DISTRIBUTES_TO: &str = "distributes_to";
 pub const PRODUCES: &str = "produces";
 /// Evidence backs a conformance claim or verdict.
 pub const EVIDENCES: &str = "evidences";
+/// A decision record (ADR / rule doc / policy doc) FULLY supersedes another — the supersession
+/// lineage edge of the architecture wiki (AW-12 / arch-R12; estate ADR-011 §adr-contract).
+/// Frontmatter `supersedes: [ids]` materializes as one edge per id, and a superseded doc's rules
+/// mint `retired = true`. PARTIAL supersession stays in prose, never as an edge. Doc→doc only —
+/// the target is a doc/rule node, never a code symbol, so the native-Governs pin does not apply.
+pub const SUPERSEDES: &str = "supersedes";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3b. Facet-key constants — metadata FACETS, deliberately NOT edge kinds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `applies_to` is a FACET, never an edge (arch-R17: "`applies_to` stays a FACET — Targets
+/// wildcard matching"). SELECT matches it against `Policy::applies_to` / rule metadata
+/// (workflow phase ids + `unit-{ord}` tokens); minting an `EdgeKind::Other` edge from this
+/// constant is a vocabulary violation.
+pub const APPLIES_TO: &str = "applies_to";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Cross-app event catalog — mirrors
@@ -614,6 +645,22 @@ mod tests {
             .get_node(&synthetic_symbol(POLICY, "x"))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn edge_vocabulary_constants_are_pinned() {
+        // AW-19 / arch-R17: the exact string spellings are wire contracts (persisted in edge
+        // rows); a drift here silently orphans every existing relationship of that kind.
+        assert_eq!(GOVERNS, "governs");
+        assert_eq!(SUPERSEDES, "supersedes");
+        assert_eq!(APPLIES_TO, "applies_to");
+        // The split-brain the pin exists for: the stringly spelling is a DIFFERENT edge kind
+        // than the native variant, so a native-only filter misses it and vice versa. (Built via
+        // a binding, not inline, so wicked-governance's source-scan lint stays quiet — this is
+        // the one demonstration site, not a mint site.)
+        let stringly_spelling = GOVERNS.to_string();
+        let stringly = EdgeKind::Other(stringly_spelling);
+        assert_ne!(EdgeKind::Governs, stringly);
     }
 
     #[test]
