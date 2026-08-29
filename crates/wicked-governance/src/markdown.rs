@@ -50,8 +50,11 @@
 //! convention makes the prefix the one spelling of the type; INV-C1 requires they agree anyway),
 //! severity is one of `info|warn|error|critical`. Anything else inside the Rules section that is
 //! not a blank line or an indented continuation is an error. `provenance.ref` is
-//! `<root-relative path>#<RULE-ID>` (forward slashes on every platform); `provenance.source_kinds`
-//! is `["doc"]`; `provenance.source` is stamped `"markdown"` by the ingest, never by the doc.
+//! `<root-relative path>@<git blob sha>#<RULE-ID>` (forward slashes on every platform; the sha is
+//! the doc's content digest per [`crate::provenance::git_blob_sha1`] — equal to
+//! `git hash-object <file>` — which is what lets `rules drift` detect a doc that changed since
+//! ingest, AW-10 / arch-R7); `provenance.source_kinds` is `["doc"]`; `provenance.source` is
+//! stamped `"markdown"` by the ingest, never by the doc.
 //!
 //! The frontmatter grammar is a deliberately STRICT YAML subset — top-level `key: value` entries
 //! from the known key set, quoted or bare scalars, `[a, b]` flow lists or `- item` block lists,
@@ -148,15 +151,22 @@ impl SourceAdapter for MarkdownAdapter {
         self.collect_md(&self.root, &mut files)?;
         let mut docs = Vec::new();
         for path in files {
-            let text = std::fs::read_to_string(&path)
+            // Read BYTES first: the provenance digest is the git BLOB sha of the raw on-disk
+            // content (`git hash-object` — AW-10), so it must be computed before any BOM/CRLF
+            // normalization touches the text.
+            let bytes = std::fs::read(&path)
                 .map_err(|e| anyhow::anyhow!("markdown adapter: cannot read {path:?}: {e}"))?;
+            let sha = crate::provenance::git_blob_sha1(&bytes);
+            let text = String::from_utf8(bytes).map_err(|e| {
+                anyhow::anyhow!("markdown adapter: {path:?} is not valid UTF-8: {e}")
+            })?;
             // BOM + CRLF tolerated (cross-platform mandate); the grammar itself stays strict.
             let text = text.trim_start_matches('\u{feff}');
             if !opens_with_fence(text) {
                 continue; // no frontmatter fence → not a rule doc (like a stray .txt); AW-10 drift reports these.
             }
             let display = self.rel_ref(&path);
-            let doc = parse_doc(text, &display)
+            let doc = parse_doc(text, &display, &sha)
                 .map_err(|e| anyhow::anyhow!("markdown adapter: {display}: {e}"))?;
             docs.push(doc);
         }
@@ -187,15 +197,16 @@ struct FrontMatter {
 }
 
 /// Parse one claimed doc into the raw bundle `Value` shape `normalize_bundle` consumes:
-/// `{ "doc": {…frontmatter…, "path": <ref path>}, "rules": [ … ] }`. Fails loud with a
-/// line-numbered reason on any malformation.
-fn parse_doc(text: &str, ref_path: &str) -> anyhow::Result<serde_json::Value> {
+/// `{ "doc": {…frontmatter…, "path": <ref path>, "sha": <blob sha>}, "rules": [ … ] }`. Fails
+/// loud with a line-numbered reason on any malformation.
+fn parse_doc(text: &str, ref_path: &str, sha: &str) -> anyhow::Result<serde_json::Value> {
     let lines: Vec<&str> = text.lines().map(|l| l.trim_end_matches('\r')).collect();
     let (fm, body_start) = parse_frontmatter(&lines)?;
-    let rules = parse_rules_section(&lines, body_start, &fm, ref_path)?;
+    let rules = parse_rules_section(&lines, body_start, &fm, ref_path, sha)?;
 
     let mut doc_meta = serde_json::Map::new();
     doc_meta.insert("path".into(), ref_path.into());
+    doc_meta.insert("sha".into(), sha.into());
     doc_meta.insert("id".into(), fm.id.clone().expect("validated").into());
     doc_meta.insert("title".into(), fm.title.clone().expect("validated").into());
     if let Some(v) = &fm.status {
@@ -457,6 +468,7 @@ fn parse_rules_section(
     body_start: usize,
     fm: &FrontMatter,
     ref_path: &str,
+    sha: &str,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
     let is_rules_heading = |l: &str| l.trim_end() == "## Rules";
     let mut heading_ix: Option<usize> = None;
@@ -512,7 +524,11 @@ fn parse_rules_section(
                 "statement": statement,
                 "severity": severity,
                 "confidence": confidence,
-                "provenance": { "ref": format!("{ref_path}#{id}"), "source_kinds": ["doc"] },
+                // `<path>@<blob sha>#<id>` — the AW-10 digest-bearing ref (crate::provenance).
+                "provenance": {
+                    "ref": crate::provenance::format_provenance_ref(ref_path, sha, &id),
+                    "source_kinds": ["doc"],
+                },
             });
             if !targets.is_empty() {
                 rule["targets"] = serde_json::Value::Object(targets.clone());
@@ -620,10 +636,11 @@ mod tests {
             pat.provenance.source, "markdown",
             "ingest stamps the adapter"
         );
+        let expected_sha = crate::provenance::git_blob_sha1(WELL_FORMED.as_bytes());
         assert_eq!(
             pat.provenance.reference.as_deref(),
-            Some("agent-behavior.md#PAT-001"),
-            "ref = root-relative path + rule anchor"
+            Some(format!("agent-behavior.md@{expected_sha}#PAT-001").as_str()),
+            "ref = root-relative path + content digest (git blob sha, AW-10) + rule anchor"
         );
         assert_eq!(pat.provenance.source_kinds, vec!["doc".to_string()]);
         assert!(!pat.retired);
@@ -779,10 +796,17 @@ mod tests {
         let dir = dir_with(&[("nested/deeper/win.md", crlf)]);
         let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
         assert_eq!(rules.len(), 1);
+        let expected_sha = crate::provenance::git_blob_sha1(crlf.as_bytes());
         assert_eq!(
             rules[0].provenance.reference.as_deref(),
-            Some("nested/deeper/win.md#PAT-002"),
-            "ref uses forward slashes regardless of platform"
+            Some(format!("nested/deeper/win.md@{expected_sha}#PAT-002").as_str()),
+            "ref uses forward slashes regardless of platform, digest over the RAW bytes"
         );
+        let parsed = crate::provenance::parse_provenance_ref(
+            rules[0].provenance.reference.as_deref().unwrap(),
+        );
+        assert_eq!(parsed.path, "nested/deeper/win.md");
+        assert_eq!(parsed.sha.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(parsed.anchor.as_deref(), Some("PAT-002"));
     }
 }
