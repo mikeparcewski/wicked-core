@@ -10,6 +10,22 @@ use wicked_governance::{
     RuleQuery,
 };
 
+/// Redirect the emit outbox spool to a per-process temp file: `register_rule`'s fire-and-forget
+/// `wicked.estate.rule.ingested` emission (AW-22) is a side effect here, not the object under
+/// test, and must not append junk to the real `~/.something-wicked` operator replay queue.
+/// Set once, never unset (an unset window would leak a parallel test's emission).
+fn hermetic_spool() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let path = std::env::temp_dir().join(format!(
+            "wg-mdingest-test-outbox-{}.ndjson",
+            std::process::id()
+        ));
+        // SAFETY: process-global env write, serialized by `Once`, never removed.
+        unsafe { std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &path) };
+    });
+}
+
 fn fixture(dir: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -18,6 +34,7 @@ fn fixture(dir: &str) -> PathBuf {
 
 #[test]
 fn fixture_corpus_ingests_to_rule_nodes_end_to_end() {
+    hermetic_spool();
     let adapter = MarkdownAdapter::new(fixture("markdown"));
     let rules = ingest_from(&adapter).expect("well-formed corpus ingests");
     // agent-behavior.md (2) + nested/event-grammar.md (1); doc-only.md mints zero rules and the

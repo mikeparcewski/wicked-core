@@ -235,17 +235,27 @@ impl FromNode for ConformanceRule {
 /// metadata; the `rule → symbol` Governs edge is emitted later by PR-C's recall→gate step, once
 /// `symbol_ref` resolves to a REAL indexed symbol — an edge to a synthetic placeholder here would
 /// dangle and be pruned by `compact` (review finding), so PR-B persists the node only.
+///
+/// After the commit, a COARSE fire-and-forget [`crate::events::EV_RULE_INGESTED`] event goes out
+/// through the shared emit seam (AW-22 / arch-R24) — a bus failure must NOT fail registration;
+/// the durable record is the rule node just committed.
 pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyhow::Result<()> {
     rule.validate()?;
     store.begin_batch()?;
     store.upsert_nodes(&[rule.to_node()])?;
     store.commit_batch()?;
+    let _ = crate::events::emit_rule_ingested(rule);
     Ok(())
 }
 
 /// Withdraw `id` from recall. Returns `false` if no such rule exists.
 ///
 /// Retire, not delete — see [`crate::engine::retire_policy`] for why the node has to survive.
+///
+/// On an ACTUAL state change (active → retired), a COARSE fire-and-forget
+/// [`crate::events::EV_RULE_RETIRED`] event goes out after the commit (AW-22 / arch-R24) — the
+/// wave-5 propagation trigger. Retiring an already-retired rule reports success but emits
+/// nothing: no state change, no event.
 pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool> {
     // O(1) by synthetic symbol rather than a scan-and-filter over every rule node — see
     // [`crate::engine::retire_policy`].
@@ -273,6 +283,7 @@ pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool>
     store.begin_batch()?;
     store.upsert_nodes(std::slice::from_ref(&rule.to_node()))?;
     store.commit_batch()?;
+    let _ = crate::events::emit_rule_retired(&rule);
     Ok(true)
 }
 
@@ -470,6 +481,7 @@ mod tests {
 
     #[test]
     fn register_persists_and_recall_filters_by_facet_and_severity() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         let py = rule(
             "PAT-100",
@@ -546,6 +558,7 @@ mod tests {
 
     #[test]
     fn recall_filters_by_layer_and_framework_wildcards() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         let svc = rule(
             "PAT-401",
@@ -626,6 +639,7 @@ mod tests {
 
     #[test]
     fn recall_skips_foreign_rule_nodes() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         register_rule(
             &mut store,
@@ -660,6 +674,7 @@ mod tests {
 
     #[test]
     fn a_retired_rule_is_no_longer_recalled() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         register_rule(
             &mut store,
@@ -688,6 +703,7 @@ mod tests {
 
     #[test]
     fn retiring_a_rule_reports_absence_and_keeps_the_node() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         assert!(
             !retire_rule(&mut store, "PAT-999").unwrap(),
@@ -719,6 +735,7 @@ mod tests {
     /// test on `retire_policy` (review on #149).
     #[test]
     fn retiring_a_misfiled_rule_errors_instead_of_retiring_a_different_one() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
 
         let victim = rule(

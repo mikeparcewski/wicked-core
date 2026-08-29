@@ -637,6 +637,7 @@ mod tests {
 
     #[test]
     fn well_formed_doc_registers_as_rule_nodes() {
+        crate::events::hermetic_test_spool();
         use wicked_apps_core::{GraphRead, NodeKind, SqliteStore};
         let dir = dir_with(&[("nodes.md", WELL_FORMED)]);
         let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();

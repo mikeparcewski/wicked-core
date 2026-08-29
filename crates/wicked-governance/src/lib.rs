@@ -27,6 +27,7 @@ mod conformance;
 mod domain;
 mod domain_model;
 mod engine;
+pub mod events;
 mod fanout;
 mod ingest;
 mod markdown;
@@ -55,6 +56,15 @@ pub use domain_model::{
 pub use ingest::{
     ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,
     NoopFramework, SourceAdapter, StubAdapter,
+};
+
+// Wiki-lifecycle events on the bus (AW-22 / arch-R24): `wicked.estate.rule.ingested/retired`
+// fire from register_rule/retire_rule; `wicked.estate.doc.drifted` is the exported seam the
+// AW-10 drift tooling calls. See `events` module docs for the AW-21/AW-24 trigger contract.
+pub use events::{
+    doc_drifted_event, emit_doc_drifted, emit_rule_ingested, emit_rule_retired,
+    rule_ingested_event, rule_retired_event, DocDrift, EV_DOC_DRIFTED, EV_RULE_INGESTED,
+    EV_RULE_RETIRED, WIKI_LIFECYCLE_EVENTS,
 };
 
 // MarkdownAdapter — frontmattered docs as a rule source on the same SourceAdapter seam
@@ -244,14 +254,11 @@ mod tests {
     /// Governs edge links policy → claim.
     #[test]
     fn conform_persists_claim_node_and_governs_edge() {
-        // Keep emit hermetic: redirect the dead-letter spool to a temp file so conform's
-        // fire-and-forget emit (which falls back to the spool when ESTATE_DB_ENV is unset) does
-        // not write under HOME during the test.
-        let spool =
-            std::env::temp_dir().join(format!("wg-conform-emit-{}.ndjson", std::process::id()));
-        unsafe {
-            std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
-        }
+        // Keep emit hermetic: conform's fire-and-forget emit (which falls back to the spool when
+        // ESTATE_DB_ENV is unset) must not write under HOME during the test. The process-wide
+        // guard is never unset, so it cannot race a parallel test's emission (the old per-test
+        // set/remove pattern leaked through the unset windows).
+        crate::events::hermetic_test_spool();
 
         let mut store = SqliteStore::in_memory().expect("open in-memory store");
         let policy = deny_policy();
@@ -291,11 +298,6 @@ mod tests {
             1,
             "exactly one policy→claim Governs edge must exist"
         );
-
-        unsafe {
-            std::env::remove_var(wicked_apps_core::emit::DEADLETTER_ENV);
-        }
-        let _ = std::fs::remove_file(&spool);
     }
 
     /// NEGATIVE: a clean context that trips no deny and no obligation ⇒ Allow.
@@ -345,11 +347,7 @@ mod tests {
     /// claim_ids and can both be stored without one overwriting the other.
     #[test]
     fn decide_and_decide_as_produce_different_claim_ids_for_same_context() {
-        let spool =
-            std::env::temp_dir().join(format!("wg-decide-as-emit-{}.ndjson", std::process::id()));
-        unsafe {
-            std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
-        }
+        crate::events::hermetic_test_spool();
 
         let selected = vec![deny_policy()];
         let context = serde_json::json!({ "phase": "build", "plan": "build the docs site" });
@@ -390,24 +388,13 @@ mod tests {
 
         assert_eq!(recovered_default.evaluator_identity, EVALUATOR_IDENTITY);
         assert_eq!(recovered_custom.evaluator_identity, "wicked-evaluator:agy");
-
-        unsafe {
-            std::env::remove_var(wicked_apps_core::emit::DEADLETTER_ENV);
-        }
-        let _ = std::fs::remove_file(&spool);
     }
 
     /// Adversarial: creator (decide → Allow) and evaluator (decide_as → Deny) on the same context
     /// both persist, with different claim_ids and their respective decisions intact.
     #[test]
     fn evaluator_deny_persists_alongside_creator_allow() {
-        let spool = std::env::temp_dir().join(format!(
-            "wg-evaluator-deny-emit-{}.ndjson",
-            std::process::id()
-        ));
-        unsafe {
-            std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &spool);
-        }
+        crate::events::hermetic_test_spool();
 
         // Creator sees a clean context (deny_policy trigger does not fire) → Allow.
         let creator_selected = vec![deny_policy()];
@@ -485,11 +472,6 @@ mod tests {
             recovered_evaluator.evaluator_identity,
             "wicked-evaluator:security"
         );
-
-        unsafe {
-            std::env::remove_var(wicked_apps_core::emit::DEADLETTER_ENV);
-        }
-        let _ = std::fs::remove_file(&spool);
     }
 
     // ── retire (FINDING-038) ────────────────────────────────────────────────
