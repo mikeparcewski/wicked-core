@@ -33,7 +33,7 @@ const OUTGOV_EXTRACTOR: &str = "outgov-v1";
 const CONFORMANCE_RESOLVED_BY: &str = "wicked-governance-conformance";
 /// The shared `provenance.source_kinds` wire enum — identical in the conformance-rules AND
 /// domain-model schemas ($defs/provenance). Enforced at the fail-closed write boundary (INV-C4).
-const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
+pub(crate) const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
 
 /// A conformance rule's kind. The id prefix MUST agree (INV-C1): `PAT-*` ⇔ pattern, `POL-*` ⇔ policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

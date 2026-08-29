@@ -4,9 +4,9 @@
 //! literal proves only serde symmetry; a real JSON-Schema validator catches every enum / const /
 //! pattern (`^RULE-[0-9]{3,6}$`) / `minItems` / type drift automatically, forever.
 //!
-//! The schema is VENDORED (`tests/domain-model.schema.json`, a byte copy of `wicked-brain/schemas/`)
-//! so the test is self-contained + CI-safe. If the canonical schema moves, this copy must be
-//! refreshed — a drift-guard belongs with the workflow-retarget follow-on.
+//! The schema is the LIVE OWNER copy at `crates/wicked-governance/schemas/domain-model.schema.json`
+//! (re-homed from the retired wicked-brain repo, AW-2 / arch-R10) — no second in-repo copy exists.
+//! `tests/schema_vendor_pin.rs` proves lift fidelity against the frozen archive.
 
 use wicked_apps_core::{
     synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
@@ -16,7 +16,7 @@ use wicked_estate_core::Annotation;
 use wicked_estate_core::ValidationClaim;
 use wicked_governance::{build_domain_model, CoverageReport};
 
-const SCHEMA: &str = include_str!("domain-model.schema.json");
+const SCHEMA: &str = include_str!("../crates/wicked-governance/schemas/domain-model.schema.json");
 
 fn node(name: &str, file: &str) -> Node {
     Node::new(
