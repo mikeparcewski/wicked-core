@@ -8785,7 +8785,11 @@ mod worker_code_graph_tests {
         assert_eq!(repo_code_graph_db(&store, Some("unindexed")), None);
         // And it did not bring the directory into existence on the way to saying no. A resolver that
         // creates as it reads is how the empty database appeared in the first place.
-        assert!(!root.join(".codegraph").exists());
+        assert!(!root
+            .join(crate::code_graph::code_graph_rel())
+            .parent()
+            .unwrap()
+            .exists());
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8794,7 +8798,7 @@ mod worker_code_graph_tests {
     fn an_indexed_repo_gets_the_graph_the_indexer_wrote() {
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = scratch("indexed");
-        let graph = root.join(".codegraph").join("estate.db");
+        let graph = root.join(crate::code_graph::code_graph_rel());
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         std::fs::write(&graph, b"not really sqlite, but it is a file").unwrap();
         register(&mut store, "indexed", &root);
@@ -8808,6 +8812,48 @@ mod worker_code_graph_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The OTHER home (estate-home ADR, code_graph.rs): a repo with NO in-tree graph whose graph
+    /// the indexer wrote into the estate home resolves to exactly that file — and nothing was ever
+    /// minted in the working tree. Runs under the env override (write lock) so the estate home is
+    /// a scratch dir, never the developer's real one.
+    #[test]
+    fn an_estate_home_graph_resolves_for_a_repo_with_no_in_tree_graph() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os(crate::code_graph::REPO_GRAPH_ROOT_ENV);
+        let estate_root = scratch("estate-home-root");
+        std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, &estate_root);
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let root = scratch("estate-home-repo");
+        let graph = crate::code_graph::estate_home_graph_db_at(&estate_root, &root);
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        std::fs::write(&graph, b"indexed into the estate home").unwrap();
+        register(&mut store, "estate-home", &root);
+
+        assert_eq!(
+            repo_code_graph_db(&store, Some("estate-home")).as_deref(),
+            Some(graph.to_string_lossy().as_ref()),
+            "the worker must get the estate-home graph the indexer wrote"
+        );
+        assert!(
+            !root
+                .join(crate::code_graph::code_graph_rel())
+                .parent()
+                .unwrap()
+                .exists(),
+            "resolution must not mint anything in the working tree"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, v),
+            None => std::env::remove_var(crate::code_graph::REPO_GRAPH_ROOT_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&estate_root);
+    }
+
     /// A directory at the graph's path is not a graph. `is_file` rather than `exists` because
     /// `.codegraph/estate.db/` is precisely what a half-finished index or a bad `--db` argument
     /// leaves behind, and handing that to a store opener fails deep inside sqlite rather than here.
@@ -8815,7 +8861,7 @@ mod worker_code_graph_tests {
     fn a_directory_where_the_graph_should_be_is_not_a_graph() {
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = scratch("dir-not-file");
-        std::fs::create_dir_all(root.join(".codegraph").join("estate.db")).unwrap();
+        std::fs::create_dir_all(root.join(crate::code_graph::code_graph_rel())).unwrap();
         register(&mut store, "dir-not-file", &root);
 
         assert_eq!(repo_code_graph_db(&store, Some("dir-not-file")), None);
@@ -9369,7 +9415,7 @@ mod project_graph_binding_tests {
         let dir = scratch("fallthrough");
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = root.join(".codegraph").join("estate.db");
+        let repo_graph = root.join(crate::code_graph::code_graph_rel());
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         std::fs::write(&repo_graph, b"a file is all this arm checks for").unwrap();
         register(&mut store, "wicked-core", &root);
@@ -9401,7 +9447,7 @@ mod project_graph_binding_tests {
         let dir = scratch("precedence");
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = root.join(".codegraph").join("estate.db");
+        let repo_graph = root.join(crate::code_graph::code_graph_rel());
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         graph_with(&repo_graph, &["wicked-core"]);
         register(&mut store, "wicked-core", &root);
@@ -9437,7 +9483,7 @@ mod project_graph_binding_tests {
         let dir = scratch("fallback");
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = root.join(".codegraph").join("estate.db");
+        let repo_graph = root.join(crate::code_graph::code_graph_rel());
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         std::fs::write(&repo_graph, b"the run repo's own graph").unwrap();
         register(&mut store, "wicked-core", &root);
@@ -9922,10 +9968,9 @@ mod coverage_store_tests {
     fn the_repo_local_graph_is_what_resolves() {
         let dir = std::env::temp_dir().join(format!("cov_repo_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".codegraph")).unwrap();
-        std::fs::write(dir.join(".codegraph").join("estate.db"), b"x").unwrap();
-
-        let want = dir.join(".codegraph").join("estate.db");
+        let want = dir.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(want.parent().unwrap()).unwrap();
+        std::fs::write(&want, b"x").unwrap();
         let got = crate::code_graph::existing_code_graph(&dir)
             .expect("a repo root with .codegraph/estate.db must resolve one");
 

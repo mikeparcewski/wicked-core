@@ -1286,8 +1286,9 @@ fn remove_entry_no_follow(p: &std::path::Path) -> anyhow::Result<()> {
 /// <path>` plus the gate-hook's env vars; the env vars arrived, the flag did not (the bridge does
 /// not parse it), so the hook had everything it needed except the instruction to run. Governed units
 /// take the wrapped path now — see the fail-closed return in `run_unit_streaming` and FINDING-060.
-/// `code_graph_db` is the run's repo-local estate graph (`<repo>/.codegraph/estate.db`), or `None`
-/// for an ungoverned / repo-less session. When present, the worker's `session/new` advertises the
+/// `code_graph_db` is the run's repo-local estate graph (engine-resolved: legacy
+/// `<repo>/.codegraph/estate.db`, or the estate home's `<estate_root>/<key>/estate.db` — see
+/// `code_graph.rs`), or `None` for an ungoverned / repo-less session. When present, the worker's `session/new` advertises the
 /// estate MCP server scoped to that store (FINDING-122) — the ACP-array twin of the wrapped path's
 /// `settings.json` injection. `None` ⇒ no estate server (never the daemon store; see FINDING-067).
 fn start_acp_process(
@@ -3815,8 +3816,15 @@ impl AcpStepRunner {
                 // cannot read it from any env.
                 let boundary = crate::gate_hook::BoundaryCtx {
                     roots: crate::path_policy::AllowedRoots {
+                        // WRITE mirrors the wrapped carrier's `armed_write_roots`: cwd, the
+                        // launch-validated extras, and — for an ESTATE-HOME graph only — that
+                        // graph's own key dir (WAL/journal; `graph_write_dir` is engine-resolved
+                        // and per-key precise, `None` for legacy in-tree graphs).
                         write: std::iter::once(unit_cwd.clone())
                             .chain(g.extra_write_roots.iter().map(std::path::PathBuf::from))
+                            .chain(crate::execute_wrapped::graph_write_dir(
+                                g.code_graph_db.as_deref(),
+                            ))
                             .collect(),
                         read: crate::execute_wrapped::assemble_read_roots(
                             g.code_graph_db.as_deref(),
@@ -5213,7 +5221,11 @@ sleep 30
         );
 
         // WITH a repo graph → the estate server, scoped to that exact db.
-        let graph_db = "/tmp/wicked-122-repo/.codegraph/estate.db";
+        let graph_db = std::path::Path::new("/tmp/wicked-122-repo")
+            .join(crate::code_graph::code_graph_rel())
+            .to_string_lossy()
+            .into_owned();
+        let graph_db = graph_db.as_str();
         let proc = start_acp_process(&stub_config(&script, None), &dir, Some(graph_db), None)
             .expect("start");
         let seen = std::fs::read_to_string(&ledger).unwrap();

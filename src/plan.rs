@@ -797,7 +797,11 @@ mod tests {
             root_path: root.to_string(),
             default_branch: "main".to_string(),
             registered_at: 0,
-            code_graph_db: format!("{root}/.codegraph/estate.db"),
+            // Through the engine's ONE resolver, never a hand-join — a second spelling here is
+            // exactly the FINDING-069 drift this fixture exists to test against.
+            code_graph_db: crate::code_graph::resolved_code_graph_db(std::path::Path::new(root))
+                .to_string_lossy()
+                .into_owned(),
         }
     }
 
@@ -811,8 +815,10 @@ mod tests {
         let def = crate::workflow::onboarding_def();
         let mut a = plan_from_def(&def, "onboard a", "sa");
         let mut b = plan_from_def(&def, "onboard b", "sb");
-        bind_repo_paths(&mut a, &repo_at("alpha", "/repos/alpha"));
-        bind_repo_paths(&mut b, &repo_at("beta", "/repos/beta"));
+        let alpha = repo_at("alpha", "/repos/alpha");
+        let beta = repo_at("beta", "/repos/beta");
+        bind_repo_paths(&mut a, &alpha);
+        bind_repo_paths(&mut b, &beta);
 
         let index_a = a[0].tool_cmd.as_ref().expect("index is a tool phase");
         let index_b = b[0].tool_cmd.as_ref().expect("index is a tool phase");
@@ -827,8 +833,11 @@ mod tests {
             "run `sb` carries run `sa`'s repo: {index_b:?}"
         );
 
-        // Both phases target the graph the ENGINE resolved, never a re-derived spelling (FINDING-069).
-        for units in [&a, &b] {
+        // Both phases target the graph the ENGINE resolved — the exact `code_graph_db` the
+        // record publishes, never a re-derived spelling (FINDING-069). Asserted against the
+        // fixture's resolver-produced value rather than a shape suffix, so this cannot drift
+        // into a second spelling of either home.
+        for (units, repo) in [(&a, &alpha), (&b, &beta)] {
             for u in units.iter() {
                 let cmd = u
                     .tool_cmd
@@ -836,7 +845,7 @@ mod tests {
                     .expect("onboarding phases are tool phases");
                 let db =
                     cmd[cmd.iter().position(|s| s == "--db").expect("carries --db") + 1].clone();
-                assert!(db.ends_with("/.codegraph/estate.db"), "{db}");
+                assert_eq!(db, repo.code_graph_db, "{db}");
             }
         }
     }

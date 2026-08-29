@@ -2797,9 +2797,12 @@ mod boundary_tests {
              presence check and still allows the governance pin to be rewritten"
         );
         assert!(
-            launcher.contains("armed_write_roots(&cwd, &g.extra_write_roots)"),
-            "the ONLY widening must be the launch-validated extra_write_roots riding the \
-             governance context — not env, not the unit, not the workflow def"
+            launcher
+                .contains("armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref())"),
+            "the ONLY widenings must be the launch-validated extra_write_roots riding the \
+             governance context and the ENGINE-resolved estate-home graph key dir \
+             (`graph_write_dir`, never worker-controlled) — not env, not the unit, not the \
+             workflow def"
         );
         // The launch side must actually judge those extras — remove the validation and the
         // widening becomes an unvetted door straight past FINDING-098.
