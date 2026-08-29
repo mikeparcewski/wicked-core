@@ -481,6 +481,7 @@ mod tests {
 
     #[test]
     fn register_persists_and_recall_filters_by_facet_and_severity() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         let py = rule(
             "PAT-100",
@@ -557,6 +558,7 @@ mod tests {
 
     #[test]
     fn recall_filters_by_layer_and_framework_wildcards() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         let svc = rule(
             "PAT-401",
@@ -637,6 +639,7 @@ mod tests {
 
     #[test]
     fn recall_skips_foreign_rule_nodes() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         register_rule(
             &mut store,
@@ -671,6 +674,7 @@ mod tests {
 
     #[test]
     fn a_retired_rule_is_no_longer_recalled() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         register_rule(
             &mut store,
@@ -699,6 +703,7 @@ mod tests {
 
     #[test]
     fn retiring_a_rule_reports_absence_and_keeps_the_node() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
         assert!(
             !retire_rule(&mut store, "PAT-999").unwrap(),
@@ -730,6 +735,7 @@ mod tests {
     /// test on `retire_policy` (review on #149).
     #[test]
     fn retiring_a_misfiled_rule_errors_instead_of_retiring_a_different_one() {
+        crate::events::hermetic_test_spool();
         let mut store = open_store(Some(":memory:")).unwrap();
 
         let victim = rule(
