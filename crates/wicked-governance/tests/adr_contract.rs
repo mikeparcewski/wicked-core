@@ -109,9 +109,14 @@ fn contract_adrs_parse_and_doc_only_ingest_is_valid() {
     assert_eq!(rules.len(), 3, "doc-only ADR contributes zero rules");
     let pol = rules.iter().find(|r| r.id == "POL-1101").unwrap();
     assert!(!pol.retired, "active ADR rules are live");
-    assert_eq!(
-        pol.provenance.reference.as_deref(),
-        Some("ADR-011-architecture-wiki.md#POL-1101")
+    // Provenance anchors the doc path and the rule-id fragment. Asserted as prefix +
+    // fragment (not exact equality) so the AW-10 digest-bearing ref grammar
+    // (`<path>@<blob sha>#<id>`, landing from the aw9/aw10 lane) merges without breaking
+    // this contract test — the contract pins WHERE a rule came from, not the ref's grammar.
+    let pol_ref = pol.provenance.reference.as_deref().unwrap();
+    assert!(
+        pol_ref.starts_with("ADR-011-architecture-wiki.md") && pol_ref.ends_with("#POL-1101"),
+        "{pol_ref}"
     );
     let hist = rules.iter().find(|r| r.id == "PAT-9904").unwrap();
     assert!(
