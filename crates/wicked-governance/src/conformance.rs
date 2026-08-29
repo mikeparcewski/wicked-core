@@ -110,8 +110,9 @@ pub struct RuleProvenance {
     pub source_kinds: Vec<String>,
 }
 
-/// A prescriptive conformance rule. Field set mirrors the retired `conformance-rules` schema
-/// (RET-BRAIN-DOMAIN-001), the wire contract garden + wicked-testing still consume.
+/// A prescriptive conformance rule. Field set mirrors the `conformance-rules` schema this crate
+/// now OWNS (`schemas/conformance-rules.schema.json`, re-homed from the retired wicked-brain repo,
+/// RET-BRAIN-DOMAIN-001 / AW-2) — the wire contract downstream consumers still speak.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConformanceRule {
     pub id: String,

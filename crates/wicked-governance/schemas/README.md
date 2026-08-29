@@ -19,7 +19,8 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
 
 - **Bundle version** (`VERSION` file): bumps when ANY file in the bundle changes
   (additive optional field = patch; new required field = minor; invariant change
-  = major). Currently `1.1.0` (the 1.0.0→1.1.0 bump was a coverage-schema change).
+  = major). Currently `1.1.0` (the 1.0.0→1.1.0 bump added `conformance-rules.schema.json`
+  to the bundle — archive commit 75735b9).
 - **Per-schema contract version** (the `$id` version segment and each schema's
   `metadata.schema_version` const): the version a *document* carries and a
   consumer validates against. Independent of the bundle semver — the schemas say
