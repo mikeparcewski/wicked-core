@@ -15,6 +15,27 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Fan-out contract across the deliberate store split** (AW-5 / arch-R3, decision record
+  `.product/DES-OUTGOV-008-fanout-placement.md`). `wicked-core rules fanout <dir>` fans ONE ruleset
+  (the `rules ingest` layout) out to the three lanes a governed run reads — (a) the enforcement
+  store the gate hook selects/recalls from, (b) every discovery graph the workers' estate MCP binds
+  (native `NodeKind::Rule` copies; deny-path policies do NOT replicate here), (c) one knowledge
+  rationale chunk per rule (id-keyed `rule-rationale/<ID>` upsert, `source` = the rule's
+  `provenance.ref`, the PAT-/POL- id embedded in the chunk text) — and smoke-verifies every cli
+  lane against a FRESH handle on the same `--db` a worker is handed, through the consumers' own
+  read paths (`recall_rules`, policy round-trip, knowledge recall). The receipt is a manifest
+  (v1.0) keyed on the stable PAT-/POL- ids mapping each rule to its three copies; any missing copy
+  fails the WHOLE fan-out loud. A daemon-held store is NEVER CLI-written (single-writer invariant):
+  `--enforcement-crew-api <url>` records the pending transport and emits the
+  `POST /api/v1/governance/{policies,rules}` payload instead, and any lane path under
+  `~/.wicked-crew` is refused before a single lane is written. Crate surface:
+  `wicked_governance::{fanout, load_ruleset, FanoutManifest, FanoutScope, FanoutTargets, …}`.
+- **`scope: workspace` in the fan-out manifest** (AW-6 / arch-R20 decision). Cross-repo doctrine
+  placement decided: replicate-to-every-repo — a workspace-scoped fan-out carries one discovery
+  copy per live repo graph (caller-enumerated; zero discovery targets refuse loudly), with id-keyed
+  idempotent re-ingest keeping the N copies syncable. Zero engine change. Option (b), a
+  workspace-root store with multi-`--db` resolution, is documented and parked as P-2 in
+  DES-OUTGOV-008 — unparking requires an estate-owner ruling on resolution + gate precedence.
 - **MarkdownAdapter on the `SourceAdapter` ingest seam** (AW-3 / arch-R1). One parse convention —
   YAML frontmatter (`id`, `title`, plus optional `status`/`enforcement_class`/`applies_to`/`scope`/
   `supersedes`/`domain`/`confidence`/`targets`) and a `## Rules` section of
