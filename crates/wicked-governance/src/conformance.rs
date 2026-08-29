@@ -33,7 +33,7 @@ const OUTGOV_EXTRACTOR: &str = "outgov-v1";
 const CONFORMANCE_RESOLVED_BY: &str = "wicked-governance-conformance";
 /// The shared `provenance.source_kinds` wire enum — identical in the conformance-rules AND
 /// domain-model schemas ($defs/provenance). Enforced at the fail-closed write boundary (INV-C4).
-const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
+pub(crate) const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
 
 /// A conformance rule's kind. The id prefix MUST agree (INV-C1): `PAT-*` ⇔ pattern, `POL-*` ⇔ policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,8 +110,9 @@ pub struct RuleProvenance {
     pub source_kinds: Vec<String>,
 }
 
-/// A prescriptive conformance rule. Field set mirrors the retired `conformance-rules` schema
-/// (RET-BRAIN-DOMAIN-001), the wire contract garden + wicked-testing still consume.
+/// A prescriptive conformance rule. Field set mirrors the `conformance-rules` schema this crate
+/// now OWNS (`schemas/conformance-rules.schema.json`, re-homed from the retired wicked-brain repo,
+/// RET-BRAIN-DOMAIN-001 / AW-2) — the wire contract downstream consumers still speak.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConformanceRule {
     pub id: String,

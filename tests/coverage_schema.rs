@@ -4,8 +4,9 @@
 //! required-field / range drift automatically, so the emitted `coverage-report.json` can never diverge
 //! from the contract the grep validator + garden consume.
 //!
-//! The schema is VENDORED (`tests/coverage.schema.json`, a byte copy of `wicked-brain/schemas/`) and
-//! kept in sync by `tests/schema_vendor_pin.rs`.
+//! The schema is the LIVE OWNER copy at `crates/wicked-governance/schemas/coverage.schema.json`
+//! (re-homed from the retired wicked-brain repo, AW-2 / arch-R10) — no second in-repo copy exists.
+//! `tests/schema_vendor_pin.rs` proves lift fidelity against the frozen archive.
 
 use wicked_apps_core::{
     synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span, SqliteStore,
@@ -15,7 +16,7 @@ use wicked_estate_core::Annotation;
 use wicked_estate_core::ValidationClaim;
 use wicked_governance::recompute_front_half_coverage;
 
-const SCHEMA: &str = include_str!("coverage.schema.json");
+const SCHEMA: &str = include_str!("../crates/wicked-governance/schemas/coverage.schema.json");
 
 fn node(store: &mut SqliteStore, name: &str, kind: NodeKind, file: &str) -> Node {
     let n = Node::new(

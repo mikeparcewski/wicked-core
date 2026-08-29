@@ -28,6 +28,7 @@ mod domain;
 mod domain_model;
 mod engine;
 mod ingest;
+mod schemas;
 
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
@@ -52,6 +53,12 @@ pub use domain_model::{
 pub use ingest::{
     ingest_from, normalize_bundle, ComplianceFramework, FilesystemAdapter, FrameworkRegistry,
     NoopFramework, SourceAdapter, StubAdapter,
+};
+
+// The governance schema bundle — owner copies embedded from `schemas/` (AW-2 / arch-R10).
+pub use schemas::{
+    schema_bundle_version, CONFORMANCE_RULES_SCHEMA, COVERAGE_SCHEMA, DOMAIN_MODEL_SCHEMA,
+    SCHEMA_BUNDLE, VOCABULARY_SCHEMA,
 };
 
 // Re-export the claim wire type so callers program against one path.
