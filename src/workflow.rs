@@ -112,8 +112,10 @@ pub struct GovernanceContext {
     /// [`Self::db_path`] or pointing at a database nothing has written (FINDING-069).
     ///
     /// TWO STORES CAN APPEAR HERE, and `actor::run_code_graph_db` chooses between them:
-    /// - the REPO-LOCAL graph (`<repo_root>/.codegraph/estate.db`, spelled once at
-    ///   `code_graph::CODE_GRAPH_DB_REL`) — the default, and the only one before crew#326;
+    /// - the REPO-LOCAL graph — the default, and the only one before crew#326. Engine-resolved by
+    ///   `code_graph::resolved_code_graph_db` (the ONE resolver): the legacy in-tree
+    ///   `<repo_root>/.codegraph/estate.db` when the repo already has one, else the estate home's
+    ///   `<estate_root>/<key>/estate.db` (see the ADR in `code_graph.rs`);
     /// - the run's PROJECT graph — one co-located database holding every member repo — when the
     ///   launcher bound one and the engine could vouch for it (`actor::project_code_graph_db`).
     ///

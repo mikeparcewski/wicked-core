@@ -53,6 +53,11 @@ pub struct RepoEntry {
     /// [`RepoEntry::from_node`] recomputes it from `root_path` and discards whatever was persisted, so
     /// a record written before this field existed reads back correct, and a repo that moves does not
     /// carry a stale path forward. Do not write to it expecting it to stick.
+    ///
+    /// TWO SHAPES can appear here, decided by the resolver in `code_graph.rs` (see its ADR): a repo
+    /// that already has an in-tree `<root>/.codegraph/estate.db` keeps publishing that (continuity —
+    /// an indexed repo never migrates silently); a repo without one publishes its estate-home path
+    /// (`<estate_root>/<key>/estate.db`), so fresh registrations stop polluting working trees.
     #[serde(default)]
     pub code_graph_db: String,
 }
@@ -92,10 +97,11 @@ impl FromNode for RepoEntry {
     }
 }
 
-/// This repo's code-graph path, absolute, derived from its root. The only spelling any consumer needs.
+/// This repo's code-graph path, absolute, derived from its root through the engine's ONE resolver
+/// (`code_graph::resolved_code_graph_db`: legacy in-tree when the repo already has one, else the
+/// estate home). The only spelling any consumer needs.
 fn code_graph_db(root_path: &str) -> String {
-    Path::new(root_path)
-        .join(crate::code_graph::code_graph_rel())
+    crate::code_graph::resolved_code_graph_db(Path::new(root_path))
         .to_string_lossy()
         .into_owned()
 }
@@ -230,8 +236,9 @@ pub fn get_repo(store: &dyn GraphRead, repo_id: &str) -> anyhow::Result<Option<R
 /// meaningless: that store holds run/governance nodes but none of a repo's domain/requirement nodes,
 /// so it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo
 /// (FINDING-009). This resolves `repo_ref` from the registry on `daemon`, opens its `code_graph_db`
-/// (`<root>/.codegraph/estate.db` — the one spelling every consumer shares) READ-ONLY, and recomputes
-/// over THAT. An unknown `repo_ref` is an error, never a silent vacuous report.
+/// (the engine-resolved path every consumer shares — in-tree for a legacy-indexed repo, the estate
+/// home otherwise; see `code_graph.rs`) READ-ONLY, and recomputes over THAT. An unknown `repo_ref`
+/// is an error, never a silent vacuous report.
 pub fn coverage_report_for_repo(
     daemon: &dyn GraphRead,
     repo_ref: &str,
@@ -243,7 +250,7 @@ pub fn coverage_report_for_repo(
 }
 
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
-/// graph store (`<repo>/.codegraph/estate.db`), never the daemon store (same discipline as
+/// graph store (its engine-resolved `code_graph_db`), never the daemon store (same discipline as
 /// [`coverage_report_for_repo`]; FINDING-009/067/122). This is the read half of #122's web surface:
 /// the studio shows what the estate graph holds for a repo instead of the operator wondering whether
 /// it was ever populated. An unknown `repo_ref` is an ERROR, never a silent empty summary.
@@ -876,6 +883,12 @@ mod tests {
 
     #[test]
     fn repo_entry_round_trips_through_node() {
+        // Read side of the estate-home env lock: `code_graph_db` resolves through
+        // `WICKED_ESTATE_REPO_GRAPH_ROOT`, and this test resolves TWICE (build + from_node) —
+        // an env-mutating test flipping the root between the two would make this flake.
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let e = RepoEntry {
             id: "demo".into(),
             name: "Demo".into(),
@@ -895,6 +908,10 @@ mod tests {
     /// every record persisted by a future version that gets the derivation wrong — reads correct.
     #[test]
     fn a_record_predating_the_field_still_resolves_its_code_graph() {
+        // Read side of the estate-home env lock — double resolution, same as the round-trip test.
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let mut node = RepoEntry {
             id: "legacy".into(),
             name: "Legacy".into(),
@@ -918,26 +935,63 @@ mod tests {
         }
     }
 
-    /// The literal, pinned. Every out-of-process consumer joins this onto a repo root — crew did it in
-    /// five places, and when the engine's spelling and crew's disagreed the worker got a database
-    /// nothing had written (FINDING-069). Changing it is a coordinated release, not a rename.
+    /// The record publishes the RESOLVER's answer, in both homes: a repo with an in-tree graph
+    /// publishes exactly that file (continuity — an indexed repo never migrates silently, AC2);
+    /// one without publishes its estate-home path (AC1), and its working tree stays clean. The
+    /// consumer-literal pins (including the Windows segment-join trap) live with the resolver, in
+    /// `code_graph::tests::the_spellings_are_the_ones_consumers_expect`.
     #[test]
-    fn the_code_graph_spelling_is_the_one_consumers_expect() {
-        assert_eq!(crate::code_graph::CODE_GRAPH_DB_REL, ".codegraph/estate.db");
-        // Joined SEGMENT BY SEGMENT, so the separator is the platform's and a consumer's
-        // `join(root, '.codegraph', 'estate.db')` produces a byte-identical string.
-        //
-        // This assertion is a no-op on Unix and load-bearing on Windows: `Path::join` given the whole
-        // `.codegraph/estate.db` appends it as one component and leaves the `/` alone, which on Unix
-        // is indistinguishable from doing it right. The first cut of this fix did exactly that and
-        // only Windows CI could see it. Do not "simplify" the two `join`s back into one.
+    fn the_record_publishes_the_resolver_answer_for_both_homes() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        // In-tree graph on disk → published verbatim.
+        let root = std::env::temp_dir().join(format!(
+            "wc-spell-legacy-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let legacy = root.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"indexed").unwrap();
         assert_eq!(
-            code_graph_db("/repo"),
-            Path::new("/repo")
-                .join(".codegraph")
-                .join("estate.db")
-                .to_string_lossy()
+            code_graph_db(root.to_str().unwrap()),
+            legacy.to_string_lossy(),
+            "an already-indexed repo keeps publishing its in-tree graph"
         );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // No in-tree graph → the estate home (when one resolves; a host with no home at all is
+        // the documented in-tree fallback).
+        let bare = std::env::temp_dir().join(format!(
+            "wc-spell-bare-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let got = code_graph_db(bare.to_str().unwrap());
+        match crate::code_graph::repo_graph_root() {
+            Some(estate_root) => assert_eq!(
+                got,
+                crate::code_graph::estate_home_graph_db_at(&estate_root, &bare).to_string_lossy(),
+                "a fresh repo publishes its estate-home path"
+            ),
+            None => assert_eq!(
+                got,
+                bare.join(crate::code_graph::code_graph_rel())
+                    .to_string_lossy()
+            ),
+        }
+        assert!(
+            !bare
+                .join(crate::code_graph::code_graph_rel())
+                .parent()
+                .unwrap()
+                .exists(),
+            "deriving the record path must not pollute the working tree"
+        );
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     // ── worktree isolation (FINDING-059) ──────────────────────────────────────
@@ -981,9 +1035,16 @@ mod tests {
     #[test]
     fn coverage_report_for_repo_reads_the_repo_store_not_the_daemon() {
         let root = git_repo("cov009");
+        // Pin the repo to a LEGACY in-tree graph (touch the file first, so the resolver
+        // short-circuits): hermetic — nothing lands in a real estate home — and env-immune, so a
+        // concurrently-running `WICKED_ESTATE_REPO_GRAPH_ROOT` test cannot move the path between
+        // this resolution and the ones inside register_repo/coverage_report_for_repo.
+        let legacy = root.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"").unwrap();
         // The repo's OWN code graph: 3 arbitrary nodes (total counts all kinds, so plain nodes work).
         let cg_path = code_graph_db(root.to_str().unwrap());
-        std::fs::create_dir_all(Path::new(&cg_path).parent().unwrap()).unwrap();
+        assert_eq!(cg_path, legacy.to_string_lossy(), "precondition: in-tree");
         {
             let mut repo_store = wicked_apps_core::open_store(Some(&cg_path)).unwrap();
             for i in 0..3 {
@@ -1032,8 +1093,12 @@ mod tests {
     #[test]
     fn graph_kinds_for_repo_summarises_the_repo_store_not_the_daemon() {
         let root = git_repo("kinds122");
+        // Legacy in-tree pin, for the same hermeticity/env-immunity reasons as the coverage test.
+        let legacy = root.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"").unwrap();
         let cg_path = code_graph_db(root.to_str().unwrap());
-        std::fs::create_dir_all(Path::new(&cg_path).parent().unwrap()).unwrap();
+        assert_eq!(cg_path, legacy.to_string_lossy(), "precondition: in-tree");
         {
             let mut repo_store = wicked_apps_core::open_store(Some(&cg_path)).unwrap();
             // Two functions + one struct, so the kind histogram is distinguishable from any count.
@@ -1088,6 +1153,11 @@ mod tests {
     /// Windows via `\?\` and rewrites `/var`→`/private/var` on macOS — see the fn's doc comment).
     #[test]
     fn register_repo_stores_an_absolute_normalised_root() {
+        // Read side of the estate-home env lock: a fresh repo's code_graph_db resolves through
+        // `WICKED_ESTATE_REPO_GRAPH_ROOT`, and this test resolves more than once.
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let root = git_repo("core214");
         let messy = root.join("."); // `<root>/.` — absolute but not normalised
         let expected = std::path::absolute(&root)
@@ -1121,10 +1191,15 @@ mod tests {
             "root_path is stored absolute + normalised, not as-given"
         );
         assert!(
-            Path::new(&entry.code_graph_db).is_absolute()
-                && entry.code_graph_db.starts_with(&expected),
-            "code_graph_db is absolute and under the normalised root: {}",
+            Path::new(&entry.code_graph_db).is_absolute(),
+            "code_graph_db is absolute: {}",
             entry.code_graph_db
+        );
+        assert_eq!(
+            entry.code_graph_db,
+            crate::code_graph::resolved_code_graph_db(Path::new(&expected)).to_string_lossy(),
+            "code_graph_db is the resolver's answer for the NORMALISED root (a fresh repo's \
+             graph lives in the estate home, not the working tree)"
         );
 
         // The persisted node round-trips to the SAME paths (FromNode re-derives code_graph_db from
@@ -1134,6 +1209,96 @@ mod tests {
         assert_eq!(fetched.code_graph_db, entry.code_graph_db);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AC2 at the registration seam: a repo that ALREADY has an in-tree graph registers with that
+    /// exact path — read and write both keep it (the resolver is legacy-first; FINDING-069's
+    /// never-orphan lesson). Zero behavior change for every repo indexed before the estate home.
+    #[test]
+    fn registration_keeps_an_existing_in_tree_graph_for_read_and_write() {
+        let root = git_repo("legacy-keep");
+        let legacy = root.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, b"indexed before the estate home existed").unwrap();
+
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Legacy Keep".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let expected = std::path::absolute(&root)
+            .unwrap()
+            .join(crate::code_graph::code_graph_rel());
+        assert_eq!(
+            entry.code_graph_db,
+            expected.to_string_lossy(),
+            "the record keeps publishing the in-tree graph"
+        );
+        assert_eq!(
+            crate::code_graph::code_graph_path_for_write(&root).unwrap(),
+            legacy,
+            "the WRITE path (re-index) also keeps the in-tree graph — never a silent fork"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// AC1 at the registration seam: a repo with NO in-tree graph publishes its estate-home path
+    /// on the record, and registration leaves the working tree clean. Runs under the env override
+    /// (write lock) so nothing resolves against — or writes into — a real home.
+    #[test]
+    fn registration_with_no_in_tree_graph_publishes_the_estate_home() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os(crate::code_graph::REPO_GRAPH_ROOT_ENV);
+        let estate_root = std::env::temp_dir().join(format!(
+            "wc-reg-estate-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, &estate_root);
+
+        let root = git_repo("estate-reg");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Estate Reg".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            entry.code_graph_db,
+            crate::code_graph::estate_home_graph_db_at(&estate_root, &root).to_string_lossy(),
+            "the record publishes the estate-home path"
+        );
+        assert!(
+            !root
+                .join(crate::code_graph::code_graph_rel())
+                .parent()
+                .unwrap()
+                .exists(),
+            "registration must not pollute the working tree"
+        );
+        // And the persisted node round-trips to the same answer (FromNode re-derives).
+        let fetched = get_repo(&store, &entry.id).unwrap().unwrap();
+        assert_eq!(fetched.code_graph_db, entry.code_graph_db);
+
+        match prev {
+            Some(v) => std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, v),
+            None => std::env::remove_var(crate::code_graph::REPO_GRAPH_ROOT_ENV),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&estate_root);
     }
 
     /// The heart of FINDING-059. `rev-parse` succeeds anywhere beneath the parent repo, including in

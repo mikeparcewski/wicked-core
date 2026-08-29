@@ -1916,7 +1916,13 @@ mod tests {
             workdir: None,
             governance: Some(crate::workflow::GovernanceContext {
                 db_path: "/abs/estate.db".into(),
-                code_graph_db: Some("/abs/repo/.codegraph/estate.db".into()),
+                // Through the resolver's spelling helper, not a hand-join (FINDING-069 discipline).
+                code_graph_db: Some(
+                    std::path::Path::new("/abs/repo")
+                        .join(crate::code_graph::code_graph_rel())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 extra_write_roots: Vec::new(),
             }),
             prior_outputs: vec![],
@@ -1948,7 +1954,9 @@ mod tests {
         // worker no estate tools at all — governance still on, recon silently gone.
         assert_eq!(
             gov.code_graph_db.as_deref(),
-            Some("/abs/repo/.codegraph/estate.db"),
+            std::path::Path::new("/abs/repo")
+                .join(crate::code_graph::code_graph_rel())
+                .to_str(),
             "the repo-local code graph survives the bus"
         );
         let _ = std::fs::remove_dir_all(&dir);

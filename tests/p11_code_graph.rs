@@ -4,9 +4,19 @@
 
 use std::sync::Mutex;
 
-/// Both tests recon the SAME `src` to the same `.wicked/code-graph.db`, so they must not index it
-/// concurrently.
+/// Both tests recon the SAME `src` into the same estate-home graph, so they must not index it
+/// concurrently. The guard also serializes the env setup below.
 static INDEX_GUARD: Mutex<()> = Mutex::new(());
+
+/// Point the estate home at a per-process scratch (estate-home ADR, `code_graph.rs`): recon on a
+/// repo with no in-tree graph writes into `$WICKED_ESTATE_REPO_GRAPH_ROOT` — without the override,
+/// that is the developer's REAL `~/.wicked-estate/repo-graphs`. Call only under INDEX_GUARD.
+fn point_estate_home_at_scratch() {
+    std::env::set_var(
+        "WICKED_ESTATE_REPO_GRAPH_ROOT",
+        std::env::temp_dir().join(format!("wicked-core-p11-estate-{}", std::process::id())),
+    );
+}
 
 fn indexer() -> Option<String> {
     for cand in [
@@ -30,6 +40,7 @@ fn recon_indexes_and_ranks_a_real_codebase() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
+    point_estate_home_at_scratch();
 
     // Index this crate's OWN src as a small real Rust codebase.
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -67,10 +78,13 @@ fn browse_and_node_detail_on_a_real_graph() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
+    point_estate_home_at_scratch();
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let _ = wicked_core::recon_repo(&src, 5).expect("recon indexes the graph");
-    let graph = src.join(".wicked/code-graph.db");
-    let graph = graph.to_str().unwrap();
+    // The graph THE RESOLVER placed — never a re-derived spelling (this line used to pin the
+    // pre-FINDING-069 `.wicked/code-graph.db`, a path nothing has written for months).
+    let graph = wicked_core::index_repo(&src).expect("index resolves the graph path");
+    let graph = graph.as_str();
 
     // The graph has node kinds (functions, etc.).
     let kinds = wicked_core::graph_kinds(graph).expect("kinds");

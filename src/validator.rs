@@ -489,7 +489,8 @@ fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<Strin
         sbpl_quote(&rcwd)
     ));
     // `extra_write`: a directory OUTSIDE the run dir the validator legitimately writes into. Coverage
-    // is the case — its store is `<repo>/.codegraph/estate.db` (repo root, per FINDING-069), and opening
+    // is the case — its store is the repo's engine-resolved graph (in-tree `.codegraph/` for a
+    // legacy-indexed repo, the estate-home key dir otherwise; FINDING-069 / code_graph.rs), and opening
     // that WAL-mode SQLite db needs to create `-wal`/`-shm`/journal files IN ITS DIRECTORY. Without this
     // the deny-writes floor blocks the open ("unable to open database file") and the coverage gate can
     // never pass on the governed daemon path despite a fully-covered store (P8 #9 / core#217).
@@ -2299,9 +2300,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P8 #9 / core#217: a coverage validator's store lives OUTSIDE the run dir
-    /// (`<repo>/.codegraph/estate.db`), and opening that WAL-mode SQLite db needs write access to the
-    /// store's DIRECTORY (for `-wal`/`-shm`/journal). The macOS profile must grant it when an
+    /// P8 #9 / core#217: a coverage validator's store lives OUTSIDE the run dir (the repo's
+    /// engine-resolved graph — in-tree or estate-home; the grant is the db's PARENT either way, so
+    /// it is per-key precise for estate-home stores), and opening that WAL-mode SQLite db needs
+    /// write access to the store's DIRECTORY (for `-wal`/`-shm`/journal). The macOS profile must grant it when an
     /// `extra_write` dir is supplied — else the deny-writes floor blocks the open ("unable to open
     /// database file") and the coverage gate can never pass on the governed daemon path.
     #[test]

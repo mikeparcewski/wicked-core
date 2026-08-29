@@ -72,7 +72,7 @@ pub use campaign::{
     CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
 };
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
-pub use code_graph::{rank_symbols, recon_repo, RankedSymbol};
+pub use code_graph::{index_repo, rank_symbols, recon_repo, RankedSymbol};
 pub use command::InjectTarget;
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
