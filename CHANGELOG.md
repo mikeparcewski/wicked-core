@@ -1,8 +1,64 @@
 # Changelog
 
-All notable changes to `wicked-core`. Versions follow [SemVer](https://semver.org/).
+All notable changes to `wicked-core`. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
+versions follow [SemVer](https://semver.org/).
+
+Two release tracks share this file, newest entry first regardless of track:
+
+- **engine** — the root Rust crate (git tags `vX.Y.Z`; not on crates.io — see ISS-010 below).
+  Headings: `[X.Y.Z]`.
+- **core-ts** — the npm binding [`wicked-core-ts`](https://www.npmjs.com/package/wicked-core-ts)
+  (git tags `core-ts-vX.Y.Z`), which bundles the engine at its release commit. Headings:
+  `[core-ts X.Y.Z]`. An npm release therefore ships engine changes even when the engine
+  version number does not move.
+
+## [Unreleased]
+
+### Added
+- **MarkdownAdapter on the `SourceAdapter` ingest seam** (AW-3 / arch-R1). One parse convention —
+  YAML frontmatter (`id`, `title`, plus optional `status`/`enforcement_class`/`applies_to`/`scope`/
+  `supersedes`/`domain`/`confidence`/`targets`) and a `## Rules` section of
+  `- <PAT|POL-nnn> (<severity>): <statement>` items. All output materializes through the existing
+  `normalize_bundle` fail-closed invariants (no second parse path); a malformed doc fails LOUD
+  per-file with path + reason, never a silent skip; a doc without a Rules section is a valid
+  doc-only ingest. `wicked-core rules ingest --dir <path>` now ingests frontmattered `*.md` docs
+  anywhere under the directory alongside the existing `policies/*.json` + `rules/*.json` lanes,
+  with cross-lane duplicate-id refusal.
+- **Schema-document nodes** — `wicked_governance::register_schema_nodes` registers the 4 governance
+  schemas on the graph (one node per schema file, keyed by `$id`, carrying contract + bundle
+  version); `rules ingest` refreshes them on every successful run (the schemas/README.md AW-3 seam).
+- **wicked-governance owns the 4 governance schemas** (AW-2 / arch-R10, #309). Re-homed byte-for-byte
+  from the retired wicked-brain repo at bundle VERSION 1.1.0 (`crates/wicked-governance/schemas/`),
+  embedded via `include_str!` with lift-fidelity + INV-C4 vocabulary guards; garden vendors from
+  this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
+
+### Fixed
+- `required_deliverables` enforced at the result fold, not in one runner (#297 → #308).
+- Failure-excerpt triage keeps the TAIL of the output, where the error usually is (crew#322 → #307).
+- Seat failover keyed to phase idempotency, not input governance (#292 → #304).
+- Resume re-provisions a reaped worktree before re-dispatching into it (#290 → #303).
+
+## [core-ts 0.7.1] — 2026-08-25
+
+### Added
+- **Project-scoped graph vouching** — a run in a project sees the project's graph when the engine
+  can vouch for it (#299, review follow-ups #300).
+- ACP bridge-death instrumentation for the crew#290 session-death hunt (#289).
+- Engine-injected phase-scope preamble + pre-build code-change warnings on the plan path (#287).
+
+### Fixed
+- ACP inbound frames dispatched by **method**, not id alone — a permission request no longer ends
+  the turn (#295).
+- Seat failover walks the full roster; evaluator prompts bounded (#286).
+- napi cross-compile: aarch64-linux built with the GNU toolchain (zig 0.13 rejected the erratum
+  flag) (#301, #302).
 
 ## [core-ts 0.7.0] — 2026-08-19
+
+### Added
+- **Live unit output streaming + phase substance gate** (#279).
+- Per-seat `login_invocation` for PTY-hosted sign-in (#278); persistent worker config home
+  (crew#267, #277); seat failover, failed-run resume, worker reaping, death instrumentation (#275).
 
 ### Fixed
 - **The evidence gate sees committed work** (core#280 → #281). `EVIDENCE_SCRIPT` now also counts
@@ -10,10 +66,151 @@ All notable changes to `wicked-core`. Versions follow [SemVer](https://semver.or
   receives harness-derived worktree evidence (porcelain + run-branch `git log --stat`, capped);
   the phase-substance gate widened identically. The built-in floor pin moved to `e2e7af1db9e48454`
   (const, shipped defs, and any operator overlay must agree).
+- ACP bridge auth refusal named instead of a silent death (crew#267 root cause, #276); agent-memory
+  carve-out follows the resolved Claude config home (#273).
 
-## Unreleased
+## [core-ts 0.6.3] — 2026-08-14
 
-## 0.2.0 — 2026-07-21
+### Fixed
+- Strip the pi RPC banner at capture and at the exit-0 arm (restores the FINDING-101 audit
+  windows); surface stderr on seat death (#269, #271).
+
+## [core-ts 0.6.2] — 2026-08-14
+
+### Added
+- Run archival — write off terminal runs without deleting evidence (crew#265 core half, #266).
+- Filesystem boundary armed on the ACP path (#263).
+
+### Fixed
+- System-temp scratch writes advisory + worker TMPDIR kept in-boundary (#265).
+
+## [core-ts 0.6.1] — 2026-08-14
+
+### Added
+- Launcher-declared `extraWriteRoots` launch option (core#259, #261).
+- ACP elicitation maps, Rust half (core#234 reland, #258).
+
+### Fixed
+- `write_lock` held around every ACP `proc.stdin` write (FINDING-254, #257); ACP tool name resolved
+  from `toolCall.name` before `toolCall.title` (core#100, #247).
+- Coverage gate requires at least one genuinely resolved requirement (#251); bus-path fail-closed +
+  evaluator≠creator wire contract (P9, #250); warn when evaluator≠creator separation cannot be
+  enforced (#248); `feature/test` workflows armed with `evidence_floor()` (#256).
+- Estate deps bumped 0.14.3 → 0.14.5 (#252).
+
+## [core-ts 0.6.0] — 2026-08-12
+
+### Added
+- **Project model** — projects + memberships + durable interaction requests (DES-PROJECT-001, #246).
+
+### Changed
+- Depend on wicked-estate via crates.io versions, not path (#245); napi release pinned to the
+  estate release tag (#244).
+
+## [core-ts 0.5.0] — 2026-08-10
+
+### Added
+- **A run consumes the repo's estate graph** — ACP parity + repo-scoped graph surface (core#122,
+  #240); `ToolInvoked` observability event (FINDING-046, #239); cache-token breakdown on
+  `cliUsage` (FINDING-012, #223); domain graph persisted into estate.db with a read boundary for
+  governed extraction (#213, #237).
+
+### Fixed
+- Coverage gate recomputes from the store — never trusts the creator's `coverage-report.json`
+  (#230); repo coverage computed over the repo's own graph (FINDING-009, #225); content-free
+  requirement accounting denied (#210).
+- Filesystem boundary extended to Bash write targets, with `/dev/null`/fd-dup and glued-separator
+  fixes (FINDING-045, #226–#228); advisory boundary READ deny unblocks unattended governed runs
+  (core#219, #220); a governed worker's write into its own `~/.claude` tree is advisory, not fatal
+  (#236).
+- One canonical `humanConfirm` parser that fails closed (FINDING-019, #224); single-seat roster
+  short-circuits the council (FINDING-010, #222); transient single-shot worker failures retried
+  (#216); `register_repo` root canonicalized (core#214, #221).
+- Reverted the first ACP elicitation landing (#212 → #233); re-landed later in 0.6.1.
+
+## [0.4.0] / [core-ts 0.4.1] — 2026-08-05
+
+Joint release (#198; the engine bump carries no separate git tag — `core-ts-v0.4.1` is the release
+commit).
+
+### Added
+- **An installer that verifies what it installed** — deploy step probes the deployed binary
+  (FINDING-081, #195, #198).
+- Requirement-string concentration reported in coverage (FINDING-131, #180).
+
+### Fixed
+- **Version-lock between the engine and the gate-hook CLI** (core#167, #181): the gate refuses a
+  protocol-mismatched hook, keyed on the binary's identity, not its path (FINDING-083, #194).
+- Coverage validator measures the REPO's graph, not the actor's (FINDING-091, #196); a coverage
+  report over zero behavior-bearing nodes is not a pass (FINDING-009, #190); coverage gets its own
+  store carrier (core#166, #182).
+- A denial names what it MEASURED (FINDING-092, #197); skipped workflows and governance DENYs say
+  WHY (#191); claims stamped from the wall clock (FINDING-017, #192); evaluator contradicting its
+  own verdict fails closed (FINDING-085, #188).
+- Installed workflow defs with an unknown pin refused at dispatch (#187); tool-call paths outside
+  the unit's boundary refused (FINDING-045, #189); each run's own repo bound into its Tool phases
+  (FINDING-075, #179); runs left `executing` with no worker announced (core#124, #183); validator
+  seat rotation past a seat that cannot run (core#132, #185); estate `ValidationClaim` adopted,
+  pin moved off a stale tag (FINDING-078, #184).
+
+## [core-ts 0.4.0] — 2026-08-04
+
+The E2E-campaign hardening wave (FINDING-0xx series from the 15-repo corpus).
+
+### Added
+- Policy/conformance-rule **retirement** (FINDING-038, #149).
+- Deterministic **evidence floor** on the built-in Evaluator phases, extended to the shipped
+  drop-ins (#154, #177); replacement workflows may not silently remove a validator pin (#155);
+  shipped drop-in's validator seeded on the plan path (FINDING-066, #164).
+- One hardening chokepoint for every process spawn (#168); cross-artifact constants pinned in
+  lockstep tests (#171).
+
+### Fixed
+- **Operational store kept out of every worker's reach** (FINDING-067, #165) — the deliberate
+  enforcement/discovery store split later formalized as the fan-out contract.
+- Worker CLI config isolated from the operator's (FINDING-047/045, #153).
+- Council: quorum counted, a panicked council no longer takes the run with it (FINDING-026, #151);
+  a vote is the option it names (FINDING-056, #158); three timing budgets measured for real
+  (FINDING-040, #150); dispatch budget real, correct, affordable (#147).
+- Validator: "could not run the check" no longer reported as "the check said no" (#156); the
+  judge-prompt reason kept (FINDING-064, #163); a governed unit that cannot be armed says so
+  (FINDING-063, #162); governed units refuse ungovernable ACP paths (FINDING-060/061, #161).
+- Abandoned chat sessions reclaimed — idle TTL, pool cap (FINDING-027, #152); cached input tokens
+  counted on the wrapped path (FINDING-058, #159); worktree existence verified, not inferred
+  (FINDING-059, #160); dead `repo-graph` workflow deleted (FINDING-070, #175); onboarding's
+  unpassable `domain` phase dropped (FINDING-068, #174); one spelling for a repo's code graph
+  (FINDING-069, #172).
+
+## [core-ts 0.3.0] — 2026-07-30
+
+### Added
+- **Chat sessions** — warm ACP seat pool + parallel group fan-out (core#13, crew#165, #134).
+
+## [0.3.1] / [core-ts 0.2.1] — 2026-07-28
+
+### Fixed
+- Launch preflight is synchronous at `LaunchRun`, covering Tool-executor phases (#120 → #121,
+  #123); onboarding `domain` phase runs domain-graph, `--help` guarded (#125).
+- Plugin-skill invocation form + Unknown-command no-op tripwire (#126 → #127); banner-tolerant
+  validator verdict parse via keyword-alone contract lines (#128 → #129).
+
+## [0.3.0] / [core-ts 0.2.0] — 2026-07-27
+
+### Added
+- **Full-roster ACP** — native copilot stdio + native opencode ACP, registry fixes, governed
+  fall-through for non-claude CLIs, adapter provenance docs, Windows `.cmd` launcher shims
+  (#109–#111).
+- **Live council deliberation** — events, seat lenses, 75% approval bar, runoff ballots (#108);
+  votes parallelized + distribution-thread panics guarded (#107).
+- Agent-judged failure triage (#115); environment-refusal escalation ladder — auto-grant, else
+  bubble to operator (#114); external-transform assumption capture (#116); PTY stall detection +
+  `collab` built-in workflow (#117).
+
+### Fixed
+- Usage parsed from the ACP prompt result — Burn panel no longer empty for ecosystem adapters
+  (#113); operator messages delivered to ACP-backed runs (#112).
+
+## [0.2.0] — 2026-07-21
 
 ### Added
 
