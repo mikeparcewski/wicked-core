@@ -352,6 +352,7 @@ mod tests {
                 cwd: sandbox.clone(),
                 home: None, // no `~` paths in this test; the carve-out is out of scope here
                 claude_config_dir: None,
+                pre_build_scope: false, // a build-phase unit: the FILESYSTEM boundary is what is on trial here
             })
         };
 
@@ -396,6 +397,145 @@ mod tests {
             "a write inside a launcher-declared root must be permitted: {result}"
         );
         assert_eq!(result["outcome"]["optionId"], "allow");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#296 — THE ISSUE, REPRODUCED AND CLOSED. On run `d1bc72c2` the `design` unit (a
+    /// `stage=recon`, `pre_build_scope=true` phase) wrote `src/board/attentionReason.ts` and
+    /// `tests/attentionReason.test.ts` INTO ITS OWN WORKTREE, before the creator phase ever ran.
+    /// The governance hook saw both calls (`seq104`/`seq105`) and answered `decision=allow,
+    /// denyingPolicy=None` — correctly, for the only question it asked: the worktree is inside the
+    /// unit's write roots, so the FILESYSTEM boundary had nothing to object to. The phase's declared
+    /// scope existed only as prompt text that called itself "(enforced)".
+    ///
+    /// So this test pins the axis that was missing, with the filesystem boundary deliberately
+    /// SATISFIED on every arm — every path below is inside the sandbox the unit may write:
+    ///
+    /// 1. pre-build phase + `Write` to `src/…​.ts` → DENIED, with a claim naming the rule;
+    /// 2. same phase, same directory, `Write` to a `.md` deliverable → ALLOWED (the phase must be
+    ///    able to produce the thing it exists to produce);
+    /// 3. the SAME production-code write with `pre_build_scope=false` (a build phase) → ALLOWED —
+    ///    the gate is scoped by phase role, not a blanket ban on writing code.
+    ///
+    /// Against the pre-fix engine arm 1 returns `allow`, which is exactly the reported bug.
+    #[test]
+    fn a_pre_build_phase_write_to_production_code_is_denied_inside_its_own_worktree() {
+        let dir = std::env::temp_dir().join(format!("wicked-acpscope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sandbox = dir.join("sandbox");
+        std::fs::create_dir_all(sandbox.join("src")).unwrap();
+        std::fs::create_dir_all(sandbox.join("docs")).unwrap();
+        // A REAL (empty) store: after the boundary and the phase scope pass, evaluation proceeds to
+        // policy selection, and an unresolvable store is an infra-deny — fail-closed and correct,
+        // but it would make the ALLOW arms pass for the wrong reason.
+        let db = dir.join("gov.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+
+        let request = |path: &std::path::Path| {
+            json!({
+                "sessionId": "s1",
+                "toolName": "Write",
+                "toolCall": {"toolCallId": "t1", "rawInput": {
+                    "file_path": path.to_str().unwrap(), "content": "export const x = 1;"}},
+                "options": [
+                    {"optionId": "allow", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"},
+                ],
+            })
+        };
+        // The boundary is SATISFIED on every arm: the sandbox IS the unit's write root, which is
+        // the whole point — this is the case the filesystem boundary correctly allows.
+        let boundary = |pre_build_scope: bool| {
+            Some(crate::gate_hook::BoundaryCtx {
+                roots: crate::path_policy::AllowedRoots {
+                    write: vec![sandbox.clone()],
+                    read: vec![],
+                },
+                cwd: sandbox.clone(),
+                home: None,
+                claude_config_dir: None,
+                pre_build_scope,
+            })
+        };
+        // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.
+        let denied_log = dir.join("decisions-denied.jsonl");
+        let g = AcpGate {
+            scope: "unit",
+            phase: "unit-2",
+            phase_alias: Some("design"),
+            db: db.to_str(),
+            decisions_path: denied_log.to_str().unwrap(),
+            boundary: boundary(true),
+        };
+        let src_file = sandbox.join("src").join("attentionReason.ts");
+        let (result, allowed) = permission_result(&g, &request(&src_file));
+        assert!(
+            !allowed,
+            "a PRE-BUILD phase writing production code must be refused — this is run d1bc72c2's \
+             `Write src/board/attentionReason.ts`, which the hook allowed: {result}"
+        );
+        assert_eq!(result["outcome"]["optionId"], "reject");
+        let log = std::fs::read_to_string(&denied_log).expect("decisions log");
+        // LEGIBILITY is the requirement, not just the refusal: the operator must be able to tell
+        // WHY. A deny with `denyingPolicy=None` is what made the original allow so hard to see.
+        assert!(
+            log.contains("phase-scope-deny"),
+            "the refusal must be recorded under its OWN claim id, not filed as a boundary or infra \
+             deny: {log}"
+        );
+        assert!(
+            log.contains("engine:pre-build-scope"),
+            "the claim must NAME the denying rule — an operator reading the record has to be able \
+             to cite it: {log}"
+        );
+        assert!(
+            log.contains("wicked-governance-phase-scope"),
+            "the evaluator identity must distinguish a phase-scope refusal from a filesystem \
+             containment block: {log}"
+        );
+        assert!(
+            log.contains("attentionReason.ts"),
+            "the claim must name the FILE that was refused: {log}"
+        );
+        assert!(
+            log.contains("docs/"),
+            "the refusal must say where the deliverable MAY go — a remedy that cannot be acted on \
+             is not a remedy: {log}"
+        );
+
+        // 2. The same phase's REAL deliverable, in the same worktree: allowed.
+        let ok_log = dir.join("decisions-doc.jsonl");
+        let g = AcpGate {
+            scope: "unit",
+            phase: "unit-2",
+            phase_alias: Some("design"),
+            db: db.to_str(),
+            decisions_path: ok_log.to_str().unwrap(),
+            boundary: boundary(true),
+        };
+        let (result, allowed) = permission_result(&g, &request(&sandbox.join("docs/design.md")));
+        assert!(
+            allowed,
+            "a pre-build phase MUST be able to write its own analysis/design deliverable: {result}"
+        );
+
+        // 3. The build phase writing the identical file: allowed. The gate is scoped by phase role;
+        //    scoping a creator away from creating would be the inverse — and worse — failure.
+        let build_log = dir.join("decisions-build.jsonl");
+        let g = AcpGate {
+            scope: "unit",
+            phase: "unit-3",
+            phase_alias: Some("build"),
+            db: db.to_str(),
+            decisions_path: build_log.to_str().unwrap(),
+            boundary: boundary(false),
+        };
+        let (result, allowed) = permission_result(&g, &request(&src_file));
+        assert!(
+            allowed,
+            "the BUILD phase must still be able to write production code: {result}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -767,6 +767,17 @@ impl WrappedCliStepRunner {
                     crate::gate_hook::WRITE_ROOTS_ENV,
                     armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref()),
                 );
+                // Arm the unit's PHASE SCOPE (core#296) — the SECOND boundary, orthogonal to the
+                // roots above. The write roots answer "where may this unit write" and the worktree
+                // is inside its own roots, so they had nothing to say about run d1bc72c2's recon
+                // phase writing `src/board/attentionReason.ts` into it. This carries the def-derived
+                // `pre_build_scope` marker to the hook subprocess, which refuses a Write/Edit to a
+                // non-documentation path. Set ONLY when the flag is on: an env var present-and-false
+                // is a shape the hook would have to guess at, and every non-pre-build phase MUST be
+                // free to write code.
+                if input.unit.pre_build_scope {
+                    cmd.env(crate::gate_hook::PRE_BUILD_SCOPE_ENV, "1");
+                }
                 // Point the worker's scratch INSIDE the boundary (core#264): `mktemp`, `> $TMPDIR/x`
                 // and every tool honoring the platform temp env land in `<cwd>/tmp` — in-boundary,
                 // reaped with the sandbox/worktree — instead of tripping (advisory) boundary denies

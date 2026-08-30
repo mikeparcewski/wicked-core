@@ -734,9 +734,11 @@ pub(crate) fn apply_and_finish_unit(
     // phase) — denies. Pure, no LLM.
     let workdir = crate::domain::get_session(store, session_id)?.and_then(|s| s.workdir);
 
-    // ── PHASE-SCOPE OBSERVABILITY (core#283, the warning half) ── A pre-build, non-creator phase
-    // whose worktree contribution touches NON-documentation files jumped the design-before-build
-    // ladder (the enforced half is the plan-time prompt preamble — see `plan::plan_from_def`).
+    // ── PHASE-SCOPE OBSERVABILITY (core#283, the completion-path backstop) ── A pre-build,
+    // non-creator phase whose worktree contribution touches NON-documentation files jumped the
+    // design-before-build ladder. Enforcement lives in `gate_hook::phase_scope_denial` (core#296),
+    // which refuses the path-bearing WRITE tools at call time; the plan-time preamble is only the
+    // PROMPT half and enforces nothing. This stays because the gate cannot see a `Bash` heredoc.
     // Record a WARNING onto the unit's persisted gate evidence, visible to operators, and DO NOT
     // deny: the check is a heuristic over file names, and a deny would turn it into a gate. The
     // unit (with the warning) is persisted by the `put_node` below, so the evidence rides the same

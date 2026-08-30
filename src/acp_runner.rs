@@ -3850,6 +3850,10 @@ impl AcpStepRunner {
                     .then(|| std::env::var_os(CLAUDE_CONFIG_DIR_ENV))
                     .flatten()
                     .and_then(|v| crate::gate_hook::valid_config_home(&v)),
+                    // The unit's PHASE SCOPE (core#296), straight off the unit — the wrapped
+                    // carrier reads the same fact from `PRE_BUILD_SCOPE_ENV`, which this carrier
+                    // has no access to (the daemon's env is the daemon's, core#260).
+                    pre_build_scope: input.unit.pre_build_scope,
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -4012,6 +4016,7 @@ impl AcpStepRunner {
                         cwd: boundary.cwd.clone(),
                         home: boundary.home.clone(),
                         claude_config_dir: boundary.claude_config_dir.clone(),
+                        pre_build_scope: boundary.pre_build_scope,
                     }),
                 }
             });
