@@ -41,6 +41,12 @@
 //!   wicked-core rules drift [--dir <docs>] [--json]  # report the residue re-ingest can't self-heal
 //!       # (AW-10): orphaned / uningested / unresolvable / unlinked / extraneous; read-only; exits 3
 //!       # when residue is found (0 clean, 1 operational error) — run with the same --dir as ingest
+//!   wicked-core rules recall [--language L] [--layer L] [--framework F] \
+//!       [--severity info|warn|error|critical] [--rule-type pattern|policy] [--json]
+//!       # the AW-17 recall-REPORT: the conformance rules that APPLY to the query facets,
+//!       # severity-ordered (critical→info), each citing rule id + provenance ref (the wiki URI a
+//!       # CI comment links to). Read-only, and strictly a report: exit 0 even when rules match
+//!       # (v1 never blocks — arch-R15); 1 = operational error only
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -166,7 +172,13 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          graph copies (one per live repo under --scope workspace) + knowledge rationale chunks, each \
          cli lane smoke-verified against the worker-visible db. A daemon-held store is NEVER \
          CLI-written: --enforcement-crew-api records the pending transport + emits the POST payload. \
-         WRITES to every cli lane store.",
+         WRITES to every cli lane store.\n\
+         wicked-core rules recall [--db <F>] [--language <L>] [--layer <L>] [--framework <F>] \
+         [--severity info|warn|error|critical] [--rule-type pattern|policy] [--json]\n  \
+         The AW-17 recall-REPORT: the conformance rules that APPLY to the query facets, \
+         severity-ordered (critical→info), each citing rule id + provenance ref (the wiki URI a CI \
+         comment links to). READ-ONLY, and strictly a report: exit 0 even when rules match (v1 of \
+         the CI conformance seam never blocks — arch-R15); 1 = operational error only.",
     ),
 ];
 
@@ -335,6 +347,11 @@ fn main() {
         // opens the store with open_store_ro and can run beside a live single-writer daemon.
         Some("rules") if args.get(2).map(String::as_str) == Some("drift") => {
             return rules_drift_cmd(&args)
+        }
+        // `rules recall` is the AW-17 recall-report: the applicable ruleset, severity-ordered, each
+        // rule citing id + provenance ref. Read-only (open_store_ro), safe beside a live daemon.
+        Some("rules") if args.get(2).map(String::as_str) == Some("recall") => {
+            return rules_recall_cmd(&args)
         }
         _ => {}
     }
@@ -1824,5 +1841,118 @@ fn rules_drift_cmd(args: &[String]) {
     // tell "the check could not run" from "the check ran and found drift".
     if report.has_residue() {
         std::process::exit(3);
+    }
+}
+
+/// `wicked-core rules recall [--db F] [--language L] [--layer L] [--framework F] [--severity S]
+/// [--rule-type T] [--json]` — the AW-17 recall-REPORT (arch-R15 v1): the conformance rules that
+/// APPLY to the query facets, severity-ordered (critical→info, [`wicked_governance::recall_rules`]),
+/// each citing its rule id + provenance ref — the `<doc path>@<blob sha>#<RULE-ID>` wiki URI a CI
+/// comment links back to.
+///
+/// Strictly READ-ONLY (`open_store_ro`, safe beside a live single-writer daemon) and strictly a
+/// REPORT: it never evaluates a diff and never exits nonzero on findings — the CI conformance
+/// seam's v1 contract is recall-report, never a block. Exit 0 = report produced (an EMPTY report
+/// prints a diagnostic line rather than silence, so "no rules ingested" is visible, not mistaken
+/// for "conformant"); exit 1 = operational error (bad flag, unopenable store).
+fn rules_recall_cmd(args: &[String]) {
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules recall: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    // A facet flag with a flag-shaped value means the value is MISSING (`--language --json`):
+    // silently treating it as a wildcard would widen the report while looking targeted. Fail loud.
+    let facet = |name: &str| -> Option<String> {
+        let v = flag(args, name)?;
+        if v.starts_with("--") {
+            fail(&format!(
+                "rules recall: {name} has no value (resolved to {v:?})"
+            ));
+        }
+        Some(v)
+    };
+    // Severity/rule-type parse through the SAME serde vocabulary the wire contract uses
+    // (snake_case enum spellings) — a typo'd value fails loud, never defaults to "all".
+    let severity: Option<wicked_governance::ConfSeverity> = facet("--severity").map(|v| {
+        match serde_json::from_value(serde_json::Value::String(v.clone())) {
+            Ok(s) => s,
+            Err(_) => {
+                fail(&format!(
+                    "rules recall: --severity must be one of info|warn|error|critical, got {v:?}"
+                ));
+                unreachable!("fail exits");
+            }
+        }
+    });
+    let rule_type: Option<wicked_governance::RuleType> = facet("--rule-type").map(|v| {
+        match serde_json::from_value(serde_json::Value::String(v.clone())) {
+            Ok(t) => t,
+            Err(_) => {
+                fail(&format!(
+                    "rules recall: --rule-type must be pattern or policy, got {v:?}"
+                ));
+                unreachable!("fail exits");
+            }
+        }
+    });
+    let query = wicked_governance::RuleQuery {
+        language: facet("--language"),
+        layer: facet("--layer"),
+        framework: facet("--framework"),
+        severity,
+        rule_type,
+    };
+    let store = match wicked_apps_core::open_store_ro(Some(&resolved_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules recall: open store read-only failed: {e}"));
+            return;
+        }
+    };
+    let rules = match wicked_governance::recall_rules(&store, &query) {
+        Ok(rs) => rs,
+        Err(e) => {
+            fail(&format!("rules recall: {e}"));
+            return;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        // One stable envelope (not a bare array): `count` lets a consumer distinguish "empty
+        // report" from a parse mishap, and the echoed `query` records WHICH facets produced it.
+        let report = serde_json::json!({
+            "count": rules.len(),
+            "query": query,
+            "rules": rules,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("report serializes")
+        );
+    } else {
+        println!(
+            "rules recall: {} applicable rule(s) (store: {resolved_db})",
+            rules.len()
+        );
+        for r in &rules {
+            println!(
+                "  {:?} {}: {} [source: {}]",
+                r.severity,
+                r.id,
+                r.statement,
+                r.provenance.reference.as_deref().unwrap_or("(none)")
+            );
+        }
+        if rules.is_empty() {
+            // An empty report is a DIAGNOSTIC, never silence: on a store nothing was ingested
+            // into, "0 rules" must read as "nothing to recall against", not as conformance.
+            println!(
+                "  no rules matched — if this store was expected to hold rules, run \
+                 `wicked-core rules ingest <dir> --db {resolved_db}` first"
+            );
+        }
     }
 }
