@@ -14,6 +14,8 @@ and relinks to enforcing code by qualified `symbol_ref` (AW-9).
 | `manifest.json` | THE SEED MANIFEST — doctrine source list with per-source `enforcement_class`, RuleSet grouping, upstream digests, lanes, and the P-4 assumption for `TARGET-ARCHITECTURE.md` |
 | `corpus/*.md` | Frontmattered rule docs (seed projections of upstream doctrine that is not itself adapter-ingestable); estate's ADR-001..012 are staged verbatim beside them at run time (`adr/`) |
 | `seed_wiki.py` | The repeatable driver: stage → index → fanout → relink → drift → bulk knowledge → recall proof, scratch stores only |
+| `gen_event_catalog.py` | AW-21 generated views: regenerates the event-catalog TABLES (`wicked-core/EVENTS.md` + the marker block in `wicked-bus/reqs/SPEC.md`) from the machine-readable producer seams; `--check` = staleness gate, `--drift [--json]` = declared-vs-emitted query |
+| `event-catalog-annotations.json` | Curated trigger/payload prose merged into the generated catalog rows (keys must match scanned event types — unknown keys fail generation) |
 | `evidence/` | Committed captures from the proof run against the INSTALLED released binaries (see below) |
 
 ## What "seeded" means (the AW-13 ACs)
