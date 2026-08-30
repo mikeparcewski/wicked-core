@@ -1,5 +1,9 @@
 # AW-13 seed corpus — ingest runbook
 
+> New to the wiki? Start with the operator guide, **[../WIKI.md](../WIKI.md)** — what the wiki
+> is, how to author/consume/retire rules, and the quickstart. This README is the seed-run
+> runbook it links to.
+
 The value-ordered doctrine seed of the graph-backed architecture wiki (estate ADR-011,
 arch-R9), packaged as data + a repeatable driver over the shipped `wicked-core rules`
 machinery. Nothing here is a new parse path: every rule materializes through the
@@ -62,6 +66,10 @@ policies re-read through the worker's own read path), relink linked every `symbo
 zero drift findings, `rules drift` came back clean over the staging root, every expected seed
 rule came back from `rules.recall` **with** a provenance ref, and every scoped
 `knowledge.recall` hit carried a `source`.
+
+Seeding the **real** stores (crew daemon enforcement lane over `--enforcement-crew-api`, one
+discovery replica per live repo graph, the estate knowledge store) is the same `rules fanout`
+pointed at production targets — runbook in [../WIKI.md](../WIKI.md) § "Seed it".
 
 ## Assumptions this seed documents (rather than hides)
 
