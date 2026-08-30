@@ -169,6 +169,41 @@ export declare class Core {
    * `decline`/`cancel`. Resolves to `"ok"` on success, rejects if no matching elicitation exists.
    */
   resolveElicitation(runId: string, elicitationId: string, action: string, response?: any | undefined | null): Promise<string>
+  /**
+   * Validate + launch a campaign — a DAG of Runs (DES-CAMPAIGN-001). `defJson` is a
+   * `CampaignDef` JSON object in the engine wire shape (snake_case): `{ id, name?, nodes:
+   * [{ node_id, run_spec: { problem, clis, entity_mode, human_confirm?, repo_ref?,
+   * workflow_id? } }], edges?: [{ from, to, condition? }], policy?, max_concurrency }`.
+   * Resolves to the campaign id. Fire-and-forget: independent nodes dispatch immediately and
+   * progress arrives as the `campaign*` CoreEvents — `subscribe()` first. Rejects a cycle /
+   * empty / duplicate-edge / unknown-edge-endpoint def at launch, before anything persists.
+   */
+  launchCampaign(defJson: string): Promise<string>
+  /**
+   * Resume a campaign from its persisted state (after a pause, crash, or a fresh process) —
+   * the scheduler re-derives the ready set from the persisted node statuses and re-attaches
+   * any mid-run node, never re-running a completed node. Resolves to the campaign status
+   * token (`running` | `paused` | `completed` | `partially_completed` | `failed` |
+   * `cancelled`); rejects for an unknown id.
+   */
+  resumeCampaign(id: string): Promise<string>
+  /**
+   * Cancel a campaign — cancel every in-flight node's Run and mark the rest `Cancelled`.
+   * Resolves to the campaign status token; rejects for an unknown id.
+   */
+  cancelCampaign(id: string): Promise<string>
+  /**
+   * A campaign's full state — the DAG (embedded def), per-node statuses, per-node run ids and
+   * attempt counters — as a JSON `Campaign` object (engine wire shape, snake_case), or the
+   * JSON literal `null` when the id is unknown. The read a DAG/scoreboard view builds from.
+   */
+  campaignDetail(id: string): Promise<string>
+  /**
+   * Every campaign on the store, as a JSON array of `Campaign` objects. Read-only store
+   * connection (the `project_list` pattern) — the single-writer actor is not involved, so a
+   * long campaign list cannot queue behind dispatch work.
+   */
+  campaignList(): Promise<string>
   /** The agent session ids currently on the store, as a JSON array of strings. */
   sessions(): Promise<string>
   /**
@@ -349,8 +384,10 @@ export declare class Core {
    * bookkeeping store (FINDING-009). `get_coverage_report` above reads `self.db_path` (the daemon
    * `core.db`), which holds run/governance nodes but none of a repo's domain/requirement nodes, so
    * it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo. This
-   * resolves the repo from the registry, opens its `code_graph_db` (`<root>/.codegraph/estate.db`,
-   * the one spelling every consumer shares), and recomputes over it. An unknown `repo_ref` is an
+   * resolves the repo from the registry, opens its `code_graph_db` (the engine-resolved path
+   * every consumer shares — the legacy in-tree `<root>/.codegraph/estate.db` for a repo that
+   * already has one, else the estate home's `<estate_root>/<key>/estate.db`; see wicked-core's
+   * `code_graph.rs` ADR), and recomputes over it. An unknown `repo_ref` is an
    * ERROR, never a silent vacuous report — the caller must name a real repo.
    * Resolves to the coverage report as a JSON string (`ts_return_type` pins it — the crew adapter
    * used to cast away an `unknown` here; #225 review).
