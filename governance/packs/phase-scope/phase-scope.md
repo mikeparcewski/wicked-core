@@ -4,7 +4,7 @@ title: Phase-scope write-denies
 status: active
 date: 2026-08-29
 enforcement_class: policy
-applies_to: [clarify, design, triage, reproduce]
+applies_to: [clarify, design, triage, reproduce, plan]
 scope: wiki:governance
 domain: phase-scope
 confidence: 1.0
@@ -14,8 +14,8 @@ confidence: 1.0
 
 A workflow's phase model is the product's story about **how** work is produced: recon plans,
 creator builds, evaluators judge. A pre-build, non-creator phase (`feature`'s `clarify`/`design`,
-`bug`'s `triage`/`reproduce` — every phase the planner marks `pre_build_scope` from def data)
-declares a scope: produce the analysis/design/plan deliverable, leave implementation to the build
+`bug`'s `triage`/`reproduce`, `migration`'s `plan` — every phase the planner marks
+`pre_build_scope` from def data) declares a scope: produce the analysis/design/plan deliverable, leave implementation to the build
 phase. If a recon phase can write production code, phase roles are advisory, the creator/evaluator
 separation is weaker than advertised, and the run's evidence trail misattributes which phase
 produced what.
@@ -55,8 +55,8 @@ data an operator can recall AND a gate the hook enforces, with a denial receipt
 ## Rules
 
 - `POL-2960` (critical): A pre-build, non-creator phase (any unit the planner marks
-  `pre_build_scope` from def data — `feature`'s `clarify`/`design`, `bug`'s `triage`/`reproduce`)
-  must not write production code. Its writable surface is documentation only: `.md`/`.txt`/`.rst`
+  `pre_build_scope` from def data — `feature`'s `clarify`/`design`, `bug`'s
+  `triage`/`reproduce`, `migration`'s `plan`) must not write production code. Its writable surface is documentation only: `.md`/`.txt`/`.rst`
   files, and paths under a `docs/` or `.product/` directory. Implementation belongs to the build
   phase. Enforced deterministically by the engine gate `engine:pre-build-scope`
   (`gate_hook::phase_scope_denial`), which refuses the `Write`/`Edit`/`NotebookEdit` at the tool
