@@ -37,6 +37,7 @@ mod knowledge_link;
 mod markdown;
 mod provenance;
 mod relink;
+mod retire;
 mod ruleset;
 mod schemas;
 mod scoreboard;
@@ -107,6 +108,15 @@ pub use fanout::{
     fanout, load_ruleset, rationale_chunk, rationale_chunk_id, EnforcementLane, EnforcementTarget,
     FanoutManifest, FanoutScope, FanoutTargets, LaneTarget, PolicyEntry, RuleEntry, RulesetLoad,
     FANOUT_MANIFEST_VERSION, KNOWLEDGE_CHUNK_PREFIX,
+};
+
+// Kill-switch retirement propagation (AW-24 / arch-R22): ONE manifest-keyed op retires the
+// enforcement copy, every discovery-graph copy, and marks the knowledge rationale non-normative —
+// the retirement twin of `fanout`, verified through the same consumer read paths. Operator-only;
+// break-glass drill in `docs/break-glass-kill-switch.md`.
+pub use retire::{
+    retire_from_manifest, retired_marker, select_doc_rules, LaneOutcome, LaneStatus, RetireReceipt,
+    RuleRetirement, RETIRED_MARKER_PREFIX, RETIRE_RECEIPT_VERSION,
 };
 
 // Relink pass — rule→code links durable-by-name, derived-by-id (AW-9 / arch-R6): `rules relink`

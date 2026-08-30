@@ -1,0 +1,123 @@
+{
+  "receipt_version": "1.0",
+  "manifest_path": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/fanout-manifest.json",
+  "requested": [
+    "PAT-1901",
+    "PAT-1902",
+    "PAT-1903",
+    "PAT-1904"
+  ],
+  "generated_at": 1788066986,
+  "retirements": [
+    {
+      "id": "PAT-1901",
+      "kind": "conformance_rule",
+      "lanes": [
+        {
+          "lane": "enforcement",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/gov.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "discovery",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/repo-graph.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "knowledge",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/knowledge.db",
+          "status": "retired",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "PAT-1902",
+      "kind": "conformance_rule",
+      "lanes": [
+        {
+          "lane": "enforcement",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/gov.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "discovery",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/repo-graph.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "knowledge",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/knowledge.db",
+          "status": "retired",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "PAT-1903",
+      "kind": "conformance_rule",
+      "lanes": [
+        {
+          "lane": "enforcement",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/gov.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "discovery",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/repo-graph.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "knowledge",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/knowledge.db",
+          "status": "retired",
+          "verified": true
+        }
+      ]
+    },
+    {
+      "id": "PAT-1904",
+      "kind": "conformance_rule",
+      "lanes": [
+        {
+          "lane": "enforcement",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/gov.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "discovery",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/repo-graph.db",
+          "status": "retired",
+          "verified": true
+        },
+        {
+          "lane": "knowledge",
+          "transport": "cli",
+          "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave5/aw24-drill-run/knowledge.db",
+          "status": "retired",
+          "verified": true
+        }
+      ]
+    }
+  ],
+  "all_cli_lanes_verified": true,
+  "pending": 0
+}
