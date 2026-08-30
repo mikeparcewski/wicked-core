@@ -20,6 +20,9 @@
 //! status: active                # optional: active|draft|superseded|retired (default active;
 //!                               #   non-active docs mint rules with retired=true — parsed,
 //!                               #   preserved, withdrawn from recall)
+//! date: 2026-08-29              # optional ISO date (YYYY-MM-DD) — required by the ADR
+//!                               #   frontmatter contract (AW-12, estate ADR-011 §adr-contract);
+//!                               #   carried as doc metadata, no effect on rule minting
 //! enforcement_class: guidance   # optional: policy|validator|guidance (vocabulary validated
 //!                               #   here; typing into Policy/validator lanes is AW-7)
 //! applies_to: [plan, build]     # optional list
@@ -73,10 +76,11 @@ const STATUSES: [&str; 4] = ["active", "draft", "superseded", "retired"];
 /// Doc `enforcement_class` vocabulary (arch-R4; the class→lane typing itself lands in AW-7).
 const ENFORCEMENT_CLASSES: [&str; 3] = ["policy", "validator", "guidance"];
 /// Frontmatter keys the convention knows. Anything else fails loud (a typo must surface).
-const KNOWN_KEYS: [&str; 10] = [
+const KNOWN_KEYS: [&str; 11] = [
     "id",
     "title",
     "status",
+    "date",
     "enforcement_class",
     "applies_to",
     "scope",
@@ -185,6 +189,7 @@ struct FrontMatter {
     id: Option<String>,
     title: Option<String>,
     status: Option<String>,
+    date: Option<String>,
     enforcement_class: Option<String>,
     applies_to: Option<Vec<String>>,
     scope: Option<String>,
@@ -211,6 +216,9 @@ fn parse_doc(text: &str, ref_path: &str, sha: &str) -> anyhow::Result<serde_json
     doc_meta.insert("title".into(), fm.title.clone().expect("validated").into());
     if let Some(v) = &fm.status {
         doc_meta.insert("status".into(), v.clone().into());
+    }
+    if let Some(v) = &fm.date {
+        doc_meta.insert("date".into(), v.clone().into());
     }
     if let Some(v) = &fm.enforcement_class {
         doc_meta.insert("enforcement_class".into(), v.clone().into());
@@ -284,6 +292,22 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
                     "scope" => fm.scope = Some(v),
                     _ => fm.domain = Some(v),
                 }
+                i += 1;
+            }
+            "date" => {
+                let v = parse_scalar(rest, line_no, key)?;
+                // Strict ISO shape (YYYY-MM-DD) — a typo'd date must surface, not persist.
+                let iso = v.len() == 10
+                    && v.bytes().enumerate().all(|(ix, b)| match ix {
+                        4 | 7 => b == b'-',
+                        _ => b.is_ascii_digit(),
+                    });
+                if !iso {
+                    anyhow::bail!(
+                        "frontmatter line {line_no}: `date` {v:?} is not an ISO date (YYYY-MM-DD)"
+                    );
+                }
+                fm.date = Some(v);
                 i += 1;
             }
             "confidence" => {
@@ -674,6 +698,32 @@ mod tests {
         let recalled = crate::recall_rules(&store, &crate::RuleQuery::default()).unwrap();
         assert_eq!(recalled.len(), 2);
         assert_eq!(recalled[0].id, "POL-002", "critical orders before error");
+    }
+
+    #[test]
+    fn date_key_parses_strict_iso_and_rides_as_doc_metadata() {
+        // The ADR frontmatter contract (AW-12, estate ADR-011 §adr-contract) requires `date`;
+        // the adapter accepts it as doc metadata with no effect on rule minting.
+        let doc = "---\nid: adr-x\ntitle: X\ndate: 2026-08-29\n---\n\n# X\n";
+        let dir = dir_with(&[("adr-dated.md", doc)]);
+        let adapter = MarkdownAdapter::new(&dir);
+        let docs = adapter.fetch().unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["doc"]["date"], "2026-08-29");
+        assert_eq!(docs[0]["rules"].as_array().unwrap().len(), 0);
+
+        // Non-ISO shapes fail loud with the path (never persisted as a typo).
+        for bad in ["2026-8-29", "29/08/2026", "yesterday", "2026-08-299"] {
+            let doc = format!("---\nid: adr-x\ntitle: X\ndate: {bad}\n---\n");
+            let dir = dir_with(&[("bad-date.md", doc.as_str())]);
+            let err = ingest_from(&MarkdownAdapter::new(&dir))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("bad-date.md") && err.contains("ISO date"),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     #[test]

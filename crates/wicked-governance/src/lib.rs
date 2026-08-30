@@ -27,6 +27,8 @@ mod conformance;
 mod domain;
 mod domain_model;
 mod drift;
+
+mod edge_vocab;
 mod engine;
 pub mod events;
 mod fanout;
@@ -70,6 +72,10 @@ pub use events::{
     rule_ingested_event, rule_retired_event, DocDrift, EV_DOC_DRIFTED, EV_RULE_INGESTED,
     EV_RULE_RETIRED, WIKI_LIFECYCLE_EVENTS,
 };
+
+// Edge-vocabulary pin — native `Governs` for code targets; the stringly spelling is
+// knowledge-store-only (AW-19 / arch-R17; estate ADR-011 §edge-vocabulary).
+pub use edge_vocab::{assert_edge_vocabulary, edge_vocabulary_violation};
 
 // MarkdownAdapter — frontmattered docs as a rule source on the same SourceAdapter seam
 // (AW-3 / arch-R1); all output still materializes through `normalize_bundle`.
