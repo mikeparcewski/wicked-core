@@ -92,7 +92,7 @@ smoke-verified against the very store a worker will read, and the whole placemen
 
 ```sh
 wicked-core rules fanout crates/wicked-governance/seed/corpus \
-  --enforcement-crew-api http://127.0.0.1:7701/api/v1 \
+  --enforcement-crew-api http://127.0.0.1:7701 \
   --discovery-db  <estate-home>/repo-graphs/<repo-key>/estate.db \   # repeat per live repo
   --knowledge-db  <estate knowledge store> \
   --scope workspace --knowledge-scope wiki:architecture \
@@ -100,9 +100,10 @@ wicked-core rules fanout crates/wicked-governance/seed/corpus \
 ```
 
 - **Crew daemon store = never CLI-written** (single-writer invariant, DES-OUTGOV-008).
-  `--enforcement-crew-api` records the lane as *pending* and emits the exact
-  `POST /api/v1/governance/rules` payloads for you to send; a daemon-held path passed as a
-  `--*-db` flag is refused outright.
+  `--enforcement-crew-api <daemon base url>` records the lane as *pending* and emits the
+  enforcement payload for you to `POST /api/v1/governance/rules` (policies:
+  `/api/v1/governance/policies`), verified via `GET /api/v1/governance/rules/preview`; a
+  daemon-held path passed as a `--*-db` flag is refused outright.
 - **Discovery copies** go to the per-repo estate graphs (default home
   `~/.wicked-estate/repo-graphs/<key>/estate.db`, overridable via
   `$WICKED_ESTATE_REPO_GRAPH_ROOT`); `--scope workspace` means every live repo graph gets a
