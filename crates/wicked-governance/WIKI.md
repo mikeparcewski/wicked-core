@@ -201,7 +201,7 @@ with its engine gate).
 
 ### Humans (wicked-studio)
 
-- **Settings → Rules** (`#/rules`) — the RuleManager: browse the registered conformance rules,
+- **Settings → Rules** (`/rules`) — the RuleManager: browse the registered conformance rules,
   add/retire on the daemon store, and preview "which rules apply?" for a facet query.
 - **Run view → Governance panel** — GovernanceAudit: the gate decisions of a run with the wiki
   rules each claim cites (the AW-14 acceptance-view conformance section does the same on the
