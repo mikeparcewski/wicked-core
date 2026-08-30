@@ -316,6 +316,22 @@ export declare class Core {
   /** All conformance claims (governance decisions) on the store, as a JSON array. */
   listConformanceClaims(): Promise<string>
   /**
+   * The AW-23 / arch-R23 population/connection scoreboard — the wiki-health report that tells
+   * a POPULATED rule corpus from an ingested-once-and-decaying one: rule counts, typing
+   * coverage, connection (ref-resolution) coverage, enforcement evidence, recall volume.
+   * Resolves to the SAME JSON `wicked-core rules scoreboard --json` emits (a pretty-printed
+   * `Scoreboard` object) — one report shape for CLI operators and crew/studio consumers alike.
+   *
+   * `docsDir` mirrors the CLI's `--dir`: typing coverage is doc-side (`enforcement_class`
+   * lives in frontmatter, never on the rule node), so it needs the SAME docs root
+   * `rules ingest --dir` used; omit it and the report says `typing.available: false`,
+   * honestly, in-band — never a fake 0% or 100%. `ambiguityCap` mirrors `--ambiguity-cap`
+   * (default 5; must be ≥ 1 — fails closed on 0, like the CLI). Strictly a REPORT over a
+   * read-only connection: it never blocks the single-writer actor, and residue gating stays
+   * `rules drift`'s job.
+   */
+  governanceScoreboard(docsDir?: string | undefined | null, ambiguityCap?: number | undefined | null): Promise<string>
+  /**
    * Upsert a governance policy. `policy_json` is a JSON-serialized `Policy` object
    * (fields: id, kind, applies_to, effect, trigger, severity, criteria, rule, obligations).
    * Validates server-side (fails closed on deny_unknown_fields + required fields). Idempotent
