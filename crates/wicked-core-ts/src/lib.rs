@@ -50,8 +50,8 @@ use napi_derive::napi;
 const EVENT_QUEUE_BOUND: usize = 1024;
 
 use wicked_core::{
-    CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus,
-    StubStepRunner,
+    CampaignDef, CampaignStatus, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec,
+    RepoSpec, SessionStatus, StubStepRunner,
 };
 use wicked_council::types::{Confidence, CouncilTask, Dispatcher, Vote};
 use wicked_council::AgenticCli;
@@ -81,6 +81,20 @@ fn status_token(s: SessionStatus) -> String {
         SessionStatus::Completed => "completed",
         SessionStatus::Cancelled => "cancelled",
         SessionStatus::Failed => "failed",
+    }
+    .to_string()
+}
+
+/// The snake_case wire token for a [`CampaignStatus`] (matches its serde representation — the
+/// test below pins the two together, same discipline as [`status_token`]).
+fn campaign_status_token(s: CampaignStatus) -> String {
+    match s {
+        CampaignStatus::Running => "running",
+        CampaignStatus::Paused => "paused",
+        CampaignStatus::Completed => "completed",
+        CampaignStatus::PartiallyCompleted => "partially_completed",
+        CampaignStatus::Failed => "failed",
+        CampaignStatus::Cancelled => "cancelled",
     }
     .to_string()
 }
@@ -540,6 +554,87 @@ impl Core {
     // NOTE: there is intentionally no `pauseRun`. wicked-core has no imperative pause — a run pauses
     // ONLY at a declared human-confirm gate (set `humanConfirm` to `all` / `before:<ord>` at launch).
     // Exposing a fake `pauseRun` would misrepresent the engine, so it is omitted (see the report).
+
+    // ── Campaign DAG scheduler (DES-CAMPAIGN-001; crew TH-9) ─────────────────────
+    // The scheduler itself is core's (src/campaign.rs — durable, crash-resumable, single-writer);
+    // these bindings only marshal it. The 11 `campaign*` CoreEvents were already serialized by
+    // `event_to_json` — a subscriber sees them the moment a campaign runs; nothing here adds a
+    // second event path. Marshalling matches the rest of this file: complex inputs/outputs are
+    // JSON strings in the ENGINE's wire shape (serde snake_case), parsed/produced by core's own
+    // serde derives so this layer cannot drift from the actor's.
+    //
+    // Deliberately NOT bound in this slice: `pauseCampaign` and `confirmCampaignGate`. They ride
+    // the studio-scoreboard slice (TH-14/TH-20), which decides how per-node gate prompts surface;
+    // binding them before a consumer exists would freeze a signature nothing exercises.
+
+    /// Validate + launch a campaign — a DAG of Runs (DES-CAMPAIGN-001). `defJson` is a
+    /// `CampaignDef` JSON object in the engine wire shape (snake_case): `{ id, name?, nodes:
+    /// [{ node_id, run_spec: { problem, clis, entity_mode, human_confirm?, repo_ref?,
+    /// workflow_id? } }], edges?: [{ from, to, condition? }], policy?, max_concurrency }`.
+    /// Resolves to the campaign id. Fire-and-forget: independent nodes dispatch immediately and
+    /// progress arrives as the `campaign*` CoreEvents — `subscribe()` first. Rejects a cycle /
+    /// empty / duplicate-edge / unknown-edge-endpoint def at launch, before anything persists.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn launch_campaign(&self, def_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let def: CampaignDef = serde_json::from_str(&def_json)
+                .map_err(|e| err(format!("defJson is not a valid CampaignDef: {e}")))?;
+            core.launch_campaign(def).map_err(err)
+        })
+    }
+
+    /// Resume a campaign from its persisted state (after a pause, crash, or a fresh process) —
+    /// the scheduler re-derives the ready set from the persisted node statuses and re-attaches
+    /// any mid-run node, never re-running a completed node. Resolves to the campaign status
+    /// token (`running` | `paused` | `completed` | `partially_completed` | `failed` |
+    /// `cancelled`); rejects for an unknown id.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn resume_campaign(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.resume_campaign(&id)
+                .map(campaign_status_token)
+                .map_err(err)
+        })
+    }
+
+    /// Cancel a campaign — cancel every in-flight node's Run and mark the rest `Cancelled`.
+    /// Resolves to the campaign status token; rejects for an unknown id.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn cancel_campaign(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            core.cancel_campaign(&id)
+                .map(campaign_status_token)
+                .map_err(err)
+        })
+    }
+
+    /// A campaign's full state — the DAG (embedded def), per-node statuses, per-node run ids and
+    /// attempt counters — as a JSON `Campaign` object (engine wire shape, snake_case), or the
+    /// JSON literal `null` when the id is unknown. The read a DAG/scoreboard view builds from.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn campaign_detail(&self, id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let detail = core.campaign_detail(&id).map_err(err)?;
+            serde_json::to_string(&detail).map_err(err)
+        })
+    }
+
+    /// Every campaign on the store, as a JSON array of `Campaign` objects. Read-only store
+    /// connection (the `project_list` pattern) — the single-writer actor is not involved, so a
+    /// long campaign list cannot queue behind dispatch work.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn campaign_list(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let store = wicked_apps_core::open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let campaigns = wicked_core::all_campaigns(&store).map_err(err)?;
+            serde_json::to_string(&campaigns).map_err(err)
+        })
+    }
 
     /// The agent session ids currently on the store, as a JSON array of strings.
     #[napi(ts_return_type = "Promise<string>")]
@@ -1945,5 +2040,65 @@ mod tests {
                 "governed",
             ],
         );
+    }
+    /// Pin [`campaign_status_token`] to serde's own representation of [`CampaignStatus`] — the
+    /// hand-written match and the derive must never disagree, because the resume/cancel bindings
+    /// answer the former while `campaignDetail`/`campaignList` JSON carries the latter.
+    #[test]
+    fn campaign_status_token_matches_serde() {
+        for status in [
+            CampaignStatus::Running,
+            CampaignStatus::Paused,
+            CampaignStatus::Completed,
+            CampaignStatus::PartiallyCompleted,
+            CampaignStatus::Failed,
+            CampaignStatus::Cancelled,
+        ] {
+            let via_serde = serde_json::to_value(status).expect("serializes");
+            assert_eq!(
+                Some(campaign_status_token(status).as_str()),
+                via_serde.as_str(),
+                "token drift for {status:?}"
+            );
+        }
+    }
+
+    /// Pin the `defJson` wire shape `launchCampaign` accepts: the ENGINE's serde form
+    /// (snake_case fields, snake_case enum tokens, defaulted optionals). A crew-side mapper is
+    /// written against exactly this JSON — a rename here is a wire break, not a refactor.
+    #[test]
+    fn campaign_def_json_wire_shape_parses() {
+        let def_json = r#"{
+            "id": "camp-1",
+            "nodes": [
+                { "node_id": "a", "run_spec": {
+                    "problem": "run scenario file /tmp/s1.spec.json",
+                    "clis": [],
+                    "entity_mode": "shared",
+                    "workflow_id": "campaign-camp-1-a"
+                } },
+                { "node_id": "b", "run_spec": {
+                    "problem": "run scenario file /tmp/s2.spec.json",
+                    "clis": [],
+                    "entity_mode": "shared"
+                } }
+            ],
+            "edges": [ { "from": "a", "to": "b", "condition": "on_success" } ],
+            "policy": "continue_independent",
+            "max_concurrency": 2
+        }"#;
+        let def: CampaignDef = serde_json::from_str(def_json).expect("engine wire shape parses");
+        assert_eq!(def.id, "camp-1");
+        assert_eq!(def.nodes.len(), 2);
+        assert_eq!(def.edges.len(), 1);
+        assert_eq!(def.max_concurrency, 2);
+        assert_eq!(
+            def.nodes[0].run_spec.workflow_id.as_deref(),
+            Some("campaign-camp-1-a")
+        );
+        // Defaulted optionals: `name`, `human_confirm`, `repo_ref`, `workflow_id` may be absent.
+        assert_eq!(def.nodes[1].run_spec.workflow_id, None);
+        // And the validator core runs at launch accepts this def (no cycle, endpoints exist).
+        wicked_core::validate_campaign(&def).expect("a valid def validates");
     }
 }
