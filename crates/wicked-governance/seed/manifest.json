@@ -1,0 +1,127 @@
+{
+  "manifest_version": "1.0",
+  "title": "AW-13 seed corpus — the doctrine sources of the graph-backed architecture wiki",
+  "date": "2026-08-29",
+  "design": "estate ADR-011 (wicked-estate/docs/adr/ADR-011-architecture-wiki.md); arch-R9 (recon-2026-08/RECON-ARCH-WIKI.md); ingest machinery = wicked-core `rules ingest|fanout|relink|drift` (this crate)",
+  "conventions": {
+    "seed_projection": "a committed, frontmattered rule doc under seed/corpus/ derived from an upstream source that is not itself adapter-ingestable; provenance.ref cites the projection, the projection's Sources section + this manifest cite the upstream",
+    "direct_ingest": "the upstream doc already parses under the MarkdownAdapter convention and is staged verbatim into the ingest root",
+    "knowledge_scope": "wiki:<area> per arch-R5; rationale chunks are stamped by `rules fanout --knowledge-scope`, bulk docs by `knowledge.ingest {scope}`",
+    "ruleset_grouping": "frontmatter `domain:` selects the NodeKind::RuleSet parent; membership = native Contains edges (AW-13)"
+  },
+  "assumptions": [
+    "TARGET-ARCHITECTURE.md lives at the WORKSPACE root's scratch/ directory, which is not inside any git repo; its owned home is parked decision P-4 (RECON-ARCH-WIKI open question 4). Until it lands in an owned repo, the seed ships a projection (corpus/plane-boundaries.md) and this manifest pins the upstream content digest.",
+    "Cross-repo doctrine fans out under `--scope workspace` (AW-6 replicate-to-every-repo): production seeding enumerates EVERY live repo graph as --discovery-db; the scratch proof run uses one indexed repo graph as the stand-in and the runbook says so."
+  ],
+  "sources": [
+    {
+      "order": 1,
+      "source": "scratch/TARGET-ARCHITECTURE.md",
+      "repo": "workspace root (NOT a git repo — parked P-4)",
+      "upstream_digest": "408a1470e4174ab30518ca2623a2a9bd86d1cd89",
+      "content_fixed_by": "DT-11",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "plane-boundaries",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/plane-boundaries.md",
+      "rule_ids": ["POL-1301", "PAT-1302", "PAT-1303", "PAT-1304", "PAT-1305"],
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": true }
+    },
+    {
+      "order": 2,
+      "source": "CLAUDE.md (root workspace) — Key architectural decisions",
+      "repo": "workspace root (NOT a git repo — same P-4 caveat)",
+      "upstream_digest": "329bdfd0e596f680b4a29a3ce74fd84b704d7261",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "plane-boundaries + storage-doctrine + mcp-surface",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/plane-boundaries.md (PAT-1306..PAT-1308), corpus/storage-doctrine.md (POL-1401, PAT-1403), corpus/mcp-surface.md (POL-1501)",
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": true }
+    },
+    {
+      "order": 3,
+      "source": "wicked-estate/CLAUDE.md — Universal Don'ts + Locked decisions",
+      "repo": "wicked-estate @ 25974355f96861e6d5c50f3ce2c37d6fb2223a5a",
+      "upstream_digest": "b5f5dfec62385de45d58948300225e814ffafd92",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "engineering-doctrine + storage-doctrine",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/universal-donts.md (POL-2001..PAT-2006), corpus/storage-doctrine.md (PAT-1402)",
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": false }
+    },
+    {
+      "order": 4,
+      "source": "wicked-estate/docs/agent-behavior-rules.md (R1-R7)",
+      "repo": "wicked-estate @ 25974355f96861e6d5c50f3ce2c37d6fb2223a5a",
+      "upstream_digest": "9cd9e80602e988b03e95ad500fa6a72a794d9cbd",
+      "enforcement_class": "validator",
+      "ruleset_domain": "agent-behavior",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/agent-behavior.md (PAT-1601..PAT-1607, Rn aliases preserved in statements)",
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": true }
+    },
+    {
+      "order": 5,
+      "source": "wicked-estate/docs/ENGINE-CONTRACT.md",
+      "repo": "wicked-estate @ 25974355f96861e6d5c50f3ce2c37d6fb2223a5a",
+      "upstream_digest": "f7a215a6a5829ab79974bbfa448b8852cf9112ab",
+      "enforcement_class": "validator",
+      "ruleset_domain": "storage-doctrine",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/engine-contract.md (PAT-1701..POL-1704, each with a symbol_ref to the enforcing code — `rules relink` derives the Governs edges after `wicked-estate index`)",
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": true }
+    },
+    {
+      "order": 6,
+      "source": "wicked-bus/reqs/SPEC.md — Naming Convention + Validation Rules + Event Catalog (DT-16 refresh)",
+      "repo": "wicked-bus @ 4189bdeef39d2b1037db8a1aca45930dff0e1a41",
+      "upstream_digest": "83551b45c862767da79e0df1f0d034027b9f6ad5",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "event-grammar",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/event-grammar.md (POL-1801 grammar + POL-1802 domain whitelist; recall-valued, not gate-enforced — the bus validates at emit)",
+      "knowledge": { "scope": "wiki:events", "bulk_ingest": true }
+    },
+    {
+      "order": 7,
+      "source": "wicked-estate/docs/adr/ADR-001..ADR-012",
+      "repo": "wicked-estate @ 25974355f96861e6d5c50f3ce2c37d6fb2223a5a",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "architecture-wiki (only ADR-011 declares a domain + mints rules: POL-1101, PAT-1102, PAT-1103, POL-1104; the others are doc-only ingests)",
+      "lane": "direct_ingest",
+      "seed_doc": "staged verbatim into <staging>/adr/ by the runbook (AW-12 normalized their frontmatter to the adapter contract)",
+      "knowledge": { "scope": "wiki:adr", "bulk_ingest": true }
+    },
+    {
+      "order": 8,
+      "source": "~/.claude/CLAUDE.md — Cross-Platform Requirement (global rules)",
+      "repo": "user-global config (outside the workspace)",
+      "enforcement_class": "guidance",
+      "ruleset_domain": "cross-platform",
+      "lane": "seed_projection",
+      "seed_doc": "corpus/cross-platform.md (PAT-1901..PAT-1904)",
+      "knowledge": { "scope": "wiki:architecture", "bulk_ingest": false }
+    }
+  ],
+  "rule_id_blocks": {
+    "13xx": "plane-boundaries",
+    "14xx": "storage-doctrine (root decisions + locked storage)",
+    "15xx": "mcp-surface",
+    "16xx": "agent-behavior (R1-R7)",
+    "17xx": "engine-contract (symbol_ref-bearing, under the storage-doctrine RuleSet)",
+    "18xx": "event-grammar",
+    "19xx": "cross-platform",
+    "20xx": "universal-donts (engineering-doctrine)",
+    "reserved": "PAT-100 (studio RuleManager template), POL-1101/PAT-1102/PAT-1103/POL-1104 (estate ADR-011)"
+  },
+  "rulesets": [
+    "plane-boundaries",
+    "storage-doctrine",
+    "mcp-surface",
+    "agent-behavior",
+    "event-grammar",
+    "cross-platform",
+    "engineering-doctrine",
+    "architecture-wiki (from estate ADR-011, direct ingest)"
+  ]
+}

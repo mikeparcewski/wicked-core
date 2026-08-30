@@ -365,8 +365,40 @@ fn markdown_docs_ingest_alongside_json_lanes() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("1 policies + 2 conformance rules (+ 4 schema nodes)"),
-        "JSON + markdown rules both counted, schema nodes registered: {stdout}"
+        stdout.contains(
+            "1 policies + 2 conformance rules (+ 0 RuleSets / 0 memberships + 4 schema nodes)"
+        ),
+        "JSON + markdown rules both counted (domainless doc groups nothing), schema nodes \
+         registered: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn a_domain_bearing_doc_groups_its_rules_under_a_ruleset() {
+    // AW-13: frontmatter `domain:` selects the RuleSet parent — the CLI mints the native RuleSet
+    // node + Contains membership and reports both counts.
+    let base = scratch("mdruleset");
+    let db = base.join("estate.db");
+    let db_s = db.to_str().unwrap().to_string();
+    let ruleset = base.join("ruleset");
+    std::fs::create_dir_all(&ruleset).unwrap();
+    std::fs::write(
+        ruleset.join("doctrine.md"),
+        "---\nid: doctrine\ntitle: Doctrine\ndomain: agent-behavior\n---\n\n## Rules\n\n\
+         - POL-210 (critical): grouped statement.\n- PAT-211 (warn): second member.\n",
+    )
+    .unwrap();
+    let out = ingest(&db_s, &ruleset);
+    assert!(
+        out.status.success(),
+        "domain-bearing ingest works: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("0 policies + 2 conformance rules (+ 1 RuleSets / 2 memberships"),
+        "the doc's domain mints one RuleSet with two memberships: {stdout}"
     );
     let _ = std::fs::remove_dir_all(&base);
 }

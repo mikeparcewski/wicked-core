@@ -1,0 +1,23 @@
+AW-13 seed proof — binary + source pins
+date: 2026-08-29
+
+proof target (INSTALLED from crates.io, never a workspace build):
+  wicked-estate      0.15.1  (cargo install wicked-estate --version 0.15.1 --locked; CLI banner: "wicked-estate 0.15.1 — usage:")
+  wicked-estate-mcp  0.15.1  (cargo install wicked-estate-mcp --version 0.15.1 --locked; served surface captured in tool-list.json: 24 tools incl. rules.recall + knowledge.recall{scope_prefix})
+
+ingest machinery:
+  wicked-core @ branch feat/aw13-seed-corpus (the commit carrying this evidence), cargo build --bin wicked-core
+
+sources:
+  wicked-estate (indexed + ADR staging): origin/main @ 25974355f96861e6d5c50f3ce2c37d6fb2223a5a (the 0.15.1 release commit)
+  wicked-bus reqs/SPEC.md:               origin/main @ 4189bdeef39d2b1037db8a1aca45930dff0e1a41
+  scratch/TARGET-ARCHITECTURE.md         blob 408a1470e4174ab30518ca2623a2a9bd86d1cd89 (workspace scratch/, outside git — parked P-4)
+  root CLAUDE.md                         blob 329bdfd0e596f680b4a29a3ce74fd84b704d7261
+
+stores: ALL scratch (paths in summary.json); no real ~/.wicked-* store was opened or written,
+and the emit seam was pointed at a scratch events store + scratch dead-letter spool.
+
+result: rules.recall returned 40/40 seed rules with provenance refs; RulesInventory shows the
+8 doctrine RuleSets with 0 ungrouped rule nodes; relink derived 4 Governs edges for the
+engine-contract symbol_refs with zero drift; rules drift clean (exit 0); knowledge.recall with
+scope_prefix "wiki:" returned cited chunks in all three probes.

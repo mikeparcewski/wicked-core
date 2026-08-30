@@ -52,7 +52,17 @@
 //! `^(PAT|POL)-[0-9]{3,6}$` (backticks optional), `rule_type` is DERIVED from the id prefix (the
 //! convention makes the prefix the one spelling of the type; INV-C1 requires they agree anyway),
 //! severity is one of `info|warn|error|critical`. Anything else inside the Rules section that is
-//! not a blank line or an indented continuation is an error. `provenance.ref` is
+//! not a blank line or an indented continuation is an error.
+//!
+//! An indented continuation of the form `symbol_ref: <qualified ref>` is a DIRECTIVE, not
+//! statement text: it sets the rule's `symbol_ref` (the durable rule→code key `rules relink`
+//! re-derives Governs edges from — AW-9/AW-13, the ENGINE-CONTRACT doc↔gate pairing). The ref
+//! must be qualified per [`crate::relink::parse_symbol_ref`] (`<repo-relative path>::<name>` or
+//! `<kind>:<name>`) — an unqualified or duplicate directive fails loud with its line number.
+//! `symbol_ref:` is therefore a reserved prefix on continuation lines; statement prose never
+//! legitimately starts with it.
+//!
+//! `provenance.ref` is
 //! `<root-relative path>@<git blob sha>#<RULE-ID>` (forward slashes on every platform; the sha is
 //! the doc's content digest per [`crate::provenance::git_blob_sha1`] — equal to
 //! `git hash-object <file>` — which is what lets `rules drift` detect a doc that changed since
@@ -142,6 +152,42 @@ impl MarkdownAdapter {
     fn rel_ref(&self, path: &Path) -> String {
         let rel = path.strip_prefix(&self.root).unwrap_or(path);
         rel.to_string_lossy().replace('\\', "/")
+    }
+
+    /// The RuleSet groupings this corpus declares (AW-13 / arch-R9): frontmatter `domain:`
+    /// selects the parent, so every rule in a `domain:`-bearing doc lands under that doctrine
+    /// RuleSet. Docs WITHOUT a `domain:` contribute nothing here (their rules stay ungrouped —
+    /// `RulesInventory` reports the count). Consumes the SAME [`SourceAdapter::fetch`] output as
+    /// the ingest (one parse convention, no second parse path); merged per domain across docs,
+    /// deterministic order (BTreeMap by domain, ids in doc order).
+    pub fn groupings(&self) -> anyhow::Result<Vec<crate::ruleset::RuleSetGrouping>> {
+        let mut by_domain: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for doc in self.fetch()? {
+            let Some(domain) = doc
+                .get("doc")
+                .and_then(|d| d.get("domain"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            let ids = by_domain.entry(domain.to_string()).or_default();
+            if let Some(rules) = doc.get("rules").and_then(|r| r.as_array()) {
+                for rule in rules {
+                    if let Some(id) = rule.get("id").and_then(|v| v.as_str()) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+        Ok(by_domain
+            .into_iter()
+            // A doc-only corpus (frontmatter, zero rules) declares no memberships — an empty
+            // grouping is dropped here, not failed: `register_rule_sets` refuses empties because
+            // a CALLER-built empty grouping is a bug, while a doc-only domain simply has nothing
+            // to group yet.
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(domain, rule_ids)| crate::ruleset::RuleSetGrouping { domain, rule_ids })
+            .collect())
     }
 }
 
@@ -532,11 +578,12 @@ fn parse_rules_section(
 
     let mut rules: Vec<serde_json::Value> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
-    // (id, severity, statement) of the item currently being assembled (continuations may extend it).
-    let mut current: Option<(String, String, String)> = None;
-    let flush = |current: &mut Option<(String, String, String)>,
-                 rules: &mut Vec<serde_json::Value>| {
-        if let Some((id, severity, statement)) = current.take() {
+    // (id, severity, statement, symbol_ref) of the item currently being assembled (continuations
+    // may extend the statement; a `symbol_ref:` continuation DIRECTIVE sets the fourth field).
+    type CurrentItem = (String, String, String, Option<String>);
+    let mut current: Option<CurrentItem> = None;
+    let flush = |current: &mut Option<CurrentItem>, rules: &mut Vec<serde_json::Value>| {
+        if let Some((id, severity, statement, symbol_ref)) = current.take() {
             let rule_type = if id.starts_with("PAT-") {
                 "pattern"
             } else {
@@ -556,6 +603,9 @@ fn parse_rules_section(
             });
             if !targets.is_empty() {
                 rule["targets"] = serde_json::Value::Object(targets.clone());
+            }
+            if let Some(sref) = symbol_ref {
+                rule["symbol_ref"] = serde_json::Value::String(sref);
             }
             if retired {
                 rule["retired"] = serde_json::Value::Bool(true);
@@ -580,14 +630,37 @@ fn parse_rules_section(
             if !seen_ids.insert(id.clone()) {
                 anyhow::bail!("line {line_no}: duplicate rule id {id:?} within this doc (INV-C3)");
             }
-            current = Some((id, caps[2].to_string(), caps[3].trim().to_string()));
+            current = Some((id, caps[2].to_string(), caps[3].trim().to_string(), None));
         } else if let (true, Some(cur)) = (l.starts_with("  "), current.as_mut()) {
-            // Continuation line: joined with a space onto the open statement. An indented line
-            // with NO open item falls through to the fail-loud arm below.
-            if !cur.2.is_empty() {
-                cur.2.push(' ');
+            // Continuation line. `symbol_ref: <ref>` is a DIRECTIVE (sets the rule's durable
+            // rule→code key, validated as a QUALIFIED ref — module docs); anything else joins
+            // the open statement with a space. An indented line with NO open item falls through
+            // to the fail-loud arm below.
+            if let Some(raw_ref) = t.strip_prefix("symbol_ref:") {
+                let raw_ref = raw_ref.trim();
+                if raw_ref.is_empty() {
+                    anyhow::bail!("line {line_no}: `symbol_ref:` directive with no value");
+                }
+                if cur.3.is_some() {
+                    anyhow::bail!(
+                        "line {line_no}: rule {} carries a second `symbol_ref:` directive — a \
+                         rule has at most one durable rule→code key (refusing to silently \
+                         overwrite)",
+                        cur.0
+                    );
+                }
+                // Shape-validate NOW (fail loud with the doc line) — an unqualified ref would
+                // otherwise only surface later as a relink/drift finding (AW-9 refuses bare names).
+                if let Err(reason) = crate::relink::parse_symbol_ref(raw_ref) {
+                    anyhow::bail!("line {line_no}: invalid `symbol_ref:` — {reason}");
+                }
+                cur.3 = Some(raw_ref.to_string());
+            } else {
+                if !cur.2.is_empty() {
+                    cur.2.push(' ');
+                }
+                cur.2.push_str(t);
             }
-            cur.2.push_str(t);
         } else {
             anyhow::bail!(
                 "line {line_no}: unrecognized content in the Rules section: {t:?} — expected \
@@ -858,5 +931,81 @@ mod tests {
         assert_eq!(parsed.path, "nested/deeper/win.md");
         assert_eq!(parsed.sha.as_deref(), Some(expected_sha.as_str()));
         assert_eq!(parsed.anchor.as_deref(), Some("PAT-002"));
+    }
+
+    #[test]
+    fn symbol_ref_directive_sets_the_durable_key_not_the_statement() {
+        let doc = "---\n\
+            id: engine-contract\n\
+            title: Engine contract invariants\n\
+            domain: storage-doctrine\n\
+            ---\n\n\
+            ## Rules\n\n\
+            - PAT-010 (error): Blast radius follows dependents,\n  \
+              continuation prose still joins.\n  \
+              symbol_ref: crates/wicked-estate-core/src/conformance.rs::graph_store_suite\n\
+            - POL-011 (critical): Kind-scoped refs work too.\n  \
+              symbol_ref: function:graph_store_suite\n";
+        let dir = dir_with(&[("engine-contract.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].symbol_ref.as_deref(),
+            Some("crates/wicked-estate-core/src/conformance.rs::graph_store_suite"),
+            "path-scoped directive rides as the rule's symbol_ref"
+        );
+        assert_eq!(
+            rules[0].statement, "Blast radius follows dependents, continuation prose still joins.",
+            "the directive never leaks into the statement"
+        );
+        assert_eq!(
+            rules[1].symbol_ref.as_deref(),
+            Some("function:graph_store_suite")
+        );
+    }
+
+    #[test]
+    fn unqualified_or_duplicate_symbol_ref_fails_loud() {
+        let bare = "---\nid: d\ntitle: T\n---\n\n## Rules\n\n\
+            - PAT-010 (error): stmt.\n  symbol_ref: graph_store_suite\n";
+        let dir = dir_with(&[("bare-ref.md", bare)]);
+        let err = ingest_from(&MarkdownAdapter::new(&dir)).expect_err("bare names are refused");
+        assert!(
+            err.to_string().contains("symbol_ref"),
+            "names the directive: {err}"
+        );
+
+        let twice = "---\nid: d2\ntitle: T\n---\n\n## Rules\n\n\
+            - PAT-010 (error): stmt.\n  \
+              symbol_ref: function:a\n  \
+              symbol_ref: function:b\n";
+        let dir = dir_with(&[("double-ref.md", twice)]);
+        let err = ingest_from(&MarkdownAdapter::new(&dir))
+            .expect_err("a second directive must not silently overwrite");
+        assert!(err.to_string().contains("second `symbol_ref:`"), "{err}");
+    }
+
+    #[test]
+    fn groupings_merge_per_domain_and_skip_domainless_docs() {
+        let a = "---\nid: a\ntitle: A\ndomain: agent-behavior\n---\n\n## Rules\n\n\
+            - PAT-020 (warn): a1.\n- PAT-021 (warn): a2.\n";
+        let b = "---\nid: b\ntitle: B\ndomain: agent-behavior\n---\n\n## Rules\n\n\
+            - POL-022 (error): b1.\n";
+        let c = "---\nid: c\ntitle: C (no domain)\n---\n\n## Rules\n\n\
+            - PAT-023 (info): ungrouped.\n";
+        let d = "---\nid: d\ntitle: D (doc-only)\ndomain: event-grammar\n---\n\nProse only.\n";
+        let dir = dir_with(&[("a.md", a), ("b.md", b), ("c.md", c), ("d.md", d)]);
+        let groupings = MarkdownAdapter::new(&dir).groupings().unwrap();
+        assert_eq!(
+            groupings.len(),
+            1,
+            "domainless + doc-only docs group nothing"
+        );
+        assert_eq!(groupings[0].domain, "agent-behavior");
+        assert_eq!(
+            groupings[0].rule_ids,
+            vec!["PAT-020", "PAT-021", "POL-022"],
+            "memberships merge across docs sharing one domain, doc order preserved"
+        );
     }
 }

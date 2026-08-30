@@ -1,0 +1,155 @@
+[
+  {
+    "title": "TARGET-ARCHITECTURE (four-plane model)",
+    "scope": "wiki:architecture",
+    "source": "workspace://scratch/TARGET-ARCHITECTURE.md",
+    "chunks": 6,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae3f-7183-8abd-8787f7aae97c:"
+    }
+  },
+  {
+    "title": "Root CLAUDE.md (wicked-* ecosystem)",
+    "scope": "wiki:architecture",
+    "source": "workspace://CLAUDE.md",
+    "chunks": 8,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae50-7093-a6e4-66175b4cd553:"
+    }
+  },
+  {
+    "title": "Engine Contract",
+    "scope": "wiki:architecture",
+    "source": "wicked-estate://docs/ENGINE-CONTRACT.md",
+    "chunks": 9,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae58-7cf3-a0d6-475132371ce7:"
+    }
+  },
+  {
+    "title": "Agent-Behavior Rules R1-R7",
+    "scope": "wiki:architecture",
+    "source": "wicked-estate://docs/agent-behavior-rules.md",
+    "chunks": 8,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae63-7e90-9fa1-1b837c48bd4f:"
+    }
+  },
+  {
+    "title": "wicked-bus SPEC (event grammar + catalog)",
+    "scope": "wiki:events",
+    "source": "wicked-bus://reqs/SPEC.md",
+    "chunks": 26,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae6f-7f61-8787-887815e2b9d8:"
+    }
+  },
+  {
+    "title": "ADR-001-graph-schema",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-001-graph-schema.md",
+    "chunks": 4,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae87-7a93-87b6-8eadeef4d771:"
+    }
+  },
+  {
+    "title": "ADR-002-stable-symbol-identity",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-002-stable-symbol-identity.md",
+    "chunks": 9,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae8c-7ce3-9cca-e35dbb5ffc8b:"
+    }
+  },
+  {
+    "title": "ADR-003-storage-backends",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-003-storage-backends.md",
+    "chunks": 6,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae97-7642-ab4e-e58408c3d475:"
+    }
+  },
+  {
+    "title": "ADR-004-infrastructure-estate-mapping",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-004-infrastructure-estate-mapping.md",
+    "chunks": 7,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-ae9f-7a51-81f0-12777e488920:"
+    }
+  },
+  {
+    "title": "ADR-005-code-intel-as-a-brain",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-005-code-intel-as-a-brain.md",
+    "chunks": 6,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aea8-7752-8561-ee489b035e3e:"
+    }
+  },
+  {
+    "title": "ADR-006-observability-otel-adapter",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-006-observability-otel-adapter.md",
+    "chunks": 6,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aeb1-7253-946f-2df659fbc25f:"
+    }
+  },
+  {
+    "title": "ADR-007-tsg-superseded-by-scip",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-007-tsg-superseded-by-scip.md",
+    "chunks": 7,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aeb7-7e42-82e7-710e62e5a054:"
+    }
+  },
+  {
+    "title": "ADR-008-memory-api-shim-retention",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-008-memory-api-shim-retention.md",
+    "chunks": 6,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aebf-7072-8674-01c54cbca2dc:"
+    }
+  },
+  {
+    "title": "ADR-009-intent-routed-lsp",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-009-intent-routed-lsp.md",
+    "chunks": 11,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aec6-7472-96ad-288a59362acc:"
+    }
+  },
+  {
+    "title": "ADR-010-plugin-overrides",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-010-plugin-overrides.md",
+    "chunks": 6,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aed3-7533-87c9-a72cf5584716:"
+    }
+  },
+  {
+    "title": "ADR-011-architecture-wiki",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-011-architecture-wiki.md",
+    "chunks": 10,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aeda-74b0-9146-4843caf61e39:"
+    }
+  },
+  {
+    "title": "ADR-012-rule-authorship",
+    "scope": "wiki:adr",
+    "source": "wicked-estate://docs/adr/ADR-012-rule-authorship.md",
+    "chunks": 5,
+    "result": {
+      "doc_id": "kdoc synthetic 01a05050-aee5-7dc0-8da1-27b4fdc25bf5:"
+    }
+  }
+]

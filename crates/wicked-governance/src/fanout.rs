@@ -107,6 +107,10 @@ pub struct FanoutTargets {
 pub struct RulesetLoad {
     pub policies: Vec<Policy>,
     pub rules: Vec<ConformanceRule>,
+    /// Doctrine RuleSet memberships the markdown corpus declares (frontmatter `domain:` selects
+    /// the parent — AW-13 / arch-R9). Graph lanes materialize these as `NodeKind::RuleSet` nodes
+    /// + native `Contains` edges beside the rules.
+    pub groupings: Vec<crate::ruleset::RuleSetGrouping>,
 }
 
 /// The enforcement lane as recorded in the manifest.
@@ -171,6 +175,11 @@ pub struct FanoutManifest {
     pub rules: BTreeMap<String, RuleEntry>,
     /// Deny-path policies, keyed on policy id.
     pub policies: BTreeMap<String, PolicyEntry>,
+    /// Doctrine RuleSet memberships (AW-13): domain → contained rule ids, replicated into every
+    /// graph lane beside the rules. Additive field — absent in pre-AW-13 manifests, so it
+    /// deserializes as empty rather than failing them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rule_sets: BTreeMap<String, Vec<String>>,
 }
 
 /// Load the canonical ruleset layout under `root`, fail-loud with the same semantics as
@@ -263,7 +272,18 @@ pub fn load_ruleset(root: &Path) -> anyhow::Result<RulesetLoad> {
              population (fail-loud)"
         );
     }
-    Ok(RulesetLoad { policies, rules })
+
+    // Doctrine RuleSet memberships (AW-13): frontmatter `domain:` selects the parent. Same parse
+    // path as the rule ingest above — the adapter re-reads the corpus and maps doc→rule ids.
+    let groupings = MarkdownAdapter::new(root)
+        .groupings()
+        .map_err(|e| anyhow::anyhow!("reading RuleSet groupings under {root:?}: {e}"))?;
+
+    Ok(RulesetLoad {
+        policies,
+        rules,
+        groupings,
+    })
 }
 
 /// The rationale chunk text for one rule. Embeds the stable `PAT-`/`POL-` id (design spine: one
@@ -294,7 +314,9 @@ pub fn rationale_chunk_id(rule_id: &str) -> String {
 }
 
 /// Register every conformance rule (and, when `include_policies`, every deny-path policy) into one
-/// graph-lane store. Enforcement gets both; discovery graphs get `NodeKind::Rule` copies only.
+/// graph-lane store, then the doctrine RuleSet parents + `Contains` membership (AW-13 — after the
+/// rules, so a membership edge never targets a not-yet-written node). Enforcement gets policies
+/// too; discovery graphs get `NodeKind::Rule` copies + RuleSets only.
 fn write_graph_lane(
     store: &mut dyn GraphStore,
     load: &RulesetLoad,
@@ -308,16 +330,19 @@ fn write_graph_lane(
             register_policy(store, policy)?;
         }
     }
+    crate::ruleset::register_rule_sets(store, &load.groupings)?;
     Ok(())
 }
 
 /// Smoke a graph-lane store through the SAME read paths a governed run uses: `recall_rules` (what
 /// the gate's recall→obligation step and the MCP `rules.recall` serve) must return every expected
-/// rule id, and (enforcement only) every policy node must round-trip active. Returns the missing
-/// ids — empty means verified.
+/// rule id, every doctrine RuleSet parent must round-trip as a native `NodeKind::RuleSet` node
+/// (what `RulesInventory` lists — AW-13), and (enforcement only) every policy node must
+/// round-trip active. Returns the missing ids — empty means verified.
 fn smoke_graph_lane(
     store: &dyn GraphRead,
     expect_rules: &[String],
+    expect_rulesets: &[String],
     expect_policies: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let recalled = recall_rules(store, &RuleQuery::default())?;
@@ -327,6 +352,15 @@ fn smoke_graph_lane(
         .filter(|id| !present.contains(id.as_str()))
         .cloned()
         .collect();
+    for domain in expect_rulesets {
+        let ok = matches!(
+            store.get_node(&crate::ruleset::rule_set_symbol(domain))?,
+            Some(node) if node.kind == wicked_estate_core::NodeKind::RuleSet
+        );
+        if !ok {
+            missing.push(format!("{}/{domain}", crate::ruleset::RULE_SET));
+        }
+    }
     for id in expect_policies {
         let ok = match store.get_node(&synthetic_symbol(POLICY, id))? {
             Some(node) => Policy::from_node(&node)
@@ -421,6 +455,7 @@ pub fn fanout(
     }
 
     let rule_ids: Vec<String> = load.rules.iter().map(|r| r.id.clone()).collect();
+    let ruleset_domains: Vec<String> = load.groupings.iter().map(|g| g.domain.clone()).collect();
     let policy_ids: Vec<String> = load.policies.iter().map(|p| p.id.clone()).collect();
 
     // Lane 1: enforcement.
@@ -436,7 +471,7 @@ pub fn fanout(
               // no WAL pragma, no schema DDL), so the smoke cannot repair what it is verifying.
             let store = wicked_apps_core::open_store_ro(Some(db))
                 .map_err(|e| anyhow::anyhow!("enforcement lane: re-open {db:?}: {e}"))?;
-            let missing = smoke_graph_lane(&store, &rule_ids, &policy_ids)?;
+            let missing = smoke_graph_lane(&store, &rule_ids, &ruleset_domains, &policy_ids)?;
             if !missing.is_empty() {
                 anyhow::bail!(
                     "enforcement lane smoke FAILED against {db:?}: missing {missing:?} — the \
@@ -475,7 +510,7 @@ pub fn fanout(
         // Read-only re-open, same reasoning as the enforcement smoke.
         let store = wicked_apps_core::open_store_ro(Some(db))
             .map_err(|e| anyhow::anyhow!("discovery lane: re-open {db:?}: {e}"))?;
-        let missing = smoke_graph_lane(&store, &rule_ids, &[])?;
+        let missing = smoke_graph_lane(&store, &rule_ids, &ruleset_domains, &[])?;
         if !missing.is_empty() {
             anyhow::bail!(
                 "discovery lane smoke FAILED against {db:?}: missing {missing:?} — the import did \
@@ -545,6 +580,12 @@ pub fn fanout(
         );
     }
 
+    let rule_sets: BTreeMap<String, Vec<String>> = load
+        .groupings
+        .iter()
+        .map(|g| (g.domain.clone(), g.rule_ids.clone()))
+        .collect();
+
     Ok(FanoutManifest {
         manifest_version: FANOUT_MANIFEST_VERSION.to_string(),
         scope: targets.scope,
@@ -555,6 +596,7 @@ pub fn fanout(
         knowledge,
         rules,
         policies,
+        rule_sets,
     })
 }
 
@@ -612,6 +654,7 @@ mod tests {
         let load = RulesetLoad {
             policies: vec![],
             rules: vec![rule("PAT-001")],
+            groupings: vec![],
         };
         let targets = FanoutTargets {
             scope: FanoutScope::Workspace,
@@ -636,6 +679,7 @@ mod tests {
         let load = RulesetLoad {
             policies: vec![],
             rules: vec![rule("PAT-001")],
+            groupings: vec![],
         };
         let targets = FanoutTargets {
             scope: FanoutScope::Repo,
@@ -667,6 +711,7 @@ mod tests {
             knowledge: vec![],
             rules: BTreeMap::new(),
             policies: BTreeMap::new(),
+            rule_sets: BTreeMap::new(),
         };
         let json = serde_json::to_value(&manifest).unwrap();
         assert_eq!(json["scope"], "workspace");

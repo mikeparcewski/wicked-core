@@ -1,0 +1,604 @@
+{
+  "manifest_version": "1.0",
+  "scope": "workspace",
+  "source_dir": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/staging",
+  "generated_at": 1788053856,
+  "enforcement": {
+    "transport": "cli",
+    "target": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+    "verified": true
+  },
+  "discovery": [
+    {
+      "db": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db",
+      "verified": true
+    }
+  ],
+  "knowledge": [
+    {
+      "db": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db",
+      "verified": true
+    }
+  ],
+  "rules": {
+    "PAT-1102": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "An edge whose target is a code-graph symbol must use the native Governs edge kind; the stringly governs spelling is legal only between knowledge-store nodes.",
+      "source": "adr/ADR-011-architecture-wiki.md@05507373f6518c18c49b3e58d360d1db2d8f787b#PAT-1102",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1102"
+      ]
+    },
+    "PAT-1103": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "While the governs deprecation window is open, any recall or traversal that claims to see every governs relationship must match both the native and the stringly spelling.",
+      "source": "adr/ADR-011-architecture-wiki.md@05507373f6518c18c49b3e58d360d1db2d8f787b#PAT-1103",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1103"
+      ]
+    },
+    "PAT-1302": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "The experience surface is a pure HTTP/WS client of the control plane's public API — rendering and editing only, nothing semantic; a surface that imports control internals has crossed the plane boundary.",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1302",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1302"
+      ]
+    },
+    "PAT-1303": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Control means intent in, governed verified work out: evaluator≠creator (a creator structurally cannot self-grade), deny-dominates dual gates, and \"done\" re-derived from evidence — never asserted.",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1303",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1303"
+      ]
+    },
+    "PAT-1304": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Enforcement is two-tier by design: hooks are fail-open advisory, crew/core gates are fail-closed — never introduce a third enforcement tier (TARGET-ARCHITECTURE contract 3).",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1304",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1304"
+      ]
+    },
+    "PAT-1305": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "estate is what the system knows (data plane); wicked-core is how crew executes (control runtime) — neither leaks into the other's box, and the published version-deps pattern keeps them decoupled with zero repo-layout constraints.",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1305",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1305"
+      ]
+    },
+    "PAT-1306": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "Single binary per product — no micro-process soup.",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1306",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1306"
+      ]
+    },
+    "PAT-1307": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "wicked-estate is the center of gravity: code graph, memory, and knowledge live there; everything else is a consumer.",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1307",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1307"
+      ]
+    },
+    "PAT-1308": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "Rust for foundations, JS/TS for products and tooling.",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#PAT-1308",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1308"
+      ]
+    },
+    "PAT-1402": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Storage lives behind the `GraphRead`/`GraphWrite` traits and a single `open_store(spec)` factory — a new backend drops in as one factory arm, never as call-site branching.",
+      "source": "storage-doctrine.md@33337819b8d43c15fffb320239f9a1013287d4cf#PAT-1402",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1402"
+      ]
+    },
+    "PAT-1403": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "One writer per store file: writes go through a single-writer seam (the crew actor in-daemon, or exactly one CLI process offline); a daemon-held store is never CLI-written (DES-OUTGOV-008 — record the crew-api transport instead).",
+      "source": "storage-doctrine.md@33337819b8d43c15fffb320239f9a1013287d4cf#PAT-1403",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1403"
+      ]
+    },
+    "PAT-1502": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Rules are read-only over MCP: recall surfaces exist (rules.recall, RulesInventory, knowledge.recall), a write surface deliberately does not — the absence of a rules.write tool is the guardrail (see estate POL-1101 / ADR-012 for the authorship contract).",
+      "source": "mcp-surface.md@51e2228f27e0d7273a3a1bfa80a7499c3c48156e#PAT-1502",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1502"
+      ]
+    },
+    "PAT-1601": {
+      "rule_type": "pattern",
+      "severity": "critical",
+      "statement": "R1: Never return isError:true early in a session — an early error causes session-wide abandonment of the tool; if the graph cannot answer, return a successful empty/partial result with a diagnostic.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1601",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1601"
+      ]
+    },
+    "PAT-1602": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "R2: Unindexed or empty graph — expose zero tools, not erroring tools; a tool that exists must work.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1602",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1602"
+      ]
+    },
+    "PAT-1603": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "R3: Partial coverage is worse than none — always surface coverage as a diagnostic so the agent knows when to fall back; track coverage as a first-class signal.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1603",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1603"
+      ]
+    },
+    "PAT-1604": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "R4: Cap tool output at roughly 25K characters — rank and budget (elided stubs, signatures + docstrings); prefer a tight ranked answer over a complete dump.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1604",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1604"
+      ]
+    },
+    "PAT-1605": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "R5: Always report staleness — embed commits_behind in every response's diagnostics; a silently-stale graph is a correctness hazard.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1605",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1605"
+      ]
+    },
+    "PAT-1606": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "R6: Loud fallback markers — emit GRAPH-FALLBACK: when files are read because the graph could not answer, LSP-FALLBACK: when a missing language server downgrades to labeled graph results, and LSP-TRUNCATED: when a References answer was capped; all ride the diagnostics channel, never extra stdout lines.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1606",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1606"
+      ]
+    },
+    "PAT-1607": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "R7: Confidence is visible and low-confidence is labeled — never present a 0.5-confidence synthesized edge as if it were a 1.0 SCIP fact.",
+      "source": "agent-behavior.md@f47b21958c88168e34bd38886d4488aa9eebbb8a#PAT-1607",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1607"
+      ]
+    },
+    "PAT-1701": {
+      "rule_type": "pattern",
+      "severity": "critical",
+      "statement": "Edge direction: source = dependent, target = dependency — \"A calls B\" is an edge from A to B; dependents of X are edges where target == X, and blast radius is transitive dependents (reverse reachability).",
+      "source": "engine-contract.md@be5d01b04e720ed44c9f69eca18e07febf8f2a61#PAT-1701",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1701"
+      ]
+    },
+    "PAT-1702": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Two-phase pipeline: extractors are stateless and per-file (parallel); cross-file references emit UnresolvedRef bound later by swappable resolvers — changing resolution never requires re-parsing. A reference is unresolved iff no resolver emitted an edge attributed to it (exact location + kind, after per-ref re-resolution) — the one definition every other surface cites.",
+      "source": "engine-contract.md@be5d01b04e720ed44c9f69eca18e07febf8f2a61#PAT-1702",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1702"
+      ]
+    },
+    "PAT-1703": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Every Edge carries confidence, provenance, and resolved_by; a heuristic edge is never presented as a fact (agent rule R7 is the recall-side twin).",
+      "source": "engine-contract.md@be5d01b04e720ed44c9f69eca18e07febf8f2a61#PAT-1703",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1703"
+      ]
+    },
+    "PAT-1901": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Never use printf or echo with backslash-escape interpretation for JSON or multi-line output — zsh/bash interpret escapes differently across platforms; use printf '%s' or Python.",
+      "source": "cross-platform.md@2c7805e9d7c5506cb79bc52cdc87361ff22e7000#PAT-1901",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1901"
+      ]
+    },
+    "PAT-1902": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Hook commands that output JSON go through python3 -c with a python -c fallback (covers macOS, Linux, WSL, and Windows Git Bash), never hand-quoted shell JSON.",
+      "source": "cross-platform.md@2c7805e9d7c5506cb79bc52cdc87361ff22e7000#PAT-1902",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1902"
+      ]
+    },
+    "PAT-1903": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "No Unix-only shell features in hook commands without a Windows fallback path; prefer Python over shell builtins for JSON, string manipulation, and file paths.",
+      "source": "cross-platform.md@2c7805e9d7c5506cb79bc52cdc87361ff22e7000#PAT-1903",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1903"
+      ]
+    },
+    "PAT-1904": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "Paths that become identifiers (provenance refs, graph locations) compare with forward slashes on every platform — normalize before comparing, never compare raw OS-native paths.",
+      "source": "cross-platform.md@2c7805e9d7c5506cb79bc52cdc87361ff22e7000#PAT-1904",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-1904"
+      ]
+    },
+    "PAT-2003": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Rules as data, not code — resolution/extraction logic lives in query files and config, never compiled per-language match arms; a new language is a new grammar plus query file with zero core change.",
+      "source": "universal-donts.md@e42f2fbea0217b0978f878f6ae4dad7ab36387bc#PAT-2003",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-2003"
+      ]
+    },
+    "PAT-2004": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Stable IDs only — never key a node by content hash or line number (ADR-002); that was the rename-breaks-everything bug.",
+      "source": "universal-donts.md@e42f2fbea0217b0978f878f6ae4dad7ab36387bc#PAT-2004",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-2004"
+      ]
+    },
+    "PAT-2005": {
+      "rule_type": "pattern",
+      "severity": "error",
+      "statement": "Bounded traversal only — every traverse carries max_depth and max_nodes; no unbounded whole-graph walks, use a real recursive traversal, never N statements per node.",
+      "source": "universal-donts.md@e42f2fbea0217b0978f878f6ae4dad7ab36387bc#PAT-2005",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-2005"
+      ]
+    },
+    "PAT-2006": {
+      "rule_type": "pattern",
+      "severity": "warn",
+      "statement": "Never claim dead code without history — run git log -S for the symbol first; \"no callers\" can mean an incomplete migration, not permission to delete.",
+      "source": "universal-donts.md@e42f2fbea0217b0978f878f6ae4dad7ab36387bc#PAT-2006",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/PAT-2006"
+      ]
+    },
+    "POL-1101": {
+      "rule_type": "policy",
+      "severity": "critical",
+      "statement": "Promotion to an enforceable Rule node happens only via a human-merged doc PR flowing through the MarkdownAdapter ingest; no MCP tool may create, mutate, or retire Rule nodes, and agent-extracted rule candidates land only as non-normative proposed knowledge.",
+      "source": "adr/ADR-011-architecture-wiki.md@05507373f6518c18c49b3e58d360d1db2d8f787b#POL-1101",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1101"
+      ]
+    },
+    "POL-1104": {
+      "rule_type": "policy",
+      "severity": "error",
+      "statement": "Every ADR opens with the one frontmatter contract — id, title, status, date, with optional supersedes and applies_to — and parses under the MarkdownAdapter convention; a new ADR that does not parse does not merge.",
+      "source": "adr/ADR-011-architecture-wiki.md@05507373f6518c18c49b3e58d360d1db2d8f787b#POL-1104",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1104"
+      ]
+    },
+    "POL-1301": {
+      "rule_type": "policy",
+      "severity": "critical",
+      "statement": "Every cross-plane interaction goes through the owning plane's contract, never around it: experience reaches control only via crew's public `/api/v1` + WS, control drives capability only as governed workers over workflows-as-data, and capability reaches the foundation only through garden's skills (estate MCP, vault/ledger evidence, bus events).",
+      "source": "plane-boundaries.md@d4924f167b1f7b120b076c26bac6e492e8ddbdbb#POL-1301",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1301"
+      ]
+    },
+    "POL-1401": {
+      "rule_type": "policy",
+      "severity": "error",
+      "statement": "The embedded durable store (SQLite, ACID/WAL, crash-safe) is the zero-infra default; Postgres is optional behind a feature/profile — the local case never requires a server to run.",
+      "source": "storage-doctrine.md@33337819b8d43c15fffb320239f9a1013287d4cf#POL-1401",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1401"
+      ]
+    },
+    "POL-1501": {
+      "rule_type": "policy",
+      "severity": "error",
+      "statement": "MCP over custom protocols — every agent-facing surface speaks JSON-RPC 2.0 (MCP); a bespoke agent protocol does not ship.",
+      "source": "mcp-surface.md@51e2228f27e0d7273a3a1bfa80a7499c3c48156e#POL-1501",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1501"
+      ]
+    },
+    "POL-1704": {
+      "rule_type": "policy",
+      "severity": "critical",
+      "statement": "Every graph store must pass the GraphStore conformance suite before it ships — the suite is the gate, the contract doc is the rationale; a store that skips the suite does not merge.",
+      "source": "engine-contract.md@be5d01b04e720ed44c9f69eca18e07febf8f2a61#POL-1704",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1704"
+      ]
+    },
+    "POL-1801": {
+      "rule_type": "policy",
+      "severity": "error",
+      "statement": "Event types are four-segment wicked.<domain>.<noun>.<past-tense-verb> — all lowercase, dot-separated, matching the WB-001 pattern; three-segment names are never constructed, statically or dynamically.",
+      "source": "event-grammar.md@19c1bbcff3efcb1e1f133b474af639162257858e#POL-1801",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1801"
+      ]
+    },
+    "POL-1802": {
+      "rule_type": "policy",
+      "severity": "warn",
+      "statement": "Producer domains are whitelisted: qe, crew, garden, interactive (bus SPEC live-domain list) plus estate (governance lifecycle events, wicked-core AW-22); the `test` namespace survives only as the legacy-stable QE-lifecycle spelling emitted under the qe domain column. A new producer domain lands in the bus SPEC catalog before its first emit.",
+      "source": "event-grammar.md@19c1bbcff3efcb1e1f133b474af639162257858e#POL-1802",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-1802"
+      ]
+    },
+    "POL-2001": {
+      "rule_type": "policy",
+      "severity": "critical",
+      "statement": "No grandfathering — warnings, clippy lints, and failing/ignored tests go to zero by fixing code, never by allow-attributes, ignore-markers, or skipping; done means 0 warnings, 0 ignored, conformance and bench green.",
+      "source": "universal-donts.md@e42f2fbea0217b0978f878f6ae4dad7ab36387bc#POL-2001",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-2001"
+      ]
+    },
+    "POL-2002": {
+      "rule_type": "policy",
+      "severity": "critical",
+      "statement": "The verdict is the verdict — conformance, bake-off, benchmark, and gate results never change based on who runs them or how urgent the moment is; a NO-GO is a NO-GO for everyone.",
+      "source": "universal-donts.md@e42f2fbea0217b0978f878f6ae4dad7ab36387bc#POL-2002",
+      "enforcement": "cli:/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+      "discovery": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db"
+      ],
+      "knowledge": [
+        "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db#kchunk:rule-rationale/POL-2002"
+      ]
+    }
+  },
+  "policies": {},
+  "rule_sets": {
+    "agent-behavior": [
+      "PAT-1601",
+      "PAT-1602",
+      "PAT-1603",
+      "PAT-1604",
+      "PAT-1605",
+      "PAT-1606",
+      "PAT-1607"
+    ],
+    "architecture-wiki": [
+      "POL-1101",
+      "PAT-1102",
+      "PAT-1103",
+      "POL-1104"
+    ],
+    "cross-platform": [
+      "PAT-1901",
+      "PAT-1902",
+      "PAT-1903",
+      "PAT-1904"
+    ],
+    "engineering-doctrine": [
+      "POL-2001",
+      "POL-2002",
+      "PAT-2003",
+      "PAT-2004",
+      "PAT-2005",
+      "PAT-2006"
+    ],
+    "event-grammar": [
+      "POL-1801",
+      "POL-1802"
+    ],
+    "mcp-surface": [
+      "POL-1501",
+      "PAT-1502"
+    ],
+    "plane-boundaries": [
+      "POL-1301",
+      "PAT-1302",
+      "PAT-1303",
+      "PAT-1304",
+      "PAT-1305",
+      "PAT-1306",
+      "PAT-1307",
+      "PAT-1308"
+    ],
+    "storage-doctrine": [
+      "PAT-1701",
+      "PAT-1702",
+      "PAT-1703",
+      "POL-1704",
+      "POL-1401",
+      "PAT-1402",
+      "PAT-1403"
+    ]
+  }
+}

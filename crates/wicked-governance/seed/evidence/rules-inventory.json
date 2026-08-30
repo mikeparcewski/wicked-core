@@ -1,0 +1,13 @@
+{
+  "content": [
+    {
+      "text": "{\"engines\":[{\"file\":\"crates/wicked-estate-extract/tests/fixtures/ibm_odm/loan_approval.brl\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"loan_approval\",\"symbol\":\"blaze synthetic crates/wicked-estate-extract/tests/fixtures/ibm_odm/loan_approval.brl::ruleset::loan_approval:\"},{\"file\":\"crates/wicked-estate-extract/tests/fixtures/rego/sample.rego\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"authz\",\"symbol\":\"rego synthetic crates/wicked-estate-extract/tests/fixtures/rego/sample.rego::package::authz:\"},{\"file\":\"rule_set/agent-behavior\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"agent-behavior\",\"symbol\":\"wicked-apps synthetic rule_set/agent-behavior:\"},{\"file\":\"rule_set/architecture-wiki\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"architecture-wiki\",\"symbol\":\"wicked-apps synthetic rule_set/architecture-wiki:\"},{\"file\":\"rule_set/cross-platform\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"cross-platform\",\"symbol\":\"wicked-apps synthetic rule_set/cross-platform:\"},{\"file\":\"rule_set/engineering-doctrine\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"engineering-doctrine\",\"symbol\":\"wicked-apps synthetic rule_set/engineering-doctrine:\"},{\"file\":\"rule_set/event-grammar\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"event-grammar\",\"symbol\":\"wicked-apps synthetic rule_set/event-grammar:\"},{\"file\":\"rule_set/mcp-surface\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"mcp-surface\",\"symbol\":\"wicked-apps synthetic rule_set/mcp-surface:\"},{\"file\":\"rule_set/plane-boundaries\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"plane-boundaries\",\"symbol\":\"wicked-apps synthetic rule_set/plane-boundaries:\"},{\"file\":\"rule_set/storage-doctrine\",\"invoked_by\":[],\"kind\":\"rule_set\",\"name\":\"storage-doctrine\",\"symbol\":\"wicked-apps synthetic rule_set/storage-doctrine:\"}],\"rule_nodes\":{\"in_rule_sets\":45,\"total\":45,\"ungrouped\":0},\"total\":10}",
+      "type": "text"
+    },
+    {
+      "text": "STALENESS: commits_behind not available at this layer \u2014 embed git rev-list delta in the MCP response",
+      "type": "text"
+    }
+  ],
+  "isError": false
+}

@@ -1,0 +1,61 @@
+{
+  "knowledge": {
+    "links_written": [],
+    "unmatched_docs": [
+      "engine-contract.md"
+    ]
+  },
+  "relink": {
+    "drift": [],
+    "edges_written": 4,
+    "linked": [
+      {
+        "doc_path": "engine-contract.md",
+        "rule_id": "PAT-1701",
+        "symbol_ref": "crates/wicked-estate-core/src/conformance.rs::graph_store_suite",
+        "targets": [
+          {
+            "epoch": 0,
+            "symbol": "ts-rust . . . crates/wicked-estate-core/src/conformance/graph_store_suite()."
+          }
+        ]
+      },
+      {
+        "doc_path": "engine-contract.md",
+        "rule_id": "PAT-1702",
+        "symbol_ref": "crates/wicked-estate-resolve/src/lib.rs::resolve_all_with_coverage",
+        "targets": [
+          {
+            "epoch": 0,
+            "symbol": "ts-rust . . . crates/wicked-estate-resolve/src/lib/resolve_all_with_coverage()."
+          }
+        ]
+      },
+      {
+        "doc_path": "engine-contract.md",
+        "rule_id": "PAT-1703",
+        "symbol_ref": "crates/wicked-estate-core/src/edge.rs::Edge",
+        "targets": [
+          {
+            "epoch": 0,
+            "symbol": "ts-rust . . . crates/wicked-estate-core/src/edge/Edge#"
+          }
+        ]
+      },
+      {
+        "doc_path": "engine-contract.md",
+        "rule_id": "POL-1704",
+        "symbol_ref": "crates/wicked-estate-core/src/conformance.rs::graph_store_suite",
+        "targets": [
+          {
+            "epoch": 0,
+            "symbol": "ts-rust . . . crates/wicked-estate-core/src/conformance/graph_store_suite()."
+          }
+        ]
+      }
+    ],
+    "rules_seen": 40,
+    "rules_with_ref": 4,
+    "skipped_retired": 0
+  }
+}
