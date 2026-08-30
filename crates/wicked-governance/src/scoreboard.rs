@@ -14,10 +14,11 @@
 //! - **enforcement evidence** — denials citing wiki rules: distinct deny claims with
 //!   [`crate::conformance::EVIDENCED_BY`] edges, the rules they cite, and the accumulated
 //!   `evidence_count` on rule → code `Governs` edges ([`crate::record_rule_evidence`] wires both).
-//! - **recall volume** — documented UNAVAILABLE: `recall_rules` is a pure read and the estate
-//!   graph schema has no telemetry/invocation table to measure it from (estate-mcp telemetry is
-//!   emitted to logs, not persisted into this store). An honest "cannot measure" beats a
-//!   fabricated zero.
+//! - **recall volume** — documented UNAVAILABLE: `recall_rules` is a pure read, and while the
+//!   store schema DOES carry telemetry tables (`access_log` / `search_misses`), nothing in the
+//!   recall funnel writes them — their only writer is estate's one-time brain-consolidation
+//!   `import-telemetry` bulk import, so they hold no `rules.recall` signal. An honest "cannot
+//!   measure" beats a fabricated zero.
 //!
 //! Everything here is READ-ONLY (`&dyn GraphRead` + an optional doc scan); pair it with
 //! `open_store_ro` so the scoreboard can run beside a live single-writer daemon.
@@ -246,9 +247,10 @@ pub fn scoreboard(
         evidence,
         recall_volume: RecallVolume {
             available: false,
-            reason: "not measurable from this store: recall_rules is a pure read and the estate \
-                     graph schema has no telemetry/invocation table (estate-mcp telemetry is \
-                     emitted to logs, not persisted here)"
+            reason: "not measurable from this store: recall_rules is a pure read, and the \
+                     store's telemetry tables (access_log / search_misses) have no live writer \
+                     — only estate's one-time brain-consolidation import populates them, so \
+                     they carry no rules.recall signal"
                 .to_string(),
         },
     })
