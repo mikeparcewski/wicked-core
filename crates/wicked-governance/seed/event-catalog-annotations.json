@@ -1,0 +1,115 @@
+{
+  "_comment": "Curated trigger/payload prose for generated event-catalog rows (gen_event_catalog.py). Keys MUST be event types the scanned seams declare — unknown keys fail generation so this file cannot rot. Content lifted from the hand-authored DT-16 catalog (wicked-bus SPEC, 2026-08-29) and from the producing modules' doc contracts.",
+  "wicked.qe.gate.passed": {
+    "trigger": "Acceptance gate PASS (garden qe gate CLI)",
+    "payload": "`run_id`, `context`, `gate_verdict`, `exit_code`, `verdict_summary`, `mode`, `completed_at`, `scenario_count`"
+  },
+  "wicked.qe.gate.failed": {
+    "trigger": "Acceptance gate FAIL",
+    "payload": "same 8 fields as `wicked.qe.gate.passed`"
+  },
+  "wicked.qe.gate.conditional": {
+    "trigger": "CONDITIONAL or SYSTEM_ERROR",
+    "payload": "same 8 fields as `wicked.qe.gate.passed`"
+  },
+  "wicked.qe.deploy.completed": {
+    "trigger": "Deploy signal alongside a PASS",
+    "payload": "`run_id`, `project_id`"
+  },
+  "wicked.test.strategy.generated": {
+    "trigger": "Test strategy produced (ledger `strategies.create`)",
+    "payload": "`strategy_id`, `project_id`, `qe_version`"
+  },
+  "wicked.test.scenario.authored": {
+    "trigger": "Scenario file created/updated (ledger `scenarios.create`)",
+    "payload": "`scenario_id`, `project_id`, `format_version`"
+  },
+  "wicked.test.run.started": {
+    "trigger": "Test run begins (ledger `runs.create`)",
+    "payload": "`run_id`, `project_id`, `scenario_id`, `started_at`"
+  },
+  "wicked.test.run.completed": {
+    "trigger": "Test run finishes (ledger `runs.update`, `finished_at` set)",
+    "payload": "`run_id`, `project_id`, `scenario_id`"
+  },
+  "wicked.test.verdict.created": {
+    "trigger": "Verdict recorded (ledger `verdicts.create`; garden qe reviewer)",
+    "payload": "`verdict_id`, `run_id`, `verdict`, `reviewer`"
+  },
+  "wicked.test.evidence.captured": {
+    "trigger": "Evidence written for a run (ledger `verdicts.create` with `vault_payload_sha`; union payload)",
+    "payload": "`project_id`, `run_id`, `evidence_path`, `qe_version`"
+  },
+  "wicked.crew.project.created": {
+    "trigger": "Crew project created; `domain` stamp `wicked-crew`",
+    "payload": "project id + descriptor"
+  },
+  "wicked.crew.project.updated": {
+    "trigger": "Crew project updated; `domain` stamp `wicked-crew`",
+    "payload": "project id + changed fields"
+  },
+  "wicked.crew.project.archived": {
+    "trigger": "Crew project archived; `domain` stamp `wicked-crew`",
+    "payload": "project id"
+  },
+  "wicked.crew.membership.attached": {
+    "trigger": "Run attached to a crew project; `domain` stamp `wicked-crew`",
+    "payload": "project id, run id"
+  },
+  "wicked.crew.membership.detached": {
+    "trigger": "Run detached from a crew project; `domain` stamp `wicked-crew`",
+    "payload": "project id, run id"
+  },
+  "wicked.crew.run.requested": {
+    "trigger": "Governed run intent (human CLI / scheduler / campaign); `domain` stamp = the requester's own — the engine's launch poller matches by event type, not domain",
+    "payload": "`workflow?`, `problem`, `args?` (payload contract in `wicked-core src/bus.rs`)"
+  },
+  "wicked.crew.run.launched": {
+    "trigger": "Launch confirmed by the engine (bus-as-truth handoff); `domain` stamp `wicked-core`; idempotency-keyed on the run id",
+    "payload": "`run_id`, `workflow`, `problem`"
+  },
+  "wicked.crew.task.dispatched": {
+    "trigger": "Workflow unit handoff to a governed worker; `domain` stamp `wicked-core`",
+    "payload": "run/unit ids + dispatch descriptor"
+  },
+  "wicked.crew.task.completed": {
+    "trigger": "Workflow unit completion (verdict in payload); `domain` stamp `wicked-core`",
+    "payload": "run/unit ids + verdict"
+  },
+  "wicked.gate.eval.requested": {
+    "trigger": "Governed evaluator bus round-trip — request (evaluator≠creator); `domain` stamp `wicked-core`",
+    "payload": "evaluation request (run/gate ids + material refs)"
+  },
+  "wicked.gate.eval.responded": {
+    "trigger": "Governed evaluator bus round-trip — response; `domain` stamp `wicked-core`",
+    "payload": "evaluation verdict for the paired request"
+  },
+  "wicked.estate.rule.ingested": {
+    "trigger": "Every rule `wicked-core rules ingest` registers (after its store commit; JSON-bundle and markdown-doc lanes)",
+    "payload": "`rule_id`, `rule_type`, `severity`, `retired`, `source`, `ref`, `confidence` — classifications only, never `rule.statement`"
+  },
+  "wicked.estate.rule.retired": {
+    "trigger": "`retire_rule` after its store commit — only on an actual state change (re-retiring emits nothing)",
+    "payload": "`rule_id`, `rule_type`, `severity`, `source`, `ref`"
+  },
+  "wicked.estate.doc.drifted": {
+    "trigger": "Drift tooling (`wicked-core rules drift`) — once per drifted governed doc",
+    "payload": "`doc_path`, `doc_id`, `reason`, `rule_ids`, `rule_count`"
+  },
+  "wicked.crew.governance.conformance_recorded": {
+    "trigger": "ConformanceClaim recorded by the governance engine (`wicked-governance src/engine.rs`)",
+    "payload": "claim ids + `obligation_count` (no rule text)"
+  },
+  "wicked.interactive.artifact.created": {
+    "trigger": "Artifact scaffolded via the wicked-interactive CLI (`src/artifact/create.js`)",
+    "payload": "artifact/document ids"
+  },
+  "wicked.interactive.artifact.published": {
+    "trigger": "Artifact published (`src/artifact/publish.js`)",
+    "payload": "artifact/document ids"
+  },
+  "wicked.interactive.artifact.validation_failed": {
+    "trigger": "Artifact failed validation (`src/artifact/validate.js`)",
+    "payload": "artifact id + failure detail"
+  }
+}
