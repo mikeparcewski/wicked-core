@@ -388,7 +388,11 @@ fn boundary_denial_with(
 /// bypass above.
 fn scope_relative(path: &str, cwd: &std::path::Path) -> String {
     let p = std::path::Path::new(path);
-    if p.is_relative() {
+    // `is_relative()` is platform-dependent: on Windows a unix-style "/repo/docs/x.md" has no
+    // drive so it counts as relative and would skip the strip/basename containment below —
+    // exactly the ancestor-grant hole this gate closes. `has_root()` treats it as anchored on
+    // every platform.
+    if !p.has_root() {
         return path.to_string();
     }
     match p.strip_prefix(cwd) {
