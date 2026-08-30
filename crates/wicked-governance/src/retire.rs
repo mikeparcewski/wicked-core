@@ -41,7 +41,7 @@
 //! - **Deleted doc ⇒ explicit retire, never silent orphaning** (arch-R22 item 3). `rules drift`
 //!   REPORTS a deleted governed doc (`OrphanReason::DocMissing`) and never auto-drops;
 //!   [`select_doc_rules`] turns that report into the retire set (`rules retire --doc <path>`),
-//!   and drift then treats the retired rules as the healed state (`skipped_retired`).
+//!   and drift's orphan scan then SKIPS the retired rules — retirement IS the healed state.
 //! - **Events.** Each graph-lane state change emits `wicked.estate.rule.retired` through
 //!   [`crate::retire_rule`]'s existing seam (AW-22) — one event per store that actually changed,
 //!   which is the propagation trail an observer replays. The knowledge rewrite is deliberately

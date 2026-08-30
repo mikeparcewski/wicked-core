@@ -2029,7 +2029,7 @@ fn rules_scoreboard_cmd(args: &[String]) {
 /// and marks the knowledge rationale non-normative, then re-opens each cli lane FRESH and verifies
 /// the withdrawn state through the consumer read path. `--doc` retires every rule the manifest
 /// derived from that doc path — the deleted-doc → explicit-retire bridge (`rules drift` reports
-/// the orphans; this clears them; drift then counts them as `skipped_retired`, the healed state).
+/// the orphans; this clears them; drift's orphan scan skips retired rules — the healed state).
 fn rules_retire_cmd(args: &[String]) {
     const VALUE_FLAGS: &[&str] = &["--id", "--doc", "--manifest", "--out"];
     for name in VALUE_FLAGS {

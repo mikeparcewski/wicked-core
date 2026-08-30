@@ -72,7 +72,8 @@ wicked-core rules retire --id PAT-XXXX --manifest fanout-manifest.json --out ret
 
   selects every rule the manifest derived from that doc (path component only — the `@sha` /
   `#anchor` parts of the recorded ref don't participate). Re-running drift afterwards shows the
-  orphans cleared (`skipped_retired` — retirement IS the healed state).
+  orphans cleared (drift's orphan scan skips retired rules — retirement IS the healed
+  state).
 
 What the one op does per id:
 
