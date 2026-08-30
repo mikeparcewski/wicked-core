@@ -37,6 +37,7 @@ mod knowledge_link;
 mod markdown;
 mod provenance;
 mod relink;
+mod ruleset;
 mod schemas;
 
 pub use domain::{Effect, Policy, Severity, Trigger};
@@ -80,6 +81,9 @@ pub use edge_vocab::{assert_edge_vocabulary, edge_vocabulary_violation};
 // MarkdownAdapter — frontmattered docs as a rule source on the same SourceAdapter seam
 // (AW-3 / arch-R1); all output still materializes through `normalize_bundle`.
 pub use markdown::MarkdownAdapter;
+// RuleSet grouping (AW-13 / arch-R9): one NodeKind::RuleSet parent per doctrine domain, native
+// Contains membership; frontmatter `domain:` selects the parent.
+pub use ruleset::{register_rule_sets, rule_set_symbol, RuleSetGrouping, RULE_SET};
 
 // Fan-out contract across the deliberate store split (AW-5 / arch-R3): one manifest keyed on
 // PAT-/POL- ids → enforcement copy + discovery graph copies + knowledge rationale chunk, each

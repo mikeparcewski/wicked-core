@@ -1,0 +1,141 @@
+{
+  "date": "2026-08-30 01:37:40 UTC",
+  "estate_rev": "25974355f96861e6d5c50f3ce2c37d6fb2223a5a",
+  "binaries": {
+    "wicked-core": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/target-aw13-seed/debug/wicked-core",
+    "wicked-estate": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/estate-prefix/bin/wicked-estate",
+    "wicked-estate-mcp": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/estate-prefix/bin/wicked-estate-mcp",
+    "note": "released versions recorded in versions.txt beside this file"
+  },
+  "stores": {
+    "enforcement": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+    "discovery": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db",
+    "knowledge": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db",
+    "memory": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/memory.db",
+    "xedge": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/xedge.db",
+    "events": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/events.db"
+  },
+  "rules_recalled": 40,
+  "seed_rule_ids_verified": [
+    "PAT-1102",
+    "PAT-1103",
+    "PAT-1302",
+    "PAT-1303",
+    "PAT-1304",
+    "PAT-1305",
+    "PAT-1306",
+    "PAT-1307",
+    "PAT-1308",
+    "PAT-1402",
+    "PAT-1403",
+    "PAT-1502",
+    "PAT-1601",
+    "PAT-1602",
+    "PAT-1603",
+    "PAT-1604",
+    "PAT-1605",
+    "PAT-1606",
+    "PAT-1607",
+    "PAT-1701",
+    "PAT-1702",
+    "PAT-1703",
+    "PAT-1901",
+    "PAT-1902",
+    "PAT-1903",
+    "PAT-1904",
+    "PAT-2003",
+    "PAT-2004",
+    "PAT-2005",
+    "PAT-2006",
+    "POL-1101",
+    "POL-1104",
+    "POL-1301",
+    "POL-1401",
+    "POL-1501",
+    "POL-1704",
+    "POL-1801",
+    "POL-1802",
+    "POL-2001",
+    "POL-2002"
+  ],
+  "inventory": {
+    "engines": [
+      {
+        "file": "crates/wicked-estate-extract/tests/fixtures/ibm_odm/loan_approval.brl",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "loan_approval",
+        "symbol": "blaze synthetic crates/wicked-estate-extract/tests/fixtures/ibm_odm/loan_approval.brl::ruleset::loan_approval:"
+      },
+      {
+        "file": "crates/wicked-estate-extract/tests/fixtures/rego/sample.rego",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "authz",
+        "symbol": "rego synthetic crates/wicked-estate-extract/tests/fixtures/rego/sample.rego::package::authz:"
+      },
+      {
+        "file": "rule_set/agent-behavior",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "agent-behavior",
+        "symbol": "wicked-apps synthetic rule_set/agent-behavior:"
+      },
+      {
+        "file": "rule_set/architecture-wiki",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "architecture-wiki",
+        "symbol": "wicked-apps synthetic rule_set/architecture-wiki:"
+      },
+      {
+        "file": "rule_set/cross-platform",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "cross-platform",
+        "symbol": "wicked-apps synthetic rule_set/cross-platform:"
+      },
+      {
+        "file": "rule_set/engineering-doctrine",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "engineering-doctrine",
+        "symbol": "wicked-apps synthetic rule_set/engineering-doctrine:"
+      },
+      {
+        "file": "rule_set/event-grammar",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "event-grammar",
+        "symbol": "wicked-apps synthetic rule_set/event-grammar:"
+      },
+      {
+        "file": "rule_set/mcp-surface",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "mcp-surface",
+        "symbol": "wicked-apps synthetic rule_set/mcp-surface:"
+      },
+      {
+        "file": "rule_set/plane-boundaries",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "plane-boundaries",
+        "symbol": "wicked-apps synthetic rule_set/plane-boundaries:"
+      },
+      {
+        "file": "rule_set/storage-doctrine",
+        "invoked_by": [],
+        "kind": "rule_set",
+        "name": "storage-doctrine",
+        "symbol": "wicked-apps synthetic rule_set/storage-doctrine:"
+      }
+    ],
+    "rule_nodes": {
+      "in_rule_sets": 45,
+      "total": 45,
+      "ungrouped": 0
+    },
+    "total": 10
+  }
+}

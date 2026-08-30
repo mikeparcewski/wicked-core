@@ -1,0 +1,616 @@
+{
+  "tools": [
+    {
+      "description": "Search the code graph for symbols matching a name (exact or substring). Returns ranked matches with name, kind, file:line, and signature.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 20,
+            "description": "Maximum number of results (default 20, max 100).",
+            "maximum": 100,
+            "type": "integer"
+          },
+          "name": {
+            "description": "Symbol name to search for (exact or substring match).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "name": "SearchEntity"
+    },
+    {
+      "description": "Retrieve full detail for a single symbol by its stable id. Returns name, kind, language, file:line, signature, and doc comment.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {
+            "description": "Stable symbol ID to retrieve.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "name": "RetrieveEntity"
+    },
+    {
+      "description": "Bounded multi-hop walk from a start symbol. Returns the subgraph (nodes, edges, depths) reachable within the given depth and node caps. Supports forward (dependencies), reverse (dependents), and bidirectional traversal. For rules engine connections: use edge_kinds=[\"invoked_by\"] to trace code\u2192rules, [\"governs\"] for ruleset\u2192rule structure, [\"evaluates\"] for rule\u2192condition.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "default": 4,
+            "description": "Maximum hop depth (default 4, max 16).",
+            "maximum": 16,
+            "type": "integer"
+          },
+          "direction": {
+            "default": "dependencies",
+            "description": "Traversal direction (default: dependencies).",
+            "enum": [
+              "dependencies",
+              "dependents",
+              "both"
+            ],
+            "type": "string"
+          },
+          "edge_kinds": {
+            "description": "Edge kinds to follow (empty = all kinds).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "max_nodes": {
+            "default": 200,
+            "description": "Node cap before truncation (default 200, max 1000).",
+            "maximum": 1000,
+            "type": "integer"
+          },
+          "symbol": {
+            "description": "Start symbol ID for the traversal.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "name": "TraverseGraph"
+    },
+    {
+      "description": "Transitive dependents of a symbol (reverse-reachability on Calls edges). Answers 'what breaks if I change this symbol?' Reports coverage: resolved dependents plus the count of unresolved call-site references that could not be bound (potential missing dependents).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "default": 8,
+            "description": "Maximum hop depth (default 8, max 24).",
+            "maximum": 24,
+            "type": "integer"
+          },
+          "symbol": {
+            "description": "Symbol ID whose transitive dependents to enumerate.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "name": "BlastRadius"
+    },
+    {
+      "description": "Return the exact source slice for a symbol (requires content to have been stored during indexing). Returns the raw source text extracted from the symbol's byte span, plus file:line for provenance. Returns found=false (no error) when the symbol is absent or its file content has not been stored.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "symbol": {
+            "description": "Stable symbol ID whose source slice to fetch.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "name": "FetchContent"
+    },
+    {
+      "description": "One-shot context bundle for a symbol: resolves the seed (by id or by name/FTS query), gathers its graph neighbours (callers + callees), ranks them by personalised PageRank, and returns the seed plus the top neighbours as token-budgeted elided stubs packed within a character budget. Replaces orchestrating SearchEntity + TraverseGraph + ContextPack by hand \u2014 use it to fill an agent's context window in a single call.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "budget": {
+            "default": 8000,
+            "description": "Character budget for the packed context (default 8000, hard-capped below the ~25K agent limit).",
+            "maximum": 24000,
+            "type": "integer"
+          },
+          "query": {
+            "description": "Name / FTS text to resolve the seed (alternative to 'symbol'); the top hit is used.",
+            "type": "string"
+          },
+          "symbol": {
+            "description": "Stable symbol ID of the seed (alternative to 'query').",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "ContextBundle"
+    },
+    {
+      "description": "List the rules-engine RuleSet nodes in the graph with the code that invokes them, plus counts of individual Rule nodes (grouped vs ungrouped). Use this to discover what business rules engines and conformance rules are present; use rules.recall for faceted, severity-ordered recall of the Rule nodes themselves. Returns: {engines: [{name, kind, file, invoked_by: [code_files]}], total, rule_nodes: {total, in_rule_sets, ungrouped}}",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {},
+        "type": "object"
+      },
+      "name": "RulesInventory"
+    },
+    {
+      "description": "Recall the conformance rules (native Rule nodes, PAT-*/POL-* ids) that apply to a query slice. language/layer/framework are wildcard facets (a rule without the facet applies to all values), severity/rule_type are exact, scope restricts to a scope subtree by prefix. Results are severity-ordered (critical\u2192info) then id. Read-only: rules are authored via git-tracked docs + `wicked-core rules ingest`, never over MCP.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "framework": {
+            "description": "Wildcard facet: match rules targeting this framework OR rules with no framework facet.",
+            "type": "string"
+          },
+          "language": {
+            "description": "Wildcard facet: match rules targeting this language OR rules with no language facet. Omit to match all.",
+            "type": "string"
+          },
+          "layer": {
+            "description": "Wildcard facet: match rules targeting this layer OR rules with no layer facet.",
+            "type": "string"
+          },
+          "limit": {
+            "default": 100,
+            "description": "Result cap (default 100, max 500). Truncation is reported in diagnostics.",
+            "maximum": 500,
+            "type": "integer"
+          },
+          "rule_type": {
+            "description": "Exact match on rule type (PAT-* pattern / POL-* policy).",
+            "enum": [
+              "pattern",
+              "policy"
+            ],
+            "type": "string"
+          },
+          "scope": {
+            "description": "Restrict to a scope subtree by canonical path prefix (e.g. \"wiki:architecture\").",
+            "type": "string"
+          },
+          "severity": {
+            "description": "Exact match on rule severity.",
+            "enum": [
+              "info",
+              "warn",
+              "error",
+              "critical"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "rules.recall"
+    },
+    {
+      "description": "Most central symbols by PageRank over Calls+Imports edges. Answers 'what are the load-bearing symbols here?' \u2014 the code the most paths flow through. Use to orient in an unfamiliar repo, pick refactor targets, or seed a change-impact review. Optionally bias toward `seeds` for a personalized (subsystem-local) ranking.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 20,
+            "description": "How many top-ranked symbols to return (default 20, max 200).",
+            "maximum": 200,
+            "type": "integer"
+          },
+          "seeds": {
+            "description": "Optional symbol IDs to bias the ranking toward (personalized PageRank). Omit for global PageRank.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "name": "RankHotspots"
+    },
+    {
+      "description": "Modularity (Louvain) communities over Calls+Imports edges, each summarized with its top-PageRank members and dominant files. Answers 'what are the natural subsystems here?' \u2014 clusters of symbols more tightly connected to each other than to the rest of the graph. Use to map an unfamiliar codebase into modules or scope a refactor to a cohesive unit.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "default": 20,
+            "description": "How many communities to return, largest first (default 20, max 200).",
+            "maximum": 200,
+            "type": "integer"
+          },
+          "min_size": {
+            "default": 2,
+            "description": "Drop communities smaller than this (default 2).",
+            "type": "integer"
+          },
+          "resolution": {
+            "default": 1.0,
+            "description": "Louvain resolution \u03b3 (default 1.0; > 1.0 yields smaller, tighter communities).",
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "name": "Communities"
+    },
+    {
+      "description": "Transitive dependencies of a symbol (forward-reachability on Calls+Imports edges). Answers 'what does this symbol depend on?' \u2014 the complement of BlastRadius. Use to understand the full dependency chain before a refactor or to build a change-impact picture from the dependency side.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "default": 8,
+            "description": "Maximum hop depth (default 8, max 24).",
+            "maximum": 24,
+            "type": "integer"
+          },
+          "symbol": {
+            "description": "Symbol ID whose transitive dependencies to enumerate.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "symbol"
+        ],
+        "type": "object"
+      },
+      "name": "Lineage"
+    },
+    {
+      "description": "Capture a new memory node (episodic/semantic/procedural/archival).",
+      "inputSchema": {
+        "properties": {
+          "about": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "content": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "working",
+              "episode",
+              "entity",
+              "fact",
+              "skill",
+              "archive"
+            ],
+            "type": "string"
+          },
+          "scope": {
+            "description": "Hierarchical scope path: slash-separated kind:id segments (e.g. \"org:acme/agent:claude\"). Empty, omitted, or null = root. Segments that are not kind:id pairs are rejected (invalid params), never silently dropped.",
+            "type": "string"
+          },
+          "tier": {
+            "enum": [
+              "working",
+              "episodic",
+              "semantic",
+              "procedural",
+              "archival"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "memory.capture"
+    },
+    {
+      "description": "Conversational recall: token-budgeted slice relevant to a query in scope. Each item carries memory_id, scope (the item's own hierarchical scope, e.g. org:acme/agent:claude), content, tier, and score. Default visibility is inheritance: memories at `scope` or an ANCESTOR of it. Pass scope_prefix to flip to subtree-inclusive visibility instead.",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "scope_prefix": {
+            "description": "Optional subtree filter: when present, candidates are memories whose scope equals this prefix or DESCENDS from it (same predicate as memory.erase/memory.coverage scope_prefix), REPLACING the ancestor-visible inheritance filter from `scope`. \"\" = root subtree = every memory. Omitted or null = inheritance behavior. A recall with a prefix previews exactly the set memory.erase with that prefix would delete.",
+            "type": "string"
+          },
+          "seeds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token_budget": {
+            "default": 2000,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "memory.recall"
+    },
+    {
+      "description": "Distil episodic memories in a scope into semantic facts (T2 tier). Returns distilled_facts list.",
+      "inputSchema": {
+        "properties": {
+          "scope": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory.reflect"
+    },
+    {
+      "description": "Hard-delete all memories whose scope starts with the given prefix.",
+      "inputSchema": {
+        "properties": {
+          "scope_prefix": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "scope_prefix"
+        ],
+        "type": "object"
+      },
+      "name": "memory.erase"
+    },
+    {
+      "description": "Store a semantic fact and link it to code symbols atomically.",
+      "inputSchema": {
+        "properties": {
+          "content": {
+            "description": "one specific, non-obvious fact",
+            "type": "string"
+          },
+          "scope": {
+            "description": "e.g. project:my-repo",
+            "type": "string"
+          },
+          "symbols": {
+            "description": "exact code symbol name(s) this fact concerns",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tier": {
+            "description": "semantic=fact/decision, procedural=how-it-works",
+            "enum": [
+              "semantic",
+              "procedural"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "symbols"
+        ],
+        "type": "object"
+      },
+      "name": "memory.learn"
+    },
+    {
+      "description": "Coverage: memory node counts (total, by tier, by kind), optionally scoped.",
+      "inputSchema": {
+        "properties": {
+          "scope_prefix": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "memory.coverage"
+    },
+    {
+      "description": "Ingest a document as doc + chunk nodes.",
+      "inputSchema": {
+        "properties": {
+          "chunks": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "chunks"
+        ],
+        "type": "object"
+      },
+      "name": "knowledge.ingest"
+    },
+    {
+      "description": "Write ONE knowledge node.",
+      "inputSchema": {
+        "properties": {
+          "class": {
+            "enum": [
+              "doc",
+              "section",
+              "chunk",
+              "concept"
+            ],
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "knowledge.write"
+    },
+    {
+      "description": "Add a typed relation between two knowledge nodes, with confidence + evidence_count + provenance.",
+      "inputSchema": {
+        "properties": {
+          "confidence": {
+            "type": "number"
+          },
+          "evidence_count": {
+            "description": "audit counter: confirmations/contradictions (default 0; non-negative, fits u32, else -32602)",
+            "maximum": 4294967295,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "provenance": {
+            "type": "string"
+          },
+          "rel": {
+            "type": "string"
+          },
+          "src": {
+            "type": "string"
+          },
+          "tgt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "src",
+          "tgt",
+          "rel"
+        ],
+        "type": "object"
+      },
+      "name": "knowledge.relate"
+    },
+    {
+      "description": "Hybrid recall (FTS + vector, RRF fused) over the knowledge base. Each item carries node_id, class, label, body_snippet, score, and source (provenance set at ingest, e.g. a file path or URL; empty string when not recorded). Pass scope_prefix to restrict recall to a scope subtree (the wiki convention scopes guidance as wiki:<area> with stable source URIs).",
+      "inputSchema": {
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "scope_prefix": {
+            "description": "Optional subtree filter: only knowledge whose scope equals this prefix or DESCENDS from it (same predicate as memory.recall scope_prefix, e.g. \"wiki:\" or \"wiki:architecture\"). \"\" = root subtree = everything. Omitted or null = no scope filtering.",
+            "type": "string"
+          },
+          "token_budget": {
+            "default": 2000,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "knowledge.recall"
+    },
+    {
+      "description": "Coverage: node counts per class, optionally within a scope subtree.",
+      "inputSchema": {
+        "properties": {
+          "class": {
+            "enum": [
+              "doc",
+              "section",
+              "chunk",
+              "concept"
+            ],
+            "type": "string"
+          },
+          "scope_prefix": {
+            "description": "Optional subtree filter (same predicate as knowledge.recall scope_prefix).",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "knowledge.coverage"
+    },
+    {
+      "description": "Link a knowledge node to estate code symbols via xedge.",
+      "inputSchema": {
+        "properties": {
+          "code_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "knowledge_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "knowledge_id",
+          "code_ids"
+        ],
+        "type": "object"
+      },
+      "name": "knowledge.relate_code"
+    },
+    {
+      "description": "Recall knowledge linked to code symbols (cross-store lookup).",
+      "inputSchema": {
+        "properties": {
+          "code_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "code_ids"
+        ],
+        "type": "object"
+      },
+      "name": "knowledge.recall_about_code"
+    }
+  ]
+}

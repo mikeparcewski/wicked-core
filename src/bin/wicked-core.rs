@@ -22,7 +22,9 @@
 //!       # shipped domain-extraction.json gate pins, so that drop-in runs instead of failing closed
 //!   wicked-core rules ingest <dir>               # populate governance policies (deny) + conformance
 //!       # rules (recall→obligation) into the store: <dir>/policies/*.json + <dir>/rules/*.json +
-//!       # frontmattered markdown rule docs anywhere under <dir> (AW-3 MarkdownAdapter)
+//!       # frontmattered markdown rule docs anywhere under <dir> (AW-3 MarkdownAdapter); doc
+//!       # frontmatter `domain:` groups its rules under a native RuleSet node with Contains
+//!       # membership (AW-13 — what RulesInventory lists)
 //!   wicked-core rules fanout <dir> \              # fan ONE ruleset out across the deliberate store
 //!       (--enforcement-db F | --enforcement-crew-api URL) \      # split (AW-5): enforcement copy
 //!       --discovery-db F [--discovery-db F]... \  # + discovery graph copies (one per live repo
@@ -1280,6 +1282,26 @@ fn rules_ingest_cmd(args: &[String]) {
         ));
         return;
     }
+    // Doctrine RuleSet grouping (AW-13 / arch-R9): frontmatter `domain:` selects the parent —
+    // mint one native RuleSet node per domain + Contains membership edges, AFTER the member
+    // rules landed above (a membership edge must never target a not-yet-written node).
+    let groupings = match wicked_governance::MarkdownAdapter::new(root).groupings() {
+        Ok(g) => g,
+        Err(e) => {
+            fail(&format!(
+                "rules ingest: reading RuleSet groupings under {root:?}: {e}"
+            ));
+            return;
+        }
+    };
+    let (n_rulesets, n_memberships) =
+        match wicked_governance::register_rule_sets(&mut store, &groupings) {
+            Ok(counts) => counts,
+            Err(e) => {
+                fail(&format!("rules ingest: register RuleSets failed: {e}"));
+                return;
+            }
+        };
     // A successful ingest also registers the governance schema-document nodes (one per schema
     // file, keyed by $id — schemas/README.md AW-3 seam), so the store's rules can reference the
     // contract version they were validated under. After the empty-population check: a refused
@@ -1293,7 +1315,8 @@ fn rules_ingest_cmd(args: &[String]) {
     };
     println!(
         "rules ingest: registered {n_policies} policies + {n_rules} conformance rules \
-         (+ {n_schemas} schema nodes) from {dir}"
+         (+ {n_rulesets} RuleSets / {n_memberships} memberships + {n_schemas} schema nodes) \
+         from {dir}"
     );
 }
 
