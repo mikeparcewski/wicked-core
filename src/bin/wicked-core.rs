@@ -178,7 +178,13 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          The AW-17 recall-REPORT: the conformance rules that APPLY to the query facets, \
          severity-ordered (critical→info), each citing rule id + provenance ref (the wiki URI a CI \
          comment links to). READ-ONLY, and strictly a report: exit 0 even when rules match (v1 of \
-         the CI conformance seam never blocks — arch-R15); 1 = operational error only.",
+         the CI conformance seam never blocks — arch-R15); 1 = operational error only.\n\
+         wicked-core rules scoreboard [--db <F>] [--dir <docs>] [--ambiguity-cap <N>] [--json]\n  \
+         The AW-23 population/connection scoreboard: % statements typed into enforcement classes \
+         (needs --dir — the class lives in doc frontmatter), % symbol_refs resolving at the current \
+         epoch, denial claims citing wiki rules (evidenced_by edges / Governs evidence_count), and \
+         recall volume (documented unavailable in-band — the store keeps no recall telemetry). \
+         READ-ONLY, strictly a report: exit 0 = report produced, 1 = operational error.",
     ),
 ];
 
@@ -352,6 +358,11 @@ fn main() {
         // rule citing id + provenance ref. Read-only (open_store_ro), safe beside a live daemon.
         Some("rules") if args.get(2).map(String::as_str) == Some("recall") => {
             return rules_recall_cmd(&args)
+        }
+        // `rules scoreboard` is the AW-23 population/connection scoreboard: typed %, resolving %,
+        // denials citing wiki rules. Read-only (open_store_ro), safe beside a live daemon.
+        Some("rules") if args.get(2).map(String::as_str) == Some("scoreboard") => {
+            return rules_scoreboard_cmd(&args)
         }
         _ => {}
     }
@@ -1955,4 +1966,140 @@ fn rules_recall_cmd(args: &[String]) {
             );
         }
     }
+}
+
+/// `wicked-core rules scoreboard [--db F] [--dir <docs>] [--ambiguity-cap N] [--json]` — the
+/// AW-23 / arch-R23 population/connection scoreboard: the report that tells a POPULATED wiki from
+/// an ingested-once-and-decaying one at a glance. Typed % is doc-side (`enforcement_class` lives
+/// in frontmatter, never on the rule node) so it needs the SAME `--dir` root `rules ingest` used;
+/// without it that metric reports unavailable, honestly, in-band. Strictly READ-ONLY
+/// (`open_store_ro`, safe beside a live single-writer daemon) and strictly a REPORT: exit 0 =
+/// report produced, 1 = operational error — residue gating stays `rules drift`'s job.
+fn rules_scoreboard_cmd(args: &[String]) {
+    let cap = ambiguity_cap(args);
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules scoreboard: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    let docs_dir = flag(args, "--dir");
+    // A `--dir` with no value must fail LOUD, never silently degrade to "typing unavailable" —
+    // the operator asked for the doc-side metric and would read the degraded report as truth.
+    if args.iter().any(|a| a == "--dir") && docs_dir.as_deref().is_none_or(|d| d.starts_with("--"))
+    {
+        fail(&format!(
+            "rules scoreboard: --dir has no value (resolved to {docs_dir:?})"
+        ));
+        return;
+    }
+    let store = match wicked_apps_core::open_store_ro(Some(&resolved_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!(
+                "rules scoreboard: open store read-only failed: {e}"
+            ));
+            return;
+        }
+    };
+
+    let report = match wicked_governance::scoreboard(
+        &store,
+        docs_dir.as_deref().map(std::path::Path::new),
+        cap,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("rules scoreboard: {e}"));
+            return;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("report serializes")
+        );
+        return;
+    }
+
+    // `None` = nothing to measure (0/0) — printed as such, never as 0% or 100%.
+    let pct = |p: Option<f64>| p.map_or_else(|| "n/a".to_string(), |v| format!("{v:.1}%"));
+    println!("rules scoreboard (store: {resolved_db})");
+    println!("  population");
+    println!(
+        "    rules: {} active, {} retired ({} total)",
+        report.rules_active, report.rules_retired, report.rules_total
+    );
+    let typing = &report.typing;
+    if typing.available {
+        let by_class = typing
+            .by_class
+            .iter()
+            .map(|(class, n)| format!("{class} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        println!(
+            "    statements typed into enforcement classes: {}/{} ({}){}",
+            typing.statements_typed,
+            typing.statements_total,
+            pct(typing.percent),
+            if by_class.is_empty() {
+                String::new()
+            } else {
+                format!("  [{by_class}]")
+            }
+        );
+        for doc in &typing.docs_untyped {
+            println!("      UNTYPED {doc} — no enforcement_class in its frontmatter");
+        }
+    } else {
+        println!(
+            "    statements typed: unavailable — {}",
+            typing.reason.as_deref().unwrap_or("(no reason recorded)")
+        );
+    }
+    println!("  connection");
+    println!(
+        "    symbol_refs resolving at current epoch: {}/{} ({}){}",
+        report.connection.refs_resolving,
+        report.connection.rules_with_ref,
+        pct(report.connection.percent),
+        if report.connection.refs_unresolvable > 0 {
+            format!(
+                "  ({} unresolvable — `rules drift` names them)",
+                report.connection.refs_unresolvable
+            )
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "    rules with live Governs links: {}",
+        report.connection.rules_linked
+    );
+    println!("  enforcement evidence");
+    println!(
+        "    denials citing wiki rules: {} distinct deny claim(s), {} evidenced_by edge(s)",
+        report.evidence.denial_claims, report.evidence.evidenced_by_edges
+    );
+    println!(
+        "    rules cited by at least one denial: {}",
+        report.evidence.rules_evidenced
+    );
+    println!(
+        "    Governs evidence_count total: {}",
+        report.evidence.governs_evidence_total
+    );
+    for row in &report.evidence.per_rule {
+        println!(
+            "      {}: {} denial claim(s), governs evidence {}",
+            row.rule_id, row.denial_claims, row.governs_evidence
+        );
+    }
+    println!(
+        "  recall volume: unavailable — {}",
+        report.recall_volume.reason
+    );
 }

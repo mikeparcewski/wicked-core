@@ -39,6 +39,7 @@ mod provenance;
 mod relink;
 mod ruleset;
 mod schemas;
+mod scoreboard;
 
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
@@ -50,6 +51,19 @@ pub use engine::{
 pub use conformance::{
     recall_rules, register_rule, retire_rule, Compliance, ConfSeverity, ConformanceRule,
     RuleProvenance, RuleQuery, RuleType, Targets,
+};
+
+// Enforcement evidence (AW-23, the aw14 verifier's flagged follow-up): a recorded denial writes
+// `evidenced_by` edges back to the rules it cites and increments `evidence_count` on their
+// derived Governs edges — `conform` calls this on every deny claim.
+pub use conformance::{record_rule_evidence, RuleEvidenceReport, CONFORMANCE_RULE, EVIDENCED_BY};
+
+// Population/connection scoreboard (AW-23 / arch-R23): is the wiki populated and connected, or
+// ingested-once-and-decaying? Aggregates typing coverage, ref resolution at the current epoch,
+// and the enforcement evidence above; recall volume is documented unavailable in-band.
+pub use scoreboard::{
+    scoreboard, ConnectionCoverage, EnforcementEvidence, RecallVolume, RuleEvidenceRow, Scoreboard,
+    TypingCoverage,
 };
 
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).

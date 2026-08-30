@@ -18,10 +18,10 @@
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
-    synthetic_symbol, Edge, EdgeKind, FromNode, GraphRead, GraphStore, Language, Location,
-    Metadata, Node, NodeKind, Span, SymbolId, ToNode, SYMBOL_SCHEME,
+    synthetic_symbol, ConformanceClaim, Decision, Edge, EdgeKind, FromNode, GraphRead, GraphStore,
+    Language, Location, Metadata, Node, NodeKind, Span, SymbolId, ToNode, SYMBOL_SCHEME,
 };
-use wicked_estate_core::{Confidence, Provenance, SymbolQuery};
+use wicked_estate_core::{Confidence, Direction, Provenance, SymbolQuery};
 
 /// Symbol-namespace prefix for conformance-rule symbols (the synthetic id; the NODE kind is the
 /// native [`NodeKind::Rule`]).
@@ -285,6 +285,161 @@ pub fn retire_rule(store: &mut dyn GraphStore, id: &str) -> anyhow::Result<bool>
     store.commit_batch()?;
     let _ = crate::events::emit_rule_retired(&rule);
     Ok(true)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enforcement evidence — evidenced_by edges + the Governs evidence_count bump (AW-23 / arch-R23)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Edge-kind spelling for the claim → rule enforcement-evidence edge. Stringly (`EdgeKind::Other`)
+/// by design: both endpoints are wicked-apps synthetic nodes, so the native code-lane vocabulary
+/// pin (AW-19 — native `Governs` for code targets) does not claim it, and estate has no native
+/// variant for "this claim is the enforcement evidence for that rule". The spelling is the
+/// program-wide vocabulary from arch-R13a/R23 (`evidenced_by`).
+pub const EVIDENCED_BY: &str = "evidenced_by";
+
+/// What [`record_rule_evidence`] did for one claim — every cited rule is accounted for, nothing
+/// is silently dropped (a missing rule node is REPORTED, never an error: a claim replayed onto a
+/// store that never held the rule must not fail conformance recording).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RuleEvidenceReport {
+    /// Rule ids the claim's `conform:<severity>:<id>:<statement>` obligations cite (deduped,
+    /// citation order).
+    pub cited: Vec<String>,
+    /// Rules that got a NEW `evidenced_by` edge (and whose Governs edges were bumped).
+    pub evidenced: Vec<String>,
+    /// Rules this claim had already evidenced (same claim re-conformed — idempotent, no
+    /// double-count).
+    pub already_recorded: Vec<String>,
+    /// Cited ids with no conformance-rule node in this store (reported, never an error).
+    pub missing: Vec<String>,
+    /// How many rule → code `Governs` edges had their `evidence_count` incremented.
+    pub governs_bumped: usize,
+}
+
+/// Does `id` have the conformance-rule wire shape (`^(PAT|POL)-[0-9]{3,6}$`, INV-C1)? Used to pick
+/// rule citations out of obligation text without ever treating free-form obligation prose as an id.
+fn is_rule_id_shape(id: &str) -> bool {
+    ["PAT-", "POL-"].iter().any(|p| {
+        id.strip_prefix(p).is_some_and(|ord| {
+            (3..=6).contains(&ord.len()) && ord.bytes().all(|b| b.is_ascii_digit())
+        })
+    })
+}
+
+/// The conformance-rule ids a claim cites, parsed from the `conform:<severity>:<id>:<statement>`
+/// obligations the recall→gate wiring attaches (`attach_recalled_rules` in wicked-core). Deduped,
+/// citation order; anything not shaped like a rule id is skipped (an obligation is free text —
+/// only the exact wire shape counts as a citation).
+fn cited_rule_ids(claim: &ConformanceClaim) -> Vec<String> {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for obligation in &claim.obligations {
+        let Some(rest) = obligation.strip_prefix("conform:") else {
+            continue;
+        };
+        // <severity>:<id>:<statement> — the statement may itself contain ':', so split at most 3.
+        let mut parts = rest.splitn(3, ':');
+        let _severity = parts.next();
+        let Some(id) = parts.next() else { continue };
+        if is_rule_id_shape(id) && seen.insert(id) {
+            out.push(id.to_string());
+        }
+    }
+    out
+}
+
+/// Record the enforcement evidence a recorded DENIAL carries back onto the rules it cites — the
+/// aw14 verifier's flagged follow-up (arch-R13a → arch-R23): `evidence_count` was initialized to 0
+/// by [`ConformanceRule::governs_edge`] and never incremented, so an enforced rule and a decaying
+/// one looked identical on the graph.
+///
+/// For each rule the deny claim's `conform:` obligations cite (and that exists in this store):
+///
+/// 1. write ONE `claim → rule` [`EVIDENCED_BY`] edge (`EdgeKind::Other("evidenced_by")`,
+///    `evidence_count = 1` — the claim IS one independent confirmation that the rule enforces);
+/// 2. increment `evidence_count` on every existing `rule → code` [`EdgeKind::Governs`] edge the
+///    relink pass derived — the audit counter estate defines as "how many times this relationship
+///    has been independently confirmed".
+///
+/// Idempotent per claim: claim ids are content-addressed (same context ⇒ same claim), so a
+/// re-conformed claim finds its own `evidenced_by` edge and bumps nothing twice. Distinct denials
+/// citing the same rule each count once. Non-deny claims are a no-op — the metric is DENIALS
+/// citing wiki rules (arch-R23), not recall breadth.
+///
+/// Call AFTER the claim node is committed ([`crate::conform`] does): both edge endpoints must
+/// exist or the edges would dangle and be pruned by estate's `compact`. A cited rule with no node
+/// in this store is reported in [`RuleEvidenceReport::missing`], never an error.
+pub fn record_rule_evidence(
+    store: &mut dyn GraphStore,
+    claim: &ConformanceClaim,
+) -> anyhow::Result<RuleEvidenceReport> {
+    let mut report = RuleEvidenceReport {
+        cited: cited_rule_ids(claim),
+        ..Default::default()
+    };
+    if claim.decision != Decision::Deny || report.cited.is_empty() {
+        return Ok(report);
+    }
+
+    let claim_sym = crate::engine::claim_symbol(&claim.claim_id);
+    // The rules this claim already evidenced (same claim re-conformed) — the idempotence read.
+    let already: std::collections::BTreeSet<SymbolId> = store
+        .neighbors(&claim_sym, Direction::Dependencies)?
+        .into_iter()
+        .filter(|e| matches!(&e.kind, EdgeKind::Other(k) if k.as_str() == EVIDENCED_BY))
+        .map(|e| e.target)
+        .collect();
+
+    let mut edges: Vec<Edge> = Vec::new();
+    for id in report.cited.clone() {
+        let rule_sym = synthetic_symbol(CONFORMANCE_RULE, &id);
+        // Same guard as recall: only OUR conformance rules (native Rule kind at the synthetic
+        // symbol) count — a foreign node at that address is "missing", never a write target.
+        let is_ours = store
+            .get_node(&rule_sym)?
+            .is_some_and(|n| n.kind == NodeKind::Rule);
+        if !is_ours {
+            report.missing.push(id);
+            continue;
+        }
+        if already.contains(&rule_sym) {
+            report.already_recorded.push(id);
+            continue;
+        }
+        edges.push(Edge {
+            source: claim_sym.clone(),
+            target: rule_sym.clone(),
+            kind: EdgeKind::Other(EVIDENCED_BY.to_string()),
+            // The citation is exact (the claim literally names the rule id) — not a heuristic.
+            confidence: Confidence::new(1.0),
+            provenance: Provenance::Extractor(OUTGOV_EXTRACTOR.to_string()),
+            resolved_by: CONFORMANCE_RESOLVED_BY.to_string(),
+            location: None,
+            metadata: Metadata::new(),
+            evidence_count: 1,
+        });
+        // Bump the audit counter on the rule's derived Governs edges. The store's upsert keeps
+        // the incoming row when `evidence_count` grows (estate 0.14.5 merge rule), so the bump
+        // lands even at equal confidence.
+        for mut governs in store
+            .neighbors(&rule_sym, Direction::Dependencies)?
+            .into_iter()
+            .filter(|e| e.kind == EdgeKind::Governs)
+        {
+            governs.evidence_count += 1;
+            edges.push(governs);
+            report.governs_bumped += 1;
+        }
+        report.evidenced.push(id);
+    }
+
+    if !edges.is_empty() {
+        store.begin_batch()?;
+        store.upsert_edges(&edges)?;
+        store.commit_batch()?;
+    }
+    Ok(report)
 }
 
 /// A recall query slice. Any `None` field matches every value of that facet.
@@ -794,5 +949,84 @@ mod tests {
             "a rule with no `retired` key must read back as active and stay enforceable"
         );
         assert!(!recalled[0].retired);
+    }
+
+    fn claim(id: &str, decision: Decision, obligations: Vec<String>) -> ConformanceClaim {
+        ConformanceClaim {
+            claim_id: id.to_string(),
+            scope: "repo:test".into(),
+            phase: "build".into(),
+            policy_ids: vec![],
+            decision,
+            obligations,
+            evaluated_context_ref: "sha256:test".into(),
+            criteria: String::new(),
+            evaluator_identity: "wicked-governance@test".into(),
+            evaluated_at: 1_750_000_000,
+        }
+    }
+
+    /// Only the exact `conform:<severity>:<id>:<statement>` wire shape counts as a citation —
+    /// free-form obligation prose, non-conform prefixes, and id-shaped text in the statement
+    /// position must never be treated as rule ids.
+    #[test]
+    fn record_rule_evidence_only_counts_denials_and_real_citations() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-100",
+                RuleType::Pattern,
+                ConfSeverity::Error,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        let obligations = vec![
+            "conform:Error:PAT-100:statement for PAT-100".to_string(), // real citation
+            "conform:Error:PAT-100:statement for PAT-100".to_string(), // duplicate — deduped
+            "conform:Info:PAT-999:never registered".to_string(),       // missing, reported
+            "conform:Info:not-an-id:free text".to_string(),            // malformed id — skipped
+            "advise:soft obligation POL-777".to_string(),              // not conform: — skipped
+            "conform:oops".to_string(),                                // too few parts — skipped
+        ];
+
+        // A non-deny claim is a NO-OP: the metric is denials citing wiki rules, not recall breadth.
+        let allowed = record_rule_evidence(
+            &mut store,
+            &claim("c-allow", Decision::Allow, obligations.clone()),
+        )
+        .unwrap();
+        assert_eq!(allowed.evidenced, Vec::<String>::new());
+        assert_eq!(allowed.governs_bumped, 0);
+
+        let denied =
+            record_rule_evidence(&mut store, &claim("c-deny", Decision::Deny, obligations))
+                .unwrap();
+        assert_eq!(
+            denied.cited,
+            vec!["PAT-100", "PAT-999"],
+            "deduped, id-shaped only"
+        );
+        assert_eq!(denied.evidenced, vec!["PAT-100"]);
+        assert_eq!(denied.missing, vec!["PAT-999"], "reported, never an error");
+        assert_eq!(denied.already_recorded, Vec::<String>::new());
+        assert_eq!(
+            denied.governs_bumped, 0,
+            "no Governs edges without a resolved target"
+        );
+
+        // Same claim replayed: its evidenced_by edge already exists — nothing double-counts.
+        let replay = record_rule_evidence(
+            &mut store,
+            &claim(
+                "c-deny",
+                Decision::Deny,
+                vec!["conform:Error:PAT-100:statement for PAT-100".to_string()],
+            ),
+        )
+        .unwrap();
+        assert_eq!(replay.already_recorded, vec!["PAT-100"]);
+        assert_eq!(replay.evidenced, Vec::<String>::new());
     }
 }

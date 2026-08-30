@@ -406,6 +406,15 @@ pub fn conform(store: &mut dyn GraphStore, claim: &ConformanceClaim) -> anyhow::
     }
     store.commit_batch()?;
 
+    // AW-23 (the aw14 verifier's flagged follow-up): a recorded DENIAL that cites conformance
+    // rules (`conform:<severity>:<id>:<statement>` obligations, attached by the recall→gate
+    // wiring) writes one `evidenced_by` edge claim → rule per cited rule and increments
+    // `evidence_count` on the rule's derived Governs edges — the enforcement signal
+    // `rules scoreboard` aggregates. After the claim commit so both edge endpoints exist;
+    // same-store writes, so a failure is a store failure and propagates (fail-closed). Non-deny
+    // claims and claims citing nothing are a no-op inside.
+    crate::conformance::record_rule_evidence(store, claim)?;
+
     // COARSE, fire-and-forget: counts/ids only. A bus failure must NOT fail conformance recording —
     // the durable record is the claim node we just committed.
     let payload = serde_json::json!({
