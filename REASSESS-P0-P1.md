@@ -1,3 +1,4 @@
+<!-- historical-doc: July-2026 P0+P1 adversarial-review record, kept as written -->
 # P0+P1 Adversarial Review + Reassessment
 
 ## Review verdicts
