@@ -1,3 +1,4 @@
+<!-- historical-doc: July-2026 orchestrator-build session handoff, kept as written (predates the Phase-6 retirements) -->
 # wicked-core — session handoff
 
 ## ⭐ Orchestrator build (current thrust) — see `ORCHESTRATOR.md`

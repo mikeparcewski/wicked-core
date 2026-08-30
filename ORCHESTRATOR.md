@@ -1,3 +1,4 @@
+<!-- historical-doc: July-2026 orchestrator design record (P0-P7 era), kept as written (predates the Phase-6 retirements) -->
 # AGENTIC-CLI ORCHESTRATOR DASHBOARD — Design (FINAL)
 
 ## 1. North star
