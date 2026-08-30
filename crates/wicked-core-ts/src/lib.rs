@@ -112,6 +112,26 @@ fn event_to_json(ev: &CoreEvent) -> serde_json::Value {
     ev.to_json()
 }
 
+/// Compute the AW-23 population/connection scoreboard over the store at `db_path` — the SAME JSON
+/// document `wicked-core rules scoreboard --json` emits (the pretty-printed
+/// [`wicked_governance::Scoreboard`] serde form), so a crew/studio consumer and a CLI operator
+/// read ONE report shape. Opens a fresh READ-ONLY connection (`open_store_ro`), the same
+/// discipline as the other governance reads — safe beside the single-writer actor.
+///
+/// A free function (not a `Core` method body) so the test below can drive the binding's exact
+/// code path against a temp store without constructing a napi `Core`.
+fn scoreboard_json(
+    db_path: &str,
+    docs_dir: Option<&str>,
+    ambiguity_cap: usize,
+) -> napi::Result<String> {
+    let store = wicked_apps_core::open_store_ro(Some(db_path)).map_err(err)?;
+    let report =
+        wicked_governance::scoreboard(&store, docs_dir.map(std::path::Path::new), ambiguity_cap)
+            .map_err(err)?;
+    serde_json::to_string_pretty(&report).map_err(err)
+}
+
 // ── the AsyncTask that runs one blocking Core call off the Node loop ──────────
 
 /// A single blocking Core call, run on a libuv worker thread. Holds a boxed closure so one Task type
@@ -1023,6 +1043,36 @@ impl Core {
                 }
             }
             serde_json::to_string(&claims).map_err(err)
+        })
+    }
+
+    /// The AW-23 / arch-R23 population/connection scoreboard — the wiki-health report that tells
+    /// a POPULATED rule corpus from an ingested-once-and-decaying one: rule counts, typing
+    /// coverage, connection (ref-resolution) coverage, enforcement evidence, recall volume.
+    /// Resolves to the SAME JSON `wicked-core rules scoreboard --json` emits (a pretty-printed
+    /// `Scoreboard` object) — one report shape for CLI operators and crew/studio consumers alike.
+    ///
+    /// `docsDir` mirrors the CLI's `--dir`: typing coverage is doc-side (`enforcement_class`
+    /// lives in frontmatter, never on the rule node), so it needs the SAME docs root
+    /// `rules ingest --dir` used; omit it and the report says `typing.available: false`,
+    /// honestly, in-band — never a fake 0% or 100%. `ambiguityCap` mirrors `--ambiguity-cap`
+    /// (default 5; must be ≥ 1 — fails closed on 0, like the CLI). Strictly a REPORT over a
+    /// read-only connection: it never blocks the single-writer actor, and residue gating stays
+    /// `rules drift`'s job.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn governance_scoreboard(
+        &self,
+        docs_dir: Option<String>,
+        ambiguity_cap: Option<u32>,
+    ) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            let cap = match ambiguity_cap {
+                None => wicked_governance::DEFAULT_AMBIGUITY_CAP,
+                Some(0) => return Err(err("ambiguityCap must be a positive integer, got 0")),
+                Some(n) => n as usize,
+            };
+            scoreboard_json(&db_path, docs_dir.as_deref(), cap)
         })
     }
 
@@ -2100,5 +2150,86 @@ mod tests {
         assert_eq!(def.nodes[1].run_spec.workflow_id, None);
         // And the validator core runs at launch accepts this def (no cycle, endpoints exist).
         wicked_core::validate_campaign(&def).expect("a valid def validates");
+    }
+
+    /// AC (wiki scoreboard binding): [`scoreboard_json`] — the exact code path
+    /// `governanceScoreboard` runs on the libuv worker thread — returns valid scoreboard JSON
+    /// over a temp store, in the SAME shape `wicked-core rules scoreboard --json` emits (the
+    /// `Scoreboard` serde form). Key drift here is a wire break for every crew/studio consumer
+    /// AND a CLI-parity break, so the exact top-level key set is pinned.
+    #[test]
+    fn governance_scoreboard_reports_over_a_temp_store() {
+        // Hermetic spool: `register_rule`'s fire-and-forget emission must never append to the
+        // operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` (the same
+        // set-once-never-unset pattern as wicked-governance's own `hermetic_test_spool`).
+        static SPOOL: std::sync::Once = std::sync::Once::new();
+        SPOOL.call_once(|| {
+            let path = std::env::temp_dir().join(format!(
+                "wicked-core-ts-test-outbox-{}.ndjson",
+                std::process::id()
+            ));
+            std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &path);
+        });
+
+        // A file-backed temp store (`:memory:` cannot be shared with the binding's fresh
+        // read-only connection), populated through the real write path.
+        let db = std::env::temp_dir().join(format!(
+            "wicked-core-ts-scoreboard-{}.db",
+            std::process::id()
+        ));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(db.with_extension(format!("db{suffix}")));
+        }
+        let db_path = db.to_str().expect("temp path is utf-8").to_string();
+        {
+            let mut store = wicked_apps_core::open_store(Some(&db_path)).expect("store opens");
+            let rule = wicked_governance::ConformanceRule {
+                id: "POL-100".into(),
+                rule_type: wicked_governance::RuleType::Policy,
+                statement: "single-writer only".into(),
+                severity: wicked_governance::ConfSeverity::Critical,
+                confidence: 0.9,
+                targets: wicked_governance::Targets::default(),
+                symbol_ref: None,
+                compliance: None,
+                provenance: wicked_governance::RuleProvenance::default(),
+                retired: false,
+            };
+            wicked_governance::register_rule(&mut store, &rule).expect("rule registers");
+        }
+
+        let json = scoreboard_json(&db_path, None, wicked_governance::DEFAULT_AMBIGUITY_CAP)
+            .expect("scoreboard over a temp store");
+        let v: Value = serde_json::from_str(&json).expect("binding emits valid JSON");
+
+        // The CLI report's exact top-level key set (`Scoreboard`'s serde form), order-insensitive
+        // (serde_json's default Map is sorted; the pin must not depend on that).
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "connection",
+                "evidence",
+                "recall_volume",
+                "rules_active",
+                "rules_retired",
+                "rules_total",
+                "typing",
+            ]
+        );
+        assert_eq!(v["rules_total"], 1);
+        assert_eq!(v["rules_active"], 1);
+        assert_eq!(v["rules_retired"], 0);
+        // No docs root supplied → typing coverage reports unavailable IN-BAND (the doc-side
+        // metric needs the same `--dir` root `rules ingest` used), never a fabricated percent.
+        assert_eq!(v["typing"]["available"], false);
+        // Recall volume is documented-unavailable in-band (see wicked-governance's scoreboard docs).
+        assert_eq!(v["recall_volume"]["available"], false);
     }
 }
