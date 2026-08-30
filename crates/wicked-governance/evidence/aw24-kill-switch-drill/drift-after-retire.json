@@ -1,0 +1,40 @@
+{
+  "orphaned": [],
+  "uningested": [],
+  "unresolvable": [
+    {
+      "rule_id": "PAT-1701",
+      "symbol_ref": "crates/wicked-estate-core/src/conformance.rs::graph_store_suite",
+      "failure": {
+        "kind": "unresolved"
+      }
+    },
+    {
+      "rule_id": "PAT-1702",
+      "symbol_ref": "crates/wicked-estate-resolve/src/lib.rs::resolve_all_with_coverage",
+      "failure": {
+        "kind": "unresolved"
+      }
+    },
+    {
+      "rule_id": "PAT-1703",
+      "symbol_ref": "crates/wicked-estate-core/src/edge.rs::Edge",
+      "failure": {
+        "kind": "unresolved"
+      }
+    },
+    {
+      "rule_id": "POL-1704",
+      "symbol_ref": "crates/wicked-estate-core/src/conformance.rs::graph_store_suite",
+      "failure": {
+        "kind": "unresolved"
+      }
+    }
+  ],
+  "unlinked": [],
+  "extraneous": [],
+  "rules_checked": 36,
+  "docs_scanned": 7,
+  "skipped_retired": 0,
+  "docs_checked": true
+}

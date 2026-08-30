@@ -364,6 +364,12 @@ fn main() {
         Some("rules") if args.get(2).map(String::as_str) == Some("scoreboard") => {
             return rules_scoreboard_cmd(&args)
         }
+        // `rules retire` is the AW-24 kill switch: manifest-keyed retirement propagated across
+        // every fan-out lane in one op. Writes cli lane stores directly (brief sole writer, like
+        // ingest/fanout); a daemon-held store is recorded PENDING, never written.
+        Some("rules") if args.get(2).map(String::as_str) == Some("retire") => {
+            return rules_retire_cmd(&args)
+        }
         _ => {}
     }
 
@@ -2102,4 +2108,182 @@ fn rules_scoreboard_cmd(args: &[String]) {
         "  recall volume: unavailable — {}",
         report.recall_volume.reason
     );
+}
+
+/// `wicked-core rules retire (--id ID)... [--doc PATH]... --manifest M.json [--out receipt.json]`
+/// — the AW-24 / arch-R22 bad-rule kill switch. OPERATOR-ONLY (arch-R22 item 1 — no agent
+/// self-retirement; a worker that dislikes a rule argues in the run transcript, not the rule
+/// store): one manifest-keyed operation retires the enforcement copy, every discovery-graph copy,
+/// and marks the knowledge rationale non-normative, then re-opens each cli lane FRESH and verifies
+/// the withdrawn state through the consumer read path. `--doc` retires every rule the manifest
+/// derived from that doc path — the deleted-doc → explicit-retire bridge (`rules drift` reports
+/// the orphans; this clears them; drift then counts them as `skipped_retired`, the healed state).
+fn rules_retire_cmd(args: &[String]) {
+    const VALUE_FLAGS: &[&str] = &["--id", "--doc", "--manifest", "--out"];
+    for name in VALUE_FLAGS {
+        for v in flag_all(args, name) {
+            if v.starts_with("--") {
+                fail(&format!(
+                    "rules retire: {name} has no value (resolved to {v:?}) — refusing a \
+                     flag-shaped argument"
+                ));
+                return;
+            }
+        }
+    }
+
+    let manifest_path = match flag(args, "--manifest") {
+        Some(m) => m,
+        None => {
+            fail(
+                "rules retire requires the fan-out manifest the rule was imported with: \
+                 wicked-core rules retire (--id <RULE-ID>)... [--doc <PATH>]... --manifest \
+                 <M.json> [--out <receipt.json>] — retirement is manifest-keyed (arch-R22) so ONE \
+                 op reaches every lane copy",
+            );
+            return;
+        }
+    };
+    let manifest_text = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => t,
+        Err(e) => {
+            fail(&format!("rules retire: cannot read {manifest_path}: {e}"));
+            return;
+        }
+    };
+    let manifest: wicked_governance::FanoutManifest = match serde_json::from_str(&manifest_text) {
+        Ok(m) => m,
+        Err(e) => {
+            fail(&format!(
+                "rules retire: {manifest_path} is not a fan-out manifest: {e}"
+            ));
+            return;
+        }
+    };
+
+    // The retire set: explicit --id values, plus every rule the manifest derived from each --doc.
+    // A --doc matching NOTHING fails loud — "I retired the deleted doc's rules" must never be
+    // claimable when zero rules were actually selected (the silent-orphan shape in reverse).
+    let mut ids = flag_all(args, "--id");
+    for doc in flag_all(args, "--doc") {
+        let derived = wicked_governance::select_doc_rules(&manifest, &doc);
+        if derived.is_empty() {
+            fail(&format!(
+                "rules retire: --doc {doc:?} matches no rule source in {manifest_path} — check \
+                 the path against the manifest rows' `source` refs (path component, no @sha / \
+                 #anchor). No store was modified."
+            ));
+            return;
+        }
+        println!("rules retire: --doc {doc} → {}", derived.join(", "));
+        ids.extend(derived);
+    }
+    if ids.is_empty() {
+        fail("rules retire: nothing to retire — pass --id <RULE-ID> and/or --doc <PATH>");
+        return;
+    }
+
+    // NEVER the CLI against a daemon-held store — same fence as `rules fanout`, applied to every
+    // cli target the SELECTED manifest rows would write. A daemon-held enforcement lane already
+    // travels as transport crew-api (recorded pending); a fenced discovery/knowledge path means
+    // the manifest itself was authored against the wrong store.
+    let mut fenced_targets: Vec<String> = Vec::new();
+    if manifest.enforcement.transport == "cli" {
+        fenced_targets.push(manifest.enforcement.target.clone());
+    }
+    for id in &ids {
+        if let Some(entry) = manifest.rules.get(id) {
+            fenced_targets.extend(entry.discovery.iter().cloned());
+            fenced_targets.extend(entry.knowledge.iter().map(|k| {
+                k.split_once("#kchunk:")
+                    .map_or(k.as_str(), |(db, _)| db)
+                    .to_string()
+            }));
+        }
+    }
+    for path in &fenced_targets {
+        if let Some(fence) = daemon_fenced(path) {
+            fail(&format!(
+                "rules retire: {path:?} resolves under the crew daemon's state home ({fence}) — a \
+                 daemon-held store is never CLI-written (single-writer invariant); retire that \
+                 lane over DELETE /api/v1/governance/rules/<id> instead"
+            ));
+            return;
+        }
+    }
+
+    let receipt = match wicked_governance::retire_from_manifest(
+        &manifest,
+        &manifest_path,
+        &ids,
+        now_secs(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("rules retire: {e}"));
+            return;
+        }
+    };
+
+    println!(
+        "rules retire: {} id(s) across the manifest's lanes",
+        receipt.requested.len()
+    );
+    for retirement in &receipt.retirements {
+        println!("  {} ({})", retirement.id, retirement.kind);
+        for lane in &retirement.lanes {
+            let status = match lane.status {
+                wicked_governance::LaneStatus::Retired => "RETIRED",
+                wicked_governance::LaneStatus::AlreadyRetired => "ALREADY-RETIRED",
+                wicked_governance::LaneStatus::Absent => "ABSENT (audit note in receipt)",
+                wicked_governance::LaneStatus::Pending => "PENDING (crew API)",
+                wicked_governance::LaneStatus::Failed => "FAILED",
+            };
+            println!(
+                "    {:<11} [{}] {} — {}{}",
+                lane.lane,
+                lane.transport,
+                lane.target,
+                status,
+                if lane.verified { ", verified" } else { "" }
+            );
+            if lane.status == wicked_governance::LaneStatus::Failed
+                || lane.status == wicked_governance::LaneStatus::Pending
+            {
+                if let Some(note) = &lane.note {
+                    println!("      {note}");
+                }
+            }
+        }
+    }
+
+    let receipt_path = flag(args, "--out").unwrap_or_else(|| "retire-receipt.json".into());
+    let json = match serde_json::to_string_pretty(&receipt) {
+        Ok(j) => j,
+        Err(e) => {
+            fail(&format!("rules retire: serialize receipt: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&receipt_path, json) {
+        fail(&format!("rules retire: cannot write {receipt_path}: {e}"));
+        return;
+    }
+    println!("  receipt → {receipt_path}");
+
+    if receipt.pending > 0 {
+        println!(
+            "  {} lane(s) PENDING: complete the crew-api DELETE(s) above, then verify via \
+             GET <crew>/governance/rules/preview — the kill switch is NOT fully propagated until \
+             then",
+            receipt.pending
+        );
+    }
+    if !receipt.all_cli_lanes_verified {
+        fail(
+            "rules retire: one or more lanes FAILED verification (see receipt) — the rule may \
+             still be recallable somewhere a governed run reads; re-run after fixing the named \
+             lane, and treat the estate as UNGOVERNED for this rule until the receipt verifies",
+        );
+    }
 }

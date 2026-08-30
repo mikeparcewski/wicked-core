@@ -26,7 +26,9 @@
 //! READ-ONLY, the gate hook's own open), so what it proves is the durable state the next process
 //! (the worker) will actually see. Any missing copy fails the
 //! whole fan-out LOUD — a partial import that reads as "governed" is the exact fail-open this
-//! contract exists to prevent. Addition only: retirement propagation is AW-24 (arch-R22).
+//! contract exists to prevent. This pass is addition-only; the retirement twin is
+//! [`crate::retire_from_manifest`] (AW-24 / arch-R22) — the manifest emitted here is the key both
+//! directions share.
 //!
 //! ## `scope: workspace` (AW-6 / arch-R20)
 //!
@@ -334,6 +336,29 @@ fn write_graph_lane(
     Ok(())
 }
 
+/// Invalidate consumers' versioned response caches after a graph-lane rules write.
+///
+/// The estate MCP caches graph read-tool responses — `rules.recall` among them — in the store's
+/// own `cache` table, keyed on the `graph_version` meta row (estate #102): a cached response is
+/// served only while the version it was stored at is still current. estate's indexer bumps the
+/// version on every re-index, but a rules write from THIS process is an external writer the MCP
+/// never sees — without a bump, a worker's `rules.recall` keeps serving the pre-write ruleset
+/// for as long as the cache row lives (the AW-24 drill caught exactly this: a retired rule still
+/// recalled through the MCP because the pre-retire response was version-cached). So every
+/// graph-lane rules write in this crate ends with `bump_version` — the same invalidation
+/// protocol the indexer follows.
+pub(crate) fn bump_graph_version(
+    store: &mut wicked_apps_core::SqliteStore,
+    db: &str,
+) -> anyhow::Result<()> {
+    store.bump_version().map_err(|e| {
+        anyhow::anyhow!(
+            "bump graph_version on {db:?} after the rules write: {e} — a stale versioned \
+             rules.recall response could outlive this write; refusing to report the lane done"
+        )
+    })
+}
+
 /// Smoke a graph-lane store through the SAME read paths a governed run uses: `recall_rules` (what
 /// the gate's recall→obligation step and the MCP `rules.recall` serve) must return every expected
 /// rule id, every doctrine RuleSet parent must round-trip as a native `NodeKind::RuleSet` node
@@ -466,6 +491,8 @@ pub fn fanout(
                     .map_err(|e| anyhow::anyhow!("enforcement lane: open {db:?}: {e}"))?;
                 write_graph_lane(&mut store, load, true)
                     .map_err(|e| anyhow::anyhow!("enforcement lane {db:?}: {e}"))?;
+                bump_graph_version(&mut store, db)
+                    .map_err(|e| anyhow::anyhow!("enforcement lane: {e}"))?;
             } // write handle dropped before the smoke re-open
               // Re-open READ-ONLY — the exact open the gate hook itself performs (`open_store_ro`,
               // no WAL pragma, no schema DDL), so the smoke cannot repair what it is verifying.
@@ -506,6 +533,8 @@ pub fn fanout(
                 .map_err(|e| anyhow::anyhow!("discovery lane: open {db:?}: {e}"))?;
             write_graph_lane(&mut store, load, false)
                 .map_err(|e| anyhow::anyhow!("discovery lane {db:?}: {e}"))?;
+            bump_graph_version(&mut store, db)
+                .map_err(|e| anyhow::anyhow!("discovery lane: {e}"))?;
         }
         // Read-only re-open, same reasoning as the enforcement smoke.
         let store = wicked_apps_core::open_store_ro(Some(db))
@@ -692,6 +721,60 @@ mod tests {
         };
         let err = fanout(&load, &targets, "ruleset", 1_750_000_000).expect_err("lane 3 required");
         assert!(err.to_string().contains("knowledge"), "{err}");
+    }
+
+    /// A fan-out is an external write the estate MCP never sees: any `rules.recall` response it
+    /// version-cached BEFORE the import must go stale, or a worker keeps recalling the old
+    /// ruleset. Twin of the retire-side test (`retire::tests`) — both directions of the
+    /// manifest-keyed contract bump the store's graph version.
+    #[test]
+    fn fanout_invalidates_the_stores_versioned_response_cache() {
+        crate::events::hermetic_test_spool();
+        let dir = std::env::temp_dir().join(format!("wg-fanout-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rules")).unwrap();
+        std::fs::write(
+            dir.join("rules/bundle.json"),
+            serde_json::json!({ "rules": [
+                { "id": "PAT-001", "rule_type": "pattern", "statement": "no plaintext secrets",
+                  "severity": "critical", "confidence": 0.95,
+                  "provenance": { "ref": "wiki://secure#PAT-001", "source_kinds": ["doc"] } }
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+
+        let enforcement = dir.join("gov.db").to_string_lossy().into_owned();
+        let discovery = dir.join("graph.db").to_string_lossy().into_owned();
+        let knowledge = dir.join("k.db").to_string_lossy().into_owned();
+        // A consumer cached a response BEFORE the import (both graph lanes).
+        for db in [&enforcement, &discovery] {
+            let mut store = open_store(Some(db)).unwrap();
+            store
+                .cache_put("rules.recall/{}", "pre-import cached response")
+                .unwrap();
+        }
+
+        let load = load_ruleset(&dir).unwrap();
+        let targets = FanoutTargets {
+            scope: FanoutScope::Repo,
+            enforcement: EnforcementTarget::Cli {
+                db: enforcement.clone(),
+            },
+            discovery_dbs: vec![discovery.clone()],
+            knowledge_dbs: vec![knowledge],
+            knowledge_scope: "wiki:governance".to_string(),
+        };
+        fanout(&load, &targets, "ruleset", 1_750_000_000).unwrap();
+
+        for db in [&enforcement, &discovery] {
+            let store = open_store(Some(db)).unwrap();
+            assert_eq!(
+                store.cache_get("rules.recall/{}").unwrap(),
+                None,
+                "{db}: a pre-import cached response must go stale after the fan-out"
+            );
+        }
     }
 
     #[test]
