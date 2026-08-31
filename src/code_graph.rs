@@ -323,7 +323,7 @@ pub(crate) fn classify_code_graph_db_at(
     db: &Path,
     estate_root: Option<&Path>,
 ) -> Option<CodeGraphHome> {
-    if !db.is_absolute() || !db.file_name().is_some_and(|n| n == CODE_GRAPH_DB_FILE) {
+    if !db.is_absolute() || db.file_name().is_none_or(|n| n != CODE_GRAPH_DB_FILE) {
         return None;
     }
     let dir = db.parent()?;

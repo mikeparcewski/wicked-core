@@ -1639,50 +1639,16 @@ pub fn count_claims(store: &dyn GraphRead, claim_id: &str) -> anyhow::Result<usi
 /// Parse Claude's PreToolUse event `{ "tool_name", "tool_input": { … } }` into the governance
 /// evaluation context (ported from `wicked-agent/src/inject.rs`). `tool_input` keys vary by tool:
 /// `Bash{command}`, `Write{file_path,content}`, `Edit{file_path,new_string}`, `Read{file_path}`, …
+///
+/// A thin delegate: the ONE implementation lives in `wicked_governance::pretool_context`, shared
+/// with `rules eval` — the eval replays corpus samples through this exact projection, and a
+/// second copy here is how an eval would quietly diverge from the gate it claims to measure.
 pub(crate) fn claude_pretool_context(
     raw: &str,
     scope: &str,
     phase: &str,
 ) -> (serde_json::Value, String) {
-    let v: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(serde_json::Value::Null);
-    let tool = v
-        .get("tool_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let input = v
-        .get("tool_input")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    let get = |k: &str| {
-        input
-            .get(k)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    };
-    let command = get("command");
-    let path = get("file_path")
-        .or_else(|| get("path"))
-        .or_else(|| get("notebook_path"));
-    let content = get("content")
-        .or_else(|| get("new_string"))
-        .or_else(|| get("new_str"));
-    let work = command
-        .clone()
-        .or_else(|| content.clone())
-        .or_else(|| path.clone())
-        .unwrap_or_else(|| tool.clone());
-    let context = serde_json::json!({
-        "phase": phase,
-        "scope": scope,
-        "tool": tool,
-        "command": command,
-        "path": path,
-        "content": content,
-        "args": input,
-        "work": work,
-    });
-    (context, tool)
+    wicked_governance::pretool_context(raw, scope, phase)
 }
 
 /// Environment variables the launcher may set to scope OUTPUT-governance recall to the produced

@@ -91,6 +91,16 @@ pub use gate_hook::{
     ESTATE_DB_ENV, GATE_DB_ENV, GATE_PHASE_ENV, GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION,
     GATE_SCOPE_ENV,
 };
+// Governance evals — the JSON-string seams the core-ts binding wraps 1:1
+// (`core.governanceEvals(argsJson)` / `core.governanceCorpusImport(argsJson)`); the report and
+// receipt JSON these return are the pinned crew `/testing/evals` wire contract, passed through
+// verbatim. Typed surface (samples/report/corpus sources) rides along for in-process callers.
+pub use wicked_governance::{
+    governance_corpus_import, governance_evals, import_corpus as governance_import_corpus,
+    load_corpus as governance_load_corpus, run_evals as governance_run_evals, CorpusSource,
+    EvalReport, EvalSample, ImportReceipt,
+};
+
 pub use graph_browser::{
     browse_nodes, graph_kinds, list_node_notes, node_detail, NeighborEdge, NodeDetail, NodeNote,
     NodeSummary, SymbolAnnotation,

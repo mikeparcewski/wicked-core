@@ -38,6 +38,14 @@
 //!       # unresolvable refs are REPORTED as drift, never dropped. With --knowledge/--xedge (or
 //!       # $WICKED_KNOWLEDGE_DB/$WICKED_XEDGE_DB) also writes knowledge→code about-xedges
 //!       # (the knowledge.relate_code seam) for docs ingested into the knowledge domain
+//!   wicked-core rules eval [--corpus <evals:scope | dir>] [--type <t>] [--db <F>] \
+//!       [--knowledge-db <F>] [--json]              # replay a behavior corpus through the REAL
+//!       # SELECT→DECIDE gate path and score caught/gap/false-positive per sample; gaps carry
+//!       # nearest non-firing rules by embedding similarity (facet-only keyword hints, marked,
+//!       # when no usable embeddings exist). Read-only on the rules store.
+//!   wicked-core rules eval --import <name> [<dir>] [--knowledge-db <F>]   # ingest a corpus into
+//!       # the estate knowledge store under evals:<name> (id-keyed, WITH embeddings) and print
+//!       # the {imported, scope, embedded} receipt
 //!   wicked-core rules drift [--dir <docs>] [--json]  # report the residue re-ingest can't self-heal
 //!       # (AW-10): orphaned / uningested / unresolvable / unlinked / extraneous; read-only; exits 3
 //!       # when residue is found (0 clean, 1 operational error) — run with the same --dir as ingest
@@ -201,7 +209,21 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          (needs --dir — the class lives in doc frontmatter), % symbol_refs resolving at the current \
          epoch, denial claims citing wiki rules (evidenced_by edges / Governs evidence_count), and \
          recall volume (documented unavailable in-band — the store keeps no recall telemetry). \
-         READ-ONLY, strictly a report: exit 0 = report produced, 1 = operational error.",
+         READ-ONLY, strictly a report: exit 0 = report produced, 1 = operational error.\n\
+         wicked-core rules eval [--corpus <evals:scope | dir>] [--type <steering-type>] \
+         [--db <rules.db>] [--knowledge-db <F>] [--json]\n  \
+         Replay a behavior corpus (default: the built-in dev-behaviors corpus) through the REAL \
+         SELECT→DECIDE gate path against the rules in --db: a bad sample a blocking rule fires for \
+         is CAUGHT, one nothing fires for is a GAP (with nearest non-firing rules by embedding \
+         similarity over the knowledge store's rule-rationale chunks — degrades HONESTLY to \
+         facet-only keyword hints, marked on the report, when no usable embeddings exist), and a \
+         good sample a blocking rule fires for is a FALSE POSITIVE. READ-ONLY on the rules store, \
+         strictly a report: exit 0 = report produced (gaps included), 1 = operational error.\n\
+         wicked-core rules eval --import <name> [<dir>] [--knowledge-db <F>]\n  \
+         Ingest a corpus (a dir of sample *.json, or the built-in corpus when <dir> is omitted) \
+         into the estate KNOWLEDGE store under scope evals:<name>, id-keyed WITH embeddings, and \
+         print the {imported, scope, embedded} receipt. WRITES to the knowledge store only \
+         (default ~/.wicked-estate/knowledge.db — always overridable via --knowledge-db).",
     ),
 ];
 
@@ -391,6 +413,12 @@ fn main() {
         // ingest/fanout); a daemon-held store is recorded PENDING, never written.
         Some("rules") if args.get(2).map(String::as_str) == Some("retire") => {
             return rules_retire_cmd(&args)
+        }
+        // `rules eval` replays a behavior corpus through the REAL SELECT→DECIDE gate path and
+        // scores caught/gap/false-positive per sample. Read-only on the rules store
+        // (open_store_ro, daemon-safe); `--import` is the one write path (knowledge store only).
+        Some("rules") if args.get(2).map(String::as_str) == Some("eval") => {
+            return rules_eval_cmd(&args)
         }
         _ => {}
     }
@@ -2283,6 +2311,180 @@ fn rules_scoreboard_cmd(args: &[String]) {
 /// the withdrawn state through the consumer read path. `--doc` retires every rule the manifest
 /// derived from that doc path — the deleted-doc → explicit-retire bridge (`rules drift` reports
 /// the orphans; this clears them; drift then counts them as `skipped_retired`, the healed state).
+/// `wicked-core rules eval …` — the governance eval lane. Two modes:
+/// - default: replay a behavior corpus through the REAL SELECT→DECIDE gate path against the rules
+///   in `--db` and score caught/gap/false-positive per sample. READ-ONLY (`open_store_ro`,
+///   daemon-safe) and strictly a report: exit 0 = report produced (gaps included), 1 = operational
+///   error — the eval measures the ruleset, it does not gate on it.
+/// - `--import <name> [<dir>]`: ingest a corpus into the estate KNOWLEDGE store under
+///   `evals:<name>` (id-keyed, WITH embeddings) — the one write path, and it never touches the
+///   rules store.
+fn rules_eval_cmd(args: &[String]) {
+    // The value-taking flags this subcommand knows; the import <dir> is the first non-flag token
+    // after `rules eval` (index 3+) — the same walk `rules ingest` uses, so `--import x /dir` and
+    // `/dir --import x` both resolve.
+    const VALUE_FLAGS: &[&str] = &["--db", "--knowledge-db", "--corpus", "--type", "--import"];
+    let positional = || -> Option<String> {
+        let mut i = 3;
+        while i < args.len() {
+            let a = &args[i];
+            if a.starts_with("--") {
+                let has_value = VALUE_FLAGS.contains(&a.as_str())
+                    && args.get(i + 1).is_some_and(|v| !v.starts_with("--"));
+                i += if has_value { 2 } else { 1 };
+            } else {
+                return Some(a.clone());
+            }
+        }
+        None
+    };
+    // Flag-shaped-value guard (same posture as ingest/recall): a missing value must fail loud,
+    // never be read as the next flag.
+    let guarded = |name: &str| -> Option<String> {
+        let v = flag(args, name)?;
+        if v.starts_with("--") {
+            fail(&format!(
+                "rules eval: {name} has no value (resolved to {v:?})"
+            ));
+        }
+        Some(v)
+    };
+
+    let knowledge_db =
+        guarded("--knowledge-db").unwrap_or_else(wicked_governance::default_knowledge_db);
+
+    // ── import mode: corpus → estate knowledge store, receipt out ──
+    if let Some(name) = guarded("--import") {
+        let source = match positional() {
+            Some(dir) => wicked_governance::CorpusSource::Dir(std::path::PathBuf::from(dir)),
+            None => wicked_governance::CorpusSource::Builtin,
+        };
+        let samples = match wicked_governance::load_corpus(&source, Some(&knowledge_db)) {
+            Ok(s) => s,
+            Err(e) => {
+                fail(&format!("rules eval --import: {e}"));
+                return;
+            }
+        };
+        match wicked_governance::import_corpus(&knowledge_db, &name, &samples, now_secs()) {
+            Ok(receipt) => println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).expect("receipt serializes")
+            ),
+            Err(e) => fail(&format!("rules eval --import: {e}")),
+        }
+        return;
+    }
+
+    // ── eval mode ──
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules eval: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    let source = match guarded("--corpus") {
+        None => wicked_governance::CorpusSource::Builtin,
+        Some(c) if c.starts_with(wicked_governance::EVAL_SCOPE_PREFIX) => {
+            wicked_governance::CorpusSource::Scope(c)
+        }
+        Some(c) => {
+            let p = std::path::PathBuf::from(&c);
+            if p.is_dir() {
+                wicked_governance::CorpusSource::Dir(p)
+            } else {
+                fail(&format!(
+                    "rules eval: --corpus {c:?} is neither an evals:<name> knowledge scope nor an \
+                     existing directory of sample *.json files"
+                ));
+                return;
+            }
+        }
+    };
+    let steering_type = guarded("--type");
+    let samples = match wicked_governance::load_corpus(&source, Some(&knowledge_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules eval: {e}"));
+            return;
+        }
+    };
+    let store = match wicked_apps_core::open_store_ro(Some(&resolved_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules eval: open store read-only failed: {e}"));
+            return;
+        }
+    };
+    let report = match wicked_governance::run_evals(
+        &store,
+        &samples,
+        steering_type.as_deref(),
+        Some(&knowledge_db),
+        now_secs(),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(&format!("rules eval: {e}"));
+            return;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        // The serde output IS the wire contract — printed verbatim (pretty for terminals).
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("report serializes")
+        );
+        return;
+    }
+    let s = &report.summary;
+    let degraded = match &report.degraded {
+        Some(d) => format!(" [hints degraded: {d}]"),
+        None => String::new(),
+    };
+    println!(
+        "rules eval: {} sample(s) — {} caught, {} gap(s), {} false positive(s){degraded} \
+         (rules store: {resolved_db})",
+        s.total, s.caught, s.gaps, s.false_positives
+    );
+    for r in &report.results {
+        let tag = match r.verdict {
+            wicked_governance::Verdict::Caught => "CAUGHT",
+            wicked_governance::Verdict::Gap => "GAP   ",
+            wicked_governance::Verdict::FalsePositive => "FALSE+",
+        };
+        let mut line = format!(
+            "  {tag}  {} ({}, {})",
+            r.sample.id,
+            r.sample.steering_type,
+            match r.sample.kind {
+                wicked_governance::SampleKind::Good => "good",
+                wicked_governance::SampleKind::Bad => "bad",
+            }
+        );
+        if !r.fired.is_empty() {
+            line.push_str(&format!(" — fired: {}", r.fired.join(", ")));
+        }
+        if let Some(nearest) = &r.nearest_rules {
+            if nearest.is_empty() {
+                line.push_str(" — no nearby rules");
+            } else {
+                let hints: Vec<String> = nearest
+                    .iter()
+                    .map(|n| format!("{} ({:.3})", n.rule_id, n.similarity))
+                    .collect();
+                line.push_str(&format!(" — nearest: {}", hints.join(", ")));
+            }
+        }
+        println!("{line}");
+    }
+    if s.total == 0 {
+        println!("  no samples matched — check --type / --corpus");
+    }
+}
+
 fn rules_retire_cmd(args: &[String]) {
     const VALUE_FLAGS: &[&str] = &["--id", "--doc", "--manifest", "--out"];
     for name in VALUE_FLAGS {
