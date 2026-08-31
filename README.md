@@ -39,16 +39,18 @@ re-opens or races on the shared DB.
 - **napi-rs Node/TS bindings** (`wicked-core-ts`) so JS/TS callers — the crew daemon and
   [wicked-studio](https://github.com/mikeparcewski/wicked-studio) (the Studio HITL UI, now its own repo) — drive runs and consume the event stream.
 
-## The architecture wiki
+## Steering
 
-wicked-core also carries the **graph-backed architecture wiki**: ecosystem doctrine authored as
-frontmattered markdown, projected into the estate graph as recallable, citable conformance rules
+wicked-core also carries **Steering**, the ecosystem's governance surface: one steering-rule
+model across seven steering types (architecture, development, security, testing, operations,
+compliance, design-ux), authored as frontmattered markdown in git or through the governed
+studio/crew surface, projected into the estate graph as recallable, citable rules
 (`crates/wicked-governance` owns the schemas, the `wicked-core rules
 ingest/fanout/relink/drift/recall/scoreboard/retire` CLI, and the seed corpus). Agents recall it
-via the estate MCP's `rules.recall`/`knowledge.recall`, humans manage it in wicked-studio, CI
-comments with it on PRs. Start here:
-**[crates/wicked-governance/WIKI.md](./crates/wicked-governance/WIKI.md)** — the operator guide
-from "never heard of it" to seeded and recalling.
+via the estate MCP's `rules.recall`/`knowledge.recall` (read-only), humans manage it in
+wicked-studio's Steering section, CI comments with it on PRs. Start here:
+**[crates/wicked-governance/STEERING.md](./crates/wicked-governance/STEERING.md)** — the
+operator guide from "never heard of it" to seeded and recalling.
 
 ## Audience
 

@@ -4,6 +4,7 @@ title: "MCP surface doctrine: JSON-RPC everywhere, read-only rules"
 status: active
 date: 2026-08-29
 enforcement_class: guidance
+steering_type: architecture
 scope: wiki:architecture
 domain: mcp-surface
 applies_to: [plan, build, review]

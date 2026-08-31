@@ -1,11 +1,13 @@
 # AW-13 seed corpus — ingest runbook
 
-> New to the wiki? Start with the operator guide, **[../WIKI.md](../WIKI.md)** — what the wiki
-> is, how to author/consume/retire rules, and the quickstart. This README is the seed-run
-> runbook it links to.
+> New to Steering? Start with the operator guide, **[../STEERING.md](../STEERING.md)** — what
+> Steering is (the unified governance surface this corpus seeds), the seven steering types,
+> the four management flows, and the quickstart. This README is the seed-run runbook it links
+> to.
 
-The value-ordered doctrine seed of the graph-backed architecture wiki (estate ADR-011,
-arch-R9), packaged as data + a repeatable driver over the shipped `wicked-core rules`
+The value-ordered doctrine seed of Steering's doc-ingest lane — the graph-backed corpus
+historically named "the architecture wiki" (estate ADR-011, arch-R9) — packaged as data + a
+repeatable driver over the shipped `wicked-core rules`
 machinery. Nothing here is a new parse path: every rule materializes through the
 MarkdownAdapter → `normalize_bundle` fail-closed pipeline, groups under a `NodeKind::RuleSet`
 parent via frontmatter `domain:` (AW-13), fans out across the deliberate store split (AW-5/AW-6),
@@ -16,7 +18,7 @@ and relinks to enforcing code by qualified `symbol_ref` (AW-9).
 | Path | What |
 |---|---|
 | `manifest.json` | THE SEED MANIFEST — doctrine source list with per-source `enforcement_class`, RuleSet grouping, upstream digests, lanes, and the P-4 assumption for `TARGET-ARCHITECTURE.md` |
-| `corpus/*.md` | Frontmattered rule docs (seed projections of upstream doctrine that is not itself adapter-ingestable); estate's ADR-001..012 are staged verbatim beside them at run time (`adr/`) |
+| `corpus/*.md` | Frontmattered rule docs (seed projections of upstream doctrine that is not itself adapter-ingestable), each typed with a `steering_type:` (`architecture` for the plane/storage/engine/event/mcp docs, `development` for agent-behavior/cross-platform/universal-donts); estate's ADR-001..012 are staged verbatim beside them at run time (`adr/`) |
 | `seed_wiki.py` | The repeatable driver: stage → index → fanout → relink → drift → bulk knowledge → recall proof, scratch stores only |
 | `gen_event_catalog.py` | AW-21 generated views: regenerates the event-catalog TABLES (`wicked-core/EVENTS.md` + the marker block in `wicked-bus/reqs/SPEC.md`) from the machine-readable producer seams; `--check` = staleness gate, `--drift [--json]` = declared-vs-emitted query |
 | `event-catalog-annotations.json` | Curated trigger/payload prose merged into the generated catalog rows (keys must match scanned event types — unknown keys fail generation) |
@@ -69,7 +71,7 @@ rule came back from `rules.recall` **with** a provenance ref, and every scoped
 
 Seeding the **real** stores (crew daemon enforcement lane over `--enforcement-crew-api`, one
 discovery replica per live repo graph, the estate knowledge store) is the same `rules fanout`
-pointed at production targets — runbook in [../WIKI.md](../WIKI.md) § "Seed it".
+pointed at production targets — runbook in [../STEERING.md](../STEERING.md) § "Seed & fan out".
 
 ## Assumptions this seed documents (rather than hides)
 

@@ -20,11 +20,16 @@ Every recalled rule cites its id (`PAT-`/`POL-`, INV-C1) and its provenance ref
 
 ## Conventions
 
-- **Git is the source of truth** (arch-R8): a pack changes only by doc PR — there is deliberately
-  no `rules.write` MCP tool, and no agent-side promotion path. The graph copy is a rebuildable
-  projection; `rules ingest` is idempotent and id-keyed, so re-ingest on merge is a non-event.
+- **Git is the source of truth for a pack** (arch-R8): a pack changes only by doc PR — there is
+  deliberately no `rules.write` MCP tool, and no agent-side promotion path. The graph copy is a
+  rebuildable projection; `rules ingest` is idempotent and id-keyed, so re-ingest on merge is a
+  non-event. (Steering's other authoring lane — governed UI/chat writes through wicked-crew's
+  API — is first-class for daemon-held rules, but a PACK rule's home is its doc: provenance
+  `path@sha#id` says so. See `crates/wicked-governance/STEERING.md`.)
 - **One doc = one doctrine area**, frontmatter carries `id`, `title`, `status`,
-  `enforcement_class` (policy | validator | guidance, arch-R4) and optional `applies_to`
+  `enforcement_class` (policy | validator | guidance, arch-R4), `steering_type` (one of the
+  seven steering types — architecture | development | security | testing | operations |
+  compliance | design-ux; omitted defaults to `architecture`) and optional `applies_to`
   phase ids. Rule items live under a `## Rules` section: `` - `POL-NNNN` (severity): statement ``.
   Prose everywhere else is rationale — ignored by the rule parser, ingestable into the knowledge
   lane via garden mem-ingest.
@@ -37,6 +42,6 @@ Every recalled rule cites its id (`PAT-`/`POL-`, INV-C1) and its provenance ref
 
 ## Packs
 
-| Pack | Doctrine | Enforcing gate |
-|---|---|---|
-| [`phase-scope/`](phase-scope/phase-scope.md) | Pre-build phases write documentation only (phase-scope write-denies) | `engine:pre-build-scope` (`gate_hook::phase_scope_denial`, core#306) + completion-path `phase_scope_warning` backstop |
+| Pack | Steering type | Doctrine | Enforcing gate |
+|---|---|---|---|
+| [`phase-scope/`](phase-scope/phase-scope.md) | `operations` | Pre-build phases write documentation only (phase-scope write-denies) | `engine:pre-build-scope` (`gate_hook::phase_scope_denial`, core#306) + completion-path `phase_scope_warning` backstop |

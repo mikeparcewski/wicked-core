@@ -4,6 +4,7 @@ title: "ENGINE-CONTRACT invariants: the doc-to-gate exemplar pairing"
 status: active
 date: 2026-08-29
 enforcement_class: validator
+steering_type: architecture
 scope: wiki:architecture
 domain: storage-doctrine
 applies_to: [build, review]

@@ -4,6 +4,7 @@ title: "Universal Don'ts (estate engineering doctrine)"
 status: active
 date: 2026-08-29
 enforcement_class: guidance
+steering_type: development
 scope: wiki:architecture
 domain: engineering-doctrine
 applies_to: [build, review]
