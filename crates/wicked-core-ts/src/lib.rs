@@ -3095,7 +3095,7 @@ mod tests {
         let bad_type = wicked_core::governance_evals(
             &serde_json::json!({ "type": "archtecture", "dbPath": db_path,
                                  "knowledgeDb": know_db })
-                .to_string(),
+            .to_string(),
         )
         .expect_err("a typo'd steering type must reject");
         assert!(
