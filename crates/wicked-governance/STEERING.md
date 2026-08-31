@@ -413,3 +413,16 @@ Both report commands are read-only (`open_store_ro`) — safe to run beside a li
 rhythm that keeps steering honest: **re-index → relink → drift → scoreboard**, a doc PR
 merge → re-ingest, and UI/chat writes audited as they land. Lifecycle events
 (`wicked.estate.rule.ingested/retired/…`, AW-22) ride the bus seam for observers.
+
+---
+
+## Test it — evals
+
+The scoreboard says the corpus is populated and connected; it cannot say whether the rules
+would actually **catch** anything. **Evals** replay a corpus of realistic dev behaviors
+(`good` and `bad` samples) against the rule store and verdict each one
+`caught` / `gap` / `false_positive` — gaps are the product working: they name the behaviors
+your rules do not cover yet, with nearest-rule hints. CLI: `wicked-core rules eval`; crew:
+`POST /api/v1/testing/evals/run` + `POST /api/v1/testing/corpora/import`; humans:
+studio's **Testing** nav. Full guide (sample format, pinned wire contract, degrade
+semantics): **[TESTING.md](./TESTING.md)**.
