@@ -378,6 +378,27 @@ export declare class Core {
    */
   upsertConformanceRule(ruleJson: string): Promise<string>
   /**
+   * STEERING batch import (the unified steering-rule model). `batch_json` is a JSON
+   * `{ default_type: string | null, entries: [...] }` document where each entry is either a
+   * frontmattered markdown doc (`{ kind: "doc", name?, content }` — parsed by the SAME
+   * MarkdownAdapter/normalize path `rules ingest --dir` runs, provenance `path@sha#id` refs
+   * included) or a ready rule object (`{ kind: "rule", rule }` — the rule JSON passes to the
+   * upsert path un-projected, so new model fields ride through without a rebuild).
+   * `default_type` is applied as the `steering_type` of every rule whose entry omits one; a
+   * rule that names its own type keeps it.
+   *
+   * Fail-closed PER ENTRY: a bad entry (unparseable doc, invalid rule, INV violation,
+   * duplicate id within the batch) rejects ALONE with its reason — the rest still land; only
+   * a malformed batch envelope rejects the whole call. Every write goes through the
+   * single-writer actor (validate + `register_rule`). Resolves to a JSON array of per-entry
+   * results, batch order: `{ index, name?, status: "imported" | "rejected", ids?, error? }`
+   * (`ids` = the rule ids the entry minted — a doc can mint several; a rejected entry mints
+   * none). This binding is also crew's PRESENCE SENTINEL for the whole steering seam
+   * (`steeringSupported()`): it ships with the unified model, so its existence tells crew the
+   * engine round-trips the steering fields instead of silently dropping them.
+   */
+  steeringImport(batchJson: string): Promise<string>
+  /**
    * Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
    * append-only, so a mis-authored policy denied forever).
    *

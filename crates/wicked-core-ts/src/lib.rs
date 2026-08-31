@@ -288,6 +288,230 @@ fn list_rule_sets_json(db_path: &str) -> napi::Result<String> {
     serde_json::to_string(&rows).map_err(err)
 }
 
+/// Per-entry outcome of a steering import batch — the row shape crew's
+/// `SteeringImportResult` wire type reads (`index` into the submitted batch, the doc entry's
+/// `name` when one was given, `status`, the minted rule `ids` on `imported`, the reason on
+/// `rejected`). `None` fields are elided so the wire spells absence as an absent key.
+#[derive(serde::Serialize)]
+struct SteeringEntryResult {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ids: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Materialize one doc entry's inline markdown through the REAL ingest read path — the
+/// [`wicked_governance::MarkdownAdapter`] over a throwaway temp dir — so a steering import and
+/// `rules ingest --dir` share one parse convention (frontmatter grammar, `## Rules` item shape,
+/// provenance `path@sha#id` refs, git-blob sha). Returns the adapter's raw JSON bundle
+/// (`{ doc, rules }`); rule materialization stays in [`wicked_governance::normalize_bundle`].
+///
+/// Content that does not open with a `---` frontmatter fence is a HARD error here: the adapter
+/// (rightly) skips fence-less files when sweeping a directory, but an import entry names its doc
+/// explicitly — silently minting zero rules would read as success.
+fn fetch_doc_bundle(name: Option<&str>, content: &str) -> anyhow::Result<serde_json::Value> {
+    use wicked_governance::SourceAdapter;
+    // Process-unique + call-unique dir: imports run concurrently on libuv worker threads.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "wicked-core-ts-steering-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("steering import: cannot create temp dir {dir:?}: {e}"))?;
+    let file = dir.join(doc_file_name(name));
+    let fetched = std::fs::write(&file, content)
+        .map_err(|e| anyhow::anyhow!("steering import: cannot write doc to {file:?}: {e}"))
+        .and_then(|()| wicked_governance::MarkdownAdapter::new(&dir).fetch());
+    let _ = std::fs::remove_dir_all(&dir); // best-effort cleanup either way
+    let mut docs = fetched?;
+    if docs.is_empty() {
+        anyhow::bail!(
+            "not a frontmattered rule doc — the content must open with a `---` frontmatter fence"
+        );
+    }
+    Ok(docs.remove(0))
+}
+
+/// The temp-dir filename a doc entry lands under — it becomes the `path` half of every minted
+/// rule's provenance ref (`<path>@<blob sha>#<id>`), so the caller's `name` is preserved where
+/// it is a safe plain filename. Sanitized (no separators, no leading dot — the adapter skips
+/// dot-entries) and forced to `.md` (the adapter only reads `*.md`).
+fn doc_file_name(name: Option<&str>) -> String {
+    let base = name.unwrap_or("entry").trim();
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let mut cleaned = cleaned.trim_start_matches('.').to_string();
+    if cleaned.is_empty() {
+        cleaned = "entry".into();
+    }
+    if !cleaned.to_ascii_lowercase().ends_with(".md") {
+        cleaned.push_str(".md");
+    }
+    cleaned
+}
+
+/// Import ONE batch entry; `Ok` carries the minted rule ids, `Err` the rejection reason. All
+/// writes go through the single-writer actor (`Core::upsert_conformance_rule` — validate +
+/// `register_rule`); this function NEVER opens the store itself.
+///
+/// `minted` is the batch-scoped id ledger: a rule id an EARLIER entry already minted rejects
+/// this entry (INV-C3 translated to per-entry form — within one batch the later write would
+/// silently overwrite the earlier at `conformance_rule/<id>`, the exact hazard ingest's
+/// cross-document check exists to catch). Re-importing an id that already exists ON THE STORE
+/// stays a legitimate idempotent upsert.
+fn import_steering_entry(
+    core: &wicked_core::Core,
+    entry: &serde_json::Value,
+    default_type: Option<&str>,
+    minted: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    let kind = entry
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("entry has no `kind` (expected \"doc\" or \"rule\")"))?;
+    match kind {
+        // Doc lane: MarkdownAdapter parse → default steering_type where the doc omitted one →
+        // the SAME normalize/validate path `rules ingest --dir` runs → actor upsert per rule.
+        "doc" => {
+            let content = entry
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("doc entry has no string `content`"))?;
+            let name = entry.get("name").and_then(serde_json::Value::as_str);
+            let mut doc = fetch_doc_bundle(name, content)?;
+            if let Some(ty) = default_type {
+                // Doc-level `steering_type:` frontmatter already rode onto each raw rule; only
+                // rules the doc left untyped take the batch default.
+                if let Some(rules) = doc
+                    .get_mut("rules")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for rule in rules.iter_mut() {
+                        if let Some(obj) = rule.as_object_mut() {
+                            obj.entry("steering_type")
+                                .or_insert_with(|| serde_json::Value::String(ty.to_string()));
+                        }
+                    }
+                }
+            }
+            let rules = wicked_governance::normalize_bundle(&doc, "markdown")?;
+            // Whole-entry checks BEFORE the first write, so a rejected entry mints nothing.
+            for rule in &rules {
+                if minted.contains(&rule.id) {
+                    anyhow::bail!(
+                        "rule id {:?} was already minted by an earlier entry in this batch \
+                         (INV-C3: the later write would silently overwrite it)",
+                        rule.id
+                    );
+                }
+            }
+            let mut ids = Vec::with_capacity(rules.len());
+            for rule in &rules {
+                let json = serde_json::to_string(rule)
+                    .map_err(|e| anyhow::anyhow!("serializing rule {:?}: {e}", rule.id))?;
+                core.upsert_conformance_rule(json)?;
+                minted.insert(rule.id.clone());
+                ids.push(rule.id.clone());
+            }
+            Ok(ids)
+        }
+        // Rule lane: the ready-rule JSON passes to the actor UN-PROJECTED (the model's own serde
+        // is the wire contract — same doctrine as `upsertConformanceRule`), with only the batch
+        // default `steering_type` spliced in when the entry omits the key.
+        "rule" => {
+            let mut raw = entry
+                .get("rule")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("rule entry has no `rule` object"))?;
+            let obj = raw
+                .as_object_mut()
+                .ok_or_else(|| anyhow::anyhow!("rule entry's `rule` is not a JSON object"))?;
+            if let Some(ty) = default_type {
+                obj.entry("steering_type")
+                    .or_insert_with(|| serde_json::Value::String(ty.to_string()));
+            }
+            let id = obj
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("rule entry's `rule` has no string `id`"))?;
+            if minted.contains(&id) {
+                anyhow::bail!(
+                    "rule id {id:?} was already minted by an earlier entry in this batch \
+                     (INV-C3: the later write would silently overwrite it)"
+                );
+            }
+            let json = serde_json::to_string(&raw)
+                .map_err(|e| anyhow::anyhow!("serializing rule {id:?}: {e}"))?;
+            core.upsert_conformance_rule(json)?;
+            minted.insert(id.clone());
+            Ok(vec![id])
+        }
+        other => anyhow::bail!("unknown entry kind {other:?} (expected \"doc\" or \"rule\")"),
+    }
+}
+
+/// Run one STEERING import batch — the exact code path the `steeringImport` binding runs on the
+/// libuv worker thread. `batch_json` is `{ default_type: string | null, entries: [...] }` where
+/// each entry is `{ kind: "doc", name?, content }` or `{ kind: "rule", rule }`; the reply is a
+/// JSON array of per-entry results (same order as the batch). Fail-closed PER ENTRY: a bad entry
+/// rejects alone, carrying its reason; the rest still land. Only a malformed BATCH (the envelope
+/// itself) rejects the whole call — crew maps that to 400, per-entry failures ride the 200.
+///
+/// A free function (not a `Core` method body) so the test below drives the binding's exact code
+/// path against a temp store — the same seam discipline as [`scoreboard_json`].
+fn steering_import_json(core: &wicked_core::Core, batch_json: &str) -> napi::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Batch {
+        #[serde(default)]
+        default_type: Option<String>,
+        entries: Vec<serde_json::Value>,
+    }
+    let batch: Batch = serde_json::from_str(batch_json)
+        .map_err(|e| err(format!("invalid steering import batch JSON: {e}")))?;
+    let default_type = batch.default_type.as_deref();
+
+    let mut minted: std::collections::HashSet<String> = Default::default();
+    let mut results: Vec<SteeringEntryResult> = Vec::with_capacity(batch.entries.len());
+    for (index, entry) in batch.entries.iter().enumerate() {
+        let name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        match import_steering_entry(core, entry, default_type, &mut minted) {
+            Ok(ids) => results.push(SteeringEntryResult {
+                index,
+                name,
+                status: "imported",
+                ids: Some(ids),
+                error: None,
+            }),
+            Err(e) => results.push(SteeringEntryResult {
+                index,
+                name,
+                status: "rejected",
+                ids: None,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+    serde_json::to_string(&results).map_err(err)
+}
+
 // ── the AsyncTask that runs one blocking Core call off the Node loop ──────────
 
 /// A single blocking Core call, run on a libuv worker thread. Holds a boxed closure so one Task type
@@ -1295,6 +1519,30 @@ impl Core {
             core.upsert_conformance_rule(rule_json).map_err(err)?;
             Ok(String::new())
         })
+    }
+
+    /// STEERING batch import (the unified steering-rule model). `batch_json` is a JSON
+    /// `{ default_type: string | null, entries: [...] }` document where each entry is either a
+    /// frontmattered markdown doc (`{ kind: "doc", name?, content }` — parsed by the SAME
+    /// MarkdownAdapter/normalize path `rules ingest --dir` runs, provenance `path@sha#id` refs
+    /// included) or a ready rule object (`{ kind: "rule", rule }` — the rule JSON passes to the
+    /// upsert path un-projected, so new model fields ride through without a rebuild).
+    /// `default_type` is applied as the `steering_type` of every rule whose entry omits one; a
+    /// rule that names its own type keeps it.
+    ///
+    /// Fail-closed PER ENTRY: a bad entry (unparseable doc, invalid rule, INV violation,
+    /// duplicate id within the batch) rejects ALONE with its reason — the rest still land; only
+    /// a malformed batch envelope rejects the whole call. Every write goes through the
+    /// single-writer actor (validate + `register_rule`). Resolves to a JSON array of per-entry
+    /// results, batch order: `{ index, name?, status: "imported" | "rejected", ids?, error? }`
+    /// (`ids` = the rule ids the entry minted — a doc can mint several; a rejected entry mints
+    /// none). This binding is also crew's PRESENCE SENTINEL for the whole steering seam
+    /// (`steeringSupported()`): it ships with the unified model, so its existence tells crew the
+    /// engine round-trips the steering fields instead of silently dropping them.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn steering_import(&self, batch_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || steering_import_json(&core, &batch_json))
     }
 
     /// Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
@@ -2502,6 +2750,119 @@ mod tests {
             bad.reason.contains("unknown steering type"),
             "error names the problem: {}",
             bad.reason
+        );
+    }
+
+    /// AC (steering import binding): [`steering_import_json`] — the exact code path
+    /// `steeringImport` runs on the libuv worker thread — lands a mixed 3-entry batch against a
+    /// temp store THROUGH THE SINGLE-WRITER ACTOR, per-entry fail-closed:
+    /// - a good frontmattered doc imports, minting BOTH its rules (ids in doc order);
+    /// - a good ready-rule JSON imports under its own id;
+    /// - a malformed doc (no frontmatter fence) rejects ALONE with its reason — the other two
+    ///   entries land anyway (fail-closed per entry, never per batch);
+    /// - all three entries omitted `steering_type`, so the batch `default_type` applied — the
+    ///   imported rules are listable under that type with the ids they were minted under.
+    #[test]
+    fn steering_import_lands_per_entry_results_over_a_temp_store() {
+        hermetic_spool();
+
+        let db_path = temp_store_path("steering-import");
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(StubDispatcher);
+        let core = wicked_core::Core::spawn_with_engine(
+            db_path.clone(),
+            dispatcher,
+            Arc::new(StubStepRunner),
+        );
+
+        let good_doc = "---\n\
+                        id: DOC-AUTH\n\
+                        title: Auth steering rules\n\
+                        ---\n\
+                        \n\
+                        ## Rules\n\
+                        \n\
+                        - PAT-100 (error): Sessions must expire within 24 hours.\n\
+                        - PAT-101 (warn): Login attempts are rate-limited.\n";
+        let batch = serde_json::json!({
+            "default_type": "security",
+            "entries": [
+                { "kind": "doc", "name": "auth-rules.md", "content": good_doc },
+                { "kind": "rule", "rule": {
+                    "id": "SEC-CUSTOM-1",
+                    "rule_type": "pattern",
+                    "statement": "Secrets never land in logs.",
+                    "severity": "critical",
+                    "confidence": 0.9,
+                } },
+                { "kind": "doc", "name": "broken.md", "content": "just prose, no fence" },
+            ],
+        });
+
+        let json = steering_import_json(&core, &batch.to_string()).expect("the batch resolves");
+        drop(core); // writes are committed per upsert; the reads below use fresh RO connections
+        let rows: Vec<Value> = serde_json::from_str(&json).expect("binding emits valid JSON");
+        assert_eq!(rows.len(), 3, "one result per entry, batch order");
+
+        // Entry 0 — the good doc: imported, minting BOTH rule ids in doc order.
+        assert_eq!(rows[0]["index"], 0);
+        assert_eq!(rows[0]["name"], "auth-rules.md");
+        assert_eq!(rows[0]["status"], "imported");
+        assert_eq!(rows[0]["ids"], serde_json::json!(["PAT-100", "PAT-101"]));
+        assert!(
+            rows[0].get("error").is_none(),
+            "an imported entry carries no error"
+        );
+
+        // Entry 1 — the ready rule: imported under its own id; a rule entry echoes no name.
+        assert_eq!(rows[1]["index"], 1);
+        assert_eq!(rows[1]["status"], "imported");
+        assert_eq!(rows[1]["ids"], serde_json::json!(["SEC-CUSTOM-1"]));
+        assert!(rows[1].get("name").is_none(), "rule entries have no name");
+
+        // Entry 2 — the malformed doc: rejected WITH its reason, minting nothing.
+        assert_eq!(rows[2]["index"], 2);
+        assert_eq!(rows[2]["name"], "broken.md");
+        assert_eq!(rows[2]["status"], "rejected");
+        let reason = rows[2]["error"]
+            .as_str()
+            .expect("rejected names its reason");
+        assert!(
+            reason.contains("frontmatter"),
+            "the reason says what was wrong: {reason}"
+        );
+        assert!(
+            rows[2].get("ids").is_none(),
+            "a rejected entry mints nothing"
+        );
+
+        // The imported rules are LISTABLE with their steering_type: every entry omitted the
+        // field, so the batch default_type ("security") rode onto each minted rule.
+        let listed = list_conformance_rules_json(&db_path, Some("security"), false).expect("lists");
+        let listed: Vec<Value> = serde_json::from_str(&listed).expect("valid JSON");
+        let mut ids: Vec<&str> = listed
+            .iter()
+            .map(|r| r["id"].as_str().expect("rows carry an id"))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["PAT-100", "PAT-101", "SEC-CUSTOM-1"]);
+        for row in &listed {
+            assert_eq!(
+                row["steering_type"], "security",
+                "the batch default_type landed on {}",
+                row["id"]
+            );
+        }
+        // And the doc-minted rows kept their ingest provenance (`<name>@<blob sha>#<id>` refs).
+        let pat = listed
+            .iter()
+            .find(|r| r["id"] == "PAT-100")
+            .expect("PAT-100 listed");
+        let doc_ref = pat["provenance"]["ref"]
+            .as_str()
+            .expect("doc rules carry a ref");
+        assert!(
+            doc_ref.starts_with("auth-rules.md@") && doc_ref.ends_with("#PAT-100"),
+            "provenance ref is the ingest spelling: {doc_ref}"
         );
     }
 
