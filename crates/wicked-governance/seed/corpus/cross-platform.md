@@ -4,6 +4,7 @@ title: "Cross-platform shell + tooling rules"
 status: active
 date: 2026-08-29
 enforcement_class: guidance
+steering_type: development
 scope: wiki:architecture
 domain: cross-platform
 applies_to: [build, review]

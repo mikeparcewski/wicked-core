@@ -4,6 +4,7 @@ title: "Storage doctrine: embedded-first, trait-fronted, single-writer"
 status: active
 date: 2026-08-29
 enforcement_class: guidance
+steering_type: architecture
 scope: wiki:architecture
 domain: storage-doctrine
 applies_to: [plan, build, review]

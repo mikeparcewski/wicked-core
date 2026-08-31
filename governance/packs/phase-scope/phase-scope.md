@@ -4,6 +4,7 @@ title: Phase-scope write-denies
 status: active
 date: 2026-08-29
 enforcement_class: policy
+steering_type: operations
 applies_to: [clarify, design, triage, reproduce, plan]
 scope: wiki:governance
 domain: phase-scope

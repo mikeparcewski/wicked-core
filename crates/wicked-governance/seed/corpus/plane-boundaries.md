@@ -4,6 +4,7 @@ title: "Four-plane model: planes, contracts, boundary rules"
 status: active
 date: 2026-08-29
 enforcement_class: guidance
+steering_type: architecture
 scope: wiki:architecture
 domain: plane-boundaries
 applies_to: [plan, build, review]

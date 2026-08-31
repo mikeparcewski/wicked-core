@@ -4,6 +4,7 @@ title: "Event grammar: four segments, whitelisted producer domains"
 status: active
 date: 2026-08-29
 enforcement_class: guidance
+steering_type: architecture
 scope: wiki:architecture
 domain: event-grammar
 applies_to: [plan, build, review]

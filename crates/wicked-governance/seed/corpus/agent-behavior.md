@@ -4,6 +4,7 @@ title: "Agent-behavior rules R1-R7 (A/B-validated)"
 status: active
 date: 2026-08-29
 enforcement_class: validator
+steering_type: development
 scope: wiki:architecture
 domain: agent-behavior
 applies_to: [build, review]
