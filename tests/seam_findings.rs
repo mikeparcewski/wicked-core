@@ -398,3 +398,109 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         "the operator transcript read answers with the partial output, not a dead end"
     );
 }
+
+/// Usability review #1, verifier lane: the TRIAGE-FAIL rejection path. An UNRECOGNIZED worker
+/// failure with a human present (any `HumanConfirm` but `None`) routes to the async triage judge
+/// instead of the terminal worker-failure arm — so it must persist the SAME flagged transcript
+/// record as every other rejection path when the judge rules `DECISION: FAIL`: the FULL failure
+/// output (the denial_reason keeps only a bounded excerpt), `resolution: "rejected"`, and the
+/// structured `worker_failure` denial — readable through `unit_transcript` and the operator
+/// `work_output` read, never a "no transcript stored" dead end.
+struct TriageFailRunner {
+    failure: String,
+}
+impl StepRunner for TriageFailRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let (output, status) = if i.run_id.starts_with("triage-") {
+            // The judge seat: rule the failure terminal.
+            (
+                "DECISION: FAIL\nthe work itself failed (fixture verdict)".to_string(),
+                StepStatus::Ok,
+            )
+        } else {
+            (self.failure.clone(), StepStatus::Failed)
+        };
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output,
+            status,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+#[test]
+fn a_triage_fail_rejection_persists_the_full_failure_transcript() {
+    let db = db_path("triage-fail-transcript");
+    // Long enough that every bounded excerpt (triage judge + denial detail) MUST truncate: only
+    // the persisted transcript record can carry both markers.
+    let failure = format!(
+        "HEADMARK worker output begins\n{}\nTAILMARK the operative last line",
+        "x".repeat(6000)
+    );
+    let core = Core::spawn_with_engine(
+        db,
+        Arc::new(StubDispatcher),
+        Arc::new(TriageFailRunner {
+            failure: failure.clone(),
+        }),
+    );
+    core.launch_run(LaunchSpec {
+        project_id: None,
+        problem: "one thing".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: EntityMode::Shared,
+        session_id: "rt".into(),
+        // A human is present (so the failure triages) but no gate ord matches (so nothing pauses).
+        human_confirm: HumanConfirm::Before(99),
+        repo_ref: None,
+        workflow: None,
+        extra_write_roots: Vec::new(),
+        project_graph: None,
+    })
+    .expect("launch");
+
+    assert!(
+        wait_status(&core, "rt", SessionStatus::Failed),
+        "a triage FAIL verdict fails the run"
+    );
+    let views = core.sessions_detail().unwrap();
+    let v = views.iter().find(|v| v.session.id == "rt").unwrap();
+    let unit = &v.units[0];
+    assert_eq!(unit.status, UnitStatus::Rejected);
+    assert!(
+        unit.denial_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("(triage:")),
+        "the denial names the triage verdict, got: {:?}",
+        unit.denial_reason
+    );
+    assert_eq!(
+        unit.denial.as_ref().map(|d| d.source.as_str()),
+        Some("worker_failure"),
+        "the structured denial rides the unit record: {:?}",
+        unit.denial
+    );
+    // The transcript record: FULL output (both markers — no excerpt bound applies), flagged.
+    let t = core
+        .unit_transcript(&unit.id)
+        .expect("a triage-failed unit persists its transcript record");
+    assert_eq!(t.resolution, "rejected");
+    assert!(t.partial);
+    assert_eq!(
+        t.output.as_deref(),
+        Some(failure.as_str()),
+        "the FULL failure output survives untruncated"
+    );
+    assert_eq!(
+        t.denial.as_ref().map(|d| d.source.as_str()),
+        Some("worker_failure")
+    );
+    // And the operator read answers with it too — no dead end.
+    assert_eq!(core.work_output(&unit.id), Some(failure));
+}

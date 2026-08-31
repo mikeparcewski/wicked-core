@@ -586,6 +586,47 @@ mod tests {
         assert_eq!(od.claim_id.as_deref(), Some("boundary-deny:unit-3"));
     }
 
+    /// Back-compat (usability review #1, verifier lane): a work-output record persisted BEFORE the
+    /// `resolution` marker existed — such records were only ever written on approval — must keep
+    /// reading as approved output through BOTH reads: `get_work_output` returns it, and
+    /// `get_unit_transcript` reports it `resolved`/not-partial with no denial. An absent marker can
+    /// never be mistaken for a rejection.
+    #[test]
+    fn a_legacy_record_without_a_resolution_marker_reads_as_resolved() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // The exact pre-fix shape: output + phase_status, NO resolution key, NO denial.
+        let mut node = Node::new(
+            synthetic_symbol(WORK_OUTPUT, "s:legacy"),
+            NodeKind::Other(WORK_OUTPUT.to_string()),
+            "s:legacy".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(format!("{WORK_OUTPUT}/s:legacy"), Span::ZERO),
+        );
+        node.metadata.insert(
+            "output".into(),
+            serde_json::Value::String("the pre-0.7.6 approved output".into()),
+        );
+        node.metadata.insert(
+            "phase_status".into(),
+            serde_json::Value::String("approved".into()),
+        );
+        put_node(&mut store, node).unwrap();
+
+        assert_eq!(
+            get_work_output(&store, "s:legacy").as_deref(),
+            Some("the pre-0.7.6 approved output"),
+            "the approved-only read still serves a legacy record"
+        );
+        let t = get_unit_transcript(&store, "s:legacy").expect("legacy record is readable");
+        assert_eq!(t.resolution, RESOLUTION_RESOLVED);
+        assert!(
+            !t.partial,
+            "an absent marker must never read as a rejection"
+        );
+        assert_eq!(t.output.as_deref(), Some("the pre-0.7.6 approved output"));
+        assert!(t.denial.is_none() && t.denial_reason.is_none());
+    }
+
     /// FINDING-025: `evaluate_unit` must report WHICH policies it applied, because `approved`
     /// alone cannot distinguish an enforced pass from a default-allow. The policy engine runs on
     /// every unit and returns Allow on an empty selection, so a consumer that reads only

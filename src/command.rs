@@ -236,6 +236,10 @@ pub(crate) enum Command {
         analysis: String,
         /// Bounded excerpt of the original failure output (for prompts + denial reasons).
         failure_excerpt: String,
+        /// The FULL failure output the worker posted (usability review #1): on a `Fail` decision
+        /// it is persisted as the rejected unit's flagged transcript record — the excerpt above
+        /// stays bounded for prompts and denial reasons; the transcript record is never truncated.
+        full_output: String,
         /// Process-generation token (DES-002): disambiguates triage for a relaunched run.
         #[allow(dead_code)]
         process_gen: Option<uuid::Uuid>,

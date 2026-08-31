@@ -2539,6 +2539,7 @@ pub(crate) fn run(
                 decision,
                 analysis: judge_analysis,
                 failure_excerpt,
+                full_output,
                 process_gen: _, // stale-triage guard — consumed by bus consumer in T7
                 launch_seq: _,
             } => {
@@ -2739,10 +2740,15 @@ pub(crate) fn run(
                         // (crew#322). `failure_excerpt` is itself already head+tail-bounded, so
                         // this second bound still ends on the real end of the transcript.
                         let excerpt: String = failure_detail_excerpt(&failure_excerpt);
-                        unit.denial_reason = Some(format!(
-                            "Worker FAILED on unit {ord} (triage: {reason}): {excerpt}"
-                        ));
+                        let why =
+                            format!("Worker FAILED on unit {ord} (triage: {reason}): {excerpt}");
+                        unit.denial_reason = Some(why.clone());
+                        unit.denial = Some(crate::domain::UnitDenial::new("worker_failure", why));
                         let _ = put_node(&mut store, unit.to_node());
+                        // Usability review #1: the triage-Fail rejection persists the same
+                        // flagged transcript record as every other rejection path — the FULL
+                        // failure output (the denial_reason above is only a bounded excerpt).
+                        persist_rejected_transcript(&mut store, &session, unit, &full_output);
                         emit(
                             &mut subscribers,
                             CoreEvent::StepFailed {
@@ -3695,8 +3701,9 @@ fn next_failover_seat(
 /// a superseded run or a re-delivered message — is ignored (`Stale`). This is the defense the
 /// per-actor `in_flight` set cannot provide (it can't see results from a different actor/process).
 /// Persist a REJECTED unit's transcript record from one of the actor's OWN rejection paths — the
-/// paths that never reach `execute::apply_unit` (worker failure, substance gate, deliverable
-/// floor, elicitation failure) and therefore stored nothing at all (usability review #1). The
+/// paths that never reach `execute::apply_unit` (worker failure, triage-judged fail, substance
+/// gate, deliverable floor, elicitation failure) and therefore stored nothing at all (usability
+/// review #1). The
 /// record carries the unit's FULL partial output (`denial_reason` keeps only a bounded excerpt),
 /// flagged `resolution: "rejected"`, with the unit's structured denial beside it. Best-effort by
 /// design: these call sites are already on the failure path headed for `fail_run`, and a store
@@ -4091,6 +4098,9 @@ fn apply_step_result(
                 let unit_ix2 = output.unit_ix;
                 let attempt2 = output.attempt;
                 let desc = unit.description.clone();
+                // The FULL output rides beside the bounded excerpt so a `Fail` decision can
+                // persist the untruncated transcript record (usability review #1).
+                let full_output = output.output.clone();
                 std::thread::spawn(move || {
                     let ctx = format!("{run_id2}-u{unit_ix2}-a{attempt2}");
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4128,6 +4138,7 @@ fn apply_step_result(
                         decision,
                         analysis,
                         failure_excerpt,
+                        full_output,
                         process_gen: None, // set when bus-dispatched in T7
                         launch_seq: 0,
                     });

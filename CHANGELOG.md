@@ -22,9 +22,9 @@ Two release tracks share this file, newest entry first regardless of track:
   failure record (no output, denial only) — so the transcript read returns honest structure
   instead of nothing exactly when an operator is diagnosing a failed run. ADR-0003 unchanged:
   `get_work_output` (evaluator artifact-passing, context injection) filters rejected records and
-  still returns approved output only. The actor's own rejection paths (worker failure, substance
-  gate, deliverable floor, elicitation failure) persist the same flagged record with the unit's
-  FULL partial output. NEW `UnitDenial` — the machine-readable twin of the `denial_reason` prose:
+  still returns approved output only. The actor's own rejection paths (worker failure, the
+  triage judge's FAIL verdict, substance gate, deliverable floor, elicitation failure) persist
+  the same flagged record with the unit's FULL partial output. NEW `UnitDenial` — the machine-readable twin of the `denial_reason` prose:
   `{source, reason, claim_id, rule_ids, denied_tool, phase}` — rides the persisted `WorkUnit`
   (additive `denial` field), `UnitOutcome`, `gateEvaluated` (camelCase `denial`, beside the
   retained `denialReason`), and `fold_input_denial`'s return (claim id + firing policy ids + the
