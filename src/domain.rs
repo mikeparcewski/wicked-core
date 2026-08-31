@@ -167,6 +167,51 @@ impl FromNode for AgentSession {
     }
 }
 
+/// The MACHINE-READABLE twin of a unit's prose `denial_reason` (usability review #1): which layer
+/// denied, which rule/policy fired, which claim recorded it, and — for an input-governance deny —
+/// which tool-call was refused. Additive everywhere it appears (unit record, work-output record,
+/// `GateEvaluated`), so a consumer that only reads the prose keeps working while a UI can render a
+/// plain-language banner from structure instead of parsing a sentence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitDenial {
+    /// The layer that denied — a stable token, one of: `governance` (the unit's own gate),
+    /// `input_governance` (the tool-call hook / boundary), `pinned_validator` (deterministic
+    /// re-verify), `agent_validator` (LLM judge), `evaluator` (evaluator≠creator second pass),
+    /// `worker_failure` (the CLI process failed), `substance` (no reviewable substance),
+    /// `deliverables` (declared deliverables missing), `elicitation` (ACP elicitation ended).
+    pub source: String,
+    /// The operator-facing prose — byte-identical to the `denial_reason` the record carries.
+    pub reason: String,
+    /// The `ConformanceClaim` id that recorded the deny (e.g. `boundary-deny:unit-2`), when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_id: Option<String>,
+    /// The policy/rule ids that fired (e.g. `engine:pre-build-scope`). Empty when the deny came
+    /// from a layer with no named rule (a worker failure, a fail-closed infra deny).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_ids: Vec<String>,
+    /// The tool whose call was refused (`Bash`, `Edit`, …) — input-governance denies only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_tool: Option<String>,
+    /// The unit-phase token the deny targeted (e.g. `unit-2`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+}
+
+impl UnitDenial {
+    /// A denial with only a source + prose reason — the shape of every layer that carries no
+    /// claim/rule/tool identity (validators, worker failures, substance/deliverable floors).
+    pub fn new(source: impl Into<String>, reason: impl Into<String>) -> Self {
+        UnitDenial {
+            source: source.into(),
+            reason: reason.into(),
+            claim_id: None,
+            rule_ids: Vec::new(),
+            denied_tool: None,
+            phase: None,
+        }
+    }
+}
+
 /// A unit of distributed work, persisted as `Node(Other(WORK_UNIT))`. Plan creates it `Pending`;
 /// distribute records the assignment; execute records the outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +246,11 @@ pub struct WorkUnit {
     /// when the run halts on this unit. `#[serde(default)]` for back-compat.
     #[serde(default)]
     pub denial_reason: Option<String>,
+    /// The STRUCTURED twin of [`Self::denial_reason`] (usability review #1): source layer, firing
+    /// rule ids, recording claim id, denied tool. Additive — absent on units persisted before it
+    /// existed and on approved units; skip-if-none keeps the wire byte-identical for those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<UnitDenial>,
     /// The orchestration phase id backing this unit (set in execute).
     #[serde(default)]
     pub phase_ref: Option<String>,
@@ -438,6 +488,7 @@ impl WorkUnit {
             council_task_ref: None,
             routing: None,
             denial_reason: None,
+            denial: None,
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,
@@ -567,15 +618,90 @@ pub fn all_sessions(store: &dyn GraphRead) -> anyhow::Result<Vec<AgentSession>> 
         .collect())
 }
 
-/// A unit's captured work output (the transcript the UI shows), if the unit ran + was approved.
+/// A unit's APPROVED work output, if the unit ran + its phase resolved. This is the read the
+/// engine itself builds on — evaluator artifact-passing ([`crate::pipeline`]'s `creator_output_for`)
+/// and prior-unit context injection — so it deliberately returns `None` for a REJECTED unit's
+/// partial record: no unapproved output may ever be handed to a later unit as reviewed work
+/// (ADR-0003). The rejected record is read through [`get_unit_transcript`] instead.
 pub fn get_work_output(store: &dyn GraphRead, unit_id: &str) -> Option<String> {
     let node = store
         .get_node(&synthetic_symbol(crate::execute::WORK_OUTPUT, unit_id))
         .ok()??;
+    // Records written before `resolution` existed were only ever written on approval, so an
+    // ABSENT marker reads as resolved; only an explicit rejected marker filters.
+    if node
+        .metadata
+        .get(crate::execute::RESOLUTION_KEY)
+        .and_then(|v| v.as_str())
+        == Some(crate::execute::RESOLUTION_REJECTED)
+    {
+        return None;
+    }
     node.metadata
         .get("output")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// A unit's transcript RECORD — what [`get_work_output`] cannot say (usability review #1): a
+/// REJECTED unit's partial output survives here, flagged, with the structured denial beside it,
+/// and a unit denied BEFORE any output existed still answers with an explicit failure record
+/// (`output: None` + the deny's claim/rule/tool) instead of nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitTranscript {
+    /// The unit this record belongs to.
+    pub unit_id: String,
+    /// `resolved` — the phase resolved approved and `output` is the gated work product; or
+    /// `rejected` — the unit was denied/failed and `output` (when present) is PARTIAL: whatever
+    /// existed at rejection, never an approved artifact.
+    pub resolution: String,
+    /// `true` ⇔ `resolution == "rejected"` — the one-bool flag a reader needs to distinguish
+    /// partial-from-failure output from resolved output.
+    pub partial: bool,
+    /// The phase status token the record was written under (`approved`, `rejected`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_status: Option<String>,
+    /// The transcript text. `None` on a rejected record when NO output existed at rejection
+    /// (a pre-output deny) — the record then exists purely to carry the denial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// The prose WHY, when rejected (same string as the unit's `denial_reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial_reason: Option<String>,
+    /// The machine-readable WHY, when rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<UnitDenial>,
+}
+
+/// Read a unit's transcript record — resolved OR rejected — or `None` when the unit never ran far
+/// enough to leave one (see [`UnitTranscript`]).
+pub fn get_unit_transcript(store: &dyn GraphRead, unit_id: &str) -> Option<UnitTranscript> {
+    let node = store
+        .get_node(&synthetic_symbol(crate::execute::WORK_OUTPUT, unit_id))
+        .ok()??;
+    let meta_str = |key: &str| {
+        node.metadata
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    // Pre-`resolution` records were only written on approval — absent marker ⇒ resolved.
+    let resolution = meta_str(crate::execute::RESOLUTION_KEY)
+        .unwrap_or_else(|| crate::execute::RESOLUTION_RESOLVED.to_string());
+    let partial = resolution == crate::execute::RESOLUTION_REJECTED;
+    let denial = node
+        .metadata
+        .get("denial")
+        .and_then(|v| serde_json::from_value::<UnitDenial>(v.clone()).ok());
+    Some(UnitTranscript {
+        unit_id: unit_id.to_string(),
+        resolution,
+        partial,
+        phase_status: meta_str("phase_status"),
+        output: meta_str("output"),
+        denial_reason: meta_str("denial_reason"),
+        denial,
+    })
 }
 
 /// A session plus its ordered units — the read the UI builds its project list from.

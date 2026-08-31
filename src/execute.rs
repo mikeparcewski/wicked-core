@@ -11,11 +11,25 @@ use wicked_apps_core::{
 use wicked_governance::{conform, decide, decide_as, select_any};
 use wicked_orchestration::{apply_event, apply_gate, get_phase, Event, Phase, PhaseStatus};
 
-use crate::domain::{put_node, WorkUnit};
+use crate::domain::{put_node, UnitDenial, WorkUnit};
 use crate::scope::{resolve_scope, EntityMode};
 
-/// Node-kind for a unit's recorded work output. Written ONLY when the gate approves.
+/// Node-kind for a unit's recorded work output. Written for EVERY gated unit (usability review #1):
+/// an approved unit's record carries the gated work product (`resolution: "resolved"`), a
+/// rejected/failed unit's record carries whatever PARTIAL output existed at rejection plus the
+/// structured denial (`resolution: "rejected"`) — so "view transcript" never dead-ends exactly when
+/// the operator needs it. [`crate::domain::get_work_output`] still returns approved output ONLY;
+/// the rejected record is read through [`crate::domain::get_unit_transcript`].
 pub const WORK_OUTPUT: &str = "work_output";
+
+/// Metadata key marking a work-output record's resolution: [`RESOLUTION_RESOLVED`] |
+/// [`RESOLUTION_REJECTED`]. Absent on records written before the key existed — those were only
+/// ever written on approval, so absence reads as resolved.
+pub const RESOLUTION_KEY: &str = "resolution";
+/// The unit's phase resolved approved — `output` is the gated work product.
+pub const RESOLUTION_RESOLVED: &str = "resolved";
+/// The unit was denied/failed — `output` (when present) is PARTIAL, never an approved artifact.
+pub const RESOLUTION_REJECTED: &str = "rejected";
 
 /// The outcome of executing one unit — recorded back onto the unit node.
 #[derive(Debug, Clone, Serialize)]
@@ -36,6 +50,10 @@ pub struct UnitOutcome {
     /// surfaces this as the run's "why it failed" explanation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denial_reason: Option<String>,
+    /// The STRUCTURED twin of `denial_reason` (usability review #1): source layer, firing rule
+    /// ids, recording claim id, denied tool. Set only when NOT approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denial: Option<UnitDenial>,
     /// True when the denial originated from the input-governance hook (as opposed to a semantic
     /// verdict or evaluator deny). Hook vetoes MUST NOT be routed to HumanConfirmIf — an adversarial
     /// hook suppression can never escalate to human review; it hard-fails the run immediately.
@@ -64,8 +82,11 @@ pub struct EvaluationOutcome {
 /// ALREADY-COMPUTED deny from the dual-validator layers (deterministic re-verify / agent judge) OR the
 /// evaluator≠creator second pass. It is folded into the gate resolution BEFORE the phase resolves and
 /// BEFORE any `work_output` is written, so a validator/evaluator deny drives the phase to `Rejected`
-/// (persisting the hard `gate_decision` veto) and leaves NO approved phase and NO stored `work_output`
-/// to leak (the ADR-0003 violation this parameter closes). `None` ⇒ governance decides alone (unchanged).
+/// (persisting the hard `gate_decision` veto) and leaves NO APPROVED phase and NO approved
+/// `work_output` to leak (the ADR-0003 violation this parameter closes) — the denied unit's record
+/// is written flagged `resolution: "rejected"` instead, invisible to [`crate::domain::get_work_output`]
+/// and readable only through [`crate::domain::get_unit_transcript`] (usability review #1).
+/// `None` ⇒ governance decides alone (unchanged).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_unit(
     store: &mut dyn GraphStore,
@@ -74,7 +95,7 @@ pub(crate) fn apply_unit(
     workflow_id: &str,
     entity_mode: EntityMode,
     session_id: &str,
-    validator_denial: Option<String>,
+    validator_denial: Option<UnitDenial>,
     attempt: u32,
 ) -> anyhow::Result<UnitOutcome> {
     let assigned_cli = unit
@@ -167,22 +188,10 @@ pub(crate) fn apply_unit(
         Some(PhaseStatus::Approved) | Some(PhaseStatus::ApprovedWithConditions)
     );
 
-    // 5. on approval: record the work-output node + durable conformance; on deny: claim only. A
-    //    validator/evaluator deny lands here as `!approved`, so it too writes NO work_output.
-    if approved {
-        let output_node = work_output_node(
-            unit,
-            &assigned_cli,
-            &collection_scope,
-            output,
-            &phase_status,
-        );
-        put_node(store, output_node)?;
-    }
-    // On a deny, capture WHY. A governance deny cites the decision + firing policies (governance exposes
-    // no policy-read API, so we cite ids + criteria — honest provenance the UI can show); a
-    // validator/evaluator-layer deny carries its own reason through unchanged.
-    let denial_reason = if approved {
+    // 5. on a deny, capture WHY — prose AND structure. A governance deny cites the decision + firing
+    // policies (governance exposes no policy-read API, so we cite ids + criteria — honest provenance
+    // the UI can show); a validator/evaluator-layer deny carries its own reason through unchanged.
+    let denial: Option<UnitDenial> = if approved {
         None
     } else if governance_denied {
         let policies = if claim.policy_ids.is_empty() {
@@ -195,14 +204,49 @@ pub(crate) fn apply_unit(
         } else {
             format!(", criteria: {}", claim.criteria)
         };
-        Some(format!(
-            "Governance DENIED unit {} ({assigned_cli}) — decision={decision_tok}, policies: [{policies}]{criteria}",
-            unit.ord
-        ))
+        Some(UnitDenial {
+            source: "governance".to_string(),
+            reason: format!(
+                "Governance DENIED unit {} ({assigned_cli}) — decision={decision_tok}, policies: [{policies}]{criteria}",
+                unit.ord
+            ),
+            claim_id: Some(claim.claim_id.clone()),
+            rule_ids: claim.policy_ids.clone(),
+            denied_tool: None,
+            phase: Some(phase_name.clone()),
+        })
     } else {
-        // A dual-validator / evaluator deny (deny-dominates over a governance ALLOW).
-        validator_denial
+        // A dual-validator / evaluator / input-hook deny (deny-dominates over a governance ALLOW).
+        validator_denial.map(|mut d| {
+            d.phase.get_or_insert_with(|| phase_name.clone());
+            d
+        })
     };
+    let denial_reason = denial.as_ref().map(|d| d.reason.clone());
+
+    // 6. record the work-output node for EVERY gated unit (usability review #1). On approval the
+    //    record IS the gated work product (`resolution: "resolved"`); on a deny it is the honest
+    //    failure record — whatever PARTIAL output existed at rejection (none, for a pre-output
+    //    deny) plus the structured denial, flagged `resolution: "rejected"` so no reader can
+    //    mistake it for approved work ([`crate::domain::get_work_output`] filters it; ADR-0003 holds).
+    let output_node = work_output_node(
+        unit,
+        &assigned_cli,
+        &collection_scope,
+        approved.then_some(output).or_else(|| {
+            // A rejected unit keeps its partial output; a pre-output deny stores NO output —
+            // the record then exists purely to carry the denial (the explicit failure record).
+            (!output.trim().is_empty()).then_some(output)
+        }),
+        &phase_status,
+        if approved {
+            RESOLUTION_RESOLVED
+        } else {
+            RESOLUTION_REJECTED
+        },
+        denial.as_ref(),
+    );
+    put_node(store, output_node)?;
     // Record the REAL governance claim (its actual decision) for provenance — the synthesized gate
     // deny above is the gate's resolution, not a rewrite of what governance decided.
     conform(store, &claim)?;
@@ -219,6 +263,7 @@ pub(crate) fn apply_unit(
         approved,
         evaluator_claim_id: None,
         denial_reason,
+        denial,
         hook_denied: false, // overwritten by pipeline::apply_and_finish_unit when the hook denied
     })
 }
@@ -321,8 +366,10 @@ fn work_output_node(
     unit: &WorkUnit,
     assigned_cli: &str,
     collection_scope: &str,
-    output: &str,
+    output: Option<&str>,
     phase_status: &str,
+    resolution: &str,
+    denial: Option<&UnitDenial>,
 ) -> Node {
     let mut node = Node::new(
         synthetic_symbol(WORK_OUTPUT, &unit.id),
@@ -338,19 +385,60 @@ fn work_output_node(
     m.insert("assigned_cli".into(), s(assigned_cli));
     m.insert("collection_scope".into(), s(collection_scope));
     m.insert("phase_status".into(), s(phase_status));
-    m.insert("output".into(), s(output));
+    m.insert(RESOLUTION_KEY.into(), s(resolution));
+    if let Some(output) = output {
+        m.insert("output".into(), s(output));
+    }
+    if let Some(d) = denial {
+        m.insert("denial_reason".into(), s(&d.reason));
+        if let Ok(v) = serde_json::to_value(d) {
+            m.insert("denial".into(), v);
+        }
+    }
     node
+}
+
+/// Persist the REJECTED transcript record for a unit that never reached the governance gate — the
+/// actor's worker-failure / substance / deliverable / elicitation rejection paths (usability
+/// review #1). `output` is whatever partial output existed (an empty/whitespace output stores
+/// none — the record then carries only the denial, the explicit failure record). The record is
+/// flagged `resolution: "rejected"`, so [`crate::domain::get_work_output`] never surfaces it as
+/// approved work; [`crate::domain::get_unit_transcript`] reads it back.
+pub(crate) fn record_rejected_output(
+    store: &mut dyn GraphStore,
+    unit: &WorkUnit,
+    collection_scope: &str,
+    output: &str,
+    denial: &UnitDenial,
+) -> anyhow::Result<()> {
+    let assigned_cli = unit
+        .assigned_cli
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    let node = work_output_node(
+        unit,
+        &assigned_cli,
+        collection_scope,
+        (!output.trim().is_empty()).then_some(output),
+        "rejected",
+        RESOLUTION_REJECTED,
+        Some(denial),
+    );
+    put_node(store, node)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{get_work_output, WorkUnit};
+    use crate::domain::{get_unit_transcript, get_work_output, WorkUnit};
     use wicked_apps_core::open_store;
 
     /// Seam finding #2: a dual-validator / evaluator deny (governance itself ALLOWS) must drive the
     /// phase to `Rejected` and write NO approved `work_output` — no Approved phase and no stale
-    /// "approved" artifact can leak past a validator deny (ADR-0003).
+    /// "approved" artifact can leak past a validator deny (ADR-0003). Usability review #1 refines
+    /// the storage HALF of that rule: the denied unit's PARTIAL output is still persisted, flagged
+    /// `rejected`, readable through `get_unit_transcript` — while `get_work_output` (what evaluator
+    /// artifact-passing and context injection read) stays `None`.
     #[test]
     fn a_validator_deny_drives_the_phase_rejected_and_writes_no_work_output() {
         let mut store = open_store(Some(":memory:")).unwrap();
@@ -365,7 +453,10 @@ mod tests {
             "wf-s",
             EntityMode::Shared,
             "s",
-            Some("agent validator rejected: diverged from criterion".into()),
+            Some(UnitDenial::new(
+                "agent_validator",
+                "agent validator rejected: diverged from criterion",
+            )),
             0,
         )
         .unwrap();
@@ -386,6 +477,23 @@ mod tests {
         assert!(
             get_work_output(&store, "s:u1").is_none(),
             "a validator-denied unit must leak NO approved work_output"
+        );
+        // Usability review #1: the REJECTED unit keeps its partial transcript, flagged.
+        let t = get_unit_transcript(&store, "s:u1")
+            .expect("a rejected unit persists its transcript record");
+        assert_eq!(t.resolution, RESOLUTION_REJECTED);
+        assert!(t.partial, "the record is flagged partial-from-failure");
+        assert_eq!(
+            t.output.as_deref(),
+            Some("the creator output"),
+            "whatever output existed at rejection survives"
+        );
+        let d = t.denial.expect("the structured denial rides the record");
+        assert_eq!(d.source, "agent_validator");
+        assert_eq!(
+            d.phase.as_deref(),
+            Some("unit-1"),
+            "the denied unit-phase token is filled in for the banner"
         );
 
         // Control: the SAME governance-allow with NO validator deny approves and DOES store output —
@@ -413,6 +521,110 @@ mod tests {
             Some("the approved output"),
             "an approved unit stores its work_output"
         );
+        // Regression (usability review #1): the RESOLVED read is unchanged in every honest field —
+        // full output, resolution `resolved`, not partial, no denial.
+        let t = get_unit_transcript(&store, "s:u2").expect("approved unit has a transcript record");
+        assert_eq!(t.resolution, RESOLUTION_RESOLVED);
+        assert!(!t.partial);
+        assert_eq!(t.output.as_deref(), Some("the approved output"));
+        assert!(t.denial.is_none() && t.denial_reason.is_none());
+    }
+
+    /// Usability review #1: a unit denied BEFORE any output existed (e.g. an input-governance
+    /// boundary deny that killed the attempt) persists an EXPLICIT FAILURE RECORD — no output, but
+    /// the deny's claim id, the rule that fired, and the denied tool — so the transcript read
+    /// returns honest structure instead of nothing.
+    #[test]
+    fn a_pre_output_deny_persists_an_explicit_failure_record() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut unit = WorkUnit::pending("s:u3", "s", 3, "build it");
+        unit.assigned_cli = Some("claude".into());
+        let hook_denial = UnitDenial {
+            source: "input_governance".to_string(),
+            reason: "input governance denied a tool-call in unit-3 (claim boundary-deny:unit-3)"
+                .to_string(),
+            claim_id: Some("boundary-deny:unit-3".to_string()),
+            rule_ids: vec!["engine:pre-build-scope".to_string()],
+            denied_tool: Some("Edit".to_string()),
+            phase: Some("unit-3".to_string()),
+        };
+        let outcome = apply_unit(
+            &mut store,
+            &unit,
+            "", // NOTHING was produced before the deny
+            "wf-s",
+            EntityMode::Shared,
+            "s",
+            Some(hook_denial),
+            0,
+        )
+        .unwrap();
+        assert!(!outcome.approved);
+        assert!(
+            get_work_output(&store, "s:u3").is_none(),
+            "no approved output can exist for a denied unit"
+        );
+        let t = get_unit_transcript(&store, "s:u3")
+            .expect("a pre-output deny still leaves a failure record");
+        assert_eq!(t.resolution, RESOLUTION_REJECTED);
+        assert!(t.partial);
+        assert_eq!(t.output, None, "no output existed, so none is invented");
+        assert!(t
+            .denial_reason
+            .as_deref()
+            .unwrap()
+            .contains("boundary-deny:unit-3"));
+        let d = t.denial.expect("structured denial");
+        assert_eq!(d.source, "input_governance");
+        assert_eq!(d.claim_id.as_deref(), Some("boundary-deny:unit-3"));
+        assert_eq!(d.rule_ids, vec!["engine:pre-build-scope".to_string()]);
+        assert_eq!(d.denied_tool.as_deref(), Some("Edit"));
+        // And the same structure rode the outcome (the wire's `GateEvaluated.denial` / unit record).
+        let od = outcome
+            .denial
+            .expect("outcome carries the structured denial");
+        assert_eq!(od.claim_id.as_deref(), Some("boundary-deny:unit-3"));
+    }
+
+    /// Back-compat (usability review #1, verifier lane): a work-output record persisted BEFORE the
+    /// `resolution` marker existed — such records were only ever written on approval — must keep
+    /// reading as approved output through BOTH reads: `get_work_output` returns it, and
+    /// `get_unit_transcript` reports it `resolved`/not-partial with no denial. An absent marker can
+    /// never be mistaken for a rejection.
+    #[test]
+    fn a_legacy_record_without_a_resolution_marker_reads_as_resolved() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // The exact pre-fix shape: output + phase_status, NO resolution key, NO denial.
+        let mut node = Node::new(
+            synthetic_symbol(WORK_OUTPUT, "s:legacy"),
+            NodeKind::Other(WORK_OUTPUT.to_string()),
+            "s:legacy".to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(format!("{WORK_OUTPUT}/s:legacy"), Span::ZERO),
+        );
+        node.metadata.insert(
+            "output".into(),
+            serde_json::Value::String("the pre-0.7.6 approved output".into()),
+        );
+        node.metadata.insert(
+            "phase_status".into(),
+            serde_json::Value::String("approved".into()),
+        );
+        put_node(&mut store, node).unwrap();
+
+        assert_eq!(
+            get_work_output(&store, "s:legacy").as_deref(),
+            Some("the pre-0.7.6 approved output"),
+            "the approved-only read still serves a legacy record"
+        );
+        let t = get_unit_transcript(&store, "s:legacy").expect("legacy record is readable");
+        assert_eq!(t.resolution, RESOLUTION_RESOLVED);
+        assert!(
+            !t.partial,
+            "an absent marker must never read as a rejection"
+        );
+        assert_eq!(t.output.as_deref(), Some("the pre-0.7.6 approved output"));
+        assert!(t.denial.is_none() && t.denial_reason.is_none());
     }
 
     /// FINDING-025: `evaluate_unit` must report WHICH policies it applied, because `approved`
@@ -539,6 +751,19 @@ mod tests {
         assert!(
             get_work_output(&store, "s:review").is_none(),
             "a denied unit must leak no work_output"
+        );
+        // The governance deny is machine-readable (usability review #1): the firing policy id and
+        // the recording claim id ride the structured denial, not just the prose.
+        let d = outcome.denial.as_ref().expect("structured denial");
+        assert_eq!(d.source, "governance");
+        assert_eq!(d.rule_ids, vec!["pol-deny-review-secrets".to_string()]);
+        assert_eq!(d.claim_id.as_deref(), outcome.claim_id.as_deref());
+        // And the rejected transcript record keeps the partial output, flagged.
+        let t = get_unit_transcript(&store, "s:review").expect("rejected transcript record");
+        assert!(t.partial);
+        assert_eq!(
+            t.output.as_deref(),
+            Some("found AKIAIOSFODNN7EXAMPLE in the config")
         );
 
         // CONTROL: the same triggering output under a DIFFERENT phase is untouched. This is what

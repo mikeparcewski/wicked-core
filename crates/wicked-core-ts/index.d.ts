@@ -211,8 +211,23 @@ export declare class Core {
    * a UI builds its project list from).
    */
   sessionsDetail(): Promise<string>
-  /** A unit's captured work output (transcript), as a JSON value — a string, or `null` if none. */
+  /**
+   * A unit's captured work output (transcript), as a JSON value — a string, or `null` if none.
+   * A REJECTED unit answers with whatever PARTIAL output existed at rejection (usability review
+   * #1) — the unit record's `status`/`denial` marks it partial; `null` only when no output was
+   * ever stored (never ran, or denied before any output existed — see `unitTranscript`).
+   */
   workOutput(unitId: string): Promise<string>
+  /**
+   * A unit's full transcript RECORD (usability review #1), as a JSON object — or `null` when the
+   * unit never ran far enough to leave one. Shape: `{ unit_id, resolution: "resolved"|"rejected",
+   * partial: bool, phase_status?, output?, denial_reason?, denial? }` where `denial` is
+   * `{ source, reason, claim_id?, rule_ids?, denied_tool?, phase? }`. A rejected unit keeps its
+   * PARTIAL output here, flagged; a unit denied BEFORE any output existed answers with an
+   * explicit failure record (`output` absent, `denial` carrying the claim id / firing rule ids /
+   * denied tool) instead of `null`.
+   */
+  unitTranscript(unitId: string): Promise<string>
   /**
    * A run's recorded event history, oldest first, as a JSON array. Each entry is the SAME tagged
    * object the `/ws` stream carries ([`CoreEvent::to_json`]) plus a capture-time `ts` (epoch millis)

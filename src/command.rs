@@ -20,8 +20,12 @@ pub(crate) enum Command {
     Sessions(Sender<anyhow::Result<Vec<String>>>),
     /// Every session + its ordered units — what the UI builds its project list from.
     Projects(Sender<anyhow::Result<Vec<crate::SessionView>>>),
-    /// A unit's captured work output (transcript), if any.
+    /// A unit's captured work output (transcript), if any — a REJECTED unit answers with its
+    /// partial output (usability review #1); `None` only when no output was ever stored.
     WorkOutput(String, Sender<Option<String>>),
+    /// A unit's full transcript RECORD — resolved or rejected, output + resolution flag +
+    /// structured denial (usability review #1).
+    UnitTranscript(String, Sender<Option<crate::domain::UnitTranscript>>),
     /// Register a live event subscriber.
     Subscribe(Sender<CoreEvent>),
     /// Run a full governed session (fire-and-forget — progress + outcome arrive as `CoreEvent`s,
@@ -232,6 +236,10 @@ pub(crate) enum Command {
         analysis: String,
         /// Bounded excerpt of the original failure output (for prompts + denial reasons).
         failure_excerpt: String,
+        /// The FULL failure output the worker posted (usability review #1): on a `Fail` decision
+        /// it is persisted as the rejected unit's flagged transcript record — the excerpt above
+        /// stays bounded for prompts and denial reasons; the transcript record is never truncated.
+        full_output: String,
         /// Process-generation token (DES-002): disambiguates triage for a relaunched run.
         #[allow(dead_code)]
         process_gen: Option<uuid::Uuid>,

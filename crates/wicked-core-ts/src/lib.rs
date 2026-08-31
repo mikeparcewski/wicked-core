@@ -1067,11 +1067,30 @@ impl Core {
     }
 
     /// A unit's captured work output (transcript), as a JSON value — a string, or `null` if none.
+    /// A REJECTED unit answers with whatever PARTIAL output existed at rejection (usability review
+    /// #1) — the unit record's `status`/`denial` marks it partial; `null` only when no output was
+    /// ever stored (never ran, or denied before any output existed — see `unitTranscript`).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn work_output(&self, unit_id: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
         task(move || {
             let out = core.work_output(&unit_id);
+            serde_json::to_string(&out).map_err(err)
+        })
+    }
+
+    /// A unit's full transcript RECORD (usability review #1), as a JSON object — or `null` when the
+    /// unit never ran far enough to leave one. Shape: `{ unit_id, resolution: "resolved"|"rejected",
+    /// partial: bool, phase_status?, output?, denial_reason?, denial? }` where `denial` is
+    /// `{ source, reason, claim_id?, rule_ids?, denied_tool?, phase? }`. A rejected unit keeps its
+    /// PARTIAL output here, flagged; a unit denied BEFORE any output existed answers with an
+    /// explicit failure record (`output` absent, `denial` carrying the claim id / firing rule ids /
+    /// denied tool) instead of `null`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn unit_transcript(&self, unit_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let out = core.unit_transcript(&unit_id);
             serde_json::to_string(&out).map_err(err)
         })
     }
@@ -2098,6 +2117,7 @@ mod tests {
                 evaluator_pass: Some(true),
                 evaluator_policies: vec![s()],
                 denial_reason: None,
+                denial: None,
                 combined: true,
             },
             "gateEvaluated",
@@ -2113,6 +2133,7 @@ mod tests {
                 "evaluatorPass",
                 "evaluatorPolicies",
                 "denialReason",
+                "denial",
                 "combined",
             ],
         );

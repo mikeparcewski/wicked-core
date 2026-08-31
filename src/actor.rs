@@ -815,7 +815,17 @@ pub(crate) fn run(
                 let _ = reply.send(list_projects(&store));
             }
             Command::WorkOutput(unit_id, reply) => {
-                let _ = reply.send(crate::domain::get_work_output(&store, &unit_id));
+                // The OPERATOR transcript read (usability review #1): a rejected unit answers with
+                // whatever PARTIAL output existed at rejection — the unit record's status/denial
+                // says it is partial — while a unit with no stored output (pre-output deny, never
+                // ran) stays `None`. Engine-internal reads that must see APPROVED output only
+                // (evaluator artifact-passing, context injection) call `get_work_output` directly.
+                let _ = reply.send(
+                    crate::domain::get_unit_transcript(&store, &unit_id).and_then(|t| t.output),
+                );
+            }
+            Command::UnitTranscript(unit_id, reply) => {
+                let _ = reply.send(crate::domain::get_unit_transcript(&store, &unit_id));
             }
             Command::Subscribe(sub) => subscribers.push(sub),
             Command::Launch(spec) => {
@@ -2529,6 +2539,7 @@ pub(crate) fn run(
                 decision,
                 analysis: judge_analysis,
                 failure_excerpt,
+                full_output,
                 process_gen: _, // stale-triage guard — consumed by bus consumer in T7
                 launch_seq: _,
             } => {
@@ -2729,10 +2740,15 @@ pub(crate) fn run(
                         // (crew#322). `failure_excerpt` is itself already head+tail-bounded, so
                         // this second bound still ends on the real end of the transcript.
                         let excerpt: String = failure_detail_excerpt(&failure_excerpt);
-                        unit.denial_reason = Some(format!(
-                            "Worker FAILED on unit {ord} (triage: {reason}): {excerpt}"
-                        ));
+                        let why =
+                            format!("Worker FAILED on unit {ord} (triage: {reason}): {excerpt}");
+                        unit.denial_reason = Some(why.clone());
+                        unit.denial = Some(crate::domain::UnitDenial::new("worker_failure", why));
                         let _ = put_node(&mut store, unit.to_node());
+                        // Usability review #1: the triage-Fail rejection persists the same
+                        // flagged transcript record as every other rejection path — the FULL
+                        // failure output (the denial_reason above is only a bounded excerpt).
+                        persist_rejected_transcript(&mut store, &session, unit, &full_output);
                         emit(
                             &mut subscribers,
                             CoreEvent::StepFailed {
@@ -3684,6 +3700,44 @@ fn next_failover_seat(
 /// cursor AND the unit isn't already `Done`. A stale or duplicate result — e.g. a worker orphaned by
 /// a superseded run or a re-delivered message — is ignored (`Stale`). This is the defense the
 /// per-actor `in_flight` set cannot provide (it can't see results from a different actor/process).
+/// Persist a REJECTED unit's transcript record from one of the actor's OWN rejection paths — the
+/// paths that never reach `execute::apply_unit` (worker failure, triage-judged fail, substance
+/// gate, deliverable floor, elicitation failure) and therefore stored nothing at all (usability
+/// review #1). The
+/// record carries the unit's FULL partial output (`denial_reason` keeps only a bounded excerpt),
+/// flagged `resolution: "rejected"`, with the unit's structured denial beside it. Best-effort by
+/// design: these call sites are already on the failure path headed for `fail_run`, and a store
+/// hiccup here must never convert a clean rejection into an actor error — the unit record with its
+/// denial_reason was already persisted, so losing the transcript record only degrades back to the
+/// pre-fix behavior (logged, never silent).
+fn persist_rejected_transcript(
+    store: &mut dyn GraphStore,
+    session: &crate::domain::AgentSession,
+    unit: &crate::domain::WorkUnit,
+    output: &str,
+) {
+    let scope = unit
+        .collection_scope
+        .clone()
+        .unwrap_or_else(|| crate::scope::resolve_scope(session.entity_mode, &session.id, &unit.id));
+    // The caller sets `unit.denial` before calling; fall back to the prose so the record is never
+    // written denial-less on a path that only filled `denial_reason`.
+    let denial = unit.denial.clone().unwrap_or_else(|| {
+        crate::domain::UnitDenial::new(
+            "worker_failure",
+            unit.denial_reason
+                .clone()
+                .unwrap_or_else(|| format!("unit {} rejected", unit.ord)),
+        )
+    });
+    if let Err(e) = crate::execute::record_rejected_output(store, unit, &scope, output, &denial) {
+        eprintln!(
+            "wicked-core: could not persist rejected transcript for {}: {e}",
+            unit.id
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_step_result(
     store: &mut dyn GraphStore,
@@ -3878,7 +3932,14 @@ fn apply_step_result(
             )
         };
         unit.denial_reason = Some(detail.clone());
+        unit.denial = Some(crate::domain::UnitDenial::new(
+            "elicitation",
+            detail.clone(),
+        ));
         put_node(store, unit.to_node())?;
+        // Usability review #1: the FULL partial transcript survives the rejection (the
+        // denial_reason above is only a bounded excerpt).
+        persist_rejected_transcript(store, &session, unit, &output.output);
         emit(
             subscribers,
             CoreEvent::StepFailed {
@@ -4037,6 +4098,9 @@ fn apply_step_result(
                 let unit_ix2 = output.unit_ix;
                 let attempt2 = output.attempt;
                 let desc = unit.description.clone();
+                // The FULL output rides beside the bounded excerpt so a `Fail` decision can
+                // persist the untruncated transcript record (usability review #1).
+                let full_output = output.output.clone();
                 std::thread::spawn(move || {
                     let ctx = format!("{run_id2}-u{unit_ix2}-a{attempt2}");
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4074,6 +4138,7 @@ fn apply_step_result(
                         decision,
                         analysis,
                         failure_excerpt,
+                        full_output,
                         process_gen: None, // set when bus-dispatched in T7
                         launch_seq: 0,
                     });
@@ -4192,7 +4257,15 @@ fn apply_step_result(
         } else {
             format!("Worker FAILED on unit {ord}: {raw_snippet}")
         });
+        unit.denial = unit
+            .denial_reason
+            .clone()
+            .map(|r| crate::domain::UnitDenial::new("worker_failure", r));
         put_node(store, unit.to_node())?;
+        // Usability review #1: the FULL failure transcript survives the rejection (the
+        // denial_reason above is only a bounded excerpt); empty output leaves an explicit
+        // no-output failure record.
+        persist_rejected_transcript(store, &session, unit, &output.output);
         // `detail` is the raw bounded excerpt — no framing text — so event consumers get
         // the worker's own output without needing to parse the denial_reason framing.
         emit(
@@ -4241,7 +4314,11 @@ fn apply_step_result(
         const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
         unit.status = crate::domain::UnitStatus::Rejected;
         unit.denial_reason = Some(NO_SUBSTANCE.to_string());
+        unit.denial = Some(crate::domain::UnitDenial::new("substance", NO_SUBSTANCE));
         put_node(store, unit.to_node())?;
+        // Usability review #1: even the under-200-char output is the honest record of what the
+        // phase produced — persist it flagged rejected rather than storing nothing.
+        persist_rejected_transcript(store, &session, unit, &output.output);
         emit(
             subscribers,
             CoreEvent::StepFailed {
@@ -4309,7 +4386,10 @@ fn apply_step_result(
             );
             unit.status = crate::domain::UnitStatus::Rejected;
             unit.denial_reason = Some(why.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new("deliverables", why.clone()));
             put_node(store, unit.to_node())?;
+            // Usability review #1: what the phase DID produce survives the rejection, flagged.
+            persist_rejected_transcript(store, &session, unit, &output.output);
             emit(
                 subscribers,
                 CoreEvent::StepFailed {

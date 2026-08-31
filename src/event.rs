@@ -237,6 +237,10 @@ pub enum CoreEvent {
         /// Policy ids applied by the evaluator second pass. Empty ⇒ default-allow (see HONESTY above).
         evaluator_policies: Vec<String>,
         denial_reason: Option<String>,
+        /// The MACHINE-READABLE twin of `denial_reason` (usability review #1): source layer, firing
+        /// rule ids, recording claim id, denied tool. `Some` only when `combined == false` and a
+        /// denying layer was identified. Additive — consumers of the prose keep working.
+        denial: Option<crate::domain::UnitDenial>,
         combined: bool,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
@@ -680,6 +684,20 @@ pub enum CoreEvent {
     },
 }
 
+/// Render a [`crate::domain::UnitDenial`] in the events wire's camelCase convention (the persisted
+/// unit record keeps serde's snake_case; the event stream is camelCase throughout, so the same
+/// structure is spelled per-surface rather than leaking one convention into the other).
+fn denial_json(d: &crate::domain::UnitDenial) -> serde_json::Value {
+    serde_json::json!({
+        "source": d.source,
+        "reason": d.reason,
+        "claimId": d.claim_id,
+        "ruleIds": d.rule_ids,
+        "deniedTool": d.denied_tool,
+        "phase": d.phase,
+    })
+}
+
 impl CoreEvent {
     /// Serialize to the tagged JSON object (`{ "type": "...", ...fields }`) that IS this event's
     /// wire identity — the shape the studio's `/ws` stream carries and the shape the durable event
@@ -868,6 +886,9 @@ impl CoreEvent {
             // `evaluatorPass` is a nullable bool (`None` = the evaluator≠creator pass did not run).
             // `evaluatorPolicies` is the applicable-policy id list; EMPTY alongside `evaluatorPass: true`
             // means nothing applied — a default-allow, not an enforced pass (FINDING-025).
+            // `denial` (usability review #1) is the machine-readable twin of `denialReason` —
+            // `{source, reason, claimId, ruleIds, deniedTool, phase}`, camelCase like every event
+            // field, nullable; consumers of the prose keep working.
             CoreEvent::GateEvaluated {
                 session,
                 ord,
@@ -879,6 +900,7 @@ impl CoreEvent {
                 evaluator_pass,
                 evaluator_policies,
                 denial_reason,
+                denial,
                 combined,
             } => json!({
                 "type": "gateEvaluated",
@@ -892,6 +914,7 @@ impl CoreEvent {
                 "evaluatorPass": evaluator_pass,
                 "evaluatorPolicies": evaluator_policies,
                 "denialReason": denial_reason,
+                "denial": denial.as_ref().map(denial_json),
                 "combined": combined,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`

@@ -76,8 +76,9 @@ pub use code_graph::{index_repo, rank_symbols, recon_repo, RankedSymbol};
 pub use command::InjectTarget;
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
-    all_sessions, get_session, get_work_output, put_node, put_nodes, session_units, AgentSession,
-    HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind, UnitStatus, WorkUnit,
+    all_sessions, get_session, get_unit_transcript, get_work_output, put_node, put_nodes,
+    session_units, AgentSession, HumanConfirm, RoutingInfo, SessionStatus, SessionView, StageKind,
+    UnitDenial, UnitStatus, UnitTranscript, WorkUnit,
 };
 pub use domain_extraction::{
     coverage_eq_one_validator, provision_and_approve_coverage_validator, COVERAGE_CRITERION,
@@ -1099,11 +1100,27 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
-    /// A unit's captured work output (the transcript), if any.
+    /// A unit's captured work output (the transcript), if any. A REJECTED unit answers with
+    /// whatever PARTIAL output existed at rejection (usability review #1) — read the unit record's
+    /// status/`denial` (or [`Core::unit_transcript`]) to distinguish partial from resolved; `None`
+    /// only when no output was ever stored (never ran, or denied before any output existed).
     pub fn work_output(&self, unit_id: &str) -> Option<String> {
         let (reply, rx) = channel();
         self.tx
             .send(Command::WorkOutput(unit_id.to_string(), reply))
+            .ok()?;
+        rx.recv().ok().flatten()
+    }
+
+    /// A unit's full transcript RECORD (usability review #1): the output (resolved, or a rejected
+    /// unit's partial output), the `resolution`/`partial` flags that distinguish the two, and the
+    /// structured denial (claim id, rule ids, denied tool) when the unit was denied — including the
+    /// EXPLICIT FAILURE RECORD of a unit denied before any output existed (`output: None`).
+    /// `None` when the unit never ran far enough to leave a record.
+    pub fn unit_transcript(&self, unit_id: &str) -> Option<domain::UnitTranscript> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::UnitTranscript(unit_id.to_string(), reply))
             .ok()?;
         rx.recv().ok().flatten()
     }
