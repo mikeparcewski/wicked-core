@@ -399,6 +399,46 @@ export declare class Core {
    */
   steeringImport(batchJson: string): Promise<string>
   /**
+   * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
+   * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
+   * `args_json` is `{ type?, corpus?, knowledgeDb?, dbPath }` (camelCase keys are the PINNED
+   * binding contract): `type` slices the corpus to one of the 7 steering types; `corpus`
+   * names an estate knowledge scope (`evals:<name>` — a corpus landed by
+   * [`Core::governance_corpus_import`]) or, omitted, selects the compiled-in default corpus;
+   * `knowledgeDb` powers embedding gap hints (absent/unusable ⇒ the report carries
+   * `degraded: "facet-only"` — an honest downgrade to keyword hints, never fabricated
+   * similarity); `dbPath` is the rules store, opened READ-ONLY — this call never goes through
+   * the single-writer actor and never writes either store.
+   *
+   * Resolves to the `EvalReport` JSON exactly as the engine serializes it (snake_case — crew
+   * passes it through verbatim as the pinned wire contract):
+   * `{ results: [{ sample: { id, description, kind, steering_type }, expected: "deny"|"allow",
+   * fired: [rule-id…], verdict: "caught"|"gap"|"false_positive", nearest_rules? }],
+   * summary: { total, caught, gaps, false_positives }, degraded: "facet-only"|null }`.
+   *
+   * Fail-closed: malformed args, an unknown steering type, a corpus name outside the
+   * `evals:` scope, or a missing store reject the Promise with the engine's reason — crew maps
+   * those to 400, and gates the whole route on this binding's PRESENCE (absent ⇒ 501).
+   */
+  governanceEvals(argsJson: string): Promise<string>
+  /**
+   * Import an eval corpus into the estate knowledge store (the engine seam behind crew's
+   * `POST /api/v1/testing/corpora/import`). `args_json` is `{ name, samples, knowledgeDb? }`
+   * (camelCase keys are the PINNED binding contract): `samples` is an array of
+   * `{ id, description, kind: "good"|"bad", steering_type, signals: { phase?, tool?, files?,
+   * content? } }` — validated fail-closed as a whole corpus (blank/duplicate ids, unknown
+   * steering types reject the batch) and landed under scope `evals:<name>`, one chunk per
+   * sample, id-keyed (re-import upserts in place) WITH embeddings via the same
+   * `KnowledgeEngine` path the rules fan-out uses. `knowledgeDb` defaults to the operator's
+   * `~/.wicked-estate/knowledge.db`; tests must always pass a temp path.
+   *
+   * Resolves to the `ImportReceipt` JSON `{ imported, scope: "evals:<name>", embedded }` —
+   * `embedded` is VERIFIED against the durable store after the write handle drops, not
+   * asserted. Fail-closed on malformed args (crew maps that to 400; route presence-gates on
+   * this binding like [`Core::governance_evals`] — absent ⇒ 501).
+   */
+  governanceCorpusImport(argsJson: string): Promise<string>
+  /**
    * Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
    * append-only, so a mis-authored policy denied forever).
    *
@@ -437,7 +477,8 @@ export declare class Core {
   registerWorkflow(json: string): Promise<string>
   /**
    * Recall which conformance rules apply to the given `query_json` (a JSON-serialized
-   * `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
+   * `RuleQuery` — fields: language, layer, framework, severity, rule_type, steering_type;
+   * all optional).
    * An empty or whitespace `query_json` is treated as an all-rules query (no facet filters).
    * Opens a read-only connection — does not block the single-writer actor. Returns a JSON
    * array of `ConformanceRule` objects, severity-first then id.
