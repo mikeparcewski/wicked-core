@@ -132,6 +132,162 @@ fn scoreboard_json(
     serde_json::to_string_pretty(&report).map_err(err)
 }
 
+/// The steering-type vocabulary the STEERING program pins on `ConformanceRule.steering_type`
+/// (enum-as-string; a rule authored before the field existed reads as `"architecture"` — the
+/// unified model's serde default). Kept in lockstep with wicked-governance's steering-rule
+/// model; collapse into a re-export once the model exposes the canonical list.
+const STEERING_TYPES: [&str; 7] = [
+    "architecture",
+    "development",
+    "security",
+    "testing",
+    "operations",
+    "compliance",
+    "design-ux",
+];
+
+/// List conformance rules as a JSON array, with the two facets crew's Steering management
+/// surface reads:
+///
+/// - `steering_type` — exact match on the rule's `steering_type`; a rule whose serialized form
+///   lacks the field (authored before the unified steering model) counts as `"architecture"`,
+///   mirroring the model's serde default. An unknown value FAILS CLOSED (a typo silently
+///   returning `[]` would read as "no rules of that type").
+/// - `include_retired` — `recall_rules` is the enforcement funnel and rightly hides withdrawn
+///   rows; a MANAGEMENT listing must be able to show them (retire-not-delete: a retired rule
+///   still explains the past decisions that cite it). `false` reproduces the exact pre-0.7.5
+///   behavior.
+///
+/// The rows are the full serialized `ConformanceRule` — whatever fields the model carries
+/// (steering_type / applies_to / excludes / weight / effect / …) ride through un-projected, so
+/// this binding never strips a field the unified model adds. NOTE the model elides
+/// default-valued steering fields on the wire (`skip_serializing_if`): an absent
+/// `steering_type` reads as `"architecture"`, an absent `weight` as `1.0`. Ordering is the
+/// unified steering order: severity-first (critical→info), then weight DESC within a band,
+/// then id — on a pre-steering store every weight is the 1.0 default, so this degrades to the
+/// exact severity→id order `recall_rules` ships today.
+///
+/// A free function (not a `Core` method body) so the tests below drive the binding's exact code
+/// path against a temp store — the same seam discipline as [`scoreboard_json`].
+fn list_conformance_rules_json(
+    db_path: &str,
+    steering_type: Option<&str>,
+    include_retired: bool,
+) -> napi::Result<String> {
+    use wicked_apps_core::{open_store_ro, synthetic_symbol, FromNode, GraphRead, NodeKind};
+    use wicked_estate_core::SymbolQuery;
+    use wicked_governance::{ConformanceRule, CONFORMANCE_RULE};
+
+    if let Some(ty) = steering_type {
+        if !STEERING_TYPES.contains(&ty) {
+            return Err(err(format!(
+                "unknown steering type {ty:?} — expected one of {STEERING_TYPES:?}"
+            )));
+        }
+    }
+
+    let store = open_store_ro(Some(db_path)).map_err(err)?;
+    // Mirrors `recall_rules`' identification walk (native Rule nodes, own synthetic-symbol
+    // round-trip skips foreign Rule nodes) WITHOUT its unconditional retired skip — see the
+    // `include_retired` contract above. Collapse onto the unified store read once the
+    // steering-rule model's `RuleQuery` carries these facets natively.
+    let sym_query = SymbolQuery {
+        kinds: vec![NodeKind::Rule],
+        ..Default::default()
+    };
+    let mut rules: Vec<ConformanceRule> = Vec::new();
+    for node in store.find_symbols(&sym_query).map_err(err)? {
+        if node.symbol != synthetic_symbol(CONFORMANCE_RULE, &node.name) {
+            continue; // foreign Rule node (e.g. estate's rules engine) — not ours
+        }
+        let rule = ConformanceRule::from_node(&node).map_err(err)?;
+        if rule.retired && !include_retired {
+            continue;
+        }
+        rules.push(rule);
+    }
+    // The steering facets read the SERIALIZED form (`steering_type`/`weight` matched as JSON
+    // fields, absent ⇒ the model's defaults: "architecture" / 1.0) so this compiles — and stays
+    // correct — on both sides of the unified-model landing, where those fields are elided at
+    // their defaults anyway.
+    let mut out: Vec<(u8, f64, String, serde_json::Value)> = Vec::with_capacity(rules.len());
+    for rule in &rules {
+        let v = serde_json::to_value(rule).map_err(err)?;
+        if let Some(ty) = steering_type {
+            let rule_ty = v
+                .get("steering_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("architecture");
+            if rule_ty != ty {
+                continue;
+            }
+        }
+        let weight = v
+            .get("weight")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1.0);
+        out.push((rule.severity.rank(), weight, rule.id.clone(), v));
+    }
+    // Unified steering order: severity (critical→info), weight DESC (INV-S2 pins weights finite,
+    // so the partial_cmp fallback is unreachable), then id. All-default weights ⇒ the exact
+    // severity→id order recall_rules ships.
+    out.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+    let rows: Vec<serde_json::Value> = out.into_iter().map(|(_, _, _, v)| v).collect();
+    serde_json::to_string(&rows).map_err(err)
+}
+
+/// List the doctrine RuleSet parents (AW-13 grouping — one `NodeKind::RuleSet` node per doctrine
+/// domain, `Contains` membership edges to its rules) as a JSON array of
+/// `{ domain, rule_ids, rule_count }` rows, domain-sorted. The array LENGTH is the
+/// `ruleset_count` crew's wiki meta reports (`countRuleSets` — `null`-on-missing-binding was its
+/// pre-0.7.5 answer); the rows carry membership so the Steering surface can render grouping
+/// without a second round-trip. Membership follows the store's `Contains` edges verbatim —
+/// retire-not-delete means a retired rule stays listed in its RuleSet (the grouping is doc
+/// structure, not enforcement); a membership edge whose target node is gone is skipped.
+///
+/// Free-function seam for the same reason as [`list_conformance_rules_json`].
+fn list_rule_sets_json(db_path: &str) -> napi::Result<String> {
+    use wicked_apps_core::{open_store_ro, EdgeKind, GraphRead, NodeKind};
+    use wicked_estate_core::{Direction, SymbolQuery};
+
+    let store = open_store_ro(Some(db_path)).map_err(err)?;
+    let sym_query = SymbolQuery {
+        kinds: vec![NodeKind::RuleSet],
+        ..Default::default()
+    };
+    let mut sets = store.find_symbols(&sym_query).map_err(err)?;
+    sets.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(sets.len());
+    for set in &sets {
+        let mut rule_ids: Vec<String> = Vec::new();
+        for edge in store
+            .neighbors(&set.symbol, Direction::Dependencies)
+            .map_err(err)?
+        {
+            if edge.kind != EdgeKind::Contains {
+                continue;
+            }
+            // The member's rule id is the target NODE's name (`to_node` round-trip) — resolved
+            // through the store rather than parsed out of the symbol string.
+            if let Some(member) = store.get_node(&edge.target).map_err(err)? {
+                rule_ids.push(member.name);
+            }
+        }
+        rule_ids.sort_unstable();
+        rows.push(serde_json::json!({
+            "domain": set.name,
+            "rule_ids": rule_ids,
+            "rule_count": rule_ids.len(),
+        }));
+    }
+    serde_json::to_string(&rows).map_err(err)
+}
+
 // ── the AsyncTask that runs one blocking Core call off the Node loop ──────────
 
 /// A single blocking Core call, run on a libuv worker thread. Holds a boxed closure so one Task type
@@ -1004,17 +1160,49 @@ impl Core {
         })
     }
 
-    /// All conformance rules on the store (Pattern + Policy types), as a JSON array.
+    /// All conformance rules on the store (Pattern + Policy types), as a JSON array of
+    /// serialized `ConformanceRule` objects — severity-first (critical→info), then weight DESC
+    /// within a band, then id. The rows carry the unified steering-rule model's fields
+    /// (steering_type / applies_to / excludes / weight / effect / trigger / obligations /
+    /// criteria / provenance / …) exactly as the model serializes them — default-valued steering
+    /// fields are elided on the wire (absent steering_type ⇒ "architecture", absent weight ⇒ 1).
+    ///
+    /// Steering facets (the studio Steering surface's list):
+    /// - `steeringType` filters on the rule's `steering_type` — one of architecture | development |
+    ///   security | testing | operations | compliance | design-ux. A rule authored before the
+    ///   field existed counts as `"architecture"` (the model's serde default); an unknown value
+    ///   REJECTS (fails closed — a typo must not read as "no rules of that type").
+    /// - `includeRetired: true` adds withdrawn rules (retire-not-delete: they still explain the
+    ///   past decisions that cite them; recall/enforcement never returns them).
+    ///
+    /// Both omitted ⇒ the exact pre-0.7.5 behavior (every active rule).
     #[napi(ts_return_type = "Promise<string>")]
-    pub fn list_conformance_rules(&self) -> AsyncTask<CoreTask> {
+    pub fn list_conformance_rules(
+        &self,
+        steering_type: Option<String>,
+        include_retired: Option<bool>,
+    ) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
         task(move || {
-            use wicked_apps_core::open_store_ro;
-            use wicked_governance::{recall_rules, RuleQuery};
-            let store = open_store_ro(Some(db_path.as_str())).map_err(err)?;
-            let rules = recall_rules(&store, &RuleQuery::default()).map_err(err)?;
-            serde_json::to_string(&rules).map_err(err)
+            list_conformance_rules_json(
+                &db_path,
+                steering_type.as_deref(),
+                include_retired.unwrap_or(false),
+            )
         })
+    }
+
+    /// The doctrine RuleSet parents (AW-13 grouping) as a JSON array of
+    /// `{ domain, rule_ids, rule_count }` rows, domain-sorted. The array length is the wiki
+    /// meta's `ruleset_count` (crew's `countRuleSets` resolved `null` on engine builds without
+    /// this binding — "cannot count" must never impersonate "0"); the rows carry `Contains`
+    /// membership so grouping renders without a second round-trip. Membership is the store's
+    /// edges verbatim — a retired rule stays listed in its RuleSet (grouping is doc structure,
+    /// not enforcement). Read-only connection; never blocks the single-writer actor.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn list_rule_sets(&self) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || list_rule_sets_json(&db_path))
     }
 
     /// All conformance claims (governance decisions) on the store, as a JSON array.
@@ -1092,8 +1280,14 @@ impl Core {
     }
 
     /// Upsert a conformance rule. `rule_json` is a JSON-serialized `ConformanceRule` object
-    /// (fields: id, rule_type, statement, severity, confidence, targets, provenance).
-    /// Validates server-side (INV-C1/C2/C4). Idempotent on stable id.
+    /// (fields: id, rule_type, statement, severity, confidence, targets, provenance — plus the
+    /// unified steering-rule fields: steering_type, applies_to, excludes, weight, and the
+    /// optional effect / trigger / obligations / criteria; a rule without `effect` stays
+    /// recall-only). The JSON passes through un-projected — the model's own serde is the wire
+    /// contract, so new steering fields ride this binding without a rebuild. Provenance is
+    /// first-class for UI/chat-authored rules too (`provenance.source: "ui" | "chat"`), not just
+    /// doc-ingested `path@sha#id` rows. Validates server-side (INV-C1/C2/C4). Idempotent on
+    /// stable id.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn upsert_conformance_rule(&self, rule_json: String) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
@@ -2158,11 +2352,10 @@ mod tests {
     /// over a temp store, in the SAME shape `wicked-core rules scoreboard --json` emits (the
     /// `Scoreboard` serde form). Key drift here is a wire break for every crew/studio consumer
     /// AND a CLI-parity break, so the exact top-level key set is pinned.
-    #[test]
-    fn governance_scoreboard_reports_over_a_temp_store() {
-        // Hermetic spool: `register_rule`'s fire-and-forget emission must never append to the
-        // operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` (the same
-        // set-once-never-unset pattern as wicked-governance's own `hermetic_test_spool`).
+    /// Set the hermetic emit spool ONCE per process: `register_rule`'s fire-and-forget emission
+    /// must never append to the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson`
+    /// (the same set-once-never-unset pattern as wicked-governance's own `hermetic_test_spool`).
+    fn hermetic_spool() {
         static SPOOL: std::sync::Once = std::sync::Once::new();
         SPOOL.call_once(|| {
             let path = std::env::temp_dir().join(format!(
@@ -2171,27 +2364,43 @@ mod tests {
             ));
             std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &path);
         });
+    }
 
-        // A file-backed temp store (`:memory:` cannot be shared with the binding's fresh
-        // read-only connection), populated through the real write path.
-        let db = std::env::temp_dir().join(format!(
-            "wicked-core-ts-scoreboard-{}.db",
-            std::process::id()
-        ));
+    /// A fresh file-backed temp-store path (`:memory:` cannot be shared with the bindings' fresh
+    /// read-only connections), with any residue of a previous run of the same test removed.
+    fn temp_store_path(name: &str) -> String {
+        let db =
+            std::env::temp_dir().join(format!("wicked-core-ts-{name}-{}.db", std::process::id()));
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(db.with_extension(format!("db{suffix}")));
         }
-        let db_path = db.to_str().expect("temp path is utf-8").to_string();
+        db.to_str().expect("temp path is utf-8").to_string()
+    }
+
+    /// Build a [`wicked_governance::ConformanceRule`] from its minimal WIRE form (the JSON shape
+    /// `upsertConformanceRule` accepts) rather than a struct literal — serde defaults fill every
+    /// optional field, so this helper keeps compiling as the unified steering-rule model grows
+    /// (`steering_type` / `applies_to` / `excludes` / `weight` / … all carry serde defaults).
+    fn wire_rule(id: &str, severity: &str) -> wicked_governance::ConformanceRule {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "rule_type": if id.starts_with("POL-") { "policy" } else { "pattern" },
+            "statement": format!("statement for {id}"),
+            "severity": severity,
+            "confidence": 0.9,
+        }))
+        .expect("the minimal wire-shape rule parses")
+    }
+
+    #[test]
+    fn governance_scoreboard_reports_over_a_temp_store() {
+        hermetic_spool();
+
+        // A file-backed temp store, populated through the real write path.
+        let db_path = temp_store_path("scoreboard");
         {
             let mut store = wicked_apps_core::open_store(Some(&db_path)).expect("store opens");
-            let rule = wicked_governance::ConformanceRule {
-                id: "POL-100".into(),
-                rule_type: wicked_governance::RuleType::Policy,
-                statement: "single-writer only".into(),
-                severity: wicked_governance::ConfSeverity::Critical,
-                confidence: 0.9,
-                ..Default::default()
-            };
+            let rule = wire_rule("POL-100", "critical");
             wicked_governance::register_rule(&mut store, &rule).expect("rule registers");
         }
 
@@ -2231,5 +2440,126 @@ mod tests {
         assert_eq!(v["typing"]["available"], false);
         // Recall volume is documented-unavailable in-band (see wicked-governance's scoreboard docs).
         assert_eq!(v["recall_volume"]["available"], false);
+    }
+
+    /// AC (steering facets): [`list_conformance_rules_json`] — the exact code path
+    /// `listConformanceRules` runs on the libuv worker thread — honors both new facets over a
+    /// temp store populated through the real write path:
+    /// - default (no facets) reproduces the pre-0.7.5 behavior: active rules only,
+    ///   severity-first then id;
+    /// - `include_retired: true` adds the withdrawn row (retire-not-delete);
+    /// - `steering_type: "architecture"` matches a rule whose serialized form predates the
+    ///   field (the unified model's serde default), any other type excludes it;
+    /// - an unknown steering type FAILS CLOSED instead of answering `[]`.
+    #[test]
+    fn list_conformance_rules_honors_steering_facets() {
+        hermetic_spool();
+
+        let db_path = temp_store_path("list-rules");
+        {
+            let mut store = wicked_apps_core::open_store(Some(&db_path)).expect("store opens");
+            for (id, sev) in [("PAT-200", "warn"), ("POL-200", "critical")] {
+                wicked_governance::register_rule(&mut store, &wire_rule(id, sev))
+                    .expect("rule registers");
+            }
+            wicked_governance::register_rule(&mut store, &wire_rule("PAT-201", "error"))
+                .expect("rule registers");
+            assert!(
+                wicked_governance::retire_rule(&mut store, "PAT-201").expect("retire runs"),
+                "the rule to retire exists"
+            );
+        }
+
+        let ids = |json: &str| -> Vec<String> {
+            let rows: Vec<Value> = serde_json::from_str(json).expect("binding emits valid JSON");
+            rows.iter()
+                .map(|r| r["id"].as_str().expect("rows carry an id").to_string())
+                .collect()
+        };
+
+        // Default: active only, severity-first (critical→info) then id — the pre-0.7.5 list.
+        let active = list_conformance_rules_json(&db_path, None, false).expect("lists");
+        assert_eq!(ids(&active), ["POL-200", "PAT-200"]);
+
+        // include_retired surfaces the withdrawn row in its severity slot, and the row SAYS so.
+        let all = list_conformance_rules_json(&db_path, None, true).expect("lists");
+        assert_eq!(ids(&all), ["POL-200", "PAT-201", "PAT-200"]);
+        let rows: Vec<Value> = serde_json::from_str(&all).unwrap();
+        assert_eq!(rows[1]["retired"], true, "the retired row is marked");
+
+        // steering_type facet: a pre-steering row counts as "architecture" (the model default) …
+        let arch =
+            list_conformance_rules_json(&db_path, Some("architecture"), false).expect("lists");
+        assert_eq!(ids(&arch), ["POL-200", "PAT-200"]);
+        // … and is excluded by every other type.
+        let sec = list_conformance_rules_json(&db_path, Some("security"), false).expect("lists");
+        assert_eq!(ids(&sec), Vec::<String>::new());
+
+        // Unknown type fails closed — never an empty array impersonating "no such rules".
+        let bad = list_conformance_rules_json(&db_path, Some("archtecture"), false)
+            .expect_err("a typo'd steering type must reject");
+        assert!(
+            bad.reason.contains("unknown steering type"),
+            "error names the problem: {}",
+            bad.reason
+        );
+    }
+
+    /// AC (rulesets binding): [`list_rule_sets_json`] — the exact code path `listRuleSets` runs —
+    /// answers `[]` on an unseeded store (crew's wiki meta reads the array LENGTH as
+    /// `ruleset_count`, so an empty store must be an honest 0-length array, valid JSON) and, once
+    /// AW-13 groupings are registered, one domain-sorted row per RuleSet parent carrying its
+    /// `Contains` membership.
+    #[test]
+    fn list_rule_sets_reports_grouping_rows() {
+        hermetic_spool();
+
+        let db_path = temp_store_path("list-rulesets");
+        {
+            let store = wicked_apps_core::open_store(Some(&db_path)).expect("store opens");
+            // Unseeded: an honest empty array, not an error and not `null`.
+            drop(store);
+            let empty = list_rule_sets_json(&db_path).expect("lists over an unseeded store");
+            let rows: Vec<Value> = serde_json::from_str(&empty).expect("valid JSON");
+            assert!(rows.is_empty(), "unseeded store reports zero rulesets");
+
+            let mut store = wicked_apps_core::open_store(Some(&db_path)).expect("store reopens");
+            for (id, sev) in [
+                ("PAT-300", "warn"),
+                ("PAT-301", "error"),
+                ("POL-300", "critical"),
+            ] {
+                wicked_governance::register_rule(&mut store, &wire_rule(id, sev))
+                    .expect("rule registers");
+            }
+            wicked_governance::register_rule_sets(
+                &mut store,
+                &[
+                    wicked_governance::RuleSetGrouping {
+                        domain: "event-grammar".to_string(),
+                        rule_ids: vec!["PAT-300".to_string(), "PAT-301".to_string()],
+                    },
+                    wicked_governance::RuleSetGrouping {
+                        domain: "agent-behavior".to_string(),
+                        rule_ids: vec!["POL-300".to_string()],
+                    },
+                ],
+            )
+            .expect("groupings register");
+        }
+
+        let json = list_rule_sets_json(&db_path).expect("lists rulesets");
+        let rows: Vec<Value> = serde_json::from_str(&json).expect("binding emits valid JSON");
+        assert_eq!(rows.len(), 2, "one row per RuleSet parent");
+        // Domain-sorted, membership resolved to rule ids through the store.
+        assert_eq!(rows[0]["domain"], "agent-behavior");
+        assert_eq!(rows[0]["rule_count"], 1);
+        assert_eq!(rows[0]["rule_ids"], serde_json::json!(["POL-300"]));
+        assert_eq!(rows[1]["domain"], "event-grammar");
+        assert_eq!(rows[1]["rule_count"], 2);
+        assert_eq!(
+            rows[1]["rule_ids"],
+            serde_json::json!(["PAT-300", "PAT-301"])
+        );
     }
 }
