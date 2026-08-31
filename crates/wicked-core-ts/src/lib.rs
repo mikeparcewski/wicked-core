@@ -1167,7 +1167,8 @@ impl Core {
     }
 
     /// Recall which conformance rules apply to the given `query_json` (a JSON-serialized
-    /// `RuleQuery` — fields: language, layer, framework, severity, rule_type; all optional).
+    /// `RuleQuery` — fields: language, layer, framework, severity, rule_type, steering_type;
+    /// all optional).
     /// An empty or whitespace `query_json` is treated as an all-rules query (no facet filters).
     /// Opens a read-only connection — does not block the single-writer actor. Returns a JSON
     /// array of `ConformanceRule` objects, severity-first then id.
@@ -2189,11 +2190,7 @@ mod tests {
                 statement: "single-writer only".into(),
                 severity: wicked_governance::ConfSeverity::Critical,
                 confidence: 0.9,
-                targets: wicked_governance::Targets::default(),
-                symbol_ref: None,
-                compliance: None,
-                provenance: wicked_governance::RuleProvenance::default(),
-                retired: false,
+                ..Default::default()
             };
             wicked_governance::register_rule(&mut store, &rule).expect("rule registers");
         }
@@ -2214,6 +2211,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "by_type",
                 "connection",
                 "evidence",
                 "recall_volume",
@@ -2224,6 +2222,8 @@ mod tests {
             ]
         );
         assert_eq!(v["rules_total"], 1);
+        // STEERING: the by-type breakdown files the (defaulted) rule under architecture.
+        assert_eq!(v["by_type"]["architecture"]["total"], 1);
         assert_eq!(v["rules_active"], 1);
         assert_eq!(v["rules_retired"], 0);
         // No docs root supplied → typing coverage reports unavailable IN-BAND (the doc-side

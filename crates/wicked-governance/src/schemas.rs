@@ -137,8 +137,11 @@ mod tests {
         );
     }
 
-    /// Each schema's `metadata.schema_version` const (the version a DOCUMENT carries) must agree
-    /// with its `$id` version segment — the two spellings of the per-schema contract version.
+    /// Each schema's `metadata.schema_version` (the version a DOCUMENT carries) must agree with
+    /// its `$id` version segment — the two spellings of the per-schema contract version. A schema
+    /// pins it as a `const` while it has one accepted version; an additively-evolved schema (the
+    /// conformance-rules 1.1.0 STEERING bump) widens it to an `enum` of every still-valid version,
+    /// whose NEWEST entry must be the `$id` segment.
     #[test]
     fn schema_version_consts_match_their_ids() {
         for (name, raw) in [
@@ -147,13 +150,28 @@ mod tests {
         ] {
             let schema = parsed(name, raw);
             let id_ver = id_version(name, &schema);
-            let const_ver = schema["properties"]["metadata"]["properties"]["schema_version"]
-                ["const"]
+            let sv = &schema["properties"]["metadata"]["properties"]["schema_version"];
+            let newest = sv["const"]
                 .as_str()
-                .unwrap_or_else(|| panic!("{name} has no metadata.schema_version const"));
+                .map(str::to_string)
+                .or_else(|| {
+                    sv["enum"].as_array().map(|versions| {
+                        versions
+                            .iter()
+                            .map(|v| v.as_str().expect("enum member is a string").to_string())
+                            .max_by(|a, b| {
+                                let key = |s: &str| -> Vec<u64> {
+                                    s.split('.').map(|p| p.parse().expect("semver")).collect()
+                                };
+                                key(a).cmp(&key(b))
+                            })
+                            .expect("non-empty schema_version enum")
+                    })
+                })
+                .unwrap_or_else(|| panic!("{name} has no metadata.schema_version const or enum"));
             assert_eq!(
-                const_ver, id_ver,
-                "{name}: metadata.schema_version const {const_ver:?} != $id segment {id_ver:?}"
+                newest, id_ver,
+                "{name}: newest accepted metadata.schema_version {newest:?} != $id segment {id_ver:?}"
             );
         }
     }

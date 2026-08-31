@@ -464,6 +464,7 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
                 compliance: None,
                 provenance: RuleProvenance::default(),
                 retired: false,
+                ..Default::default()
             },
         )
         .unwrap();

@@ -15,6 +15,37 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **STEERING unification — one steering-rule model** (STEERING program, gov-model lane). The
+  wiki/rules model and the standalone governance `Policy` model MERGE into `ConformanceRule`:
+  new optional/defaulted fields `steering_type` (enum-as-string over
+  `architecture|development|security|testing|operations|compliance|design-ux`, default
+  `architecture` — INV-S1), `applies_to` (inclusion, the exact `Policy.applies_to` SELECT
+  semantics), `excludes` (the NEW exclusion twin — exclusion dominates), `weight` (finite ≥ 0,
+  default 1.0 — recall orders severity → weight desc → id; stored gate-priority signal — INV-S2),
+  and the merged enforcement half `effect`/`trigger`/`obligations`/`criteria` (a rule WITHOUT
+  `effect` is recall-only exactly as before; `effect` + blank `applies_to` or a bad trigger regex
+  is refused — INV-S3). Every field is skipped at its default, so pre-steering rows parse
+  unchanged (the additive migration happens on read) and a rule that uses none of them keeps the
+  2.x wire shape byte-for-byte. INV-C1 is now scoped to the reserved `PAT-`/`POL-` namespace;
+  other ids (migrated policies keep theirs verbatim; UI/chat-authored rules mint their own) need
+  only be non-blank. `register_policy` became a thin shim (dual-writes the effect-bearing
+  steering rule + the legacy `Other(POLICY)` audit node; refuses an id collision with a
+  recall-only rule); `retire_policy` retires both rows; `select_any`/`decide` read the UNIFIED
+  store (legacy-only rows union in at read time so an un-migrated store never fails open), and a
+  golden test proves a migrated policy's decisions are BYTE-equal to its old row's.
+  `migrate_policies_to_steering` is the one-time idempotent migration (`rules ingest` runs it;
+  kind→steering_type mapping documented in `steering.rs`: the seven types map to themselves,
+  `guardrail`/`gate` and every other legacy kind → `operations`; ids unchanged, `retired`
+  honored, legacy nodes retained for decision-audit resolvability). `RuleQuery` gains the
+  `steering_type` facet (recall + estate `rules.recall` wire-compatible); NEW `list_rules` +
+  `wicked-core rules list [--type <t>] [--include-retired]` is the management/audit listing
+  (decide-lane rows always shown; retired rows listable — closes the recall-skips-retired
+  listing gap); `rules recall` gains `--type`; the scoreboard gains a per-steering-type
+  population breakdown (`by_type`); MarkdownAdapter frontmatter gains optional
+  `steering_type`/`excludes`/`weight` keys and `applies_to` now rides onto minted rules;
+  UI/chat provenance sources are first-class. `conformance-rules.schema.json` bumped additively
+  to contract 1.1.0 (bundle 1.2.0): new optional properties, id pattern relaxed outside the
+  reserved namespace, `metadata.schema_version` widened to `enum [1.0.0, 1.1.0]`.
 - **Fan-out contract across the deliberate store split** (AW-5 / arch-R3, decision record
   `.product/DES-OUTGOV-008-fanout-placement.md`). `wicked-core rules fanout <dir>` fans ONE ruleset
   (the `rules ingest` layout) out to the three lanes a governed run reads — (a) the enforcement

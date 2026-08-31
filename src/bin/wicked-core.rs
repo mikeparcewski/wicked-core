@@ -42,11 +42,19 @@
 //!       # (AW-10): orphaned / uningested / unresolvable / unlinked / extraneous; read-only; exits 3
 //!       # when residue is found (0 clean, 1 operational error) — run with the same --dir as ingest
 //!   wicked-core rules recall [--language L] [--layer L] [--framework F] \
-//!       [--severity info|warn|error|critical] [--rule-type pattern|policy] [--json]
+//!       [--severity info|warn|error|critical] [--rule-type pattern|policy] \
+//!       [--type <steering-type>] [--json]
 //!       # the AW-17 recall-REPORT: the conformance rules that APPLY to the query facets,
-//!       # severity-ordered (critical→info), each citing rule id + provenance ref (the wiki URI a
-//!       # CI comment links to). Read-only, and strictly a report: exit 0 even when rules match
+//!       # severity-ordered (critical→info, then weight desc, then id), each citing rule id +
+//!       # provenance ref (the wiki URI a CI comment links to). --type is the STEERING facet
+//!       # (architecture|development|security|testing|operations|compliance|design-ux).
+//!       # Read-only, and strictly a report: exit 0 even when rules match
 //!       # (v1 never blocks — arch-R15); 1 = operational error only
+//!   wicked-core rules list [--type <t>] [--include-retired] [--language L] [--layer L] \
+//!       [--framework F] [--severity S] [--rule-type T] [--json]
+//!       # the STEERING management LISTING over the unified store: recall-only AND effect-bearing
+//!       # (decide-lane / migrated-policy) rules, with retired rows included under
+//!       # --include-retired (recall never returns them — this is the audit view). Read-only.
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--coverage F] [--out F]  # translate the annotated estate graph into
@@ -174,11 +182,20 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          CLI-written: --enforcement-crew-api records the pending transport + emits the POST payload. \
          WRITES to every cli lane store.\n\
          wicked-core rules recall [--db <F>] [--language <L>] [--layer <L>] [--framework <F>] \
-         [--severity info|warn|error|critical] [--rule-type pattern|policy] [--json]\n  \
+         [--severity info|warn|error|critical] [--rule-type pattern|policy] \
+         [--type <steering-type>] [--json]\n  \
          The AW-17 recall-REPORT: the conformance rules that APPLY to the query facets, \
-         severity-ordered (critical→info), each citing rule id + provenance ref (the wiki URI a CI \
-         comment links to). READ-ONLY, and strictly a report: exit 0 even when rules match (v1 of \
+         severity-ordered (critical→info, then weight desc, then id), each citing rule id + \
+         provenance ref (the wiki URI a CI comment links to). --type filters on the STEERING type \
+         (architecture|development|security|testing|operations|compliance|design-ux). READ-ONLY, \
+         and strictly a report: exit 0 even when rules match (v1 of \
          the CI conformance seam never blocks — arch-R15); 1 = operational error only.\n\
+         wicked-core rules list [--db <F>] [--type <steering-type>] [--include-retired] \
+         [--language <L>] [--layer <L>] [--framework <F>] [--severity <S>] [--rule-type <T>] \
+         [--json]\n  \
+         The STEERING management LISTING over the unified steering-rule store: recall-only AND \
+         effect-bearing (decide-lane / migrated-policy) rules alike, with retired rows included \
+         under --include-retired — the audit view recall deliberately never serves. READ-ONLY.\n\
          wicked-core rules scoreboard [--db <F>] [--dir <docs>] [--ambiguity-cap <N>] [--json]\n  \
          The AW-23 population/connection scoreboard: % statements typed into enforcement classes \
          (needs --dir — the class lives in doc frontmatter), % symbol_refs resolving at the current \
@@ -358,6 +375,11 @@ fn main() {
         // rule citing id + provenance ref. Read-only (open_store_ro), safe beside a live daemon.
         Some("rules") if args.get(2).map(String::as_str) == Some("recall") => {
             return rules_recall_cmd(&args)
+        }
+        // `rules list` is the STEERING management listing over the unified store — recall-only AND
+        // decide-lane rules, retired rows on request. Read-only (open_store_ro), daemon-safe.
+        Some("rules") if args.get(2).map(String::as_str) == Some("list") => {
+            return rules_list_cmd(&args)
         }
         // `rules scoreboard` is the AW-23 population/connection scoreboard: typed %, resolving %,
         // denials citing wiki rules. Read-only (open_store_ro), safe beside a live daemon.
@@ -1152,6 +1174,40 @@ fn rules_ingest_cmd(args: &[String]) {
         }
     };
 
+    // STEERING migration-on-open: ingest is the population path that already holds the store as a
+    // brief sole writer, so it heals any legacy `Other(POLICY)` rows into unified steering rules
+    // FIRST (one-time, idempotent — a migrated store reports nothing). Conflicts/skips are LOUD:
+    // an unmigrated enforcement row still enforces (select's read-time fallback), but the operator
+    // must know the unified listing does not carry it yet.
+    match wicked_governance::migrate_policies_to_steering(&mut store) {
+        Ok(report) => {
+            if !report.migrated.is_empty() {
+                println!(
+                    "rules ingest: migrated {} legacy policy row(s) into steering rules: {}",
+                    report.migrated.len(),
+                    report.migrated.join(", ")
+                );
+            }
+            for id in &report.conflicts {
+                eprintln!(
+                    "rules ingest: WARNING policy {id:?} conflicts with an existing recall-only \
+                     steering rule at the same id — NOT migrated (still enforced via the legacy \
+                     row); rename the policy or retire the rule, then re-ingest"
+                );
+            }
+            for skipped in &report.skipped {
+                eprintln!(
+                    "rules ingest: WARNING legacy policy row skipped by the steering migration: \
+                     {skipped}"
+                );
+            }
+        }
+        Err(e) => {
+            fail(&format!("rules ingest: steering migration failed: {e}"));
+            return;
+        }
+    }
+
     let root = std::path::Path::new(&dir);
     let mut n_policies = 0usize;
     let mut n_rules = 0usize;
@@ -1872,22 +1928,15 @@ fn rules_drift_cmd(args: &[String]) {
 /// seam's v1 contract is recall-report, never a block. Exit 0 = report produced (an EMPTY report
 /// prints a diagnostic line rather than silence, so "no rules ingested" is visible, not mistaken
 /// for "conformant"); exit 1 = operational error (bad flag, unopenable store).
-fn rules_recall_cmd(args: &[String]) {
-    let resolved_db = store_path(args);
-    if resolved_db.starts_with("--") {
-        fail(&format!(
-            "rules recall: --db has no value (resolved to {resolved_db:?})"
-        ));
-        return;
-    }
-    // A facet flag with a flag-shaped value means the value is MISSING (`--language --json`):
-    // silently treating it as a wildcard would widen the report while looking targeted. Fail loud.
+/// Parse the shared rule-query facets (`--language/--layer/--framework/--severity/--rule-type/
+/// --type`) for `rules recall` / `rules list`. A facet flag with a flag-shaped or vocabulary-
+/// violating value fails LOUD — silently treating it as a wildcard would widen the report while
+/// looking targeted.
+fn parse_rule_query(args: &[String], cmd: &str) -> wicked_governance::RuleQuery {
     let facet = |name: &str| -> Option<String> {
         let v = flag(args, name)?;
         if v.starts_with("--") {
-            fail(&format!(
-                "rules recall: {name} has no value (resolved to {v:?})"
-            ));
+            fail(&format!("{cmd}: {name} has no value (resolved to {v:?})"));
         }
         Some(v)
     };
@@ -1898,7 +1947,7 @@ fn rules_recall_cmd(args: &[String]) {
             Ok(s) => s,
             Err(_) => {
                 fail(&format!(
-                    "rules recall: --severity must be one of info|warn|error|critical, got {v:?}"
+                    "{cmd}: --severity must be one of info|warn|error|critical, got {v:?}"
                 ));
                 unreachable!("fail exits");
             }
@@ -1909,19 +1958,61 @@ fn rules_recall_cmd(args: &[String]) {
             Ok(t) => t,
             Err(_) => {
                 fail(&format!(
-                    "rules recall: --rule-type must be pattern or policy, got {v:?}"
+                    "{cmd}: --rule-type must be pattern or policy, got {v:?}"
                 ));
                 unreachable!("fail exits");
             }
         }
     });
-    let query = wicked_governance::RuleQuery {
+    // The STEERING facet — validated against the same vocabulary the write boundary enforces
+    // (INV-S1), so a typo'd type fails loud instead of silently matching nothing.
+    let steering_type = facet("--type").inspect(|v| {
+        if !wicked_governance::STEERING_TYPES.contains(&v.as_str()) {
+            fail(&format!(
+                "{cmd}: --type must be one of {}, got {v:?}",
+                wicked_governance::STEERING_TYPES.join("|")
+            ));
+        }
+    });
+    wicked_governance::RuleQuery {
         language: facet("--language"),
         layer: facet("--layer"),
         framework: facet("--framework"),
         severity,
         rule_type,
-    };
+        steering_type,
+    }
+}
+
+/// One rule row of the `rules recall`/`rules list` text reports.
+fn print_rule_row(r: &wicked_governance::ConformanceRule) {
+    let mut markers = String::new();
+    if r.retired {
+        markers.push_str(" [RETIRED]");
+    }
+    if let Some(effect) = &r.effect {
+        markers.push_str(&format!(" [effect: {effect:?}]"));
+    }
+    println!(
+        "  {:?} {} ({}): {}{} [source: {}]",
+        r.severity,
+        r.id,
+        r.steering_type,
+        r.statement,
+        markers,
+        r.provenance.reference.as_deref().unwrap_or("(none)")
+    );
+}
+
+fn rules_recall_cmd(args: &[String]) {
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules recall: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    let query = parse_rule_query(args, "rules recall");
     let store = match wicked_apps_core::open_store_ro(Some(&resolved_db)) {
         Ok(s) => s,
         Err(e) => {
@@ -1955,17 +2046,77 @@ fn rules_recall_cmd(args: &[String]) {
             rules.len()
         );
         for r in &rules {
-            println!(
-                "  {:?} {}: {} [source: {}]",
-                r.severity,
-                r.id,
-                r.statement,
-                r.provenance.reference.as_deref().unwrap_or("(none)")
-            );
+            print_rule_row(r);
         }
         if rules.is_empty() {
             // An empty report is a DIAGNOSTIC, never silence: on a store nothing was ingested
             // into, "0 rules" must read as "nothing to recall against", not as conformance.
+            println!(
+                "  no rules matched — if this store was expected to hold rules, run \
+                 `wicked-core rules ingest <dir> --db {resolved_db}` first"
+            );
+        }
+    }
+}
+
+/// `wicked-core rules list [--db F] [--type T] [--include-retired] [<facets>] [--json]` — the
+/// STEERING management listing over the UNIFIED steering-rule store. Where `rules recall` is the
+/// enforcement funnel (active, recall-only rules — what a gate attaches), `rules list` is the
+/// operator/audit view: effect-bearing (decide-lane / migrated-policy) rules always appear, and
+/// `--include-retired` lists withdrawn rows too — the 0.7.5 follow-up closing the
+/// recall-skips-retired listing gap. Strictly READ-ONLY (`open_store_ro`, daemon-safe).
+fn rules_list_cmd(args: &[String]) {
+    let resolved_db = store_path(args);
+    if resolved_db.starts_with("--") {
+        fail(&format!(
+            "rules list: --db has no value (resolved to {resolved_db:?})"
+        ));
+        return;
+    }
+    let query = parse_rule_query(args, "rules list");
+    let include_retired = args.iter().any(|a| a == "--include-retired");
+    let store = match wicked_apps_core::open_store_ro(Some(&resolved_db)) {
+        Ok(s) => s,
+        Err(e) => {
+            fail(&format!("rules list: open store read-only failed: {e}"));
+            return;
+        }
+    };
+    let rules = match wicked_governance::list_rules(&store, &query, include_retired) {
+        Ok(rs) => rs,
+        Err(e) => {
+            fail(&format!("rules list: {e}"));
+            return;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        // Same stable envelope as recall, plus the echoed retired switch (a listing that MAY
+        // contain withdrawn rows must say whether it was asked to).
+        let report = serde_json::json!({
+            "count": rules.len(),
+            "query": query,
+            "include_retired": include_retired,
+            "rules": rules,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).expect("report serializes")
+        );
+    } else {
+        println!(
+            "rules list: {} steering rule(s){} (store: {resolved_db})",
+            rules.len(),
+            if include_retired {
+                " incl. retired"
+            } else {
+                ""
+            }
+        );
+        for r in &rules {
+            print_rule_row(r);
+        }
+        if rules.is_empty() {
             println!(
                 "  no rules matched — if this store was expected to hold rules, run \
                  `wicked-core rules ingest <dir> --db {resolved_db}` first"
@@ -2038,6 +2189,20 @@ fn rules_scoreboard_cmd(args: &[String]) {
         "    rules: {} active, {} retired ({} total)",
         report.rules_active, report.rules_retired, report.rules_total
     );
+    // STEERING by-type breakdown — one row per steering sub-page that holds rules.
+    for (steering_type, row) in &report.by_type {
+        println!(
+            "      {steering_type}: {} active, {} retired ({} total{})",
+            row.active,
+            row.retired,
+            row.total,
+            if row.enforcing > 0 {
+                format!(", {} enforcing", row.enforcing)
+            } else {
+                String::new()
+            }
+        );
+    }
     let typing = &report.typing;
     if typing.available {
         let by_class = typing

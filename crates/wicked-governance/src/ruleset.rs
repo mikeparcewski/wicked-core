@@ -128,6 +128,7 @@ mod tests {
             compliance: None,
             provenance: RuleProvenance::default(),
             retired: false,
+            ..Default::default()
         }
     }
 

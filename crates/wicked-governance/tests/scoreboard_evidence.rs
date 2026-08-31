@@ -100,6 +100,7 @@ fn evidence_count_increments_persist_through_the_merge_rule_and_a_reopen() {
                 source_kinds: vec!["doc".into()],
             },
             retired: false,
+            ..Default::default()
         },
     )
     .unwrap();

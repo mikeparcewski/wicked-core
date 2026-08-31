@@ -112,12 +112,25 @@ pub struct RecallVolume {
     pub reason: String,
 }
 
+/// One steering type's population slice (STEERING: the per-sub-page counts).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SteeringTypeCount {
+    pub total: usize,
+    pub active: usize,
+    pub retired: usize,
+    /// Decide-lane rows (effect-bearing — the merged Policy model) within this type.
+    pub enforcing: usize,
+}
+
 /// The population/connection scoreboard (arch-R23).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Scoreboard {
     pub rules_total: usize,
     pub rules_active: usize,
     pub rules_retired: usize,
+    /// Population per steering type (STEERING) — one row per type that has any rules, keyed by
+    /// the [`crate::STEERING_TYPES`] spelling (pre-steering rows count under the default type).
+    pub by_type: BTreeMap<String, SteeringTypeCount>,
     pub typing: TypingCoverage,
     pub connection: ConnectionCoverage,
     pub evidence: EnforcementEvidence,
@@ -134,6 +147,21 @@ pub fn scoreboard(
     let rules = load_conformance_rules(store)?;
     let rules_total = rules.len();
     let rules_retired = rules.iter().filter(|r| r.retired).count();
+
+    // ── STEERING by-type breakdown: population per steering sub-page ──
+    let mut by_type: BTreeMap<String, SteeringTypeCount> = BTreeMap::new();
+    for rule in &rules {
+        let row = by_type.entry(rule.steering_type.clone()).or_default();
+        row.total += 1;
+        if rule.retired {
+            row.retired += 1;
+        } else {
+            row.active += 1;
+        }
+        if rule.effect.is_some() {
+            row.enforcing += 1;
+        }
+    }
 
     // ── typing (doc-side — the class lives in frontmatter, not on the rule node) ──
     let typing = match docs_root {
@@ -242,6 +270,7 @@ pub fn scoreboard(
         rules_total,
         rules_active: rules_total - rules_retired,
         rules_retired,
+        by_type,
         typing,
         connection,
         evidence,
@@ -356,6 +385,7 @@ mod tests {
                 source_kinds: vec!["doc".into()],
             },
             retired: false,
+            ..Default::default()
         };
         register_rule(&mut store, &linked).unwrap();
         relink(&mut store, DEFAULT_AMBIGUITY_CAP, 1_000).unwrap();
@@ -487,6 +517,7 @@ mod tests {
                 source_kinds: vec!["doc".into()],
             },
             retired: false,
+            ..Default::default()
         };
         register_rule(&mut store, &rule).unwrap();
         // RuleSet grouping must not confuse the scoreboard's rule scan (native Contains edges in).
@@ -517,5 +548,78 @@ mod tests {
         // record_rule_evidence on a retired rule still resolves the node (retire-not-delete).
         let after = record_rule_evidence(&mut store, &deny_claim("claim-c", ob)).unwrap();
         assert_eq!(after.evidenced, vec!["PAT-200".to_string()]);
+    }
+
+    /// STEERING: the scoreboard's by-type breakdown counts population per steering sub-page —
+    /// pre-steering rows under the default type, retired and decide-lane rows called out.
+    #[test]
+    fn scoreboard_breaks_population_down_by_steering_type() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // A defaulted (pre-steering shape) rule → architecture.
+        register_rule(
+            &mut store,
+            &ConformanceRule {
+                id: "PAT-300".into(),
+                rule_type: RuleType::Pattern,
+                statement: "arch rule".into(),
+                severity: ConfSeverity::Info,
+                confidence: 0.5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Two security rules, one of them retired.
+        for id in ["PAT-301", "PAT-302"] {
+            register_rule(
+                &mut store,
+                &ConformanceRule {
+                    id: id.into(),
+                    rule_type: RuleType::Pattern,
+                    statement: "sec rule".into(),
+                    severity: ConfSeverity::Warn,
+                    confidence: 0.5,
+                    steering_type: "security".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        retire_rule(&mut store, "PAT-302").unwrap();
+        // A migrated-policy-shaped decide-lane rule → operations, enforcing.
+        register_rule(
+            &mut store,
+            &ConformanceRule {
+                id: "pol-ops".into(),
+                rule_type: RuleType::Policy,
+                statement: "deny x".into(),
+                severity: ConfSeverity::Critical,
+                confidence: 1.0,
+                steering_type: "operations".into(),
+                applies_to: vec!["build".into()],
+                effect: Some(crate::Effect::Deny),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = scoreboard(&store, None, DEFAULT_AMBIGUITY_CAP).unwrap();
+        assert_eq!(report.rules_total, 4);
+        let arch = &report.by_type["architecture"];
+        assert_eq!(
+            (arch.total, arch.active, arch.retired, arch.enforcing),
+            (1, 1, 0, 0)
+        );
+        let sec = &report.by_type["security"];
+        assert_eq!(
+            (sec.total, sec.active, sec.retired, sec.enforcing),
+            (2, 1, 1, 0)
+        );
+        let ops = &report.by_type["operations"];
+        assert_eq!(
+            (ops.total, ops.active, ops.retired, ops.enforcing),
+            (1, 1, 0, 1)
+        );
+        assert_eq!(report.by_type.len(), 3, "only types that hold rules appear");
     }
 }

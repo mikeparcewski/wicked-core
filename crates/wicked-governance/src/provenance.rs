@@ -216,6 +216,7 @@ mod tests {
                 source_kinds: vec!["doc".into()],
             },
             retired: false,
+            ..Default::default()
         }
     }
 

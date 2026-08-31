@@ -25,7 +25,14 @@
 //!                               #   carried as doc metadata, no effect on rule minting
 //! enforcement_class: guidance   # optional: policy|validator|guidance (vocabulary validated
 //!                               #   here; typing into Policy/validator lanes is AW-7)
-//! applies_to: [plan, build]     # optional list
+//! applies_to: [plan, build]     # optional list — rides onto every minted rule (STEERING
+//!                               #   inclusion, the merged Policy.applies_to semantics)
+//! excludes: [clarify]           # optional list — the STEERING exclusion twin (withdraws the
+//!                               #   doc's rules from those phases; exclusion dominates)
+//! steering_type: security       # optional — one of the seven STEERING_TYPES (default
+//!                               #   architecture); the studio Steering sub-page the rules file under
+//! weight: 2.5                   # optional, finite ≥ 0 (default 1.0) — recall order within a
+//!                               #   severity band + stored gate priority; applies to every rule
 //! scope: wiki:architecture      # optional
 //! supersedes: [old-doc-id]      # optional list
 //! domain: agent-behavior        # optional — RuleSet parent (grouping is AW-9/AW-13)
@@ -86,18 +93,24 @@ const STATUSES: [&str; 4] = ["active", "draft", "superseded", "retired"];
 /// Doc `enforcement_class` vocabulary (arch-R4; the class→lane typing itself lands in AW-7).
 const ENFORCEMENT_CLASSES: [&str; 3] = ["policy", "validator", "guidance"];
 /// Frontmatter keys the convention knows. Anything else fails loud (a typo must surface).
-const KNOWN_KEYS: [&str; 11] = [
+/// `steering_type` / `excludes` / `weight` are the STEERING keys (optional, doc-level — applied
+/// to every rule the doc mints, like `confidence` and `targets`); `applies_to` now also rides
+/// onto each minted rule (the unified model's inclusion field), not just the doc metadata.
+const KNOWN_KEYS: [&str; 14] = [
     "id",
     "title",
     "status",
     "date",
     "enforcement_class",
     "applies_to",
+    "excludes",
     "scope",
     "supersedes",
     "domain",
     "confidence",
     "targets",
+    "steering_type",
+    "weight",
 ];
 /// Keys allowed under `targets:` (the wildcard facets of [`crate::Targets`]).
 const TARGET_KEYS: [&str; 3] = ["language", "layer", "framework"];
@@ -238,10 +251,13 @@ struct FrontMatter {
     date: Option<String>,
     enforcement_class: Option<String>,
     applies_to: Option<Vec<String>>,
+    excludes: Option<Vec<String>>,
     scope: Option<String>,
     supersedes: Option<Vec<String>>,
     domain: Option<String>,
     confidence: Option<f64>,
+    steering_type: Option<String>,
+    weight: Option<f64>,
     targets_language: Option<String>,
     targets_layer: Option<String>,
     targets_framework: Option<String>,
@@ -277,6 +293,15 @@ fn parse_doc(text: &str, ref_path: &str, sha: &str) -> anyhow::Result<serde_json
     }
     if let Some(v) = &fm.applies_to {
         doc_meta.insert("applies_to".into(), v.clone().into());
+    }
+    if let Some(v) = &fm.excludes {
+        doc_meta.insert("excludes".into(), v.clone().into());
+    }
+    if let Some(v) = &fm.steering_type {
+        doc_meta.insert("steering_type".into(), v.clone().into());
+    }
+    if let Some(v) = fm.weight {
+        doc_meta.insert("weight".into(), v.into());
     }
     if let Some(v) = &fm.supersedes {
         doc_meta.insert("supersedes".into(), v.clone().into());
@@ -328,7 +353,8 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
         }
         let rest = rest.trim();
         match key {
-            "id" | "title" | "status" | "enforcement_class" | "scope" | "domain" => {
+            "id" | "title" | "status" | "enforcement_class" | "scope" | "domain"
+            | "steering_type" => {
                 let v = parse_scalar(rest, line_no, key)?;
                 match key {
                     "id" => fm.id = Some(v),
@@ -336,6 +362,7 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
                     "status" => fm.status = Some(v),
                     "enforcement_class" => fm.enforcement_class = Some(v),
                     "scope" => fm.scope = Some(v),
+                    "steering_type" => fm.steering_type = Some(v),
                     _ => fm.domain = Some(v),
                 }
                 i += 1;
@@ -369,12 +396,27 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
                 fm.confidence = Some(c);
                 i += 1;
             }
-            "applies_to" | "supersedes" => {
+            "weight" => {
+                let v = parse_scalar(rest, line_no, key)?;
+                let w: f64 = v.parse().map_err(|_| {
+                    anyhow::anyhow!("frontmatter line {line_no}: weight {v:?} is not a number")
+                })?;
+                // INV-S2 surfaced at parse (with the path/line): weight orders recall, so
+                // NaN/∞/negative must never persist.
+                if !w.is_finite() || w < 0.0 {
+                    anyhow::bail!(
+                        "frontmatter line {line_no}: weight {w} must be a finite number ≥ 0 (INV-S2)"
+                    );
+                }
+                fm.weight = Some(w);
+                i += 1;
+            }
+            "applies_to" | "supersedes" | "excludes" => {
                 let (list, consumed) = parse_list(lines, i, close, rest, key)?;
-                if key == "applies_to" {
-                    fm.applies_to = Some(list);
-                } else {
-                    fm.supersedes = Some(list);
+                match key {
+                    "applies_to" => fm.applies_to = Some(list),
+                    "excludes" => fm.excludes = Some(list),
+                    _ => fm.supersedes = Some(list),
                 }
                 i = consumed;
             }
@@ -447,6 +489,16 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
         if !ENFORCEMENT_CLASSES.contains(&c.as_str()) {
             anyhow::bail!(
                 "frontmatter `enforcement_class` {c:?} is not one of {ENFORCEMENT_CLASSES:?}"
+            );
+        }
+    }
+    // INV-S1 surfaced at parse (with the path): an out-of-vocabulary steering_type must fail the
+    // FILE, not mint rules no Steering sub-page lists.
+    if let Some(t) = &fm.steering_type {
+        if !crate::conformance::STEERING_TYPES.contains(&t.as_str()) {
+            anyhow::bail!(
+                "frontmatter `steering_type` {t:?} is not one of {:?}",
+                crate::conformance::STEERING_TYPES
             );
         }
     }
@@ -609,6 +661,21 @@ fn parse_rules_section(
             }
             if retired {
                 rule["retired"] = serde_json::Value::Bool(true);
+            }
+            // STEERING doc-level keys apply to every rule the doc mints (like `confidence` and
+            // `targets`); absent keys stay absent so the minted rule keeps the 2.x wire shape and
+            // reads back at the serde defaults.
+            if let Some(t) = &fm.steering_type {
+                rule["steering_type"] = serde_json::Value::String(t.clone());
+            }
+            if let Some(a) = &fm.applies_to {
+                rule["applies_to"] = serde_json::json!(a);
+            }
+            if let Some(x) = &fm.excludes {
+                rule["excludes"] = serde_json::json!(x);
+            }
+            if let Some(w) = fm.weight {
+                rule["weight"] = serde_json::json!(w);
             }
             rules.push(rule);
         }
@@ -983,6 +1050,71 @@ mod tests {
         let err = ingest_from(&MarkdownAdapter::new(&dir))
             .expect_err("a second directive must not silently overwrite");
         assert!(err.to_string().contains("second `symbol_ref:`"), "{err}");
+    }
+
+    /// STEERING frontmatter keys (steering_type / applies_to / excludes / weight) ride onto every
+    /// rule the doc mints; a doc without them mints rules at the serde defaults (2.x shape).
+    #[test]
+    fn steering_frontmatter_keys_ride_onto_every_minted_rule() {
+        let doc = "---\n\
+            id: security-doctrine\n\
+            title: Security doctrine\n\
+            steering_type: security\n\
+            applies_to: [build, review]\n\
+            excludes: [clarify]\n\
+            weight: 2.5\n\
+            ---\n\n\
+            ## Rules\n\n\
+            - PAT-050 (error): validate inputs.\n\
+            - POL-051 (critical): no secrets in source.\n";
+        let dir = dir_with(&[("security.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules.len(), 2);
+        for r in &rules {
+            assert_eq!(r.steering_type, "security");
+            assert_eq!(r.applies_to, vec!["build", "review"]);
+            assert_eq!(r.excludes, vec!["clarify"]);
+            assert!((r.weight - 2.5).abs() < 1e-6);
+            assert!(r.effect.is_none(), "doc rules stay recall-only");
+        }
+
+        // A doc WITHOUT the keys mints defaulted rules (the pre-steering shape).
+        let dir = dir_with(&[(
+            "plain.md",
+            "---\nid: p\ntitle: P\n---\n\n## Rules\n\n- PAT-052 (info): s.\n",
+        )]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules[0].steering_type, crate::DEFAULT_STEERING_TYPE);
+        assert_eq!(rules[0].weight, crate::DEFAULT_RULE_WEIGHT);
+        assert!(rules[0].applies_to.is_empty() && rules[0].excludes.is_empty());
+    }
+
+    /// An out-of-vocabulary steering_type or a non-finite/negative weight fails the FILE loud.
+    #[test]
+    fn bad_steering_type_or_weight_fails_loud() {
+        let dir = dir_with(&[(
+            "bad-type.md",
+            "---\nid: x\ntitle: y\nsteering_type: vibes\n---\n",
+        )]);
+        let err = ingest_from(&MarkdownAdapter::new(&dir))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bad-type.md") && err.contains("steering_type") && err.contains("vibes"),
+            "{err}"
+        );
+
+        for bad in ["-1", "NaN", "inf", "banana"] {
+            let doc = format!("---\nid: x\ntitle: y\nweight: {bad}\n---\n");
+            let dir = dir_with(&[("bad-weight.md", doc.as_str())]);
+            let err = ingest_from(&MarkdownAdapter::new(&dir))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("bad-weight.md") && err.contains("weight"),
+                "{bad:?}: {err}"
+            );
+        }
     }
 
     #[test]

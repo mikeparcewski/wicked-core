@@ -48,7 +48,7 @@ the same three verbs pointed at the real stores.
 | Piece | Where |
 |---|---|
 | Schemas, adapters, invariants (INV-C1..C4) | this crate (`wicked-core/crates/wicked-governance`) |
-| Operator CLI (`rules ingest/fanout/relink/drift/recall/scoreboard/retire`) | `wicked-core` binary (`src/bin/wicked-core.rs`) |
+| Operator CLI (`rules ingest/fanout/relink/drift/recall/list/scoreboard/retire`) | `wicked-core` binary (`src/bin/wicked-core.rs`) |
 | Seed corpus + repeatable seed driver | [`seed/`](./seed/README.md) |
 | Governed policy packs (per-doctrine ingest units) | [`governance/packs/`](../../governance/packs/README.md) |
 | Bad-rule kill switch runbook | [`docs/break-glass-kill-switch.md`](./docs/break-glass-kill-switch.md) |
@@ -138,7 +138,11 @@ date: 2026-08-30                # ISO date — required by the ADR contract (AW-
 enforcement_class: guidance     # policy|validator|guidance (see cheat sheet)
 scope: wiki:architecture        # recall scope
 domain: my-doctrine-area        # RuleSet parent — what RulesInventory lists
-applies_to: [plan, build]       # optional phase ids
+applies_to: [plan, build]       # optional phase ids — rides onto every minted rule (STEERING inclusion)
+excludes: [clarify]             # optional — the STEERING exclusion twin (withdraws these phases; dominates)
+steering_type: architecture     # optional — the studio Steering sub-page (architecture|development|
+                                #   security|testing|operations|compliance|design-ux; default architecture)
+weight: 1.0                     # optional, finite ≥ 0 — recall order within a severity band + gate priority
 ---
 # My doctrine area
 
@@ -197,7 +201,9 @@ with its engine gate).
 - Via wicked-garden, the same surfaces are skill-routed: the `mem` skill's `recall`/`answer`
   actions (knowledge + memory), and the `engineering-conformance-reviewer` skill (rule-by-rule
   semantic evaluation of an artifact against `rules.recall` output).
-- The CLI twin for terminals and scripts: `wicked-core rules recall --db <store> [--json]`.
+- The CLI twin for terminals and scripts: `wicked-core rules recall --db <store> [--type <t>] [--json]`;
+  the management/audit view (decide-lane rules included, retired rows via `--include-retired`) is
+  `wicked-core rules list --db <store> [--type <t>] [--include-retired] [--json]`.
 
 ### Humans (wicked-studio)
 
