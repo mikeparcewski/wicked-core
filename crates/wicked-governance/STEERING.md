@@ -27,10 +27,13 @@ and only rules that carry an `effect` participate in it. Seeding steering makes 
 
 > **Status note.** Everything in the CLI sections below (`rules
 > ingest/fanout/relink/drift/recall/scoreboard/retire`, the crew `/api/v1/governance/*`
-> routes, the seed corpus) is released and verified. The unified-model fields
-> (`steering_type`, `excludes`, `weight`, effect-on-rule), the policy migration, and the
-> studio **Steering** nav land with the Steering program; until your installed versions
-> carry them, the legacy split (rules + policies) answers the same verbs.
+> routes) is released and verified. The unified-model fields (`steering_type`, `excludes`,
+> `weight`, effect-on-rule), the policy migration, and the studio **Steering** nav land with
+> the Steering program; until your installed versions carry them, the legacy split
+> (rules + policies) answers the same verbs. One consequence to know: the shipped seed
+> corpus is already typed with `steering_type:` frontmatter, so ingesting it needs a
+> steering-aware engine — a pre-steering `rules ingest` refuses the key loudly
+> (`unknown key "steering_type"`) rather than silently dropping it.
 
 ---
 
@@ -283,9 +286,12 @@ row migrates to a steering rule:
   every id a past gate decision cites stays resolvable in the unified store.
 - `decide()`/`select()` read the unified store — a migrated deny gates exactly as before.
 
-`GET|POST /api/v1/governance/policies` and `DELETE /api/v1/governance/policies/:id` keep
-answering during the shim window (they read/write the unified store); prefer the `rules`
-routes for new work.
+`GET /api/v1/governance/policies` keeps answering — a read shim over the unified store, kept
+so past decisions citing a policy id stay resolvable. The policy WRITES fold rather than
+shim: on a steering engine `POST /api/v1/governance/policies` and
+`DELETE /api/v1/governance/policies/:id` answer `410 Gone` with a pointer at the `rules`
+CRUD (a silent alias would accept a write into a store `decide()`/`select()` no longer
+read). Use the `rules` routes.
 
 ---
 
@@ -337,8 +343,8 @@ jobs:
 
 For a crew-daemon-held store, the governance routes are the write/read surface:
 `GET|POST /api/v1/governance/rules`, `GET /api/v1/governance/rules/preview` (faceted recall
-preview), `DELETE /api/v1/governance/rules/:id` (audited retire), the shim-window
-`policies` equivalents — plus `governance/claims`, `governance/coverage`,
+preview), `DELETE /api/v1/governance/rules/:id` (audited retire), the `policies` read shim
+(writes fold to the `rules` routes — § Migration note) — plus `governance/claims`, `governance/coverage`,
 `governance/graph` for the evidence side and `governance/wiki/scoreboard` +
 `governance/wiki/meta` for corpus health.
 
