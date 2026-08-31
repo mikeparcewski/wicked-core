@@ -82,6 +82,7 @@ mod tests {
             council_task_ref: None,
             routing: None,
             denial_reason: None,
+            denial: None,
             phase_ref: None,
             conformance_ref: None,
             phase_status: None,

@@ -368,9 +368,33 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         "the denial names the evaluator pass, got: {:?}",
         v.units[0].denial_reason
     );
-    // Finding #2 in the interactive lane: a validator/evaluator-denied unit leaks NO approved output.
-    assert!(
-        core.work_output("r:u1").is_none(),
-        "an evaluator-denied unit must leave no readable approved work_output"
+    // Finding #2 in the interactive lane, refined by usability review #1: an evaluator-denied unit
+    // leaks NO APPROVED output — the stored record is flagged `rejected`/partial (which is what the
+    // engine's approved-output read, `get_work_output`, filters on; see `execute::tests`) — while
+    // the OPERATOR transcript read no longer dead-ends: it returns the partial output beside the
+    // structured denial instead of nothing.
+    let t = core
+        .unit_transcript("r:u1")
+        .expect("a rejected unit keeps its transcript record");
+    assert_eq!(
+        t.resolution, "rejected",
+        "the record is flagged — never mistakable for approved work"
+    );
+    assert!(t.partial);
+    assert_eq!(
+        t.output.as_deref(),
+        Some("EVALDENY appears in the output"),
+        "the partial output that existed at rejection survives"
+    );
+    assert_eq!(
+        t.denial.as_ref().map(|d| d.source.as_str()),
+        Some("evaluator"),
+        "the structured denial names the denying layer: {:?}",
+        t.denial
+    );
+    assert_eq!(
+        core.work_output("r:u1").as_deref(),
+        Some("EVALDENY appears in the output"),
+        "the operator transcript read answers with the partial output, not a dead end"
     );
 }

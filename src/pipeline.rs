@@ -805,11 +805,16 @@ pub(crate) fn apply_and_finish_unit(
         .map(|e| e.policies.clone())
         .unwrap_or_default();
     let evaluator_denial = eval.as_ref().and_then(|e| {
-        (!e.approved).then(|| {
-            format!(
+        (!e.approved).then(|| crate::domain::UnitDenial {
+            source: "evaluator".to_string(),
+            reason: format!(
                 "evaluator ({evaluator_cli}) rejected unit {} (evaluator≠creator second pass, decision={})",
                 unit.ord, e.decision
-            )
+            ),
+            claim_id: Some(e.claim_id.clone()),
+            rule_ids: e.policies.clone(),
+            denied_tool: None,
+            phase: None, // filled in by apply_unit with the unit-phase token
         })
     });
 
@@ -854,8 +859,11 @@ pub(crate) fn apply_and_finish_unit(
     }
 
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
+    // Each layer is wrapped as a STRUCTURED denial naming its source (usability review #1); the
+    // hook layer already carries claim id / rule ids / denied tool from the decisions log.
     let validator_denial = det_denial
-        .or(agent_denial)
+        .map(|r| crate::domain::UnitDenial::new("pinned_validator", r))
+        .or(agent_denial.map(|r| crate::domain::UnitDenial::new("agent_validator", r)))
         .or(evaluator_denial)
         .or(hook_denial);
 
@@ -881,6 +889,7 @@ pub(crate) fn apply_and_finish_unit(
     unit.phase_status = Some(outcome.phase_status.clone());
     unit.collection_scope = Some(outcome.collection_scope.clone());
     unit.denial_reason = outcome.denial_reason.clone();
+    unit.denial = outcome.denial.clone();
     unit.status = if outcome.approved {
         UnitStatus::Done
     } else {
@@ -911,6 +920,13 @@ pub(crate) fn apply_and_finish_unit(
     } else {
         outcome.denial_reason.clone()
     };
+    // (usability review #1) The MACHINE-READABLE twin — source layer, firing rule ids, recording
+    // claim id, denied tool — additive beside the prose, so the UI renders a banner from structure.
+    let denial = if outcome.approved {
+        None
+    } else {
+        outcome.denial.clone()
+    };
     emit(CoreEvent::GateEvaluated {
         session: session_id.to_string(),
         ord: unit.ord,
@@ -922,6 +938,7 @@ pub(crate) fn apply_and_finish_unit(
         evaluator_pass,
         evaluator_policies,
         denial_reason,
+        denial,
         combined: outcome.approved,
     });
     emit(CoreEvent::GateDecided {

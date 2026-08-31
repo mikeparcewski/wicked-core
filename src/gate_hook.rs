@@ -1383,13 +1383,24 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
 /// missing, erased, or truncated) DENIES — closing the council blocker where an agent could erase its own
 /// Deny evidence (or the hook could silently never fire) and flip the run from Failed to Completed. An
 /// UNGOVERNED unit legitimately has no log, so `governed=false` ⇒ the fold is inert (`Ok(None)`).
+///
+/// Returns a STRUCTURED [`UnitDenial`] (usability review #1), not just prose: a real Deny claim
+/// carries its claim id, its firing policy ids, and — when the log's tool-call annotation names it —
+/// the denied tool, so the UI can render "rule X denied tool Y in unit-N" from fields instead of
+/// parsing a sentence. The fail-closed arms carry prose only (there is no claim to cite).
 pub fn fold_input_denial(
     store: &mut dyn GraphStore,
     run_id: &str,
     attempt: u32,
     phase: &str,
     governed: bool,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
+    // Every denial this fold produces is an input-governance deny for `phase`.
+    let fail_closed = |reason: String| {
+        let mut d = crate::domain::UnitDenial::new("input_governance", reason);
+        d.phase = Some(phase.to_string());
+        d
+    };
     let path = decisions_path_for(run_id, attempt);
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -1397,23 +1408,24 @@ pub fn fold_input_denial(
         // the evidence was never written or the whole gov dir was erased → fail CLOSED. An ungoverned
         // unit legitimately has no log.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(governed.then(|| format!(
+            return Ok(governed.then(|| fail_closed(format!(
                 "input governance denied {phase} (fail-closed): governed unit produced NO decisions log \
                  (hook never fired or evidence erased)"
-            )))
+            ))))
         }
         // A non-NotFound read error (permission / sharing) is un-evaluable governance evidence ⇒ deny
         // (fail closed) via the normal terminal path, never a run-wedging Err.
         Err(e) => {
-            return Ok(Some(format!(
+            return Ok(Some(fail_closed(format!(
                 "input governance denied {phase} (fail-closed): could not read decisions log: {e}"
-            )))
+            ))))
         }
     };
-    let mut denial: Option<String> = None;
+    let mut denial: Option<crate::domain::UnitDenial> = None;
     let mut saw_marker = false;
     let mut saw_hook_fired = false;
     let mut has_claim_lines = false; // any ConformanceClaim present for `phase`
+    let mut pending_tool: Option<String> = None; // tool name from the last annotation (this phase)
     for line in raw.lines() {
         let line = line.trim();
         if !line.starts_with('{') {
@@ -1426,10 +1438,11 @@ pub fn fold_input_denial(
             Ok(v) => v,
             Err(e) => {
                 if denial.is_none() {
-                    denial = Some(format!(
+                    denial = Some(fail_closed(format!(
                         "input governance denied {phase} (fail-closed): corrupted decision line: {e}"
-                    ));
+                    )));
                 }
+                pending_tool = None;
                 continue;
             }
         };
@@ -1447,57 +1460,71 @@ pub fn fold_input_denial(
             }
             continue;
         }
-        // Tool-call annotation written by `run_gate_hook` immediately before each claim so that
-        // `collect_hook_decisions` can recover the tool name. NOT a `ConformanceClaim` — skip it
-        // here with the same root-key check used for the other sentinel types.
-        if tool_call_entry(&v).is_some() {
+        // Tool-call annotation written by `run_gate_hook` immediately before each claim so the tool
+        // name can be recovered. NOT a `ConformanceClaim` — note the tool for the NEXT claim on this
+        // phase (cleared when the annotation belongs to a different phase, same as
+        // `collect_hook_decisions`, so a stale name never attaches to another phase's claim).
+        if let Some((tool, ann_phase)) = tool_call_entry(&v) {
+            pending_tool = (ann_phase == phase).then(|| tool.to_string());
             continue;
         }
         let claim: ConformanceClaim = match serde_json::from_value(v) {
             Ok(c) => c,
             Err(e) => {
                 if denial.is_none() {
-                    denial = Some(format!(
+                    denial = Some(fail_closed(format!(
                         "input governance denied {phase} (fail-closed): corrupted decision line: {e}"
-                    ));
+                    )));
                 }
+                pending_tool = None;
                 continue;
             }
         };
         if claim.phase != phase {
+            pending_tool = None;
             continue; // another unit's claim — folded when that unit finishes
         }
         has_claim_lines = true;
         conform(store, &claim)?;
+        // Each claim consumes the annotation immediately preceding it — allow or deny — so a tool
+        // name can never skip forward past its own claim onto a later one.
+        let tool_for_claim = pending_tool.take();
         // An ADVISORY deny — an out-of-boundary READ (P8 #10 / core#219) or a PHASE-SCOPE write
         // (core#296) — is recorded (conform above, for audit) but does NOT fail the unit: the call
         // was blocked, nothing landed or leaked, and the worker adapts. Whether the blocked call
         // MATTERED is judged by the unit's OUTPUT gate and its required deliverables, not by this
         // containment event.
         if denial.is_none() && claim.decision == Decision::Deny && !is_advisory_deny(&claim) {
-            denial = Some(format!(
-                "input governance denied a tool-call in {phase} (claim {})",
-                claim.claim_id
-            ));
+            denial = Some(crate::domain::UnitDenial {
+                source: "input_governance".to_string(),
+                reason: format!(
+                    "input governance denied a tool-call in {phase} (claim {})",
+                    claim.claim_id
+                ),
+                claim_id: Some(claim.claim_id.clone()),
+                rule_ids: claim.policy_ids.clone(),
+                denied_tool: tool_for_claim,
+                phase: Some(phase.to_string()),
+            });
         }
     }
     // A GOVERNED unit whose log is PRESENT but has lost its armed marker was truncated/edited → the
     // evidence stream is untrustworthy → fail CLOSED (even if no surviving Deny remains).
     if governed && !saw_marker && denial.is_none() {
-        denial = Some(format!(
+        denial = Some(fail_closed(format!(
             "input governance denied {phase} (fail-closed): armed marker missing \
              (decisions log tampered or truncated)"
-        ));
+        )));
     }
     // Hook-liveness check: if there are claim lines for this phase but no hook-fired sentinel, the
     // hook process was suppressed while tool calls still executed — deny immediately. The sentinel is
     // written BEFORE any claim evaluation in `run_gate_hook`, so its absence with claims present is
     // impossible in normal operation and indicates hook bypass.
     if governed && saw_marker && has_claim_lines && !saw_hook_fired && denial.is_none() {
-        denial = Some(format!(
+        denial = Some(fail_closed(format!(
             "input governance denied {phase} (fail-closed): hook-fired sentinel missing with \
              claim lines present — hook process may have been suppressed (core#34)"
-        ));
+        )));
     }
     Ok(denial)
 }
@@ -2019,7 +2046,7 @@ mod tests {
 
         let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap();
         assert!(
-            denial.as_deref().is_some_and(|d| d.contains("d1")),
+            denial.as_ref().is_some_and(|d| d.reason.contains("d1")),
             "a Deny for unit-1 surfaces a denial naming the claim: {denial:?}"
         );
         // Durable evidence: unit-1's claims conformed; unit-2's is filtered out (folded by its own unit).
@@ -2048,8 +2075,8 @@ mod tests {
         let corrupt = fold_input_denial(&mut store, &run_id, 1, "unit-1", false).unwrap();
         assert!(
             corrupt
-                .as_deref()
-                .is_some_and(|d| d.contains("fail-closed")),
+                .as_ref()
+                .is_some_and(|d| d.reason.contains("fail-closed")),
             "a corrupted claim line DENIES (fail-closed), not Err: {corrupt:?}"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
@@ -2064,7 +2091,8 @@ mod tests {
         // (a) GOVERNED unit, NO log at all (erased gov dir / hook never fired) → DENY (fail closed).
         let d = fold_input_denial(&mut store, &run_id, 0, "unit-1", true).unwrap();
         assert!(
-            d.as_deref().is_some_and(|s| s.contains("NO decisions log")),
+            d.as_ref()
+                .is_some_and(|s| s.reason.contains("NO decisions log")),
             "a governed unit with no evidence fails closed: {d:?}"
         );
 
@@ -2093,8 +2121,8 @@ mod tests {
         append_decision(&path2, &allow_claim("ev-a1", "unit-1")).unwrap(); // an Allow, but NO marker
         let d = fold_input_denial(&mut store, &run_id, 2, "unit-1", true).unwrap();
         assert!(
-            d.as_deref()
-                .is_some_and(|s| s.contains("armed marker missing")),
+            d.as_ref()
+                .is_some_and(|s| s.reason.contains("armed marker missing")),
             "a governed unit whose armed marker was stripped fails closed: {d:?}"
         );
 
@@ -2173,10 +2201,16 @@ mod tests {
         let write_denial = fold_input_denial(&mut store, &run_id, 1, "unit-5", true).unwrap();
         assert!(
             write_denial
-                .as_deref()
-                .is_some_and(|d| d.contains("boundary-deny:unit-5")),
+                .as_ref()
+                .is_some_and(|d| d.reason.contains("boundary-deny:unit-5")),
             "a boundary WRITE deny fails the unit and names the claim: {write_denial:?}"
         );
+        // Usability review #1: the deny is MACHINE-READABLE — the claim id rides as a field,
+        // not only inside the prose, so a UI can render a banner without parsing the sentence.
+        let wd = write_denial.as_ref().unwrap();
+        assert_eq!(wd.source, "input_governance");
+        assert_eq!(wd.claim_id.as_deref(), Some("boundary-deny:unit-5"));
+        assert_eq!(wd.phase.as_deref(), Some("unit-5"));
 
         // (c) MIXED: an advisory read deny AND a real POLICY deny in the same unit → still DENIED. The
         // advisory exclusion must not mask a co-occurring fatal deny (a policy deny carries a policy
