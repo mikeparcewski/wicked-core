@@ -311,8 +311,35 @@ export declare class Core {
   recallKnowledge(query: string, k: number): Promise<string>
   /** All registered governance policies, as a JSON array of `Policy` objects. */
   listPolicies(): Promise<string>
-  /** All conformance rules on the store (Pattern + Policy types), as a JSON array. */
-  listConformanceRules(): Promise<string>
+  /**
+   * All conformance rules on the store (Pattern + Policy types), as a JSON array of
+   * serialized `ConformanceRule` objects — severity-first (critical→info), then weight DESC
+   * within a band, then id. The rows carry the unified steering-rule model's fields
+   * (steering_type / applies_to / excludes / weight / effect / trigger / obligations /
+   * criteria / provenance / …) exactly as the model serializes them — default-valued steering
+   * fields are elided on the wire (absent steering_type ⇒ "architecture", absent weight ⇒ 1).
+   *
+   * Steering facets (the studio Steering surface's list):
+   * - `steeringType` filters on the rule's `steering_type` — one of architecture | development |
+   *   security | testing | operations | compliance | design-ux. A rule authored before the
+   *   field existed counts as `"architecture"` (the model's serde default); an unknown value
+   *   REJECTS (fails closed — a typo must not read as "no rules of that type").
+   * - `includeRetired: true` adds withdrawn rules (retire-not-delete: they still explain the
+   *   past decisions that cite them; recall/enforcement never returns them).
+   *
+   * Both omitted ⇒ the exact pre-0.7.5 behavior (every active rule).
+   */
+  listConformanceRules(steeringType?: string | undefined | null, includeRetired?: boolean | undefined | null): Promise<string>
+  /**
+   * The doctrine RuleSet parents (AW-13 grouping) as a JSON array of
+   * `{ domain, rule_ids, rule_count }` rows, domain-sorted. The array length is the wiki
+   * meta's `ruleset_count` (crew's `countRuleSets` resolved `null` on engine builds without
+   * this binding — "cannot count" must never impersonate "0"); the rows carry `Contains`
+   * membership so grouping renders without a second round-trip. Membership is the store's
+   * edges verbatim — a retired rule stays listed in its RuleSet (grouping is doc structure,
+   * not enforcement). Read-only connection; never blocks the single-writer actor.
+   */
+  listRuleSets(): Promise<string>
   /** All conformance claims (governance decisions) on the store, as a JSON array. */
   listConformanceClaims(): Promise<string>
   /**
@@ -340,10 +367,37 @@ export declare class Core {
   upsertPolicy(policyJson: string): Promise<string>
   /**
    * Upsert a conformance rule. `rule_json` is a JSON-serialized `ConformanceRule` object
-   * (fields: id, rule_type, statement, severity, confidence, targets, provenance).
-   * Validates server-side (INV-C1/C2/C4). Idempotent on stable id.
+   * (fields: id, rule_type, statement, severity, confidence, targets, provenance — plus the
+   * unified steering-rule fields: steering_type, applies_to, excludes, weight, and the
+   * optional effect / trigger / obligations / criteria; a rule without `effect` stays
+   * recall-only). The JSON passes through un-projected — the model's own serde is the wire
+   * contract, so new steering fields ride this binding without a rebuild. Provenance is
+   * first-class for UI/chat-authored rules too (`provenance.source: "ui" | "chat"`), not just
+   * doc-ingested `path@sha#id` rows. Validates server-side (INV-C1/C2/C4). Idempotent on
+   * stable id.
    */
   upsertConformanceRule(ruleJson: string): Promise<string>
+  /**
+   * STEERING batch import (the unified steering-rule model). `batch_json` is a JSON
+   * `{ default_type: string | null, entries: [...] }` document where each entry is either a
+   * frontmattered markdown doc (`{ kind: "doc", name?, content }` — parsed by the SAME
+   * MarkdownAdapter/normalize path `rules ingest --dir` runs, provenance `path@sha#id` refs
+   * included) or a ready rule object (`{ kind: "rule", rule }` — the rule JSON passes to the
+   * upsert path un-projected, so new model fields ride through without a rebuild).
+   * `default_type` is applied as the `steering_type` of every rule whose entry omits one; a
+   * rule that names its own type keeps it.
+   *
+   * Fail-closed PER ENTRY: a bad entry (unparseable doc, invalid rule, INV violation,
+   * duplicate id within the batch) rejects ALONE with its reason — the rest still land; only
+   * a malformed batch envelope rejects the whole call. Every write goes through the
+   * single-writer actor (validate + `register_rule`). Resolves to a JSON array of per-entry
+   * results, batch order: `{ index, name?, status: "imported" | "rejected", ids?, error? }`
+   * (`ids` = the rule ids the entry minted — a doc can mint several; a rejected entry mints
+   * none). This binding is also crew's PRESENCE SENTINEL for the whole steering seam
+   * (`steeringSupported()`): it ships with the unified model, so its existence tells crew the
+   * engine round-trips the steering fields instead of silently dropping them.
+   */
+  steeringImport(batchJson: string): Promise<string>
   /**
    * Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
    * append-only, so a mis-authored policy denied forever).
