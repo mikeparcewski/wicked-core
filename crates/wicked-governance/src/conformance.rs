@@ -12,9 +12,11 @@
 //! an edge to a synthetic placeholder would dangle and be pruned by `compact`.
 //!
 //! Recall (`recall_rules`) returns the rules that apply to a query slice: `language`/`layer`/
-//! `framework` are WILDCARD facets (an ABSENT facet applies to all), `severity`/`rule_type` are
-//! exact, results ordered severity-first (critical→info) then id — deterministic, enforcement-ready.
-//! (Wiring recall INTO the per-output gate is PR-C; this module is the population + query half.)
+//! `framework` are WILDCARD facets (an ABSENT facet applies to all), `severity`/`rule_type`/
+//! `steering_type` are exact, results ordered severity-first (critical→info) then weight (desc)
+//! then id — deterministic, enforcement-ready. Retired and DECIDE-lane (effect-bearing) rules
+//! never recall; `list_rules` is the management view that shows them. (Wiring recall INTO the
+//! per-output gate is PR-C; this module is the population + query half.)
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::{
@@ -22,6 +24,8 @@ use wicked_apps_core::{
     Language, Location, Metadata, Node, NodeKind, Span, SymbolId, ToNode, SYMBOL_SCHEME,
 };
 use wicked_estate_core::{Confidence, Direction, Provenance, SymbolQuery};
+
+use crate::domain::{Effect, Trigger};
 
 /// Symbol-namespace prefix for conformance-rule symbols (the synthetic id; the NODE kind is the
 /// native [`NodeKind::Rule`]).
@@ -34,6 +38,43 @@ const CONFORMANCE_RESOLVED_BY: &str = "wicked-governance-conformance";
 /// The shared `provenance.source_kinds` wire enum — identical in the conformance-rules AND
 /// domain-model schemas ($defs/provenance). Enforced at the fail-closed write boundary (INV-C4).
 pub(crate) const VALID_SOURCE_KINDS: [&str; 4] = ["code-body", "type-def", "comment", "doc"];
+
+/// The steering-type vocabulary (STEERING program) — one sub-page per type in studio's Steering
+/// surface. Enum-as-STRING on the wire (a new type is a vocabulary bump, not a serde break),
+/// validated fail-closed at the write boundary (INV-S1).
+pub const STEERING_TYPES: [&str; 7] = [
+    "architecture",
+    "development",
+    "security",
+    "testing",
+    "operations",
+    "compliance",
+    "design-ux",
+];
+
+/// The `steering_type` every pre-steering row reads back as (serde default — the additive
+/// metadata-key migration: existing rows carry no key and default here on every read).
+pub const DEFAULT_STEERING_TYPE: &str = "architecture";
+
+fn default_steering_type() -> String {
+    DEFAULT_STEERING_TYPE.to_string()
+}
+
+fn is_default_steering_type(s: &str) -> bool {
+    s == DEFAULT_STEERING_TYPE
+}
+
+/// The `weight` every pre-steering row reads back as (serde default, same migration story).
+pub const DEFAULT_RULE_WEIGHT: f32 = 1.0;
+
+fn default_weight() -> f32 {
+    DEFAULT_RULE_WEIGHT
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_default_weight(w: &f32) -> bool {
+    *w == DEFAULT_RULE_WEIGHT
+}
 
 /// A conformance rule's kind. The id prefix MUST agree (INV-C1): `PAT-*` ⇔ pattern, `POL-*` ⇔ policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,24 +175,102 @@ pub struct ConformanceRule {
     /// for the `serde(default)`: rules written before the field existed read back as active.
     #[serde(default)]
     pub retired: bool,
+
+    // ── STEERING unification (the wiki/rules model + the standalone Policy model merged into ONE
+    //    steering-rule model). Every field below is optional/defaulted AND skipped at its default,
+    //    so every pre-steering row parses (the additive metadata-key migration happens on READ) and
+    //    a rule that uses none of them serializes byte-identical to the 2.x wire shape.
+    /// Which steering page this rule belongs to — one of [`STEERING_TYPES`] (enum-as-string,
+    /// INV-S1 fail-closed). Pre-steering rows default to [`DEFAULT_STEERING_TYPE`].
+    #[serde(
+        default = "default_steering_type",
+        skip_serializing_if = "is_default_steering_type"
+    )]
+    pub steering_type: String,
+    /// Phase/tool INCLUSION — the same exact-token-match semantics the merged standalone
+    /// [`crate::domain::Policy::applies_to`] had in SELECT. Empty = not phase-scoped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applies_to: Vec<String>,
+    /// The EXCLUSION twin of `applies_to`: a phase token listed here withdraws the rule from that
+    /// phase even when `applies_to` (or a wildcard) would include it — exclusion dominates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<String>,
+    /// Ordering weight within a severity band (recall/list order severity → weight DESC → id) and
+    /// the stored gate-priority signal. Default 1.0 (INV-S2: finite, ≥ 0). NOTE: `decide()` keeps
+    /// the merged Policy model's precedence (severity → id) so a migrated policy's decisions stay
+    /// byte-equal; threading weight into gate precedence is the follow-up that moves `decide` onto
+    /// steering rules natively.
+    #[serde(default = "default_weight", skip_serializing_if = "is_default_weight")]
+    pub weight: f32,
+    /// The enforcement effect, from the merged standalone Policy model. `None` ⇒ the rule is
+    /// RECALL-ONLY, exactly as every wiki rule was before the merge; `Some` ⇒ the rule is
+    /// decide-lane (SELECT/DECIDE pick it up) and is therefore NOT attached again by recall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<Effect>,
+    /// The condition under which an effect-bearing rule fires (merged `Policy.trigger`;
+    /// `None` ⇔ the old `Trigger::default()` — fires whenever phase-selected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<Trigger>,
+    /// Obligations collected when a triggered `AllowWithConditions` effect fires (merged
+    /// `Policy.obligations`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub obligations: Vec<String>,
+    /// Frozen acceptance-criteria text (merged `Policy.criteria` — becomes the claim's criteria).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub criteria: String,
+}
+
+/// The all-defaults rule — INVALID as-is (empty id), useful as `..Default::default()` filler so
+/// the additive steering fields never force every construction site to spell them out.
+impl Default for ConformanceRule {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            rule_type: RuleType::Pattern,
+            statement: String::new(),
+            severity: ConfSeverity::Info,
+            confidence: 1.0,
+            targets: Targets::default(),
+            symbol_ref: None,
+            compliance: None,
+            provenance: RuleProvenance::default(),
+            retired: false,
+            steering_type: default_steering_type(),
+            applies_to: Vec::new(),
+            excludes: Vec::new(),
+            weight: DEFAULT_RULE_WEIGHT,
+            effect: None,
+            trigger: None,
+            obligations: Vec::new(),
+            criteria: String::new(),
+        }
+    }
 }
 
 impl ConformanceRule {
-    /// Fail-closed write-time invariants (ported from `conformance-store` INV-C1/INV-C2). INV-C3
-    /// (bundle-unique ids) is enforced at ingest, where the whole bundle is visible.
+    /// Fail-closed write-time invariants (ported from `conformance-store` INV-C1/INV-C2, extended
+    /// by the STEERING unification INV-S1..S3). INV-C3 (bundle-unique ids) is enforced at ingest,
+    /// where the whole bundle is visible.
     pub fn validate(&self) -> anyhow::Result<()> {
-        // INV-C1: the id must match the wire contract `^(PAT|POL)-[0-9]{3,6}$` AND its prefix must
-        // agree with rule_type (PAT-⇔pattern, POL-⇔policy).
-        let prefix = self.rule_type.id_prefix();
-        let ordinal_ok = self.id.strip_prefix(prefix).is_some_and(|ord| {
-            (3..=6).contains(&ord.len()) && ord.bytes().all(|b| b.is_ascii_digit())
-        });
-        if !ordinal_ok {
-            anyhow::bail!(
-                "INV-C1: rule id {:?} must match `{prefix}<3-6 digits>` for rule_type {:?}",
-                self.id,
-                self.rule_type
-            );
+        // INV-C1 (steering-scoped): `PAT-`/`POL-` is the RESERVED doc-ingest namespace — an id in
+        // it must match the wire contract `^(PAT|POL)-[0-9]{3,6}$` AND its prefix must agree with
+        // rule_type (PAT-⇔pattern, POL-⇔policy), exactly as before the merge. Ids OUTSIDE the
+        // reserved namespace (migrated policies keep their original ids unchanged — audit
+        // resolvability; UI/chat-authored steering rules mint their own) need only be non-blank.
+        if self.id.starts_with("PAT-") || self.id.starts_with("POL-") {
+            let prefix = self.rule_type.id_prefix();
+            let ordinal_ok = self.id.strip_prefix(prefix).is_some_and(|ord| {
+                (3..=6).contains(&ord.len()) && ord.bytes().all(|b| b.is_ascii_digit())
+            });
+            if !ordinal_ok {
+                anyhow::bail!(
+                    "INV-C1: rule id {:?} must match `{prefix}<3-6 digits>` for rule_type {:?}",
+                    self.id,
+                    self.rule_type
+                );
+            }
+        } else if self.id.trim().is_empty() {
+            anyhow::bail!("INV-C1: rule id must not be blank");
         }
         if !(0.0..=1.0).contains(&self.confidence) {
             anyhow::bail!(
@@ -167,6 +286,44 @@ impl ConformanceRule {
             if !VALID_SOURCE_KINDS.contains(&sk.as_str()) {
                 anyhow::bail!(
                     "INV-C4: provenance.source_kinds contains {sk:?}, not one of {VALID_SOURCE_KINDS:?}"
+                );
+            }
+        }
+        // INV-S1: steering_type is enum-as-string — an out-of-vocabulary value fails closed so a
+        // typo'd type can never mint a rule no Steering sub-page lists.
+        if !STEERING_TYPES.contains(&self.steering_type.as_str()) {
+            anyhow::bail!(
+                "INV-S1: steering_type {:?} is not one of {STEERING_TYPES:?}",
+                self.steering_type
+            );
+        }
+        // INV-S2: weight orders recall and carries gate priority — NaN/∞/negative would make the
+        // ordering non-deterministic (NaN is unordered) or nonsensical.
+        if !self.weight.is_finite() || self.weight < 0.0 {
+            anyhow::bail!(
+                "INV-S2: weight must be a finite number ≥ 0, got {}",
+                self.weight
+            );
+        }
+        // INV-S3 (mirrors the merged Policy::validate, same fail-open reasons): an EFFECT-bearing
+        // rule with no non-blank applies_to entry is selected for NO phase and enforces nothing —
+        // a silent fail-open on the primary safety control; and a malformed trigger regex fails
+        // CLOSED in the engine (never fires), so an invalid regex is a silent dead Deny.
+        if self.effect.is_some() && self.applies_to.iter().all(|p| p.trim().is_empty()) {
+            anyhow::bail!(
+                "INV-S3: steering rule {:?} carries an effect but no non-blank applies_to entry — \
+                 it is selected for no phase and enforces nothing (fail-loud: a non-enforcing \
+                 enforcement rule must not silently register)",
+                self.id
+            );
+        }
+        if let Some(pattern) = self.trigger.as_ref().and_then(|t| t.contains.as_deref()) {
+            if let Err(e) = regex::Regex::new(pattern) {
+                anyhow::bail!(
+                    "INV-S3: steering rule {:?} trigger.contains {:?} is not a valid regex — it \
+                     would never fire (a silent fail-open): {e}",
+                    self.id,
+                    pattern
                 );
             }
         }
@@ -451,15 +608,23 @@ pub struct RuleQuery {
     pub framework: Option<String>,
     pub severity: Option<ConfSeverity>,
     pub rule_type: Option<RuleType>,
+    /// STEERING facet — exact match against [`ConformanceRule::steering_type`] (a pre-steering row
+    /// reads back as [`DEFAULT_STEERING_TYPE`] and matches that). Absent field on the 2.x wire
+    /// parses as `None` (serde's built-in Option handling), so old query payloads stay valid.
+    #[serde(default)]
+    pub steering_type: Option<String>,
 }
 
-/// Recall the conformance rules that apply to `query`. Facet semantics (ported from
-/// `conformance-store.recallRules`): `language`/`layer`/`framework` match when the rule's facet is
-/// ABSENT (wildcard — applies broadly) OR equals the query; `severity`/`rule_type` are exact.
-/// Results are ordered severity-first (critical→info) then rule id — deterministic + enforcement-ready.
-pub fn recall_rules(
+/// The shared scan behind [`recall_rules`] (the enforcement funnel) and [`list_rules`] (the
+/// operator/management view). Facet semantics (ported from `conformance-store.recallRules`):
+/// `language`/`layer`/`framework` match when the rule's facet is ABSENT (wildcard — applies
+/// broadly) OR equals the query; `severity`/`rule_type`/`steering_type` are exact. Ordered
+/// severity (critical→info) → weight DESC → rule id — deterministic + enforcement-ready.
+fn scan_rules(
     store: &dyn GraphRead,
     query: &RuleQuery,
+    include_retired: bool,
+    include_enforcing: bool,
 ) -> anyhow::Result<Vec<ConformanceRule>> {
     // Index-only: restrict to native Rule nodes (the cheap deterministic lane — no FTS, no traversal).
     let sym_query = SymbolQuery {
@@ -487,9 +652,14 @@ pub fn recall_rules(
             continue;
         }
         let rule = ConformanceRule::from_node(&node)?;
-        // Withdrawn rules are skipped here, the single funnel every recall goes through — same
-        // reasoning as `engine::select_any`.
-        if rule.retired {
+        if rule.retired && !include_retired {
+            continue;
+        }
+        // Effect-bearing steering rules are DECIDE-lane (SELECT/DECIDE fire them; a triggered
+        // effect denies or collects its own obligations). Recall attaching them AGAIN would
+        // double-govern one rule in a single gate pass, so the enforcement funnel keeps them out;
+        // the listing view includes them.
+        if rule.effect.is_some() && !include_enforcing {
             continue;
         }
         if facet_matches(&rule.targets.language, &query.language)
@@ -497,6 +667,10 @@ pub fn recall_rules(
             && facet_matches(&rule.targets.framework, &query.framework)
             && query.severity.is_none_or(|s| s == rule.severity)
             && query.rule_type.is_none_or(|t| t == rule.rule_type)
+            && query
+                .steering_type
+                .as_deref()
+                .is_none_or(|t| t == rule.steering_type)
         {
             matched.push(rule);
         }
@@ -506,9 +680,36 @@ pub fn recall_rules(
         b.severity
             .rank()
             .cmp(&a.severity.rank())
+            // Within a severity band the heavier rule orders first (STEERING weight; ties keep
+            // the id order pre-steering rows had, since every default weight is 1.0).
+            .then_with(|| b.weight.total_cmp(&a.weight))
             .then_with(|| a.id.cmp(&b.id))
     });
     Ok(matched)
+}
+
+/// Recall the conformance rules that APPLY to `query` — the enforcement funnel: retired rules and
+/// effect-bearing (decide-lane) rules are excluded, exactly as before the steering unification
+/// (rules without an effect are recall-only, exactly as today; rules WITH an effect reach the gate
+/// through SELECT/DECIDE instead). See [`scan_rules`] for facet + ordering semantics.
+pub fn recall_rules(
+    store: &dyn GraphRead,
+    query: &RuleQuery,
+) -> anyhow::Result<Vec<ConformanceRule>> {
+    scan_rules(store, query, false, false)
+}
+
+/// List steering rules for MANAGEMENT (the studio Steering surface / `wicked-core rules list`):
+/// the whole unified store — recall-only AND effect-bearing rules — with retired rows included
+/// when `include_retired` (the recall-skips-retired listing gap: an operator auditing the corpus
+/// must be able to see what was withdrawn, which `recall_rules` rightly never returns). Same
+/// facets and ordering as recall ([`scan_rules`]).
+pub fn list_rules(
+    store: &dyn GraphRead,
+    query: &RuleQuery,
+    include_retired: bool,
+) -> anyhow::Result<Vec<ConformanceRule>> {
+    scan_rules(store, query, include_retired, true)
 }
 
 #[cfg(test)]
@@ -524,10 +725,7 @@ mod tests {
             severity: sev,
             confidence: 0.72,
             targets,
-            symbol_ref: None,
-            compliance: None,
-            provenance: RuleProvenance::default(),
-            retired: false,
+            ..Default::default()
         }
     }
 
@@ -1028,5 +1226,275 @@ mod tests {
         .unwrap();
         assert_eq!(replay.already_recorded, vec!["PAT-100"]);
         assert_eq!(replay.evidenced, Vec::<String>::new());
+    }
+
+    // ── STEERING unification ────────────────────────────────────────────────
+
+    /// The unified model round-trips: every steering field survives Node + wire JSON, losslessly.
+    #[test]
+    fn steering_fields_round_trip_through_node_and_wire() {
+        let r = ConformanceRule {
+            id: "sec-input-validation".into(), // a non-reserved (UI-authored shape) id
+            rule_type: RuleType::Policy,
+            statement: "validate every external input".into(),
+            severity: ConfSeverity::Error,
+            confidence: 0.9,
+            steering_type: "security".into(),
+            applies_to: vec!["build".into(), "review".into()],
+            excludes: vec!["clarify".into()],
+            weight: 2.5,
+            effect: Some(crate::domain::Effect::AllowWithConditions),
+            trigger: Some(crate::domain::Trigger {
+                contains: Some("input".into()),
+            }),
+            obligations: vec!["sanitize".into()],
+            criteria: "inputs are sanitized".into(),
+            provenance: RuleProvenance {
+                source: "ui".into(), // UI-authored provenance is first-class
+                reference: Some("steering/security#sec-input-validation".into()),
+                source_kinds: vec![],
+            },
+            ..Default::default()
+        };
+        r.validate().expect("a well-formed steering rule validates");
+
+        // Node round-trip.
+        let back = ConformanceRule::from_node(&r.to_node()).unwrap();
+        assert_eq!(back, r, "lossless steering round-trip through the node");
+
+        // Wire round-trip.
+        let json = serde_json::to_string(&r).unwrap();
+        let wire: ConformanceRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(wire, r, "lossless steering round-trip over the wire");
+    }
+
+    /// The additive migration on READ: a node written before the steering fields existed (no new
+    /// keys in its metadata bag) parses and defaults to steering_type=architecture / weight=1.0 —
+    /// AND a rule that never sets the new fields serializes byte-identical to the 2.x wire shape.
+    #[test]
+    fn pre_steering_rows_default_and_default_rows_keep_the_2x_wire_shape() {
+        let legacy = rule(
+            "PAT-500",
+            RuleType::Pattern,
+            ConfSeverity::Warn,
+            Targets::default(),
+        );
+        let mut node = legacy.to_node();
+        for k in [
+            "steering_type",
+            "applies_to",
+            "excludes",
+            "weight",
+            "effect",
+            "trigger",
+            "obligations",
+            "criteria",
+        ] {
+            node.metadata.remove(k);
+            // The 2.x node never carried the key in the first place — prove serialization skipped it.
+            assert!(
+                !legacy.to_node().metadata.contains_key(k),
+                "a defaulted `{k}` must not serialize (2.x wire shape preserved)"
+            );
+        }
+        let read = ConformanceRule::from_node(&node).expect("a pre-steering node must parse");
+        assert_eq!(read.steering_type, DEFAULT_STEERING_TYPE);
+        assert_eq!(read.weight, DEFAULT_RULE_WEIGHT);
+        assert!(read.applies_to.is_empty() && read.excludes.is_empty());
+        assert!(read.effect.is_none() && read.trigger.is_none());
+        assert_eq!(
+            read, legacy,
+            "defaults reconstruct the exact pre-steering rule"
+        );
+    }
+
+    #[test]
+    fn steering_invariants_fail_closed() {
+        // INV-S1: out-of-vocabulary steering_type.
+        let mut r = rule(
+            "PAT-001",
+            RuleType::Pattern,
+            ConfSeverity::Info,
+            Targets::default(),
+        );
+        r.steering_type = "vibes".into();
+        assert!(r.validate().unwrap_err().to_string().contains("INV-S1"));
+
+        // INV-S2: NaN / negative weight.
+        let mut r = rule(
+            "PAT-001",
+            RuleType::Pattern,
+            ConfSeverity::Info,
+            Targets::default(),
+        );
+        r.weight = f32::NAN;
+        assert!(r.validate().unwrap_err().to_string().contains("INV-S2"));
+        r.weight = -1.0;
+        assert!(r.validate().unwrap_err().to_string().contains("INV-S2"));
+
+        // INV-S3: an effect with no applies_to enforces nothing — refuse the silent fail-open.
+        let mut r = rule(
+            "PAT-001",
+            RuleType::Pattern,
+            ConfSeverity::Info,
+            Targets::default(),
+        );
+        r.effect = Some(crate::domain::Effect::Deny);
+        assert!(r.validate().unwrap_err().to_string().contains("INV-S3"));
+        r.applies_to = vec!["build".into()];
+        assert!(r.validate().is_ok());
+
+        // INV-S3: a malformed trigger regex would never fire — refuse the silent dead Deny.
+        r.trigger = Some(crate::domain::Trigger {
+            contains: Some("[unclosed".into()),
+        });
+        assert!(r.validate().unwrap_err().to_string().contains("INV-S3"));
+
+        // INV-C1 outside the reserved namespace: blank ids refused, free-form ids accepted.
+        let mut r = rule(
+            "steer-1",
+            RuleType::Policy,
+            ConfSeverity::Info,
+            Targets::default(),
+        );
+        assert!(
+            r.validate().is_ok(),
+            "non-reserved ids need only be non-blank"
+        );
+        r.id = "  ".into();
+        assert!(r.validate().unwrap_err().to_string().contains("INV-C1"));
+    }
+
+    /// The steering_type facet works end-to-end through recall, and weight orders within a
+    /// severity band (severity → weight desc → id).
+    #[test]
+    fn recall_filters_by_steering_type_and_orders_by_weight_within_severity() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut sec_heavy = rule(
+            "PAT-601",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            Targets::default(),
+        );
+        sec_heavy.steering_type = "security".into();
+        sec_heavy.weight = 5.0;
+        let mut sec_light = rule(
+            "PAT-600",
+            RuleType::Pattern,
+            ConfSeverity::Error,
+            Targets::default(),
+        );
+        sec_light.steering_type = "security".into();
+        // default weight 1.0 — must order AFTER the heavier PAT-601 despite the smaller id
+        let arch = rule(
+            "PAT-599",
+            RuleType::Pattern,
+            ConfSeverity::Critical,
+            Targets::default(),
+        ); // defaults to architecture
+        for r in [&sec_heavy, &sec_light, &arch] {
+            register_rule(&mut store, r).unwrap();
+        }
+
+        let sec = recall_rules(
+            &store,
+            &RuleQuery {
+                steering_type: Some("security".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sec.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-601", "PAT-600"],
+            "type facet exact; weight desc breaks the tie within the error band"
+        );
+
+        let arch_only = recall_rules(
+            &store,
+            &RuleQuery {
+                steering_type: Some("architecture".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            arch_only.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-599"],
+            "a pre-steering/defaulted rule is the architecture page's"
+        );
+
+        let all = recall_rules(&store, &RuleQuery::default()).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-599", "PAT-601", "PAT-600"],
+            "severity first, then weight desc, then id"
+        );
+    }
+
+    /// list_rules is the management view: retired rows appear when asked (the recall-skips-retired
+    /// listing gap), effect-bearing (decide-lane) rules appear always, and recall keeps excluding
+    /// both — the enforcement funnel is unchanged.
+    #[test]
+    fn list_rules_includes_retired_and_enforcing_rows_recall_never_does() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-700",
+                RuleType::Pattern,
+                ConfSeverity::Warn,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        register_rule(
+            &mut store,
+            &rule(
+                "PAT-701",
+                RuleType::Pattern,
+                ConfSeverity::Warn,
+                Targets::default(),
+            ),
+        )
+        .unwrap();
+        retire_rule(&mut store, "PAT-701").unwrap();
+        let mut enforcing = rule(
+            "pol-block-x",
+            RuleType::Policy,
+            ConfSeverity::Critical,
+            Targets::default(),
+        );
+        enforcing.effect = Some(crate::domain::Effect::Deny);
+        enforcing.applies_to = vec!["build".into()];
+        enforcing.steering_type = "operations".into();
+        register_rule(&mut store, &enforcing).unwrap();
+
+        let recalled = recall_rules(&store, &RuleQuery::default()).unwrap();
+        assert_eq!(
+            recalled.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["PAT-700"],
+            "recall: no retired rows, no decide-lane rows"
+        );
+
+        let active = list_rules(&store, &RuleQuery::default(), false).unwrap();
+        assert_eq!(
+            active.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["pol-block-x", "PAT-700"],
+            "listing includes the enforcing rule (critical orders first)"
+        );
+
+        let all = list_rules(&store, &RuleQuery::default(), true).unwrap();
+        assert_eq!(
+            all.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["pol-block-x", "PAT-700", "PAT-701"],
+            "--include-retired: the withdrawn row is listable"
+        );
+        assert!(
+            all.iter().find(|r| r.id == "PAT-701").unwrap().retired,
+            "the listed row still says it is retired"
+        );
     }
 }

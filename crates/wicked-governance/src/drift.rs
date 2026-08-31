@@ -485,6 +485,7 @@ mod tests {
                 source_kinds: vec!["doc".into()],
             },
             retired: false,
+            ..Default::default()
         };
         register_rule(&mut store, &legacy).unwrap();
 
@@ -538,6 +539,7 @@ mod tests {
                 source_kinds: vec!["doc".into()],
             },
             retired: false,
+            ..Default::default()
         };
         register_rule(&mut store, &rule).unwrap();
 

@@ -39,6 +39,7 @@ fn sample_rule(id: &str) -> ConformanceRule {
             source_kinds: vec!["doc".to_string()],
         },
         retired: false,
+        ..Default::default()
     }
 }
 

@@ -4,7 +4,7 @@
 //! (`lib/{select,decide,store,evidence-port}.mjs`) onto the verified `wicked-apps-core` estate API:
 //!
 //! ```text
-//!   register_policy ─► [Node Other(POLICY)]            (shared estate store)
+//!   register_policy ─► [Node Rule (steering twin) + Node Other(POLICY) audit row]   (shared estate store)
 //!   SELECT ─► by applies_to(phase)  ─► DECIDE ─► ConformanceClaim ─► conform ─► [Node + Governs edge]
 //!                                       (deny dominates; NO model)            (+ coarse bus event)
 //! ```
@@ -41,6 +41,7 @@ mod retire;
 mod ruleset;
 mod schemas;
 mod scoreboard;
+mod steering;
 
 pub use domain::{Effect, Policy, Severity, Trigger};
 pub use engine::{
@@ -48,10 +49,24 @@ pub use engine::{
     retire_policy, select, select_any, EVALUATOR_IDENTITY, EV_CONFORMANCE_RECORDED_LITERAL,
 };
 
-// Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B).
+// Conformance rules — prescriptive pattern/policy rules on native estate `Rule` nodes (PR-B),
+// extended by the STEERING unification into the ONE steering-rule model (steering_type /
+// applies_to / excludes / weight / effect / trigger / obligations / criteria). `list_rules` is
+// the management view (retired rows listable, decide-lane rows included); `recall_rules` stays
+// the enforcement funnel.
 pub use conformance::{
-    recall_rules, register_rule, retire_rule, Compliance, ConfSeverity, ConformanceRule,
-    RuleProvenance, RuleQuery, RuleType, Targets,
+    list_rules, recall_rules, register_rule, retire_rule, Compliance, ConfSeverity,
+    ConformanceRule, RuleProvenance, RuleQuery, RuleType, Targets, DEFAULT_RULE_WEIGHT,
+    DEFAULT_STEERING_TYPE, STEERING_TYPES,
+};
+
+// STEERING unification (the wiki/rules model + the standalone Policy model, merged): the
+// documented kind→steering_type and severity mappings, the Policy⇄steering projections
+// SELECT/DECIDE run on, and the one-time idempotent migration of legacy `Other(POLICY)` rows.
+pub use steering::{
+    conf_severity_for_policy, migrate_policies_to_steering, policy_severity_for, policy_view,
+    steering_rule_from_policy, steering_type_for_policy_kind, PolicyMigration,
+    POLICY_PROVENANCE_SOURCE,
 };
 
 // Enforcement evidence (AW-23, the aw14 verifier's flagged follow-up): a recorded denial writes
@@ -64,7 +79,7 @@ pub use conformance::{record_rule_evidence, RuleEvidenceReport, CONFORMANCE_RULE
 // and the enforcement evidence above; recall volume is documented unavailable in-band.
 pub use scoreboard::{
     scoreboard, ConnectionCoverage, EnforcementEvidence, RecallVolume, RuleEvidenceRow, Scoreboard,
-    TypingCoverage,
+    SteeringTypeCount, TypingCoverage,
 };
 
 // Domain-model output artifact + front-half coverage gate (PR-D foundation — DES-OUTGOV-001 §10).

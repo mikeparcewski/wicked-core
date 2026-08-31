@@ -655,6 +655,7 @@ mod tests {
                 source_kinds: vec!["doc".to_string()],
             },
             retired: false,
+            ..Default::default()
         }
     }
 

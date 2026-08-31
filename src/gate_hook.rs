@@ -1846,8 +1846,9 @@ fn output_rule_query() -> RuleQuery {
         language: env(OUTPUT_LANGUAGE_ENV),
         layer: env(OUTPUT_LAYER_ENV),
         framework: env(OUTPUT_FRAMEWORK_ENV),
-        severity: None,
-        rule_type: None,
+        // Severity/rule-type/steering-type are never narrowed for the output gate: the recall
+        // report must carry EVERY applicable steering page's rules.
+        ..Default::default()
     }
 }
 
@@ -1924,6 +1925,7 @@ mod tests {
                 compliance: None,
                 provenance: RuleProvenance::default(),
                 retired: false,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1975,6 +1977,7 @@ mod tests {
             compliance: None,
             provenance: RuleProvenance::default(),
             retired: false,
+            ..Default::default()
         };
         register_rule(&mut store, &mk("PAT-001", "python")).unwrap();
         register_rule(&mut store, &mk("PAT-002", "rust")).unwrap();
