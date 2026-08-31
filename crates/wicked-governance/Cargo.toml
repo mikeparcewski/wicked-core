@@ -14,6 +14,11 @@ wicked-estate-store = "0.14.3"
 # rationale chunks + about-xedges through the SAME engine the estate MCP serves. Cargo unifies
 # the 0.14 line to one version.
 wicked-estate-knowledge = "0.14.5"
+# `Embedder`/`HashEmbedder` for the eval lane's gap hints (`rules eval`): query vectors must come
+# from the SAME embedder family the knowledge engine's compile-time default writes with, and the
+# knowledge crate does not re-export the trait. Already a transitive dep of -knowledge (same 0.14
+# line, no semantic/ONNX features), so this adds no build weight — hence no cargo feature gate.
+wicked-estate-retrieve = "0.14.5"
 wicked-estate-overlay = "0.14.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

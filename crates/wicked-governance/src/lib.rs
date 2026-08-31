@@ -30,6 +30,7 @@ mod drift;
 
 mod edge_vocab;
 mod engine;
+mod evals;
 pub mod events;
 mod fanout;
 mod ingest;
@@ -163,6 +164,19 @@ pub use knowledge_link::{relate_linked_rules, KnowledgeLink, KnowledgeLinkReport
 pub use schemas::{
     register_schema_nodes, schema_bundle_version, CONFORMANCE_RULES_SCHEMA, COVERAGE_SCHEMA,
     DOMAIN_MODEL_SCHEMA, GOVERNANCE_SCHEMA, SCHEMA_BUNDLE, VOCABULARY_SCHEMA,
+};
+
+// Governance evals: corpus samples through the REAL SELECT→DECIDE gate path (`rules eval` /
+// crew's `/testing/evals` seam). `pretool_context` is the ONE tool-event → evaluation-context
+// projection — `wicked-core`'s PreToolUse gate hook delegates here so the eval can never drift
+// from the gate it measures. `governance_evals`/`governance_corpus_import` are the JSON-string
+// entry points the core-ts binding wraps verbatim.
+pub use evals::{
+    default_knowledge_db, governance_corpus_import, governance_evals, import_corpus, load_corpus,
+    pretool_context, pretool_event_from_signals, run_evals, sample_chunk_id, CorpusSource,
+    EvalReport, EvalSample, EvalSummary, Expected, ImportReceipt, NearestRule, SampleKind,
+    SampleRef, SampleResult, SampleSignals, Verdict, DEFAULT_CORPUS_NAME, DEFAULT_EVAL_PHASE,
+    DEGRADED_FACET_ONLY, EVAL_SAMPLE_PREFIX, EVAL_SCOPE_PREFIX,
 };
 
 // Re-export the claim wire type so callers program against one path.

@@ -3502,6 +3502,7 @@ dependencies = [
  "wicked-estate-core",
  "wicked-estate-knowledge",
  "wicked-estate-overlay",
+ "wicked-estate-retrieve",
  "wicked-estate-store",
 ]
 
