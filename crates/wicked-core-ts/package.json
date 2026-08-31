@@ -38,7 +38,8 @@
     "smoke": "node smoke.mjs",
     "smoke:lifecycle": "node smoke-lifecycle.mjs",
     "smoke:terminal": "node smoke-terminal.mjs",
-    "smoke:all": "node smoke.mjs && node smoke-lifecycle.mjs && node smoke-terminal.mjs"
+    "smoke:evals": "node smoke-evals.mjs",
+    "smoke:all": "node smoke.mjs && node smoke-lifecycle.mjs && node smoke-terminal.mjs && node smoke-evals.mjs"
   },
   "optionalDependencies": {
     "wicked-core-ts-darwin-x64": "0.7.5",

@@ -1545,6 +1545,50 @@ impl Core {
         task(move || steering_import_json(&core, &batch_json))
     }
 
+    /// Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
+    /// score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
+    /// `args_json` is `{ type?, corpus?, knowledgeDb?, dbPath }` (camelCase keys are the PINNED
+    /// binding contract): `type` slices the corpus to one of the 7 steering types; `corpus`
+    /// names an estate knowledge scope (`evals:<name>` — a corpus landed by
+    /// [`Core::governance_corpus_import`]) or, omitted, selects the compiled-in default corpus;
+    /// `knowledgeDb` powers embedding gap hints (absent/unusable ⇒ the report carries
+    /// `degraded: "facet-only"` — an honest downgrade to keyword hints, never fabricated
+    /// similarity); `dbPath` is the rules store, opened READ-ONLY — this call never goes through
+    /// the single-writer actor and never writes either store.
+    ///
+    /// Resolves to the `EvalReport` JSON exactly as the engine serializes it (snake_case — crew
+    /// passes it through verbatim as the pinned wire contract):
+    /// `{ results: [{ sample: { id, description, kind, steering_type }, expected: "deny"|"allow",
+    /// fired: [rule-id…], verdict: "caught"|"gap"|"false_positive", nearest_rules? }],
+    /// summary: { total, caught, gaps, false_positives }, degraded: "facet-only"|null }`.
+    ///
+    /// Fail-closed: malformed args, an unknown steering type, a corpus name outside the
+    /// `evals:` scope, or a missing store reject the Promise with the engine's reason — crew maps
+    /// those to 400, and gates the whole route on this binding's PRESENCE (absent ⇒ 501).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn governance_evals(&self, args_json: String) -> AsyncTask<CoreTask> {
+        task(move || wicked_core::governance_evals(&args_json).map_err(err))
+    }
+
+    /// Import an eval corpus into the estate knowledge store (the engine seam behind crew's
+    /// `POST /api/v1/testing/corpora/import`). `args_json` is `{ name, samples, knowledgeDb? }`
+    /// (camelCase keys are the PINNED binding contract): `samples` is an array of
+    /// `{ id, description, kind: "good"|"bad", steering_type, signals: { phase?, tool?, files?,
+    /// content? } }` — validated fail-closed as a whole corpus (blank/duplicate ids, unknown
+    /// steering types reject the batch) and landed under scope `evals:<name>`, one chunk per
+    /// sample, id-keyed (re-import upserts in place) WITH embeddings via the same
+    /// `KnowledgeEngine` path the rules fan-out uses. `knowledgeDb` defaults to the operator's
+    /// `~/.wicked-estate/knowledge.db`; tests must always pass a temp path.
+    ///
+    /// Resolves to the `ImportReceipt` JSON `{ imported, scope: "evals:<name>", embedded }` —
+    /// `embedded` is VERIFIED against the durable store after the write handle drops, not
+    /// asserted. Fail-closed on malformed args (crew maps that to 400; route presence-gates on
+    /// this binding like [`Core::governance_evals`] — absent ⇒ 501).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn governance_corpus_import(&self, args_json: String) -> AsyncTask<CoreTask> {
+        task(move || wicked_core::governance_corpus_import(&args_json).map_err(err))
+    }
+
     /// Withdraw a governance policy from enforcement (FINDING-038 — governance state was otherwise
     /// append-only, so a mis-authored policy denied forever).
     ///
@@ -2921,6 +2965,151 @@ mod tests {
         assert_eq!(
             rows[1]["rule_ids"],
             serde_json::json!(["PAT-300", "PAT-301"])
+        );
+    }
+
+    /// AC (evals bindings): `governanceEvals` / `governanceCorpusImport` are 1:1 passthroughs of
+    /// wicked-core's JSON-string eval seams — this drives THOSE EXACT SEAMS (the closures the
+    /// napi methods run on the libuv worker thread) against a temp rules store + temp knowledge
+    /// db, and pins the wire fields crew's `/testing/evals` routes pass through verbatim:
+    /// - import: `{ imported, scope: "evals:<name>", embedded }`, with `embedded` verified true
+    ///   (the default hash embedder stores vectors on write);
+    /// - eval: `{ results: [{ sample{id,description,kind,steering_type}, expected, fired,
+    ///   verdict }], summary{total,caught,gaps,false_positives}, degraded }`, run against the
+    ///   imported `evals:` scope with a real deny policy firing through the gate path;
+    /// - fail-closed: an unknown steering type and a non-`evals:` corpus name both reject with
+    ///   the engine's reason (crew's 400 lane), never an empty report.
+    #[test]
+    fn governance_evals_bindings_pass_the_pinned_wire_shapes_through() {
+        hermetic_spool();
+
+        // A temp rules store with one decide-lane policy: deny `push --force` in build.
+        let db_path = temp_store_path("gov-evals");
+        {
+            let mut store = wicked_apps_core::open_store(Some(&db_path)).expect("store opens");
+            let policy: wicked_governance::Policy = serde_json::from_value(serde_json::json!({
+                "id": "GOV-FORCE-PUSH",
+                "kind": "development",
+                "applies_to": ["build"],
+                "effect": "deny",
+                "trigger": { "contains": "push\\s+--force" },
+                "criteria": "history on shared branches is append-only",
+                "severity": "high",
+                "rule": "never force-push a shared branch",
+            }))
+            .expect("the wire-shape policy parses");
+            wicked_governance::register_policy(&mut store, &policy).expect("policy registers");
+        }
+
+        // A temp knowledge db — NEVER the operator's ~/.wicked-estate/knowledge.db.
+        let know_dir = std::env::temp_dir().join(format!(
+            "wicked-core-ts-gov-evals-know-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&know_dir);
+        std::fs::create_dir_all(&know_dir).expect("temp knowledge dir");
+        let know_db = know_dir
+            .join("knowledge.db")
+            .to_str()
+            .expect("utf-8")
+            .to_string();
+
+        // Import a 2-sample corpus through the EXACT seam `governanceCorpusImport` wraps.
+        let samples = serde_json::json!([
+            {
+                "id": "dev-force-push",
+                "description": "force-push to a shared branch",
+                "kind": "bad",
+                "steering_type": "development",
+                "signals": { "phase": "build", "tool": "Bash",
+                             "content": "git push --force origin main" },
+            },
+            {
+                "id": "dev-small-pr",
+                "description": "a plain feature-branch push",
+                "kind": "good",
+                "steering_type": "development",
+                "signals": { "phase": "build", "tool": "Bash",
+                             "content": "git push origin fix/null-guard" },
+            },
+        ]);
+        let receipt_json = wicked_core::governance_corpus_import(
+            &serde_json::json!({ "name": "smoke", "samples": samples, "knowledgeDb": know_db })
+                .to_string(),
+        )
+        .expect("the corpus imports");
+        let receipt: Value = serde_json::from_str(&receipt_json).expect("receipt is valid JSON");
+        assert_eq!(receipt["imported"], 2);
+        assert_eq!(receipt["scope"], "evals:smoke");
+        assert_eq!(
+            receipt["embedded"], true,
+            "the default hash embedder stores vectors on write"
+        );
+
+        // Eval the imported scope through the EXACT seam `governanceEvals` wraps.
+        let report_json = wicked_core::governance_evals(
+            &serde_json::json!({
+                "type": "development",
+                "corpus": "evals:smoke",
+                "knowledgeDb": know_db,
+                "dbPath": db_path,
+            })
+            .to_string(),
+        )
+        .expect("the eval runs");
+        let report: Value = serde_json::from_str(&report_json).expect("report is valid JSON");
+        assert_eq!(report["summary"]["total"], 2);
+        assert_eq!(
+            report["summary"]["caught"], 2,
+            "bad sample denied + good sample allowed are both caught"
+        );
+        assert_eq!(report["summary"]["gaps"], 0);
+        assert_eq!(report["summary"]["false_positives"], 0);
+        assert!(
+            report["degraded"].is_string() || report["degraded"].is_null(),
+            "degraded is ALWAYS serialized: \"facet-only\" | null, got {}",
+            report["degraded"]
+        );
+        let results = report["results"].as_array().expect("results is an array");
+        assert_eq!(results.len(), 2, "one row per sample");
+        // Rows come back sorted by sample id (scope loads sort); pin the wire fields per row.
+        let bad = &results[0];
+        assert_eq!(bad["sample"]["id"], "dev-force-push");
+        assert_eq!(bad["sample"]["kind"], "bad");
+        assert_eq!(bad["sample"]["steering_type"], "development");
+        assert!(bad["sample"]["description"].is_string());
+        assert_eq!(bad["expected"], "deny");
+        assert_eq!(bad["verdict"], "caught");
+        assert_eq!(
+            bad["fired"],
+            serde_json::json!(["GOV-FORCE-PUSH"]),
+            "the deny fired through the REAL gate path"
+        );
+        let good = &results[1];
+        assert_eq!(good["sample"]["id"], "dev-small-pr");
+        assert_eq!(good["expected"], "allow");
+        assert_eq!(good["verdict"], "caught");
+        assert_eq!(good["fired"], serde_json::json!([]));
+
+        // Fail-closed (crew's 400 lane): unknown steering type / non-`evals:` corpus reject.
+        let bad_type = wicked_core::governance_evals(
+            &serde_json::json!({ "type": "archtecture", "dbPath": db_path,
+                                 "knowledgeDb": know_db })
+            .to_string(),
+        )
+        .expect_err("a typo'd steering type must reject");
+        assert!(
+            bad_type.to_string().contains("unknown steering type"),
+            "error names the problem: {bad_type}"
+        );
+        let bad_corpus = wicked_core::governance_evals(
+            &serde_json::json!({ "corpus": "smoke", "dbPath": db_path, "knowledgeDb": know_db })
+                .to_string(),
+        )
+        .expect_err("a corpus name outside the evals: scope must reject");
+        assert!(
+            bad_corpus.to_string().contains("evals:"),
+            "error names the required scope spelling: {bad_corpus}"
         );
     }
 }
