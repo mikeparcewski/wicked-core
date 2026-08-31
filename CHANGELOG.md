@@ -15,6 +15,25 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Rejected units keep their transcripts + machine-readable deny** (usability review #1,
+  core-ts 0.7.6). The `work_output` record is now written for EVERY gated unit: a denied/failed
+  unit keeps whatever PARTIAL output existed at rejection, flagged `resolution: "rejected"`
+  beside the structured denial; a unit denied BEFORE any output existed persists an explicit
+  failure record (no output, denial only) — so the transcript read returns honest structure
+  instead of nothing exactly when an operator is diagnosing a failed run. ADR-0003 unchanged:
+  `get_work_output` (evaluator artifact-passing, context injection) filters rejected records and
+  still returns approved output only. The actor's own rejection paths (worker failure, substance
+  gate, deliverable floor, elicitation failure) persist the same flagged record with the unit's
+  FULL partial output. NEW `UnitDenial` — the machine-readable twin of the `denial_reason` prose:
+  `{source, reason, claim_id, rule_ids, denied_tool, phase}` — rides the persisted `WorkUnit`
+  (additive `denial` field), `UnitOutcome`, `gateEvaluated` (camelCase `denial`, beside the
+  retained `denialReason`), and `fold_input_denial`'s return (claim id + firing policy ids + the
+  denied tool recovered from the decisions log's tool-call annotation). NEW read path
+  `get_unit_transcript` / `Core::unit_transcript` / napi `unitTranscript(unitId)` →
+  `{unit_id, resolution, partial, phase_status?, output?, denial_reason?, denial?}`. The existing
+  `workOutput` binding keeps its `string | null` shape — a rejected unit now answers with its
+  partial output (`null` only when none was ever stored), which released crew 0.7.3 serves and
+  studio 0.4.3 renders unchanged.
 - **STEERING unification — one steering-rule model** (STEERING program, gov-model lane). The
   wiki/rules model and the standalone governance `Policy` model MERGE into `ConformanceRule`:
   new optional/defaulted fields `steering_type` (enum-as-string over
