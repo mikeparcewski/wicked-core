@@ -201,6 +201,44 @@ pub fn deadletter_path() -> Option<PathBuf> {
     )
 }
 
+/// TEST-SUPPORT — never call from runtime code. Redirects the outbox spool to one per-process
+/// temp file for the REST of the process, so a test suite that trips a fire-and-forget emission
+/// (a gate transition, conformance recording, a rule-lifecycle event) can never append junk to
+/// the operator's real `<home>/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue
+/// (core#311).
+///
+/// One shared helper instead of a copy per test binary. Idempotent (`Once`) and deliberately
+/// NEVER unset: an unset window would leak a parallel test's emission to the real spool (the
+/// per-test set/remove pattern had exactly that race). Returns the armed spool path — every
+/// caller in the same process gets the same file. Spawned subprocesses (e.g. the real
+/// `wicked-core` binary under `CARGO_BIN_EXE_*`) inherit the env var, so arming the test process
+/// covers its children. Tests that assert spool CONTENTS under their own path must live in a
+/// binary that manages [`DEADLETTER_ENV`] itself and must not call this.
+///
+/// The DEFAULT runtime resolution ([`deadletter_path`]) is unchanged: this only sets the
+/// already-honored [`DEADLETTER_ENV`] override, and only in processes that opt in.
+///
+/// Also arms [`crate::spawn::hermetic_test_worker_home`] — the worker-config-home override is the
+/// same test-hygiene guarantee for the engine's ACP spawn path (a real start re-sanitizes the
+/// resolved worker home, which must never be the operator's real `~/.wicked-worker/claude`), and
+/// riding here means every existing pre-main arming block covers both without edits.
+pub fn hermetic_test_spool() -> PathBuf {
+    crate::spawn::hermetic_test_worker_home();
+    static ARMED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ARMED
+        .get_or_init(|| {
+            let path = std::env::temp_dir().join(format!(
+                "wicked-apps-test-outbox-{}.ndjson",
+                std::process::id()
+            ));
+            // SAFETY: process-global env write, serialized by `OnceLock` and never removed
+            // afterwards, so there is no read-during-unset window to race.
+            unsafe { std::env::set_var(DEADLETTER_ENV, &path) };
+            path
+        })
+        .clone()
+}
+
 /// Append one NDJSON line for `event` to the outbox spool, writing the loud [`DEADLETTER_MARKER`]
 /// lines to stderr. Used whenever the event could not be written to the shared store.
 fn spool(event: &EmitEvent, reason: &str) {

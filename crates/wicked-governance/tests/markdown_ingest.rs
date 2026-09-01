@@ -13,17 +13,9 @@ use wicked_governance::{
 /// Redirect the emit outbox spool to a per-process temp file: `register_rule`'s fire-and-forget
 /// `wicked.estate.rule.ingested` emission (AW-22) is a side effect here, not the object under
 /// test, and must not append junk to the real `~/.something-wicked` operator replay queue.
-/// Set once, never unset (an unset window would leak a parallel test's emission).
+/// Delegates to the shared seam-level helper (core#311) — set once, never unset.
 fn hermetic_spool() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let path = std::env::temp_dir().join(format!(
-            "wg-mdingest-test-outbox-{}.ndjson",
-            std::process::id()
-        ));
-        // SAFETY: process-global env write, serialized by `Once`, never removed.
-        unsafe { std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &path) };
-    });
+    wicked_apps_core::emit::hermetic_test_spool();
 }
 
 fn fixture(dir: &str) -> PathBuf {

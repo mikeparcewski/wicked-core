@@ -93,3 +93,10 @@ wicked-apps-core = { path = "crates/wicked-apps-core" }
 wicked-governance = { path = "crates/wicked-governance" }
 wicked-orchestration = { path = "crates/wicked-orchestration" }
 wicked-council = { path = "crates/wicked-council" }
+# Pre-main arming of the hermetic emit spool in EVERY test binary (core#311): engine paths under
+# test fire coarse `wicked.*` emissions as a side effect, and with no shared store configured
+# those spool to `~/.something-wicked/wicked-apps/emit-outbox.ndjson` — the operator's REAL replay
+# queue. `#[ctor::ctor]` runs before main (single-threaded), so the `WICKED_APPS_EMIT_DEADLETTER`
+# override is set before any test thread can emit — a per-test arming call can never guarantee
+# that (a parallel unarmed test could spool first). Enforced by `tests/harness_hygiene.rs`.
+ctor = "1.0.13"

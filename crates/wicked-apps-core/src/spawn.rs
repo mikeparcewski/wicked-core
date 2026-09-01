@@ -85,6 +85,40 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
     "WICKED_PRE_BUILD_SCOPE",
 ];
 
+/// The env var the engine's ACP spawn path resolves the persistent worker config home from
+/// (`wicked-core`'s `worker_config_home`): unset ⇒ `<home>/.wicked-worker`, set ⇒ that base.
+/// Owned HERE (below the root in the dependency graph) so the root's runtime resolution and the
+/// shared test-support arming below spell the variable once.
+pub const WORKER_HOME_ENV: &str = "WICKED_WORKER_HOME";
+
+/// TEST-SUPPORT — never call from runtime code. Points [`WORKER_HOME_ENV`] at one per-process
+/// temp directory for the REST of the process, so a test that reaches the engine's real ACP
+/// spawn path can never mutate the operator's REAL `~/.wicked-worker/claude` — the persistent
+/// worker config home the spawn re-sanitizes on every start (settings.json is REWRITTEN and
+/// `hooks/`, `plugins/`, `commands/`, `agents/`, `settings.local.json`, `managed-settings.json`
+/// are DELETED there). Same disease as the emit-outbox leak (core#311), adjacent organ; armed by
+/// the same pre-main block, because `emit::hermetic_test_spool` calls this.
+///
+/// Idempotent (`OnceLock`) and deliberately NEVER unset — a test that re-aims the variable at
+/// its own fixture home must RESTORE it to this armed value afterwards (set-to-armed, not
+/// `remove_var`): an unset window would hand a parallel or later real start the operator's home.
+/// Returns the armed base dir — every caller in the same process gets the same one. Spawned
+/// subprocesses inherit the variable, so arming the test process covers its children.
+pub fn hermetic_test_worker_home() -> std::path::PathBuf {
+    static ARMED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ARMED
+        .get_or_init(|| {
+            let path = std::env::temp_dir()
+                .join(format!("wicked-worker-test-home-{}", std::process::id()));
+            // SAFETY: process-global env write, serialized by `OnceLock` and never removed
+            // afterwards, so there is no read-during-unset window to race. Pre-main callers
+            // (the `#[ctor]` arming blocks) run single-threaded.
+            unsafe { std::env::set_var(WORKER_HOME_ENV, &path) };
+            path
+        })
+        .clone()
+}
+
 /// Chainable environment hardening for [`Command`].
 ///
 /// Returns `&mut Command` so it composes with the builder style every spawn site already uses:

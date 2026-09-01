@@ -52,8 +52,12 @@ mod tests {
 
     // ── Test helpers ─────────────────────────────────────────────────────────
 
-    /// A fresh hermetic in-memory estate store.
+    /// A fresh hermetic in-memory estate store. Also arms the hermetic emit spool (core#311):
+    /// `apply_gate`'s fire-and-forget `wicked.crew.phase.transitioned` emission is a side effect
+    /// here, not the object under test, and with no shared store configured it would otherwise
+    /// append junk to the operator's real `~/.something-wicked` replay queue.
     fn store() -> SqliteStore {
+        wicked_apps_core::emit::hermetic_test_spool();
         SqliteStore::in_memory().expect("open in-memory estate store")
     }
 

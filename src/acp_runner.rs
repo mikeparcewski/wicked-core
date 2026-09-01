@@ -1152,9 +1152,12 @@ fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std
 /// pre-creation attack the old exclusive-create defended against ($HOME is not
 /// world-writable); a symlink planted at either path component is still refused below.
 ///
-/// `WICKED_WORKER_HOME` overrides the BASE dir (tests point it at scratch space).
+/// [`wicked_apps_core::spawn::WORKER_HOME_ENV`] overrides the BASE dir. Every TEST binary arms it
+/// pre-main at a per-process temp base (via `emit::hermetic_test_spool`, core#311-class): a real
+/// start reached by a test re-sanitizes the resolved home, which must never be the operator's
+/// real `~/.wicked-worker`.
 fn worker_config_home() -> anyhow::Result<std::path::PathBuf> {
-    if let Some(base) = std::env::var_os("WICKED_WORKER_HOME") {
+    if let Some(base) = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV) {
         return Ok(std::path::PathBuf::from(base).join("claude"));
     }
     let home = std::env::var_os("HOME")
@@ -4350,6 +4353,19 @@ mod tests {
         dir
     }
 
+    /// Fixture cleanup for tests that re-aim `WICKED_WORKER_HOME` at their own scratch base:
+    /// RESTORE the pre-main hermetic arming (core#311-class) instead of `remove_var`. An unset
+    /// window would hand the next real start in this binary the DEFAULT resolution — the
+    /// operator's REAL `~/.wicked-worker/claude`, which `ensure_worker_config_home` REWRITES
+    /// (settings.json) and SANITIZES (deletes hooks/, plugins/, …) on every start. Callers hold
+    /// `ENV_LOCK` write, same as the mutation they are cleaning up after.
+    fn restore_hermetic_worker_home() {
+        std::env::set_var(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            wicked_apps_core::spawn::hermetic_test_worker_home(),
+        );
+    }
+
     // ── FINDING #5: transient single-shot failures are retried; deterministic ones are not ────────
 
     /// crew#267 — the bridge's auth refusal is classified by CODE (downcast), never by display
@@ -4550,7 +4566,7 @@ mod tests {
         );
         assert!(a.join(".claude.json").exists());
 
-        std::env::remove_var("WICKED_WORKER_HOME");
+        restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4596,7 +4612,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(home.join("settings.json")).unwrap()).unwrap();
         assert!(settings["permissions"]["deny"].is_array());
 
-        std::env::remove_var("WICKED_WORKER_HOME");
+        restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4613,8 +4629,47 @@ mod tests {
         std::env::set_var("WICKED_WORKER_HOME", &base);
         let err = ensure_worker_config_home().expect_err("symlinked home must be refused");
         assert!(err.to_string().contains("symlink"), "{err}");
-        std::env::remove_var("WICKED_WORKER_HOME");
+        restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#311 (adjacent organ): with NO test-local override, a real start's home resolution must
+    /// land in the pre-main-armed per-process temp base — never the operator's real
+    /// `~/.wicked-worker/claude`, which `ensure_worker_config_home` REWRITES (settings.json) and
+    /// SANITIZES (deletes hooks/, plugins/, …). Before the arming, every unscoped real-start test
+    /// in this binary (`an_auth_requiring_agent…`, `eight_simultaneous_starts…`, the mock-ACP
+    /// suite) did exactly that on every `cargo test` run. Falsified by removing the
+    /// `hermetic_test_worker_home()` call from `emit::hermetic_test_spool`: the resolution below
+    /// then lands under `$HOME` and the containment asserts fail.
+    #[test]
+    fn worker_home_resolution_lands_in_the_armed_temp_base_never_the_real_home() {
+        // Read side: fixture tests above re-aim the variable under the write lock and RESTORE the
+        // armed value; under the read lock we always observe the armed (or restored) state.
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let armed = wicked_apps_core::spawn::hermetic_test_worker_home();
+        assert_eq!(
+            std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV)
+                .map(std::path::PathBuf::from),
+            Some(armed.clone()),
+            "the pre-main ctor must have armed the worker-home override (and every fixture must \
+             RESTORE it, never remove it)"
+        );
+        let resolved = ensure_worker_config_home().expect("ensure resolves the armed base");
+        assert_eq!(resolved, armed.join("claude"));
+        assert!(
+            resolved.starts_with(std::env::temp_dir()),
+            "the armed worker home must live under the system temp dir, got {}",
+            resolved.display()
+        );
+        if let Some(home) = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+        {
+            assert!(
+                !resolved.starts_with(home.join(".wicked-worker")),
+                "a test resolution must never reach the operator's real ~/.wicked-worker"
+            );
+        }
     }
     use super::*;
     use crate::command::InjectTarget;
@@ -5193,7 +5248,7 @@ sleep 30
             "the seeded user scope must fence the worker, not just exist: {settings}"
         );
         drop(proc);
-        std::env::remove_var("WICKED_WORKER_HOME");
+        restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&seen_dir);
     }
@@ -5303,7 +5358,7 @@ sleep 30
             "the mint must land in this test's scoped home, not a shared one: {}",
             minted.display()
         );
-        std::env::remove_var("WICKED_WORKER_HOME");
+        restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5338,7 +5393,7 @@ sleep 30
         let base = worker_home_base("fence");
         std::env::set_var("WICKED_WORKER_HOME", &base);
         let dir = ensure_worker_config_home().expect("ensure");
-        std::env::remove_var("WICKED_WORKER_HOME");
+        restore_hermetic_worker_home();
         let settings: Value =
             serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
         let deny: Vec<String> = settings["permissions"]["deny"]
