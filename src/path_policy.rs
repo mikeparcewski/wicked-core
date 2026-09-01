@@ -253,6 +253,15 @@ fn validate_extra_roots(
                  launcher's incidental cwd, not a declared destination)"
             ));
         }
+        // The wrapped carrier transports roots via std::env::join_paths; a root containing the
+        // platform path-list separator makes that join fail AT SPAWN, silently degrading the
+        // boundary mid-run. Refuse it here so the launch fails loudly on both carriers alike.
+        if std::env::join_paths([p]).is_err() {
+            return Err(format!(
+                "extra {kind} root {raw} contains the platform path-list separator and cannot \
+                 ride the env carrier; refused at launch rather than degraded at spawn"
+            ));
+        }
         let resolved = resolve_symlinks(p);
         if resolved_is_within(&resolved, &config_tree)
             || resolved_is_within(&config_tree, &resolved)
@@ -562,6 +571,17 @@ mod tests {
         let e = validate_extra_read_roots(&[repo.to_string_lossy().into_owned()], None)
             .expect_err("no HOME must refuse the widening, never wave it through");
         assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
+
+        // A root carrying the platform path-list separator would make join_paths fail AT SPAWN,
+        // silently dropping the env carrier's roots — refused at LAUNCH instead, on both mirrors.
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let poisoned = format!("{}{sep}sneaky", repo.to_string_lossy());
+        let e = validate_extra_read_roots(&[poisoned.clone()], Some(&home))
+            .expect_err("a separator-poisoned read root must be refused");
+        assert!(e.contains("separator"), "names the failure: {e}");
+        let e = validate_extra_write_roots(&[poisoned], Some(&home))
+            .expect_err("a separator-poisoned write root must be refused");
+        assert!(e.contains("separator"), "names the failure: {e}");
     }
 }
 
