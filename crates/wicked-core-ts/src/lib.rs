@@ -2666,17 +2666,10 @@ mod tests {
     /// `Scoreboard` serde form). Key drift here is a wire break for every crew/studio consumer
     /// AND a CLI-parity break, so the exact top-level key set is pinned.
     /// Set the hermetic emit spool ONCE per process: `register_rule`'s fire-and-forget emission
-    /// must never append to the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson`
-    /// (the same set-once-never-unset pattern as wicked-governance's own `hermetic_test_spool`).
+    /// must never append to the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson`.
+    /// Delegates to the shared seam-level helper (core#311) — set once, never unset.
     fn hermetic_spool() {
-        static SPOOL: std::sync::Once = std::sync::Once::new();
-        SPOOL.call_once(|| {
-            let path = std::env::temp_dir().join(format!(
-                "wicked-core-ts-test-outbox-{}.ndjson",
-                std::process::id()
-            ));
-            std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &path);
-        });
+        wicked_apps_core::emit::hermetic_test_spool();
     }
 
     /// A fresh file-backed temp-store path (`:memory:` cannot be shared with the bindings' fresh

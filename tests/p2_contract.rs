@@ -573,3 +573,17 @@ fn cancel_while_a_worker_is_in_flight_terminates_and_is_not_wedged() {
         "a late worker result must not resurrect a cancelled run"
     );
 }
+
+// ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
+/// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
+/// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
+/// no shared store configured those spool — which must land in a per-process temp file, never in
+/// the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue. Every
+/// binary in this suite carries this block; `harness_hygiene.rs` fails the suite if one is missing.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}

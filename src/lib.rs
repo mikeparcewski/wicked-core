@@ -1492,3 +1492,20 @@ mod tests {
         );
     }
 }
+
+// ── Test-harness hygiene (core#311) — the LIB test binary's pre-main arming ──────────────────
+/// Arm the hermetic emit spool BEFORE main for `cargo test --lib`: unit tests across this crate
+/// drive gate and governance paths whose fire-and-forget `wicked.*` emissions would otherwise
+/// spool to the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay
+/// queue. Pre-main is single-threaded, so no test thread can emit before the override is set.
+/// The integration-test binaries each carry their own copy of this block (enforced by
+/// `tests/harness_hygiene.rs`); this one covers the inline `#[cfg(test)]` modules.
+#[cfg(test)]
+mod test_harness_hygiene {
+    /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env
+    /// var via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+    #[ctor::ctor(unsafe)]
+    fn arm_hermetic_emit_spool() {
+        wicked_apps_core::emit::hermetic_test_spool();
+    }
+}

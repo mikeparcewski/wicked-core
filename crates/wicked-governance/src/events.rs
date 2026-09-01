@@ -157,20 +157,10 @@ pub fn emit_doc_drifted(drift: &DocDrift) -> bool {
 /// process, so tests that exercise [`crate::register_rule`]/[`crate::retire_rule`]/`conform`
 /// (whose fire-and-forget emissions are a side effect, not the object under test) never append
 /// junk events to the real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` — the operator's
-/// replay queue. Idempotent, and deliberately NEVER unset: an unset window would leak a parallel
-/// test's emission to the real spool (the old per-test set/remove pattern had exactly that race).
-/// A test that asserts spool CONTENTS must live in its own integration-test binary and manage the
-/// env var itself (see `tests/lifecycle_events.rs`).
+/// replay queue. Delegates to the shared seam-level helper (core#311) — one implementation,
+/// idempotent, never unset. A test that asserts spool CONTENTS must live in its own
+/// integration-test binary and manage the env var itself (see `tests/lifecycle_events.rs`).
 #[cfg(test)]
 pub(crate) fn hermetic_test_spool() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let path = std::env::temp_dir().join(format!(
-            "wicked-governance-test-outbox-{}.ndjson",
-            std::process::id()
-        ));
-        // SAFETY: process-global env write, serialized by `Once`; no test in this binary removes
-        // the var (see the doc comment), so there is no read-during-unset window to race.
-        unsafe { std::env::set_var(wicked_apps_core::emit::DEADLETTER_ENV, &path) };
-    });
+    wicked_apps_core::emit::hermetic_test_spool();
 }

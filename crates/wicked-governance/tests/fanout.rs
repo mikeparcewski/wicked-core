@@ -15,6 +15,10 @@ use wicked_governance::{
 };
 
 fn scratch(name: &str) -> PathBuf {
+    // core#311: `fanout` registers rules, whose fire-and-forget `rule.ingested` emissions would
+    // otherwise spool to the operator's real `~/.something-wicked` replay queue. Every test's
+    // first act is this fixture, so arming here precedes any emission in every thread.
+    wicked_apps_core::emit::hermetic_test_spool();
     let dir = std::env::temp_dir().join(format!("wg-fanout-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
