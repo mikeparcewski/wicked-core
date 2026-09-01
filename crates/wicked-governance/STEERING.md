@@ -44,7 +44,7 @@ half of the retired standalone `Policy` (`src/domain.rs`):
 
 | Field | Type | Meaning |
 |---|---|---|
-| `id` | string | `^(PAT\|POL)-[0-9]{3,6}$` (INV-C1); prefix agrees with `rule_type` |
+| `id` | string | any non-blank id; `PAT-`/`POL-` is the RESERVED namespace — an id with either prefix must match `^(PAT\|POL)-[0-9]{3,6}$` and agree with `rule_type` (INV-C1); other families (`OPS-CUSTOM-10`) are free-form |
 | `rule_type` | `pattern` \| `policy` | how the rule is evaluated (semantic pattern vs. typed projection) |
 | `statement` | string | the one-sentence, checkable rule text |
 | `severity` | `info`..`critical` | recall/report ordering (critical → info) |
@@ -172,9 +172,16 @@ ingestable into the knowledge lane.
 
 The load-bearing details (full contract in [`src/markdown.rs`](./src/markdown.rs)):
 
-- **Rule items** are `` - `ID` (severity): statement `` — id matches `^(PAT|POL)-[0-9]{3,6}$`
-  (`PAT-` = pattern, `POL-` = policy; the type derives from the prefix), severity is
-  `info|warn|error|critical`.
+- **Rule items** are `` - `ID` (severity): statement `` — severity is `info|warn|error|critical`;
+  the id is any `<UPPERCASE-FAMILY>-<suffix>` (an `[A-Z][A-Z0-9]*` family segment plus one or
+  more dash-joined alphanumeric segments — every id the doc lane accepts is valid in the rules
+  CRUD too, core#335; the CRUD itself only requires non-blank outside the reserved namespace,
+  so the doc lane is the disciplined subset). `PAT-`/`POL-`
+  is the reserved namespace: those ids must match `^(PAT|POL)-[0-9]{3,6}$` and the type derives
+  from the prefix (`PAT-` = pattern, `POL-` = policy). Any other family (`OPS-CUSTOM-10`) is a
+  first-class custom id carrying the same doc provenance; its `rule_type` derives from the doc's
+  `enforcement_class` (`policy` ⇒ policy, otherwise pattern — `steering_type` is orthogonal to
+  the pattern/policy split, so it never picks the type).
 - **`symbol_ref:`** on an indented continuation line names the code that enforces the rule
   (`<repo-relative path>::<name>`); `rules relink` re-derives the `Governs` edge from it
   after every re-index — the doc↔gate pairing.

@@ -252,11 +252,15 @@ impl ConformanceRule {
     /// by the STEERING unification INV-S1..S3). INV-C3 (bundle-unique ids) is enforced at ingest,
     /// where the whole bundle is visible.
     pub fn validate(&self) -> anyhow::Result<()> {
-        // INV-C1 (steering-scoped): `PAT-`/`POL-` is the RESERVED doc-ingest namespace — an id in
-        // it must match the wire contract `^(PAT|POL)-[0-9]{3,6}$` AND its prefix must agree with
-        // rule_type (PAT-⇔pattern, POL-⇔policy), exactly as before the merge. Ids OUTSIDE the
-        // reserved namespace (migrated policies keep their original ids unchanged — audit
-        // resolvability; UI/chat-authored steering rules mint their own) need only be non-blank.
+        // INV-C1 (steering-scoped): `PAT-`/`POL-` is the RESERVED namespace — the reservation is
+        // a SHAPE contract, not a lane split (core#335): an id with either prefix, from ANY lane
+        // (doc ingest, UI/chat CRUD, migration), must match the wire contract
+        // `^(PAT|POL)-[0-9]{3,6}$` AND its prefix must agree with rule_type (PAT-⇔pattern,
+        // POL-⇔policy), exactly as before the merge. Ids OUTSIDE the reserved namespace need only
+        // be non-blank, whatever minted them: migrated policies keep their original ids unchanged
+        // (audit resolvability), UI/chat-authored steering rules mint their own, and md-ingested
+        // custom-family ids (`OPS-CUSTOM-10`) are first-class doc-lane rules carrying full doc
+        // provenance (`path@sha#id`, source_kinds ["doc"]) — the doc is the source.
         if self.id.starts_with("PAT-") || self.id.starts_with("POL-") {
             let prefix = self.rule_type.id_prefix();
             let ordinal_ok = self.id.strip_prefix(prefix).is_some_and(|ord| {
@@ -474,9 +478,10 @@ pub struct RuleEvidenceReport {
     pub governs_bumped: usize,
 }
 
-/// Does `id` have the conformance-rule wire shape (`^(PAT|POL)-[0-9]{3,6}$`, INV-C1)? Used to pick
-/// rule citations out of obligation text without ever treating free-form obligation prose as an id.
-fn is_rule_id_shape(id: &str) -> bool {
+/// Does `id` have the RESERVED-namespace wire shape (`^(PAT|POL)-[0-9]{3,6}$`, INV-C1)? Used by
+/// the markdown adapter to fail a near-miss reserved id at its doc line, and to pick rule
+/// citations out of obligation text without ever treating free-form obligation prose as an id.
+pub(crate) fn is_reserved_rule_id(id: &str) -> bool {
     ["PAT-", "POL-"].iter().any(|p| {
         id.strip_prefix(p).is_some_and(|ord| {
             (3..=6).contains(&ord.len()) && ord.bytes().all(|b| b.is_ascii_digit())
@@ -499,7 +504,7 @@ fn cited_rule_ids(claim: &ConformanceClaim) -> Vec<String> {
         let mut parts = rest.splitn(3, ':');
         let _severity = parts.next();
         let Some(id) = parts.next() else { continue };
-        if is_rule_id_shape(id) && seen.insert(id) {
+        if is_reserved_rule_id(id) && seen.insert(id) {
             out.push(id.to_string());
         }
     }

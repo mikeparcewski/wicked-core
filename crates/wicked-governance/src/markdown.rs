@@ -53,13 +53,34 @@
 //! - `PAT-001` (error): Never use `printf` without `%s`.
 //! - `POL-002` (critical): All writes go through the single-writer actor,
 //!   continuation lines are indented by two or more spaces.
+//! - `OPS-CUSTOM-10` (warn): Custom id families import through the same lane.
 //! ```
 //!
-//! Each rule item is `- <ID> (<severity>): <statement>` — id matches INV-C1's
-//! `^(PAT|POL)-[0-9]{3,6}$` (backticks optional), `rule_type` is DERIVED from the id prefix (the
-//! convention makes the prefix the one spelling of the type; INV-C1 requires they agree anyway),
-//! severity is one of `info|warn|error|critical`. Anything else inside the Rules section that is
-//! not a blank line or an indented continuation is an error.
+//! Each rule item is `- <ID> (<severity>): <statement>` (backticks around the id optional),
+//! severity is one of `info|warn|error|critical`. Every id this grammar accepts is valid in the
+//! rules CRUD too (core#335 — no md-importable id is grid-rejected; the CRUD itself only requires
+//! non-blank outside the reserved namespace, so the doc lane is the disciplined subset):
+//!
+//! - An id is `<UPPERCASE-FAMILY>-<suffix>` — an uppercase-led `[A-Z][A-Z0-9]*` family segment
+//!   followed by one or more `-`-joined alphanumeric segments (`PAT-001`, `OPS-CUSTOM-10`,
+//!   `SEC-XSS-9`). Lowercase-led or dash-less tokens are not ids and fail the line loud.
+//! - `PAT-`/`POL-` stays the RESERVED namespace (INV-C1): an id with either prefix must match
+//!   `^(PAT|POL)-[0-9]{3,6}$` exactly, and `rule_type` is DERIVED from the prefix
+//!   (`PAT-` ⇔ pattern, `POL-` ⇔ policy — the convention makes the prefix the one spelling of
+//!   the type; INV-C1 requires they agree anyway). A reserved-prefix id with a non-conforming
+//!   suffix (`PAT-1`, `PAT-CUSTOM-10`) fails the FILE with its line number — honest per-entry
+//!   rejection, never a late context-free INV-C1.
+//! - Any OTHER family is a first-class custom id. Its `rule_type` is INFERRED from the doc's
+//!   frontmatter (the id spells no type): `enforcement_class: policy` ⇒ `policy` (the doc
+//!   declares its rules deterministically enforced — the typed-projection lane), anything else
+//!   (`validator`, `guidance`, or absent) ⇒ `pattern` (recall-valued doctrine — the honest
+//!   default). `steering_type` is deliberately NOT the anchor: every steering type holds
+//!   guidance and gates alike (STEERING.md), so it cannot choose between pattern and policy.
+//!   Custom-family rules carry FULL doc provenance exactly like reserved-namespace ones — the
+//!   doc is the source (`ref: <path>@<sha>#<ID>`, `source_kinds: ["doc"]`).
+//!
+//! Anything else inside the Rules section that is not a blank line or an indented continuation
+//! is an error.
 //!
 //! An indented continuation of the form `symbol_ref: <qualified ref>` is a DIRECTIVE, not
 //! statement text: it sets the rule's `symbol_ref` (the durable rule→code key `rules relink`
@@ -610,8 +631,11 @@ fn parse_rules_section(
     };
 
     // The rule item shape: `- <ID> (<severity>): <statement>` (backticks around the id optional).
+    // The id grammar is any `<UPPERCASE-FAMILY>-<suffix>` (module docs, core#335) — the same id
+    // namespace the rules CRUD accepts; the reserved PAT-/POL- shape is enforced AFTER the match
+    // so a near-miss reserved id fails with its line number, not a context-free INV-C1 later.
     let item_re = regex::Regex::new(
-        r"^[-*]\s+`?((?:PAT|POL)-[0-9]{3,6})`?\s*\((info|warn|error|critical)\)\s*:\s*(.*)$",
+        r"^[-*]\s+`?([A-Z][A-Z0-9]*(?:-[A-Za-z0-9]+)+)`?\s*\((info|warn|error|critical)\)\s*:\s*(.*)$",
     )
     .expect("static regex compiles");
 
@@ -636,10 +660,16 @@ fn parse_rules_section(
     let mut current: Option<CurrentItem> = None;
     let flush = |current: &mut Option<CurrentItem>, rules: &mut Vec<serde_json::Value>| {
         if let Some((id, severity, statement, symbol_ref)) = current.take() {
+            // Reserved namespace: the prefix IS the type (module docs / INV-C1). Custom families
+            // spell no type — infer from the doc's `enforcement_class` frontmatter (documented
+            // rule): `policy` ⇒ policy (deterministically-enforced doctrine), anything else ⇒
+            // pattern (recall-valued, the honest default).
             let rule_type = if id.starts_with("PAT-") {
                 "pattern"
-            } else {
+            } else if id.starts_with("POL-") || fm.enforcement_class.as_deref() == Some("policy") {
                 "policy"
+            } else {
+                "pattern"
             };
             let mut rule = serde_json::json!({
                 "id": id,
@@ -694,6 +724,19 @@ fn parse_rules_section(
         if let Some(caps) = item_re.captures(l) {
             flush(&mut current, &mut rules);
             let id = caps[1].to_string();
+            // INV-C1 surfaced at parse (with the line): an id in the reserved `PAT-`/`POL-`
+            // namespace must match the strict wire shape — a near-miss (`PAT-1`,
+            // `PAT-CUSTOM-10`) fails HERE, per entry, instead of as a context-free
+            // register-time error.
+            if (id.starts_with("PAT-") || id.starts_with("POL-"))
+                && !crate::conformance::is_reserved_rule_id(&id)
+            {
+                anyhow::bail!(
+                    "line {line_no}: rule id {id:?} is in the reserved `PAT-`/`POL-` namespace \
+                     and must match `(PAT|POL)-<3-6 digits>` (INV-C1) — pick another family \
+                     (e.g. `OPS-…`) for a custom id"
+                );
+            }
             if !seen_ids.insert(id.clone()) {
                 anyhow::bail!("line {line_no}: duplicate rule id {id:?} within this doc (INV-C3)");
             }
@@ -731,8 +774,9 @@ fn parse_rules_section(
         } else {
             anyhow::bail!(
                 "line {line_no}: unrecognized content in the Rules section: {t:?} — expected \
-                 `- <PAT|POL-nnn> (<info|warn|error|critical>): <statement>`, an indented \
-                 continuation, or a blank line (refusing to silently skip)"
+                 `- <FAMILY-id> (<info|warn|error|critical>): <statement>` (id = an UPPERCASE-led \
+                 family plus dash-joined alphanumeric segments, e.g. `PAT-001`, `OPS-CUSTOM-10`), \
+                 an indented continuation, or a blank line (refusing to silently skip)"
             );
         }
     }
@@ -1113,6 +1157,150 @@ mod tests {
             assert!(
                 err.contains("bad-weight.md") && err.contains("weight"),
                 "{bad:?}: {err}"
+            );
+        }
+    }
+
+    /// core#335: the md grammar accepts a disciplined subset of the rules-CRUD id namespace — any
+    /// `<UPPERCASE-FAMILY>-<suffix>` id imports through the doc lane, carrying FULL doc
+    /// provenance (the doc is the source), with PAT-/POL- semantics untouched beside it.
+    #[test]
+    fn custom_family_ids_import_with_doc_provenance() {
+        let doc = "---\n\
+            id: ops-doctrine\n\
+            title: Ops doctrine\n\
+            ---\n\n\
+            ## Rules\n\n\
+            - `OPS-CUSTOM-10` (warn): Custom families ride the md lane.\n\
+            - PAT-001 (error): Reserved pattern semantics unchanged.\n\
+            - POL-002 (critical): Reserved policy semantics unchanged.\n\
+            - SEC-XSS-9 (info): Another family,\n  \
+              with a continuation line.\n";
+        let dir = dir_with(&[("ops-doctrine.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules.len(), 4, "all four ids import through one lane");
+
+        let custom = &rules[0];
+        assert_eq!(custom.id, "OPS-CUSTOM-10");
+        assert_eq!(
+            custom.rule_type,
+            crate::RuleType::Pattern,
+            "no enforcement_class ⇒ recall-valued pattern (the documented default)"
+        );
+        assert_eq!(custom.severity, crate::ConfSeverity::Warn);
+        let expected_sha = crate::provenance::git_blob_sha1(doc.as_bytes());
+        assert_eq!(
+            custom.provenance.reference.as_deref(),
+            Some(format!("ops-doctrine.md@{expected_sha}#OPS-CUSTOM-10").as_str()),
+            "custom-family ids carry the SAME doc provenance ref as reserved ones"
+        );
+        assert_eq!(custom.provenance.source, "markdown");
+        assert_eq!(custom.provenance.source_kinds, vec!["doc".to_string()]);
+
+        assert_eq!(
+            rules[1].rule_type,
+            crate::RuleType::Pattern,
+            "PAT unchanged"
+        );
+        assert_eq!(rules[2].rule_type, crate::RuleType::Policy, "POL unchanged");
+        assert_eq!(
+            rules[3].statement, "Another family, with a continuation line.",
+            "continuations join for custom families too"
+        );
+    }
+
+    /// The full round-trip: an md-ingested custom-family rule registers (INV-C1 passes — the id
+    /// is outside the reserved namespace) and comes back through recall.
+    #[test]
+    fn custom_family_rule_round_trips_through_register_and_recall() {
+        crate::events::hermetic_test_spool();
+        use wicked_apps_core::SqliteStore;
+        let doc = "---\nid: rt\ntitle: RT\n---\n\n## Rules\n\n\
+            - OPS-CUSTOM-10 (error): round-trips.\n";
+        let dir = dir_with(&[("roundtrip.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        let mut store = SqliteStore::in_memory().unwrap();
+        for r in &rules {
+            crate::register_rule(&mut store, r).unwrap();
+        }
+        let recalled = crate::recall_rules(&store, &crate::RuleQuery::default()).unwrap();
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].id, "OPS-CUSTOM-10");
+        assert_eq!(
+            recalled[0]
+                .provenance
+                .reference
+                .as_deref()
+                .map(|r| { crate::provenance::parse_provenance_ref(r).anchor }),
+            Some(Some("OPS-CUSTOM-10".to_string())),
+            "the provenance anchor survives the store round-trip"
+        );
+    }
+
+    /// A custom family spells no rule_type — the doc's `enforcement_class` frontmatter is the
+    /// documented inference anchor: `policy` ⇒ policy; reserved prefixes still win over it.
+    #[test]
+    fn custom_family_rule_type_infers_from_enforcement_class() {
+        let doc = "---\n\
+            id: gates\n\
+            title: Gates\n\
+            enforcement_class: policy\n\
+            ---\n\n\
+            ## Rules\n\n\
+            - OPS-GATE-1 (critical): custom id in a policy-class doc.\n\
+            - PAT-100 (warn): reserved prefix still derives its own type.\n";
+        let dir = dir_with(&[("gates.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules[0].rule_type, crate::RuleType::Policy);
+        assert_eq!(
+            rules[1].rule_type,
+            crate::RuleType::Pattern,
+            "PAT- ⇒ pattern even in a policy-class doc (the prefix is the one spelling)"
+        );
+
+        // `validator` / `guidance` docs mint pattern rules (recall-valued default).
+        let doc = "---\nid: g2\ntitle: G2\nenforcement_class: guidance\n---\n\n## Rules\n\n\
+            - DEV-STYLE-1 (info): guidance-class doc.\n";
+        let dir = dir_with(&[("guidance.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules[0].rule_type, crate::RuleType::Pattern);
+    }
+
+    /// A near-miss RESERVED id (`PAT-` prefix, non-conforming suffix) fails the FILE at its line
+    /// with the honest INV-C1 reason — never a late context-free register error, never a skip.
+    #[test]
+    fn reserved_prefix_near_miss_fails_loud_at_its_line() {
+        for bad in ["PAT-1", "PAT-CUSTOM-10", "POL-1234567", "POL-12a"] {
+            let doc = format!("---\nid: x\ntitle: y\n---\n\n## Rules\n\n- {bad} (error): s.\n");
+            let dir = dir_with(&[("near-miss.md", doc.as_str())]);
+            let err = ingest_from(&MarkdownAdapter::new(&dir))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("near-miss.md")
+                    && err.contains("line 8")
+                    && err.contains("reserved")
+                    && err.contains("INV-C1"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    /// Ids outside the grammar entirely (lowercase-led, dash-less) still fail with the
+    /// per-entry hint — the text the studio import panel echoes verbatim.
+    #[test]
+    fn malformed_custom_ids_still_rejected_with_the_hint() {
+        for bad in ["ops-custom-10", "OPSCUSTOM", "1OPS-2", "OPS-"] {
+            let doc = format!("---\nid: x\ntitle: y\n---\n\n## Rules\n\n- {bad} (error): s.\n");
+            let dir = dir_with(&[("bad-id.md", doc.as_str())]);
+            let err = ingest_from(&MarkdownAdapter::new(&dir))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("bad-id.md")
+                    && err.contains("unrecognized content")
+                    && err.contains("OPS-CUSTOM-10"),
+                "{bad:?}: the hint must teach the widened grammar: {err}"
             );
         }
     }
