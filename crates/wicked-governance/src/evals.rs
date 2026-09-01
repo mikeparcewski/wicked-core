@@ -465,6 +465,30 @@ pub fn import_corpus(
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow::anyhow!("create knowledge db directory {parent:?}: {e}"))?;
     }
+    // Replace, not append: purge any prior docs in this scope before writing the new batch.
+    // KnowledgeEngine stores the scope in node.metadata["scope"] (not node.scope), so we mirror
+    // what load_corpus does: filter by KClass::Chunk kind then check kn.scope.
+    {
+        let mut store = SqliteStore::open(knowledge_db)
+            .map_err(|e| anyhow::anyhow!("open knowledge store to purge scope {scope:?}: {e}"))?;
+        let prior_ids: Vec<SymbolId> = store
+            .find_symbols(&SymbolQuery {
+                kinds: vec![NodeKind::Other(KClass::Chunk.as_kind().to_string())],
+                ..Default::default()
+            })?
+            .into_iter()
+            .filter_map(|n| {
+                KNode::from_node(&n)
+                    .filter(|kn| kn.scope == scope)
+                    .map(|_| n.symbol)
+            })
+            .collect();
+        if !prior_ids.is_empty() {
+            store
+                .remove_nodes(&prior_ids)
+                .map_err(|e| anyhow::anyhow!("purge scope {scope:?}: {e}"))?;
+        }
+    }
     {
         let mut engine = KnowledgeEngine::open(knowledge_db)
             .map_err(|e| anyhow::anyhow!("open knowledge store at {knowledge_db:?}: {e}"))?;
@@ -1234,6 +1258,55 @@ mod tests {
         assert_eq!(loaded[0].id, "dev-small-pr");
         assert_eq!(loaded[1].id, "sec-aws-key");
         assert_eq!(loaded[1].signals.files, vec![".env".to_string()]);
+    }
+
+    #[test]
+    fn reimport_replaces_prior_docs_not_appends() {
+        let kdb = temp_db("replace");
+        let first = vec![
+            sample(
+                "old-a",
+                SampleKind::Bad,
+                "security",
+                "build",
+                "Write",
+                &[".env"],
+                "SECRET=old",
+            ),
+            sample(
+                "old-b",
+                SampleKind::Good,
+                "development",
+                "build",
+                "Bash",
+                &[],
+                "safe cmd",
+            ),
+        ];
+        let receipt1 = import_corpus(&kdb, "smoke", &first, 1_000).unwrap();
+        assert_eq!(receipt1.imported, 2);
+
+        // Re-import with entirely different IDs — old docs must not survive.
+        let second = vec![sample(
+            "new-x",
+            SampleKind::Bad,
+            "security",
+            "build",
+            "Write",
+            &[".env"],
+            "API_KEY=new",
+        )];
+        let receipt2 = import_corpus(&kdb, "smoke", &second, 2_000).unwrap();
+        assert_eq!(receipt2.imported, 1);
+        assert_eq!(receipt2.scope, "evals:smoke");
+
+        let loaded = load_corpus(&CorpusSource::Scope("evals:smoke".into()), Some(&kdb)).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1,
+            "re-import must replace, not append: {loaded:?}"
+        );
+        assert_eq!(loaded[0].id, "new-x", "only the new sample survives");
     }
 
     #[test]
