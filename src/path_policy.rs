@@ -576,7 +576,7 @@ mod tests {
         // silently dropping the env carrier's roots — refused at LAUNCH instead, on both mirrors.
         let sep = if cfg!(windows) { ';' } else { ':' };
         let poisoned = format!("{}{sep}sneaky", repo.to_string_lossy());
-        let e = validate_extra_read_roots(&[poisoned.clone()], Some(&home))
+        let e = validate_extra_read_roots(std::slice::from_ref(&poisoned), Some(&home))
             .expect_err("a separator-poisoned read root must be refused");
         assert!(e.contains("separator"), "names the failure: {e}");
         let e = validate_extra_write_roots(&[poisoned], Some(&home))
