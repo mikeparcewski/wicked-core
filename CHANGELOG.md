@@ -104,10 +104,10 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
-- **Markdown steering import accepts the full rules-CRUD id namespace** (#335). The `## Rules`
+- **Markdown steering import accepts custom-family rule ids** (#335). The `## Rules`
   item grammar widens from `PAT|POL-nnn` only to any `<UPPERCASE-FAMILY>-<suffix>` id
-  (`OPS-CUSTOM-10`), so an id valid in the studio grid is importable via `.md` — the two lanes
-  are no longer id-disjoint. `PAT-`/`POL-` stays the RESERVED namespace (strict
+  (`OPS-CUSTOM-10`), every one of them valid in the rules CRUD too — the doc lane is now a
+  disciplined subset of the CRUD id namespace instead of disjoint from it. `PAT-`/`POL-` stays the RESERVED namespace (strict
   `^(PAT|POL)-[0-9]{3,6}$` shape, prefix ⇔ `rule_type`, enforced per entry at the doc line);
   custom families infer `rule_type` from the doc's `enforcement_class` (`policy` ⇒ policy, else
   pattern) and carry full doc provenance (`path@sha#id`, `source_kinds: ["doc"]`) — the doc is

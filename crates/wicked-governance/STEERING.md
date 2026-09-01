@@ -173,8 +173,10 @@ ingestable into the knowledge lane.
 The load-bearing details (full contract in [`src/markdown.rs`](./src/markdown.rs)):
 
 - **Rule items** are `` - `ID` (severity): statement `` — severity is `info|warn|error|critical`;
-  the id is any `<UPPERCASE-FAMILY>-<suffix>` (an uppercase-led family segment plus dash-joined
-  alphanumeric segments — the same id namespace the rules CRUD accepts, core#335). `PAT-`/`POL-`
+  the id is any `<UPPERCASE-FAMILY>-<suffix>` (an `[A-Z][A-Z0-9]*` family segment plus one or
+  more dash-joined alphanumeric segments — every id the doc lane accepts is valid in the rules
+  CRUD too, core#335; the CRUD itself only requires non-blank outside the reserved namespace,
+  so the doc lane is the disciplined subset). `PAT-`/`POL-`
   is the reserved namespace: those ids must match `^(PAT|POL)-[0-9]{3,6}$` and the type derives
   from the prefix (`PAT-` = pattern, `POL-` = policy). Any other family (`OPS-CUSTOM-10`) is a
   first-class custom id carrying the same doc provenance; its `rule_type` derives from the doc's

@@ -57,8 +57,9 @@
 //! ```
 //!
 //! Each rule item is `- <ID> (<severity>): <statement>` (backticks around the id optional),
-//! severity is one of `info|warn|error|critical`. The id grammar matches the rules-CRUD id
-//! namespace (core#335 — the two lanes must accept the same ids):
+//! severity is one of `info|warn|error|critical`. Every id this grammar accepts is valid in the
+//! rules CRUD too (core#335 — no md-importable id is grid-rejected; the CRUD itself only requires
+//! non-blank outside the reserved namespace, so the doc lane is the disciplined subset):
 //!
 //! - An id is `<UPPERCASE-FAMILY>-<suffix>` — an uppercase-led `[A-Z][A-Z0-9]*` family segment
 //!   followed by one or more `-`-joined alphanumeric segments (`PAT-001`, `OPS-CUSTOM-10`,
@@ -1160,7 +1161,7 @@ mod tests {
         }
     }
 
-    /// core#335: the md grammar accepts the same id namespace the rules CRUD does — any
+    /// core#335: the md grammar accepts a disciplined subset of the rules-CRUD id namespace — any
     /// `<UPPERCASE-FAMILY>-<suffix>` id imports through the doc lane, carrying FULL doc
     /// provenance (the doc is the source), with PAT-/POL- semantics untouched beside it.
     #[test]
