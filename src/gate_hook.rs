@@ -2830,6 +2830,104 @@ mod boundary_tests {
         assert!(!fatal, "…and the deny stays advisory, exactly as before");
     }
 
+    /// core#294, the ADVERSARIAL topology: the declared read root CONTAINS the write root. This is
+    /// not exotic — it is the PRIMARY use: worktrees live at `<repo>/wicked-worktrees/<run>`
+    /// (see [`crate::repo`]), so `extraReadRoots: [repoRoot]` on a run bound to that same repo
+    /// puts the unit's own worktree INSIDE the read grant. If the read list leaked into the write
+    /// judgement — or the wider root won by prefix-length, order, or any merge — the grant
+    /// "read the repo" would silently become "write the repo", the exact weakening core#294's
+    /// fail-closed claim rules out. [`crate::path_policy::check`] tests a write against
+    /// `roots.write` ALONE, so containment between the lists must be irrelevant; this pins that.
+    #[test]
+    fn a_read_root_containing_the_write_root_never_admits_a_write() {
+        // Nothing here is created on disk, and none of it is under the system temp — a write-deny
+        // under temp is ADVISORY via the core#264 carve-out, which would turn every fatality
+        // assertion below vacuous. Drive-prefixed on Windows (a bare `/srv` is not absolute there).
+        #[cfg(unix)]
+        let repo = std::path::PathBuf::from("/srv/monorepo");
+        #[cfg(windows)]
+        let repo = std::path::PathBuf::from("C:\\srv\\monorepo");
+        let wt = repo.join("wicked-worktrees").join("run-1");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![repo.clone()],
+        };
+
+        // Inside the worktree: both lists admit it, and the write grant is the NARROW one.
+        let in_wt = wt.join("src").join("main.rs");
+        assert!(
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &ctx(in_wt.to_str().unwrap()),
+                "Write"
+            )
+            .is_none(),
+            "a write inside the worktree stays granted — the read widening must not disturb it"
+        );
+
+        // Inside the repo but OUTSIDE the worktree — the parent checkout the read root grounds
+        // the run in. Readable by declaration; a WRITE stays blocked and unit-FATAL.
+        let sibling = repo.join("src").join("main.rs");
+        let sibling = sibling.to_str().unwrap();
+        assert!(
+            boundary_denial_with(&roots, &wt, None, None, &ctx(sibling), "Read").is_none(),
+            "reading the parent checkout is the declared grant"
+        );
+        let (reason, fatal) = boundary_denial_with(&roots, &wt, None, None, &ctx(sibling), "Write")
+            .expect("a write into the read-only remainder of the repo must be blocked");
+        assert!(
+            fatal,
+            "a read root containing the worktree must not soften the write escape: {reason}"
+        );
+
+        // Edit and the Bash arm agree — every write path through the boundary, same verdict.
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, None, None, &ctx(sibling), "Edit").expect("blocked");
+        assert!(fatal, "an Edit into the repo remainder stays unit-fatal");
+        let cmd = json!({ "command": format!("echo x > {sibling}") });
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash").expect("blocked");
+        assert!(
+            fatal,
+            "a Bash redirect into the repo remainder stays unit-fatal"
+        );
+
+        // The repo root itself — the declared read root verbatim as a write target.
+        let (_, fatal) = boundary_denial_with(
+            &roots,
+            &wt,
+            None,
+            None,
+            &ctx(repo.to_str().unwrap()),
+            "Write",
+        )
+        .expect("the read root itself is not writable");
+        assert!(
+            fatal,
+            "writing the read root itself is the same fatal escape"
+        );
+
+        // And `..` from the worktree cannot launder the escape into an in-boundary-looking path:
+        // normalization collapses it back to the repo remainder before the lists are consulted.
+        let dotted = wt.join("..").join("..").join("Cargo.toml");
+        let (_, fatal) = boundary_denial_with(
+            &roots,
+            &wt,
+            None,
+            None,
+            &ctx(dotted.to_str().unwrap()),
+            "Write",
+        )
+        .expect("a dotted escape from the worktree is still a write outside it");
+        assert!(
+            fatal,
+            "`..` out of the worktree into the read root stays unit-fatal"
+        );
+    }
+
     /// core#272. Run f09d4331 unit-FAILED at build because the worker wrote its own agent memory
     /// under an ALTERNATE Claude config home (`CLAUDE_CONFIG_DIR=~/alt-configs/.claude`) and the
     /// core#235 carve-out only tested `home/.claude`. The carve-out follows the RESOLVED config
