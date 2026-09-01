@@ -104,6 +104,16 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Markdown steering import accepts the full rules-CRUD id namespace** (#335). The `## Rules`
+  item grammar widens from `PAT|POL-nnn` only to any `<UPPERCASE-FAMILY>-<suffix>` id
+  (`OPS-CUSTOM-10`), so an id valid in the studio grid is importable via `.md` — the two lanes
+  are no longer id-disjoint. `PAT-`/`POL-` stays the RESERVED namespace (strict
+  `^(PAT|POL)-[0-9]{3,6}$` shape, prefix ⇔ `rule_type`, enforced per entry at the doc line);
+  custom families infer `rule_type` from the doc's `enforcement_class` (`policy` ⇒ policy, else
+  pattern) and carry full doc provenance (`path@sha#id`, `source_kinds: ["doc"]`) — the doc is
+  the source. Malformed ids still fail loud per entry; the import-panel hint (the error text
+  studio echoes verbatim) now teaches the widened grammar. INV-C1 re-documented as a SHAPE
+  contract on the reserved namespace, not a lane split (STEERING.md format section updated).
 - `required_deliverables` enforced at the result fold, not in one runner (#297 → #308).
 - Failure-excerpt triage keeps the TAIL of the output, where the error usually is (crew#322 → #307).
 - Seat failover keyed to phase idempotency, not input governance (#292 → #304).

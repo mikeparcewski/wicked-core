@@ -31,7 +31,7 @@
 //!       --knowledge-db F [--knowledge-db F]... \  #   under --scope workspace) + knowledge rationale
 //!       [--scope repo|workspace] [--knowledge-scope S] [--manifest OUT.json]
 //!       # Every cli lane is smoke-verified against the SAME db a worker is handed; the manifest
-//!       # (keyed on PAT-/POL- ids) is the receipt. A daemon-held store is NEVER CLI-written:
+//!       # (keyed on rule ids) is the receipt. A daemon-held store is NEVER CLI-written:
 //!       # --enforcement-crew-api records the pending transport + emits the POST payload instead.
 //!   wicked-core rules relink [--ambiguity-cap N] [--json]   # re-derive rule→code Governs edges from
 //!       # qualified symbol_refs at the current epoch (AW-9) — run after every `wicked-estate index`;
