@@ -3704,12 +3704,14 @@ impl AcpStepRunner {
         };
         // The post-mortem note carries the exit status, the stderr tail, and any queued
         // stdout — everything crew#267/#289 taught this file to keep about a dead bridge.
+        // The kill-handle Arc rides along as the HUSK'S IDENTITY: the registry purge below
+        // must match this exact process, never a racing replacement's entries.
         let post_mortem = match arc.try_lock() {
             Ok(proc) => proc
                 .kill_handle
                 .try_exit_status()
                 .is_some()
-                .then(|| death_context(&proc)),
+                .then(|| (death_context(&proc), Arc::clone(&proc.kill_handle))),
             // Held by an in-flight turn — alive enough; that turn's own paths report death.
             Err(std::sync::TryLockError::WouldBlock) => None,
             Err(std::sync::TryLockError::Poisoned(p)) => {
@@ -3717,10 +3719,10 @@ impl AcpStepRunner {
                 proc.kill_handle
                     .try_exit_status()
                     .is_some()
-                    .then(|| death_context(&proc))
+                    .then(|| (death_context(&proc), Arc::clone(&proc.kill_handle)))
             }
         };
-        let Some(note) = post_mortem else {
+        let Some((note, husk_kill)) = post_mortem else {
             return SessionProbe::Live(arc);
         };
         // The husk is dead. Purge exactly THIS husk (never a racing replacement) from the
@@ -3734,10 +3736,15 @@ impl AcpStepRunner {
                 guard.remove(session_key);
             }
         }
+        // Registry entries are matched by the husk's own kill-handle identity — a concurrent
+        // replacement for the same (run_id, cli_key) inserted between the map removal above
+        // and this purge keeps its handles (its key differs by launch_seq, its value by Arc).
         self.write_reg
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retain(|(rid, key, _), _| rid != &session_key.0 || key != &session_key.1);
+            .retain(|(rid, key, _), (_, kill)| {
+                rid != &session_key.0 || key != &session_key.1 || !Arc::ptr_eq(kill, &husk_kill)
+            });
         // LOUD (crew#340): the operator's daemon log must say the cached bridge was found
         // dead and a fresh session is being started — the old symptom was a silent
         // degradation that read as "ACP wedged until daemon restart".
