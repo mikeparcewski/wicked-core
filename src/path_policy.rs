@@ -194,6 +194,43 @@ pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
 /// Symlink-resolved with the same [`resolve_symlinks`] the boundary check uses, so a root reached
 /// through `/tmp`→`/private/tmp` (or a symlinked config dir) cannot dodge the comparison.
 pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
+    validate_extra_roots(
+        roots,
+        home,
+        "write",
+        "a governed worker could rewrite the pin that gates its own work (FINDING-098)",
+    )
+}
+
+/// Validate launcher-declared extra READ roots at LAUNCH time (core#294) — the read-only mirror of
+/// [`validate_extra_write_roots`], and judged by the same two fail-closed rules.
+///
+/// A read root never widens write scope ([`check`] tests a write against the write list alone), so
+/// the FINDING-098 pin-REWRITE escape cannot ride one. The pin-tree containment rule still applies,
+/// in both directions, because the grant is still a grant:
+/// - a root INSIDE the config tree hands a governed worker the text of the very pins and overlays
+///   that gate its own work — a creator that can read its evaluator's rules can write to them;
+/// - a root CONTAINING it (`~`, `/`) is an over-broad grant by construction — "ground this run in
+///   X" names X, never the operator's whole home.
+pub fn validate_extra_read_roots(roots: &[String], home: Option<&Path>) -> Result<(), String> {
+    validate_extra_roots(
+        roots,
+        home,
+        "read",
+        "even read-only, the pin that gates a governed worker's own work must stay outside \
+         every launch-declared root (core#294, mirroring FINDING-098)",
+    )
+}
+
+/// The shared body of [`validate_extra_write_roots`] / [`validate_extra_read_roots`]: one judgement,
+/// two spellings, so the read mirror cannot drift from the write original (core#294). `kind` names
+/// the root set in every message; `exposure` states what admitting a pin-tree root would hand over.
+fn validate_extra_roots(
+    roots: &[String],
+    home: Option<&Path>,
+    kind: &str,
+    exposure: &str,
+) -> Result<(), String> {
     if roots.is_empty() {
         return Ok(());
     }
@@ -202,19 +239,27 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
         // No HOME ⇒ the pin tree cannot be located, so containment cannot be proven either way.
         // Fail CLOSED: refuse the widening rather than arm roots we cannot judge.
         None => {
-            return Err(
-                "extra write roots need $HOME to validate against the engine config tree; \
+            return Err(format!(
+                "extra {kind} roots need $HOME to validate against the engine config tree; \
                  refusing to widen the boundary without it"
-                    .to_string(),
-            )
+            ))
         }
     };
     for raw in roots {
         let p = Path::new(raw);
         if !p.is_absolute() {
             return Err(format!(
-                "extra write root is not absolute: {raw} (a relative root binds to the \
+                "extra {kind} root is not absolute: {raw} (a relative root binds to the \
                  launcher's incidental cwd, not a declared destination)"
+            ));
+        }
+        // The wrapped carrier transports roots via std::env::join_paths; a root containing the
+        // platform path-list separator makes that join fail AT SPAWN, silently degrading the
+        // boundary mid-run. Refuse it here so the launch fails loudly on both carriers alike.
+        if std::env::join_paths([p]).is_err() {
+            return Err(format!(
+                "extra {kind} root {raw} cannot ride the env path-list carrier (it contains a \
+                 character join_paths refuses); refused at launch rather than degraded at spawn"
             ));
         }
         let resolved = resolve_symlinks(p);
@@ -222,8 +267,8 @@ pub fn validate_extra_write_roots(roots: &[String], home: Option<&Path>) -> Resu
             || resolved_is_within(&config_tree, &resolved)
         {
             return Err(format!(
-                "extra write root {raw} would expose the engine config tree ({}) — a governed \
-                 worker could rewrite the pin that gates its own work (FINDING-098); refused",
+                "extra {kind} root {raw} would expose the engine config tree ({}) — {exposure}; \
+                 refused",
                 config_tree.display()
             ));
         }
@@ -487,6 +532,57 @@ mod tests {
         let e = validate_extra_write_roots(&[inbox.to_string_lossy().into_owned()], None)
             .expect_err("no HOME must refuse the widening, never wave it through");
         assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
+    }
+
+    /// core#294 — the launch-time judgement on launcher-declared READ roots mirrors the write one
+    /// rule for rule: a scratch source dir is admitted; relative, pin-tree-containing (either
+    /// direction) and HOME-less declarations are refused. Read-only never relaxes the vetting —
+    /// the grant is still a grant.
+    #[test]
+    fn extra_read_roots_validation_mirrors_the_write_rules() {
+        let home = scratch("xrr_home");
+        let repo = scratch("xrr_repo");
+
+        // Declaring nothing is always fine — and needs no HOME.
+        validate_extra_read_roots(&[], None).expect("empty roots need no validation");
+
+        // A repo checkout outside the pin tree is the intended use ("ground this run in X").
+        validate_extra_read_roots(&[repo.to_string_lossy().into_owned()], Some(&home))
+            .expect("a source tree must be admitted");
+
+        // Relative → refused (binds to incidental cwd, not a declared source).
+        let e = validate_extra_read_roots(&["relative/repo".to_string()], Some(&home))
+            .expect_err("a relative root must be refused");
+        assert!(e.contains("not absolute"), "names the failure: {e}");
+
+        // Inside the pin tree → refused even read-only (the worker would read the very pins that
+        // gate its own work).
+        let pin_child = home.join(".config/wicked-core/workflows");
+        let e = validate_extra_read_roots(&[pin_child.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("a root inside the pin tree must be refused");
+        assert!(e.contains("FINDING-098"), "names the escape: {e}");
+
+        // CONTAINING the pin tree (the home dir itself) → refused: an over-broad grant.
+        let e = validate_extra_read_roots(&[home.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("a root containing the pin tree must be refused");
+        assert!(e.contains("FINDING-098"), "names the escape: {e}");
+
+        // Roots present but no HOME to judge against → fail CLOSED, not open.
+        let e = validate_extra_read_roots(&[repo.to_string_lossy().into_owned()], None)
+            .expect_err("no HOME must refuse the widening, never wave it through");
+        assert!(e.contains("HOME"), "names the missing prerequisite: {e}");
+
+        // A root the env carrier cannot transport would make join_paths fail AT SPAWN, silently
+        // dropping the carrier's roots — refused at LAUNCH instead, on both mirrors. The char
+        // join_paths rejects is ':' on Unix and '"' on Windows (';' rides quoted there).
+        let sep = if cfg!(windows) { '"' } else { ':' };
+        let poisoned = format!("{}{sep}sneaky", repo.to_string_lossy());
+        let e = validate_extra_read_roots(std::slice::from_ref(&poisoned), Some(&home))
+            .expect_err("a separator-poisoned read root must be refused");
+        assert!(e.contains("carrier"), "names the failure: {e}");
+        let e = validate_extra_write_roots(&[poisoned], Some(&home))
+            .expect_err("a separator-poisoned write root must be refused");
+        assert!(e.contains("carrier"), "names the failure: {e}");
     }
 }
 

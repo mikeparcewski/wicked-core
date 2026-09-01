@@ -123,6 +123,7 @@ fn review_unit_runs_a_distinct_cli_from_the_builder() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .unwrap();

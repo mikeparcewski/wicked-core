@@ -138,6 +138,17 @@ pub struct GovernanceContext {
     /// for tasks from older peers) means the boundary stays exactly the unit cwd.
     #[serde(default)]
     pub extra_write_roots: Vec<String>,
+    /// ADDITIONAL absolute READ-ONLY roots the LAUNCHER declared for this run (core#294) — the
+    /// read mirror of [`Self::extra_write_roots`], for grounding a run in content it must never
+    /// edit (a repo the workflow reads without binding its worktree). Joined into
+    /// `WICKED_READ_ROOTS` by the wrapped launcher and into the ACP carrier's
+    /// [`crate::gate_hook::BoundaryCtx`] read list — never into any write list, so write
+    /// containment is unchanged. Validated at launch by
+    /// [`crate::path_policy::validate_extra_read_roots`] (absolute, outside the engine's
+    /// config/pin tree). Empty (the default, and the deserialization fallback for tasks from
+    /// older peers) means the read boundary stays exactly the evidence-derived assembly.
+    #[serde(default)]
+    pub extra_read_roots: Vec<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

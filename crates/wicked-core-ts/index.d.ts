@@ -60,6 +60,16 @@ export interface LaunchOptions {
    */
   extraWriteRoots?: Array<string>
   /**
+   * ADDITIONAL absolute READ-ONLY roots for the run (core#294) — the read mirror of
+   * `extraWriteRoots`, for grounding a run in content it must never edit (e.g. a repo the
+   * workflow reads without binding its worktree). Reads inside these roots pass the governed
+   * units' boundary; WRITES there stay denied — a read root never widens write scope. Same
+   * launch-side vetting as the write roots (absolute, outside the engine's config/pin tree);
+   * an invalid root REJECTS the launch with no session persisted. Omit for the default
+   * evidence-derived read boundary.
+   */
+  extraReadRoots?: Array<string>
+  /**
    * The PROJECT code graph this run's governed workers should query, instead of the run repo's
    * own graph — one database holding every member repo of the project, so a worker's
    * SearchEntity / BlastRadius / TraverseGraph can see the whole project rather than one repo.

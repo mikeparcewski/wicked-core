@@ -802,11 +802,14 @@ impl WrappedCliStepRunner {
                 // `<repo>/.codegraph/estate.db` → widen the READ boundary to the repo root;
                 // `<estate_root>/<key>/estate.db` → to EXACTLY that key dir (per-key precision —
                 // never the whole repo-graphs root; a sibling repo's graph must stay unreachable).
-                // The skill/plugin dir rides along. ONE assembly shared with the ACP carrier
-                // (core#260) — see `assemble_read_roots`. A mis-shaped `code_graph_db` is NOT
-                // widened (the helper's shape check), reported here so the operator sees why.
+                // The skill/plugin dir rides along, and so do the LAUNCH-declared
+                // `extra_read_roots` (core#294 — validated at launch like the write extras, and
+                // read-only by construction: they join THIS list, never the write roots above).
+                // ONE assembly shared with the ACP carrier (core#260) — see
+                // `assemble_read_roots`. A mis-shaped `code_graph_db` is NOT widened (the
+                // helper's shape check), reported here so the operator sees why.
                 let read_roots: Vec<std::ffi::OsString> =
-                    assemble_read_roots(g.code_graph_db.as_deref())
+                    assemble_read_roots(g.code_graph_db.as_deref(), &g.extra_read_roots)
                         .into_iter()
                         .map(PathBuf::into_os_string)
                         .collect();
@@ -1318,6 +1321,11 @@ struct GovLaunch {
     /// [`crate::workflow::GovernanceContext::extra_write_roots`] — already validated at launch
     /// against the pin tree. Joined after the cwd into `WICKED_WRITE_ROOTS`.
     extra_write_roots: Vec<String>,
+    /// LAUNCHER-declared extra READ-ONLY roots (core#294), copied from
+    /// [`crate::workflow::GovernanceContext::extra_read_roots`] — already validated at launch.
+    /// Joined into `WICKED_READ_ROOTS` via [`assemble_read_roots`], NEVER into the write roots:
+    /// a read root grounds the run in content it must not touch.
+    extra_read_roots: Vec<String>,
 }
 
 /// Point a GOVERNED worker's estate CLI channel at the repo's OWN graph via `$WICKED_ESTATE_DB`.
@@ -1410,12 +1418,19 @@ fn graph_write_dir_at(code_graph_db: Option<&str>, estate_root: Option<&Path>) -
     }
 }
 
-/// The evidence-derived READ roots for a governed unit, as ONE assembly both carriers share
-/// (core#260): the worker's skill/plugin dir plus the graph-derived root ([`repo_read_root`]: the
-/// repo root for a legacy in-tree graph, exactly the key dir for an estate-home one).
-/// The wrapped path env-joins these onto the subprocess; the ACP path hands them to the
-/// in-process boundary. Two assemblies would drift the first time one grew a root.
-pub(crate) fn assemble_read_roots(code_graph_db: Option<&str>) -> Vec<PathBuf> {
+/// The READ roots for a governed unit, as ONE assembly both carriers share (core#260): the
+/// evidence-derived set — the worker's skill/plugin dir plus the graph-derived root
+/// ([`repo_read_root`]: the repo root for a legacy in-tree graph, exactly the key dir for an
+/// estate-home one) — widened by the LAUNCH-declared `extra_read_roots` (core#294, validated at
+/// launch by `validate_extra_read_roots`; the read mirror of core#259's write extras). READ-ONLY
+/// by construction: nothing assembled here ever reaches a write list, so the widening cannot
+/// reopen the FINDING-098 pin-rewrite escape. The wrapped path env-joins these onto the
+/// subprocess (`WICKED_READ_ROOTS`); the ACP path hands them to the in-process boundary. Two
+/// assemblies would drift the first time one grew a root.
+pub(crate) fn assemble_read_roots(
+    code_graph_db: Option<&str>,
+    extra_read_roots: &[String],
+) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(Path::new(&home).join(".claude").join("plugins"));
@@ -1423,6 +1438,7 @@ pub(crate) fn assemble_read_roots(code_graph_db: Option<&str>) -> Vec<PathBuf> {
     if let Some(repo_root) = repo_read_root(code_graph_db) {
         roots.push(PathBuf::from(repo_root));
     }
+    roots.extend(extra_read_roots.iter().map(PathBuf::from));
     roots
 }
 
@@ -1557,6 +1573,7 @@ fn arm_input_governance(
         phase_id: input.unit.phase_id().unwrap_or_default().to_string(),
         code_graph_db: gov.code_graph_db.clone(),
         extra_write_roots: gov.extra_write_roots.clone(),
+        extra_read_roots: gov.extra_read_roots.clone(),
     })
 }
 
@@ -2067,6 +2084,38 @@ mod tests {
         );
     }
 
+    /// core#294 — the LAUNCH-declared extra READ roots ride the ONE shared assembly, appended to
+    /// the evidence-derived set without disturbing it; declaring none reproduces the pre-#294
+    /// assembly byte for byte. (That the assembly feeds ONLY read lists — env `WICKED_READ_ROOTS`
+    /// and the ACP `BoundaryCtx.roots.read` — is pinned by
+    /// `gate_hook::boundary_tests::the_launcher_arms_the_launch_declared_read_roots` and by the
+    /// write-arming audit, whose exact `armed_write_roots` argument list has no read extras.)
+    #[test]
+    fn launch_declared_extra_read_roots_ride_the_shared_assembly() {
+        #[cfg(unix)]
+        let declared = "/srv/grounding-repo".to_string();
+        #[cfg(windows)]
+        let declared = "C:\\srv\\grounding-repo".to_string();
+
+        let base = assemble_read_roots(None, &[]);
+        let widened = assemble_read_roots(None, std::slice::from_ref(&declared));
+        assert_eq!(
+            &widened[..base.len()],
+            &base[..],
+            "the evidence-derived set must be untouched by the widening"
+        );
+        assert_eq!(
+            widened.len(),
+            base.len() + 1,
+            "exactly the declared root is added — nothing implicit rides along"
+        );
+        assert_eq!(
+            widened.last().map(std::path::PathBuf::as_path),
+            Some(Path::new(&declared)),
+            "the declared root itself is what lands in the read list"
+        );
+    }
+
     /// Why the two emptiness guards on this path (`argv.is_empty()` before spawning, and the
     /// `argv.first()` guard on the FINDING-063 disclosure event) are DEFENSIVE and not live: the
     /// `!placed` fallback at the end of `build_argv` unconditionally pushes the prompt, so there is
@@ -2184,6 +2233,7 @@ mod tests {
                 db_path: dir.join("estate.db").to_string_lossy().to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -2539,6 +2589,7 @@ mod tests {
                     .into_owned(),
             ),
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -2774,6 +2825,7 @@ mod tests {
                 db_path: op_db.to_string(),
                 code_graph_db: Some(graph_db.to_string()),
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
@@ -2793,6 +2845,7 @@ mod tests {
                 db_path: op_db.to_string(),
                 code_graph_db: None,
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             },
             &format!("mcptest-norepo-{}", std::process::id()),
         );
@@ -2836,6 +2889,7 @@ mod tests {
                 phase_id: String::new(),
                 code_graph_db: code_graph_db.map(str::to_string),
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             };
             // spawn-audit: test-only — this Command is never spawned; it is a probe whose `get_envs`
             // we inspect to assert exactly which store the helper hands the worker's estate CLI. It
@@ -4063,6 +4117,7 @@ mod project_graph_end_to_end_tests {
             repo_ref: Some(repo.id.clone()),
             workflow: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: pg,
         };
 

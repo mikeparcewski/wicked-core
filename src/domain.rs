@@ -114,6 +114,12 @@ pub struct AgentSession {
     /// older sessions deserialize with no extra roots, i.e. the pre-#259 boundary.
     #[serde(default)]
     pub extra_write_roots: Vec<String>,
+    /// Launcher-declared extra READ-ONLY roots (core#294) — the read mirror of
+    /// [`Self::extra_write_roots`], persisted for the same reason: a resume/redrive must re-arm
+    /// the SAME boundary the launch declared and validated. Widens what governed units may READ;
+    /// never what they may write. `#[serde(default)]` for back-compat.
+    #[serde(default)]
+    pub extra_read_roots: Vec<String>,
     /// The project code graph the launcher bound this run to, if any (see
     /// [`crate::project::ProjectGraphBinding`]). Persisted on the session for the same reason
     /// `extra_write_roots` is (core#259): a resume/redrive re-enters through the actor with no
@@ -764,6 +770,7 @@ mod tests {
             workdir: None,
             repo_ref: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
             archived_at: None,
             archive_note: None,

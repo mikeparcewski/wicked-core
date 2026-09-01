@@ -1924,6 +1924,7 @@ mod tests {
                         .into_owned(),
                 ),
                 extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
