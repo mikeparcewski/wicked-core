@@ -323,6 +323,7 @@ mod tests {
             repo_ref: None,
             workflow: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
         })
         .expect("launch_run must not fail");

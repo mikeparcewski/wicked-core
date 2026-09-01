@@ -188,6 +188,7 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     });
 
@@ -227,6 +228,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         repo_ref: None,
         workflow: Some("bug".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch bug workflow");
@@ -284,6 +286,7 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         repo_ref: None,
         workflow: Some("bug".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch bug workflow");
@@ -349,6 +352,7 @@ fn an_evaluator_second_pass_deny_halts_the_run_and_leaks_no_output() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -461,6 +465,7 @@ fn a_triage_fail_rejection_persists_the_full_failure_transcript() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");

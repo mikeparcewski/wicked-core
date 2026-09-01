@@ -66,6 +66,7 @@ pub fn run_session(
         None,                              // sync path has no registered repo
         None,
         Vec::new(), // sync path declares no extra write roots (core#259)
+        Vec::new(), // …no extra read roots either (core#294)
         None,       // …and no repo (above) ⇒ no project graph to bind
         workflow,
         &dispatcher,
@@ -354,6 +355,9 @@ pub(crate) fn pre_distribute(
     // Launcher-declared extra write roots (core#259), already validated at launch; persisted on
     // the session so resume/redrive re-arms the boundary the launch declared.
     extra_write_roots: Vec<String>,
+    // Launcher-declared extra READ-ONLY roots (core#294), same launch-time validation and same
+    // persistence rationale — a resume must not silently narrow (or widen) what the run may read.
+    extra_read_roots: Vec<String>,
     // The launcher's project-graph binding, persisted on the session for the same reason: a resume
     // re-enters with no LaunchSpec, and a run whose tools silently narrow from the whole project to
     // one repo halfway through is worse than one that never had them. VERIFIED at dispatch, never
@@ -476,6 +480,7 @@ pub(crate) fn pre_distribute(
         workdir,
         repo_ref,
         extra_write_roots,
+        extra_read_roots,
         project_graph,
         archived_at: None,
         archive_note: None,
@@ -664,6 +669,7 @@ pub(crate) fn plan_and_distribute(
     repo_ref: Option<String>,
     workdir: Option<String>,
     extra_write_roots: Vec<String>,
+    extra_read_roots: Vec<String>,
     project_graph: Option<crate::project::ProjectGraphBinding>,
     workflow: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
@@ -686,6 +692,7 @@ pub(crate) fn plan_and_distribute(
         repo_ref,
         workdir,
         extra_write_roots,
+        extra_read_roots,
         project_graph,
         workflow,
         emit,
@@ -1562,6 +1569,7 @@ mod resolve_tests {
             None,
             None,
             Vec::new(),
+            Vec::new(),
             None,
             Some("feature"),
             &mut |_| {},
@@ -1683,6 +1691,7 @@ mod resolve_tests {
             crate::domain::HumanConfirm::None,
             Some(repo.id.clone()),
             None,
+            Vec::new(),
             Vec::new(),
             None,
             Some(&id),

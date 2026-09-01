@@ -103,6 +103,7 @@ fn spec(session: &str) -> LaunchSpec {
         entity_mode: EntityMode::Shared,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     }
 }

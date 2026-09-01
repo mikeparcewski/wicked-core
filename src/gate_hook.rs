@@ -114,9 +114,10 @@ pub const WICKED_CORE_EXE_ENV: &str = "WICKED_CORE_EXE";
 pub const WRITE_ROOTS_ENV: &str = "WICKED_WRITE_ROOTS";
 
 /// Absolute roots this unit may READ but not write, `PATH`-separator joined. Evidence-derived (skill
-/// definitions, language runtimes, package caches) — see [`crate::path_policy`]. A boundary that
-/// breaks every real run gets switched off, and one that is off is worse than none because it is
-/// believed.
+/// definitions, language runtimes, package caches) — see [`crate::path_policy`] — plus the
+/// LAUNCH-declared `extra_read_roots` (core#294, validated at launch like the write extras). A
+/// boundary that breaks every real run gets switched off, and one that is off is worse than none
+/// because it is believed.
 pub const READ_ROOTS_ENV: &str = "WICKED_READ_ROOTS";
 
 /// Set to `1` by the launcher when the governed unit's backing phase is a PRE-BUILD, non-creator
@@ -2763,6 +2764,72 @@ mod boundary_tests {
         }
     }
 
+    /// core#294 — a LAUNCH-DECLARED read root ("ground this run in X without letting it touch X"),
+    /// judged exactly as the evidence-derived read roots are. Reads inside it pass; a WRITE into it
+    /// stays a fatal escape — a read root never widens write scope; reads outside every root stay
+    /// advisory-denied (core#219); and with no declared read roots the boundary is byte-identical
+    /// to the pre-#294 one.
+    #[test]
+    fn a_launch_declared_read_root_grants_reads_and_nothing_else() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-rr");
+        std::fs::create_dir_all(&wt).unwrap();
+        // Deliberately NOT under temp_dir (a write-deny there is advisory via the core#264
+        // carve-out, which would make the fatality assertions vacuous), and drive-prefixed on
+        // Windows (a bare `/srv` has no drive there and is not absolute).
+        #[cfg(unix)]
+        let grounding = std::path::PathBuf::from("/srv/grounding-repo");
+        #[cfg(windows)]
+        let grounding = std::path::PathBuf::from("C:\\srv\\grounding-repo");
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![grounding.clone()],
+        };
+        let src = grounding.join("src").join("lib.rs");
+        let src = src.to_str().unwrap();
+
+        // Read inside the declared root → no denial at all: the widening this issue exists for.
+        assert!(
+            boundary_denial_with(&roots, &wt, None, None, &ctx(src), "Read").is_none(),
+            "a read inside a launch-declared read root must pass the boundary"
+        );
+
+        // WRITE into the read root → still blocked, and unit-FATAL: write containment is
+        // unchanged — the read grant must never leak into the write list.
+        let (reason, fatal) =
+            boundary_denial_with(&roots, &wt, None, None, &ctx(src), "Write").expect("blocked");
+        assert!(
+            fatal,
+            "a write into a read-only root is an escape attempt, not a widened grant: {reason}"
+        );
+
+        // The Bash arm agrees: a shell redirect into the read root is the same fatal class.
+        let cmd = json!({ "command": format!("echo x > {src}") });
+        let (_, fatal) =
+            boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash").expect("blocked");
+        assert!(fatal, "a Bash write into a read-only root stays unit-fatal");
+
+        // Read OUTSIDE every root → still blocked, still advisory (blocked-but-not-fatal).
+        #[cfg(unix)]
+        let outside = "/srv/other-repo/secret.txt";
+        #[cfg(windows)]
+        let outside = "C:\\srv\\other-repo\\secret.txt";
+        let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &ctx(outside), "Read")
+            .expect("a read outside every root is still blocked");
+        assert!(
+            !fatal,
+            "a blocked read outside every root stays ADVISORY (core#219)"
+        );
+
+        // No declared read roots ⇒ today's behavior: the same read is advisory-denied.
+        let bare = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let (_, fatal) = boundary_denial_with(&bare, &wt, None, None, &ctx(src), "Read")
+            .expect("an undeclared root grants nothing");
+        assert!(!fatal, "…and the deny stays advisory, exactly as before");
+    }
+
     /// core#272. Run f09d4331 unit-FAILED at build because the worker wrote its own agent memory
     /// under an ALTERNATE Claude config home (`CLAUDE_CONFIG_DIR=~/alt-configs/.claude`) and the
     /// core#235 carve-out only tested `home/.claude`. The carve-out follows the RESOLVED config
@@ -3122,6 +3189,39 @@ mod boundary_tests {
         assert!(
             launcher.contains(r#"cmd.env("TMPDIR", &unit_tmp)"#),
             "the launcher no longer points the governed worker's TMPDIR into the unit tree"
+        );
+    }
+
+    /// The read mirror of the wiring audit above (core#294): the launch-declared extra READ roots
+    /// must ride the ONE shared assembly on BOTH carriers, and must be judged at launch. The
+    /// helper tests stay green if any of these calls is deleted — that gap has bitten three times
+    /// (`run_gate_hook_actually_consults_the_boundary`), so assert the wiring itself.
+    #[test]
+    fn the_launcher_arms_the_launch_declared_read_roots() {
+        // The wrapped carrier: extras enter WICKED_READ_ROOTS through `assemble_read_roots` —
+        // never through `armed_write_roots`, whose exact argument list the test above pins.
+        let launcher = include_str!("execute_wrapped.rs");
+        assert!(
+            launcher
+                .contains("assemble_read_roots(g.code_graph_db.as_deref(), &g.extra_read_roots)"),
+            "the wrapped launcher no longer joins the launch-declared extra_read_roots into \
+             WICKED_READ_ROOTS (core#294)"
+        );
+        // The ACP carrier builds its BoundaryCtx from the same assembly (core#260's one-assembly
+        // rule): dropping the extras there would make the read grant depend on which seat the run
+        // resolved to — the exact per-seat divergence core#297 §1 closed for deliverables.
+        let acp = include_str!("acp_runner.rs");
+        assert!(
+            acp.contains("&g.extra_read_roots,"),
+            "the ACP carrier no longer hands the launch-declared extra_read_roots to the shared \
+             read-root assembly (core#294)"
+        );
+        // The launch side must actually judge the extras — same rules as the write roots, or the
+        // widening becomes an unvetted grant.
+        let launch = include_str!("actor.rs");
+        assert!(
+            launch.contains("validate_extra_read_roots"),
+            "the launch path no longer validates extra read roots (core#294)"
         );
     }
 

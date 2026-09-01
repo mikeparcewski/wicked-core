@@ -191,6 +191,7 @@ fn spec(session_id: &str, clis: Vec<AgenticCli>) -> LaunchSpec {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     }
 }
@@ -256,6 +257,7 @@ fn session_started_cli_count_matches_spec() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -288,6 +290,7 @@ fn session_started_entity_mode_is_serialized() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch shared");
@@ -313,6 +316,7 @@ fn session_started_entity_mode_is_serialized() {
             repo_ref: None,
             workflow: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
         })
         .expect("launch isolated");
@@ -340,6 +344,7 @@ fn session_started_workflow_id_is_none_for_free_text() {
         repo_ref: None,
         workflow: None, // free-text
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -398,6 +403,7 @@ fn unit_planned_role_and_gate_from_phase_def() {
         repo_ref: None,
         workflow: Some("test-rolegate".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -474,6 +480,7 @@ fn unit_planned_skill_ref_and_has_validator_pin() {
         repo_ref: None,
         workflow: Some("test-skillref".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -545,6 +552,7 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
         repo_ref: None,
         workflow: Some("test-toolexec".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -594,6 +602,7 @@ fn unit_planned_free_text_defaults() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -642,6 +651,7 @@ fn unit_distributed_council_routing_carries_agreement_fields() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -711,6 +721,7 @@ fn unit_distributed_evaluator_distinct_routing() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -773,6 +784,7 @@ fn unit_distributed_degraded_routing_carries_reason() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -894,6 +906,7 @@ fn workflow_selected_fires_for_structured_run_only() {
         repo_ref: None,
         workflow: Some("test-wfsel".into()),
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch structured");
@@ -1071,6 +1084,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
         repo_ref: None,
         workflow: None,
         extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
         project_graph: None,
     })
     .expect("launch");
@@ -1169,6 +1183,7 @@ fn unit_rework_amended_fires_on_non_empty_amend_and_precedes_resumed() {
             repo_ref: None,
             workflow: None,
             extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
             project_graph: None,
         })
         .expect("launch empty amend run");
