@@ -6868,6 +6868,9 @@ mod code_evidence_floor_tests {
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-qm", "base"]);
         let wt = base.join("wt");
+        // Branch name derives from the per-test tag — the engine's real convention is
+        // `wicked/<run>`, and a shared literal would let fixtures assume each other's branch.
+        let branch = format!("wicked/{tag}");
         git(
             &repo,
             &[
@@ -6876,7 +6879,7 @@ mod code_evidence_floor_tests {
                 "-q",
                 wt.to_str().unwrap(),
                 "-b",
-                "wicked/run1",
+                branch.as_str(),
             ],
         );
         wt
