@@ -217,7 +217,13 @@ pub fn deadletter_path() -> Option<PathBuf> {
 ///
 /// The DEFAULT runtime resolution ([`deadletter_path`]) is unchanged: this only sets the
 /// already-honored [`DEADLETTER_ENV`] override, and only in processes that opt in.
+///
+/// Also arms [`crate::spawn::hermetic_test_worker_home`] — the worker-config-home override is the
+/// same test-hygiene guarantee for the engine's ACP spawn path (a real start re-sanitizes the
+/// resolved worker home, which must never be the operator's real `~/.wicked-worker/claude`), and
+/// riding here means every existing pre-main arming block covers both without edits.
 pub fn hermetic_test_spool() -> PathBuf {
+    crate::spawn::hermetic_test_worker_home();
     static ARMED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ARMED
         .get_or_init(|| {

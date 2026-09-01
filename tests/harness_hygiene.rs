@@ -217,6 +217,35 @@ fn a_forced_spool_lands_in_the_armed_temp_outbox_never_in_the_real_home() {
     }
 }
 
+/// core#311, adjacent organ: the SAME pre-main arming block also points the engine's persistent
+/// worker config home (`WICKED_WORKER_HOME`, resolved by the ACP spawn path) at a per-process
+/// temp base — `emit::hermetic_test_spool` arms both. A test binary that reaches a real start
+/// without this would REWRITE the operator's real `~/.wicked-worker/claude/settings.json` and
+/// DELETE its executable-config entries (hooks/, plugins/, …) on every `cargo test` run. This
+/// asserts the arming reached THIS integration binary; the resolution-level proof lives in the
+/// lib binary (`worker_home_resolution_lands_in_the_armed_temp_base_never_the_real_home`).
+#[test]
+fn the_worker_home_override_is_armed_pre_main_too() {
+    let armed = std::path::PathBuf::from(
+        std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV)
+            .expect("the pre-main ctor armed the worker-home override"),
+    );
+    assert!(
+        armed.starts_with(std::env::temp_dir()),
+        "the armed worker home must live under the system temp dir, got {}",
+        armed.display()
+    );
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+    {
+        assert!(
+            !armed.starts_with(home.join(".wicked-worker")),
+            "the armed worker home must never be the operator's real ~/.wicked-worker"
+        );
+    }
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
 /// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
