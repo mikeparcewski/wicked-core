@@ -276,9 +276,26 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
             let parsed: TomlRegistry =
                 toml::from_str(&raw).map_err(|e| format!("parsing {}: {e}", path.display()))?;
             for tcli in parsed.cli {
-                let cli: AgenticCli = tcli.into();
-                // User record overrides a built-in with the same key.
+                // Whether the override OMITTED trust_flags entirely (`None`) vs. specified them
+                // (`Some`, including an explicit `[]`). An omission must not silently strip a
+                // built-in seat's trust posture: a hand-edited override of `codex` that drops
+                // `trust_flags` otherwise runs codex in its own read-only sandbox, where every
+                // governed unit REFUSES to edit/test/network (crew#419). An explicit `[]` stays
+                // deliberately-untrusted.
+                let omitted_trust = tcli.trust_flags.is_none();
+                let mut cli: AgenticCli = tcli.into();
                 if let Some(slot) = merged.iter_mut().find(|c| c.key == cli.key) {
+                    // User record overrides a built-in with the same key.
+                    if omitted_trust && !slot.trust_flags.is_empty() {
+                        cli.trust_flags = slot.trust_flags.clone();
+                        eprintln!(
+                            "wicked-council: seat '{}' overrides a built-in that carries \
+                             trust_flags but the override omits them — inheriting the built-in's \
+                             {:?} (specify `trust_flags = []` to run it deliberately untrusted; \
+                             crew#419)",
+                            cli.key, cli.trust_flags
+                        );
+                    }
                     *slot = cli;
                 } else {
                     merged.push(cli);
@@ -354,6 +371,65 @@ enabled_for_council = false
         let claude = merged.iter().find(|c| c.key == "claude").unwrap();
         assert_eq!(claude.display_name, "Claude (overridden)");
         assert!(!claude.enabled_for_council);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn override_omitting_trust_flags_inherits_the_builtin_posture() {
+        // crew#419: a hand-edited override of `codex` (a built-in that carries
+        // --dangerously-bypass-approvals-and-sandbox) that OMITS trust_flags must not silently
+        // run untrusted — it inherits the built-in's. An explicit `[]` stays untrusted.
+        let dir = std::env::temp_dir().join(format!(
+            "wc-trust-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"
+[[cli]]
+key = "codex"
+display_name = "Codex (override, trust omitted)"
+binary = "codex"
+headless_invocation = "codex exec {{PROMPT}}"
+
+[[cli]]
+key = "claude"
+display_name = "Claude (override, trust explicitly empty)"
+binary = "claude"
+headless_invocation = "claude -p {{PROMPT}}"
+trust_flags = []
+"#,
+        )
+        .unwrap();
+
+        let merged = load(Some(&path)).expect("load must succeed");
+        // Assert INHERITANCE against the built-in's actual posture, not a hard-coded string —
+        // the point is that the override adopts whatever the built-in codex carries.
+        let builtin_codex_trust = builtin()
+            .into_iter()
+            .find(|c| c.key == "codex")
+            .expect("built-in codex seat")
+            .trust_flags;
+        assert!(
+            !builtin_codex_trust.is_empty(),
+            "precondition: the built-in codex seat must carry trust_flags for this test to mean anything"
+        );
+        let codex = merged.iter().find(|c| c.key == "codex").unwrap();
+        assert_eq!(
+            codex.trust_flags, builtin_codex_trust,
+            "an override that OMITS trust_flags inherits the built-in's posture"
+        );
+        assert_eq!(codex.display_name, "Codex (override, trust omitted)");
+        let claude = merged.iter().find(|c| c.key == "claude").unwrap();
+        assert!(
+            claude.trust_flags.is_empty(),
+            "an explicit `trust_flags = []` stays deliberately untrusted"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
