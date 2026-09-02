@@ -5468,6 +5468,49 @@ sleep 30
              terminal-scoped signal to the daemon reaches the idle cached bridge (crew#290)"
         );
 
+        // Direct negative control — SAFE (the test runner's own group is never signalled): a
+        // decoy child in ITS OWN fresh process group. A group-scoped SIGTERM aimed at the DECOY's
+        // group kills the decoy but leaves the bridge (a DIFFERENT own group) ALIVE — proving
+        // group signals do not cross group boundaries, so the daemon's-group signal
+        // (child_pgid != daemon_pgid, asserted above) likewise cannot reach the bridge.
+        {
+            use std::os::unix::process::CommandExt as _;
+            // spawn-audit: test-only — a `sleep` decoy that runs no job; it exists only to receive
+            // a group signal and prove cross-group non-delivery.
+            let mut decoy = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn decoy");
+            let decoy_pgid = pgid_of(decoy.id());
+            assert_ne!(
+                decoy_pgid, child_pgid,
+                "decoy and bridge must be in different groups"
+            );
+            assert_ne!(
+                decoy_pgid, daemon_pgid,
+                "decoy must not share the daemon's group"
+            );
+            // spawn-audit: test-only — /bin/kill delivering a signal to the DECOY's group only.
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", "--", &format!("-{decoy_pgid}")])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while decoy.try_wait().ok().flatten().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "decoy never died from its own group's SIGTERM"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The bridge, in a DIFFERENT group, is untouched by the decoy-group signal.
+            let p = arc.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                p.kill_handle.try_exit_status().is_none(),
+                "the bridge in its own group must survive a group signal aimed at another group"
+            );
+        }
+
         // Positive control: a group-scoped SIGTERM aimed at the child's OWN group is delivered.
         // `-- -<pgid>`: the leading `--` ends option parsing so the negative pgid is taken as a
         // target, not a flag. This exercises group-signal delivery against the bridge's group
