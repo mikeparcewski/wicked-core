@@ -15,6 +15,11 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.7** — npm release cut with everything below since 0.7.6: the ACP dead-session
+  liveness probe (crew#340 / #343), the creator evidence floor + `executes_code` plan-carry
+  (crew#311 / #342), launch-declared `extraReadRoots` (#294 / #340), widened markdown steering
+  ids (#335 / #338), replace-scope eval-corpus import (#336), and hermetic `cargo test`
+  (#339 — the suite no longer writes the operator's real home).
 - **Rejected units keep their transcripts + machine-readable deny** (usability review #1,
   core-ts 0.7.6). The `work_output` record is now written for EVERY gated unit: a denied/failed
   unit keeps whatever PARTIAL output existed at rejection, flagged `resolution: "rejected"`
