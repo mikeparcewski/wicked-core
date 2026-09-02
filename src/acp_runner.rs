@@ -5418,20 +5418,16 @@ sleep 30
 
     // ── crew#290 defense-in-depth: bridge spawns in its own process group ────────
 
-    /// The process-group id of `pid`, read via `ps` — dependency-free and portable across
-    /// macOS and Linux (`ps -o pgid=` prints only the numeric pgid, no header). Test-only.
+    /// The process-group id of `pid`, read via the `getpgid(2)` syscall — the same minimal libc
+    /// FFI `wicked-council`'s dispatch teardown uses (no `ps` shell-out, so it can't break on a
+    /// BusyBox/minimal image). `-1` on failure (e.g. the child already reaped). Test-only.
     #[cfg(unix)]
     fn pgid_of(pid: u32) -> i64 {
-        // spawn-audit: test-only — /bin/ps reading a process attribute; runs no job of its own.
-        let out = std::process::Command::new("ps")
-            .args(["-o", "pgid=", "-p", &pid.to_string()])
-            .output()
-            .expect("spawn ps");
-        assert!(out.status.success(), "ps must find pid {pid}");
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<i64>()
-            .unwrap_or_else(|e| panic!("ps pgid for {pid} was not an integer: {e}"))
+        extern "C" {
+            fn getpgid(pid: i32) -> i32;
+        }
+        // SAFETY: getpgid is a pure read of a kernel process attribute; no memory is touched.
+        i64::from(unsafe { getpgid(pid as i32) })
     }
 
     /// crew#290 defense-in-depth: `start_acp_process` must put the bridge in its OWN process
@@ -5504,7 +5500,9 @@ sleep 30
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        drop(arc); // drop → kill_handle.signal() is a no-op on the already-reaped child
+        // drop → AcpProcess::drop still calls kill_handle.signal(), which takes the Child and
+        // best-effort kill()/wait()s it; on an already-reaped child those errors are ignored.
+        drop(arc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
