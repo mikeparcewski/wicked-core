@@ -1369,6 +1369,37 @@ fn start_acp_process(
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+        // Defense-in-depth for crew#290: put the bridge in its OWN process group so a
+        // signal delivered to the DAEMON's process group — a Ctrl-C in the terminal the
+        // daemon runs in (SIGINT to the foreground group), or a `kill -TERM -<daemon_pgid>`
+        // / `pkill -g <daemon_pgid>` — cannot reach an idle cached bridge. Upstream turns
+        // SIGTERM/SIGINT into a silent `process.exit(0)`, so a stray group signal was one
+        // way an idle bridge could die between units and then be reused blind.
+        //
+        // `process_group(0)` calls `setpgid(0, 0)` in the child post-fork/pre-exec: the
+        // child becomes the leader of a new group whose id equals its own pid. This changes
+        // ONLY the process-group id — the parent/child link is untouched (ppid stays the
+        // daemon), so `Child::kill`/`wait` (pid-targeted, see `KillHandle::signal`) and the
+        // stdin-EOF teardown both still work exactly as before.
+        //
+        // This is NOT complete protection and core#343's liveness probe stays the PRIMARY
+        // recovery: a pid-targeted signal (`kill <pid>`) and, crucially, a name-pattern
+        // `pkill claude` / `pkill -f claude-agent-acp` still reach the bridge directly —
+        // process-group isolation only blocks GROUP- and terminal-scoped signals, not
+        // signals addressed to the process by pid or by name.
+        //
+        // Windows has no process groups in the POSIX sense; the analogue is spawning with
+        // the `CREATE_NEW_PROCESS_GROUP` creation flag (via `CommandExt::creation_flags`),
+        // which detaches the child from the console's Ctrl-C/Ctrl-Break group. The bridge
+        // path is Unix-shaped today (stdio adapters, the reaper, this whole runner run on
+        // Unix in the field), so this is gated `#[cfg(unix)]` rather than guessed at for
+        // win32; a Windows port should add the `creation_flags(CREATE_NEW_PROCESS_GROUP)`
+        // leg here and verify Ctrl-Break routing before relying on it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
         cmd
     };
 
@@ -5382,6 +5413,139 @@ sleep 30
             "a live session must stay cached"
         );
         drop(runner); // drops the map → kills the stub
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── crew#290 defense-in-depth: bridge spawns in its own process group ────────
+
+    /// The process-group id of `pid`, read via the `getpgid(2)` syscall — the same minimal libc
+    /// FFI `wicked-council`'s dispatch teardown uses (no `ps` shell-out, so it can't break on a
+    /// BusyBox/minimal image). `-1` on failure (e.g. the child already reaped). Test-only.
+    #[cfg(unix)]
+    fn pgid_of(pid: u32) -> i64 {
+        extern "C" {
+            fn getpgid(pid: i32) -> i32;
+        }
+        // SAFETY: getpgid is a pure read of a kernel process attribute; no memory is touched.
+        i64::from(unsafe { getpgid(pid as i32) })
+    }
+
+    /// crew#290 defense-in-depth: `start_acp_process` must put the bridge in its OWN process
+    /// group, isolated from the daemon's. `process_group(0)` makes the child a group leader
+    /// whose pgid equals its own pid and differs from the caller's group — so a signal
+    /// addressed to the DAEMON's process group (a terminal Ctrl-C → SIGINT to the foreground
+    /// group, `kill -TERM -<daemon_pgid>`, `pkill -g <daemon_pgid>`) cannot include an idle
+    /// cached bridge. The positive control fires a group-scoped SIGTERM at the child's OWN
+    /// group and proves it lands (the mechanism is real); because that group id is provably
+    /// different from the daemon's, the same class of signal aimed at the daemon's group
+    /// excludes the bridge — and we prove that WITHOUT ever signalling the test runner's own
+    /// group, which would kill the harness. Reverting `cmd.process_group(0)` leaves the child
+    /// in the test process's group, failing both the leader assertion and the difference
+    /// assertion. This does NOT defend against a pid-targeted or name-pattern `pkill claude`
+    /// — that is why core#343's liveness probe stays primary (see the two probe tests above).
+    #[test]
+    #[cfg(unix)]
+    fn the_bridge_spawns_in_its_own_process_group_isolated_from_the_daemon() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("pgroup-isolation");
+        let script = stub_idle_bridge(&dir);
+        let proc = start_acp_process(&stub_config(&script, None), &dir, None, None)
+            .expect("the idle stub must handshake");
+        let arc = Arc::new(Mutex::new(proc));
+
+        let pid = bridge_pid(&arc);
+        let daemon_pgid = pgid_of(std::process::id());
+        let child_pgid = pgid_of(pid);
+
+        assert_eq!(
+            child_pgid, pid as i64,
+            "process_group(0) must make the bridge its own group leader (pgid == its pid)"
+        );
+        assert_ne!(
+            child_pgid, daemon_pgid,
+            "the bridge must NOT share the daemon's process group — else a group- or \
+             terminal-scoped signal to the daemon reaches the idle cached bridge (crew#290)"
+        );
+
+        // Direct negative control — SAFE (the test runner's own group is never signalled): a
+        // decoy child in ITS OWN fresh process group. A group-scoped SIGTERM aimed at the DECOY's
+        // group kills the decoy but leaves the bridge (a DIFFERENT own group) ALIVE — proving
+        // group signals do not cross group boundaries, so the daemon's-group signal
+        // (child_pgid != daemon_pgid, asserted above) likewise cannot reach the bridge.
+        {
+            use std::os::unix::process::CommandExt as _;
+            // spawn-audit: test-only — a `sleep` decoy that runs no job; it exists only to receive
+            // a group signal and prove cross-group non-delivery.
+            let mut decoy = std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .expect("spawn decoy");
+            let decoy_pgid = pgid_of(decoy.id());
+            assert_ne!(
+                decoy_pgid, child_pgid,
+                "decoy and bridge must be in different groups"
+            );
+            assert_ne!(
+                decoy_pgid, daemon_pgid,
+                "decoy must not share the daemon's group"
+            );
+            // spawn-audit: test-only — /bin/kill delivering a signal to the DECOY's group only.
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", "--", &format!("-{decoy_pgid}")])
+                .status();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while decoy.try_wait().ok().flatten().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "decoy never died from its own group's SIGTERM"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            // The bridge, in a DIFFERENT group, is untouched by the decoy-group signal.
+            let p = arc.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                p.kill_handle.try_exit_status().is_none(),
+                "the bridge in its own group must survive a group signal aimed at another group"
+            );
+        }
+
+        // Positive control: a group-scoped SIGTERM aimed at the child's OWN group is delivered.
+        // `-- -<pgid>`: the leading `--` ends option parsing so the negative pgid is taken as a
+        // target, not a flag. This exercises group-signal delivery against the bridge's group
+        // only; the test process's own group is never touched.
+        // spawn-audit: test-only — /bin/kill delivering a signal; it runs no job of its own.
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", "--", &format!("-{child_pgid}")])
+            .status()
+            .expect("spawn kill");
+        assert!(
+            status.success(),
+            "group SIGTERM to the child's own group ({child_pgid}) must be delivered"
+        );
+
+        // The child must actually die from that group signal — proof the group is real and the
+        // bridge is a member of it (and therefore of NO OTHER group, the daemon's included).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let exited = {
+                let p = arc.lock().unwrap_or_else(|p| p.into_inner());
+                p.kill_handle.try_exit_status().is_some()
+            };
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the bridge never died from the group SIGTERM aimed at its own group"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // drop → AcpProcess::drop still calls kill_handle.signal(), which takes the Child and
+        // best-effort kill()/wait()s it; on an already-reaped child those errors are ignored.
+        drop(arc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
