@@ -4,7 +4,9 @@
 //!
 //! A [`RepoEntry`] is a `Node(Other("repo_entry"))` on the shared estate store (mirrors the
 //! `AgentSession` projection in [`crate::domain`]). A run that targets a registered repo gets its own
-//! worktree at `<repo>/.wicked/worktrees/<run_id>` on branch `wicked/<run_id>`; the worker runs there
+//! worktree at `<repo>/wicked-worktrees/<id>` on branch `wicked/<id>`, where `<id>` is the run id's
+//! ref- and filesystem-safe spelling ([`sanitize_worktree_id`], core#337 — a campaign node's run id
+//! carries `:`, illegal in a git ref and on NTFS); the worker runs there
 //! (augment mode — see `ORCHESTRATOR.md` §4). Worktrees are reaped on a terminal run status — but
 //! only when CLEAN ([`reap_worktree_if_clean`]): a tree holding uncommitted work is kept and logged,
 //! never force-deleted, because those bytes may be the only copy of the work. The startup orphan
@@ -282,14 +284,130 @@ fn legacy_worktrees_root(repo_root: &str) -> PathBuf {
     Path::new(repo_root).join(".wicked").join("worktrees")
 }
 
-/// The on-disk path of `run_id`'s worktree: the new root, unless the run already exists under
-/// the legacy root (resume/reap of a pre-move run).
+/// The 64-bit FNV-1a hash of `s` — small, dependency-free, and (unlike `DefaultHasher`) stable
+/// across platforms and Rust releases. Stability is load-bearing: the hash lands in on-disk
+/// directory names and git branch names that resume/reap must re-derive after an engine upgrade.
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Windows reserved device filenames (matched case-insensitively against the name up to its first
+/// `.`): a directory named `NUL` or `con.anything` is unusable on NTFS even though every char in
+/// it is individually legal.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    let up = stem.to_ascii_uppercase();
+    matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (up.len() == 4
+            && (up.starts_with("COM") || up.starts_with("LPT"))
+            && up.as_bytes()[3].is_ascii_digit()
+            && up.as_bytes()[3] != b'0')
+}
+
+/// core#337 — the ref- and filesystem-safe spelling of `run_id`, used for BOTH the worktree
+/// directory name and the branch component after `wicked/`.
+///
+/// A campaign node's run id is `{campaign}:{node}:a{attempt}` ([`crate::campaign`] §2.1) — and `:`
+/// is illegal both in a git ref and in an NTFS file name, so the verbatim spelling failed every
+/// repo-scoped campaign node at dispatch ("is not a valid branch name"). The mapping is a pure
+/// function of the id (resume, reap and the startup orphan reaper all re-derive it) and tiered:
+///
+///  - **nothing illegal** → returned byte-for-byte, so plain uuid run ids are untouched;
+///  - **`:` is the only illegal content** → plain `':' → '-'`, NO hash suffix. This deliberately
+///    matches the convention crew's shipped workaround already stamps on operators' repos
+///    (branch `wicked/<id with ':' → '-'>` — crew#390/#391,
+///    `packages/crew/src/campaigns/worktrees.ts`), so engine and daemon spell the SAME branch;
+///  - **anything else** — other ref-/NTFS-illegal chars (per `git check-ref-format`: control
+///    chars, space, `~ ^ ? * [ \ < > | "`, and `/` since this is one component), the sequences
+///    `..` and `@{`, a leading or trailing `.`, a `.lock` suffix, a lone `@`, or an NTFS reserved
+///    device name — → mapped to `-` plus an 8-hex FNV-1a suffix of the RAW id, so two distinct
+///    ids that flatten to the same string get distinct worktrees instead of silently sharing one.
+///
+/// The output is always its own fixed point (`sanitize(sanitize(x)) == sanitize(x)`): the startup
+/// reaper re-derives ids from directory NAMES, which may already be sanitized spellings.
+pub(crate) fn sanitize_worktree_id(run_id: &str) -> String {
+    let mut mapped = String::with_capacity(run_id.len());
+    let mut colon_mapped = false; // some ':' was replaced
+    let mut residual = false; // anything OTHER than ':' had to change
+    let mut prev = '\0';
+    for c in run_id.chars() {
+        let illegal = c.is_ascii_control()
+            || matches!(
+                c,
+                ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\' | '/' | '<' | '>' | '|' | '"'
+            )
+            || (c == '.' && prev == '.') // ".." is illegal in a ref component
+            || (c == '{' && prev == '@'); // "@{" is illegal anywhere in a ref
+        if illegal {
+            if c == ':' {
+                colon_mapped = true;
+            } else {
+                residual = true;
+            }
+            mapped.push('-');
+            prev = '-';
+        } else {
+            mapped.push(c);
+            prev = c;
+        }
+    }
+    // Position rules a char map can't express: a ref component cannot start or end with '.' and
+    // cannot end with ".lock"; NTFS additionally refuses a trailing '.' and reserved device names.
+    if mapped.starts_with('.') {
+        mapped.replace_range(..1, "-");
+        residual = true;
+    }
+    if mapped.ends_with('.') {
+        let n = mapped.len();
+        mapped.replace_range(n - 1.., "-");
+        residual = true;
+    }
+    if let Some(stripped) = mapped.strip_suffix(".lock") {
+        mapped = format!("{stripped}-lock");
+        residual = true;
+    }
+    if mapped == "@" || mapped.is_empty() {
+        residual = true;
+    }
+    if is_windows_reserved(&mapped) {
+        // NTFS reserves the STEM up to the first dot ("con.txt" is as reserved as "con"), so a
+        // hash SUFFIX alone leaves the name illegal — the stem itself must change.
+        mapped = format!("r-{mapped}");
+        residual = true;
+    }
+    if residual {
+        format!("{mapped}-{:08x}", (fnv1a64(run_id) >> 32) as u32)
+    } else if colon_mapped {
+        mapped
+    } else {
+        run_id.to_string()
+    }
+}
+
+/// The on-disk path of `run_id`'s worktree: `<new root>/<sanitized id>`, unless the run already
+/// exists at an earlier spelling — the legacy `.wicked/worktrees` root (resume/reap of a pre-move
+/// run), or the RAW id under the new root (crew#390/#391: crew's shipped workaround
+/// pre-provisions campaign-node worktrees at `wicked-worktrees/<raw id>` and rides the documented
+/// reuse contract, so the derivation must FIND them; a raw spelling that needed sanitizing can
+/// only exist on filesystems that allow it, so the probe is inert on Windows).
 fn worktree_path(repo_root: &str, run_id: &str) -> PathBuf {
     let legacy = legacy_worktrees_root(repo_root).join(run_id);
     if legacy.is_dir() {
         return legacy;
     }
-    worktrees_root(repo_root).join(run_id)
+    let sanitized = sanitize_worktree_id(run_id);
+    if sanitized != run_id {
+        let raw = worktrees_root(repo_root).join(run_id);
+        if raw.is_dir() {
+            return raw;
+        }
+    }
+    worktrees_root(repo_root).join(sanitized)
 }
 
 /// Keep the operator's `git status` clean in the parent checkout: the new worktree dir is not
@@ -335,9 +453,69 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
     matches!(git(p, &["rev-parse", "--git-dir"]), Ok((true, _, _)))
 }
 
-/// Create an isolated git worktree for `run_id` at `<repo>/.wicked/worktrees/<run_id>` on a fresh
-/// `wicked/<run_id>` branch. Idempotent for a genuine resume: a live worktree already at the path is
-/// reused. Returns the worktree path.
+// ── Worktree ownership (core#337, the collision half) ────────────────────────────────────────────
+//
+// The colon tier of [`sanitize_worktree_id`] is deliberately hashless (crew#390/#391 branch
+// parity), so two DISTINCT raw run ids can spell the SAME worktree name: `a-b:c:a0` and
+// `a:b-c:a0` both flatten to `a-b-c-a0`. Names alone therefore cannot keep colliding runs apart —
+// ownership does. Each minted (or adopted) worktree carries the RAW run id it belongs to in a
+// marker file inside its git ADMIN directory (`<repo>/.git/worktrees/<name>/wicked-run-id` —
+// never the working tree, so `git status` stays clean, and the marker dies with the worktree on
+// remove/prune). `create_worktree` refuses to hand a marked tree to a different raw id, and the
+// destructive forms (`remove_worktree`, `reap_worktree_if_clean`) refuse to touch one — a
+// colliding run's cancel/terminal cleanup derives the OWNER's path (actor.rs keys both on
+// `repo_ref` alone), and without the guard it would reap or force-remove a live run's tree.
+
+/// The worktree's git admin directory (`<repo>/.git/worktrees/<name>`) — resolvable only while
+/// the tree is a live worktree.
+fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
+    let p = wt.to_str()?;
+    match git(p, &["rev-parse", "--absolute-git-dir"]) {
+        Ok((true, out, _)) if !out.is_empty() => Some(PathBuf::from(out)),
+        _ => None,
+    }
+}
+
+/// The RAW run id a live worktree was minted (or adopted) for — `None` when unmarked: a tree from
+/// a pre-marker engine, or one a downstream pre-provisioned (crew#390/#391).
+fn worktree_owner(wt: &Path) -> Option<String> {
+    let marker = worktree_admin_dir(wt)?.join("wicked-run-id");
+    let owner = std::fs::read_to_string(marker).ok()?;
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
+/// Record `run_id` as the worktree's owner. Best-effort: an unmarked tree degrades to the
+/// pre-marker adopt-on-reuse behavior, it never fails a run.
+fn stamp_worktree_owner(wt: &Path, run_id: &str) {
+    if let Some(dir) = worktree_admin_dir(wt) {
+        let _ = std::fs::write(dir.join("wicked-run-id"), run_id);
+    }
+}
+
+/// Whether a DESTRUCTIVE operation keyed by `run_id` may touch the tree at `wt`. True when the
+/// tree is unmarked (pre-marker mints, downstream-provisioned trees), or the marker matches the
+/// key — either verbatim (a run cleaning its own tree) or via [`sanitize_worktree_id`] (the
+/// startup reaper keys by directory NAME, which is the owner's sanitized spelling). False means
+/// the tree belongs to a DIFFERENT raw run id that merely spells the same name — leave it alone.
+fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
+    match worktree_owner(wt) {
+        None => true,
+        Some(owner) => owner == run_id || sanitize_worktree_id(&owner) == run_id,
+    }
+}
+
+/// Create an isolated git worktree for `run_id` at `<repo>/wicked-worktrees/<id>` on a fresh
+/// `wicked/<id>` branch, where `<id>` is [`sanitize_worktree_id`]'s spelling of the run id
+/// (core#337 — campaign run ids carry `:`, illegal in a git ref and on NTFS; plain ids pass
+/// through byte-for-byte). Idempotent for a genuine resume: a live worktree already at the path is
+/// reused — including one a downstream pre-provisioned at the RAW id spelling (crew#390/#391).
+/// Reuse is OWNER-only: a live tree marked for a DIFFERENT raw run id that merely spells the same
+/// sanitized name (the hashless colon tier) is refused loudly, never shared — see the worktree
+/// ownership section above [`worktree_owner`]. Returns the worktree path.
 ///
 /// The reuse test is [`is_live_worktree`], not `is_dir()`. It used to be `is_dir()`, and the
 /// difference is FINDING-059: `remove_worktree` falls back to `remove_dir_all`, a partial removal
@@ -352,6 +530,21 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
     let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
         if is_live_worktree(&wt) {
+            // A genuine resume reuses the tree — but only the OWNER resumes. Two distinct raw
+            // ids can spell the same worktree name (the hashless colon tier, core#337), and
+            // handing one run's live tree to another would silently interleave their work.
+            match worktree_owner(&wt) {
+                Some(owner) if owner != run_id => anyhow::bail!(
+                    "worktree {} already belongs to run {owner} — run {run_id}'s sanitized \
+                     name collides with it (two distinct run ids can spell the same worktree \
+                     name); refusing to share one working tree between two runs",
+                    wt.display()
+                ),
+                Some(_) => {}
+                // Unmarked: a pre-marker mint resolved FOR this id, or a tree a downstream
+                // pre-provisioned for exactly this run (crew#390/#391) — adopt it.
+                None => stamp_worktree_owner(&wt, run_id),
+            }
             return Ok(wt); // genuine resume — reuse it
         }
         // Not a worktree. Recoverable only while it holds nothing: an empty shell can be cleared and
@@ -378,7 +571,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
     }
     std::fs::create_dir_all(worktrees_root(repo_root))?;
     ensure_worktrees_excluded(repo_root);
-    let branch = format!("wicked/{run_id}");
+    let branch = format!("wicked/{}", sanitize_worktree_id(run_id));
     let wt_str = wt.to_string_lossy().to_string();
     let (ok, _, err) = git(repo_root, &["worktree", "add", &wt_str, "-b", &branch])?;
     if !ok {
@@ -388,6 +581,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
             anyhow::bail!("git worktree add failed: {err}{err2}");
         }
     }
+    stamp_worktree_owner(&wt, run_id);
     Ok(wt)
 }
 
@@ -398,6 +592,17 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
 /// A run that merely FINISHED goes through [`reap_worktree_if_clean`] instead (FINDING-003).
 pub fn remove_worktree(repo_root: &str, run_id: &str) {
     let wt = worktree_path(repo_root, run_id);
+    // A colliding run id derives the OWNER's path (core#337, hashless colon tier) — and this is
+    // the FORCE form, so touching a tree minted for a different raw id would destroy a live
+    // run's work. The colliding run never held a tree here; there is nothing of its own to remove.
+    if !may_touch_worktree(&wt, run_id) {
+        eprintln!(
+            "wicked-core: not removing worktree {} for run {run_id} — it belongs to a \
+             different run whose id spells the same worktree name",
+            wt.display()
+        );
+        return;
+    }
     let wt_str = wt.to_string_lossy().to_string();
     let _ = git(repo_root, &["worktree", "remove", "--force", &wt_str]);
     // If git refused (e.g. already gone), drop the dir directly.
@@ -422,6 +627,18 @@ pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
     if !wt.is_dir() {
         // Nothing on disk. Drop any dangling admin entry so the path is re-usable.
         let _ = git(repo_root, &["worktree", "prune"]);
+        return true;
+    }
+    // The tree at the derived path may belong to a DIFFERENT raw run id that spells the same
+    // worktree name (core#337, hashless colon tier). A clean live tree is exactly what the
+    // non-forced remove below would take, so the ownership check has to come first. `run_id`
+    // itself never held a tree here — its reap is trivially complete.
+    if !may_touch_worktree(&wt, run_id) {
+        eprintln!(
+            "wicked-core: not reaping worktree {} for run {run_id} — it belongs to a \
+             different run whose id spells the same worktree name",
+            wt.display()
+        );
         return true;
     }
     let wt_str = wt.to_string_lossy().to_string();
@@ -457,6 +674,17 @@ pub fn reap_orphan_worktrees(
     live_run_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
 ) {
+    // A worktree directory carries either a run id verbatim (plain ids; a raw-spelling campaign
+    // tree crew pre-provisioned) or the id's SANITIZED spelling (core#337 — what create_worktree
+    // mints for a campaign id). The store holds raw ids, so recognize both spellings here — or a
+    // LIVE campaign run's checkout reads as "unknown to the store" and is force-removed at boot.
+    let with_sanitized = |ids: &HashSet<String>| -> HashSet<String> {
+        let mut all = ids.clone();
+        all.extend(ids.iter().map(|id| sanitize_worktree_id(id)));
+        all
+    };
+    let live_names = with_sanitized(live_run_ids);
+    let terminal_names = with_sanitized(terminal_run_ids);
     for repo in repos {
         // Both layouts: pre-crew#276 leftovers under `.wicked/worktrees` reap by the same rules.
         for root in [
@@ -468,10 +696,10 @@ pub fn reap_orphan_worktrees(
             };
             for e in entries.flatten() {
                 if let Some(name) = e.file_name().to_str() {
-                    if live_run_ids.contains(name) {
+                    if live_names.contains(name) {
                         continue;
                     }
-                    if terminal_run_ids.contains(name) {
+                    if terminal_names.contains(name) {
                         let _ = reap_worktree_if_clean(&repo.root_path, name);
                     } else {
                         remove_worktree(&repo.root_path, name);
@@ -1483,6 +1711,342 @@ mod tests {
         assert!(
             !wt_gone.exists(),
             "a worktree no session owns is force-removed, dirty or not"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── worktree name sanitization (core#337) ─────────────────────────────────
+    //
+    // A campaign node's run id is `{campaign}:{node}:a{attempt}`, and `:` is illegal in a git ref
+    // and in an NTFS file name — `create_worktree` naming branches `wicked/{run_id}` VERBATIM
+    // failed every repo-scoped campaign node at dispatch with "is not a valid branch name".
+
+    /// Plain run ids (uuids) must pass through byte-for-byte: their worktrees and branches are
+    /// already on operators' disks under the raw spelling, and any change strands them.
+    #[test]
+    fn sanitize_leaves_a_plain_id_untouched() {
+        for id in ["8b9b1a2c-3d4e-5f60-8192-a3b4c5d6e7f8", "run-1", "a.b_c"] {
+            assert_eq!(sanitize_worktree_id(id), id);
+        }
+    }
+
+    /// The campaign shape maps `':' → '-'` with NO hash suffix — deliberately the convention
+    /// crew's shipped workaround (crew#390/#391) already stamps on operators' repos
+    /// (`wicked/<id with ':' → '-'>`), so engine and daemon spell the SAME branch.
+    #[test]
+    fn sanitize_maps_a_campaign_id_to_crews_shipped_convention() {
+        assert_eq!(sanitize_worktree_id("camp:node:a0"), "camp-node-a0");
+        assert_eq!(
+            sanitize_worktree_id("web-refresh:lint:a12"),
+            "web-refresh-lint-a12"
+        );
+    }
+
+    /// The residual tier (illegal content beyond `:`) is pinned EXACTLY, hash and all. The
+    /// spelling is an on-disk directory name and a git branch that resume/reap re-derive after an
+    /// engine upgrade — if this pin moves, existing worktrees strand.
+    #[test]
+    fn sanitize_pins_the_residual_mapping_and_its_hash() {
+        assert_eq!(sanitize_worktree_id("a?b"), "a-b-e657a319");
+        assert_eq!(sanitize_worktree_id("a..b"), "a.-b-6b848b82");
+        assert_eq!(sanitize_worktree_id("x.lock"), "x-lock-88586aac");
+        assert_eq!(sanitize_worktree_id("nul"), "r-nul-2102ba19");
+        // NTFS reserves the STEM up to the first dot — "con.txt" is as reserved as "con", so
+        // the stem must change (the r- prefix), not just gain a suffix after the dot.
+        let con = sanitize_worktree_id("con.txt");
+        assert!(
+            con.starts_with("r-con.txt-"),
+            "reserved stem must be renamed: {con}"
+        );
+        let com1 = sanitize_worktree_id("COM1.log");
+        assert!(
+            com1.starts_with("r-COM1.log-"),
+            "reserved stem must be renamed: {com1}"
+        );
+        assert_eq!(sanitize_worktree_id("@"), "@-af63fd4c");
+        assert_eq!(sanitize_worktree_id("trailing."), "trailing--fe043e6e");
+    }
+
+    /// Collision-awareness: two distinct ids that flatten to the same chars must NOT silently
+    /// share a worktree — the hash suffix of the RAW id keeps them apart.
+    #[test]
+    fn sanitize_disambiguates_ids_that_flatten_identically() {
+        let a = sanitize_worktree_id("a?b");
+        let b = sanitize_worktree_id("a*b");
+        assert!(a.starts_with("a-b-") && b.starts_with("a-b-"));
+        assert_ne!(a, b, "identical flattening must not mean a shared worktree");
+    }
+
+    /// Every Windows/NTFS-illegal character is mapped, not just `:` — the worktree NAME is a
+    /// directory, and a `:` (or `?`, `|`, ...) in it keeps campaign nodes broken on win32 even
+    /// with a legal branch. Also the NTFS oddities: trailing dot, reserved device names.
+    #[test]
+    fn sanitize_covers_the_windows_illegal_set() {
+        for c in [
+            '<', '>', ':', '"', '|', '?', '*', '\\', '/', '\u{1}', '\u{1f}',
+        ] {
+            let got = sanitize_worktree_id(&format!("x{c}y"));
+            assert!(!got.contains(c), "{c:?} must be mapped, got {got}");
+            assert!(got.starts_with("x-y"), "{c:?} maps to '-', got {got}");
+        }
+        assert!(!sanitize_worktree_id("trailing.").ends_with('.'));
+        assert_ne!(sanitize_worktree_id("nul"), "nul");
+        assert_ne!(sanitize_worktree_id("COM1"), "COM1");
+        // Not reserved — must stay byte-for-byte.
+        assert_eq!(sanitize_worktree_id("console"), "console");
+        assert_eq!(sanitize_worktree_id("COM0"), "COM0");
+    }
+
+    /// git's ref rules beyond single chars (`check-ref-format`): no `..`, no `@{`, no leading or
+    /// trailing `.`, no `.lock` suffix, not a lone `@`. And the output must be its own fixed
+    /// point — the startup reaper re-derives ids from directory NAMES, which may already be
+    /// sanitized spellings.
+    #[test]
+    fn sanitize_output_is_a_valid_ref_component_and_a_fixed_point() {
+        for bad in [
+            "a..b",
+            "a@{b",
+            ".lead",
+            "trail.",
+            "x.lock",
+            "@",
+            "camp:node:a0",
+            "a?b",
+            "",
+            "a b",
+        ] {
+            let got = sanitize_worktree_id(bad);
+            assert!(!got.contains(".."), "{bad:?} → {got}");
+            assert!(!got.contains("@{"), "{bad:?} → {got}");
+            assert!(!got.starts_with('.'), "{bad:?} → {got}");
+            assert!(!got.ends_with('.'), "{bad:?} → {got}");
+            assert!(!got.ends_with(".lock"), "{bad:?} → {got}");
+            assert_ne!(got, "@");
+            assert!(!got.is_empty());
+            assert_eq!(
+                sanitize_worktree_id(&got),
+                got,
+                "not idempotent for {bad:?}"
+            );
+        }
+    }
+
+    /// The core#337 repro: a campaign-shaped run id gets a real worktree and a real branch —
+    /// `git worktree add -b wicked/camp:node:a0` used to refuse at dispatch. The second call is
+    /// the resume contract on the SANITIZED path: same checkout, work preserved.
+    #[test]
+    fn create_worktree_sanitizes_campaign_shaped_run_ids() {
+        let root = git_repo("campaign");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "camp:node:a0").unwrap();
+        assert!(is_live_worktree(&wt));
+        assert_eq!(
+            wt.file_name().unwrap().to_str().unwrap(),
+            "camp-node-a0",
+            "the DIRECTORY carries the sanitized spelling too — ':' is NTFS-illegal"
+        );
+        let (ok, branches, _) = git(p, &["branch", "--list", "wicked/camp-node-a0"]).unwrap();
+        assert!(
+            ok && branches.contains("wicked/camp-node-a0"),
+            "branch under crew's shipped convention, got: {branches}"
+        );
+        std::fs::write(wt.join("turn-1.txt"), "landed\n").unwrap();
+        let again = create_worktree(p, "camp:node:a0").unwrap();
+        assert_eq!(wt, again, "resume re-derives the same sanitized path");
+        assert_eq!(
+            std::fs::read_to_string(again.join("turn-1.txt")).unwrap(),
+            "landed\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// crew#390/#391 COMPAT: crew's shipped workaround pre-provisions a campaign node's worktree
+    /// at the engine's layout but the RAW id spelling (`wicked-worktrees/<id with ':'>`), on the
+    /// branch-safe branch, riding the documented "a live worktree already at the path is reused"
+    /// contract. A fixed engine must FIND that tree — deriving only the sanitized path would try
+    /// to mint a second worktree and fail on the branch crew already holds checked out.
+    #[cfg(unix)]
+    #[test]
+    fn create_worktree_reuses_a_crew_preprovisioned_raw_path_worktree() {
+        let root = git_repo("crew-prov");
+        let p = root.to_str().unwrap();
+        std::fs::create_dir_all(worktrees_root(p)).unwrap();
+        let raw = worktrees_root(p).join("camp:node:a0");
+        // Exactly crew's provisioning: RAW path, branch-SAFE branch.
+        let (ok, _, err) = git(
+            p,
+            &[
+                "worktree",
+                "add",
+                raw.to_str().unwrap(),
+                "-b",
+                "wicked/camp-node-a0",
+            ],
+        )
+        .unwrap();
+        assert!(ok, "precondition — crew's own provisioning works: {err}");
+        std::fs::write(raw.join("provisioned.txt"), "crew\n").unwrap();
+
+        let wt = create_worktree(p, "camp:node:a0").unwrap();
+        assert_eq!(wt, raw, "the pre-provisioned tree is reused, not shadowed");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("provisioned.txt")).unwrap(),
+            "crew\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The startup reaper matches directory names against the store's RAW run ids — a live
+    /// campaign run's checkout sits under its SANITIZED name, and treating it as "unknown to the
+    /// store" would force-remove a live run's worktree at every boot.
+    #[test]
+    fn startup_reaper_recognizes_campaign_worktrees_by_their_sanitized_names() {
+        let root = git_repo("reap-campaign");
+        let p = root.to_str().unwrap();
+        let wt_live = create_worktree(p, "camp:live:a0").unwrap();
+        let wt_done = create_worktree(p, "camp:done:a0").unwrap();
+
+        let repo = RepoEntry {
+            id: "r".into(),
+            name: "r".into(),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+        };
+        // The store holds RAW ids — matching happens across spellings inside the reaper.
+        let live: HashSet<String> = ["camp:live:a0".to_string()].into_iter().collect();
+        let terminal: HashSet<String> = ["camp:done:a0".to_string()].into_iter().collect();
+        reap_orphan_worktrees(std::slice::from_ref(&repo), &live, &terminal);
+
+        assert!(
+            is_live_worktree(&wt_live),
+            "a live campaign run keeps its checkout — sanitized name must not read as unknown"
+        );
+        assert!(
+            !wt_done.exists(),
+            "a clean terminal campaign tree converges"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADVERSARIAL PROBE (core#337): the colon tier is deliberately hashless (crew#390/#391
+    /// branch parity), so two DISTINCT campaign run ids can sanitize IDENTICALLY —
+    /// `a-b:c:a0` and `a:b-c:a0` both spell `a-b-c-a0`. The second dispatch must NOT silently
+    /// share the first run's live working tree: it fails loudly, and the owner's tree (work
+    /// included) survives untouched.
+    #[test]
+    fn create_worktree_refuses_a_colliding_campaign_id() {
+        let root = git_repo("collide");
+        let p = root.to_str().unwrap();
+        assert_eq!(
+            sanitize_worktree_id("a-b:c:a0"),
+            sanitize_worktree_id("a:b-c:a0"),
+            "precondition — the two ids flatten identically"
+        );
+        let wt_x = create_worktree(p, "a-b:c:a0").unwrap();
+        std::fs::write(wt_x.join("owner-work.txt"), "X\n").unwrap();
+
+        let res = create_worktree(p, "a:b-c:a0");
+        assert!(
+            res.is_err(),
+            "a colliding id must be refused, not handed the owner's tree: {res:?}"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("a-b:c:a0"),
+            "the refusal names the owning run: {msg}"
+        );
+        assert!(
+            is_live_worktree(&wt_x)
+                && std::fs::read_to_string(wt_x.join("owner-work.txt")).unwrap() == "X\n",
+            "the owner's tree and work survive the refusal"
+        );
+        // The owner itself still resumes.
+        assert_eq!(create_worktree(p, "a-b:c:a0").unwrap(), wt_x);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADVERSARIAL PROBE (core#337): the colliding run's own CLEANUP is the other half —
+    /// `cancel_run` force-removes and `reap_terminal_worktree` reaps by DERIVING the path from
+    /// the run id (actor.rs keys them on `repo_ref` alone), and a colliding id derives the
+    /// OWNER's path. Neither destructive form may touch a tree that was minted for a different
+    /// raw run id.
+    #[test]
+    fn cleanup_keyed_by_a_colliding_id_never_touches_the_owners_tree() {
+        let root = git_repo("collide-reap");
+        let p = root.to_str().unwrap();
+        let wt_x = create_worktree(p, "a-b:c:a0").unwrap();
+        // X's tree is CLEAN — exactly the state a non-forced reap would happily remove.
+
+        assert!(
+            reap_worktree_if_clean(p, "a:b-c:a0"),
+            "the colliding run has nothing on disk — its reap converges (returns true)"
+        );
+        assert!(
+            is_live_worktree(&wt_x),
+            "a colliding TERMINAL run's reap must not remove the owner's clean live tree"
+        );
+
+        remove_worktree(p, "a:b-c:a0"); // cancel_run's force-discard spelling
+        assert!(
+            is_live_worktree(&wt_x),
+            "a colliding CANCELLED run's force-remove must not destroy the owner's tree"
+        );
+
+        // The owner's own cleanup still works — ownership guards the tree, not the reap.
+        assert!(reap_worktree_if_clean(p, "a-b:c:a0"));
+        assert!(!wt_x.exists(), "the owner's keyed reap still converges");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The core#337 repro end-to-end at the id's SOURCE: the run id comes from the engine's own
+    /// dispatch rule ([`crate::campaign::Campaign::derive_run_id`], §2.1) — not a hand-spelled
+    /// lookalike — and provisions through [`create_worktree`]. The test also pins WHY main
+    /// failed: git itself refuses the verbatim `wicked/{run_id}` branch main used to mint.
+    #[test]
+    fn a_dispatch_derived_campaign_run_id_provisions_through_the_engine_path() {
+        let def = crate::campaign::CampaignDef {
+            id: "web-refresh".into(),
+            name: String::new(),
+            nodes: vec![crate::campaign::CampaignNode {
+                node_id: "lint".into(),
+                run_spec: crate::campaign::RunSpec {
+                    problem: "p".into(),
+                    clis: vec![],
+                    entity_mode: crate::scope::EntityMode::Shared,
+                    human_confirm: crate::domain::HumanConfirm::None,
+                    repo_ref: Some("r".into()),
+                    workflow_id: None,
+                },
+            }],
+            edges: vec![],
+            policy: crate::campaign::FailurePolicy::default(),
+            max_concurrency: 1,
+        };
+        crate::campaign::validate(&def).unwrap();
+        let campaign = crate::campaign::Campaign::new(def);
+        let rid = campaign.derive_run_id("lint");
+        assert_eq!(rid, "web-refresh:lint:a0", "the §2.1 id rule");
+
+        let root = git_repo("dispatch");
+        let p = root.to_str().unwrap();
+        // Main's spelling: branch `wicked/{run_id}` VERBATIM — git refuses it outright.
+        let (ok, _, _) = git(
+            p,
+            &["check-ref-format", "--branch", &format!("wicked/{rid}")],
+        )
+        .unwrap();
+        assert!(
+            !ok,
+            "precondition — the verbatim campaign branch is what git refuses"
+        );
+
+        let wt = create_worktree(p, &rid).expect("the engine provisions the campaign node");
+        assert!(is_live_worktree(&wt));
+        assert_eq!(
+            wt.file_name().unwrap().to_str().unwrap(),
+            "web-refresh-lint-a0"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
