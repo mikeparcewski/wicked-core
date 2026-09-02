@@ -7668,6 +7668,154 @@ else:
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// core#341 adversarial probe: SEATS whose key and binary disagree, in BOTH directions,
+    /// loaded through the real user-overlay seam (`registry::load` with a clis.toml — the
+    /// same loader `registry_record`/`acp_config_for` consult) and driven to the wire. The
+    /// seat KEY must be inert at both sites:
+    ///
+    /// - a custom seat whose KEY is spelled exactly like the verified bridge
+    ///   (`claude-agent-acp`) over an UNVERIFIED binary must not be advertised the
+    ///   capability, and an elicitation it raises anyway is auto-cancelled — the old
+    ///   key-based turn gate would have SERVED this seat what was never advertised
+    /// - a custom seat with an arbitrary key over the VERIFIED bridge binary (spelled as an
+    ///   absolute path, the clis.toml shape) must be advertised AND served — the old key
+    ///   gate auto-cancelled this shape, which is the stock-`claude`-seat bug itself
+    ///
+    /// The mock asserts advertisement at the wire (exit 3/4) and the serve/cancel behavior
+    /// (exit 2/5), so advertisement == turn-time handling is proven per direction.
+    #[test]
+    #[cfg(unix)]
+    fn seat_key_is_inert_for_elicitation_in_both_divergence_directions() {
+        let dir = std::env::temp_dir().join(format!("wicked-341-seatkey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two mock bridges: one under the VERIFIED stem, one under an arbitrary name.
+        let verified_bridge = write_mock_acp_py(&dir, "claude-agent-acp");
+        let custom_bridge = write_mock_acp_py(&dir, "my-custom-bridge");
+
+        // A user overlay whose seats cross key and binary in both directions.
+        let toml_path = dir.join("clis.toml");
+        std::fs::write(
+            &toml_path,
+            format!(
+                r#"
+[[cli]]
+key = "claude-agent-acp"
+display_name = "Verified-looking key, unverified bridge"
+binary = "irrelevant"
+headless_invocation = "irrelevant \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{custom}"
+start_args = ["elicit_unadvertised"]
+transport = "stdio"
+
+[[cli]]
+key = "totally-custom"
+display_name = "Arbitrary key, verified bridge"
+binary = "irrelevant"
+headless_invocation = "irrelevant \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{verified}"
+start_args = ["elicit_ok"]
+transport = "stdio"
+"#,
+                custom = custom_bridge.display(),
+                verified = verified_bridge.display(),
+            ),
+        )
+        .unwrap();
+
+        let merged = wicked_council::registry::load(Some(&toml_path)).expect("overlay must parse");
+
+        for (key, expect_advertised) in [("claude-agent-acp", false), ("totally-custom", true)] {
+            let seat = merged
+                .iter()
+                .find(|c| c.key == key)
+                .unwrap_or_else(|| panic!("overlay seat '{key}' must be in the merged registry"));
+            let acp = seat
+                .acp
+                .as_ref()
+                .unwrap_or_else(|| panic!("overlay seat '{key}' must carry [cli.acp]"));
+
+            // The one predicate both sites share must classify by the BINARY alone.
+            assert_eq!(
+                elicitation_verified_adapter(&acp.binary),
+                expect_advertised,
+                "seat '{key}': elicitation is a property of the binary, never the key"
+            );
+
+            let run_id = format!("run-341-seatkey-{key}");
+            let mut proc = {
+                // Hold the env read-lock across the start (core#285) like `start_mock_proc`.
+                let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+                start_acp_process(acp, &dir, None, None)
+                    .unwrap_or_else(|e| panic!("seat '{key}' mock start failed: {e}"))
+            };
+            assert_eq!(
+                proc.elicitation_advertised, expect_advertised,
+                "seat '{key}': the stored advertisement decision must follow the binary"
+            );
+
+            let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let noop: &DeltaSink = &|_: &str| {};
+
+            // For the served direction, deliver the human response from a concurrent
+            // thread (polling: the elicitation registers mid-turn).
+            let deliver_thread = expect_advertised.then(|| {
+                let maps_clone = Arc::clone(&maps);
+                let run_id = run_id.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..80 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let pending = {
+                            let m = maps_clone.lock().unwrap();
+                            m.pending.keys().next().cloned()
+                        };
+                        if let Some(id) = pending {
+                            let mut m = maps_clone.lock().unwrap();
+                            let _ = m.deliver(
+                                &run_id,
+                                &id,
+                                "accept".to_string(),
+                                Some(serde_json::json!("Alice")),
+                            );
+                            return;
+                        }
+                    }
+                })
+            });
+
+            let result = exec_turn_acp(
+                &mut proc,
+                "go",
+                &[],
+                noop,
+                Duration::from_secs(5),
+                Arc::clone(&maps),
+                &run_id,
+                1, // governed epoch: only the adapter's binary decides the capability
+                &tx,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("seat '{key}' turn failed: {e}"));
+            if let Some(t) = deliver_thread {
+                t.join().unwrap();
+            }
+
+            // The mock exits nonzero on any advertisement/serve divergence, which would
+            // kill the prompt mid-turn and the status would not be Ok.
+            assert_eq!(
+                result.status,
+                StepStatus::Ok,
+                "seat '{key}': advertisement and turn-time handling must be one decision"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Test 13 & 14 integration: multi-property and non-string-schema elicitations are immediately
     /// cancelled and the turn still completes as `Ok`.
     #[test]
