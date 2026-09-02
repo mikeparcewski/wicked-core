@@ -15,6 +15,11 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.8** — npm release cut with the due-diligence engine fixes since 0.7.7:
+  campaign-safe worktree names + ownership-marked trees + a reaper that spares live campaign
+  worktrees (crew#337 / #345, #347), and the single elicitation-capability predicate — a seat
+  advertises exactly what its turns serve, stock claude and codex seats included
+  (crew#341-adjacent / #346).
 - **core-ts 0.7.7** — npm release cut with everything below since 0.7.6: the ACP dead-session
   liveness probe (crew#340 / #343), the creator evidence floor + `executes_code` plan-carry
   (crew#311 / #342), launch-declared `extraReadRoots` (#294 / #340), widened markdown steering
