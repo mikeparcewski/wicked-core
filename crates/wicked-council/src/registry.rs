@@ -408,10 +408,20 @@ trust_flags = []
         .unwrap();
 
         let merged = load(Some(&path)).expect("load must succeed");
+        // Assert INHERITANCE against the built-in's actual posture, not a hard-coded string —
+        // the point is that the override adopts whatever the built-in codex carries.
+        let builtin_codex_trust = builtin()
+            .into_iter()
+            .find(|c| c.key == "codex")
+            .expect("built-in codex seat")
+            .trust_flags;
+        assert!(
+            !builtin_codex_trust.is_empty(),
+            "precondition: the built-in codex seat must carry trust_flags for this test to mean anything"
+        );
         let codex = merged.iter().find(|c| c.key == "codex").unwrap();
         assert_eq!(
-            codex.trust_flags,
-            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()],
+            codex.trust_flags, builtin_codex_trust,
             "an override that OMITS trust_flags inherits the built-in's posture"
         );
         assert_eq!(codex.display_name, "Codex (override, trust omitted)");
