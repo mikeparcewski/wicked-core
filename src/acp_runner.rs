@@ -1070,8 +1070,15 @@ fn stderr_context(tail: &StderrTail) -> String {
 /// a bridge that dies mid-write leaves its final words there, unread by any turn. Two silent
 /// deaths in the field carried "(silent)" stderr; exit + stdout are the next discriminators.
 fn death_context(proc: &AcpProcess) -> String {
+    death_context_with(proc, proc.kill_handle.try_exit_status())
+}
+
+/// [`death_context`] with the exit status the CALLER already fetched — `try_exit_status`
+/// reaps, and a concurrent `signal()` can take the child between two calls, so a probe that
+/// observed the status once must pass it through rather than ask again and read `None`.
+fn death_context_with(proc: &AcpProcess, status: Option<std::process::ExitStatus>) -> String {
     let mut note = stderr_context(&proc.stderr_tail);
-    match proc.kill_handle.try_exit_status() {
+    match status {
         Some(status) => note.push_str(&format!("; bridge exit: {status}")),
         None => note.push_str("; bridge exit: unknown (not yet reaped)"),
     }
@@ -3104,6 +3111,20 @@ fn fallback_with_warning(
 // `(run_id, cli_key)` fall back immediately without re-attempting spawn.
 type SessionMap = Arc<Mutex<HashMap<(String, String), Option<Arc<Mutex<AcpProcess>>>>>>;
 
+/// What the session cache holds for a `(run_id, cli_key)` — after the crew#340 liveness
+/// probe has had its say. A cached bridge that already EXITED (a `kill -9` between turns,
+/// an OOM kill, a crash) is a husk: writing `session/prompt` into it can only produce a
+/// broken pipe, which used to degrade the unit to single-shot AND leave the map poisoned
+/// for every later unit of the run. The probe purges the husk so the caller spawns fresh.
+enum SessionProbe {
+    /// A cached session whose bridge has not been observed dead — reuse it.
+    Live(Arc<Mutex<AcpProcess>>),
+    /// A previous startup for this key failed; fall back single-shot without re-spawning.
+    FailedStartup,
+    /// Nothing cached (or a dead husk was just purged) — start a fresh session.
+    Vacant,
+}
+
 /// A [`StepRunner`] that drives ACP multi-turn sessions for all registered CLIs.
 ///
 /// Sessions are keyed by `(run_id, cli_key)` — each CLI in a multi-CLI run gets its own
@@ -3665,6 +3686,87 @@ impl AcpStepRunner {
         delivered
     }
 
+    /// Probe the session cache for `session_key`, purging a dead husk (crew#340).
+    ///
+    /// `kill -9` on a cached bridge between turns leaves `Some(arc)` in the map pointing at
+    /// an exited process. The next `session/prompt` write EPIPEs, the unit degrades to the
+    /// single-shot fallback, and — because the husk was only evicted per-turn — every later
+    /// unit of the run repeated the dance. Worse, in the field the daemon's ACP client looked
+    /// wedged until restart. The fix: check `KillHandle::try_exit_status` (non-blocking, never
+    /// killing) BEFORE reuse; a bridge that already exited is purged from the session map and
+    /// the write registry, and the caller starts a FRESH `session/new` instead of degrading.
+    ///
+    /// A session whose proc mutex is HELD (a concurrent turn in flight) cannot be probed
+    /// without blocking behind that turn — it is reported `Live` and the caller blocks on the
+    /// lock exactly as before; the in-flight turn's own error path handles a mid-turn death.
+    fn probe_cached_session(&self, session_key: &(String, String)) -> SessionProbe {
+        let slot = {
+            let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(session_key).cloned()
+        };
+        let arc = match slot {
+            None => return SessionProbe::Vacant,
+            Some(None) => return SessionProbe::FailedStartup,
+            Some(Some(arc)) => arc,
+        };
+        // The post-mortem note carries the exit status, the stderr tail, and any queued
+        // stdout — everything crew#267/#289 taught this file to keep about a dead bridge.
+        // The kill-handle Arc rides along as the HUSK'S IDENTITY: the registry purge below
+        // must match this exact process, never a racing replacement's entries.
+        let post_mortem = match arc.try_lock() {
+            Ok(proc) => proc.kill_handle.try_exit_status().map(|st| {
+                (
+                    death_context_with(&proc, Some(st)),
+                    Arc::clone(&proc.kill_handle),
+                )
+            }),
+            // Held by an in-flight turn — alive enough; that turn's own paths report death.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let proc = p.into_inner();
+                proc.kill_handle.try_exit_status().map(|st| {
+                    (
+                        death_context_with(&proc, Some(st)),
+                        Arc::clone(&proc.kill_handle),
+                    )
+                })
+            }
+        };
+        let Some((note, husk_kill)) = post_mortem else {
+            return SessionProbe::Live(arc);
+        };
+        // The husk is dead. Purge exactly THIS husk (never a racing replacement) from the
+        // session map, and drop its write-registry handles so teardown stops signalling it.
+        {
+            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if guard
+                .get(session_key)
+                .is_some_and(|slot| slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &arc)))
+            {
+                guard.remove(session_key);
+            }
+        }
+        // Registry entries are matched by the husk's own kill-handle identity — a concurrent
+        // replacement for the same (run_id, cli_key) inserted between the map removal above
+        // and this purge keeps its handles (its key differs by launch_seq, its value by Arc).
+        self.write_reg
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(rid, key, _), (_, kill)| {
+                rid != &session_key.0 || key != &session_key.1 || !Arc::ptr_eq(kill, &husk_kill)
+            });
+        // LOUD (crew#340): the operator's daemon log must say the cached bridge was found
+        // dead and a fresh session is being started — the old symptom was a silent
+        // degradation that read as "ACP wedged until daemon restart".
+        eprintln!(
+            "[wicked-core] cached ACP session for '{}' (run {}) found dead before reuse \
+             (crew#340) — purging the husk and starting a fresh session instead of \
+             degrading to single-shot{note}",
+            session_key.1, session_key.0
+        );
+        SessionProbe::Vacant
+    }
+
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         // The actor allocates one epoch for every ACP unit before it leaves the actor
         // thread. Keep the cleanup guard outside the implementation so every return path
@@ -3891,20 +3993,16 @@ impl AcpStepRunner {
         // Lazily open a session for (run_id, cli_key). The global map lock is held only
         // for the brief map lookup/insert — not across the blocking spawn + handshake.
         let session_key = (run_id.clone(), cli_key.clone());
-        // `None` in the map means a previous startup for this key failed; fall back
+        // `FailedStartup` means a previous startup for this key failed; fall back
         // immediately without re-attempting spawn (avoids repeated warnings per run).
-        let proc_arc: Arc<Mutex<AcpProcess>> = {
-            let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(slot) = guard.get(&session_key) {
-                match slot {
-                    Some(arc) => arc.clone(),
-                    None => {
-                        drop(guard); // release sessions lock before the blocking fallback call
-                        return self.fallback.run_unit_streaming(input, emit);
-                    }
-                }
-            } else {
-                drop(guard);
+        // A cached session is liveness-probed first (crew#340): a bridge SIGKILLed
+        // between turns is purged and replaced by a fresh spawn, never written into.
+        let proc_arc: Arc<Mutex<AcpProcess>> = match self.probe_cached_session(&session_key) {
+            SessionProbe::FailedStartup => {
+                return self.fallback.run_unit_streaming(input, emit);
+            }
+            SessionProbe::Live(arc) => arc,
+            SessionProbe::Vacant => {
                 // The SAME cwd the boundary was built from (core#260) — worktree, else the
                 // per-run sandbox. The old `current_dir()` fallback ran repo-less units in the
                 // DAEMON's own directory.
@@ -5084,6 +5182,204 @@ sleep 30
         );
         drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── crew#340: liveness probe before cached-session reuse ────────────────────
+
+    /// Handshakes normally, then sleeps — a stand-in for a warm bridge between turns.
+    #[cfg(unix)]
+    fn stub_idle_bridge(dir: &std::path::Path) -> std::path::PathBuf {
+        write_stub(
+            dir,
+            r#"#!/bin/sh
+read _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read _new
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"probe-stub"}}'
+sleep 30
+"#,
+        )
+    }
+
+    /// The child pid behind an `AcpProcess`'s kill handle — test-only, for the external
+    /// `kill -9` that models an operator (or the OOM killer) taking a worker down.
+    #[cfg(unix)]
+    fn bridge_pid(arc: &Arc<Mutex<AcpProcess>>) -> u32 {
+        let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = proc
+            .kill_handle
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().expect("child not yet taken").id()
+    }
+
+    /// A runner with one REAL cached session for `(run, cli)`, plus the arc for direct
+    /// inspection. The write registry carries the session's handles AND an unrelated seat's
+    /// no-op handles, so purge tests can prove eviction is per-`(run_id, cli_key)`.
+    #[cfg(unix)]
+    fn runner_with_cached_session(
+        dir: &std::path::Path,
+        run: &str,
+        cli: &str,
+    ) -> (AcpStepRunner, Arc<Mutex<AcpProcess>>) {
+        let script = stub_idle_bridge(dir);
+        let proc = start_acp_process(&stub_config(&script, None), dir, None, None)
+            .expect("the idle stub must handshake");
+        let handles = (Arc::clone(&proc.write_lock), Arc::clone(&proc.kill_handle));
+        let arc = Arc::new(Mutex::new(proc));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The probe never emits Commands today, but leak the receiver so any future emit
+        // in this path cannot silently fail in tests.
+        std::mem::forget(rx);
+        let runner = AcpStepRunner::new(tx);
+        runner
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((run.to_string(), cli.to_string()), Some(Arc::clone(&arc)));
+        let mut reg = runner.write_reg.lock().unwrap_or_else(|p| p.into_inner());
+        reg.insert((run.to_string(), cli.to_string(), 1), handles);
+        reg.insert(
+            (run.to_string(), "other-cli".to_string(), 1),
+            (Arc::new(Mutex::new(())), Arc::new(KillHandle::noop())),
+        );
+        drop(reg);
+        (runner, arc)
+    }
+
+    /// crew#340, the wedge itself: `kill -9` on a cached bridge between turns must NOT leave
+    /// the husk in the session map. The probe reports Vacant (so the caller starts a fresh
+    /// `session/new` instead of writing into a broken pipe and degrading to single-shot),
+    /// purges the map entry, and drops the write-registry handles for exactly that seat.
+    #[test]
+    #[cfg(unix)]
+    fn a_sigkilled_cached_session_is_purged_and_the_next_unit_starts_fresh() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("probe-killed");
+        let (runner, arc) = runner_with_cached_session(&dir, "run-340", "stub-cli");
+        let key = ("run-340".to_string(), "stub-cli".to_string());
+
+        let pid = bridge_pid(&arc);
+        // The real kill: SIGKILL from outside, exactly like an operator's `kill -9`.
+        // spawn-audit: test-only — /bin/kill delivering a signal; it runs no job of its own.
+        let status = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .expect("spawn kill");
+        assert!(status.success(), "kill -9 {pid} must be delivered");
+
+        // Wait until the exit is observable (try_wait), else the probe legitimately says Live.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let exited = {
+                let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+                proc.kill_handle.try_exit_status().is_some()
+            };
+            if exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the SIGKILLed bridge never became observably dead"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert!(
+            matches!(runner.probe_cached_session(&key), SessionProbe::Vacant),
+            "a dead cached session must probe Vacant so the caller spawns fresh"
+        );
+        assert!(
+            !runner
+                .sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&key),
+            "the husk must be purged from the session map"
+        );
+        {
+            let reg = runner.write_reg.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(
+                !reg.keys()
+                    .any(|(r, c, _)| r == "run-340" && c == "stub-cli"),
+                "the dead seat's write-registry handles must be dropped"
+            );
+            assert!(
+                reg.keys()
+                    .any(|(r, c, _)| r == "run-340" && c == "other-cli"),
+                "an unrelated seat's handles must survive the purge"
+            );
+        }
+        // Idempotent: the husk is gone, so the next probe is a plain miss.
+        assert!(matches!(
+            runner.probe_cached_session(&key),
+            SessionProbe::Vacant
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe must never evict a HEALTHY warm session — reuse is the entire point of the
+    /// session cache, and core#13 measured cold starts in seconds.
+    #[test]
+    #[cfg(unix)]
+    fn a_live_cached_session_is_reported_live_and_left_cached() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // real start reads env (core#285)
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("probe-live");
+        let (runner, arc) = runner_with_cached_session(&dir, "run-340", "stub-cli");
+        let key = ("run-340".to_string(), "stub-cli".to_string());
+
+        match runner.probe_cached_session(&key) {
+            SessionProbe::Live(probed) => assert!(
+                Arc::ptr_eq(&probed, &arc),
+                "the probe must hand back the cached session, not a copy"
+            ),
+            _ => panic!("a live cached session must probe Live"),
+        }
+        assert!(
+            runner
+                .sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&key),
+            "a live session must stay cached"
+        );
+        drop(runner); // drops the map → kills the stub
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `None` slot means "startup already failed once this run" — the probe must keep the
+    /// tombstone (fall back immediately) rather than reporting Vacant and re-attempting a
+    /// spawn that would fail again with a fresh warning per unit.
+    #[test]
+    fn a_failed_startup_tombstone_probes_failed_startup_and_is_kept() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let key = ("run-340".to_string(), "stub-cli".to_string());
+        runner
+            .sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key.clone(), None);
+
+        assert!(matches!(
+            runner.probe_cached_session(&key),
+            SessionProbe::FailedStartup
+        ));
+        assert!(
+            matches!(
+                runner
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&key),
+                Some(None)
+            ),
+            "the tombstone must survive the probe"
+        );
     }
 
     /// The operator's `auth_method` (the new serde-default field on `AcpConfig`) overrides the
