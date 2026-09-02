@@ -492,8 +492,23 @@ fn worktree_owner(wt: &Path) -> Option<String> {
 /// pre-marker adopt-on-reuse behavior, it never fails a run.
 fn stamp_worktree_owner(wt: &Path, run_id: &str) {
     if let Some(dir) = worktree_admin_dir(wt) {
-        let _ = std::fs::write(dir.join("wicked-run-id"), run_id);
+        // A failed stamp leaves the tree UNMARKED, which silently downgrades the ownership
+        // guard (a later colliding id would read it as adoptable) — say so, loudly.
+        if let Err(e) = std::fs::write(dir.join("wicked-run-id"), run_id) {
+            eprintln!(
+                "wicked-core: could not stamp worktree owner for run {run_id} at {} ({e}) — \
+                 the tree stays unmarked and a name-colliding run could adopt it (core#337)",
+                dir.display()
+            );
+        }
     }
+}
+
+/// The branch a run's worktree lives on — the ONE spelling (`wicked/` + the sanitized id), so
+/// log lines and diagnostics cannot drift back to the raw `wicked/{run_id}` form that campaign
+/// ids made illegal (core#337).
+pub(crate) fn worktree_branch(run_id: &str) -> String {
+    format!("wicked/{}", sanitize_worktree_id(run_id))
 }
 
 /// Whether a DESTRUCTIVE operation keyed by `run_id` may touch the tree at `wt`. True when the
@@ -571,7 +586,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
     }
     std::fs::create_dir_all(worktrees_root(repo_root))?;
     ensure_worktrees_excluded(repo_root);
-    let branch = format!("wicked/{}", sanitize_worktree_id(run_id));
+    let branch = worktree_branch(run_id);
     let wt_str = wt.to_string_lossy().to_string();
     let (ok, _, err) = git(repo_root, &["worktree", "add", &wt_str, "-b", &branch])?;
     if !ok {
