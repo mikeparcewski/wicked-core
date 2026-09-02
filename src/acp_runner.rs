@@ -1070,8 +1070,15 @@ fn stderr_context(tail: &StderrTail) -> String {
 /// a bridge that dies mid-write leaves its final words there, unread by any turn. Two silent
 /// deaths in the field carried "(silent)" stderr; exit + stdout are the next discriminators.
 fn death_context(proc: &AcpProcess) -> String {
+    death_context_with(proc, proc.kill_handle.try_exit_status())
+}
+
+/// [`death_context`] with the exit status the CALLER already fetched — `try_exit_status`
+/// reaps, and a concurrent `signal()` can take the child between two calls, so a probe that
+/// observed the status once must pass it through rather than ask again and read `None`.
+fn death_context_with(proc: &AcpProcess, status: Option<std::process::ExitStatus>) -> String {
     let mut note = stderr_context(&proc.stderr_tail);
-    match proc.kill_handle.try_exit_status() {
+    match status {
         Some(status) => note.push_str(&format!("; bridge exit: {status}")),
         None => note.push_str("; bridge exit: unknown (not yet reaped)"),
     }
@@ -3707,19 +3714,22 @@ impl AcpStepRunner {
         // The kill-handle Arc rides along as the HUSK'S IDENTITY: the registry purge below
         // must match this exact process, never a racing replacement's entries.
         let post_mortem = match arc.try_lock() {
-            Ok(proc) => proc
-                .kill_handle
-                .try_exit_status()
-                .is_some()
-                .then(|| (death_context(&proc), Arc::clone(&proc.kill_handle))),
+            Ok(proc) => proc.kill_handle.try_exit_status().map(|st| {
+                (
+                    death_context_with(&proc, Some(st)),
+                    Arc::clone(&proc.kill_handle),
+                )
+            }),
             // Held by an in-flight turn — alive enough; that turn's own paths report death.
             Err(std::sync::TryLockError::WouldBlock) => None,
             Err(std::sync::TryLockError::Poisoned(p)) => {
                 let proc = p.into_inner();
-                proc.kill_handle
-                    .try_exit_status()
-                    .is_some()
-                    .then(|| (death_context(&proc), Arc::clone(&proc.kill_handle)))
+                proc.kill_handle.try_exit_status().map(|st| {
+                    (
+                        death_context_with(&proc, Some(st)),
+                        Arc::clone(&proc.kill_handle),
+                    )
+                })
             }
         };
         let Some((note, husk_kill)) = post_mortem else {
