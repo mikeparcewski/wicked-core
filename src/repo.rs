@@ -371,7 +371,13 @@ pub(crate) fn sanitize_worktree_id(run_id: &str) -> String {
         mapped = format!("{stripped}-lock");
         residual = true;
     }
-    if mapped == "@" || mapped.is_empty() || is_windows_reserved(&mapped) {
+    if mapped == "@" || mapped.is_empty() {
+        residual = true;
+    }
+    if is_windows_reserved(&mapped) {
+        // NTFS reserves the STEM up to the first dot ("con.txt" is as reserved as "con"), so a
+        // hash SUFFIX alone leaves the name illegal — the stem itself must change.
+        mapped = format!("r-{mapped}");
         residual = true;
     }
     if residual {
@@ -1744,7 +1750,19 @@ mod tests {
         assert_eq!(sanitize_worktree_id("a?b"), "a-b-e657a319");
         assert_eq!(sanitize_worktree_id("a..b"), "a.-b-6b848b82");
         assert_eq!(sanitize_worktree_id("x.lock"), "x-lock-88586aac");
-        assert_eq!(sanitize_worktree_id("nul"), "nul-2102ba19");
+        assert_eq!(sanitize_worktree_id("nul"), "r-nul-2102ba19");
+        // NTFS reserves the STEM up to the first dot — "con.txt" is as reserved as "con", so
+        // the stem must change (the r- prefix), not just gain a suffix after the dot.
+        let con = sanitize_worktree_id("con.txt");
+        assert!(
+            con.starts_with("r-con.txt-"),
+            "reserved stem must be renamed: {con}"
+        );
+        let com1 = sanitize_worktree_id("COM1.log");
+        assert!(
+            com1.starts_with("r-COM1.log-"),
+            "reserved stem must be renamed: {com1}"
+        );
         assert_eq!(sanitize_worktree_id("@"), "@-af63fd4c");
         assert_eq!(sanitize_worktree_id("trailing."), "trailing--fe043e6e");
     }
