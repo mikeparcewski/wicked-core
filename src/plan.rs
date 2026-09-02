@@ -187,6 +187,11 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // nothing read it, so a workflow could list required outputs the engine never verified.
             // The completion path checks them, mirroring how validator/gate/role flow from def to unit.
             unit.required_deliverables = phase.required_deliverables.clone();
+            // Carry the phase's `executes_code` declaration (crew#311 / core#297 §2) so the
+            // completion path's CODE-EVIDENCE floor can re-derive a build phase's "done" from the
+            // worktree diff — the fold has no route back to the def, so like role/gate/deps the
+            // declaration must ride the unit.
+            unit.executes_code = phase.executes_code;
             // Carry the tool command for Tool-executor phases so the actor can run it directly.
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());
@@ -394,6 +399,32 @@ mod tests {
         assert_eq!(dep("review"), vec!["test".to_string()]);
         // The first phase depends on nothing; an empty list must stay empty (not a defaulted guess).
         assert!(dep("clarify").is_empty());
+    }
+
+    /// crew#311 / core#297 §2: the phase's `executes_code` declaration rides the unit — the fold's
+    /// CODE-EVIDENCE floor has no route back to the def, so without the carry every build unit
+    /// would read `false` and the floor would be armed nowhere.
+    #[test]
+    fn plan_from_def_carries_executes_code_onto_the_unit() {
+        let def = feature_def();
+        let units = plan_from_def(&def, "add SSO login", "s1");
+        for (unit, phase) in units.iter().zip(def.phases.iter()) {
+            assert_eq!(
+                unit.executes_code, phase.executes_code,
+                "phase `{}` must carry its own executes_code verbatim",
+                phase.id
+            );
+        }
+        // The concrete shape this exists for: `build` is marked, the prose phases are not.
+        let marked = |id: &str| {
+            units
+                .iter()
+                .find(|u| u.id == format!("s1:{id}"))
+                .unwrap_or_else(|| panic!("feature has a `{id}` phase"))
+                .executes_code
+        };
+        assert!(marked("build"), "feature/build is the executes_code phase");
+        assert!(!marked("clarify") && !marked("design") && !marked("adversarial-review"));
     }
 
     /// FINDING-024, the join that makes the fix work at all. `prior_context_label` matches a prior's

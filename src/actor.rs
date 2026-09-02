@@ -4323,16 +4323,39 @@ fn apply_step_result(
     // letting a one-line "done." fold as a completed phase and starve every unit behind it of
     // context. Evaluator-role units are exempt: their output is a verdict over ANOTHER unit's
     // work, and they carry their own pinned floors (see `builtin_floors`).
+    //
+    // SECOND ARM — the CODE-EVIDENCE floor (crew#311 / core#297 §2). For an `executes_code`
+    // CREATOR phase of a BOUND run, prose is not evidence at ANY length: the phase's entire job
+    // is to leave a diff, and crew#311 recorded three governed builds folding "done" on 280–509
+    // bytes of read-narration over a worktree clean at main's HEAD — caught (if at all) one phase
+    // later by the Evaluator's pinned diff floor, after the gate between them had already
+    // approved nothing. So the same criterion the Evaluator floor pins ("the run left a change in
+    // its worktree — done is re-derived from the diff, never asserted") is enforced HERE, at the
+    // phase that was supposed to make the change. Scoped tightly: governed (a governance floor,
+    // like the prose arm) + Creator (an `executes_code` Evaluator — e.g. a test phase — produces
+    // a verdict, not a diff; `migration/cutover` is Neutral and flips state rather than authoring
+    // it) + bound (an unbound run has no worktree to leave a diff in, so the prose arm is the
+    // only floor it CAN carry). No validator pin and no LLM judge — a deterministic fold check,
+    // which sidesteps core#297's stated objection to pinning a floor on build phases.
     const MIN_SUBSTANCE_CHARS: usize = 200;
+    let no_prose = unit.role != crate::workflow::PhaseRole::Evaluator
+        && output.output.trim().chars().count() < MIN_SUBSTANCE_CHARS;
+    let code_without_diff = unit.role == crate::workflow::PhaseRole::Creator
+        && unit.executes_code
+        && session.workdir.is_some();
     if output.governed
-        && unit.role != crate::workflow::PhaseRole::Evaluator
-        && output.output.trim().chars().count() < MIN_SUBSTANCE_CHARS
+        && (no_prose || code_without_diff)
         && worktree_is_clean(session.workdir.as_deref())
     {
         const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
+        const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
+                               worktree (done is re-derived from the diff, never asserted)";
+        // `no_prose` wins the tie so the pre-existing rejection keeps its exact record shape —
+        // the new arm only ever rejects folds that previously passed.
+        let why: &'static str = if no_prose { NO_SUBSTANCE } else { NO_DIFF };
         unit.status = crate::domain::UnitStatus::Rejected;
-        unit.denial_reason = Some(NO_SUBSTANCE.to_string());
-        unit.denial = Some(crate::domain::UnitDenial::new("substance", NO_SUBSTANCE));
+        unit.denial_reason = Some(why.to_string());
+        unit.denial = Some(crate::domain::UnitDenial::new("substance", why));
         put_node(store, unit.to_node())?;
         // Usability review #1: even the under-200-char output is the honest record of what the
         // phase produced — persist it flagged rejected rather than storing nothing.
@@ -4343,7 +4366,7 @@ fn apply_step_result(
                 session: run_id.clone(),
                 ord,
                 attempt: output.attempt,
-                detail: NO_SUBSTANCE.to_string(),
+                detail: why.to_string(),
                 // NOT WorkerError: the worker ran and exited Ok — this is core's own governance
                 // veto, and a consumer that reads workerError as "the CLI process failed" (seat
                 // health, failover) must not act on it (PR #279 review).
@@ -6778,6 +6801,398 @@ mod substance_gate_tests {
             unit.denial_reason.as_deref(),
             Some(NO_SUBSTANCE),
             "200 trimmed chars of prose must clear the substance gate"
+        );
+    }
+}
+
+/// crew#311 / core#297 §2 — the CODE-EVIDENCE floor: a governed `executes_code` CREATOR phase of
+/// a BOUND run may not fold Ok over an untouched worktree, at ANY prose length. crew#311's three
+/// dogfood runs each reached build "done" on 280–509 bytes of read-narration with the worktree
+/// clean at main's HEAD, and the execution gate between build and review approved the nothing.
+/// Driven through `apply_step_result` — the real fold site — against a REAL linked worktree on a
+/// `wicked/<run>` branch (the layout `repo::create_worktree` provisions), so both of
+/// `worktree_is_clean`'s instruments (porcelain + run-branch commits) are exercised for real.
+#[cfg(test)]
+mod code_evidence_floor_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{PhaseRole, StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, ToNode};
+
+    const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
+                           worktree (done is re-derived from the diff, never asserted)";
+    const NO_SUBSTANCE: &str = "phase produced no reviewable substance";
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    /// Well over the substance threshold, so the floor decision under test rides ONLY on the
+    /// worktree — exactly the crew#311 shape (plausible narration, no diff).
+    fn prose() -> String {
+        "I'll read the design spec first, then check the API types before writing. ".repeat(6)
+    }
+
+    /// A real repo + linked worktree on `wicked/<run>` — the layout the engine provisions for a
+    /// bound run. Returns the WORKTREE path to use as the session workdir.
+    fn git_worktree(tag: &str) -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-code-floor-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "."]);
+        git(&repo, &["config", "user.email", "t@example.invalid"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("base.txt"), "base\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        // Branch name derives from the per-test tag — the engine's real convention is
+        // `wicked/<run>`, and a shared literal would let fixtures assume each other's branch.
+        let branch = format!("wicked/{tag}");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                branch.as_str(),
+            ],
+        );
+        wt
+    }
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        // spawn-audit: test-only — a git fixture building the worktree layout under test; it
+        // reads no engine state.
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// One Executing session at cursor 0 over a single unit of `role` with the given
+    /// `executes_code` marker, bound to `workdir` when given.
+    fn seed(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        role: PhaseRole,
+        executes_code: bool,
+        workdir: Option<String>,
+    ) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
+        u.role = role;
+        u.executes_code = executes_code;
+        u.status = UnitStatus::Distributed;
+        put_node(store, u.to_node()).unwrap();
+        wicked_orchestration::register_workflow(
+            store,
+            format!("wf-{run_id}"),
+            "p",
+            &[(format!("wf-{run_id}:unit-1"), "build the feature")],
+        )
+        .unwrap();
+    }
+
+    /// Fold an Ok result for the seeded unit and return `(session, unit)`.
+    fn fold(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        output_text: &str,
+        governed: bool,
+    ) -> (AgentSession, WorkUnit) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: output_text.into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed,
+        };
+        apply_step_result(
+            store,
+            subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .remove(0);
+        (session, unit)
+    }
+
+    /// The crew#311 reproducer: governed build, long plausible narration, worktree clean at
+    /// base — REJECTED through the standard failure path, kinded SubstanceRejected (core's own
+    /// veto, not a worker failure), run terminally Failed.
+    #[test]
+    fn a_governed_code_creator_folding_prose_over_a_clean_worktree_is_rejected() {
+        let wt = git_worktree("reject");
+        let run_id = "code-floor-reject";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
+
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(unit.denial_reason.as_deref(), Some(NO_DIFF));
+        let saw_step_failed = std::iter::from_fn(|| erx.try_recv().ok()).any(|ev| {
+            matches!(
+                ev,
+                CoreEvent::StepFailed { detail, failure_kind, .. }
+                    if detail == NO_DIFF
+                        && failure_kind == crate::event::StepFailureKind::SubstanceRejected
+            )
+        });
+        assert!(
+            saw_step_failed,
+            "the code-evidence rejection must ride the standard failure path \
+             (StepFailed, kinded SubstanceRejected)"
+        );
+    }
+
+    /// An UNCOMMITTED change is evidence (instrument 1, porcelain): the same fold passes the
+    /// floor and proceeds to the normal gates.
+    #[test]
+    fn an_uncommitted_change_clears_the_code_evidence_floor() {
+        let wt = git_worktree("dirty");
+        std::fs::write(wt.join("feature.ts"), "export const x = 1;\n").unwrap();
+        let run_id = "code-floor-dirty";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (_session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_DIFF),
+            "a worktree with an uncommitted change must clear the code-evidence floor"
+        );
+    }
+
+    /// A change COMMITTED on the run branch (porcelain goes clean — the core#280 shape) is
+    /// equally evidence, via instrument 2 (run-branch commits).
+    #[test]
+    fn a_run_branch_commit_clears_the_code_evidence_floor() {
+        let wt = git_worktree("committed");
+        std::fs::write(wt.join("feature.ts"), "export const x = 1;\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "feat: the change"]);
+        let run_id = "code-floor-committed";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (_session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_DIFF),
+            "a run-branch commit must clear the code-evidence floor (instrument 2)"
+        );
+    }
+
+    /// UNBOUND exemption: with no worktree there is no diff a build could leave, so the code
+    /// arm never fires — the prose floor is the only floor an unbound run can carry.
+    #[test]
+    fn an_unbound_code_creator_stays_on_the_prose_floor_only() {
+        let run_id = "code-floor-unbound";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, run_id, PhaseRole::Creator, true, None);
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (_session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_DIFF),
+            "an unbound run has no worktree to leave a diff in — the code arm must not fire"
+        );
+    }
+
+    /// A NON-code Creator (recon/design phases) legitimately produces prose only: bound + clean
+    /// worktree + long prose must keep passing exactly as before this floor existed.
+    #[test]
+    fn a_non_code_creator_with_prose_still_clears_the_gate() {
+        let wt = git_worktree("prose-only");
+        let run_id = "code-floor-prose-only";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            false,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (_session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_DIFF),
+            "a phase that never declared executes_code must not be held to the diff floor"
+        );
+    }
+
+    /// Evaluator exemption: an `executes_code` EVALUATOR (e.g. a test phase running the suite)
+    /// produces a verdict, not a diff — it carries its own pinned floors (`builtin_floors`).
+    #[test]
+    fn an_executes_code_evaluator_is_exempt() {
+        let wt = git_worktree("evaluator");
+        let run_id = "code-floor-evaluator";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Evaluator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (_session, unit) = fold(&mut store, &mut subs, run_id, &prose(), true);
+
+        assert_ne!(
+            unit.denial_reason.as_deref(),
+            Some(NO_DIFF),
+            "an Evaluator's output is a verdict over another unit's work, never a diff"
+        );
+    }
+
+    /// UNGOVERNED exemption: like the prose arm, this is a governance floor — the engine's own
+    /// internal phases and ungoverned runs are untouched.
+    #[test]
+    fn an_ungoverned_code_creator_still_completes() {
+        let wt = git_worktree("ungoverned");
+        let run_id = "code-floor-ungoverned";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, run_id, &prose(), false);
+
+        assert_eq!(
+            session.status,
+            SessionStatus::Completed,
+            "an ungoverned code fold must complete, never trip the code-evidence floor"
+        );
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(unit.denial_reason, None);
+    }
+
+    /// The tie: a SHORT output on a code creator over a clean worktree trips BOTH arms — the
+    /// pre-existing prose rejection keeps its exact record shape (`NO_SUBSTANCE`), so the new
+    /// arm only ever rejects folds that previously passed.
+    #[test]
+    fn a_short_output_keeps_the_prose_denial_shape() {
+        let wt = git_worktree("tie");
+        let run_id = "code-floor-tie";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            run_id,
+            PhaseRole::Creator,
+            true,
+            Some(wt.to_string_lossy().into_owned()),
+        );
+        let mut subs = crate::event_log::EventSink::default();
+
+        let (session, unit) = fold(&mut store, &mut subs, run_id, "done.", true);
+
+        assert_eq!(session.status, SessionStatus::Failed);
+        assert_eq!(
+            unit.denial_reason.as_deref(),
+            Some(NO_SUBSTANCE),
+            "when both arms apply, the pre-existing prose denial wins the tie"
         );
     }
 }

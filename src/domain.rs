@@ -308,6 +308,21 @@ pub struct WorkUnit {
     /// run resolved to.
     #[serde(default)]
     pub required_deliverables: Vec<String>,
+    /// Whether this unit's backing phase declared [`executes_code`](crate::workflow::PhaseDef::executes_code)
+    /// — carried verbatim at plan time, the same way stage/role/gate flow from the def
+    /// (crew#311 / core#297 §2).
+    ///
+    /// One consumer: the CODE-EVIDENCE arm of the phase-substance gate in
+    /// `actor::apply_step_result`. A governed Creator unit carrying this flag in a BOUND run may
+    /// not fold Ok over an untouched worktree — its entire job was a diff, and prose of any
+    /// length is not that evidence. Without this field the fold had no route back to the def's
+    /// declaration (the session records only a synthetic `wf-<session>` id), exactly the gap
+    /// `depends_on` closed for context.
+    ///
+    /// `#[serde(default)]` + skip-if-false: units persisted before this field deserialize, and
+    /// non-code units serialize byte-identical to before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub executes_code: bool,
     /// The exact command this unit runs when `PhaseExecutor::Tool` (carried from the phase def).
     /// `None` for Agent-executor units. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,6 +520,7 @@ impl WorkUnit {
             role: crate::workflow::PhaseRole::default(),
             validator: None,
             required_deliverables: Vec::new(),
+            executes_code: false,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
             depends_on: Vec::new(),
@@ -797,6 +813,28 @@ mod tests {
             u, back,
             "WorkUnit must survive a node round-trip losslessly"
         );
+    }
+
+    /// crew#311 / core#297 §2 back-compat: `executes_code` round-trips when set, serializes to
+    /// NOTHING when false (non-code units stay byte-identical to before the field existed), and a
+    /// unit persisted before the field existed still loads as `false`.
+    #[test]
+    fn executes_code_is_additive_on_the_persisted_unit() {
+        let mut marked = WorkUnit::pending("s-demo:build", "s-demo", 1, "build the feature");
+        marked.executes_code = true;
+        let back = WorkUnit::from_node(&marked.to_node()).expect("from_node");
+        assert!(back.executes_code, "true must survive the round-trip");
+
+        let unmarked = WorkUnit::pending("s-demo:u1", "s-demo", 1, "Do step one");
+        assert!(
+            !unmarked.to_node().metadata.contains_key("executes_code"),
+            "false must not serialize — unmarked units stay byte-identical"
+        );
+
+        let mut node = unmarked.to_node();
+        node.metadata.remove("executes_code"); // already absent; belt and braces
+        let legacy = WorkUnit::from_node(&node).expect("a pre-field unit still loads");
+        assert!(!legacy.executes_code, "absent deserializes to false");
     }
 
     /// A unit distributed before `seated` existed must still load. `WorkUnit::from_node` parses the
