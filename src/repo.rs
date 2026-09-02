@@ -662,9 +662,10 @@ pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
         Ok((false, _, err)) => {
             eprintln!(
                 "wicked-core: keeping worktree {} — git refused a non-forced remove ({}); it \
-                 likely holds uncommitted work the wicked/{run_id} branch does not carry",
+                 likely holds uncommitted work the {} branch does not carry",
                 wt.display(),
-                err.trim()
+                err.trim(),
+                worktree_branch(run_id)
             );
             false
         }
