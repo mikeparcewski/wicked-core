@@ -447,12 +447,69 @@ pub(crate) fn is_live_worktree(wt: &Path) -> bool {
     matches!(git(p, &["rev-parse", "--git-dir"]), Ok((true, _, _)))
 }
 
+// ── Worktree ownership (core#337, the collision half) ────────────────────────────────────────────
+//
+// The colon tier of [`sanitize_worktree_id`] is deliberately hashless (crew#390/#391 branch
+// parity), so two DISTINCT raw run ids can spell the SAME worktree name: `a-b:c:a0` and
+// `a:b-c:a0` both flatten to `a-b-c-a0`. Names alone therefore cannot keep colliding runs apart —
+// ownership does. Each minted (or adopted) worktree carries the RAW run id it belongs to in a
+// marker file inside its git ADMIN directory (`<repo>/.git/worktrees/<name>/wicked-run-id` —
+// never the working tree, so `git status` stays clean, and the marker dies with the worktree on
+// remove/prune). `create_worktree` refuses to hand a marked tree to a different raw id, and the
+// destructive forms (`remove_worktree`, `reap_worktree_if_clean`) refuse to touch one — a
+// colliding run's cancel/terminal cleanup derives the OWNER's path (actor.rs keys both on
+// `repo_ref` alone), and without the guard it would reap or force-remove a live run's tree.
+
+/// The worktree's git admin directory (`<repo>/.git/worktrees/<name>`) — resolvable only while
+/// the tree is a live worktree.
+fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
+    let p = wt.to_str()?;
+    match git(p, &["rev-parse", "--absolute-git-dir"]) {
+        Ok((true, out, _)) if !out.is_empty() => Some(PathBuf::from(out)),
+        _ => None,
+    }
+}
+
+/// The RAW run id a live worktree was minted (or adopted) for — `None` when unmarked: a tree from
+/// a pre-marker engine, or one a downstream pre-provisioned (crew#390/#391).
+fn worktree_owner(wt: &Path) -> Option<String> {
+    let marker = worktree_admin_dir(wt)?.join("wicked-run-id");
+    let owner = std::fs::read_to_string(marker).ok()?;
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
+/// Record `run_id` as the worktree's owner. Best-effort: an unmarked tree degrades to the
+/// pre-marker adopt-on-reuse behavior, it never fails a run.
+fn stamp_worktree_owner(wt: &Path, run_id: &str) {
+    if let Some(dir) = worktree_admin_dir(wt) {
+        let _ = std::fs::write(dir.join("wicked-run-id"), run_id);
+    }
+}
+
+/// Whether a DESTRUCTIVE operation keyed by `run_id` may touch the tree at `wt`. True when the
+/// tree is unmarked (pre-marker mints, downstream-provisioned trees), or the marker matches the
+/// key — either verbatim (a run cleaning its own tree) or via [`sanitize_worktree_id`] (the
+/// startup reaper keys by directory NAME, which is the owner's sanitized spelling). False means
+/// the tree belongs to a DIFFERENT raw run id that merely spells the same name — leave it alone.
+fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
+    match worktree_owner(wt) {
+        None => true,
+        Some(owner) => owner == run_id || sanitize_worktree_id(&owner) == run_id,
+    }
+}
+
 /// Create an isolated git worktree for `run_id` at `<repo>/wicked-worktrees/<id>` on a fresh
 /// `wicked/<id>` branch, where `<id>` is [`sanitize_worktree_id`]'s spelling of the run id
 /// (core#337 — campaign run ids carry `:`, illegal in a git ref and on NTFS; plain ids pass
 /// through byte-for-byte). Idempotent for a genuine resume: a live worktree already at the path is
 /// reused — including one a downstream pre-provisioned at the RAW id spelling (crew#390/#391).
-/// Returns the worktree path.
+/// Reuse is OWNER-only: a live tree marked for a DIFFERENT raw run id that merely spells the same
+/// sanitized name (the hashless colon tier) is refused loudly, never shared — see the worktree
+/// ownership section above [`worktree_owner`]. Returns the worktree path.
 ///
 /// The reuse test is [`is_live_worktree`], not `is_dir()`. It used to be `is_dir()`, and the
 /// difference is FINDING-059: `remove_worktree` falls back to `remove_dir_all`, a partial removal
@@ -467,6 +524,21 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
     let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
         if is_live_worktree(&wt) {
+            // A genuine resume reuses the tree — but only the OWNER resumes. Two distinct raw
+            // ids can spell the same worktree name (the hashless colon tier, core#337), and
+            // handing one run's live tree to another would silently interleave their work.
+            match worktree_owner(&wt) {
+                Some(owner) if owner != run_id => anyhow::bail!(
+                    "worktree {} already belongs to run {owner} — run {run_id}'s sanitized \
+                     name collides with it (two distinct run ids can spell the same worktree \
+                     name); refusing to share one working tree between two runs",
+                    wt.display()
+                ),
+                Some(_) => {}
+                // Unmarked: a pre-marker mint resolved FOR this id, or a tree a downstream
+                // pre-provisioned for exactly this run (crew#390/#391) — adopt it.
+                None => stamp_worktree_owner(&wt, run_id),
+            }
             return Ok(wt); // genuine resume — reuse it
         }
         // Not a worktree. Recoverable only while it holds nothing: an empty shell can be cleared and
@@ -503,6 +575,7 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
             anyhow::bail!("git worktree add failed: {err}{err2}");
         }
     }
+    stamp_worktree_owner(&wt, run_id);
     Ok(wt)
 }
 
@@ -513,6 +586,17 @@ pub fn create_worktree(repo_root: &str, run_id: &str) -> anyhow::Result<PathBuf>
 /// A run that merely FINISHED goes through [`reap_worktree_if_clean`] instead (FINDING-003).
 pub fn remove_worktree(repo_root: &str, run_id: &str) {
     let wt = worktree_path(repo_root, run_id);
+    // A colliding run id derives the OWNER's path (core#337, hashless colon tier) — and this is
+    // the FORCE form, so touching a tree minted for a different raw id would destroy a live
+    // run's work. The colliding run never held a tree here; there is nothing of its own to remove.
+    if !may_touch_worktree(&wt, run_id) {
+        eprintln!(
+            "wicked-core: not removing worktree {} for run {run_id} — it belongs to a \
+             different run whose id spells the same worktree name",
+            wt.display()
+        );
+        return;
+    }
     let wt_str = wt.to_string_lossy().to_string();
     let _ = git(repo_root, &["worktree", "remove", "--force", &wt_str]);
     // If git refused (e.g. already gone), drop the dir directly.
@@ -537,6 +621,18 @@ pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
     if !wt.is_dir() {
         // Nothing on disk. Drop any dangling admin entry so the path is re-usable.
         let _ = git(repo_root, &["worktree", "prune"]);
+        return true;
+    }
+    // The tree at the derived path may belong to a DIFFERENT raw run id that spells the same
+    // worktree name (core#337, hashless colon tier). A clean live tree is exactly what the
+    // non-forced remove below would take, so the ownership check has to come first. `run_id`
+    // itself never held a tree here — its reap is trivially complete.
+    if !may_touch_worktree(&wt, run_id) {
+        eprintln!(
+            "wicked-core: not reaping worktree {} for run {run_id} — it belongs to a \
+             different run whose id spells the same worktree name",
+            wt.display()
+        );
         return true;
     }
     let wt_str = wt.to_string_lossy().to_string();
@@ -1812,6 +1908,127 @@ mod tests {
         assert!(
             !wt_done.exists(),
             "a clean terminal campaign tree converges"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADVERSARIAL PROBE (core#337): the colon tier is deliberately hashless (crew#390/#391
+    /// branch parity), so two DISTINCT campaign run ids can sanitize IDENTICALLY —
+    /// `a-b:c:a0` and `a:b-c:a0` both spell `a-b-c-a0`. The second dispatch must NOT silently
+    /// share the first run's live working tree: it fails loudly, and the owner's tree (work
+    /// included) survives untouched.
+    #[test]
+    fn create_worktree_refuses_a_colliding_campaign_id() {
+        let root = git_repo("collide");
+        let p = root.to_str().unwrap();
+        assert_eq!(
+            sanitize_worktree_id("a-b:c:a0"),
+            sanitize_worktree_id("a:b-c:a0"),
+            "precondition — the two ids flatten identically"
+        );
+        let wt_x = create_worktree(p, "a-b:c:a0").unwrap();
+        std::fs::write(wt_x.join("owner-work.txt"), "X\n").unwrap();
+
+        let res = create_worktree(p, "a:b-c:a0");
+        assert!(
+            res.is_err(),
+            "a colliding id must be refused, not handed the owner's tree: {res:?}"
+        );
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(
+            msg.contains("a-b:c:a0"),
+            "the refusal names the owning run: {msg}"
+        );
+        assert!(
+            is_live_worktree(&wt_x)
+                && std::fs::read_to_string(wt_x.join("owner-work.txt")).unwrap() == "X\n",
+            "the owner's tree and work survive the refusal"
+        );
+        // The owner itself still resumes.
+        assert_eq!(create_worktree(p, "a-b:c:a0").unwrap(), wt_x);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADVERSARIAL PROBE (core#337): the colliding run's own CLEANUP is the other half —
+    /// `cancel_run` force-removes and `reap_terminal_worktree` reaps by DERIVING the path from
+    /// the run id (actor.rs keys them on `repo_ref` alone), and a colliding id derives the
+    /// OWNER's path. Neither destructive form may touch a tree that was minted for a different
+    /// raw run id.
+    #[test]
+    fn cleanup_keyed_by_a_colliding_id_never_touches_the_owners_tree() {
+        let root = git_repo("collide-reap");
+        let p = root.to_str().unwrap();
+        let wt_x = create_worktree(p, "a-b:c:a0").unwrap();
+        // X's tree is CLEAN — exactly the state a non-forced reap would happily remove.
+
+        assert!(
+            reap_worktree_if_clean(p, "a:b-c:a0"),
+            "the colliding run has nothing on disk — its reap converges (returns true)"
+        );
+        assert!(
+            is_live_worktree(&wt_x),
+            "a colliding TERMINAL run's reap must not remove the owner's clean live tree"
+        );
+
+        remove_worktree(p, "a:b-c:a0"); // cancel_run's force-discard spelling
+        assert!(
+            is_live_worktree(&wt_x),
+            "a colliding CANCELLED run's force-remove must not destroy the owner's tree"
+        );
+
+        // The owner's own cleanup still works — ownership guards the tree, not the reap.
+        assert!(reap_worktree_if_clean(p, "a-b:c:a0"));
+        assert!(!wt_x.exists(), "the owner's keyed reap still converges");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The core#337 repro end-to-end at the id's SOURCE: the run id comes from the engine's own
+    /// dispatch rule ([`crate::campaign::Campaign::derive_run_id`], §2.1) — not a hand-spelled
+    /// lookalike — and provisions through [`create_worktree`]. The test also pins WHY main
+    /// failed: git itself refuses the verbatim `wicked/{run_id}` branch main used to mint.
+    #[test]
+    fn a_dispatch_derived_campaign_run_id_provisions_through_the_engine_path() {
+        let def = crate::campaign::CampaignDef {
+            id: "web-refresh".into(),
+            name: String::new(),
+            nodes: vec![crate::campaign::CampaignNode {
+                node_id: "lint".into(),
+                run_spec: crate::campaign::RunSpec {
+                    problem: "p".into(),
+                    clis: vec![],
+                    entity_mode: crate::scope::EntityMode::Shared,
+                    human_confirm: crate::domain::HumanConfirm::None,
+                    repo_ref: Some("r".into()),
+                    workflow_id: None,
+                },
+            }],
+            edges: vec![],
+            policy: crate::campaign::FailurePolicy::default(),
+            max_concurrency: 1,
+        };
+        crate::campaign::validate(&def).unwrap();
+        let campaign = crate::campaign::Campaign::new(def);
+        let rid = campaign.derive_run_id("lint");
+        assert_eq!(rid, "web-refresh:lint:a0", "the §2.1 id rule");
+
+        let root = git_repo("dispatch");
+        let p = root.to_str().unwrap();
+        // Main's spelling: branch `wicked/{run_id}` VERBATIM — git refuses it outright.
+        let (ok, _, _) = git(
+            p,
+            &["check-ref-format", "--branch", &format!("wicked/{rid}")],
+        )
+        .unwrap();
+        assert!(
+            !ok,
+            "precondition — the verbatim campaign branch is what git refuses"
+        );
+
+        let wt = create_worktree(p, &rid).expect("the engine provisions the campaign node");
+        assert!(is_live_worktree(&wt));
+        assert_eq!(
+            wt.file_name().unwrap().to_str().unwrap(),
+            "web-refresh-lint-a0"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
