@@ -826,6 +826,15 @@ struct AcpProcess {
     _stderr_reader: Option<std::thread::JoinHandle<()>>,
     session_id: String,
     next_id: u64,
+    /// Whether this session's `initialize` advertised the elicitation capability.
+    /// Computed exactly once in `start_acp_process` (from the adapter BINARY via
+    /// `elicitation_verified_adapter`) and read by `exec_turn_acp`'s turn-time gate,
+    /// so advertisement and turn-time behavior are the same decision by construction —
+    /// a seat can never advertise elicitation and then auto-cancel it, nor serve what
+    /// it never advertised (core#341: the old turn-time gate keyed on the registry
+    /// `cli_key`, so the stock `claude` seat — key `claude`, binary `claude-agent-acp` —
+    /// advertised the capability and then cancelled every `elicitation/create`).
+    elicitation_advertised: bool,
 }
 
 impl Drop for AcpProcess {
@@ -1459,9 +1468,13 @@ fn start_acp_process(
     }
 
     // Advertise elicitation/form support only to adapters in the verified allow-list
-    // (ELICITATION_VERIFIED_ADAPTERS). Other adapters receive no elicitation capability so
+    // (ELICITATION_VERIFIED_ADAPTERS, matched on the binary's file stem — see
+    // `elicitation_verified_adapter`). Other adapters receive no elicitation capability so
     // they cannot suspend turns waiting for a human response that will never arrive.
-    let form_enabled = ELICITATION_VERIFIED_ADAPTERS.contains(&config.binary.as_str());
+    // This decision is made exactly ONCE per session, here, and stored on the returned
+    // `AcpProcess` (`elicitation_advertised`) — turn-time gating reads that stored flag,
+    // so advertisement and `elicitation/create` handling cannot diverge (core#341).
+    let form_enabled = elicitation_verified_adapter(&config.binary);
     // `permission: true` says this client ANSWERS session/request_permission. Without it the
     // bridge never asks, which is exactly why the ACP path ran ungoverned (FINDING-060/062).
     //
@@ -1616,6 +1629,7 @@ fn start_acp_process(
         _stderr_reader: stderr_reader,
         session_id,
         next_id,
+        elicitation_advertised: form_enabled,
     })
 }
 
@@ -1841,13 +1855,32 @@ fn note_write_failure(
 }
 
 /// ACP adapters verified to correctly serialize tool execution across the
-/// `elicitation/create` suspension boundary (OQ-R-6). Only adapters on this list
-/// may receive `elicitation/create` via the allow-list guard in `exec_turn_acp`.
+/// `elicitation/create` suspension boundary (OQ-R-6). Entries are adapter BINARY
+/// names (never registry `cli_key`s — keys diverge from binaries: the stock `claude`
+/// seat runs the `claude-agent-acp` bridge), matched by [`elicitation_verified_adapter`].
+/// The one consumer is `start_acp_process`, which both advertises the capability and
+/// stores the decision on `AcpProcess::elicitation_advertised` for the turn-time gate
+/// in `exec_turn_acp` — one predicate, one evaluation, both sites (core#341).
 ///
 /// Adding a new adapter REQUIRES a verifiable artifact (link to passing integration
 /// test run or source-code audit in the PR description) — self-assertion alone is
 /// insufficient (spec §Ask first).
 const ELICITATION_VERIFIED_ADAPTERS: &[&str] = &["claude-agent-acp", "codex-acp"];
+
+/// Whether `binary` is one of the [`ELICITATION_VERIFIED_ADAPTERS`], classified by the
+/// binary's file STEM — the same rationale as `binary_is_claude` (core#341): registry
+/// records and clis.toml overlays may point at an absolute path (`/opt/bin/claude-agent-acp`)
+/// or a platform-suffixed name (`claude-agent-acp.cmd` — the Windows spawn retry), and all
+/// of those run the same verified bridge code. Registry `cli_key`s (e.g. `claude`,
+/// `codex`, or an aliased `claude-eval`) never reach this predicate — the capability is a
+/// property of the adapter program, not of the seat name.
+fn elicitation_verified_adapter(binary: &str) -> bool {
+    std::path::Path::new(binary)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|stem| ELICITATION_VERIFIED_ADAPTERS.contains(&stem))
+        .unwrap_or(false)
+}
 
 /// Dual-poll interval for the `'elicit` loop: check the resolution channel AND
 /// drain stdout every 50 ms to prevent the ACP adapter's stdout buffer from filling
@@ -2177,7 +2210,6 @@ fn exec_turn_acp(
     elicitation_maps: Arc<Mutex<ElicitationMaps>>,
     run_id: &str,
     epoch: u64,
-    adapter_key: &str,
     tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
 ) -> anyhow::Result<TurnResult> {
@@ -2189,9 +2221,13 @@ fn exec_turn_acp(
     // this held to detect an in-flight write (FINDING-254 / core#254).
     let write_lock = Arc::clone(&proc.write_lock);
 
-    // Elicitation is gated on a non-zero epoch AND on the adapter being in the verified
-    // allow-list (OQ-R-6). Chat turns always pass epoch=0 and are never suspended.
-    let elicitation_enabled = epoch > 0 && ELICITATION_VERIFIED_ADAPTERS.contains(&adapter_key);
+    // Elicitation is gated on a non-zero epoch AND on what this session actually
+    // ADVERTISED at initialize (OQ-R-6, core#341). `elicitation_advertised` is the one
+    // decision `start_acp_process` made from the adapter binary — gating on it here means
+    // a seat can never advertise the capability and then auto-cancel `elicitation/create`
+    // at turn time (the old gate keyed on the registry `cli_key`, which diverges from the
+    // binary for every stock seat). Chat turns always pass epoch=0 and are never suspended.
+    let elicitation_enabled = epoch > 0 && proc.elicitation_advertised;
 
     // Build the prompt block array: a contract header, the prior outputs, then the work prompt.
     let mut blocks: Vec<Value> = Vec::new();
@@ -3549,7 +3585,6 @@ impl AcpStepRunner {
                 Arc::clone(&self.elicitation_maps),
                 "",
                 0,
-                cli_key,
                 &self.tx,
                 None,
             )
@@ -4134,7 +4169,6 @@ impl AcpStepRunner {
             Arc::clone(&self.elicitation_maps),
             &run_id,
             input.elicitation_epoch,
-            &cli_key,
             &self.tx,
             gate.as_ref(),
         );
@@ -7075,11 +7109,18 @@ sleep 30
     ///   in-flight `session/prompt` (core#293)
     /// - `"unknown_request"`: sends an `fs/read_text_file` request this client does not implement
     ///   and requires a JSON-RPC error answer (core#293)
+    /// - `"elicit_unadvertised"`: exits nonzero if `initialize` advertised elicitation; then
+    ///   sends an elicitation anyway and tolerates the cancel (core#341 — an UNVERIFIED
+    ///   adapter must neither be advertised the capability nor have it served)
+    ///
+    /// The script is written under `file_name` (core#341): the elicitation capability is now
+    /// decided from the binary's file STEM, so tests name the mock `claude-agent-acp` (via
+    /// [`start_mock_proc`]) to run as a verified adapter, or anything else to run unverified.
     #[cfg(unix)]
-    fn write_mock_acp_py(dir: &std::path::Path) -> std::path::PathBuf {
+    fn write_mock_acp_py(dir: &std::path::Path, file_name: &str) -> std::path::PathBuf {
         // The script uses Python dict literals (which json.dumps handles) to avoid Rust brace
         // escaping in format!. The behavior is controlled entirely via sys.argv[1].
-        let path = dir.join("mock-acp-bridge.py");
+        let path = dir.join(file_name);
         // Write as a raw literal (no format substitutions needed — all braces are Python dict syntax)
         std::fs::write(
             &path,
@@ -7103,8 +7144,9 @@ def r():
             except Exception:
                 pass
 
-# initialize
+# initialize — record whether the client ADVERTISED the elicitation capability (core#341)
 req = r()
+elic_advertised = "elicitation" in ((req.get("params") or {}).get("clientCapabilities") or {})
 w({"jsonrpc": "2.0", "id": req["id"], "result": {
     "protocolVersion": "2025-03-26", "capabilities": {},
     "serverInfo": {"name": "mock", "version": "0"}
@@ -7124,6 +7166,11 @@ if behavior == "ok":
     }})
 
 elif behavior == "elicit_ok":
+    # A turn that is SERVED elicitation must also have been ADVERTISED it (core#341):
+    # the client only serves what it advertised, so a missing capability here means the
+    # session-start and turn-time gates diverged.
+    if not elic_advertised:
+        sys.exit(3)
     # Valid string-schema elicitation: wicked-core must register + deliver via channel
     w({"jsonrpc": "2.0", "id": "elicit-1", "method": "elicitation/create", "params": {
         "message": "What is your name?",
@@ -7146,6 +7193,22 @@ elif behavior == "elicit_disabled":
         "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
     }})
     r()  # receives action:cancel from the disabled path — do NOT assert it is an accept
+    w({"jsonrpc": "2.0", "id": prompt_id, "result": {
+        "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
+    }})
+
+elif behavior == "elicit_unadvertised":
+    # core#341 regression: an UNVERIFIED adapter must not be advertised the capability…
+    if elic_advertised:
+        sys.exit(4)
+    # …and an elicitation it sends anyway must be auto-cancelled, never suspend the turn.
+    w({"jsonrpc": "2.0", "id": "elicit-1", "method": "elicitation/create", "params": {
+        "message": "What is your name?",
+        "requestedSchema": {"type": "object", "properties": {"name": {"type": "string"}}}
+    }})
+    resp = r()  # must be the immediate action:cancel, not a human-delivered accept
+    if resp is None or (resp.get("result") or {}).get("action") != "cancel":
+        sys.exit(5)
     w({"jsonrpc": "2.0", "id": prompt_id, "result": {
         "stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}
     }})
@@ -7347,11 +7410,21 @@ else:
         path
     }
 
-    /// Start a mock ACP process using the shared Python bridge script.
+    /// Start a mock ACP process using the shared Python bridge script, written under the
+    /// VERIFIED adapter name `claude-agent-acp` (core#341): the elicitation capability is
+    /// decided from the binary's file stem, so this mock is advertised — and served —
+    /// elicitation exactly like the stock claude seat's bridge.
     /// The `behavior` string is passed as `start_args[0]` to the script.
     #[cfg(unix)]
     fn start_mock_proc(dir: &std::path::Path, behavior: &str) -> AcpProcess {
-        let py_path = write_mock_acp_py(dir);
+        start_mock_proc_named(dir, behavior, "claude-agent-acp")
+    }
+
+    /// [`start_mock_proc`] with an explicit script file name, for tests that need an
+    /// UNVERIFIED adapter (any stem not in `ELICITATION_VERIFIED_ADAPTERS`).
+    #[cfg(unix)]
+    fn start_mock_proc_named(dir: &std::path::Path, behavior: &str, file_name: &str) -> AcpProcess {
+        let py_path = write_mock_acp_py(dir, file_name);
         let config = AcpConfig {
             binary: py_path.to_string_lossy().to_string(),
             start_args: vec![behavior.to_string()],
@@ -7392,7 +7465,6 @@ else:
             maps,
             "run-t12",
             0, // epoch=0 → disabled
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7403,6 +7475,344 @@ else:
             "turn must complete ok when elicitation is disabled: {:?}",
             result.status
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── core#341: ONE source of truth for elicitation support ─────────────────────────
+
+    /// core#341 — the verified-adapter predicate classifies by the binary's file STEM, so
+    /// every seat shape resolves the same way: bare binary names, absolute paths, platform
+    /// suffixes. Registry KEYS (`claude`, `codex`, aliased seats) are NOT verified names —
+    /// gating on them is the exact divergence #341 closes.
+    #[test]
+    fn elicitation_verified_adapter_classifies_by_binary_stem() {
+        // The verified bridges, in every shape a registry/clis.toml record can spell them.
+        for verified in [
+            "claude-agent-acp",
+            "codex-acp",
+            "/opt/bridges/claude-agent-acp",
+            "claude-agent-acp.cmd", // the Windows spawn retry's shape
+            "./relative/codex-acp",
+        ] {
+            assert!(
+                elicitation_verified_adapter(verified),
+                "must be verified: {verified:?}"
+            );
+        }
+        // Registry keys, the wrapped CLIs, and arbitrary bridges are NOT verified.
+        for unverified in [
+            "claude", // the stock seat's KEY — the old turn-time gate checked this
+            "codex",
+            "claude-eval", // an aliased seat's key
+            "agy-acp",
+            "mock-acp-bridge.py",
+            "",
+        ] {
+            assert!(
+                !elicitation_verified_adapter(unverified),
+                "must not be verified: {unverified:?}"
+            );
+        }
+    }
+
+    /// core#341 — the stock seats' elicitation support is a property of their ACP BINARY.
+    /// The built-in `claude` seat (key `claude`, bridge `claude-agent-acp`) and `codex`
+    /// seat (key `codex`, bridge `codex-acp`) must classify as verified through the one
+    /// predicate both sites use — while the old key-based lookup returns false for every
+    /// stock seat, which is exactly how `claude` advertised elicitation and then
+    /// auto-cancelled it at turn time.
+    #[test]
+    fn stock_seats_support_elicitation_by_binary_not_by_key() {
+        let builtin = wicked_council::registry::builtin();
+        for key in ["claude", "codex"] {
+            let seat = builtin
+                .iter()
+                .find(|c| c.key == key)
+                .unwrap_or_else(|| panic!("builtin registry must have a '{key}' seat"));
+            let acp = seat
+                .acp
+                .as_ref()
+                .unwrap_or_else(|| panic!("stock '{key}' seat must have an ACP config"));
+            assert!(
+                elicitation_verified_adapter(&acp.binary),
+                "stock '{key}' seat's bridge ({}) must be elicitation-verified",
+                acp.binary
+            );
+            // The divergence regression: the seat KEY is not a verified adapter name, so any
+            // gate that consults the key disagrees with the advertisement for every stock seat.
+            assert!(
+                !ELICITATION_VERIFIED_ADAPTERS.contains(&seat.key.as_str()),
+                "ELICITATION_VERIFIED_ADAPTERS holds BINARY names; seat key '{}' must not \
+                 appear in it (keys are not a capability truth — core#341)",
+                seat.key
+            );
+        }
+        // Advertisement and turn-time behavior are the same stored decision for EVERY seat:
+        // both read `AcpProcess::elicitation_advertised`, which is derived from the binary.
+        // Spot-check the derivation for every builtin ACP seat so a future roster entry
+        // cannot reintroduce a key that shadows a verified binary stem.
+        for seat in builtin.iter().filter(|c| c.acp.is_some()) {
+            let advertised = elicitation_verified_adapter(&seat.acp.as_ref().unwrap().binary);
+            let old_key_gate = ELICITATION_VERIFIED_ADAPTERS.contains(&seat.key.as_str());
+            assert!(
+                !old_key_gate || advertised,
+                "seat '{}': key-based gating would serve elicitation that was never \
+                 advertised",
+                seat.key
+            );
+        }
+    }
+
+    /// core#341 regression (the fixed side): a VERIFIED adapter both advertises elicitation
+    /// at session start AND has it served at turn time. The mock bridge runs under the
+    /// verified name `claude-agent-acp` and exits nonzero if `initialize` did NOT advertise
+    /// the capability, so a re-divergence fails this test at the wire, not just in the flag.
+    #[test]
+    #[cfg(unix)]
+    fn verified_adapter_advertises_and_serves_elicitation() {
+        let dir = std::env::temp_dir().join(format!("wicked-341-served-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut proc = start_mock_proc(&dir, "elicit_ok");
+        assert!(
+            proc.elicitation_advertised,
+            "a verified adapter's session must record the advertised capability"
+        );
+
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        // Deliver the human response from a concurrent thread so 'elicit doesn't time out.
+        let maps_clone = Arc::clone(&maps);
+        let deliver_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let m = maps_clone.lock().unwrap();
+            let elicitation_id = m.pending.keys().next().cloned();
+            drop(m);
+            if let Some(id) = elicitation_id {
+                let mut m = maps_clone.lock().unwrap();
+                let _ = m.deliver(
+                    "run-341-served",
+                    &id,
+                    "accept".to_string(),
+                    Some(serde_json::json!("Alice")),
+                );
+            }
+        });
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            Arc::clone(&maps),
+            "run-341-served",
+            1, // governed epoch: the capability question is decided by the ADAPTER alone
+            &tx,
+            None,
+        )
+        .unwrap();
+        deliver_thread.join().unwrap();
+
+        // elicit_ok exits 2 if the accept never arrived and 3 if the capability was not
+        // advertised — either kills the prompt and this turn would not be Ok.
+        assert_eq!(
+            result.status,
+            StepStatus::Ok,
+            "verified adapter must be advertised AND served elicitation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#341 regression (the auto-cancel divergence): an UNVERIFIED adapter must get the
+    /// capability at NEITHER site — no advertisement at `initialize`, and an immediate
+    /// `action:cancel` if it elicits anyway, even in a governed (non-zero) epoch. The mock
+    /// exits nonzero if it was advertised the capability or if the cancel never arrived.
+    #[test]
+    #[cfg(unix)]
+    fn unverified_adapter_neither_advertises_nor_serves_elicitation() {
+        let dir = std::env::temp_dir().join(format!("wicked-341-unadv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Any stem outside ELICITATION_VERIFIED_ADAPTERS — the pre-#341 mock's own name.
+        let mut proc = start_mock_proc_named(&dir, "elicit_unadvertised", "mock-acp-bridge.py");
+        assert!(
+            !proc.elicitation_advertised,
+            "an unverified adapter's session must not record the capability"
+        );
+
+        let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let noop: &DeltaSink = &|_: &str| {};
+
+        let result = exec_turn_acp(
+            &mut proc,
+            "go",
+            &[],
+            noop,
+            Duration::from_secs(5),
+            maps,
+            "run-341-unadv",
+            1, // epoch>0: only the adapter's (un)verified status disables elicitation here
+            &tx,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            result.status,
+            StepStatus::Ok,
+            "unverified adapter's elicitation must be auto-cancelled and the turn completed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#341 adversarial probe: SEATS whose key and binary disagree, in BOTH directions,
+    /// loaded through the real user-overlay seam (`registry::load` with a clis.toml — the
+    /// same loader `registry_record`/`acp_config_for` consult) and driven to the wire. The
+    /// seat KEY must be inert at both sites:
+    ///
+    /// - a custom seat whose KEY is spelled exactly like the verified bridge
+    ///   (`claude-agent-acp`) over an UNVERIFIED binary must not be advertised the
+    ///   capability, and an elicitation it raises anyway is auto-cancelled — the old
+    ///   key-based turn gate would have SERVED this seat what was never advertised
+    /// - a custom seat with an arbitrary key over the VERIFIED bridge binary (spelled as an
+    ///   absolute path, the clis.toml shape) must be advertised AND served — the old key
+    ///   gate auto-cancelled this shape, which is the stock-`claude`-seat bug itself
+    ///
+    /// The mock asserts advertisement at the wire (exit 3/4) and the serve/cancel behavior
+    /// (exit 2/5), so advertisement == turn-time handling is proven per direction.
+    #[test]
+    #[cfg(unix)]
+    fn seat_key_is_inert_for_elicitation_in_both_divergence_directions() {
+        let dir = std::env::temp_dir().join(format!("wicked-341-seatkey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Two mock bridges: one under the VERIFIED stem, one under an arbitrary name.
+        let verified_bridge = write_mock_acp_py(&dir, "claude-agent-acp");
+        let custom_bridge = write_mock_acp_py(&dir, "my-custom-bridge");
+
+        // A user overlay whose seats cross key and binary in both directions.
+        let toml_path = dir.join("clis.toml");
+        std::fs::write(
+            &toml_path,
+            format!(
+                r#"
+[[cli]]
+key = "claude-agent-acp"
+display_name = "Verified-looking key, unverified bridge"
+binary = "irrelevant"
+headless_invocation = "irrelevant \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{custom}"
+start_args = ["elicit_unadvertised"]
+transport = "stdio"
+
+[[cli]]
+key = "totally-custom"
+display_name = "Arbitrary key, verified bridge"
+binary = "irrelevant"
+headless_invocation = "irrelevant \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{verified}"
+start_args = ["elicit_ok"]
+transport = "stdio"
+"#,
+                custom = custom_bridge.display(),
+                verified = verified_bridge.display(),
+            ),
+        )
+        .unwrap();
+
+        let merged = wicked_council::registry::load(Some(&toml_path)).expect("overlay must parse");
+
+        for (key, expect_advertised) in [("claude-agent-acp", false), ("totally-custom", true)] {
+            let seat = merged
+                .iter()
+                .find(|c| c.key == key)
+                .unwrap_or_else(|| panic!("overlay seat '{key}' must be in the merged registry"));
+            let acp = seat
+                .acp
+                .as_ref()
+                .unwrap_or_else(|| panic!("overlay seat '{key}' must carry [cli.acp]"));
+
+            // The one predicate both sites share must classify by the BINARY alone.
+            assert_eq!(
+                elicitation_verified_adapter(&acp.binary),
+                expect_advertised,
+                "seat '{key}': elicitation is a property of the binary, never the key"
+            );
+
+            let run_id = format!("run-341-seatkey-{key}");
+            let mut proc = {
+                // Hold the env read-lock across the start (core#285) like `start_mock_proc`.
+                let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+                start_acp_process(acp, &dir, None, None)
+                    .unwrap_or_else(|e| panic!("seat '{key}' mock start failed: {e}"))
+            };
+            assert_eq!(
+                proc.elicitation_advertised, expect_advertised,
+                "seat '{key}': the stored advertisement decision must follow the binary"
+            );
+
+            let maps = Arc::new(Mutex::new(ElicitationMaps::new()));
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let noop: &DeltaSink = &|_: &str| {};
+
+            // For the served direction, deliver the human response from a concurrent
+            // thread (polling: the elicitation registers mid-turn).
+            let deliver_thread = expect_advertised.then(|| {
+                let maps_clone = Arc::clone(&maps);
+                let run_id = run_id.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..80 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let pending = {
+                            let m = maps_clone.lock().unwrap();
+                            m.pending.keys().next().cloned()
+                        };
+                        if let Some(id) = pending {
+                            let mut m = maps_clone.lock().unwrap();
+                            let _ = m.deliver(
+                                &run_id,
+                                &id,
+                                "accept".to_string(),
+                                Some(serde_json::json!("Alice")),
+                            );
+                            return;
+                        }
+                    }
+                })
+            });
+
+            let result = exec_turn_acp(
+                &mut proc,
+                "go",
+                &[],
+                noop,
+                Duration::from_secs(5),
+                Arc::clone(&maps),
+                &run_id,
+                1, // governed epoch: only the adapter's binary decides the capability
+                &tx,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("seat '{key}' turn failed: {e}"));
+            if let Some(t) = deliver_thread {
+                t.join().unwrap();
+            }
+
+            // The mock exits nonzero on any advertisement/serve divergence, which would
+            // kill the prompt mid-turn and the status would not be Ok.
+            assert_eq!(
+                result.status,
+                StepStatus::Ok,
+                "seat '{key}': advertisement and turn-time handling must be one decision"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7434,7 +7844,6 @@ else:
                 maps,
                 "run-schema",
                 1,
-                "claude-agent-acp",
                 &tx,
                 None,
             )
@@ -7490,7 +7899,6 @@ else:
             Arc::clone(&maps),
             "run-t15",
             1,
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7535,7 +7943,6 @@ else:
             maps,
             "run-t19",
             1,
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7586,7 +7993,6 @@ else:
             Arc::clone(&maps),
             "run-t20",
             1,
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7641,7 +8047,6 @@ else:
             Arc::clone(&maps),
             "run-293",
             0,
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7670,7 +8075,6 @@ else:
             Arc::clone(&maps),
             "run-293",
             0,
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7725,7 +8129,6 @@ else:
             maps,
             "run-293-unk",
             0,
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -7792,7 +8195,6 @@ else:
             Arc::clone(&maps),
             "run-293-ep",
             1, // epoch > 0 + verified adapter ⇒ elicitation enabled, so 'elicit is entered
-            "claude-agent-acp",
             &tx,
             None,
         )
@@ -8268,7 +8670,6 @@ else:
                 maps,
                 "run-wl-invariant",
                 0,
-                "claude-agent-acp",
                 &cmd_tx,
                 None,
             );
@@ -8365,7 +8766,6 @@ else:
             Arc::clone(&maps_arc),
             "run-cleanup-integration",
             epoch,
-            "claude-agent-acp",
             &cmd_tx,
             None,
         );
