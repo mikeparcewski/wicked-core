@@ -4692,9 +4692,9 @@ fn reprovision_reaped_worktree(
     })?;
     let wt = crate::repo::create_worktree(&repo.root_path, &session.id).map_err(|e| {
         anyhow::anyhow!(
-            "cannot restore the reaped worktree for run {} from branch wicked/{}: {e}",
+            "cannot restore the reaped worktree for run {} from branch {}: {e}",
             session.id,
-            session.id
+            crate::repo::worktree_branch(&session.id)
         )
     })?;
     let mut session = session;
@@ -4708,8 +4708,9 @@ fn reprovision_reaped_worktree(
     };
     eprintln!(
         "wicked-core: run {} resumed with its worktree reaped ({workdir} {was}); re-created it \
-         at {restored} from branch wicked/{} (core#290)",
-        session.id, session.id
+         at {restored} from branch {} (core#290)",
+        session.id,
+        crate::repo::worktree_branch(&session.id)
     );
     session.workdir = Some(restored);
     put_node(store, session.to_node())?;
