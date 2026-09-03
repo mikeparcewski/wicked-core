@@ -1628,8 +1628,11 @@ pub(crate) fn resolve_invocation(cli_key: &str) -> String {
 /// write/temp/socket the verification suite needs. Applying the declared posture here makes the
 /// seat's sandbox/approval declaration actually take effect for the real unit, not just for votes.
 pub(crate) fn resolve_seat_posture(cli_key: &str) -> Vec<String> {
-    let user =
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/wicked-council/clis.toml"));
+    // Resolve the operator clis.toml through the SAME shared helper the vote path uses
+    // (HOME with a USERPROFILE fallback) — a hand-rolled `HOME`-only lookup would silently ignore
+    // the override on Windows (no HOME), diverging the governed-worker posture from the vote posture
+    // (Copilot, crew#427).
+    let user = wicked_council::registry::default_user_path();
     // Cap it before it reaches the argv: on the governed-worker path there is NO compensating
     // control (see [`bound_ungated_posture`]), so the RESOLVED posture — not just the built-in —
     // must be a bounded one. `seat_posture_from` returns the raw declared flags (built-in OR the
@@ -1666,14 +1669,30 @@ pub(crate) fn seat_posture_from(cli_key: &str, user_path: Option<&Path>) -> Vec<
 /// already bounded (the shipped default), so a correctly-migrated operator sees byte-identical argv.
 pub(crate) fn bound_ungated_posture(cli_key: &str, posture: Vec<String>) -> Vec<String> {
     // The tokens that turn a seat's OWN sandbox off (codex 0.148.0 `exec --help`): the blanket
-    // bypass flag, and the `danger-full-access` value of `-s/--sandbox`.
+    // bypass flag, and the `danger-full-access` value of `-s/--sandbox` — as a following token, a
+    // stray token, or an `=`-attached value.
     const FULL_BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
     const UNBOUNDED_SANDBOX_VALUE: &str = "danger-full-access";
     const BOUNDED_SANDBOX_VALUE: &str = "workspace-write";
+    // The recognized `-s/--sandbox` modes. A `--sandbox` whose FOLLOWING token is none of these does
+    // not own it as a value (it is a separate flag, or the value is missing) — so the `--sandbox` is
+    // malformed and must be bounded on its own.
+    const SANDBOX_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
 
-    let unbounded = posture
-        .iter()
-        .any(|f| f == FULL_BYPASS || f == UNBOUNDED_SANDBOX_VALUE);
+    // An `=`-attached sandbox flag: `--sandbox=<mode>` or `-s=<mode>`. Returns the `<mode>`.
+    fn attached_sandbox_mode(tok: &str) -> Option<&str> {
+        tok.strip_prefix("--sandbox=")
+            .or_else(|| tok.strip_prefix("-s="))
+    }
+
+    // Detect every unbounded shape, not just the two-token one: the blanket bypass, a bare
+    // `danger-full-access` (stray or as a `--sandbox` value token), and an `=`-attached
+    // `--sandbox=danger-full-access`. Missing any shape here would let it pass through untouched.
+    let unbounded = posture.iter().any(|f| {
+        f == FULL_BYPASS
+            || f == UNBOUNDED_SANDBOX_VALUE
+            || attached_sandbox_mode(f) == Some(UNBOUNDED_SANDBOX_VALUE)
+    });
     if !unbounded {
         return posture;
     }
@@ -1683,25 +1702,51 @@ pub(crate) fn bound_ungated_posture(cli_key: &str, posture: Vec<String>) -> Vec<
     let mut i = 0;
     while i < posture.len() {
         let flag = &posture[i];
+        // Drop the blanket bypass entirely; a `--sandbox workspace-write` is added below if nothing
+        // else bounds the posture.
         if flag == FULL_BYPASS {
-            // Drop the blanket bypass entirely; a `--sandbox workspace-write` is added below if the
-            // posture carries no other `--sandbox` flag to bound it.
             i += 1;
             continue;
         }
+        // `=`-attached sandbox flag: rewrite an unbounded mode to the bounded one, pass others through.
+        if let Some(mode) = attached_sandbox_mode(flag) {
+            has_sandbox_flag = true;
+            let bounded = if mode == UNBOUNDED_SANDBOX_VALUE {
+                BOUNDED_SANDBOX_VALUE
+            } else {
+                mode
+            };
+            capped.push(format!("--sandbox={bounded}"));
+            i += 1;
+            continue;
+        }
+        // Bare `--sandbox`/`-s`: its value is the FOLLOWING token, but only when that token is a
+        // recognized mode. If the next token is missing, is another flag, or is an unrecognized
+        // value, the flag is malformed/valueless — supply the bounded value and DO NOT consume the
+        // next token (it is a separate flag, handled on its own iteration). This is what prevents a
+        // dangling bare `--sandbox` in the output.
         if flag == "--sandbox" || flag == "-s" {
             has_sandbox_flag = true;
             capped.push(flag.clone());
-            // Rewrite an unbounded VALUE to the bounded one; pass any other value through.
-            if let Some(val) = posture.get(i + 1) {
-                if val == UNBOUNDED_SANDBOX_VALUE {
-                    capped.push(BOUNDED_SANDBOX_VALUE.to_string());
-                } else {
-                    capped.push(val.clone());
+            match posture.get(i + 1) {
+                Some(val) if SANDBOX_MODES.contains(&val.as_str()) => {
+                    capped.push(if val == UNBOUNDED_SANDBOX_VALUE {
+                        BOUNDED_SANDBOX_VALUE.to_string()
+                    } else {
+                        val.clone()
+                    });
+                    i += 2;
                 }
-                i += 2;
-                continue;
+                _ => {
+                    capped.push(BOUNDED_SANDBOX_VALUE.to_string());
+                    i += 1;
+                }
             }
+            continue;
+        }
+        // A stray `danger-full-access` NOT owned by a `--sandbox` flag: drop it — passing it through
+        // would leak the unbounded mode, and it is not a valid standalone flag on its own.
+        if flag == UNBOUNDED_SANDBOX_VALUE {
             i += 1;
             continue;
         }
@@ -2985,10 +3030,69 @@ mod tests {
             ],
             "unrelated flags survive the cap; a bounding --sandbox is added"
         );
-        // Post-condition on every capped result: no token can disable the sandbox.
+        // (7) Copilot crew#427: a `--sandbox` FOLLOWED BY ANOTHER FLAG (the bypass) — the old code
+        // consumed the bypass as the flag's "value" and passed it through, leaking it AND leaving a
+        // bare `--sandbox`. The value must be a recognized mode; otherwise bound the flag on its own
+        // and drop the bypass.
+        assert_eq!(
+            bound_ungated_posture(
+                "codex",
+                vec![
+                    "--sandbox".to_string(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                ]
+            ),
+            ws(),
+            "a --sandbox whose next token is a flag is bounded; the bypass is dropped, not smuggled in as a value"
+        );
+        // (8) Copilot crew#427: a STRAY `danger-full-access` token not owned by any --sandbox flag —
+        // the pre-scan flags it unbounded, so the loop must drop it (not pass it through) and add a
+        // bounding --sandbox.
+        assert_eq!(
+            bound_ungated_posture("codex", vec!["danger-full-access".to_string()]),
+            ws(),
+            "a stray danger-full-access is dropped and the posture is bounded"
+        );
+        // (9) Copilot crew#427: the `=`-attached form `--sandbox=danger-full-access` — the pre-scan
+        // and the loop both understand it, rewriting only the mode.
+        assert_eq!(
+            bound_ungated_posture("codex", vec!["--sandbox=danger-full-access".to_string()]),
+            vec!["--sandbox=workspace-write".to_string()],
+            "an =-attached unbounded mode is downgraded in place"
+        );
+        assert_eq!(
+            bound_ungated_posture("codex", vec!["--sandbox=read-only".to_string()]),
+            vec!["--sandbox=read-only".to_string()],
+            "an =-attached bounded mode is untouched"
+        );
+        // (10) A TRAILING bare `--sandbox` (no value) alongside the bypass — no dangling flag, the
+        // missing value is supplied.
+        assert_eq!(
+            bound_ungated_posture(
+                "codex",
+                vec![
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                    "--sandbox".to_string(),
+                ]
+            ),
+            ws(),
+            "a trailing valueless --sandbox is given the bounded value, not left bare"
+        );
+        // Post-condition on every capped result: no token can disable the sandbox, and no bare
+        // `--sandbox`/`-s` is left without a following value.
         for raw in [
             vec!["--dangerously-bypass-approvals-and-sandbox".to_string()],
             vec!["--sandbox".to_string(), "danger-full-access".to_string()],
+            vec![
+                "--sandbox".to_string(),
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+            ],
+            vec!["danger-full-access".to_string()],
+            vec!["--sandbox=danger-full-access".to_string()],
+            vec![
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--sandbox".to_string(),
+            ],
         ] {
             let capped = bound_ungated_posture("codex", raw);
             assert!(
@@ -2998,6 +3102,18 @@ mod tests {
                         || f == "danger-full-access"),
                 "capped posture must contain no sandbox-disabling token; got {capped:?}"
             );
+            // And no bare `--sandbox`/`-s` is left without a recognized bounded mode following it.
+            for (j, f) in capped.iter().enumerate() {
+                if f == "--sandbox" || f == "-s" {
+                    assert!(
+                        matches!(
+                            capped.get(j + 1).map(String::as_str),
+                            Some("read-only" | "workspace-write")
+                        ),
+                        "bare {f} left without a bounded mode value in {capped:?}"
+                    );
+                }
+            }
         }
     }
 
