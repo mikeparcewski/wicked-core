@@ -2244,6 +2244,11 @@ mod tests {
     /// write-arming audit, whose exact `armed_write_roots` argument list has no read extras.)
     #[test]
     fn launch_declared_extra_read_roots_ride_the_shared_assembly() {
+        // Both `assemble_read_roots` calls read the process-global HOME to build the
+        // evidence-derived (HOME-anchored) base set, and the assertion requires the two reads to
+        // agree. Take ENV_LOCK so a concurrent HOME-swapping test (the crew#427 seat-posture
+        // cap E2Es) cannot mutate HOME between them — per the module rule at ENV_LOCK's definition.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(unix)]
         let declared = "/srv/grounding-repo".to_string();
         #[cfg(windows)]
