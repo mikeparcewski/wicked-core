@@ -15,6 +15,11 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.9** — npm release with two engine fixes since 0.7.8: a seat override that omits
+  `trust_flags` now inherits the built-in's trust posture (crew#419 / #349 — a stale codex
+  override no longer silently runs the seat in a read-only sandbox where governed work refuses),
+  and ACP bridges spawn in their own process group so a terminal/group signal can't reach an idle
+  bridge (crew#290 / #350, `#[cfg(unix)]`).
 - **core-ts 0.7.8** — npm release cut with the due-diligence engine fixes since 0.7.7:
   campaign-safe worktree names + ownership-marked trees + a reaper that spares live campaign
   worktrees (crew#337 / #345, #347), and the single elicitation-capability predicate — a seat
