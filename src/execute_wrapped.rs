@@ -1605,8 +1605,11 @@ fn arm_input_governance(
 /// the user's `~/.config/wicked-council/clis.toml`); if the key isn't registered, treats the key
 /// itself as the binary (`<key> {PROMPT}`) so an ad-hoc binary still runs.
 pub(crate) fn resolve_invocation(cli_key: &str) -> String {
-    let user =
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/wicked-council/clis.toml"));
+    // Resolve the operator clis.toml through the SAME shared helper as resolve_seat_posture and the
+    // vote path (HOME → USERPROFILE). A hand-rolled HOME-only lookup here would, on Windows, apply
+    // an override's posture (resolve_seat_posture reads it) while ignoring its headless_invocation —
+    // a mismatched launch (Copilot, crew#427).
+    let user = wicked_council::registry::default_user_path();
     if let Ok(clis) = wicked_council::registry::load(user.as_deref()) {
         if let Some(c) = clis.iter().find(|c| c.key == cli_key) {
             if !c.headless_invocation.trim().is_empty() {
@@ -1757,10 +1760,15 @@ pub(crate) fn bound_ungated_posture(cli_key: &str, posture: Vec<String>) -> Vec<
         capped.push("--sandbox".to_string());
         capped.push(BOUNDED_SANDBOX_VALUE.to_string());
     }
+    // Name the ACTUAL resolved registry path (HOME → USERPROFILE), not a hard-coded Unix path, so
+    // the remedy is correct on Windows too; fall back to a platform-neutral hint when none resolves.
+    let registry_path = wicked_council::registry::default_user_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "your wicked-council clis.toml".to_string());
     eprintln!(
         "wicked-core: seat '{cli_key}' declared an UNBOUNDED sandbox posture ({posture:?}) but the \
          governed-worker path has no compensating gate — capping to {capped:?} (crew#427). Set \
-         `trust_flags = [\"--sandbox\", \"workspace-write\"]` in ~/.config/wicked-council/clis.toml \
+         `trust_flags = [\"--sandbox\", \"workspace-write\"]` in {registry_path} \
          to silence this and declare the bounded posture explicitly."
     );
     capped
@@ -3227,10 +3235,9 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
-        let saved_home = std::env::var_os("HOME");
-        // SAFETY: process-global env write, serialized against the other env-mutating tests in this
-        // module by ENV_LOCK; restored below before any assertion can unwind.
-        std::env::set_var("HOME", &home);
+        // Pin HOME (serialized by ENV_LOCK) behind an RAII guard so it is restored even if the body
+        // panics; declared after the lock guard, it restores HOME before the lock releases.
+        let _home = HomeGuard::pin(&home);
 
         let dir = home.join("wt");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3257,11 +3264,6 @@ mod tests {
             launch_seq: 0,
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
-
-        match saved_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
 
         assert!(
             out.output.contains("--sandbox") && out.output.contains("workspace-write"),
@@ -3309,9 +3311,8 @@ mod tests {
              trust_flags = [\"--dangerously-bypass-approvals-and-sandbox\"]\n",
         )
         .unwrap();
-        let saved_home = std::env::var_os("HOME");
-        // SAFETY: process-global env write, serialized by ENV_LOCK; restored before any assertion.
-        std::env::set_var("HOME", &home);
+        // Pin HOME (serialized by ENV_LOCK) behind an RAII guard so it is restored even on a panic.
+        let _home = HomeGuard::pin(&home);
 
         let dir = home.join("wt");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3336,11 +3337,6 @@ mod tests {
             launch_seq: 0,
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
-
-        match saved_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
 
         assert!(
             !out.output.contains("dangerously-bypass"),
@@ -4282,6 +4278,28 @@ mod tests {
     /// flags got injected do not, because `DENIED_BASH` is unconditional and so the deny flag is
     /// present either way. Poison-tolerant on purpose: one panicking test must not cascade.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII restore of the process-global `HOME`: captures the current value on `pin`, sets the new
+    /// one, and restores the original (or unsets it) on drop — INCLUDING a panic unwind. A test that
+    /// pins HOME must hold this alongside [`ENV_LOCK`]; declaring the guard AFTER the lock guard
+    /// means it restores HOME before the lock releases (drop order is reverse of declaration), so a
+    /// panicking body cannot leak the pinned value into the next lock-holder (crew#427, Copilot).
+    struct HomeGuard(Option<std::ffi::OsString>);
+    impl HomeGuard {
+        fn pin(home: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            Self(prev)
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
 
     /// Read the value that follows `flag` in an argv.
     fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {

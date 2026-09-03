@@ -158,7 +158,8 @@ pub fn builtin() -> Vec<AgenticCli> {
             // and `codex exec` is already non-interactive so no approval flag is needed. codex's
             // own workspace-write sandbox is then the boundary — aligned with path_policy's intent
             // that the worktree is the write root — which is safe WITHOUT the claude-only gate.
-            // Operators overriding codex in ~/.config/wicked-council/clis.toml should mirror this:
+            // Operators overriding codex in their wicked-council clis.toml (see `default_user_path`;
+            // `~/.config/...` on Unix, `%USERPROFILE%\...` on Windows) should mirror this:
             //   trust_flags = ["--sandbox", "workspace-write"]
             trust_flags: vec!["--sandbox".into(), "workspace-write".into()],
             alt_binaries: vec![],
