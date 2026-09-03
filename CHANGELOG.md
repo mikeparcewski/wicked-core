@@ -15,6 +15,18 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.10** — npm release with the crew#427 engine fix since 0.7.9: the non-claude
+  adversarial-review seat (codex) now runs BOUNDED on the governed-worker path
+  (`--sandbox workspace-write`). Its declared sandbox posture is applied on that path — it was
+  dropped before, so a codex evaluator ran under codex's default read-only sandbox and refused the
+  temp/socket writes the verification suite needs — and the in-boundary `TMPDIR→<cwd>/tmp` scratch
+  redirect now covers non-claude seats too. A code cap (`bound_ungated_posture`) keeps the RESOLVED
+  posture bounded regardless of a stale/hand-edited `clis.toml`: any sandbox-disabling token
+  (`--dangerously-bypass-approvals-and-sandbox`, `--sandbox danger-full-access`, `=`-attached, or a
+  stray value) is rewritten to `--sandbox workspace-write`, so the boundary holds in code rather
+  than depending on operators migrating a TOML. User-registry path resolution now goes through the
+  shared `default_user_path` (HOME→USERPROFILE) on both the posture and invocation paths, so the
+  override composes consistently on Windows.
 - **core-ts 0.7.9** — npm release with two engine fixes since 0.7.8: a seat override that omits
   `trust_flags` now inherits the built-in's trust posture (crew#419 / #349 — a stale codex
   override no longer silently runs the seat in a read-only sandbox where governed work refuses),
