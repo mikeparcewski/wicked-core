@@ -141,12 +141,27 @@ pub fn builtin() -> Vec<AgenticCli> {
             binary: "codex".into(),
             // --skip-git-repo-check: unit sandboxes/worktrees are often not git repos;
             // without it codex refuses with "Not inside a trusted directory" (headless
-            // has no prompt to answer). Approvals/sandboxing are NOT touched here.
+            // has no prompt to answer). Approvals/sandboxing are set by `trust_flags`, below.
             headless_invocation: "codex exec --skip-git-repo-check \"{PROMPT}\"".into(),
             category: Category::AgenticCoder,
             input_mode: InputMode::PromptArg,
             version_probe: vec!["codex".into(), "--version".into()],
-            trust_flags: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            // BOUNDED posture, not the full bypass (crew#427). codex is the seat the
+            // evaluator≠creator router moves review/test units onto, and its default sandbox is
+            // READ-ONLY — every write/temp/socket the verification suite needs is refused, so the
+            // reviewer defaults to "not ready". The obvious fix (`--dangerously-bypass-approvals-
+            // and-sandbox`, which turns codex's OWN sandbox off) is UNSAFE on the governed-worker
+            // path: wicked-core's boundary gate is claude-specific (`gate_hook` PreToolUse), so a
+            // codex worker with no sandbox AND no gate would be UNBOUNDED — free to write outside
+            // its worktree. `--sandbox workspace-write` is codex's native bounded mode: writes are
+            // confined to the workspace (the worktree + in-boundary scratch) and DENIED outside,
+            // and `codex exec` is already non-interactive so no approval flag is needed. codex's
+            // own workspace-write sandbox is then the boundary — aligned with path_policy's intent
+            // that the worktree is the write root — which is safe WITHOUT the claude-only gate.
+            // Operators overriding codex in their wicked-council clis.toml (see `default_user_path`;
+            // `~/.config/...` on Unix, `%USERPROFILE%\...` on Windows) should mirror this:
+            //   trust_flags = ["--sandbox", "workspace-write"]
+            trust_flags: vec!["--sandbox".into(), "workspace-write".into()],
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
@@ -377,9 +392,11 @@ enabled_for_council = false
 
     #[test]
     fn override_omitting_trust_flags_inherits_the_builtin_posture() {
-        // crew#419: a hand-edited override of `codex` (a built-in that carries
-        // --dangerously-bypass-approvals-and-sandbox) that OMITS trust_flags must not silently
-        // run untrusted — it inherits the built-in's. An explicit `[]` stays untrusted.
+        // crew#419: a hand-edited override of `codex` (a built-in that carries a bounded
+        // `--sandbox workspace-write` posture) that OMITS trust_flags must not silently run under
+        // codex's default read-only sandbox — it inherits the built-in's. An explicit `[]` stays
+        // untrusted. Asserted against `builtin()` codex's actual flags, so it holds whatever the
+        // built-in posture is.
         let dir = std::env::temp_dir().join(format!(
             "wc-trust-{}-{:?}",
             std::process::id(),
