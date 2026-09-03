@@ -4284,7 +4284,11 @@ mod tests {
     /// pins HOME must hold this alongside [`ENV_LOCK`]; declaring the guard AFTER the lock guard
     /// means it restores HOME before the lock releases (drop order is reverse of declaration), so a
     /// panicking body cannot leak the pinned value into the next lock-holder (crew#427, Copilot).
+    /// `#[cfg(unix)]` to match its only callers — the argv-probe tests are Unix-only, so on Windows
+    /// this would otherwise be dead code (`-D warnings`).
+    #[cfg(unix)]
     struct HomeGuard(Option<std::ffi::OsString>);
+    #[cfg(unix)]
     impl HomeGuard {
         fn pin(home: &std::path::Path) -> Self {
             let prev = std::env::var_os("HOME");
@@ -4292,6 +4296,7 @@ mod tests {
             Self(prev)
         }
     }
+    #[cfg(unix)]
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             match &self.0 {
