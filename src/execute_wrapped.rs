@@ -636,6 +636,17 @@ impl WrappedCliStepRunner {
             // ungoverned unit reading the operator's config is the same defect as a governed one
             // doing it (FINDING-047/045).
             inject_isolation_flags(&mut argv, &invocation);
+        } else {
+            // Non-claude seat (crew#427): apply its DECLARED sandbox/trust posture, exactly as the
+            // council vote path does — the governed-worker path dropped it before, so a codex
+            // evaluator ran under codex's default read-only sandbox and refused every write/temp/
+            // socket, stranding otherwise-correct work at the adversarial-review gate. The built-in
+            // codex posture is BOUNDED `--sandbox workspace-write` (registry.rs): writes confined to
+            // the worktree, denied outside — codex's own sandbox is the boundary, which is safe
+            // without the claude-only gate-hook. This is deliberately NOT the claude branch: claude
+            // gets `--permission-mode acceptEdits` + the gate-hook, and its `--dangerously-skip-
+            // permissions` trust flag would make those deny rules inert.
+            apply_seat_posture(&mut argv, &resolve_seat_posture(&cli_key));
         }
 
         // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
@@ -730,6 +741,15 @@ impl WrappedCliStepRunner {
             // Harden FIRST so the gate-hook variables set below survive as deliberate exceptions.
             cmd.hardened();
             cmd.args(&argv[1..]).current_dir(&cwd);
+            // Point EVERY seat's scratch INSIDE the boundary (core#264, widened for crew#427): this
+            // used to live in the claude-only `gov_env` arm, so a non-claude evaluator (codex, under
+            // its own `--sandbox workspace-write`) got no in-boundary scratch and its `mktemp` /
+            // `$TMPDIR` writes / vitest's `.vite-temp` + sockets landed in the system temp — OUTSIDE
+            // codex's workspace-write root, where they are DENIED ("managed read-only sandbox").
+            // Lifted here it runs for claude and non-claude alike, governed or not: it is a scratch
+            // convenience, not a governance control, and every seat benefits from temp that is
+            // reaped with the worktree and inside its own write root.
+            redirect_scratch_into_boundary(&mut cmd, &cwd);
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
             // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
             // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
@@ -777,19 +797,6 @@ impl WrappedCliStepRunner {
                 // free to write code.
                 if input.unit.pre_build_scope {
                     cmd.env(crate::gate_hook::PRE_BUILD_SCOPE_ENV, "1");
-                }
-                // Point the worker's scratch INSIDE the boundary (core#264): `mktemp`, `> $TMPDIR/x`
-                // and every tool honoring the platform temp env land in `<cwd>/tmp` — in-boundary,
-                // reaped with the sandbox/worktree — instead of tripping (advisory) boundary denies
-                // in the system temp. Set ONLY when the dir really exists as a directory: a temp
-                // env pointing at nothing (mkdir refused — pre-existing `tmp` FILE, read-only FS)
-                // breaks every tool that consults it; the un-set fallback is the system temp,
-                // which the advisory carve-out now tolerates (Copilot).
-                let unit_tmp = cwd.join("tmp");
-                if std::fs::create_dir_all(&unit_tmp).is_ok() && unit_tmp.is_dir() {
-                    cmd.env("TMPDIR", &unit_tmp);
-                    cmd.env("TMP", &unit_tmp);
-                    cmd.env("TEMP", &unit_tmp);
                 }
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
@@ -959,6 +966,23 @@ fn armed_write_roots(
             eprintln!("[wicked-core] write-root list not joinable ({e}); arming cwd only");
             cwd.as_os_str().to_os_string()
         }
+    }
+}
+
+/// Point a worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at `<cwd>/tmp` (core#264, crew#427):
+/// `mktemp`, `> $TMPDIR/x`, vitest's `.vite-temp`/sockets and every tool honoring the platform temp
+/// env then land in-boundary — reaped with the sandbox/worktree, and inside codex's own
+/// `workspace-write` root — instead of the system temp (outside it, where a bounded sandbox denies
+/// them). Applied for EVERY seat, unlike the boundary-arming that stays claude-only: this is a
+/// scratch convenience, not a governance control. Set ONLY when the dir really exists as a
+/// directory — a temp env pointing at nothing (mkdir refused: a pre-existing `tmp` FILE, a read-only
+/// FS) breaks every tool that consults it; the un-set fallback is the system temp.
+pub(crate) fn redirect_scratch_into_boundary(cmd: &mut Command, cwd: &Path) {
+    let unit_tmp = cwd.join("tmp");
+    if std::fs::create_dir_all(&unit_tmp).is_ok() && unit_tmp.is_dir() {
+        cmd.env("TMPDIR", &unit_tmp);
+        cmd.env("TMP", &unit_tmp);
+        cmd.env("TEMP", &unit_tmp);
     }
 }
 
@@ -1591,6 +1615,57 @@ pub(crate) fn resolve_invocation(cli_key: &str) -> String {
         }
     }
     format!("{cli_key} {{PROMPT}}")
+}
+
+/// The declared sandbox/trust posture flags for `cli_key`, from the merged registry (built-ins
+/// overlaid with the operator's `clis.toml`, the operator's override winning) — resolved the same
+/// way, from the same source, as the council vote path (`wicked_council::dispatch`, which appends
+/// `cli.trust_flags` to a voting seat's argv). Empty when the seat is unknown or declares none.
+///
+/// crew#427: the governed-worker path (`exec`) used to drop this entirely — `assigned_invocation`
+/// and [`resolve_invocation`] carry only the `headless_invocation` template, never `trust_flags` —
+/// so a non-claude evaluator (codex) ran under codex's DEFAULT read-only sandbox and refused every
+/// write/temp/socket the verification suite needs. Applying the declared posture here makes the
+/// seat's sandbox/approval declaration actually take effect for the real unit, not just for votes.
+pub(crate) fn resolve_seat_posture(cli_key: &str) -> Vec<String> {
+    let user =
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/wicked-council/clis.toml"));
+    seat_posture_from(cli_key, user.as_deref())
+}
+
+/// [`resolve_seat_posture`] against an explicit registry path (`None` ⇒ built-ins only) — the
+/// testable seam, so a test can pin the built-in posture without depending on the operator's live
+/// `~/.config/wicked-council/clis.toml`.
+pub(crate) fn seat_posture_from(cli_key: &str, user_path: Option<&Path>) -> Vec<String> {
+    wicked_council::registry::load(user_path)
+        .ok()
+        .and_then(|clis| clis.into_iter().find(|c| c.key == cli_key))
+        .map(|c| c.trust_flags)
+        .unwrap_or_default()
+}
+
+/// Extend a NON-claude seat's argv with its declared `posture` flags, mirroring the council vote
+/// path (`wicked_council::dispatch` `argv.extend(cli.trust_flags)`), but placed BEFORE any `--`
+/// guard that [`build_argv`] inserted: the guard makes everything after it positional, so appending
+/// a flag past it would be read as a prompt argument, not an option. When there is no guard (the
+/// codex template — the prompt follows a bare flag, so `build_argv` adds none), this appends at the
+/// end, byte-identical to the vote path. Claude is never routed here: its boundary is the gate-hook
+/// plus the isolation flags, and applying `--dangerously-skip-permissions` would make those deny
+/// rules inert (see [`inject_isolation_flags`]).
+pub(crate) fn apply_seat_posture(argv: &mut Vec<String>, posture: &[String]) {
+    // An empty argv is a no-invocation unit that fails hard below; never turn it into a runnable
+    // one by making a posture flag argv[0].
+    if posture.is_empty() || argv.is_empty() {
+        return;
+    }
+    match argv.iter().position(|a| a == "--") {
+        Some(guard) => {
+            for (k, flag) in posture.iter().enumerate() {
+                argv.insert(guard + k, flag.clone());
+            }
+        }
+        None => argv.extend(posture.iter().cloned()),
+    }
 }
 
 const TIMED_OUT: &str = "__wicked_timed_out__";
@@ -2708,6 +2783,205 @@ mod tests {
         assert!(
             out.output.contains("SEEN=[UNSET]"),
             "the worker must not inherit an estate store from the environment; got: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// crew#427, part 2 (the BOUNDED default). The built-in codex seat is the seat the
+    /// evaluator≠creator router moves review/test units onto, and its posture must be codex's native
+    /// `--sandbox workspace-write` — writes confined to the worktree, denied outside — NOT the
+    /// unbounded `--dangerously-bypass-approvals-and-sandbox`: with codex's own sandbox off AND
+    /// wicked-core's boundary gate being claude-only, a codex worker would be free to write outside
+    /// its worktree. Pinned against BUILT-INS (no user path) so it holds regardless of the operator's
+    /// live clis.toml, and asserts the EXACT flags land on a codex-shaped argv.
+    #[test]
+    fn codex_builtin_posture_is_bounded_workspace_write_not_full_bypass() {
+        let posture = seat_posture_from("codex", None);
+        assert_eq!(
+            posture,
+            vec!["--sandbox".to_string(), "workspace-write".to_string()],
+            "the built-in codex seat must declare the BOUNDED workspace-write posture"
+        );
+        assert!(
+            !posture.iter().any(|f| f.contains("dangerously-bypass")),
+            "the built-in codex posture must NOT be the unbounded full-bypass (crew#427)"
+        );
+        // The codex template's prompt follows a bare flag, so `build_argv` adds no `--` guard and the
+        // posture appends at the tail, byte-identical to the council vote path.
+        let mut argv = build_argv(
+            "codex exec --skip-git-repo-check \"{PROMPT}\"",
+            "do it",
+            &[],
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--"),
+            "precondition: the codex template yields no `--` guard"
+        );
+        apply_seat_posture(&mut argv, &posture);
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            &["--sandbox".to_string(), "workspace-write".to_string()],
+            "the exact posture flags must appear, in order, on the argv"
+        );
+    }
+
+    /// `apply_seat_posture` respects `build_argv`'s `--` guard: past the guard, a flag is positional
+    /// (prompt text), so posture must land BEFORE it. Empty argv / empty posture are no-ops — a
+    /// posture flag must never become `argv[0]` of a no-invocation unit.
+    #[test]
+    fn apply_seat_posture_inserts_before_the_prompt_guard() {
+        let mut guarded = vec![
+            "/bin/sh".to_string(),
+            "probe".to_string(),
+            "--".to_string(),
+            "the prompt".to_string(),
+        ];
+        apply_seat_posture(
+            &mut guarded,
+            &["--sandbox".to_string(), "workspace-write".to_string()],
+        );
+        assert_eq!(
+            guarded,
+            vec![
+                "/bin/sh",
+                "probe",
+                "--sandbox",
+                "workspace-write",
+                "--",
+                "the prompt"
+            ],
+            "posture flags go before the `--` guard, in order"
+        );
+
+        let mut empty: Vec<String> = vec![];
+        apply_seat_posture(&mut empty, &["--x".to_string()]);
+        assert!(
+            empty.is_empty(),
+            "posture must never make a flag the argv[0] of an empty (no-invocation) argv"
+        );
+
+        let mut no_posture = vec!["codex".to_string()];
+        apply_seat_posture(&mut no_posture, &[]);
+        assert_eq!(no_posture, vec!["codex"], "empty posture is a no-op");
+    }
+
+    /// crew#427, part 1 (the wiring). The governed-worker path used to DROP a non-claude seat's
+    /// declared posture — `assigned_invocation`/`resolve_invocation` carry only the headless template
+    /// — so a codex evaluator ran under codex's default READ-ONLY sandbox and refused every
+    /// write/temp/socket. Prove the runner now extends a codex-key seat's real argv with its declared
+    /// posture, END-TO-END, and that the posture is the BOUNDED form (not the full-bypass). HOME is
+    /// pinned at a clis.toml-free dir so the runner resolves the SHIPPED built-in deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn governed_worker_argv_for_a_codex_seat_carries_its_bounded_posture() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "wicked-posture-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let saved_home = std::env::var_os("HOME");
+        // SAFETY: process-global env write, serialized against the other env-mutating tests in this
+        // module by ENV_LOCK; restored below before any assertion can unwind.
+        std::env::set_var("HOME", &home);
+
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"ARGV=[$*]\"\n").unwrap();
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        // The evaluator≠creator router assigns the review unit to codex, carrying only the headless
+        // template as `assigned_invocation` — exactly the shape that dropped the posture before.
+        u.assigned_cli = Some("codex".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        let input = StepInput {
+            run_id: "run-posture".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            out.output.contains("--sandbox") && out.output.contains("workspace-write"),
+            "the governed-worker argv for a codex-key seat must carry its `--sandbox workspace-write` \
+             posture (crew#427: it was dropped); got: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("dangerously-bypass"),
+            "the applied posture must be BOUNDED, never the full-bypass; got: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// crew#427, part 3 (in-boundary scratch for EVERY seat). The `TMPDIR`/`TMP`/`TEMP` → `<cwd>/tmp`
+    /// redirect used to live inside the claude-only `gov_env` arm, so a NON-claude seat got none — its
+    /// `mktemp`/`$TMPDIR` writes (vitest's `.vite-temp` + sockets) landed in the system temp, OUTSIDE
+    /// codex's `workspace-write` root, where they are denied. Lifted out, it now applies to a
+    /// non-claude seat too: the probe (a non-claude seat) sees `TMPDIR` pointed at its own `<cwd>/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_redirect_applies_to_a_nonclaude_seat() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-scratch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"TMP=[${TMPDIR:-UNSET}]\"\n").unwrap();
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        // A NON-claude seat (binary is /bin/sh, not claude) with NO governance — the exact case the
+        // old claude-only placement skipped.
+        u.assigned_cli = Some("codex".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        let input = StepInput {
+            run_id: "run-scratch".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+
+        let expected = dir.join("tmp");
+        assert!(
+            out.output.contains(&expected.display().to_string()),
+            "a non-claude seat must get its scratch redirected to <cwd>/tmp ({}); got: {}",
+            expected.display(),
+            out.output
+        );
+        assert!(
+            !out.output.contains("TMP=[UNSET]"),
+            "TMPDIR must be set for a non-claude seat, not left to the system temp; got: {}",
             out.output
         );
         let _ = std::fs::remove_dir_all(&dir);
