@@ -19,7 +19,8 @@ Two release tracks share this file, newest entry first regardless of track:
   the agy seat council-disabled by default (#354), the actor-scoped seat-health bench +
   abstention-aware quorum + one-wave dispatch (#355), `StepStatus::TimedOut` distinguishing
   the turn ceiling from an operator cancel (#357), and the idle-tick WAL checkpoint on the
-  actor's own connections (#356, estate crates ≥0.14.7).
+  actor's own connections (#356 — needs `wicked-estate-{store,memory,knowledge}` ≥0.14.7, the
+  backport line carrying `checkpoint_truncate`; `wicked-estate-core` stays on its 0.14.x pin).
 - **Idle-tick WAL checkpoint on the actor's own connections (perf #5).** The actor loop's
   blocking `recv` became `recv_timeout(5s)`: a full tick of channel silence with
   `in_flight` empty and ≥60s since the last checkpoint (env knob
