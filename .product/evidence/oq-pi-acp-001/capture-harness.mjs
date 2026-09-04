@@ -16,7 +16,7 @@ const CAPTURE_FILE = process.argv[4]
 const SCENARIO = process.argv[5] || 'allow'
 
 if (!PI_ACP_BIN || !FIXTURE_CWD || !CAPTURE_FILE) {
-  console.error('usage: harness.mjs <pi-acp-bin> <fixture-cwd> <capture-file> <allow|reject>')
+  console.error('usage: capture-harness.mjs <pi-acp-bin> <fixture-cwd> <capture-file> <allow|reject>')
   process.exit(2)
 }
 
@@ -25,7 +25,7 @@ writeFileSync(CAPTURE_FILE, '')
 function record(direction, raw) {
   const entry = {
     ts: new Date().toISOString(),
-    direction, // 'client->agent' | 'agent->client'
+    direction, // 'client->agent' | 'agent->client' | 'harness-meta' (harness annotations)
     raw
   }
   appendFileSync(CAPTURE_FILE, JSON.stringify(entry) + '\n')

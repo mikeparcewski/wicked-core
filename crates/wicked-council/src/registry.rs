@@ -240,11 +240,12 @@ pub fn builtin() -> Vec<AgenticCli> {
                 auth_method: None,
                 // OQ-PI-ACP-001 resolved NOT admitted: a live capture against the pinned
                 // pi-acp@0.0.32 (gitHead 2f6e3c5, see .product/evidence/oq-pi-acp-001/)
-                // shows core tool calls (read/write/edit/bash) go pending -> in_progress
-                // -> completed with zero session/request_permission round-trips — pi-acp
-                // only requests permission for its own extension select/confirm UI, never
-                // for tool execution. Stays disclosed-ungoverned until a fixed adapter
-                // version proves otherwise.
+                // shows a core `write` tool call go pending -> in_progress -> completed
+                // with zero session/request_permission round-trips, and the shipped
+                // adapter source confirms the same path serves read/edit/bash — its
+                // requestPermission is invoked only for pi's extension select/confirm UI,
+                // never for tool execution. Stays disclosed-ungoverned until a fixed
+                // adapter version proves otherwise.
                 acp_input_governance: false,
             }),
             capabilities: Some(

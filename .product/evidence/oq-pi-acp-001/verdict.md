@@ -1,8 +1,8 @@
 # OQ-PI-ACP-001 verdict
 
 **Admission: NOT ADMITTED.** `acp_input_governance` stays `false` for `pi` in
-`crates/wicked-council/src/registry.rs`. Property (a) fails; (b) and (c) are moot as a
-consequence (there is nothing to disable or reject — the gate never exists).
+`crates/wicked-council/src/registry.rs`. Property (a) fails; (b) and (c) therefore also FAIL (recorded as FAIL below —
+there is no gate to disable and no request to reject, which is itself the failure).
 
 See `manifest.md` for the exact pinned artifact and `capture-allow.ndjson` /
 `capture-reject.ndjson` for the raw (redacted) frames this verdict is based on.
