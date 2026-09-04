@@ -21,10 +21,10 @@ Two release tracks share this file, newest entry first regardless of track:
   `WICKED_CORE_WAL_CHECKPOINT_SECS`, `0` disables) TRUNCATE-checkpoints all three actor-owned
   WALs — graph store (`AnyStore::checkpoint_truncate`; the Postgres arm is a no-op),
   memory (`<estate>.mem`), and knowledge (`<estate>.knowledge`) — via
-  `wicked-estate-store 0.14.6`'s busy-tolerant `checkpoint_truncate` (a concurrent
+  `wicked-estate-store 0.14.7`'s busy-tolerant `checkpoint_truncate` (a concurrent
   `open_readonly` gate-hook holder defers it; it never blocks the writer). Fixes WALs
-  outgrowing their DBs (core.db 3.35MB vs 4.19MB WAL). Requires the estate-store 0.14.6
-  publish (pins bumped).
+  outgrowing their DBs (core.db 3.35MB vs 4.19MB WAL). Requires the estate-store-family 0.14.7
+  backport publish (pins bumped; 0.14.6 already exists on crates.io without the API).
 - **core-ts 0.7.10** — npm release with the crew#427 engine fix since 0.7.9: the non-claude
   adversarial-review seat (codex) now runs BOUNDED on the governed-worker path
   (`--sandbox workspace-write`). Its declared sandbox posture is applied on that path — it was

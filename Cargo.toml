@@ -51,9 +51,9 @@ wicked-estate-core = "0.14.5"
 wicked-estate-rank = "0.14.5"
 wicked-estate-retrieve = { version = "0.14.5", features = ["model2vec"] }
 # Memory + knowledge migrated off tombstone wicked-memory/-core/knowledge-mcp onto estate.
-wicked-estate-memory = "0.14.6"
+wicked-estate-memory = "0.14.7"
 wicked-estate-memory-core = "0.14.5"
-wicked-estate-knowledge = "0.14.6"
+wicked-estate-knowledge = "0.14.7"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -100,4 +100,3 @@ wicked-council = { path = "crates/wicked-council" }
 # override is set before any test thread can emit — a per-test arming call can never guarantee
 # that (a parallel unarmed test could spool first). Enforced by `tests/harness_hygiene.rs`.
 ctor = "1.0.13"
-

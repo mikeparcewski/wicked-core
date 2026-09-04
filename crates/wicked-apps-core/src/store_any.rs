@@ -47,7 +47,7 @@ impl AnyStore {
     /// TRUNCATE-checkpoint the backend's WAL (`SqliteStore::checkpoint_truncate`: busy-tolerant,
     /// never blocking — a concurrent `open_readonly` holder yields `busy: true` and the checkpoint
     /// simply defers to a later call). The Postgres backend has no SQLite WAL, so that arm is a
-    /// no-op returning empty stats. Like `compact`, an operational method — deliberately NOT part
+    /// no-op returning the `-1` no-WAL sentinel stats (`WalCheckpointStats::default`). Like `compact`, an operational method — deliberately NOT part
     /// of the `GraphWrite` contract.
     pub fn checkpoint_truncate(&mut self) -> Result<WalCheckpointStats> {
         match self {
