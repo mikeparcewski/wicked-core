@@ -2616,7 +2616,13 @@ mod tests {
     /// notify-only behavior there, so the spelling is the contract).
     #[test]
     fn unit_output_captured_step_status_values_pass_through_verbatim() {
-        for status in ["ok", "failed", "cancelled", "elicitation_failed", "timed_out"] {
+        for status in [
+            "ok",
+            "failed",
+            "cancelled",
+            "elicitation_failed",
+            "timed_out",
+        ] {
             let v = event_to_json(&CoreEvent::UnitOutputCaptured {
                 session: "s".to_string(),
                 ord: 1,

@@ -4249,12 +4249,7 @@ impl AcpStepRunner {
                 tools: result.tools,
                 governed: gate.is_some(),
             },
-            Ok(result)
-                if matches!(
-                    result.status,
-                    StepStatus::Cancelled | StepStatus::TimedOut
-                ) =>
-            {
+            Ok(result) if matches!(result.status, StepStatus::Cancelled | StepStatus::TimedOut) => {
                 // Turn ceiling (TimedOut) or an external cancel — drop the session either way:
                 // the reader thread may wedge on a full pipe if we leave the ACP process running
                 // while no longer consuming its output. The status is FORWARDED, not collapsed —

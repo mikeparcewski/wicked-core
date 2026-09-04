@@ -1834,7 +1834,10 @@ mod tests {
         // TimedOut and Cancelled must never collapse on the wire — the whole point of the
         // distinguishing status is that an operator cancel and the engine's turn ceiling stay
         // separable (616c8661).
-        assert_ne!(status_to_str(StepStatus::TimedOut), status_to_str(StepStatus::Cancelled));
+        assert_ne!(
+            status_to_str(StepStatus::TimedOut),
+            status_to_str(StepStatus::Cancelled)
+        );
         // Unknown token fails safe to Ok (the actor's failed/cancelled arms are the deny paths; an
         // unknown status must not spuriously fail a run — Ok goes through the normal gate).
         assert_eq!(status_from_str("garbage"), StepStatus::Ok);

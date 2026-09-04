@@ -10590,7 +10590,9 @@ mod coverage_store_tests {
 #[cfg(test)]
 mod turn_timeout_vs_cancel_tests {
     use super::*;
-    use crate::domain::{put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit};
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
     use crate::scope::EntityMode;
     use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
     use std::sync::mpsc::channel;

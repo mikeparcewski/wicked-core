@@ -2431,7 +2431,10 @@ mod tests {
             "the deadline must kill the child promptly, not wait out the sleep"
         );
         assert_eq!(code, -1, "a timed-out worker reports the killed exit shape");
-        assert_eq!(err, TIMED_OUT, "a deadline kill reports the TIMED_OUT sentinel");
+        assert_eq!(
+            err, TIMED_OUT,
+            "a deadline kill reports the TIMED_OUT sentinel"
+        );
     }
 
     #[cfg(unix)]
