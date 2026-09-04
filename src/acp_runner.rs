@@ -2852,7 +2852,9 @@ prior output you are reviewing, testing, or revising."
             // Elicitation-terminal paths: not retriable, bypass FailureTriageReady (spec I-7).
             StepStatus::ElicitationFailed
         } else if timed_out {
-            StepStatus::Cancelled
+            // The engine's own turn ceiling (`WICKED_UNIT_TIMEOUT_SECS`) — NOT an operator
+            // cancel, which tears the session down and never reaches this classification.
+            StepStatus::TimedOut
         } else {
             StepStatus::Failed
         },
@@ -4247,9 +4249,11 @@ impl AcpStepRunner {
                 tools: result.tools,
                 governed: gate.is_some(),
             },
-            Ok(result) if result.status == StepStatus::Cancelled => {
-                // Timeout — drop the session: the reader thread may wedge on a full pipe
-                // if we leave the ACP process running while no longer consuming its output.
+            Ok(result) if matches!(result.status, StepStatus::Cancelled | StepStatus::TimedOut) => {
+                // Turn ceiling (TimedOut) or an external cancel — drop the session either way:
+                // the reader thread may wedge on a full pipe if we leave the ACP process running
+                // while no longer consuming its output. The status is FORWARDED, not collapsed —
+                // the fold's consumers separate the engine's own timeout from an operator cancel.
                 drop(proc);
                 self.drop_session(&run_id);
                 StepOutput {
@@ -4257,7 +4261,7 @@ impl AcpStepRunner {
                     unit_ix: input.unit_ix,
                     attempt: input.attempt,
                     output: result.output,
-                    status: StepStatus::Cancelled,
+                    status: result.status,
                     usage: result.usage,
                     files: result.files,
                     tools: result.tools,
@@ -4666,11 +4670,17 @@ mod tests {
             transient,
             0
         ));
-        // Never retry a success, a cancel (our own timeout), or a non-transient failure.
+        // Never retry a success, an external cancel, our own turn ceiling, or a non-transient failure.
         assert!(!should_retry_worker(true, StepStatus::Ok, transient, 0));
         assert!(!should_retry_worker(
             true,
             StepStatus::Cancelled,
+            transient,
+            0
+        ));
+        assert!(!should_retry_worker(
+            true,
+            StepStatus::TimedOut,
             transient,
             0
         ));

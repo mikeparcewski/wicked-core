@@ -2608,6 +2608,36 @@ mod tests {
             ],
         );
     }
+
+    /// The `stepStatus` VALUE is a verbatim passthrough — in particular `"timed_out"` (the
+    /// engine's turn ceiling, perf#4) must reach TS consumers exactly as core spells it: it is
+    /// the one wire signal that separates a turn-timeout from an operator cancel, and a crew-side
+    /// watchdog keys automatic recovery on this string (an unknown value degrades to today's
+    /// notify-only behavior there, so the spelling is the contract).
+    #[test]
+    fn unit_output_captured_step_status_values_pass_through_verbatim() {
+        for status in [
+            "ok",
+            "failed",
+            "cancelled",
+            "elicitation_failed",
+            "timed_out",
+        ] {
+            let v = event_to_json(&CoreEvent::UnitOutputCaptured {
+                session: "s".to_string(),
+                ord: 1,
+                attempt: 0,
+                output_bytes: 0,
+                step_status: status.to_string(),
+                governed: false,
+            });
+            assert_eq!(
+                v.get("stepStatus").and_then(Value::as_str),
+                Some(status),
+                "stepStatus value drift for {status:?}"
+            );
+        }
+    }
     /// Pin [`campaign_status_token`] to serde's own representation of [`CampaignStatus`] — the
     /// hand-written match and the derive must never disagree, because the resume/cancel bindings
     /// answer the former while `campaignDetail`/`campaignList` JSON carries the latter.

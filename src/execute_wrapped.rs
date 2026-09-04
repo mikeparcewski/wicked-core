@@ -893,13 +893,37 @@ impl WrappedCliStepRunner {
                     // here: two sites is how the split came back.
                     (StepStatus::Ok, out, usage, files, tools)
                 }
-                // A timeout still surfaces the tools that DID run before the kill — this is exactly
-                // when an operator needs to see what a hung unit was doing (FINDING-046).
-                Ok((-1, _, err, _, _, tools)) if err == TIMED_OUT => (
+                // A timeout still surfaces what DID happen before the kill — the tools
+                // (FINDING-046) AND the preserved pre-kill output/usage/files `run_bounded`
+                // kept exactly for this post-mortem (Copilot on perf#4: dropping them here
+                // defeated that preservation). The kill notice stays the FIRST line so
+                // substring classifiers ("exceeded the timeout") keep matching.
+                // The engine's own turn ceiling → `TimedOut`, never `Cancelled`: an operator's
+                // cancel must stay distinguishable from the platform's deadline (616c8661).
+                Ok((-1, out, err, usage, files, tools)) if err == TIMED_OUT => (
+                    StepStatus::TimedOut,
+                    if out.trim().is_empty() {
+                        format!("(cli `{cli_key}` exceeded the timeout and was killed)")
+                    } else {
+                        format!("(cli `{cli_key}` exceeded the timeout and was killed)\n{out}")
+                    },
+                    usage,
+                    files,
+                    tools,
+                ),
+                // The run-terminal cancel token (crew#277): the RUN already terminated and this
+                // worker was killed to stop it orphaning — an external cancel, reported as such,
+                // with the same pre-kill context preserved. (The actor's terminal/stale guards
+                // discard this output; the status matters for any consumer seeing it earlier.)
+                Ok((-1, out, err, usage, files, tools)) if err == CANCELLED => (
                     StepStatus::Cancelled,
-                    format!("(cli `{cli_key}` exceeded the timeout and was killed)"),
-                    None,
-                    Vec::new(),
+                    if out.trim().is_empty() {
+                        format!("(cli `{cli_key}` was killed by run cancellation)")
+                    } else {
+                        format!("(cli `{cli_key}` was killed by run cancellation)\n{out}")
+                    },
+                    usage,
+                    files,
                     tools,
                 ),
                 Ok((code, out, err, _, _, tools)) => {
@@ -1799,6 +1823,11 @@ pub(crate) fn apply_seat_posture(argv: &mut Vec<String>, posture: &[String]) {
 }
 
 const TIMED_OUT: &str = "__wicked_timed_out__";
+/// Sentinel for the run-terminal CANCEL-TOKEN kill (crew#277), kept apart from [`TIMED_OUT`]:
+/// the token flips because the RUN already terminated (operator cancel included), while the
+/// deadline is the engine's own turn ceiling. Collapsing them re-creates the 616c8661 ambiguity
+/// where a turn-timeout and an operator cancel are indistinguishable downstream.
+const CANCELLED: &str = "__wicked_cancelled__";
 
 /// Upper bound on retained tool names per unit turn (FINDING-046 review, Copilot). `output` is capped
 /// at `MAX_OUT`; `tools` needs its own ceiling or a hung/looping CLI emitting `tool_use` blocks with
@@ -1824,8 +1853,10 @@ type BoundedRun = (i32, String, String, Option<Usage>, Vec<String>, Vec<String>)
 /// Run `cmd` bounded by `timeout`, draining stdout+stderr CONCURRENTLY (no pipe-buffer deadlock). Each
 /// raw stdout line is routed through `adapter`, whose READABLE text deltas are streamed through `emit`
 /// (live output) exactly as raw lines were before (for passthrough) while its structured signals (usage,
-/// files) are accumulated. Returns `(exit_code, stdout, stderr, usage, files, tools)`; a timeout returns
-/// `(-1, "", TIMED_OUT, None, [], [])` after killing. Uses a scoped thread so the stdout drain can borrow
+/// files) are accumulated. Returns `(exit_code, stdout, stderr, usage, files, tools)`; a deadline
+/// elapse returns `(-1, out, TIMED_OUT, …)` after killing, a cancel-token kill `(-1, out,
+/// CANCELLED, …)` — two sentinels, because the ceiling is the engine's own act while the token
+/// flips on a run-terminal (operator) cancel. Uses a scoped thread so the stdout drain can borrow
 /// `emit` (which lives on the worker stack); the adapter is MOVED into that thread.
 fn run_bounded(
     mut cmd: Command,
@@ -1848,7 +1879,7 @@ fn run_bounded(
     // `emit` is unaffected (every delta still streams); only the retained string is bounded.
     const MAX_OUT: usize = 8 * 1024 * 1024;
 
-    let (code, timed_out, out, usage, files, tools, err) = std::thread::scope(|scope| {
+    let (code, killed_by, out, usage, files, tools, err) = std::thread::scope(|scope| {
         // Stdout: read line-by-line, route through `adapter`, stream each readable delta through `emit`,
         // accumulate the readable text (bounded) + the structured signals (usage/files).
         let out_h = scope.spawn(move || {
@@ -1893,39 +1924,42 @@ fn run_bounded(
         });
 
         let start = Instant::now();
-        let (code, timed_out) = loop {
+        // `killed_by`: which kill fired, when one did — the cancel token (run-terminal, operator
+        // cancel included) vs the engine's own deadline. Kept apart so the caller can report
+        // `Cancelled` vs `TimedOut` instead of conflating both into one status (616c8661).
+        let (code, killed_by) = loop {
             match child_ref.try_wait() {
-                Ok(Some(status)) => break (status.code().unwrap_or(-1), false),
+                Ok(Some(status)) => break (status.code().unwrap_or(-1), None),
                 Ok(None) => {
                     if cancel
                         .as_ref()
                         .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                     {
-                        // Run-terminal cancellation: kill + reap NOW. Reported like a timeout
-                        // (the late StepOutput is discarded by the actor's stale-result guard;
-                        // the kill is the part that matters — crew#277's orphaned worker).
+                        // Run-terminal cancellation: kill + reap NOW (the late StepOutput is
+                        // discarded by the actor's stale-result guard; the kill is the part
+                        // that matters — crew#277's orphaned worker).
                         let _ = child_ref.kill();
                         let _ = child_ref.wait();
-                        break (-1, true);
+                        break (-1, Some(CANCELLED));
                     }
                     if start.elapsed() > timeout {
                         let _ = child_ref.kill();
                         let _ = child_ref.wait();
-                        break (-1, true);
+                        break (-1, Some(TIMED_OUT));
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(_) => break (-1, false),
+                Err(_) => break (-1, None),
             }
         };
         let (out, usage, files, tools) = out_h.join().unwrap_or_default();
         let err = err_h.join().unwrap_or_default();
-        (code, timed_out, out, usage, files, tools, err)
+        (code, killed_by, out, usage, files, tools, err)
     });
 
-    if timed_out {
+    if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
-        Ok((-1, out, TIMED_OUT.to_string(), usage, files, tools))
+        Ok((-1, out, sentinel.to_string(), usage, files, tools))
     } else {
         Ok((code, out, err, usage, files, tools))
     }
@@ -2363,7 +2397,7 @@ mod tests {
             flipper.store(true, std::sync::atomic::Ordering::Relaxed);
         });
         let start = Instant::now();
-        let (code, _out, _err, _usage, _files, _tools) = run_bounded(
+        let (code, _out, err, _usage, _files, _tools) = run_bounded(
             cmd,
             Duration::from_secs(60),
             &emit,
@@ -2376,6 +2410,43 @@ mod tests {
             "cancellation must kill the child promptly, not wait out the sleep"
         );
         assert_eq!(code, -1, "a cancelled worker reports the killed exit shape");
+        assert_eq!(
+            err, CANCELLED,
+            "a cancel-token kill reports the CANCELLED sentinel, never TIMED_OUT — the two \
+             must stay separable (616c8661: a turn-timeout is the engine's own act, a token \
+             flip is a run-terminal cancel)"
+        );
+    }
+
+    /// The engine's own deadline reports the TIMED_OUT sentinel — the other half of the
+    /// cancel-vs-timeout separation `run_bounded_kills_the_child_when_the_cancel_token_flips`
+    /// pins. Consumed at `run_unit_streaming`, where TIMED_OUT → `StepStatus::TimedOut` and
+    /// CANCELLED → `StepStatus::Cancelled`.
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_reports_timed_out_when_the_deadline_elapses() {
+        let emit = |_: &str| {};
+        // spawn-audit: test-only — `sleep` fixture proving the deadline reaps the child.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let (code, _out, err, _usage, _files, _tools) = run_bounded(
+            cmd,
+            Duration::from_millis(150),
+            &emit,
+            Box::new(Passthrough),
+            None,
+        )
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the deadline must kill the child promptly, not wait out the sleep"
+        );
+        assert_eq!(code, -1, "a timed-out worker reports the killed exit shape");
+        assert_eq!(
+            err, TIMED_OUT,
+            "a deadline kill reports the TIMED_OUT sentinel"
+        );
     }
 
     #[cfg(unix)]

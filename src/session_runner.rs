@@ -388,8 +388,9 @@ fn collect_turn(
 
     // Loop returns (found_result, timed_out):
     //   (true,  _)    → StepStatus::Ok
-    //   (false, true) → StepStatus::Cancelled (deadline elapsed, CLI still alive)
-    //   (false, false)→ StepStatus::Failed    (CLI crash / PTY exit / channel disconnect)
+    //   (false, true) → StepStatus::TimedOut (the engine's own deadline elapsed, CLI still alive
+    //                   — distinguishable from an operator cancel, which never reaches this loop)
+    //   (false, false)→ StepStatus::Failed   (CLI crash / PTY exit / channel disconnect)
     let (found_result, timed_out): (bool, bool) = loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -469,7 +470,7 @@ fn collect_turn(
         status: if found_result {
             StepStatus::Ok
         } else if timed_out {
-            StepStatus::Cancelled
+            StepStatus::TimedOut
         } else {
             StepStatus::Failed
         },

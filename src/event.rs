@@ -562,8 +562,12 @@ pub enum CoreEvent {
     /// (EVT-013) A worker's `ApplyStepResult` arrived and the output is ready to be gated. Fires
     /// after all terminal/idempotency/attempt guards pass, before the gate runs. `output_bytes` is
     /// the byte length of the worker's output — lets an operator immediately distinguish "0 bytes"
-    /// from "8 MB that was truncated by MAX_OUT". `step_status` is `"ok"`, `"failed"`, or
-    /// `"cancelled"`. `governed` reflects whether the runner armed input governance for this unit.
+    /// from "8 MB that was truncated by MAX_OUT". `step_status` is `"ok"`, `"failed"`,
+    /// `"cancelled"`, `"elicitation_failed"`, or `"timed_out"` — the last two kept apart from
+    /// `"cancelled"` on purpose: `"timed_out"` is the engine's own turn ceiling
+    /// (WICKED_UNIT_TIMEOUT_SECS), and it is the wire-visible signal that separates a
+    /// turn-timeout from an operator cancel (616c8661). `governed` reflects whether the runner
+    /// armed input governance for this unit.
     UnitOutputCaptured {
         session: String,
         ord: u32,

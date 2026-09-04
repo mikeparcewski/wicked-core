@@ -249,6 +249,9 @@ fn status_to_str(s: StepStatus) -> &'static str {
         StepStatus::Cancelled => "cancelled",
         // ACP elicitation terminal: non-retriable; bypasses FailureTriageReady (DES-002 I-7).
         StepStatus::ElicitationFailed => "elicitation_failed",
+        // The engine's own turn ceiling — kept apart from "cancelled" so a consumer can
+        // separate the platform's deadline from an operator cancel (616c8661).
+        StepStatus::TimedOut => "timed_out",
     }
 }
 
@@ -259,6 +262,9 @@ fn status_from_str(s: &str) -> StepStatus {
         // ACP elicitation terminal — explicit arm required; the wildcard default `Ok` is WRONG here
         // (DES-002-tests.md §StepStatus exhaustive match sites).
         "elicitation_failed" => StepStatus::ElicitationFailed,
+        // Turn-timeout terminal — same rule: falling through to `Ok` would fold a killed turn
+        // as completed work.
+        "timed_out" => StepStatus::TimedOut,
         _ => StepStatus::Ok,
     }
 }
@@ -1816,9 +1822,22 @@ mod tests {
 
     #[test]
     fn status_string_roundtrips() {
-        for s in [StepStatus::Ok, StepStatus::Failed, StepStatus::Cancelled] {
+        for s in [
+            StepStatus::Ok,
+            StepStatus::Failed,
+            StepStatus::Cancelled,
+            StepStatus::ElicitationFailed,
+            StepStatus::TimedOut,
+        ] {
             assert_eq!(status_from_str(status_to_str(s)), s);
         }
+        // TimedOut and Cancelled must never collapse on the wire — the whole point of the
+        // distinguishing status is that an operator cancel and the engine's turn ceiling stay
+        // separable (616c8661).
+        assert_ne!(
+            status_to_str(StepStatus::TimedOut),
+            status_to_str(StepStatus::Cancelled)
+        );
         // Unknown token fails safe to Ok (the actor's failed/cancelled arms are the deny paths; an
         // unknown status must not spuriously fail a run — Ok goes through the normal gate).
         assert_eq!(status_from_str("garbage"), StepStatus::Ok);

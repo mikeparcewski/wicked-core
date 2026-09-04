@@ -3877,7 +3877,7 @@ fn apply_step_result(
     // (EVT-013) UnitOutputCaptured — fires here, after all guards pass and usage/data events land,
     // before the three status branches (Cancelled / Failed / Ok-gate). This is the earliest point
     // where the output is known to belong to the current live unit at the correct attempt.
-    // `step_status` mirrors the three observable outcomes so consumers can distinguish them without
+    // `step_status` mirrors the observable outcomes so consumers can distinguish them without
     // pattern-matching the downstream events; `output_bytes` surfaces truncation at a glance.
     emit(
         subscribers,
@@ -3892,6 +3892,12 @@ fn apply_step_result(
                 crate::workflow::StepStatus::Ok => "ok",
                 // ACP elicitation terminal — routes to run-terminal path, not triage (DES-002 I-7).
                 crate::workflow::StepStatus::ElicitationFailed => "elicitation_failed",
+                // The engine's own turn ceiling (WICKED_UNIT_TIMEOUT_SECS). This string is THE
+                // wire-visible distinction between a turn-timeout and an operator cancel — a
+                // consumer arming automatic stall recovery keys on it, and it precedes the
+                // RunCancelled terminal frame from this same fold (single actor thread, ordered
+                // per-subscriber channel).
+                crate::workflow::StepStatus::TimedOut => "timed_out",
             }
             .to_string(),
             governed: output.governed,
@@ -3920,7 +3926,16 @@ fn apply_step_result(
 
     // A worker that CANCELLED the live unit (e.g. P4a subprocess kill) terminates the run as
     // Cancelled — and clears in_flight via `Finished` (NOT `Stale`, which would wedge the run).
-    if output.status == crate::workflow::StepStatus::Cancelled {
+    // `TimedOut` (the engine's own WICKED_UNIT_TIMEOUT_SECS ceiling) takes the SAME terminal
+    // backstop path: the ceiling is the last resort, and the primary recovery is a
+    // silence-watchdog reassign long before it fires. The statuses stay distinct on the wire
+    // (`UnitOutputCaptured.step_status` above) so automation can act on the platform's own
+    // timeout without ever converting an operator's cancel into an auto-failover — do NOT add
+    // an auto-failover here keyed on the shared branch (616c8661).
+    if matches!(
+        output.status,
+        crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
+    ) {
         session.status = SessionStatus::Cancelled;
         put_node(store, session.to_node())?;
         emit(
@@ -4622,9 +4637,10 @@ fn fail_run(
 /// `finalize_run` (Completed), `fail_run` (Failed, which `fail_run_by_id` also routes through),
 /// and resume's crash-during-planning guard. This is NOT every terminal transition — two reach a
 /// terminal status without calling this, on purpose: operator `cancel_run` FORCE-removes instead
-/// (Cancel is the operator discarding the work), and the WORKER-originated Cancelled path
-/// (`apply_step_result`, `StepStatus::Cancelled` — e.g. a P4a subprocess kill) reaps nowhere
-/// inline. That last leftover is not lost: the startup reaper
+/// (Cancel is the operator discarding the work), and the WORKER-originated terminal path
+/// (`apply_step_result`, `StepStatus::Cancelled` — e.g. a P4a subprocess kill — and
+/// `StepStatus::TimedOut`, the engine's own turn ceiling, which shares that branch) reaps
+/// nowhere inline. That last leftover is not lost: the startup reaper
 /// ([`crate::repo::reap_orphan_worktrees`]) classifies Cancelled as terminal and re-applies the
 /// same clean-only rule to it (and to anything a crash left behind), so a missed reap is a leak
 /// until next boot, not forever.
@@ -10554,5 +10570,198 @@ mod coverage_store_tests {
             !args.contains("Some(db_path)"),
             "the actor's own store is being handed to the coverage validator again: FINDING-091"
         );
+    }
+}
+
+/// perf#4 (stall-watchdog actionable) — the turn-timeout / operator-cancel separation.
+///
+/// `StepStatus::TimedOut` (the engine's own `WICKED_UNIT_TIMEOUT_SECS` ceiling) and
+/// `StepStatus::Cancelled` (an external stop: operator Ctrl-C / run-terminal kill) take the SAME
+/// terminal backstop at the fold, but must stay DISTINGUISHABLE on the wire
+/// (`UnitOutputCaptured.step_status`) — run 616c8661: automation keying failover on the shared
+/// `Cancelled` status would convert an operator's cancel into an auto-failover. These tests pin:
+///
+/// 1. a turn-timeout folds terminal with `step_status: "timed_out"`;
+/// 2. an operator/worker cancel folds terminal with `step_status: "cancelled"` — the two strings
+///    never collapse;
+/// 3. the reassign contract's stale-drop: after `ReassignUnit` bumps `session.attempt`, the
+///    superseded turn's EVENTUAL TimedOut posts at the OLD attempt and is dropped as Stale — it
+///    must not cancel the reassigned run (the only safe mid-turn recovery is `reassignUnit`).
+#[cfg(test)]
+mod turn_timeout_vs_cancel_tests {
+    use super::*;
+    use crate::domain::{
+        put_node, AgentSession, HumanConfirm, SessionStatus, UnitStatus, WorkUnit,
+    };
+    use crate::scope::EntityMode;
+    use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::{open_store, GraphStore, ToNode};
+
+    struct NoopRunner;
+    impl StepRunner for NoopRunner {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "unused".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    fn seed_run(store: &mut dyn GraphStore, run_id: &str, attempt: u32) {
+        let session = AgentSession {
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into(), "codex".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+        };
+        put_node(store, session.to_node()).unwrap();
+        let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
+        u.assigned_cli = Some("claude".to_string());
+        u.status = UnitStatus::Distributed;
+        put_node(store, u.to_node()).unwrap();
+    }
+
+    /// Fold one StepOutput with `status` at `attempt`, capturing the emitted events.
+    fn fold(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        status: StepStatus,
+        attempt: u32,
+    ) -> (StepApplied, AgentSession, Vec<CoreEvent>) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        subs.push(ev_tx);
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: 0,
+            attempt,
+            output: "(cli `claude` exceeded the timeout and was killed)".into(),
+            status,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        };
+        let applied = apply_step_result(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let events: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        (applied, session, events)
+    }
+
+    fn step_status_of(events: &[CoreEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            CoreEvent::UnitOutputCaptured { step_status, .. } => Some(step_status.clone()),
+            _ => None,
+        })
+    }
+
+    /// (1) The engine's turn ceiling folds terminal — same backstop as a cancel — but the wire
+    /// says `"timed_out"`, and the terminal frame is still `RunCancelled` (shape-compatible for
+    /// every existing consumer).
+    #[test]
+    fn turn_timeout_folds_terminal_with_a_distinguishing_step_status() {
+        let run_id = format!("timeout-fold-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+
+        let (applied, session, events) = fold(&mut store, &run_id, StepStatus::TimedOut, 0);
+        assert!(matches!(applied, StepApplied::Finished));
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert_eq!(
+            step_status_of(&events).as_deref(),
+            Some("timed_out"),
+            "the turn-timeout must be wire-distinguishable from an operator cancel"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, CoreEvent::RunCancelled { session } if session == &run_id)),
+            "the terminal frame stays RunCancelled — additive distinction, no wire break"
+        );
+    }
+
+    /// (2) An operator/worker cancel keeps its `"cancelled"` spelling — the two statuses never
+    /// collapse into one wire string.
+    #[test]
+    fn operator_cancel_still_folds_as_cancelled() {
+        let run_id = format!("cancel-fold-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_run(&mut store, &run_id, 0);
+
+        let (applied, session, events) = fold(&mut store, &run_id, StepStatus::Cancelled, 0);
+        assert!(matches!(applied, StepApplied::Finished));
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        assert_eq!(step_status_of(&events).as_deref(), Some("cancelled"));
+    }
+
+    /// (3) THE reassign-safety pin: `ReassignUnit` bumps `session.attempt` (and cancels the ACP
+    /// epoch) exactly so the wedged turn's eventual output is a redelivery. When that superseded
+    /// turn finally hits its ceiling, its TimedOut posts at the OLD attempt and must drop as
+    /// Stale — never terminate the reassigned (still executing) run. A raw kill without the
+    /// attempt bump would land in the terminal branch at the CURRENT attempt: the exact 616c8661
+    /// unrecoverable-cancel bug.
+    #[test]
+    fn a_superseded_turns_late_timeout_drops_stale_and_spares_the_reassigned_run() {
+        let run_id = format!("stale-timeout-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // Post-reassign shape: the session is at attempt 1; the wedged worker still holds 0.
+        seed_run(&mut store, &run_id, 1);
+
+        let (applied, session, events) = fold(&mut store, &run_id, StepStatus::TimedOut, 0);
+        assert!(
+            matches!(applied, StepApplied::Stale),
+            "a superseded attempt's late TimedOut is a redelivery — dropped, not applied"
+        );
+        assert_eq!(
+            session.status,
+            SessionStatus::Executing,
+            "the reassigned run keeps executing; the old turn's death cannot cancel it"
+        );
+        assert!(
+            events.is_empty(),
+            "a stale drop emits nothing — no RunCancelled, no UnitOutputCaptured; got {events:?}"
+        );
+
+        // …and the CURRENT attempt's cancel still lands (the guard is attempt-authoritative,
+        // not a blanket drop).
+        let (applied, session, _events) = fold(&mut store, &run_id, StepStatus::Cancelled, 1);
+        assert!(matches!(applied, StepApplied::Finished));
+        assert_eq!(session.status, SessionStatus::Cancelled);
     }
 }
