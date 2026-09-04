@@ -339,7 +339,8 @@ pub struct Verdict {
     pub seated: u32,
     /// The recommendation the most votes converged on (the winner), if any.
     pub winning_recommendation: Option<String>,
-    /// Agreement ratio in `[0.0, 1.0]`: winning vote count / votes **cast**.
+    /// Agreement ratio in `[0.0, 1.0]`: winning vote count / votes that **answered** (cast a
+    /// non-empty recommendation — a tolerant parse of a hollow exit-0 return is not an answer).
     ///
     /// Deliberately NOT quorum-adjusted — it answers "of the seats that answered, how many
     /// agreed?", which is what drives the runoff loop. Quorum is a separate axis and lives on

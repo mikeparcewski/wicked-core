@@ -1532,13 +1532,17 @@ mod tests {
             "ballot 1's plurality stands (tie-break low): {verdict:?}"
         );
 
-        // The control: the identical split WITHOUT a tight deadline deliberates to the round
-        // cap — proving the deadline is what stopped round 2 above, not the split resolving.
+        // The control: the identical split with a deadline too generous to ever fire
+        // deliberates to the round cap — proving the deadline is what stopped round 2 above,
+        // not the split resolving. Pinned explicitly (over the pin `worker_with` already
+        // applies) so this control is hermetic against the process environment on its face:
+        // only MAX_BALLOTS can end it.
         let control = Arc::new(SlowSplitDispatcher {
             per_seat: Duration::from_millis(1),
             max_ballot: Mutex::new(0),
         });
-        let control_worker = worker_with(control.clone(), &["a", "b"]);
+        let control_worker =
+            worker_with(control.clone(), &["a", "b"]).with_deadline(Duration::from_secs(600));
         control_worker.queue_blocking(task());
         assert_eq!(
             *control.max_ballot.lock().unwrap(),

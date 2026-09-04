@@ -3,7 +3,7 @@
 //! **The cardinal rule:** consensus is measured by RISK CONVERGENCE — how many CLIs
 //! independently converge on the same recommendation and cite the same risks — **NOT** by
 //! averaging uncalibrated model confidence numbers. `agreement_ratio =
-//! winning_vote_count / total_votes`.
+//! winning_vote_count / answering_votes` (votes that carried a usable recommendation).
 
 use std::collections::BTreeMap;
 
@@ -166,9 +166,11 @@ pub fn live_agreement(votes: &[Vote], seated: u32, abstained: u32) -> f32 {
 ///   however differently they justified it (see [`rec_key`]). A dead tie breaks to the lowest
 ///   option number — deterministic, and honestly reported: a 1-1-1 split is exactly the
 ///   `NoConsensus` that `kind` and `agreement_ratio` then say it is.
-/// - `agreement_ratio` = winning count / votes **cast**.
+/// - `agreement_ratio` = winning count / votes that **answered** (cast a non-empty
+///   recommendation — a hollow exit-0 return is liveness, not an answer).
 /// - Consensus = a **strict majority of the LIVE council** (winner count * 2 > seated −
-///   abstained), gated by [`answering_floor`]. Counts agreement, never confidence.
+///   abstained), gated by [`answering_floor`] over the answering count. Counts agreement,
+///   never confidence.
 /// - `risk_convergence` = risks cited by ≥1 CLI, most-cited first (the high-signal axis).
 /// - `dissent` = non-winning recommendations.
 ///
@@ -195,19 +197,36 @@ pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32, abstained: u32) ->
         None => (None, 0),
     };
 
-    let agreement_ratio = if total == 0 {
+    // The votes that ANSWERED: cast a recommendation the tally can use. `parse_vote` is
+    // tolerant — a CLI that exits 0 with a help screen or auth banner yields a Vote whose
+    // recommendation is empty, which `build_matrix` drops from the counts while `total` still
+    // includes it. A hollow return proves the seat is alive, not that it answered, so
+    // everything below that MEANS "answering" — the floor, the split-vs-quorum-lost
+    // classification, the agreement denominator — keys on this count. Left keyed on `total`,
+    // two hollow returns beside one real vote satisfied a floor of three, and a council where
+    // ONE seat actually spoke could be recorded as consensus (the FINDING-026 D hole, re-dug
+    // by tolerant parsing).
+    let answering: u32 = matrix
+        .recommendation_counts
+        .iter()
+        .map(|(_, count)| *count)
+        .sum();
+
+    let agreement_ratio = if answering == 0 {
         0.0
     } else {
-        winning_count as f32 / total as f32
+        winning_count as f32 / answering as f32
     };
 
     // Strict majority of the LIVE council converges on the winner. Both clamps are defensive:
     // an under-reported `seated` (including the 0 that legacy records deserialize to) and an
     // over-reported `abstained` must never be able to manufacture a majority by shrinking the
-    // denominator below what was actually cast — they can only fail to detect a lost one.
+    // denominator below what actually came back — and the clamps stay on the RETURNED count
+    // (`total`), not `answering`: a returned vote, hollow or not, is proof of a live seat, and
+    // the stronger clamp is the safer one.
     let seated = seated.max(total);
     let live = seated.saturating_sub(abstained).max(total);
-    let consensus = total >= answering_floor(seated) && winning_count * 2 > live;
+    let consensus = answering >= answering_floor(seated) && winning_count * 2 > live;
 
     let dissent: Vec<String> = matrix
         .recommendation_counts
@@ -218,8 +237,10 @@ pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32, abstained: u32) ->
 
     // Among the seats that ANSWERED, did the winner take a majority? This separates the two
     // reasons a council fails to reach consensus, which the summary string must not conflate:
-    // the seats disagreed, or the seats never spoke. Only the first is a split.
-    let split_among_cast = winning_count * 2 <= total;
+    // the seats disagreed, or the seats never spoke. Only the first is a split — and a hollow
+    // return is a seat that never spoke, so it must not be able to relabel a lost quorum as a
+    // disagreement.
+    let split_among_cast = winning_count * 2 <= answering;
 
     // The abstentions the arithmetic actually honoured, after the clamps above — what the
     // summary string reports, so it can never disagree with the `consensus` it sits next to.
@@ -601,6 +622,62 @@ mod tests {
         assert!((live_agreement(&split, 5, 5) - 0.6).abs() < 1e-6);
         // No votes is no agreement, not a divide-by-zero.
         assert_eq!(live_agreement(&[], 0, 0), 0.0);
+    }
+
+    #[test]
+    fn hollow_returns_do_not_satisfy_the_answering_floor() {
+        // `parse_vote` is tolerant: a CLI that exits 0 with a help screen or auth banner comes
+        // back as a Vote whose recommendation is EMPTY — dropped from the tally, but returned.
+        // Keying the floor on the returned count re-dug the FINDING-026 D hole: here, 6 seated
+        // and 3 benched, three votes come back but only two carry a ballot. Three returned
+        // met a floor of three and 2-of-3-live is a strict majority — consensus recorded on a
+        // council where two seats actually answered.
+        let votes = vec![
+            vote("a", "A", "latency"),
+            vote("b", "A", "latency"),
+            vote("c", "", ""),
+        ];
+        let v = synthesize("t16", &votes, 6, 3);
+        assert!(
+            !v.consensus,
+            "two answering seats of 6 convened is below the floor, however many returned: {v:?}"
+        );
+        assert!(
+            v.kind.contains("quorum lost"),
+            "the record must name what was lost: {:?}",
+            v.kind
+        );
+        assert_eq!(
+            v.agreement_ratio, 1.0,
+            "of the seats that ANSWERED, all agreed — a hollow return is not a dissent"
+        );
+    }
+
+    #[test]
+    fn hollow_returns_cannot_relabel_a_lost_quorum_as_a_split() {
+        // 6 seated, 2 benched: one real vote beside two hollow returns. Counting the hollow
+        // returns as answers made this read as a 1-of-3 disagreement ("NoConsensus: A (1/3)");
+        // in fact ONE seat spoke, which is a lost quorum and must say so.
+        let votes = vec![
+            vote("a", "A", "latency"),
+            vote("b", "", ""),
+            vote("c", "", ""),
+        ];
+        let v = synthesize("t17", &votes, 6, 2);
+        assert!(!v.consensus, "{v:?}");
+        assert!(
+            v.kind.contains("quorum lost"),
+            "one answering seat is absence, not disagreement: {:?}",
+            v.kind
+        );
+
+        // And the all-hollow edge: votes returned, none usable — no winner, no consensus, no
+        // divide-by-zero.
+        let hollow_only = vec![vote("a", "", ""), vote("b", "", "")];
+        let v = synthesize("t18", &hollow_only, 3, 0);
+        assert!(!v.consensus, "{v:?}");
+        assert_eq!(v.winning_recommendation, None);
+        assert_eq!(v.agreement_ratio, 0.0);
     }
 
     #[test]
