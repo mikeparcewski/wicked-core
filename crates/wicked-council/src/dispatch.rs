@@ -404,13 +404,22 @@ impl RealDispatcher {
 
     /// Record how a REAL dispatch resolved (the gate short-circuits never reach here).
     ///
-    /// A parsed vote clears health outright — streak, bench, probation, all of it. Not because
-    /// the past failures didn't happen, but because the question health answers is "can this
-    /// seat vote right now?", and a vote is the strongest possible yes.
-    fn record_seat_outcome(&self, cli: &AgenticCli, voted: bool) {
+    /// Readiness is a PARSED ballot, not a clean exit: only a vote carrying a non-empty
+    /// recommendation clears health — streak, bench, probation, all of it. Not because the
+    /// past failures didn't happen, but because the question health answers is "can this seat
+    /// vote right now?", and a usable ballot is the strongest possible yes. A CLI that exits 0
+    /// WITHOUT one (a help screen, an auth banner — `parse_vote` is tolerant and yields an
+    /// empty recommendation, which synthesis then drops from the tally) is alive, not ready:
+    /// re-admitting on it is the `--version` mistake wearing an exit code, so it counts
+    /// against health like any other failure.
+    fn record_seat_outcome(&self, cli: &AgenticCli, outcome: &DispatchOutcome) {
+        let usable = match outcome {
+            DispatchOutcome::Voted(v) => !v.recommendation.trim().is_empty(),
+            DispatchOutcome::Failed(_) => false,
+        };
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
         let health = seats.entry(cli.key.clone()).or_default();
-        if voted {
+        if usable {
             *health = SeatHealth::default();
             return;
         }
@@ -536,7 +545,7 @@ impl RealDispatcher {
                     )),
                     queued_ms: 0,
                     ran_ms: 0,
-                }
+                };
             }
         };
 
@@ -574,11 +583,12 @@ impl RealDispatcher {
             Ok(run) => DispatchOutcome::Voted(parse_vote(cli, &run.stdout)),
         };
         // A real dispatch ran to a real outcome: this is the ONLY thing that moves health. A
-        // parsed vote is the readiness signal (it clears everything, probation included); a
-        // failure extends the streak or fails the probation. The guard is disarmed AFTER the
-        // record — and its reopen only touches a seat still in `Probation`, so this order can
-        // never undo what was just recorded.
-        self.record_seat_outcome(cli, outcome.is_voted());
+        // parsed, non-empty vote is the readiness signal (it clears everything, probation
+        // included); anything else — a failure, or a hollow exit-0 — extends the streak or
+        // fails the probation. The guard is disarmed AFTER the record — and its reopen only
+        // touches a seat still in `Probation`, so this order can never undo what was just
+        // recorded.
+        self.record_seat_outcome(cli, &outcome);
         probation_guard.armed = false;
         TimedOutcome {
             outcome,
@@ -1829,7 +1839,11 @@ mod failure_diagnostics_tests {
         // Bench expiry: the next dispatch is the ONE probationary ballot, and a parsed vote on
         // it clears health outright.
         std::thread::sleep(BASE + Duration::from_millis(200));
-        assert_eq!(kind_of(&voting), None, "the probationary ballot really runs");
+        assert_eq!(
+            kind_of(&voting),
+            None,
+            "the probationary ballot really runs"
+        );
         assert_eq!(
             kind_of(&failing),
             Some(SeatFailureKind::NonZeroExit),
@@ -1858,6 +1872,49 @@ mod failure_diagnostics_tests {
             benched_backoff(&d, "flappy"),
             Some(MAX),
             "the backoff is capped at the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_hollow_exit_zero_is_liveness_not_readiness() {
+        // A CLI that exits 0 WITHOUT a parseable ballot — a help screen, an auth banner —
+        // proves it is alive, not that it can vote. `parse_vote` tolerantly yields a Vote with
+        // an empty recommendation (which synthesis drops from the tally), and clearing health
+        // on that would re-admit a seat on exactly the liveness-for-readiness confusion the
+        // `--version` probe had. A hollow probe is a FAILED probation: re-benched, escalated.
+        const BASE: Duration = Duration::from_secs(1);
+        const MAX: Duration = Duration::from_secs(4);
+        let d = dispatcher_with_bench(2, BASE, MAX);
+        let failing = shell_seat("hollow", "exit 3");
+        let chatty = shell_seat("hollow", "echo pardon could you repeat that");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                d.dispatch_prompt(&failing, &task(), "ignored"),
+                DispatchOutcome::Failed(f) if f.kind == SeatFailureKind::NonZeroExit
+            ));
+        }
+        assert_eq!(benched_backoff(&d, "hollow"), Some(BASE));
+
+        // Bench expiry: the hollow seat gets its probationary ballot and exits 0. The council
+        // layer still records the (empty) vote — health is a dispatcher question, not a tally
+        // question — but the bench must NOT clear.
+        std::thread::sleep(BASE + Duration::from_millis(200));
+        assert!(
+            d.dispatch_prompt(&chatty, &task(), "ignored").is_voted(),
+            "the probe really ran and exited 0"
+        );
+        assert_eq!(
+            benched_backoff(&d, "hollow"),
+            Some(BASE * 2),
+            "a hollow exit-0 fails the probation with escalated backoff, never clears it"
+        );
+        assert!(
+            matches!(
+                d.dispatch_prompt(&chatty, &task(), "ignored"),
+                DispatchOutcome::Failed(f) if f.kind == SeatFailureKind::Benched
+            ),
+            "and the seat is back on the bench"
         );
     }
 

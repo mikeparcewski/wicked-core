@@ -480,8 +480,7 @@ fn run_council(
         // The deadline is only ever consulted BETWEEN ballots: the ballot that is out
         // finishes and its votes all count — there is no mid-ballot cancel, by design (the
         // seat threads in the scope above cannot be safely torn down mid-run).
-        let live_agreement =
-            synthesis::live_agreement(&votes, roster.len() as u32, abstained);
+        let live_agreement = synthesis::live_agreement(&votes, roster.len() as u32, abstained);
         if live_agreement >= APPROVAL_THRESHOLD
             || ballot >= MAX_BALLOTS
             || convened_at.elapsed() >= deadline
@@ -723,6 +722,11 @@ mod tests {
             keys.iter().map(|k| cli(k)).collect(),
             "general",
         )
+        // Hermetic: `Worker::new` reads WICKED_COUNCIL_DEADLINE_SECS, and these tests assert
+        // BALLOT-count behavior — a tight deadline exported in a developer's or CI's
+        // environment must not be able to end a deliberation early and flip an assertion.
+        // Tests about the deadline itself override this again with their own value.
+        .with_deadline(Duration::from_secs(600))
     }
 
     fn task() -> CouncilTask {
@@ -949,7 +953,9 @@ mod tests {
             Arc::new(NoopEventSink),
             ["a", "b", "c"].iter().map(|k| cli(k)).collect(),
             "general",
-        );
+        )
+        // Hermetic against an exported WICKED_COUNCIL_DEADLINE_SECS, like `worker_with_parts`.
+        .with_deadline(Duration::from_secs(600));
         let id = worker.queue_blocking(task());
         worker.poll(&id).expect("the council must still resolve");
 
@@ -1368,7 +1374,11 @@ mod tests {
         let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e", "f"]);
         let id = worker.queue_blocking(task());
         let status = worker.poll(&id).expect("status");
-        assert_eq!(status.state, TaskState::Voted, "the plurality still resolves");
+        assert_eq!(
+            status.state,
+            TaskState::Voted,
+            "the plurality still resolves"
+        );
         assert_eq!(
             *dispatcher.max_ballot.lock().unwrap(),
             1,
@@ -1470,7 +1480,11 @@ mod tests {
                 *max = (*max).max(ctx.ballot);
             }
             std::thread::sleep(self.per_seat);
-            let rec = if cli.key == "a" { "1 — mine" } else { "2 — mine" };
+            let rec = if cli.key == "a" {
+                "1 — mine"
+            } else {
+                "2 — mine"
+            };
             Some(vote(&cli.key, rec))
         }
     }

@@ -506,7 +506,10 @@ mod tests {
             v.consensus,
             "3 of the 4 live seats is a strict majority of everyone who could answer: {v:?}"
         );
-        assert_eq!(v.seated, 6, "the quorum record still carries the full council");
+        assert_eq!(
+            v.seated, 6,
+            "the quorum record still carries the full council"
+        );
         assert!(
             v.kind.contains("3/4 live seats") && v.kind.contains("2 benched of 6"),
             "the summary must name the live denominator and the abstentions: {:?}",
