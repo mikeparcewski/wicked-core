@@ -4425,6 +4425,13 @@ impl StepRunner for AcpStepRunner {
         });
     }
 
+    /// ACP can fall back to a one-shot wrapped CLI when its bridge is unavailable. That child has
+    /// no ACP kill handle, so forward ReassignUnit's exact old-turn identity to the fallback.
+    fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
+        self.fallback
+            .cancel_reassigned_worker(run_id, epoch, launch_seq);
+    }
+
     /// Close a single ACP session for `(run_id, cli_key)` — called by `ReassignUnit` before
     /// re-dispatching to a different CLI. Registry/session removal is synchronous so the
     /// replacement cannot race with cleanup; kill/wait remains on a background thread.

@@ -266,6 +266,12 @@ pub trait StepRunner: Send + Sync {
     /// errors silently — the run is already gone; a send failure is expected and harmless.
     fn on_run_complete(&self, _run_id: &str) {}
 
+    /// Stop the single wrapped child superseded by `ReassignUnit`. `epoch` and `launch_seq` are
+    /// the actor-minted identity of the old attempt; implementations must not cancel a newer
+    /// launch for the same run. Stateless and persistent-only runners have nothing to do.
+    /// Must be fire-and-forget — never block the actor thread.
+    fn cancel_reassigned_worker(&self, _run_id: &str, _epoch: u64, _launch_seq: u64) {}
+
     /// Queue an operator message for delivery on the run's NEXT matching unit prompt (the
     /// inject path for runs with no live PTY to write into — i.e. every ACP-backed run).
     /// Returns `true` when the runner accepted the message; the default declines, so

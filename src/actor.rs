@@ -2500,14 +2500,23 @@ pub(crate) fn run(
                 // Otherwise the killed worker can interpret the deliberate disconnect as an
                 // adapter failure and start a wrapped-CLI fallback that continues mutating the
                 // worktree after reassignment.
-                if let Some(ref maps) = lifecycle_maps {
+                let (old_epoch, old_launch_seq) = if let Some(ref maps) = lifecycle_maps {
                     let mut maps = maps.lock().unwrap_or_else(|p| p.into_inner());
                     let epoch = maps.current_epoch(&run_id);
+                    let launch_seq = maps.current_launch_seq(&run_id);
                     if epoch > 0 {
                         maps.cancel_epoch(&run_id, epoch);
                     }
                     maps.advance_launch_seq(&run_id);
-                }
+                    (epoch, launch_seq)
+                } else {
+                    (0, 0)
+                };
+                // A WRAPPED fallback has no ACP kill handle and no PTY terminal. Cancel its
+                // exact old epoch/launch before dispatching the replacement; this leaves the
+                // new launch alive and the token tombstone covers a child still between dispatch
+                // and token registration.
+                runner.cancel_reassigned_worker(&run_id, old_epoch, old_launch_seq);
                 // ── close the PTY session (if any) ──────────────────────────────────────────
                 if let Some(session_entries) = run_sessions.remove(&run_id) {
                     for (cli_key, terminal_id) in &session_entries {
@@ -10804,9 +10813,9 @@ mod coverage_store_tests {
 /// 1. a turn-timeout folds terminal with `step_status: "timed_out"`;
 /// 2. an operator/worker cancel folds terminal with `step_status: "cancelled"` — the two strings
 ///    never collapse;
-/// 3. the reassign contract's stale-drop: after `ReassignUnit` bumps `session.attempt`, the
-///    superseded turn's EVENTUAL TimedOut posts at the OLD attempt and is dropped as Stale — it
-///    must not cancel the reassigned run (the only safe mid-turn recovery is `reassignUnit`).
+/// 3. the reassign contract's stale-drop: after `ReassignUnit` bumps `session.attempt`, either
+///    old-turn outcome (`TimedOut` or reassign-triggered `Cancelled`) posts at the OLD attempt and
+///    is dropped as Stale — it must not cancel the reassigned run.
 #[cfg(test)]
 mod turn_timeout_vs_cancel_tests {
     use super::*;
@@ -10951,11 +10960,11 @@ mod turn_timeout_vs_cancel_tests {
     }
 
     /// (3) THE reassign-safety pin: `ReassignUnit` bumps `session.attempt` (and cancels the ACP
-    /// epoch) exactly so the wedged turn's eventual output is a redelivery. When that superseded
-    /// turn finally hits its ceiling, its TimedOut posts at the OLD attempt and must drop as
-    /// Stale — never terminate the reassigned (still executing) run. A raw kill without the
-    /// attempt bump would land in the terminal branch at the CURRENT attempt: the exact 616c8661
-    /// unrecoverable-cancel bug.
+    /// epoch) exactly so the wedged turn's eventual output is a redelivery. Whether it reaches
+    /// its ceiling or is killed by reassign, that old-attempt result must drop as Stale — never
+    /// terminate the reassigned (still executing) run. A raw kill without the attempt bump would
+    /// land in the terminal branch at the CURRENT attempt: the exact 616c8661 unrecoverable-cancel
+    /// bug.
     #[test]
     fn a_superseded_turns_late_timeout_drops_stale_and_spares_the_reassigned_run() {
         let run_id = format!("stale-timeout-{}", std::process::id());
@@ -10976,6 +10985,16 @@ mod turn_timeout_vs_cancel_tests {
         assert!(
             events.is_empty(),
             "a stale drop emits nothing — no RunCancelled, no UnitOutputCaptured; got {events:?}"
+        );
+
+        // core#358: a superseded WRAPPED fallback now returns Cancelled (not TimedOut). It also
+        // holds the old attempt and must take the same stale-drop path.
+        let (applied, session, events) = fold(&mut store, &run_id, StepStatus::Cancelled, 0);
+        assert!(matches!(applied, StepApplied::Stale));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert!(
+            events.is_empty(),
+            "a late reassign-cancelled output is stale too; got {events:?}"
         );
 
         // …and the CURRENT attempt's cancel still lands (the guard is attempt-authoritative,

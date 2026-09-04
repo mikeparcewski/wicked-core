@@ -1,0 +1,2 @@
+{"campaign":"c1","node":"n1","runId":"run-7","seq":8,"ts":1788523852496,"type":"campaignNodeStarted"}
+{"campaign":"c1","node":"n1","prompt":"approve?","runId":"run-7","seq":9,"ts":1788523852496,"type":"campaignNodeAwaitingHuman"}

@@ -497,19 +497,34 @@ pub(crate) fn inject_claude_stream_flags(argv: &mut Vec<String>) {
 pub struct WrappedCliStepRunner {
     /// Per-unit wall-clock bound. A CLI exceeding it is killed and the step reports `Cancelled`.
     timeout: Duration,
-    /// Cancellation tokens for in-flight wrapped workers, keyed by run id (crew#277): a canceled
-    /// run's hung `copilot -p` survived ~90 minutes because CancelRun had no path to a wrapped
-    /// child — only ACP sessions had kill handles. `run_bounded`'s poll loop watches the token;
-    /// `cancel_run_workers` flips every token for the run.
-    cancel_tokens: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<String, Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
-        >,
-    >,
+    /// Cancellation tokens for in-flight wrapped workers. A run-wide cancellation kills every
+    /// token (crew#277); reassign must kill only the superseded `(epoch, launch_seq)` worker, so
+    /// a fresh attempt may write its worktree without its predecessor still mutating it.
+    cancel_tokens: std::sync::Arc<std::sync::Mutex<WrappedCancelRegistry>>,
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`). `None` for
     /// the `Default` path (no-tx contexts such as standalone tests); `Some` when constructed via
     /// [`WrappedCliStepRunner::with_tx`] (the actor path, seeded from `AcpStepRunner::new`).
     tx: Option<std::sync::mpsc::Sender<crate::command::Command>>,
+}
+
+type CancelToken = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// The identity of one actor-dispatched wrapped turn. `launch_seq` is the authoritative
+/// supersession coordinate; epoch keeps the fallback aligned with ACP's elicitation lifetime.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WrappedWorkerKey {
+    run_id: String,
+    epoch: u64,
+    launch_seq: u64,
+}
+
+#[derive(Default)]
+struct WrappedCancelRegistry {
+    tokens: std::collections::HashMap<WrappedWorkerKey, Vec<CancelToken>>,
+    /// Reassign can arrive after dispatch but before the fallback has registered its token. Keep
+    /// this tombstone until terminal cleanup so that late registration is born cancelled instead
+    /// of starting a stale child in the newly reassigned worktree.
+    reassigned: std::collections::HashSet<WrappedWorkerKey>,
 }
 
 /// Per-unit wall-clock timeout. Default 2 h — agentic CLIs doing real multi-file extraction
@@ -544,30 +559,34 @@ impl WrappedCliStepRunner {
         }
     }
 
-    /// Register a cancellation token for an in-flight worker of `run_id`; the caller passes the
-    /// token to [`run_bounded`] and MUST call [`Self::unregister_token`] when the worker returns
-    /// (tokens for finished workers are dead weight until the run terminates).
-    fn register_token(&self, run_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    fn worker_key(input: &StepInput) -> WrappedWorkerKey {
+        WrappedWorkerKey {
+            run_id: input.run_id.clone(),
+            epoch: input.elicitation_epoch,
+            launch_seq: input.launch_seq,
+        }
+    }
+
+    /// Register a cancellation token for one actor-dispatched wrapped worker. The caller passes
+    /// the token to [`run_bounded`] and MUST call [`Self::unregister_token`] when it returns.
+    fn register_token(&self, input: &StepInput) -> CancelToken {
+        let key = Self::worker_key(input);
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.cancel_tokens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .entry(run_id.to_string())
-            .or_default()
-            .push(token.clone());
+        let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.reassigned.contains(&key) {
+            token.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        guard.tokens.entry(key).or_default().push(token.clone());
         token
     }
 
-    fn unregister_token(
-        &self,
-        run_id: &str,
-        token: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) {
+    fn unregister_token(&self, input: &StepInput, token: &CancelToken) {
+        let key = Self::worker_key(input);
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(v) = guard.get_mut(run_id) {
+        if let Some(v) = guard.tokens.get_mut(&key) {
             v.retain(|t| !std::sync::Arc::ptr_eq(t, token));
             if v.is_empty() {
-                guard.remove(run_id);
+                guard.tokens.remove(&key);
             }
         }
     }
@@ -578,10 +597,40 @@ impl WrappedCliStepRunner {
     pub(crate) fn cancel_run_workers(&self, run_id: &str) {
         let tokens = {
             let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
-            guard.remove(run_id).unwrap_or_default()
+            let keys: Vec<WrappedWorkerKey> = guard
+                .tokens
+                .keys()
+                .filter(|key| key.run_id == run_id)
+                .cloned()
+                .collect();
+            let tokens: Vec<CancelToken> = keys
+                .into_iter()
+                .flat_map(|key| guard.tokens.remove(&key).unwrap_or_default())
+                .collect();
+            guard.reassigned.retain(|key| key.run_id != run_id);
+            tokens
         };
         for t in tokens {
             t.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Kill exactly the wrapped worker superseded by `ReassignUnit`. This is deliberately not a
+    /// run-wide cancel: the replacement's different launch sequence must remain live. The
+    /// tombstone closes the dispatch-to-registration race described on [`WrappedCancelRegistry`].
+    pub(crate) fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
+        let key = WrappedWorkerKey {
+            run_id: run_id.to_string(),
+            epoch,
+            launch_seq,
+        };
+        let tokens = {
+            let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
+            guard.reassigned.insert(key.clone());
+            guard.tokens.get(&key).cloned().unwrap_or_default()
+        };
+        for token in tokens {
+            token.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -606,6 +655,10 @@ impl StepRunner for WrappedCliStepRunner {
 
     fn on_run_complete(&self, run_id: &str) {
         self.cancel_run_workers(run_id);
+    }
+
+    fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
+        Self::cancel_reassigned_worker(self, run_id, epoch, launch_seq);
     }
 }
 
@@ -847,9 +900,9 @@ impl WrappedCliStepRunner {
                     }
                 }
             }
-            let cancel_token = self.register_token(&input.run_id);
+            let cancel_token = self.register_token(input);
             let bounded = run_bounded(cmd, self.timeout, emit, adapter, Some(cancel_token.clone()));
-            self.unregister_token(&input.run_id, &cancel_token);
+            self.unregister_token(input, &cancel_token);
             match bounded {
                 // FINDING-100. A unit may background work and return — domain-extraction's extract
                 // phase writes a resumable worker script into its worktree, starts N copies, and
@@ -1867,6 +1920,15 @@ fn run_bounded(
     // the poll loop kills the child instead of letting it orphan past the run's death.
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<BoundedRun> {
+    // Pre-spawn guard (core#358): a token born cancelled means `ReassignUnit` landed in the
+    // dispatch-to-registration window. Never spawn the child — otherwise the superseded worker
+    // mutates the newly reassigned worktree for one poll tick before the loop below kills it.
+    if cancel
+        .as_ref()
+        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    {
+        return Ok((-1, String::new(), CANCELLED.to_string(), None, Vec::new(), Vec::new()));
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2416,6 +2478,160 @@ mod tests {
              must stay separable (616c8661: a turn-timeout is the engine's own act, a token \
              flip is a run-terminal cancel)"
         );
+    }
+
+    /// core#358: ReassignUnit must reach a one-shot wrapped child too. Unlike ACP, this path has
+    /// no process kill handle; its token is keyed by the old epoch + launch sequence. The fixture
+    /// writes continuously in the unit worktree, so joining with `Cancelled` and observing a
+    /// stable file proves the superseded child cannot keep mutating alongside its replacement.
+    #[cfg(unix)]
+    #[test]
+    fn reassign_cancels_the_matching_wrapped_worker_and_stops_its_worktree_writes() {
+        use std::time::{Duration, Instant};
+
+        let root =
+            std::env::temp_dir().join(format!("wicked-reassign-wrapped-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("writer.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nwhile :; do printf x >> heartbeat; sleep 0.01; done\n",
+        )
+        .unwrap();
+
+        let mut unit = WorkUnit::pending("reassign:wrapped", "reassign", 1, "keep writing");
+        unit.assigned_cli = Some("sh".to_string());
+        unit.assigned_invocation = Some(format!("sh {} {{PROMPT}}", script.display()));
+        let input = StepInput {
+            run_id: "reassign-wrapped".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-reassign".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(root.clone()),
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 41,
+            process_gen: None,
+            launch_seq: 73,
+        };
+        let runner = std::sync::Arc::new(WrappedCliStepRunner::default());
+        let worker = std::sync::Arc::clone(&runner);
+        let child_input = input.clone();
+        let handle = std::thread::spawn(move || worker.run_unit(&child_input));
+
+        let heartbeat = root.join("heartbeat");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !heartbeat.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            heartbeat.exists(),
+            "the wrapped fixture must be writing before reassign"
+        );
+
+        runner.cancel_reassigned_worker(&input.run_id, input.elicitation_epoch, input.launch_seq);
+        let output = handle.join().expect("wrapped worker thread must not panic");
+        assert_eq!(
+            output.status,
+            StepStatus::Cancelled,
+            "reassign is a cancellation, not a timeout"
+        );
+
+        let writes_after_kill = std::fs::metadata(&heartbeat).unwrap().len();
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            std::fs::metadata(&heartbeat).unwrap().len(),
+            writes_after_kill,
+            "the superseded wrapped child must stop writing the worktree"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A reassign tombstone must be exact: an older turn is killed, a replacement with a new
+    /// sequence (or a different epoch) is not. It also covers reassign arriving before fallback
+    /// token registration, the narrow race that otherwise starts a zombie after reassignment.
+    #[test]
+    fn reassign_cancellation_is_epoch_and_launch_sequence_scoped() {
+        let runner = WrappedCliStepRunner::default();
+        let make_input = |epoch, launch_seq| StepInput {
+            run_id: "same-run".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: WorkUnit::pending("same-run:u1", "same-run", 1, "work"),
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: epoch,
+            process_gen: None,
+            launch_seq,
+        };
+        let old = make_input(4, 10);
+        let replacement = make_input(5, 11);
+        let old_token = runner.register_token(&old);
+        let replacement_token = runner.register_token(&replacement);
+
+        runner.cancel_reassigned_worker("same-run", 4, 10);
+        assert!(old_token.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            !replacement_token.load(std::sync::atomic::Ordering::Relaxed),
+            "the fresh attempt must survive cancellation of the old coordinate"
+        );
+
+        let late = make_input(6, 12);
+        runner.cancel_reassigned_worker("same-run", 6, 12);
+        let late_token = runner.register_token(&late);
+        assert!(
+            late_token.load(std::sync::atomic::Ordering::Relaxed),
+            "a worker registering after reassign must be born cancelled"
+        );
+        runner.unregister_token(&old, &old_token);
+        runner.unregister_token(&replacement, &replacement_token);
+        runner.unregister_token(&late, &late_token);
+    }
+
+    /// The design's pre-spawn guard: a token born cancelled (reassign won the
+    /// dispatch-to-registration race) must stop `run_bounded` from EVER spawning the child, not
+    /// merely kill it a poll tick later. A fixture that would create a marker file on start lets
+    /// us assert the process never ran, closing the residual concurrent-mutation window.
+    #[cfg(unix)]
+    #[test]
+    fn a_born_cancelled_token_prevents_the_child_from_spawning() {
+        use std::process::Command;
+
+        let root =
+            std::env::temp_dir().join(format!("wicked-prespawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("started");
+
+        // spawn-audit: test-only — asserts the pre-spawn guard skips spawning; the child never runs.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!("touch {}", marker.display()));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let emit = |_: &str| {};
+        let bounded = run_bounded(
+            cmd,
+            Duration::from_secs(30),
+            &emit,
+            Box::new(Passthrough),
+            Some(cancel),
+        )
+        .expect("run_bounded returns cleanly for a born-cancelled token");
+        assert_eq!(
+            bounded.2, CANCELLED,
+            "a born-cancelled run reports CANCELLED without spawning"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !marker.exists(),
+            "the pre-spawn guard must prevent the child from ever running"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The engine's own deadline reports the TIMED_OUT sentinel — the other half of the
