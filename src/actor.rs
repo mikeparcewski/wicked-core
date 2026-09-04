@@ -527,6 +527,156 @@ pub(crate) fn sidecar_base(path: &str) -> String {
     }
 }
 
+/// Channel-silence window that counts as "idle" for the WAL checkpoint (the `recv_timeout` on the
+/// actor loop). Small enough to notice idleness promptly; the min interval below (not this tick)
+/// bounds how often a checkpoint actually runs.
+const WAL_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Default minimum interval between idle-tick WAL checkpoints (seconds).
+const WAL_CHECKPOINT_DEFAULT_SECS: u64 = 60;
+
+/// Minimum interval between idle-tick WAL checkpoints: `WICKED_CORE_WAL_CHECKPOINT_SECS`
+/// (`0` disables the idle checkpoint entirely; unset/unparsable → the 60s default), following the
+/// actor's opt-in env-knob pattern (`WICKED_BUS_DB` / `WICKED_BUS_EXEC`).
+fn wal_checkpoint_min_interval() -> Option<std::time::Duration> {
+    let secs = std::env::var("WICKED_CORE_WAL_CHECKPOINT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(WAL_CHECKPOINT_DEFAULT_SECS);
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// TRUNCATE-checkpoint the three actor-owned WALs (graph store, memory, knowledge) — on the actor
+/// thread, via the actor's OWN connections, never a second one (single-writer invariant). Cheap: a
+/// strict subset of `compact()` (PASSIVE→TRUNCATE only, no prune/VACUUM). Busy-tolerant end to
+/// end: a concurrent `open_readonly` holder (gate-hook subprocess) yields `busy: true` and the
+/// checkpoint defers to a later tick — it never blocks and never errors for that. Best-effort like
+/// every sidecar: a real failure is logged, never fatal.
+fn checkpoint_wals(
+    store: &mut AnyStore,
+    memory: Option<&mut crate::memory::RunMemory>,
+    knowledge: Option<&mut crate::knowledge::RunKnowledge>,
+) {
+    if let Err(e) = store.checkpoint_truncate() {
+        eprintln!("wicked-core: WAL checkpoint (store) failed: {e}");
+    }
+    if let Some(m) = memory {
+        if let Err(e) = m.checkpoint_truncate() {
+            eprintln!("wicked-core: WAL checkpoint (memory) failed: {e}");
+        }
+    }
+    if let Some(k) = knowledge {
+        if let Err(e) = k.checkpoint_truncate() {
+            eprintln!("wicked-core: WAL checkpoint (knowledge) failed: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod wal_checkpoint_tests {
+    use super::*;
+
+    /// Perf #5: the idle-tick helper must empty all three actor-owned WALs via the actor's own
+    /// connections and leave every store readable. (The `recv_timeout` wiring above is exercised
+    /// by every existing actor test — this pins the checkpoint work itself.)
+    #[test]
+    fn checkpoint_wals_truncates_all_three_sidecars_and_reads_survive() {
+        let dir = std::env::temp_dir().join(format!("wicked-wal-ckpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("estate.db");
+        let path = db.to_str().unwrap().to_string();
+
+        let mut store = open_store_any(Some(&path)).expect("open store");
+        // Seed a write so the graph WAL has frames (same shape as the AnyStore bridge test).
+        {
+            use wicked_apps_core::{
+                synthetic_symbol, GraphWrite, Language, Location, Node, NodeKind, Span,
+                SYMBOL_SCHEME,
+            };
+            let node = Node::new(
+                synthetic_symbol("wal_ckpt_test", "n1"),
+                NodeKind::Other("wal_ckpt_test".to_string()),
+                "n1".to_string(),
+                Language::new(SYMBOL_SCHEME),
+                Location::new("wal_ckpt_test/n1", Span::ZERO),
+            );
+            store.begin_batch().unwrap();
+            store.upsert_nodes(&[node]).unwrap();
+            store.commit_batch().unwrap();
+        }
+        let mut memory = crate::memory::RunMemory::open(&path).expect("open memory sidecar");
+        memory
+            .capture(
+                "wal checkpoint test",
+                wicked_estate_memory_core::Scope::root(),
+                1,
+            )
+            .expect("seed memory");
+        let mut knowledge =
+            crate::knowledge::RunKnowledge::open(&path).expect("open knowledge sidecar");
+        knowledge
+            .ingest("wal", &["the log must not outgrow the db".into()], 1)
+            .expect("seed knowledge");
+
+        checkpoint_wals(&mut store, Some(&mut memory), Some(&mut knowledge));
+
+        for wal in [
+            dir.join("estate.db-wal"),
+            dir.join("estate.db.mem-wal"),
+            dir.join("estate.db.knowledge-wal"),
+        ] {
+            if let Ok(meta) = std::fs::metadata(&wal) {
+                assert_eq!(
+                    meta.len(),
+                    0,
+                    "{} must be truncated by the idle-tick checkpoint",
+                    wal.display()
+                );
+            }
+        }
+        // Reads survive the truncate.
+        let read = store
+            .get_node(&wicked_apps_core::synthetic_symbol("wal_ckpt_test", "n1"))
+            .expect("read after truncate");
+        assert!(read.is_some(), "graph node must survive the checkpoint");
+        let hits = knowledge.recall("outgrow", 4, 2).expect("knowledge recall");
+        assert!(
+            hits.iter().any(|h| h.content.contains("outgrow")),
+            "knowledge recall must survive the checkpoint"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The env knob: unset → 60s default; `0` disables; a parsable value wins. Runs as ONE test
+    /// (not three) because env vars are process-global and tests run in parallel.
+    #[test]
+    fn wal_checkpoint_min_interval_honors_the_env_knob() {
+        const KNOB: &str = "WICKED_CORE_WAL_CHECKPOINT_SECS";
+        let prior = std::env::var(KNOB).ok();
+        std::env::remove_var(KNOB);
+        assert_eq!(
+            wal_checkpoint_min_interval(),
+            Some(std::time::Duration::from_secs(WAL_CHECKPOINT_DEFAULT_SECS)),
+            "unset must yield the default"
+        );
+        std::env::set_var(KNOB, "0");
+        assert_eq!(
+            wal_checkpoint_min_interval(),
+            None,
+            "0 must disable the idle checkpoint"
+        );
+        std::env::set_var(KNOB, "300");
+        assert_eq!(
+            wal_checkpoint_min_interval(),
+            Some(std::time::Duration::from_secs(300))
+        );
+        match prior {
+            Some(v) => std::env::set_var(KNOB, v),
+            None => std::env::remove_var(KNOB),
+        }
+    }
+}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
@@ -804,7 +954,36 @@ pub(crate) fn run(
     // worked.
     report_orphaned_executing_sessions(&store, &mut subscribers, &in_flight);
 
-    while let Ok(cmd) = rx.recv() {
+    // ── WAL idle-tick checkpoint (perf #5) ──────────────────────────────────────
+    // The three actor-owned WALs (graph store + memory + knowledge) outgrow their DBs when nothing
+    // TRUNCATE-checkpoints them: passive auto-checkpoints keep deferring while `open_readonly`
+    // gate-hook subprocesses ride the WAL. The ONLY safe place to checkpoint is HERE, on the actor
+    // thread via the actor's own connections (a second writer connection breaks single-writer). The
+    // loop below turns the blocking `recv` into `recv_timeout(WAL_IDLE_TICK)`: a full tick of
+    // channel silence is the idle signal, and the checkpoint additionally requires
+    // `in_flight.is_empty()` (a live worker posts results through this channel — its run is not
+    // idle) plus a min interval, so it can never add latency to a step. `busy` results defer
+    // harmlessly; the store-side `wal_autocheckpoint` bound is the backstop.
+    let wal_min_interval = wal_checkpoint_min_interval();
+    let mut last_wal_checkpoint = std::time::Instant::now();
+
+    loop {
+        let cmd = match rx.recv_timeout(WAL_IDLE_TICK) {
+            Ok(cmd) => cmd,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(interval) = wal_min_interval {
+                    if in_flight.is_empty() && last_wal_checkpoint.elapsed() >= interval {
+                        checkpoint_wals(&mut store, memory.as_mut(), knowledge.as_mut());
+                        last_wal_checkpoint = std::time::Instant::now();
+                    }
+                }
+                continue;
+            }
+            // Unreachable in practice (the actor holds `self_tx`, so the channel can't close;
+            // `Shutdown` is the real exit) — kept as a defensive break, matching the old
+            // `while let Ok(..)` behavior.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match cmd {
             Command::Ping(reply) => {
                 emit(&mut subscribers, CoreEvent::Heartbeat);

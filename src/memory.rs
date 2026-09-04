@@ -40,6 +40,16 @@ impl RunMemory {
         })
     }
 
+    /// TRUNCATE-checkpoint the memory store's WAL — forwards to the engine
+    /// (`SqliteStore::checkpoint_truncate`: busy-tolerant, never blocking; a `busy` result just
+    /// defers to a later idle tick). Called by the actor on its idle tick so `<estate>.mem-wal`
+    /// stops outgrowing its db.
+    pub fn checkpoint_truncate(&mut self) -> anyhow::Result<wicked_apps_core::WalCheckpointStats> {
+        self.engine
+            .checkpoint_truncate()
+            .map_err(|e| anyhow::anyhow!("checkpoint memory store: {e}"))
+    }
+
     /// Capture an episodic memory — a run outcome / decision the orchestrator learned — at `scope`
     /// (e.g. `app:<id>` so the memory belongs to one application; `Scope::root()` for global).
     pub fn capture(

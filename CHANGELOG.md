@@ -15,6 +15,16 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Idle-tick WAL checkpoint on the actor's own connections (perf #5).** The actor loop's
+  blocking `recv` became `recv_timeout(5s)`: a full tick of channel silence with
+  `in_flight` empty and ≥60s since the last checkpoint (env knob
+  `WICKED_CORE_WAL_CHECKPOINT_SECS`, `0` disables) TRUNCATE-checkpoints all three actor-owned
+  WALs — graph store (`AnyStore::checkpoint_truncate`; the Postgres arm is a no-op),
+  memory (`<estate>.mem`), and knowledge (`<estate>.knowledge`) — via
+  `wicked-estate-store 0.14.6`'s busy-tolerant `checkpoint_truncate` (a concurrent
+  `open_readonly` gate-hook holder defers it; it never blocks the writer). Fixes WALs
+  outgrowing their DBs (core.db 3.35MB vs 4.19MB WAL). Requires the estate-store 0.14.6
+  publish (pins bumped).
 - **core-ts 0.7.10** — npm release with the crew#427 engine fix since 0.7.9: the non-claude
   adversarial-review seat (codex) now runs BOUNDED on the governed-worker path
   (`--sandbox workspace-write`). Its declared sandbox posture is applied on that path — it was
