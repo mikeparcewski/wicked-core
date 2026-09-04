@@ -1927,7 +1927,14 @@ fn run_bounded(
         .as_ref()
         .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     {
-        return Ok((-1, String::new(), CANCELLED.to_string(), None, Vec::new(), Vec::new()));
+        return Ok((
+            -1,
+            String::new(),
+            CANCELLED.to_string(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ));
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2603,8 +2610,7 @@ mod tests {
     fn a_born_cancelled_token_prevents_the_child_from_spawning() {
         use std::process::Command;
 
-        let root =
-            std::env::temp_dir().join(format!("wicked-prespawn-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("wicked-prespawn-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let marker = root.join("started");

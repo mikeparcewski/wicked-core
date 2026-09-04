@@ -2515,8 +2515,13 @@ pub(crate) fn run(
                 // A WRAPPED fallback has no ACP kill handle and no PTY terminal. Cancel its
                 // exact old epoch/launch before dispatching the replacement; this leaves the
                 // new launch alive and the token tombstone covers a child still between dispatch
-                // and token registration.
-                runner.cancel_reassigned_worker(&run_id, old_epoch, old_launch_seq);
+                // and token registration. ONLY with a real identity: `launch_seq == 0` means no
+                // launch was ever recorded (no lifecycle maps, or a never-launched run) — there
+                // is no wrapped worker to kill, and `0` doubles as a sentinel, so tombstoning
+                // `(run, ·, 0)` could born-cancel an unrelated future worker (Copilot, #361).
+                if old_launch_seq > 0 {
+                    runner.cancel_reassigned_worker(&run_id, old_epoch, old_launch_seq);
+                }
                 // ── close the PTY session (if any) ──────────────────────────────────────────
                 if let Some(session_entries) = run_sessions.remove(&run_id) {
                     for (cli_key, terminal_id) in &session_entries {
