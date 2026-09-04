@@ -499,6 +499,16 @@ pub enum SeatFailureKind {
     /// thread — turns one bad seat into a failed distribution, which is the opposite of what a
     /// quorum is for.
     Panicked,
+    /// The seat is benched by the dispatcher's health gate: it failed consecutively and is
+    /// sitting out its backoff, so the dispatch short-circuited before spawning anything.
+    ///
+    /// This is an ABSTENTION, not an error: the seat was seated, was asked, and cost the ballot
+    /// nothing. The council counts it separately from the failure kinds above — a benched seat
+    /// shrinks the *live* majority denominator, while a timed-out seat is an answer that was
+    /// lost and still counts against it. Recovery is a real ballot round-trip (a probationary
+    /// dispatch on bench expiry), never a `--version` probe: a binary that prints its version is
+    /// alive, not ready.
+    Benched,
 }
 
 impl SeatFailureKind {
@@ -515,6 +525,7 @@ impl SeatFailureKind {
             SeatFailureKind::NonZeroExit => "non_zero_exit",
             SeatFailureKind::Unreported => "unreported",
             SeatFailureKind::Panicked => "panicked",
+            SeatFailureKind::Benched => "benched",
         }
     }
 }

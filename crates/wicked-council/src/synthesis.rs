@@ -114,6 +114,19 @@ fn sort_counts(map: BTreeMap<String, (String, u32)>) -> Vec<(String, u32)> {
         .collect()
 }
 
+/// The minimum number of ANSWERING seats a council of `seated` needs before "majority of the
+/// live seats" is allowed to mean consensus.
+///
+/// The abstention-aware denominator below can shrink all the way to the seats that answered,
+/// and taken alone that re-opens the FINDING-026 D hole from the other side: one survivor of
+/// six is a 100% "majority of the live". The floor is the absolute backstop — at least half
+/// the CONVENED council (rounded up), and never fewer than two seats, must actually have
+/// answered. Below it the council degrades honestly (plurality stands, `consensus` false)
+/// rather than declaring an agreement most of the council never saw.
+fn answering_floor(seated: u32) -> u32 {
+    seated.div_ceil(2).max(2)
+}
+
 /// Synthesize the [`Verdict`] (layer c) from votes.
 ///
 /// - Winner = the option with the most votes, where two seats picking the same option agree
@@ -121,8 +134,8 @@ fn sort_counts(map: BTreeMap<String, (String, u32)>) -> Vec<(String, u32)> {
 ///   option number — deterministic, and honestly reported: a 1-1-1 split is exactly the
 ///   `NoConsensus` that `kind` and `agreement_ratio` then say it is.
 /// - `agreement_ratio` = winning count / votes **cast**.
-/// - Consensus = a **strict majority of the SEATED council** (winner count * 2 > seated).
-///   Counts agreement, never confidence.
+/// - Consensus = a **strict majority of the LIVE council** (winner count * 2 > seated −
+///   abstained), gated by [`answering_floor`]. Counts agreement, never confidence.
 /// - `risk_convergence` = risks cited by ≥1 CLI, most-cited first (the high-signal axis).
 /// - `dissent` = non-winning recommendations.
 ///
@@ -132,7 +145,15 @@ fn sort_counts(map: BTreeMap<String, (String, u32)>) -> Vec<(String, u32)> {
 /// one seat answering out of three is arithmetically indistinguishable from a one-seat council,
 /// and both render as 100% unanimous (FINDING-026 D). Pass 0 only when the seated count is
 /// genuinely unknown; it then degrades to the cast count, i.e. the pre-quorum behaviour.
-pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32) -> Verdict {
+///
+/// `abstained` is how many of the seated seats ABSTAINED at dispatch — benched by the
+/// dispatcher's health gate, at zero cost, before anything spawned. An abstention is a
+/// different fact from a lost answer, and the arithmetic must not conflate them: a benched
+/// seat could never have voted, so it leaves the majority denominator (a known-dead seat must
+/// not hold a quorum hostage); a TIMED-OUT seat was asked and may have been about to agree or
+/// dissent, so it stays in the denominator. Pass 0 when nothing abstained — that reproduces
+/// the seated-majority arithmetic exactly.
+pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32, abstained: u32) -> Verdict {
     let matrix = build_matrix(votes);
     let total = matrix.total;
 
@@ -147,11 +168,13 @@ pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32) -> Verdict {
         winning_count as f32 / total as f32
     };
 
-    // Strict majority of the SEATED council converges on the winner. `max(total)` is defensive:
-    // an under-reported `seated` (including the 0 that legacy records deserialize to) must never
-    // be able to manufacture a majority — it can only fail to detect a lost one.
+    // Strict majority of the LIVE council converges on the winner. Both clamps are defensive:
+    // an under-reported `seated` (including the 0 that legacy records deserialize to) and an
+    // over-reported `abstained` must never be able to manufacture a majority by shrinking the
+    // denominator below what was actually cast — they can only fail to detect a lost one.
     let seated = seated.max(total);
-    let consensus = total > 0 && winning_count * 2 > seated;
+    let live = seated.saturating_sub(abstained).max(total);
+    let consensus = total >= answering_floor(seated) && winning_count * 2 > live;
 
     let dissent: Vec<String> = matrix
         .recommendation_counts
@@ -165,7 +188,17 @@ pub fn synthesize(task_id: &str, votes: &[Vote], seated: u32) -> Verdict {
     // the seats disagreed, or the seats never spoke. Only the first is a split.
     let split_among_cast = winning_count * 2 <= total;
 
+    // The abstentions the arithmetic actually honoured, after the clamps above — what the
+    // summary string reports, so it can never disagree with the `consensus` it sits next to.
+    let abstained = seated - live;
+
     let kind = match &winning_recommendation {
+        // With abstentions in play the seated count alone would render "2/6 seats" for a
+        // majority the arithmetic legitimately granted — so the summary names the live
+        // denominator it was measured against, and the abstentions that shrank it.
+        Some(rec) if consensus && abstained > 0 => format!(
+            "Consensus: {rec} ({winning_count}/{live} live seats, {abstained} benched of {seated})"
+        ),
         Some(rec) if consensus => format!("Consensus: {rec} ({winning_count}/{seated} seats)"),
         // Would have carried among those who answered; what stopped it is the seats that didn't.
         Some(rec) if !split_among_cast => format!(
@@ -217,7 +250,7 @@ mod tests {
             vote("a", "Option A", "latency"),
             vote("b", "Option A", "latency"),
         ];
-        let v = synthesize("t1", &votes, 2);
+        let v = synthesize("t1", &votes, 2, 0);
         assert!(v.consensus, "2/2 on A must be consensus");
         assert_eq!(v.winning_recommendation.as_deref(), Some("Option A"));
         assert_eq!(v.agreement_ratio, 1.0);
@@ -234,7 +267,7 @@ mod tests {
             vote("a", "Option A", "latency"),
             vote("b", "Option B", "cost"),
         ];
-        let v = synthesize("t2", &votes, 2);
+        let v = synthesize("t2", &votes, 2, 0);
         assert!(!v.consensus, "1-1 split is not a strict majority");
         assert!((v.agreement_ratio - 0.5).abs() < f32::EPSILON);
         assert!(v.kind.starts_with("NoConsensus"));
@@ -247,7 +280,7 @@ mod tests {
             vote("b", "A", "latency"),
             vote("c", "B", "cost"),
         ];
-        let v = synthesize("t3", &votes, 3);
+        let v = synthesize("t3", &votes, 3, 0);
         assert!(v.consensus, "2 of 3 is a strict majority");
         assert_eq!(v.winning_recommendation.as_deref(), Some("A"));
         // 2 cite latency, 1 cites cost → latency converges higher.
@@ -265,7 +298,7 @@ mod tests {
         // in the artifact said the quorum was lost, so the audit trail asserted a three-seat
         // consensus that never happened.
         let votes = vec![vote("a", "Option A", "latency")];
-        let v = synthesize("t5", &votes, 3);
+        let v = synthesize("t5", &votes, 3, 0);
         assert!(
             !v.consensus,
             "1 of 3 seats is not a majority of the council: {v:?}"
@@ -290,7 +323,7 @@ mod tests {
         // must not veto a decision the remaining two genuinely converged on. Otherwise the fix
         // for a false positive would just manufacture false negatives.
         let votes = vec![vote("a", "A", "latency"), vote("b", "A", "latency")];
-        let v = synthesize("t6", &votes, 3);
+        let v = synthesize("t6", &votes, 3, 0);
         assert!(v.consensus, "2 of 3 seats is a strict majority: {v:?}");
         assert!(
             v.kind.starts_with("Consensus: A (2/3 seats)"),
@@ -304,7 +337,7 @@ mod tests {
         // Two distinct reasons a council fails to converge, and the summary must not conflate
         // them: 1-1 among two of three seats is a genuine disagreement, not silence.
         let votes = vec![vote("a", "A", "latency"), vote("b", "B", "cost")];
-        let v = synthesize("t7", &votes, 3);
+        let v = synthesize("t7", &votes, 3, 0);
         assert!(!v.consensus);
         assert!(
             !v.kind.contains("quorum lost"),
@@ -320,7 +353,7 @@ mod tests {
         // a caller passes when it genuinely does not know. It must never MANUFACTURE a majority
         // by shrinking the denominator below what was actually cast.
         let votes = vec![vote("a", "A", "latency"), vote("b", "A", "latency")];
-        let v = synthesize("t8", &votes, 0);
+        let v = synthesize("t8", &votes, 0, 0);
         assert!(v.consensus, "2/2 stands on the cast count alone");
         assert_eq!(v.seated, 2, "0 must widen to the cast count, never stay 0");
     }
@@ -331,7 +364,7 @@ mod tests {
             vote("a", "JWT", "revocation"),
             vote("b", "jwt", "revocation"),
         ];
-        let v = synthesize("t4", &votes, 2);
+        let v = synthesize("t4", &votes, 2, 0);
         assert!(v.consensus);
         assert_eq!(v.agreement_ratio, 1.0);
     }
@@ -355,7 +388,7 @@ mod tests {
             ),
             vote("c", "2 — faster iteration on small edits", "shallow review"),
         ];
-        let v = synthesize("t9", &votes, 3);
+        let v = synthesize("t9", &votes, 3, 0);
         assert!(
             v.consensus,
             "two seats named option 1; that is a majority however they phrased it"
@@ -387,7 +420,7 @@ mod tests {
             vote("b", "10 — best at docs", "verbose"),
             vote("c", "2 — best at refactors", "cost"),
         ];
-        let v = synthesize("t10", &votes, 3);
+        let v = synthesize("t10", &votes, 3, 0);
         assert!(!v.consensus, "1-1-1 is not consensus");
         assert!((v.agreement_ratio - 1.0 / 3.0).abs() < 1e-6);
         // 2 < 3 < 10 numerically. Keying on the raw text would have ranked "10" first, since it
@@ -410,9 +443,106 @@ mod tests {
             vote("a", "adopt JWT", "revocation"),
             vote("b", "adopt sessions", "sticky routing"),
         ];
-        let v = synthesize("t11", &votes, 2);
+        let v = synthesize("t11", &votes, 2, 0);
         assert!(!v.consensus, "two different prose picks are still a split");
         assert!((v.agreement_ratio - 0.5).abs() < f32::EPSILON);
+    }
+
+    // Abstention-aware quorum: a seat the dispatcher benched abstained at dispatch — it could
+    // never have voted, so it leaves the majority denominator. A timed-out seat stays in it:
+    // that was an answer LOST, not an answer that could not exist.
+    #[test]
+    fn a_benched_abstention_shrinks_the_live_majority_denominator() {
+        // 6 seated, 2 benched, 3 vote A and 1 votes B. Against the full seated count the winner
+        // has no majority (3*2 = 6 ≯ 6) and the council would re-deliberate — re-asking the same
+        // four live seats and abstaining the same two benched ones, round after round. Against
+        // the LIVE count it is a plain majority: 3 of 4 seats that could answer, agreed.
+        let votes = vec![
+            vote("a", "A", "latency"),
+            vote("b", "A", "latency"),
+            vote("c", "A", "latency"),
+            vote("d", "B", "cost"),
+        ];
+        let with_seated_denominator = synthesize("t12", &votes, 6, 0);
+        assert!(
+            !with_seated_denominator.consensus,
+            "control: against the full seated count this is no majority: {with_seated_denominator:?}"
+        );
+        let v = synthesize("t12", &votes, 6, 2);
+        assert!(
+            v.consensus,
+            "3 of the 4 live seats is a strict majority of everyone who could answer: {v:?}"
+        );
+        assert_eq!(v.seated, 6, "the quorum record still carries the full council");
+        assert!(
+            v.kind.contains("3/4 live seats") && v.kind.contains("2 benched of 6"),
+            "the summary must name the live denominator and the abstentions: {:?}",
+            v.kind
+        );
+    }
+
+    #[test]
+    fn answering_below_the_floor_degrades_instead_of_declaring_consensus() {
+        // One survivor of six, five benched. The live denominator alone would call this a 100%
+        // majority — the FINDING-026 D hole re-opened from the abstention side. The floor is
+        // the backstop: fewer than half the convened council answering can never be consensus,
+        // however unanimous the survivors are. The plurality still stands for routing.
+        let votes = vec![vote("a", "A", "latency")];
+        let v = synthesize("t13", &votes, 6, 5);
+        assert!(
+            !v.consensus,
+            "1 answering seat of 6 convened is below the floor: {v:?}"
+        );
+        assert_eq!(v.agreement_ratio, 1.0, "of those who answered, all agreed");
+        assert_eq!(v.winning_recommendation.as_deref(), Some("A"));
+        assert!(
+            v.kind.contains("quorum lost"),
+            "the summary must name the lost quorum, got {:?}",
+            v.kind
+        );
+    }
+
+    #[test]
+    fn a_split_among_live_seats_is_still_a_split_whatever_abstained() {
+        // 2-2 among the four live seats, two benched: a genuine disagreement. Abstentions must
+        // not be able to convert a split into a majority for whichever side the tie-break
+        // favours.
+        let votes = vec![
+            vote("a", "A", "latency"),
+            vote("b", "A", "latency"),
+            vote("c", "B", "cost"),
+            vote("d", "B", "cost"),
+        ];
+        let v = synthesize("t14", &votes, 6, 2);
+        assert!(!v.consensus, "2-2 among the live seats is a split: {v:?}");
+        assert_eq!(v.kind, "NoConsensus: A vs B");
+    }
+
+    #[test]
+    fn an_over_reported_abstained_count_cannot_manufacture_a_majority() {
+        // Defensive clamp, same spirit as `seated: 0` widening to the cast count: the live
+        // denominator never shrinks below the votes actually cast.
+        let votes = vec![
+            vote("a", "A", "latency"),
+            vote("b", "A", "latency"),
+            vote("c", "B", "cost"),
+            vote("d", "B", "cost"),
+        ];
+        // Claiming 5 of 6 abstained while 4 demonstrably voted: live clamps to 4, and 2-2 is
+        // still a split.
+        let v = synthesize("t15", &votes, 6, 5);
+        assert!(!v.consensus, "{v:?}");
+    }
+
+    #[test]
+    fn the_answering_floor_is_half_the_council_and_never_below_two() {
+        assert_eq!(answering_floor(1), 2, "a council of one cannot self-quorum");
+        assert_eq!(answering_floor(2), 2);
+        assert_eq!(answering_floor(3), 2);
+        assert_eq!(answering_floor(4), 2);
+        assert_eq!(answering_floor(5), 3);
+        assert_eq!(answering_floor(6), 3);
+        assert_eq!(answering_floor(7), 4);
     }
 
     #[test]

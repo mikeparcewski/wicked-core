@@ -9,8 +9,10 @@
 //! prompt to use this format; the E2E test uses fake-CLI shell scripts that echo exactly
 //! these lines.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wicked_apps_core::HardenedCommand;
 
@@ -112,12 +114,25 @@ pub fn render_ballot(task: &CouncilTask, ctx: &BallotContext) -> String {
 }
 
 /// The real, subprocess-backed dispatcher.
+///
+/// Clones share the seat-health map (it sits behind an `Arc`), so however many councils a run
+/// convenes, a seat's failure streak is one streak. It is deliberately NOT a process-wide
+/// static: health lives and dies with the dispatcher instance the engine built, so a test —
+/// or a future per-run dispatcher — starts from a clean slate.
 #[derive(Debug, Clone)]
 pub struct RealDispatcher {
     /// Timeout for agentic/chat CLIs.
     pub timeout: Duration,
     /// Longer timeout for local runners (cold model load).
     pub local_runner_timeout: Duration,
+    /// The bench policy: how many consecutive failures sideline a seat, and for how long.
+    bench: BenchConfig,
+    /// Per-seat health, keyed by `cli.key` — the registry identity the roster convenes by.
+    ///
+    /// Keyed on the key rather than the resolved binary: the key is what the council seats,
+    /// what the failure events name, and what an operator overrides in `clis.toml`. Two keys
+    /// resolving to one binary is a registry configuration, not a health question.
+    seats: Arc<Mutex<HashMap<String, SeatHealth>>>,
 }
 
 /// Env var overriding the agentic/chat CLI budget, in whole seconds.
@@ -130,8 +145,15 @@ pub const ENV_LOCAL_TIMEOUT_SECS: &str = "WICKED_COUNCIL_LOCAL_TIMEOUT_SECS";
 /// A council ballot asks a coding CLI to read a task, weigh several capability profiles and
 /// justify a pick — a reasoning turn, not a shell command. Measured cost of that turn on the
 /// shipped roster is 21.5–35.5 s (`tools/council_probe.py`, 8 ballots), so anything near 30 s
-/// kills seats that were about to answer and reports it as the seat's failure.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// kills seats that were about to answer and reports it as the seat's failure (FINDING-026).
+///
+/// 40 s clears the slowest measured answer with margin while no longer donating a full extra
+/// half-minute to every seat that is genuinely down — live evidence showed a dead seat charging
+/// its whole budget to every ballot it sat on. What makes 40 s safe where 30 s was a roster
+/// killer is the seat-health gate below: a seat must fail CONSECUTIVELY before it is benched, so
+/// one slow answer is one slow answer, never an outage — and the `from_env` override still
+/// stands for a roster whose slowest seat needs more.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(40);
 /// Default budget for a local runner, which pays a cold model load before it reasons at all.
 const DEFAULT_LOCAL_RUNNER_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -140,6 +162,8 @@ impl Default for RealDispatcher {
         RealDispatcher {
             timeout: DEFAULT_TIMEOUT,
             local_runner_timeout: DEFAULT_LOCAL_RUNNER_TIMEOUT,
+            bench: BenchConfig::default(),
+            seats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -154,7 +178,7 @@ impl Default for RealDispatcher {
 ///
 /// Takes the value rather than the variable name so it is testable without mutating the
 /// process environment, which test threads share.
-fn secs_or(raw: Option<String>, fallback: Duration) -> Duration {
+pub(crate) fn secs_or(raw: Option<String>, fallback: Duration) -> Duration {
     raw.and_then(|raw| raw.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .map(Duration::from_secs)
@@ -175,6 +199,8 @@ impl RealDispatcher {
                 std::env::var(ENV_LOCAL_TIMEOUT_SECS).ok(),
                 DEFAULT_LOCAL_RUNNER_TIMEOUT,
             ),
+            bench: BenchConfig::from_env(),
+            seats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -182,6 +208,232 @@ impl RealDispatcher {
         match cli.category {
             Category::LocalRunner => self.local_runner_timeout,
             _ => self.timeout,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seat health: bench a seat that fails consecutively, re-admit it on a real ballot
+// ---------------------------------------------------------------------------
+
+/// Env var overriding how many CONSECUTIVE failures bench a seat.
+pub const ENV_SEAT_BENCH_THRESHOLD: &str = "WICKED_COUNCIL_SEAT_BENCH_THRESHOLD";
+/// Env var overriding the first bench span, in whole seconds.
+pub const ENV_SEAT_BENCH_BASE_SECS: &str = "WICKED_COUNCIL_SEAT_BENCH_BASE_SECS";
+/// Env var overriding the bench-span ceiling, in whole seconds.
+pub const ENV_SEAT_BENCH_MAX_SECS: &str = "WICKED_COUNCIL_SEAT_BENCH_MAX_SECS";
+
+/// Default consecutive-failure threshold before a seat is benched.
+///
+/// CONSECUTIVE is what makes the shorter dispatch budget above safe. A 30 s budget once killed
+/// the whole roster in a single stroke (FINDING-026) because every seat's first slow answer was
+/// treated as that seat's failure; a streak requirement means a seat has to be failing on its
+/// own merits, repeatedly, before the council stops paying for it. Two is the smallest number
+/// that is a streak at all — live evidence showed a structurally-dead seat charging its full
+/// budget to EVERY ballot of EVERY council in a run, which is the cost this exists to stop.
+const DEFAULT_SEAT_BENCH_THRESHOLD: u32 = 2;
+/// Default first bench span. Roughly one ballot's worth of sitting out.
+const DEFAULT_SEAT_BENCH_BASE: Duration = Duration::from_secs(30);
+/// Default ceiling on the bench span, however many probations fail.
+///
+/// The cap is what keeps health self-correcting on any scope: a seat is never written off, it
+/// is at most five minutes from its next real chance to vote.
+const DEFAULT_SEAT_BENCH_MAX: Duration = Duration::from_secs(300);
+
+/// The bench policy knobs, resolved once when the dispatcher is built.
+#[derive(Debug, Clone, Copy)]
+struct BenchConfig {
+    /// Consecutive failures before the seat is benched.
+    threshold: u32,
+    /// The first bench span; doubles on every failed probation.
+    base: Duration,
+    /// The ceiling the doubling saturates at.
+    max: Duration,
+}
+
+impl Default for BenchConfig {
+    fn default() -> Self {
+        BenchConfig {
+            threshold: DEFAULT_SEAT_BENCH_THRESHOLD,
+            base: DEFAULT_SEAT_BENCH_BASE,
+            max: DEFAULT_SEAT_BENCH_MAX,
+        }
+    }
+}
+
+impl BenchConfig {
+    /// Resolve the policy from the environment, falling back per knob like every other budget
+    /// here. `max` is clamped to at least `base` so a config that inverts them cannot make the
+    /// backoff shrink on escalation.
+    fn from_env() -> Self {
+        let base = secs_or(
+            std::env::var(ENV_SEAT_BENCH_BASE_SECS).ok(),
+            DEFAULT_SEAT_BENCH_BASE,
+        );
+        let max = secs_or(
+            std::env::var(ENV_SEAT_BENCH_MAX_SECS).ok(),
+            DEFAULT_SEAT_BENCH_MAX,
+        )
+        .max(base);
+        BenchConfig {
+            threshold: count_or(
+                std::env::var(ENV_SEAT_BENCH_THRESHOLD).ok(),
+                DEFAULT_SEAT_BENCH_THRESHOLD,
+            ),
+            base,
+            max,
+        }
+    }
+}
+
+/// Parse a positive count from a raw env value, falling back when it says nothing usable.
+///
+/// Zero is rejected for the same reason `secs_or` rejects it: a threshold of zero benches every
+/// seat before it has failed at all, which is the roster-wide outage this gate exists to
+/// prevent, reintroduced by configuration.
+fn count_or(raw: Option<String>, fallback: u32) -> u32 {
+    raw.and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(fallback)
+}
+
+/// One seat's health, as the dispatcher's gate sees it.
+///
+/// The lifecycle is a loop, not a ladder: `Healthy → (streak) → Benched → (expiry) → Probation`,
+/// and Probation resolves back to `Healthy` on a parsed vote or to a longer `Benched` on another
+/// failure. Readiness is only ever proven by the Probation arm — a REAL ballot round-trip.
+/// A `--version` probe was how a structurally-dead seat kept getting re-admitted (liveness
+/// misread as readiness: printing a version proves the binary exists, not that anything behind
+/// it can answer), so nothing in this type can be moved out of `Benched` by anything cheaper
+/// than a vote.
+#[derive(Debug, Clone, Copy)]
+enum SeatHealth {
+    /// Dispatching normally; tracks the current failure streak.
+    Healthy {
+        /// Failures in a row so far. Any parsed vote resets it to zero.
+        consecutive_failures: u32,
+    },
+    /// Sitting out until the instant. `backoff` is the span that was applied, kept so a failed
+    /// probation knows what to double.
+    Benched { until: Instant, backoff: Duration },
+    /// The one probationary ballot is in flight. Every other dispatch of this seat abstains
+    /// until it resolves — ONE real ballot decides re-admission, not a thundering herd of them.
+    Probation { backoff: Duration },
+}
+
+impl Default for SeatHealth {
+    fn default() -> Self {
+        SeatHealth::Healthy {
+            consecutive_failures: 0,
+        }
+    }
+}
+
+impl RealDispatcher {
+    /// The health gate at the top of every dispatch. `None` means dispatch normally (including
+    /// the probationary ballot, which IS a normal dispatch — that is the point of it);
+    /// `Some(failure)` means the seat abstains right here, before a tempdir, a permit, or a
+    /// subprocess exists to pay for.
+    fn seat_gate(&self, cli: &AgenticCli) -> Option<SeatFailure> {
+        let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
+        let health = seats.entry(cli.key.clone()).or_default();
+        match *health {
+            SeatHealth::Healthy { .. } => None,
+            SeatHealth::Benched { until, backoff } => {
+                let now = Instant::now();
+                if now < until {
+                    Some(SeatFailure::new(
+                        SeatFailureKind::Benched,
+                        format!(
+                            "seat benched for {:?} more (span {:?}) after consecutive failures; \
+                             re-admission is one probationary ballot on expiry",
+                            until - now,
+                            backoff
+                        ),
+                    ))
+                } else {
+                    // Bench expired: THIS dispatch is the probationary ballot. The transition
+                    // happens under the same lock that gates every other dispatch, so exactly
+                    // one caller claims it.
+                    *health = SeatHealth::Probation { backoff };
+                    None
+                }
+            }
+            SeatHealth::Probation { .. } => Some(SeatFailure::new(
+                SeatFailureKind::Benched,
+                "seat's probationary ballot is already in flight; abstaining until it resolves",
+            )),
+        }
+    }
+
+    /// Record how a REAL dispatch resolved (the gate short-circuits never reach here).
+    ///
+    /// A parsed vote clears health outright — streak, bench, probation, all of it. Not because
+    /// the past failures didn't happen, but because the question health answers is "can this
+    /// seat vote right now?", and a vote is the strongest possible yes.
+    fn record_seat_outcome(&self, cli: &AgenticCli, voted: bool) {
+        let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
+        let health = seats.entry(cli.key.clone()).or_default();
+        if voted {
+            *health = SeatHealth::default();
+            return;
+        }
+        match *health {
+            SeatHealth::Healthy {
+                consecutive_failures,
+            } => {
+                let streak = consecutive_failures + 1;
+                if streak >= self.bench.threshold {
+                    *health = SeatHealth::Benched {
+                        until: Instant::now() + self.bench.base,
+                        backoff: self.bench.base,
+                    };
+                    // Operator-visible on purpose: several seats benching together is how a
+                    // provider-wide outage looks from here, and the gate must surface that
+                    // pattern rather than quietly absorb it.
+                    eprintln!(
+                        "wicked-council: seat `{}` benched for {:?} after {streak} consecutive \
+                         failures; re-admission is one probationary ballot",
+                        cli.key, self.bench.base,
+                    );
+                } else {
+                    *health = SeatHealth::Healthy {
+                        consecutive_failures: streak,
+                    };
+                }
+            }
+            SeatHealth::Probation { backoff } => {
+                // The probationary ballot failed: back on the bench, twice as long, capped.
+                let span = (backoff * 2).min(self.bench.max);
+                *health = SeatHealth::Benched {
+                    until: Instant::now() + span,
+                    backoff: span,
+                };
+                eprintln!(
+                    "wicked-council: seat `{}` failed its probationary ballot; re-benched for \
+                     {span:?}",
+                    cli.key,
+                );
+            }
+            // A dispatch that was already in flight when a concurrent failure benched the seat.
+            // The bench stands as set — extending it would let overlapping failures compound
+            // one outage into several.
+            SeatHealth::Benched { .. } => {}
+        }
+    }
+
+    /// Give back a claimed probation when the dispatch never actually ran (the tempdir could
+    /// not be created — a host problem that says nothing about the seat). The bench is restored
+    /// as already-expired, so the NEXT dispatch becomes the probationary ballot instead.
+    fn reopen_probation(&self, cli: &AgenticCli) {
+        let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(health) = seats.get_mut(&cli.key) {
+            if let SeatHealth::Probation { backoff } = *health {
+                *health = SeatHealth::Benched {
+                    until: Instant::now(),
+                    backoff,
+                };
+            }
         }
     }
 }
@@ -209,10 +461,26 @@ impl RealDispatcher {
         task: &CouncilTask,
         prompt: &str,
     ) -> TimedOutcome {
+        // The seat-health gate, FIRST — before the tempdir, the permit, and the subprocess. A
+        // benched seat reads to the council as an abstention at ~zero cost, instead of charging
+        // its whole dispatch budget to every ballot it sits on (the measured shape of a dead
+        // seat: 50 of 66 dispatch-budget timeouts belonged to one structurally-broken CLI).
+        if let Some(failure) = self.seat_gate(cli) {
+            return TimedOutcome {
+                outcome: DispatchOutcome::Failed(failure),
+                queued_ms: 0,
+                ran_ms: 0,
+            };
+        }
+
         // Isolation: a per-dispatch tempdir under the system temp root.
         let workdir = match make_tempdir(&cli.key, &task.id) {
             Ok(d) => d,
             Err(e) => {
+                // The seat never ran, so this outcome must not touch its health — but if the
+                // gate had just claimed the probationary ballot for this dispatch, hand it back
+                // or the seat is stuck "in probation" forever over a host filesystem error.
+                self.reopen_probation(cli);
                 return TimedOutcome {
                     outcome: DispatchOutcome::Failed(SeatFailure::new(
                         SeatFailureKind::WorkdirUnavailable,
@@ -257,6 +525,10 @@ impl RealDispatcher {
             ),
             Ok(run) => DispatchOutcome::Voted(parse_vote(cli, &run.stdout)),
         };
+        // A real dispatch ran to a real outcome: this is the ONLY thing that moves health. A
+        // parsed vote is the readiness signal (it clears everything, probation included); a
+        // failure extends the streak or fails the probation.
+        self.record_seat_outcome(cli, outcome.is_voted());
         TimedOutcome {
             outcome,
             queued_ms: queued.as_millis() as u64,
@@ -503,9 +775,12 @@ pub const ENV_MAX_CONCURRENT_SEATS: &str = "WICKED_COUNCIL_MAX_CONCURRENT_SEATS"
 /// competes for the same provider quota and the same few hundred MB apiece, and a seat starved
 /// past its budget is indistinguishable from a broken one.
 ///
-/// Three is what the sequential build effectively ran (one seat per council, three councils) and
-/// the configuration under which the roster demonstrably voted.
-const DEFAULT_MAX_CONCURRENT_SEATS: usize = 3;
+/// Six lets a full roster ballot go out in ONE wave. Three (what the sequential build
+/// effectively ran) split a six-seat ballot into two serialized waves, so every ballot cost two
+/// slowest-seats instead of one — measured live as a first-dispatch p50 of 473 s when several
+/// units convened councils at once. Concurrency ACROSS councils is still bounded by this same
+/// process-wide ceiling; what changed is that one council's ballot no longer queues on itself.
+const DEFAULT_MAX_CONCURRENT_SEATS: usize = 6;
 
 /// A counting semaphore over concurrent seat subprocesses, shared by every council in the process.
 struct SeatPermits {
@@ -906,6 +1181,7 @@ mod failure_diagnostics_tests {
         let d = RealDispatcher {
             timeout,
             local_runner_timeout: timeout,
+            ..RealDispatcher::default()
         };
         match d.dispatch_prompt(cli, &task(), "ignored") {
             DispatchOutcome::Failed(f) => f,
@@ -998,6 +1274,7 @@ mod failure_diagnostics_tests {
         let d = RealDispatcher {
             timeout: Duration::from_secs(30),
             local_runner_timeout: Duration::from_secs(30),
+            ..RealDispatcher::default()
         };
         let outcome = d.dispatch_prompt(&cli, &task(), "ignored");
         // The control case: without it, a bug that made EVERY dispatch fail would still pass
@@ -1074,10 +1351,20 @@ mod failure_diagnostics_tests {
         if std::env::var(ENV_LOCAL_TIMEOUT_SECS).is_err() {
             assert_eq!(d.local_runner_timeout, expected.local_runner_timeout);
         }
+        // Both bounds are semantic. The floor: the shipped roster answers a ballot in
+        // 21.5-35.5s, and a budget at or below the slowest measured answer kills seats
+        // mid-reasoning and reports it as their failure (FINDING-026). The ceiling: every
+        // second above what the roster needs is a second a genuinely-dead seat charges to
+        // every ballot it sits on — the health gate absorbs slow CLIs, so the budget no
+        // longer has to.
         assert!(
-            expected.timeout >= Duration::from_secs(60),
-            "the shipped roster answers a ballot in 21.5-35.5s; a budget at or below that kills \
-             seats mid-reasoning and reports it as their failure"
+            expected.timeout > Duration::from_millis(35_500),
+            "the budget must clear the slowest measured roster answer (35.5s)"
+        );
+        assert!(
+            expected.timeout <= Duration::from_secs(60),
+            "the budget must not re-grow toward donating a full minute to every dead seat; \
+             a slower roster belongs in {ENV_TIMEOUT_SECS}, not in the default"
         );
     }
 
@@ -1391,5 +1678,149 @@ mod failure_diagnostics_tests {
         let reason = f.reason();
         assert!(!reason.contains('\n'), "{reason}");
         assert!(reason.contains("one two three"), "{reason}");
+    }
+
+    // ------------------------------------------------------------------
+    // Seat health: the bench gate. These drive the REAL dispatcher against real processes,
+    // like the diagnostics tests above, because what the gate must prove is precisely that
+    // no process happens.
+    // ------------------------------------------------------------------
+
+    /// A dispatcher with a test-sized bench policy and generous budgets.
+    fn dispatcher_with_bench(threshold: u32, base: Duration, max: Duration) -> RealDispatcher {
+        RealDispatcher {
+            timeout: Duration::from_secs(30),
+            local_runner_timeout: Duration::from_secs(30),
+            bench: BenchConfig {
+                threshold,
+                base,
+                max,
+            },
+            ..RealDispatcher::default()
+        }
+    }
+
+    /// The backoff currently recorded for `key`, when the seat is on the bench.
+    fn benched_backoff(d: &RealDispatcher, key: &str) -> Option<Duration> {
+        let seats = d.seats.lock().unwrap();
+        match seats.get(key) {
+            Some(SeatHealth::Benched { backoff, .. }) => Some(*backoff),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_benched_seat_short_circuits_without_spawning() {
+        // The proof that nothing spawned is structural: this binary does not exist, so any
+        // dispatch that ATTEMPTS it can only come back SpawnFailed. Getting Benched back means
+        // the dispatch turned around before the spawn — and before the permit and the tempdir,
+        // which is what queued_ms == 0 and ran_ms == 0 say. That is the whole point of the
+        // gate: an abstention at ~zero cost, where the same seat used to charge its full
+        // budget to every ballot it sat on.
+        let d = dispatcher_with_bench(2, Duration::from_secs(600), Duration::from_secs(600));
+        let cli = seat(
+            "ghost",
+            "wicked-council-no-such-binary-xyzzy",
+            "wicked-council-no-such-binary-xyzzy --headless",
+        );
+        for _ in 0..2 {
+            match d.dispatch_prompt(&cli, &task(), "ignored") {
+                DispatchOutcome::Failed(f) => {
+                    // Below the threshold the seat still dispatches — the second failure is
+                    // still a REAL spawn attempt, not a skip.
+                    assert_eq!(f.kind, SeatFailureKind::SpawnFailed, "{f:?}");
+                }
+                DispatchOutcome::Voted(_) => panic!("a missing binary cannot vote"),
+            }
+        }
+        let timed = d.dispatch_prompt_timed(&cli, &task(), "ignored");
+        match timed.outcome {
+            DispatchOutcome::Failed(f) => {
+                assert_eq!(f.kind, SeatFailureKind::Benched, "{f:?}");
+                assert!(
+                    f.detail.contains("probationary"),
+                    "the detail must name the way back in: {f:?}"
+                );
+            }
+            DispatchOutcome::Voted(_) => panic!("a benched seat cannot vote"),
+        }
+        assert_eq!(timed.ran_ms, 0, "nothing ran");
+        assert_eq!(timed.queued_ms, 0, "no permit was waited on");
+    }
+
+    #[test]
+    fn the_bench_arithmetic_holds_across_probation_votes_and_failures() {
+        const BASE: Duration = Duration::from_secs(1);
+        const MAX: Duration = Duration::from_secs(4);
+        let d = dispatcher_with_bench(2, BASE, MAX);
+
+        // One SEAT, two invocations: health is keyed on `cli.key`, so these are the same seat
+        // having a bad day and then answering.
+        let failing = shell_seat("flappy", "exit 3");
+        let voting = shell_seat("flappy", "echo RECOMMENDATION: 1");
+
+        let kind_of = |cli: &AgenticCli| match d.dispatch_prompt(cli, &task(), "ignored") {
+            DispatchOutcome::Failed(f) => Some(f.kind),
+            DispatchOutcome::Voted(_) => None,
+        };
+
+        // One failure is a bad ballot, not a streak: the seat keeps dispatching.
+        assert_eq!(kind_of(&failing), Some(SeatFailureKind::NonZeroExit));
+        // The second consecutive failure is the streak: benched at the base span.
+        assert_eq!(kind_of(&failing), Some(SeatFailureKind::NonZeroExit));
+        assert_eq!(benched_backoff(&d, "flappy"), Some(BASE));
+        assert_eq!(
+            kind_of(&failing),
+            Some(SeatFailureKind::Benched),
+            "while the bench holds, the seat abstains"
+        );
+
+        // Bench expiry: the next dispatch is the ONE probationary ballot, and a parsed vote on
+        // it clears health outright.
+        std::thread::sleep(BASE + Duration::from_millis(200));
+        assert_eq!(kind_of(&voting), None, "the probationary ballot really runs");
+        assert_eq!(
+            kind_of(&failing),
+            Some(SeatFailureKind::NonZeroExit),
+            "a vote cleared the slate: the next failure is a fresh streak of one, not a bench"
+        );
+
+        // Streak of two again, then FAIL the probation: the span doubles.
+        assert_eq!(kind_of(&failing), Some(SeatFailureKind::NonZeroExit));
+        assert_eq!(benched_backoff(&d, "flappy"), Some(BASE));
+        std::thread::sleep(BASE + Duration::from_millis(200));
+        assert_eq!(
+            kind_of(&failing),
+            Some(SeatFailureKind::NonZeroExit),
+            "the probationary ballot ran (and failed)"
+        );
+        assert_eq!(
+            benched_backoff(&d, "flappy"),
+            Some(BASE * 2),
+            "a failed probation doubles the span"
+        );
+
+        // And the doubling saturates at the ceiling: 2s -> min(4s, MAX) == MAX.
+        std::thread::sleep(BASE * 2 + Duration::from_millis(200));
+        assert_eq!(kind_of(&failing), Some(SeatFailureKind::NonZeroExit));
+        assert_eq!(
+            benched_backoff(&d, "flappy"),
+            Some(MAX),
+            "the backoff is capped at the ceiling"
+        );
+    }
+
+    #[test]
+    fn a_misconfigured_bench_threshold_falls_back_instead_of_benching_on_sight() {
+        assert_eq!(count_or(Some("3".into()), 2), 3);
+        assert_eq!(count_or(Some(" 3 ".into()), 2), 3);
+        assert_eq!(count_or(None, 2), 2);
+        assert_eq!(count_or(Some("abc".into()), 2), 2);
+        assert_eq!(count_or(Some("-1".into()), 2), 2);
+        assert_eq!(
+            count_or(Some("0".into()), 2),
+            2,
+            "a threshold of zero would bench every seat before it has failed at all"
+        );
     }
 }
