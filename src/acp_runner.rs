@@ -3953,7 +3953,10 @@ impl AcpStepRunner {
             .workdir
             .clone()
             .unwrap_or_else(|| crate::execute_wrapped::sandbox_for(input));
-        let gate_ctx = match (&input.governance, cli_runs_claude(&cli_key)) {
+        // Read once and reused below, both to decide the unadmitted-disclosure scope and (past
+        // the match) to decide the ACP-vs-fallback route for this same seat.
+        let acp_cfg_probe = acp_config_for(&cli_key);
+        let gate_ctx = match (&input.governance, cli_acp_input_governed(&cli_key)) {
             (Some(g), true) => {
                 let scope =
                     crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
@@ -4034,12 +4037,30 @@ impl AcpStepRunner {
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
-            _ => None,
+            // An ACP adapter that has not passed the evidence proof must remain usable for
+            // non-governance-required work, but it must never look governed: disclose the
+            // permissive ACP response path on the audit wire before it can execute a turn.
+            //
+            // Only when the seat actually HAS an ACP config: a seat with none never reaches
+            // `allow_result` at all (it falls straight to `self.fallback` below), so disclosing
+            // "answered by allow_result, unchecked" here would be a false claim about a unit the
+            // wrapped path may be governing correctly via its own, independent gate-hook check.
+            (Some(_), false) => {
+                if acp_unadmitted_but_configured(acp_cfg_probe.as_ref()) {
+                    if let Some(event) = acp_ungoverned_event(input, &cli_key) {
+                        self.emit_event(event);
+                    }
+                }
+                None
+            }
+            (None, _) => None,
         };
 
-        // SHARED ACP SESSION PATH — ungoverned units of every CLI, plus governed units of
-        // non-claude CLIs (input arming is claude-only; their output-side gates still run).
-        let acp_config = match acp_config_for(&cli_key) {
+        // SHARED ACP SESSION PATH — ungoverned units of every CLI, plus governed units whose
+        // adapter is not yet admitted. The latter remain explicitly disclosed as ungoverned.
+        // Reuses `acp_cfg_probe` from the `gate_ctx` match above rather than re-reading the
+        // (disk-backed) merged registry a second time for the same seat.
+        let acp_config = match acp_cfg_probe {
             Some(c) => c,
             None => return self.fallback.run_unit_streaming(input, emit),
         };
@@ -4483,15 +4504,47 @@ fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
     registry_record(cli_key).and_then(|c| c.acp)
 }
 
-/// Whether this seat runs Claude Code — classified by the REGISTERED BINARY, not the
-/// key: `binary_is_claude` is a path-stem classifier and registry keys can diverge from
-/// binary names (e.g. a "claude-eval" seat whose binary is `claude`). Ad-hoc CLIs not
-/// in the registry fall back to classifying the key itself (the historical behaviour).
-fn cli_runs_claude(cli_key: &str) -> bool {
-    match registry_record(cli_key) {
-        Some(c) => crate::execute_wrapped::binary_is_claude(&c.binary),
-        None => crate::execute_wrapped::binary_is_claude(cli_key),
-    }
+/// Whether this seat's merged ACP configuration is admitted to input governance. The capability
+/// records a proof about this pinned adapter rather than guessing from the CLI name or binary.
+fn cli_acp_input_governed(cli_key: &str) -> bool {
+    registry_record(cli_key)
+        .and_then(|c| c.acp)
+        .map(|acp| acp.acp_input_governance)
+        .unwrap_or(false)
+}
+
+/// Make the wire-visible disclosure for a governed unit using an ACP adapter that has not passed
+/// admission. Returning `None` for an empty key keeps the audit vocabulary actionable.
+///
+/// Callers must have already established that `cli_key` actually HAS an ACP config: the wording
+/// below claims the unit's tool calls are "answered by `allow_result`", which is only true for a
+/// seat that takes the ACP session path at all. Guard with [`acp_unadmitted_but_configured`] at
+/// the `gate_ctx` call site.
+fn acp_ungoverned_event(input: &StepInput, cli_key: &str) -> Option<CoreEvent> {
+    (!cli_key.is_empty()).then(|| CoreEvent::GovernanceUnenforced {
+        session: input.run_id.clone(),
+        ord: input.unit.ord,
+        attempt: input.attempt,
+        cli: cli_key.to_string(),
+        reason: format!(
+            "unit is governed but the ACP adapter for '{cli_key}' is not admitted to input \
+             governance (acp_input_governance=false); its tool calls are answered by \
+             allow_result, unchecked"
+        ),
+    })
+}
+
+/// The `gate_ctx` disclosure gate: true only when the seat's resolved ACP config exists but its
+/// capability is off. A `None` config means the seat has no `[cli.acp]` at all — it never enters
+/// the ACP session path (`acp_config_for` returning `None` a few lines below `gate_ctx` sends it
+/// straight to `self.fallback.run_unit_streaming`, which answers tool calls through the
+/// wrapped-CLI gate-hook, or its own independent `GovernanceUnenforced`, never `allow_result`).
+/// Disclosing the ACP-unadmitted reason for such a seat would be false: it never touched the path
+/// that reason describes. Takes the already-resolved config rather than re-reading the (disk-
+/// backed) merged registry, which also keeps this predicate pure and independent of ambient
+/// registry state for testing.
+fn acp_unadmitted_but_configured(acp_cfg: Option<&AcpConfig>) -> bool {
+    matches!(acp_cfg, Some(cfg) if !cfg.acp_input_governance)
 }
 
 #[cfg(test)]
@@ -5034,6 +5087,7 @@ sleep 30
             start_args: vec![],
             transport: AcpTransport::default(),
             auth_method: None,
+            acp_input_governance: false,
         };
 
         let handles: Vec<_> = (0..8)
@@ -5199,6 +5253,7 @@ sleep 30
             start_args: vec![],
             transport: AcpTransport::default(),
             auth_method: auth_method.map(str::to_string),
+            acp_input_governance: false,
         }
     }
 
@@ -6489,17 +6544,80 @@ sleep 30
         );
     }
 
-    /// The predicate the branch turns on, at its boundary. `cli_runs_claude` classifies by the
-    /// REGISTERED BINARY, so a seat whose key is not `claude` still routes to wrapped when its
-    /// binary is — and a non-claude seat keeps the shared ACP path, since input arming was always
-    /// claude-only and rerouting it would cost multi-turn for nothing.
+    /// ACP input governance is an explicit adapter-proof capability, not a CLI-name heuristic.
+    /// The built-in registry admits only Claude today; absent seats and every unproven adapter
+    /// fail safely to the explicitly disclosed ungoverned posture.
     #[test]
-    fn the_reroute_predicate_follows_the_binary_not_the_key() {
-        assert!(cli_runs_claude("claude"));
-        // Ad-hoc keys not in the registry classify on the key itself, path-stem-wise.
-        assert!(cli_runs_claude("/opt/somewhere/claude"));
-        assert!(!cli_runs_claude("codex"));
-        assert!(!cli_runs_claude("claude-ish"));
+    fn acp_input_governance_is_admitted_by_capability_only() {
+        assert!(cli_acp_input_governed("claude"));
+        for cli in ["agy", "codex", "pi", "copilot", "opencode", "unknown"] {
+            assert!(
+                !cli_acp_input_governed(cli),
+                "{cli} must not be admitted without a pinned adapter proof"
+            );
+        }
+    }
+
+    #[test]
+    fn unadmitted_acp_governance_is_explicit_on_the_audit_wire() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-acp-ungoverned-event-{}",
+            std::process::id()
+        ));
+        let input = governed_input(&dir);
+        assert!(
+            !cli_acp_input_governed("codex"),
+            "precondition: codex ACP has no pinned admission proof"
+        );
+        let event = acp_ungoverned_event(&input, "codex").expect("non-empty seat must disclose");
+        match event {
+            crate::event::CoreEvent::GovernanceUnenforced { cli, reason, .. } => {
+                assert_eq!(cli, "codex");
+                assert!(reason.contains("acp_input_governance=false"));
+                assert!(reason.contains("allow_result"));
+            }
+            other => panic!("expected GovernanceUnenforced, got {other:?}"),
+        }
+        assert!(
+            acp_ungoverned_event(&input, "").is_none(),
+            "an empty seat must not produce an unactionable audit event"
+        );
+    }
+
+    /// The `gate_ctx` disclosure gate must not fire for a seat with NO ACP config at all: such a
+    /// unit never reaches `allow_result` (it falls straight through to the wrapped fallback two
+    /// lines below `gate_ctx` in `exec_turn_inner`), so claiming "answered by allow_result,
+    /// unchecked" for it would be a false statement on the audit wire — the exact failure an
+    /// adversarial review of #364 caught: an unrelated, possibly fully-governed wrapped-path unit
+    /// getting mislabeled as ACP-ungoverned just because it has no ACP adapter to be admitted.
+    #[test]
+    fn acp_ungoverned_disclosure_is_scoped_to_seats_with_an_acp_config() {
+        // Deliberately built in-process rather than read through `acp_config_for`/the merged
+        // registry: this predicate must hold regardless of what the OPERATOR's real
+        // ~/.config/wicked-council/clis.toml happens to contain. (It happens to already contain
+        // exactly case (b) below for several built-ins — a live instance of the bug this predicate
+        // exists to prevent, not a hypothetical.)
+        let unadmitted_but_configured = AcpConfig {
+            binary: "some-acp-adapter".into(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: false,
+        };
+        let admitted = AcpConfig {
+            acp_input_governance: true,
+            ..unadmitted_but_configured.clone()
+        };
+
+        // (a) Configured but unadmitted: this call site must disclose.
+        assert!(acp_unadmitted_but_configured(Some(
+            &unadmitted_but_configured
+        )));
+        // (a-negative) Configured AND admitted: must not disclose (that seat takes the armed path).
+        assert!(!acp_unadmitted_but_configured(Some(&admitted)));
+        // (b) No ACP config at all: the seat never reaches `allow_result` (it falls straight to
+        // the wrapped fallback), so disclosing the ACP-unadmitted reason for it would be false.
+        assert!(!acp_unadmitted_but_configured(None));
     }
 
     // ── DES-002 EpochCleanup unit tests (T4) ─────────────────────────────────────
@@ -7611,6 +7729,7 @@ else:
             start_args: vec![behavior.to_string()],
             transport: AcpTransport::default(),
             auth_method: None,
+            acp_input_governance: false,
         };
         // The spawn resolves WICKED_WORKER_HOME mid-call (`ensure_worker_config_home`), so hold
         // the env read-lock across the start (core#285): without it, a start landing inside a

@@ -83,6 +83,15 @@ pub struct AcpConfig {
     /// no methods — `authenticate` is never sent unsolicited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_method: Option<String>,
+    /// Whether this ACP adapter has passed the evidence proof required to route every
+    /// `session/request_permission` through wicked-core's shared policy and audit gate.
+    ///
+    /// Defaults to `false`: an adapter remains explicitly input-ungoverned until its pinned
+    /// version has proved that every tool action blocks on a request with canonical tool identity
+    /// and raw input, honours rejection, and has its auto-approval surface disabled. This admits
+    /// an adapter to the core ACP gate; it does not claim a sandbox.
+    #[serde(default)]
+    pub acp_input_governance: bool,
 }
 
 /// How the scaffold prompt is delivered to the CLI process.
