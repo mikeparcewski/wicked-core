@@ -7,7 +7,10 @@
 //!
 //! The registry record is the de-drift source of truth — flags are encoded here, never
 //! re-derived per call. The built-in roster uses the CLIs that actually exist in this
-//! environment (**claude, agy, codex, copilot, opencode, pi**) so a real probe can detect them.
+//! environment (**claude, agy, codex, copilot, opencode, pi**) so a real probe can detect
+//! them. agy stays listed but council-disabled: it has no working headless/ACP path, so
+//! seating it only buys dispatch timeouts (liveness ≠ readiness — `agy --version` answering
+//! proves nothing about completing a ballot).
 
 use std::path::{Path, PathBuf};
 
@@ -77,8 +80,9 @@ impl From<TomlCli> for AgenticCli {
 }
 
 /// The built-in, hand-verified registry. These are the agentic CLIs available in this
-/// environment (**claude, agy, codex, copilot, opencode, pi**). The full roster is data, not logic; it grows by
-/// appending records here or via the user TOML.
+/// environment (**claude, agy, codex, copilot, opencode, pi**; agy listed but
+/// council-disabled — no working headless/ACP path). The full roster is data, not logic;
+/// it grows by appending records here or via the user TOML.
 pub fn builtin() -> Vec<AgenticCli> {
     vec![
         AgenticCli {
@@ -119,7 +123,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             trust_flags: vec![],
             alt_binaries: vec![],
             confidence: Confidence::Verified,
-            enabled_for_council: true,
+            // Disabled 2026-09: agy never establishes an ACP session, so every seating
+            // costs a full dispatch-budget timeout and re-deliberation pressure.
+            // Re-enable once an agy bridge completes a real ballot round-trip.
+            enabled_for_council: false,
             // wicked-crew's own bridge (packages/agent-acp-bridges) — no ecosystem
             // adapter exists for Antigravity yet.
             acp: Some(AcpConfig {
@@ -343,6 +350,10 @@ mod tests {
         assert!(keys.contains(&"claude"), "claude must be a built-in seat");
         assert!(keys.contains(&"agy"), "agy must be a built-in seat");
         assert!(keys.contains(&"pi"), "pi must be a built-in seat");
+        // agy stays listed (roster completeness) but council-disabled: it has no working
+        // headless/ACP path, so seating it only buys dispatch timeouts.
+        let agy = clis.iter().find(|c| c.key == "agy").unwrap();
+        assert!(!agy.enabled_for_council, "agy must stay council-disabled until its bridge completes a real ballot");
         // Built-ins ship Verified confidence.
         assert!(clis.iter().all(|c| c.confidence == Confidence::Verified));
     }
