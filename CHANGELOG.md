@@ -15,6 +15,12 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.13** — npm release carrying #371 (issue #364, umbrella #360): ACP
+  input-governance admission is an explicit, evidence-gated adapter capability
+  (`acp_input_governance`, default false) instead of the `cli_runs_claude` name predicate.
+  claude (the one proven adapter) stays admitted; an unadmitted ACP-configured seat is loudly
+  disclosed on the audit wire (`GovernanceUnenforced`, scoped to seats that actually take the
+  ACP path); an omitted capability on a user-TOML override inherits the builtin's value.
 - **core-ts 0.7.12** — npm release carrying #361 (issue #358): `ReassignUnit` now kills an
   in-flight WRAPPED-fallback worker via an identity-keyed cancel registry (`run_id`, epoch,
   `launch_seq`) with a reassign tombstone covering the dispatch-to-registration race — the
