@@ -2,7 +2,7 @@
 
 **Issue:** wicked-core #360  
 **Status:** recon only — no implementation made  
-**Scope:** governed units assigned to the non-Claude council seats: codex, opencode, copilot, and pi.
+**Scope:** governed units assigned to the non-Claude council seats: `codex`, `opencode`, `copilot`, and `pi`.
 
 ## Decision summary
 
