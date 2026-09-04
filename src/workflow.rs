@@ -158,12 +158,23 @@ pub enum StepStatus {
     #[default]
     Ok,
     Failed,
+    /// An EXTERNAL stop: the operator's Ctrl-C / `CancelRun`, or the run-terminal cancel token
+    /// killing an orphaned worker (crew#277). Somebody asked for this — it must stay final.
     Cancelled,
     /// ACP elicitation reached a terminal state without a human response — deadline expiry,
     /// adapter disconnect, or `Err(Disconnected)` on the resolution channel (DES-002).
     /// Distinct from `Failed` (which enters the `FailureTriageReady` path and can produce
     /// `Retry`). `ElicitationFailed` routes directly to the run-terminal path, bypassing triage.
     ElicitationFailed,
+    /// The ENGINE's own turn ceiling elapsed (`WICKED_UNIT_TIMEOUT_SECS`, default 7200s) and the
+    /// runner killed the worker — no operator asked for this. Kept apart from `Cancelled` so a
+    /// consumer arming automatic stall recovery can key on the platform's own timeout WITHOUT
+    /// ever treating an operator's cancel as failover-eligible (run 616c8661: making the ceiling
+    /// actionable under the shared `Cancelled` status would let auto-recovery un-cancel a Ctrl-C).
+    /// The fold treats it exactly like `Cancelled` (terminal backstop — the silence watchdog is
+    /// the primary recovery lever and fires far earlier); the distinction rides the wire as
+    /// `UnitOutputCaptured.step_status == "timed_out"`.
+    TimedOut,
 }
 
 /// End-of-unit resource usage a runner's `OutputAdapter` parsed from a CLI's

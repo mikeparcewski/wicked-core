@@ -1099,8 +1099,9 @@ fn agent_validate_in(
             // which `parse_agent_verdict` fails closed to REJECT. Rotating past an answer would be
             // shopping for a better one.
             StepStatus::Ok => return Ok(parse_agent_verdict(&out.output)),
-            // An operator (or a timeout) stopped this run. Rotating would defy the stop.
-            StepStatus::Cancelled => {
+            // An operator stopped this run, or the seat burned its whole turn ceiling.
+            // Rotating would defy the stop (and re-burn the ceiling on the next seat).
+            StepStatus::Cancelled | StepStatus::TimedOut => {
                 anyhow::bail!(
                     "agent validation cancelled on seat {}: {}",
                     seat.key,
