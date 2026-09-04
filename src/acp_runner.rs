@@ -6545,16 +6545,29 @@ sleep 30
     }
 
     /// ACP input governance is an explicit adapter-proof capability, not a CLI-name heuristic.
-    /// The built-in registry admits only Claude today; absent seats and every unproven adapter
-    /// fail safely to the explicitly disclosed ungoverned posture.
+    /// The built-in registry admits only Claude today; every other built-in fails safely to the
+    /// explicitly disclosed ungoverned posture. Asserted against `builtin()` — never the merged
+    /// registry, whose answer would depend on the operator's real clis.toml (review, #371).
     #[test]
     fn acp_input_governance_is_admitted_by_capability_only() {
-        assert!(cli_acp_input_governed("claude"));
-        for cli in ["agy", "codex", "pi", "copilot", "opencode", "unknown"] {
-            assert!(
-                !cli_acp_input_governed(cli),
-                "{cli} must not be admitted without a pinned adapter proof"
-            );
+        for cli in wicked_council::registry::builtin() {
+            let admitted = cli
+                .acp
+                .as_ref()
+                .map(|a| a.acp_input_governance)
+                .unwrap_or(false);
+            if cli.key == "claude" {
+                assert!(
+                    admitted,
+                    "claude's pinned adapter passed the admission proof"
+                );
+            } else {
+                assert!(
+                    !admitted,
+                    "{} must not be admitted without a pinned adapter proof",
+                    cli.key
+                );
+            }
         }
     }
 
@@ -6565,8 +6578,16 @@ sleep 30
             std::process::id()
         ));
         let input = governed_input(&dir);
+        // Precondition read from the BUILT-IN roster, not the merged registry — hermetic against
+        // the operator's real clis.toml (review, #371).
+        let codex_admitted = wicked_council::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == "codex")
+            .and_then(|c| c.acp)
+            .map(|a| a.acp_input_governance)
+            .unwrap_or(false);
         assert!(
-            !cli_acp_input_governed("codex"),
+            !codex_admitted,
             "precondition: codex ACP has no pinned admission proof"
         );
         let event = acp_ungoverned_event(&input, "codex").expect("non-empty seat must disclose");
