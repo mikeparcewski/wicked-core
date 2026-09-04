@@ -275,9 +275,13 @@ mod tests {
         let released_clone = released.clone();
         let reassign_seen: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let reassign_seen_clone = reassign_seen.clone();
+        let cancelled_coordinates: Arc<Mutex<Vec<(String, u64, u64)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let cancelled_coordinates_clone = cancelled_coordinates.clone();
 
         struct BlockingRunner {
             released: Arc<Mutex<bool>>,
+            cancelled_coordinates: Arc<Mutex<Vec<(String, u64, u64)>>>,
         }
         impl StepRunner for BlockingRunner {
             fn run_unit(&self, i: &StepInput) -> StepOutput {
@@ -304,11 +308,20 @@ mod tests {
                     governed: false,
                 }
             }
+
+            fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
+                self.cancelled_coordinates.lock().unwrap().push((
+                    run_id.to_string(),
+                    epoch,
+                    launch_seq,
+                ));
+            }
         }
 
         let db = unique_db("reassign-happy");
         let runner = Arc::new(BlockingRunner {
             released: released_clone,
+            cancelled_coordinates: cancelled_coordinates_clone,
         });
         let core = Core::spawn_with_engine(db, Arc::new(AlwaysA), runner as Arc<dyn StepRunner>);
         let events = core.subscribe();
@@ -367,6 +380,11 @@ mod tests {
         assert!(
             *reassign_seen.lock().unwrap(),
             "UnitReassigned event must have been observed"
+        );
+        assert_eq!(
+            cancelled_coordinates.lock().unwrap().as_slice(),
+            [("run-reassign".to_string(), 0, 1)],
+            "ReassignUnit must target the superseded epoch/launch, even for a runner without ACP handles"
         );
 
         // Release the blocking runner so the re-dispatched unit can complete and the run
