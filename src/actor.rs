@@ -647,33 +647,63 @@ mod wal_checkpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Serializes the knob-mutating test against anything else in this binary that touches
+    /// process-global env — the same rule as `execute_wrapped::tests::ENV_LOCK` (env vars are
+    /// process-global and cargo runs tests on many threads; an unsynchronized `set_var` is a
+    /// flake generator at best and UB on POSIX at worst). Poison-tolerant on purpose: one
+    /// panicking test must not cascade.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII restore of the process-global knob: captures the current value up front and restores
+    /// the original (or unsets it) on drop — INCLUDING a panic unwind. Declared AFTER the lock
+    /// guard so it restores before the lock releases (drop order is reverse of declaration) —
+    /// the `HomeGuard` precedent from `execute_wrapped.rs` (crew#427, Copilot).
+    struct KnobGuard(Option<std::ffi::OsString>);
+    impl KnobGuard {
+        const KNOB: &'static str = "WICKED_CORE_WAL_CHECKPOINT_SECS";
+        fn capture() -> Self {
+            Self(std::env::var_os(Self::KNOB))
+        }
+        fn set(v: &str) {
+            std::env::set_var(Self::KNOB, v);
+        }
+        fn unset() {
+            std::env::remove_var(Self::KNOB);
+        }
+    }
+    impl Drop for KnobGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var(Self::KNOB, v),
+                None => std::env::remove_var(Self::KNOB),
+            }
+        }
+    }
+
     /// The env knob: unset → 60s default; `0` disables; a parsable value wins. Runs as ONE test
-    /// (not three) because env vars are process-global and tests run in parallel.
+    /// (not three) because env vars are process-global; the mutation is serialized by [`ENV_LOCK`]
+    /// and restored by the [`KnobGuard`] RAII even on a panicking assertion.
     #[test]
     fn wal_checkpoint_min_interval_honors_the_env_knob() {
-        const KNOB: &str = "WICKED_CORE_WAL_CHECKPOINT_SECS";
-        let prior = std::env::var(KNOB).ok();
-        std::env::remove_var(KNOB);
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _restore = KnobGuard::capture();
+        KnobGuard::unset();
         assert_eq!(
             wal_checkpoint_min_interval(),
             Some(std::time::Duration::from_secs(WAL_CHECKPOINT_DEFAULT_SECS)),
             "unset must yield the default"
         );
-        std::env::set_var(KNOB, "0");
+        KnobGuard::set("0");
         assert_eq!(
             wal_checkpoint_min_interval(),
             None,
             "0 must disable the idle checkpoint"
         );
-        std::env::set_var(KNOB, "300");
+        KnobGuard::set("300");
         assert_eq!(
             wal_checkpoint_min_interval(),
             Some(std::time::Duration::from_secs(300))
         );
-        match prior {
-            Some(v) => std::env::set_var(KNOB, v),
-            None => std::env::remove_var(KNOB),
-        }
     }
 }
 
@@ -968,21 +998,32 @@ pub(crate) fn run(
     let mut last_wal_checkpoint = std::time::Instant::now();
 
     loop {
-        let cmd = match rx.recv_timeout(WAL_IDLE_TICK) {
-            Ok(cmd) => cmd,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if let Some(interval) = wal_min_interval {
+        // Loop-mode selection: the knob decides ONCE, at actor start, whether this loop ever
+        // wakes on its own. Disabled (`None`) means disabled — the plain blocking `recv()` of
+        // the pre-checkpoint loop, zero periodic wakeups — not a 5s tick that skips the work.
+        // The two arms differ only in how `cmd` is obtained, so the `None` arm is byte-equivalent
+        // to the original `while let Ok(cmd) = rx.recv()` head; no timing test can pin "never
+        // wakes" without sleeping, so the equivalence is by construction here rather than by test
+        // (the knob parse itself is pinned in `wal_checkpoint_min_interval_honors_the_env_knob`).
+        let cmd = match wal_min_interval {
+            None => match rx.recv() {
+                Ok(cmd) => cmd,
+                // Unreachable in practice (the actor holds `self_tx`, so the channel can't
+                // close; `Shutdown` is the real exit) — the old `while let Ok(..)` behavior.
+                Err(_) => break,
+            },
+            Some(interval) => match rx.recv_timeout(WAL_IDLE_TICK) {
+                Ok(cmd) => cmd,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if in_flight.is_empty() && last_wal_checkpoint.elapsed() >= interval {
                         checkpoint_wals(&mut store, memory.as_mut(), knowledge.as_mut());
                         last_wal_checkpoint = std::time::Instant::now();
                     }
+                    continue;
                 }
-                continue;
-            }
-            // Unreachable in practice (the actor holds `self_tx`, so the channel can't close;
-            // `Shutdown` is the real exit) — kept as a defensive break, matching the old
-            // `while let Ok(..)` behavior.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // Same unreachable-in-practice defensive break as the blocking arm.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            },
         };
         match cmd {
             Command::Ping(reply) => {
