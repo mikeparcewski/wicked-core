@@ -51,7 +51,35 @@ struct TomlCli {
     #[serde(default)]
     login_invocation: Option<String>,
     #[serde(default)]
-    acp: Option<AcpConfig>,
+    acp: Option<TomlAcpConfig>,
+}
+
+/// TOML-only ACP shape. The resolved [`AcpConfig`] deliberately uses a plain bool on the
+/// cross-language wire; this mirror retains omission so a same-binary override can inherit an
+/// already-proven built-in admission without treating an explicit `false` as omitted.
+#[derive(Debug, Deserialize)]
+struct TomlAcpConfig {
+    binary: String,
+    #[serde(default)]
+    start_args: Vec<String>,
+    #[serde(default)]
+    transport: AcpTransport,
+    #[serde(default)]
+    auth_method: Option<String>,
+    #[serde(default)]
+    acp_input_governance: Option<bool>,
+}
+
+impl From<TomlAcpConfig> for AcpConfig {
+    fn from(t: TomlAcpConfig) -> Self {
+        Self {
+            binary: t.binary,
+            start_args: t.start_args,
+            transport: t.transport,
+            auth_method: t.auth_method,
+            acp_input_governance: t.acp_input_governance.unwrap_or(false),
+        }
+    }
 }
 
 impl From<TomlCli> for AgenticCli {
@@ -72,7 +100,7 @@ impl From<TomlCli> for AgenticCli {
             // A user record without [cli.acp] falls back to single-shot; note that an
             // overlay REPLACES its built-in wholesale, so overriding a CLI that has a
             // built-in ACP config requires restating [cli.acp] in the TOML.
-            acp: t.acp,
+            acp: t.acp.map(Into::into),
             capabilities: t.capabilities,
             login_invocation: t.login_invocation,
         }
@@ -102,6 +130,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
+                // claude-agent-acp's pinned adapter proof passed DES-INPUT-GOV-001 §3.
+                acp_input_governance: true,
             }),
             capabilities: Some(
                 "broad reasoning, architecture design, TypeScript/React/web, \
@@ -134,6 +164,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
+                // Unadmitted pending its ACP permission-round-trip proof.
+                acp_input_governance: false,
             }),
             capabilities: Some(
                 "fast iteration, multi-language code generation, open-source models, \
@@ -178,6 +210,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
+                // OQ-CODEX-ACP-001 must prove permission coverage before admission.
+                acp_input_governance: false,
             }),
             capabilities: Some(
                 "algorithm implementation, Python/JavaScript code generation, \
@@ -204,6 +238,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
+                // OQ-PI-ACP-001 must prove permission coverage before admission.
+                acp_input_governance: false,
             }),
             capabilities: Some(
                 "conversational reasoning, nuanced analysis, cross-language tasks, \
@@ -231,6 +267,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec!["--acp".into()],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
+                // OQ-COPILOT-ACP-001 must prove permission coverage before admission.
+                acp_input_governance: false,
             }),
             capabilities: Some(
                 "GitHub context, pull request review, commit-level changes, \
@@ -257,6 +295,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec!["acp".into()],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
+                // OQ-OPENCODE-ACP-001 must prove permission coverage before admission.
+                acp_input_governance: false,
             }),
             capabilities: Some(
                 "open-source models, local/private code, broad language support, \
@@ -310,6 +350,12 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                 // built-in (agy) would silently re-seat it. An omission inherits the
                 // built-in's value; re-enabling takes an explicit `enabled_for_council = true`.
                 let omitted_enabled = tcli.enabled_for_council.is_none();
+                // A nested option is needed here: `AcpConfig` deliberately resolves the field to
+                // bool for consumers, while merging must distinguish omission from explicit false.
+                let omitted_acp_gov = tcli
+                    .acp
+                    .as_ref()
+                    .is_some_and(|acp| acp.acp_input_governance.is_none());
                 let mut cli: AgenticCli = tcli.into();
                 if let Some(slot) = merged.iter_mut().find(|c| c.key == cli.key) {
                     // User record overrides a built-in with the same key.
@@ -331,6 +377,28 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                              (set `enabled_for_council = true` to re-seat it deliberately)",
                             cli.key
                         );
+                    }
+                    if omitted_acp_gov {
+                        if let (Some(new_acp), Some(builtin_acp)) =
+                            (cli.acp.as_mut(), slot.acp.as_ref())
+                        {
+                            // A proof belongs to the pinned adapter, never merely its seat key.
+                            // An operator who swaps the binary must explicitly re-admit it.
+                            if builtin_acp.acp_input_governance
+                                && !new_acp.acp_input_governance
+                                && new_acp.binary == builtin_acp.binary
+                            {
+                                new_acp.acp_input_governance = true;
+                                eprintln!(
+                                    "wicked-council: seat '{}' overrides a built-in whose ACP adapter \
+                                     '{}' is admitted to input governance but [cli.acp] omits \
+                                     acp_input_governance — inheriting true (set \
+                                     acp_input_governance = false to opt out deliberately; \
+                                     wicked-core#364)",
+                                    cli.key, builtin_acp.binary
+                                );
+                            }
+                        }
                     }
                     *slot = cli;
                 } else {
@@ -373,6 +441,93 @@ mod tests {
         );
         // Built-ins ship Verified confidence.
         assert!(clis.iter().all(|c| c.confidence == Confidence::Verified));
+    }
+
+    #[test]
+    fn only_claudes_proven_acp_adapter_is_admitted_in_the_builtin_roster() {
+        for cli in builtin() {
+            let admitted = cli.acp.as_ref().is_some_and(|acp| acp.acp_input_governance);
+            assert_eq!(
+                admitted,
+                cli.key == "claude",
+                "only the pinned Claude adapter has passed ACP input-governance proof"
+            );
+        }
+    }
+
+    #[test]
+    fn acp_admission_inherits_only_for_an_omitted_same_binary_override() {
+        let dir = std::env::temp_dir().join(format!(
+            "wc-acp-admission-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+
+        let write_override = |binary: &str, flag: Option<bool>| {
+            let flag = flag
+                .map(|value| format!("acp_input_governance = {value}"))
+                .unwrap_or_default();
+            std::fs::write(
+                &path,
+                format!(
+                    r#"
+[[cli]]
+key = "claude"
+display_name = "Claude (override)"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{binary}"
+{flag}
+"#
+                ),
+            )
+            .unwrap();
+        };
+
+        let builtin_binary = builtin()
+            .into_iter()
+            .find(|cli| cli.key == "claude")
+            .and_then(|cli| cli.acp)
+            .expect("Claude must ship an ACP config")
+            .binary;
+
+        write_override(&builtin_binary, None);
+        let merged = load(Some(&path)).unwrap();
+        assert!(merged
+            .iter()
+            .find(|cli| cli.key == "claude")
+            .and_then(|cli| cli.acp.as_ref())
+            .is_some_and(|acp| acp.acp_input_governance));
+
+        write_override(&builtin_binary, Some(false));
+        let merged = load(Some(&path)).unwrap();
+        assert!(!merged
+            .iter()
+            .find(|cli| cli.key == "claude")
+            .and_then(|cli| cli.acp.as_ref())
+            .is_some_and(|acp| acp.acp_input_governance));
+
+        write_override("deliberately-admitted-acp", Some(true));
+        let merged = load(Some(&path)).unwrap();
+        assert!(merged
+            .iter()
+            .find(|cli| cli.key == "claude")
+            .and_then(|cli| cli.acp.as_ref())
+            .is_some_and(|acp| acp.acp_input_governance));
+
+        write_override("unproven-acp", None);
+        let merged = load(Some(&path)).unwrap();
+        assert!(!merged
+            .iter()
+            .find(|cli| cli.key == "claude")
+            .and_then(|cli| cli.acp.as_ref())
+            .is_some_and(|acp| acp.acp_input_governance));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -512,10 +512,10 @@ pub enum CoreEvent {
         path: String,
         db_path: String,
     },
-    /// (EVT-017) A unit that the workflow declared GOVERNED ran with input governance UNENFORCED,
-    /// because the CLI it was routed to has no gate-hook adapter. Input arming is claude-only (it
-    /// works by injecting a PreToolUse hook via `--settings`), so any governed unit the router
-    /// sends elsewhere executes its tool calls unchecked.
+    /// (EVT-017) A unit that the workflow declared GOVERNED ran with input governance UNENFORCED.
+    /// The wrapped carrier emits this when its CLI has no gate-hook adapter; the ACP carrier emits
+    /// it when its pinned adapter has not been admitted to the shared permission gate. `reason`
+    /// names the applicable carrier and missing admission, so either unchecked path is visible.
     ///
     /// This is not a fallback and nothing retries: the unit runs, and `UnitOutputCaptured` reports
     /// `governed: false`. That bare `false` is indistinguishable from an ungoverned-by-design unit,
@@ -523,7 +523,8 @@ pub enum CoreEvent {
     /// tell "no governance was asked for" apart from "governance was asked for and could not be
     /// applied". Measured on `pilot-migration-001`: the `evaluator_distinct` router moved ord 4 off
     /// claude to `agy`, and that unit produced no ARMED marker, no hook firings, and no claims,
-    /// while units 1–3 armed normally (FINDING-063).
+    /// while units 1–3 armed normally (FINDING-063). ACP now uses the same audit vocabulary so an
+    /// unadmitted adapter cannot be mistaken for an armed carrier.
     ///
     /// The routing interaction is the sharp edge: `evaluator_distinct` exists to keep the evaluator
     /// off the creator's CLI, so on a claude-creator run it *necessarily* selects a CLI that cannot
@@ -533,7 +534,10 @@ pub enum CoreEvent {
         session: String,
         ord: u32,
         attempt: u32,
-        /// The binary the unit was actually routed to (argv[0]), not the seat key.
+        /// Which CLI ran unchecked — per carrier: the wrapped path emits the binary the unit
+        /// was actually routed to (argv[0]); the ACP path emits the registry seat key (the
+        /// identity the roster convenes by; there is no separate argv[0] on that path). Audit
+        /// consumers should treat this as a display/correlation name, not parse it.
         cli: String,
         reason: String,
     },

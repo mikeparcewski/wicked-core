@@ -152,6 +152,16 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **ACP input-governance admission is evidence-gated (#364).** ACP permission requests now enter
+  the shared policy, boundary, marker, and conformance-claim evaluator only for an ACP adapter
+  explicitly marked `acp_input_governance = true`; the capability defaults off and only the
+  pinned Claude adapter is currently admitted. Governed turns on a CLI that HAS an ACP config but
+  isn't admitted emit the `governanceUnenforced` audit event rather than silently appearing
+  governed; a CLI with no ACP config at all stays silent here (it never touches the ACP path, so
+  claiming otherwise would be a false disclosure — an adversarial review caught this against a
+  live `clis.toml`, since several built-ins are commonly wholesale-overridden with no `[cli.acp]`
+  block at all). A user ACP override that keeps an admitted built-in's binary and omits the
+  capability inherits it (with a warning); explicit `false` and adapter swaps remain unadmitted.
 - **Markdown steering import accepts custom-family rule ids** (#335). The `## Rules`
   item grammar widens from `PAT|POL-nnn` only to any `<UPPERCASE-FAMILY>-<suffix>` id
   (`OPS-CUSTOM-10`), every one of them valid in the rules CRUD too — the doc lane is now a
