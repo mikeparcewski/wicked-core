@@ -893,26 +893,37 @@ impl WrappedCliStepRunner {
                     // here: two sites is how the split came back.
                     (StepStatus::Ok, out, usage, files, tools)
                 }
-                // A timeout still surfaces the tools that DID run before the kill — this is exactly
-                // when an operator needs to see what a hung unit was doing (FINDING-046).
+                // A timeout still surfaces what DID happen before the kill — the tools
+                // (FINDING-046) AND the preserved pre-kill output/usage/files `run_bounded`
+                // kept exactly for this post-mortem (Copilot on perf#4: dropping them here
+                // defeated that preservation). The kill notice stays the FIRST line so
+                // substring classifiers ("exceeded the timeout") keep matching.
                 // The engine's own turn ceiling → `TimedOut`, never `Cancelled`: an operator's
                 // cancel must stay distinguishable from the platform's deadline (616c8661).
-                Ok((-1, _, err, _, _, tools)) if err == TIMED_OUT => (
+                Ok((-1, out, err, usage, files, tools)) if err == TIMED_OUT => (
                     StepStatus::TimedOut,
-                    format!("(cli `{cli_key}` exceeded the timeout and was killed)"),
-                    None,
-                    Vec::new(),
+                    if out.trim().is_empty() {
+                        format!("(cli `{cli_key}` exceeded the timeout and was killed)")
+                    } else {
+                        format!("(cli `{cli_key}` exceeded the timeout and was killed)\n{out}")
+                    },
+                    usage,
+                    files,
                     tools,
                 ),
                 // The run-terminal cancel token (crew#277): the RUN already terminated and this
-                // worker was killed to stop it orphaning — an external cancel, reported as such.
-                // (The actor's terminal/stale guards discard this output; the status matters for
-                // any consumer that sees it before the drop.)
-                Ok((-1, _, err, _, _, tools)) if err == CANCELLED => (
+                // worker was killed to stop it orphaning — an external cancel, reported as such,
+                // with the same pre-kill context preserved. (The actor's terminal/stale guards
+                // discard this output; the status matters for any consumer seeing it earlier.)
+                Ok((-1, out, err, usage, files, tools)) if err == CANCELLED => (
                     StepStatus::Cancelled,
-                    format!("(cli `{cli_key}` was killed by run cancellation)"),
-                    None,
-                    Vec::new(),
+                    if out.trim().is_empty() {
+                        format!("(cli `{cli_key}` was killed by run cancellation)")
+                    } else {
+                        format!("(cli `{cli_key}` was killed by run cancellation)\n{out}")
+                    },
+                    usage,
+                    files,
                     tools,
                 ),
                 Ok((code, out, err, _, _, tools)) => {
@@ -2411,6 +2422,7 @@ mod tests {
     /// cancel-vs-timeout separation `run_bounded_kills_the_child_when_the_cancel_token_flips`
     /// pins. Consumed at `run_unit_streaming`, where TIMED_OUT → `StepStatus::TimedOut` and
     /// CANCELLED → `StepStatus::Cancelled`.
+    #[cfg(unix)]
     #[test]
     fn run_bounded_reports_timed_out_when_the_deadline_elapses() {
         let emit = |_: &str| {};
