@@ -4637,9 +4637,10 @@ fn fail_run(
 /// `finalize_run` (Completed), `fail_run` (Failed, which `fail_run_by_id` also routes through),
 /// and resume's crash-during-planning guard. This is NOT every terminal transition — two reach a
 /// terminal status without calling this, on purpose: operator `cancel_run` FORCE-removes instead
-/// (Cancel is the operator discarding the work), and the WORKER-originated Cancelled path
-/// (`apply_step_result`, `StepStatus::Cancelled` — e.g. a P4a subprocess kill) reaps nowhere
-/// inline. That last leftover is not lost: the startup reaper
+/// (Cancel is the operator discarding the work), and the WORKER-originated terminal path
+/// (`apply_step_result`, `StepStatus::Cancelled` — e.g. a P4a subprocess kill — and
+/// `StepStatus::TimedOut`, the engine's own turn ceiling, which shares that branch) reaps
+/// nowhere inline. That last leftover is not lost: the startup reaper
 /// ([`crate::repo::reap_orphan_worktrees`]) classifies Cancelled as terminal and re-applies the
 /// same clean-only rule to it (and to anything a crash left behind), so a missed reap is a leak
 /// until next boot, not forever.
