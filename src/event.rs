@@ -534,7 +534,10 @@ pub enum CoreEvent {
         session: String,
         ord: u32,
         attempt: u32,
-        /// The binary the unit was actually routed to (argv[0]), not the seat key.
+        /// Which CLI ran unchecked — per carrier: the wrapped path emits the binary the unit
+        /// was actually routed to (argv[0]); the ACP path emits the registry seat key (the
+        /// identity the roster convenes by; there is no separate argv[0] on that path). Audit
+        /// consumers should treat this as a display/correlation name, not parse it.
         cli: String,
         reason: String,
     },
