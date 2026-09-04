@@ -413,10 +413,9 @@ impl RealDispatcher {
     /// re-admitting on it is the `--version` mistake wearing an exit code, so it counts
     /// against health like any other failure.
     fn record_seat_outcome(&self, cli: &AgenticCli, outcome: &DispatchOutcome) {
-        let usable = match outcome {
-            DispatchOutcome::Voted(v) => !v.recommendation.trim().is_empty(),
-            DispatchOutcome::Failed(_) => false,
-        };
+        // The shared predicate — the same one the worker's ranking signal uses, so health and
+        // ranking can never disagree about what a hollow return was.
+        let usable = outcome.is_usable_vote();
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
         let health = seats.entry(cli.key.clone()).or_default();
         if usable {

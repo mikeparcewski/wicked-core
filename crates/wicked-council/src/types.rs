@@ -343,9 +343,11 @@ pub struct Verdict {
     /// non-empty recommendation — a tolerant parse of a hollow exit-0 return is not an answer).
     ///
     /// Deliberately NOT quorum-adjusted — it answers "of the seats that answered, how many
-    /// agreed?", which is what drives the runoff loop. Quorum is a separate axis and lives on
-    /// `consensus` + `seated`; folding it in here would silently re-scope the approval
-    /// threshold and send every degraded council to a runoff that loses the same seats again.
+    /// agreed?". Observability only: the runoff loop's exit is measured separately, as the
+    /// winner's share of the LIVE council (`synthesis::live_agreement`, winner / seated −
+    /// benched), and quorum is a third axis again, living on `consensus` + `seated`. Three
+    /// denominators, three questions — this one is the conversation among those who spoke,
+    /// and folding either of the others into it would misstate that.
     /// Emitted on `wicked.council.voted`. Counts agreement, NOT averaged confidence.
     pub agreement_ratio: f32,
     /// Risk convergence: each distinct `top_risk` and how many CLIs cited it,
@@ -656,6 +658,19 @@ impl DispatchOutcome {
     /// Whether the seat voted, without consuming the outcome.
     pub fn is_voted(&self) -> bool {
         matches!(self, DispatchOutcome::Voted(_))
+    }
+
+    /// Whether the seat cast a USABLE vote — parsed, with a non-empty recommendation.
+    ///
+    /// The one predicate health, ranking and telemetry share, so they cannot drift:
+    /// [`DispatchOutcome::is_voted`] says a `Vote` value exists, which tolerant parsing
+    /// guarantees for ANY exit-0 (a help screen, an auth banner), while this says the vote can
+    /// actually count — synthesis tallies exactly the votes this accepts. A seat must never be
+    /// penalized by seat health for a hollow return and simultaneously credited for it in the
+    /// ranking store; that inconsistency biases future seat selection toward CLIs that exit 0
+    /// without answering.
+    pub fn is_usable_vote(&self) -> bool {
+        matches!(self, DispatchOutcome::Voted(v) if !v.recommendation.trim().is_empty())
     }
 }
 

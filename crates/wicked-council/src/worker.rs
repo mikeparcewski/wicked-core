@@ -397,7 +397,12 @@ fn run_council(
             } = timed;
             let cli = &roster[i];
             let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
-            entry.0 = outcome.is_voted();
+            // USABLE, not merely voted: `RankSignal::success` is documented as "did the CLI
+            // produce a usable vote?", and tolerant parsing yields a Vote for any exit-0. A
+            // hollow return is already a failure to seat health; counting it as a ranking
+            // success would bias `RankStore::best_for` toward CLIs that exit 0 without
+            // answering — penalized on one axis, promoted on the other.
+            entry.0 = outcome.is_usable_vote();
             // Rank on run time only. Queue time measures how busy the council was, not how fast
             // this CLI is, and charging it to the seat would rank whichever seat happened to wait.
             entry.1 += ran_ms;
@@ -969,6 +974,56 @@ mod tests {
             *latency_ms >= WORK.as_millis() as u64,
             "a seat that worked for {WORK:?} before panicking must not be ranked as instant, \
              got {latency_ms}ms"
+        );
+    }
+
+    /// One seat "answers" with a hollow exit-0 vote (tolerant parsing: empty recommendation);
+    /// the rest cast real ballots.
+    struct HollowSeatDispatcher {
+        victim: String,
+    }
+    impl Dispatcher for HollowSeatDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            if cli.key == self.victim {
+                Some(vote(&cli.key, ""))
+            } else {
+                Some(vote(&cli.key, "2 — best"))
+            }
+        }
+    }
+
+    #[test]
+    fn a_hollow_vote_is_not_ranked_as_a_success() {
+        // `RankSignal::success` is documented as "did the CLI produce a USABLE vote?", and the
+        // dispatcher's health gate already counts a hollow exit-0 as a failure. Ranking it as
+        // a success would split the two: the same return penalized on one axis and promoted on
+        // the other, biasing `best_for` toward CLIs that exit 0 without answering.
+        let rank = Arc::new(RecordingRank::default());
+        let worker = worker_with_parts(
+            Arc::new(HollowSeatDispatcher {
+                victim: "b".to_string(),
+            }),
+            rank.clone(),
+            Arc::new(NoopEventSink),
+            &["a", "b", "c"],
+        );
+        let id = worker.queue_blocking(task());
+        assert_eq!(worker.poll(&id).expect("status").state, TaskState::Voted);
+
+        let seen = rank.seen.lock().unwrap().clone();
+        let (_, success, _) = seen
+            .iter()
+            .find(|(k, _, _)| k == "b")
+            .expect("the hollow seat is still ranked");
+        assert!(
+            !success,
+            "an exit-0 with no usable ballot must not count as a ranking success: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|(k, _, _)| k != "b")
+                .all(|(_, success, _)| *success),
+            "the seats that actually answered still rank as successes: {seen:?}"
         );
     }
 
