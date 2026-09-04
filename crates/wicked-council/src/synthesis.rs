@@ -127,6 +127,39 @@ fn answering_floor(seated: u32) -> u32 {
     seated.div_ceil(2).max(2)
 }
 
+/// The winner's share of the LIVE council: `winning_count / (seated − abstained)`.
+///
+/// This is the deliberation loop's exit quorum — the approval bar measured against every seat
+/// that could have answered. It sits BETWEEN the two ratios the verdict carries, and the
+/// difference is the whole design: `agreement_ratio` (winner / votes cast) excludes every
+/// non-voter, so a seat whose answer was LOST (timed out, crashed) stops counting against the
+/// bar the moment it fails — the bar quietly shrinks to whoever answered. Winner / seated goes
+/// the other way: a seat the dispatcher benched — one that structurally could not vote — holds
+/// the bar hostage forever. Live is seated minus the benched abstentions and nothing else: an
+/// abstention is a fact about the seat (known dead, told to sit out), a lost answer is a fact
+/// about one ballot, and only the first may leave the denominator. A seat that keeps losing
+/// its answer becomes an abstention the moment the health gate benches it — the two halves of
+/// the design meet exactly here.
+///
+/// Same defensive clamps as [`synthesize`]: neither an under-reported `seated` nor an
+/// over-reported `abstained` can shrink the denominator below the votes actually cast.
+pub fn live_agreement(votes: &[Vote], seated: u32, abstained: u32) -> f32 {
+    let matrix = build_matrix(votes);
+    let total = matrix.total;
+    let winning_count = matrix
+        .recommendation_counts
+        .first()
+        .map(|(_, count)| *count)
+        .unwrap_or(0);
+    let seated = seated.max(total);
+    let live = seated.saturating_sub(abstained).max(total);
+    if live == 0 {
+        0.0
+    } else {
+        winning_count as f32 / live as f32
+    }
+}
+
 /// Synthesize the [`Verdict`] (layer c) from votes.
 ///
 /// - Winner = the option with the most votes, where two seats picking the same option agree
@@ -532,6 +565,39 @@ mod tests {
         // still a split.
         let v = synthesize("t15", &votes, 6, 5);
         assert!(!v.consensus, "{v:?}");
+    }
+
+    #[test]
+    fn live_agreement_excludes_abstentions_and_keeps_lost_answers() {
+        // 4A/1B with 1 benched of 6: the benched seat leaves the denominator (4/5), the seated
+        // count does not decide it (4/6 would miss the bar).
+        let votes = vec![
+            vote("a", "A", "latency"),
+            vote("b", "A", "latency"),
+            vote("c", "A", "latency"),
+            vote("d", "A", "latency"),
+            vote("e", "B", "cost"),
+        ];
+        assert!((live_agreement(&votes, 6, 1) - 0.8).abs() < 1e-6);
+
+        // The same tally with the sixth seat TIMED OUT instead of benched: a lost answer stays
+        // in the denominator (4/6), because it might have been the dissent that mattered.
+        assert!((live_agreement(&votes, 6, 0) - 4.0 / 6.0).abs() < 1e-6);
+
+        // Fully live 3A/2B: 3/5 — no abstentions, nothing shrinks.
+        let split = vec![
+            vote("a", "A", "latency"),
+            vote("b", "A", "latency"),
+            vote("c", "A", "latency"),
+            vote("d", "B", "cost"),
+            vote("e", "B", "cost"),
+        ];
+        assert!((live_agreement(&split, 5, 0) - 0.6).abs() < 1e-6);
+
+        // The clamps: an over-reported abstained count cannot shrink live below the cast.
+        assert!((live_agreement(&split, 5, 5) - 0.6).abs() < 1e-6);
+        // No votes is no agreement, not a divide-by-zero.
+        assert_eq!(live_agreement(&[], 0, 0), 0.0);
     }
 
     #[test]

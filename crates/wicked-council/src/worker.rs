@@ -462,17 +462,27 @@ fn run_council(
             .count() as u32;
         let verdict = synthesis::synthesize(&task.id, &votes, roster.len() as u32, abstained);
 
-        // The council stops deliberating when any of these holds, in spirit-order:
-        // - the ballot cleared the approval bar among the seats that answered;
-        // - the answering seats already form a strict majority of the LIVE council
-        //   (`verdict.consensus`) — re-opening deliberation would re-ask the seats that
-        //   already agreed and re-abstain the benched ones, round after round;
-        // - the round or wall-clock budget is spent, and the plurality stands (the degrade
-        //   both caps share). The deadline is only ever consulted BETWEEN ballots: the ballot
-        //   that is out finishes and its votes all count — there is no mid-ballot cancel, by
-        //   design (the seat threads in the scope above cannot be safely torn down mid-run).
-        if verdict.consensus
-            || verdict.agreement_ratio >= APPROVAL_THRESHOLD
+        // The council stops deliberating when the winner clears the approval bar over the
+        // LIVE council — seated minus the benched abstentions — or when a budget is spent
+        // (rounds or wall clock) and the plurality stands, the degrade both caps share.
+        //
+        // The bar itself never moves: it is APPROVAL_THRESHOLD, always. What the abstentions
+        // change is only the DENOMINATOR it is measured against — a benched seat could not
+        // have voted, so it does not hold the bar hostage, while a seat whose answer was
+        // merely lost this round (timed out, crashed) still counts against it: it might have
+        // been the dissent that mattered, and if it keeps failing, the health gate benches it
+        // and it becomes an abstention. Anything weaker here — a strict-majority exit, say —
+        // would quietly lower the 75% bar for fully-live councils (3A/2B halting in one
+        // ballot at 60%), which is a different decision procedure, not a perf fix.
+        // `verdict.consensus` (strict majority of live, floored) remains a verdict/telemetry
+        // fact and deliberately NOT an exit.
+        //
+        // The deadline is only ever consulted BETWEEN ballots: the ballot that is out
+        // finishes and its votes all count — there is no mid-ballot cancel, by design (the
+        // seat threads in the scope above cannot be safely torn down mid-run).
+        let live_agreement =
+            synthesis::live_agreement(&votes, roster.len() as u32, abstained);
+        if live_agreement >= APPROVAL_THRESHOLD
             || ballot >= MAX_BALLOTS
             || convened_at.elapsed() >= deadline
         {
@@ -486,7 +496,12 @@ fn run_council(
             &serde_json::json!({
                 "task_id": task.id,
                 "round": ballot,
-                "agreement_ratio": verdict.agreement_ratio,
+                // The ratio the gate actually judged (winner / live seats), not the
+                // cast-only `verdict.agreement_ratio` — this event exists to explain why a
+                // runoff is happening, and emitting a ratio that can sit ABOVE the threshold
+                // beside it (a lost answer shrinks the cast, never the live count) would
+                // read as a runoff over nothing.
+                "agreement_ratio": live_agreement,
                 "votes": votes.len(),
                 "threshold": APPROVAL_THRESHOLD,
             }),
@@ -1196,11 +1211,13 @@ mod tests {
     }
 
     /// Some seats vote, some abstain the way the real dispatcher's health gate reports a
-    /// benched seat (a `Benched` failure, no subprocess behind it). Ballot 1 votes come from
-    /// `first_ballot`; any later ballot converges on option 1, so a council that re-deliberates
-    /// terminates and the test can read how many rounds it took.
+    /// benched seat (a `Benched` failure, no subprocess behind it), and some FAIL the way a
+    /// live seat does (a timeout — an answer lost, not an abstention). Ballot 1 votes come
+    /// from `first_ballot`; any later ballot converges on option 1, so a council that
+    /// re-deliberates terminates and the test can read how many rounds it took.
     struct BenchedSeatsDispatcher {
         benched: Vec<&'static str>,
+        failed: Vec<&'static str>,
         first_ballot: fn(&str) -> &'static str,
         max_ballot: Mutex<u32>,
     }
@@ -1224,6 +1241,12 @@ mod tests {
                     "seat benched after consecutive failures",
                 ));
             }
+            if self.failed.contains(&cli.key.as_str()) {
+                return DispatchOutcome::Failed(SeatFailure::new(
+                    SeatFailureKind::TimedOut,
+                    "exceeded the dispatch budget",
+                ));
+            }
             let rec = if ctx.ballot == 1 {
                 (self.first_ballot)(&cli.key)
             } else {
@@ -1240,6 +1263,10 @@ mod tests {
         // benched seat abstained, it did not lose the council its quorum, and re-opening
         // deliberation over it would re-ask the seats that already agreed and re-abstain the
         // benched one, round after round (the measured shape: one dead seat forcing runoffs).
+        //
+        // The arithmetic this pins is the DENOMINATOR: 4 of 5 live = 80% clears the bar, while
+        // 4 of 6 seated = 67% does not — an exit measured against the seated count would send
+        // this council to a runoff and turn `max_ballot == 1` below red.
         let dissent_ballot = |key: &str| -> &'static str {
             if key == "e" {
                 "2 — other"
@@ -1249,6 +1276,7 @@ mod tests {
         };
         let abstaining = Arc::new(BenchedSeatsDispatcher {
             benched: vec!["f"],
+            failed: vec![],
             first_ballot: dissent_ballot,
             max_ballot: Mutex::new(0),
         });
@@ -1260,6 +1288,7 @@ mod tests {
 
         let full = Arc::new(BenchedSeatsDispatcher {
             benched: vec![],
+            failed: vec![],
             first_ballot: dissent_ballot,
             max_ballot: Mutex::new(0),
         });
@@ -1307,6 +1336,7 @@ mod tests {
         // runoff exactly as a full-roster split would.
         let dispatcher = Arc::new(BenchedSeatsDispatcher {
             benched: vec!["e", "f"],
+            failed: vec![],
             first_ballot: |key| match key {
                 "a" | "b" => "1 — fits",
                 _ => "2 — other",
@@ -1331,6 +1361,7 @@ mod tests {
         // plurality stands for routing.
         let dispatcher = Arc::new(BenchedSeatsDispatcher {
             benched: vec!["b", "c", "d", "e", "f"],
+            failed: vec![],
             first_ballot: |_| "1 — fits",
             max_ballot: Mutex::new(0),
         });
@@ -1360,6 +1391,61 @@ mod tests {
                 .expect("the plurality stands")
                 .starts_with('1'),
             "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_live_majority_below_the_bar_still_redeliberates() {
+        // Five seats, everyone answers, 3A/2B: a strict majority — and 15 points below the
+        // 75% approval bar. The bar is the decision procedure the voters are told about, and
+        // with no abstentions in play NOTHING here may move: this council deliberates again,
+        // exactly as it did before seat health existed. This is the mutation-killer for the
+        // loop-exit — any exit softer than the bar (a strict-majority-of-live test, say)
+        // halts this council in one ballot at 60% and turns the assertion red.
+        let dispatcher = Arc::new(BenchedSeatsDispatcher {
+            benched: vec![],
+            failed: vec![],
+            first_ballot: |key| match key {
+                "a" | "b" | "c" => "1 — fits",
+                _ => "2 — other",
+            },
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert!(
+            *dispatcher.max_ballot.lock().unwrap() >= 2,
+            "a fully-live 3A/2B is below the 75% bar and must re-deliberate"
+        );
+    }
+
+    #[test]
+    fn a_lost_answer_still_counts_against_the_bar() {
+        // Six seats: f is benched (abstains), e times out (an answer LOST), and the cast
+        // splits 3A/1B. Of the seats that answered the winner has exactly 75% — but the bar
+        // is measured against the LIVE council, and e is live: it was asked, it may have been
+        // the dissent that mattered, and 3 of 5 live is 60%. The council re-deliberates,
+        // giving e another chance to answer — and if e keeps failing, the health gate benches
+        // it and only THEN does it stop counting. An exit measured against the votes cast
+        // would close this council in one ballot and turn the assertion red.
+        let dispatcher = Arc::new(BenchedSeatsDispatcher {
+            benched: vec!["f"],
+            failed: vec!["e"],
+            first_ballot: |key| match key {
+                "a" | "b" | "c" => "1 — fits",
+                _ => "2 — other",
+            },
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e", "f"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert!(
+            *dispatcher.max_ballot.lock().unwrap() >= 2,
+            "3 of 5 live seats is below the bar however many of the CAST agreed"
         );
     }
 

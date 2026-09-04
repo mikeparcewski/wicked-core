@@ -55,8 +55,10 @@ pub fn render_ballot(task: &CouncilTask, ctx: &BallotContext) -> String {
 
     let threshold_block = if ctx.approval_threshold > 0.0 {
         format!(
-            "The council needs at least {pct}% of seats to converge on one option. If a \
-             ballot fragments, a runoff round shares the tally and dissent with every seat.\n\n",
+            "The council needs at least {pct}% of its live seats to converge on one option \
+             (a seat the dispatcher has benched abstains and is not counted; a seat that \
+             fails to answer still is). If a ballot falls short, a runoff round shares the \
+             tally and dissent with every seat.\n\n",
             pct = (ctx.approval_threshold * 100.0).round() as u32,
         )
     } else {
@@ -329,20 +331,54 @@ impl Default for SeatHealth {
     }
 }
 
+/// What the health gate decided for one dispatch.
+enum GateDecision {
+    /// Dispatch normally.
+    Dispatch,
+    /// Dispatch normally — and this dispatch IS the seat's one probationary ballot, so the
+    /// caller must hold a [`ProbationGuard`] until the outcome is recorded.
+    Probe,
+    /// The seat abstains right here, before a tempdir, a permit, or a subprocess exists to
+    /// pay for.
+    Abstain(SeatFailure),
+}
+
+/// Hands a claimed probationary ballot back if the dispatch unwinds before its outcome is
+/// recorded.
+///
+/// The gate admits exactly ONE probe at a time, so a probe that vanishes — a panic anywhere
+/// between the claim and `record_seat_outcome` — would otherwise strand the seat in
+/// `Probation` until the process restarts, with every later dispatch abstaining on
+/// "probation in flight". The guard's drop reverts the seat to an already-expired bench, so
+/// the NEXT dispatch simply becomes the probationary ballot instead. `armed` is cleared once
+/// the outcome is recorded; after that the drop is a no-op (and `reopen_probation` itself
+/// only touches a seat still in `Probation`, so a late drop can never clobber a recorded
+/// result).
+struct ProbationGuard<'a> {
+    dispatcher: &'a RealDispatcher,
+    cli: &'a AgenticCli,
+    armed: bool,
+}
+
+impl Drop for ProbationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.dispatcher.reopen_probation(self.cli);
+        }
+    }
+}
+
 impl RealDispatcher {
-    /// The health gate at the top of every dispatch. `None` means dispatch normally (including
-    /// the probationary ballot, which IS a normal dispatch — that is the point of it);
-    /// `Some(failure)` means the seat abstains right here, before a tempdir, a permit, or a
-    /// subprocess exists to pay for.
-    fn seat_gate(&self, cli: &AgenticCli) -> Option<SeatFailure> {
+    /// The health gate at the top of every dispatch.
+    fn seat_gate(&self, cli: &AgenticCli) -> GateDecision {
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
         let health = seats.entry(cli.key.clone()).or_default();
         match *health {
-            SeatHealth::Healthy { .. } => None,
+            SeatHealth::Healthy { .. } => GateDecision::Dispatch,
             SeatHealth::Benched { until, backoff } => {
                 let now = Instant::now();
                 if now < until {
-                    Some(SeatFailure::new(
+                    GateDecision::Abstain(SeatFailure::new(
                         SeatFailureKind::Benched,
                         format!(
                             "seat benched for {:?} more (span {:?}) after consecutive failures; \
@@ -356,10 +392,10 @@ impl RealDispatcher {
                     // happens under the same lock that gates every other dispatch, so exactly
                     // one caller claims it.
                     *health = SeatHealth::Probation { backoff };
-                    None
+                    GateDecision::Probe
                 }
             }
-            SeatHealth::Probation { .. } => Some(SeatFailure::new(
+            SeatHealth::Probation { .. } => GateDecision::Abstain(SeatFailure::new(
                 SeatFailureKind::Benched,
                 "seat's probationary ballot is already in flight; abstaining until it resolves",
             )),
@@ -422,9 +458,10 @@ impl RealDispatcher {
         }
     }
 
-    /// Give back a claimed probation when the dispatch never actually ran (the tempdir could
-    /// not be created — a host problem that says nothing about the seat). The bench is restored
-    /// as already-expired, so the NEXT dispatch becomes the probationary ballot instead.
+    /// Give back a claimed probation when the dispatch never resolved it — the tempdir could
+    /// not be created (a host problem that says nothing about the seat), or the dispatch
+    /// unwound outright ([`ProbationGuard`]). The bench is restored as already-expired, so the
+    /// NEXT dispatch becomes the probationary ballot instead.
     fn reopen_probation(&self, cli: &AgenticCli) {
         let mut seats = self.seats.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(health) = seats.get_mut(&cli.key) {
@@ -465,22 +502,33 @@ impl RealDispatcher {
         // benched seat reads to the council as an abstention at ~zero cost, instead of charging
         // its whole dispatch budget to every ballot it sits on (the measured shape of a dead
         // seat: 50 of 66 dispatch-budget timeouts belonged to one structurally-broken CLI).
-        if let Some(failure) = self.seat_gate(cli) {
-            return TimedOutcome {
-                outcome: DispatchOutcome::Failed(failure),
-                queued_ms: 0,
-                ran_ms: 0,
-            };
-        }
+        let probing = match self.seat_gate(cli) {
+            GateDecision::Abstain(failure) => {
+                return TimedOutcome {
+                    outcome: DispatchOutcome::Failed(failure),
+                    queued_ms: 0,
+                    ran_ms: 0,
+                }
+            }
+            GateDecision::Probe => true,
+            GateDecision::Dispatch => false,
+        };
+        // Armed only while this dispatch holds the seat's one probationary ballot. Every early
+        // return below — and any panic in the dispatch body — hands the probe back through the
+        // guard's drop, so a probe can never be stranded "in flight" forever. Disarmed once the
+        // outcome is recorded.
+        let mut probation_guard = ProbationGuard {
+            dispatcher: self,
+            cli,
+            armed: probing,
+        };
 
         // Isolation: a per-dispatch tempdir under the system temp root.
         let workdir = match make_tempdir(&cli.key, &task.id) {
             Ok(d) => d,
             Err(e) => {
-                // The seat never ran, so this outcome must not touch its health — but if the
-                // gate had just claimed the probationary ballot for this dispatch, hand it back
-                // or the seat is stuck "in probation" forever over a host filesystem error.
-                self.reopen_probation(cli);
+                // The seat never ran, so this outcome must not touch its health; the guard
+                // hands a claimed probation back on the way out.
                 return TimedOutcome {
                     outcome: DispatchOutcome::Failed(SeatFailure::new(
                         SeatFailureKind::WorkdirUnavailable,
@@ -527,8 +575,11 @@ impl RealDispatcher {
         };
         // A real dispatch ran to a real outcome: this is the ONLY thing that moves health. A
         // parsed vote is the readiness signal (it clears everything, probation included); a
-        // failure extends the streak or fails the probation.
+        // failure extends the streak or fails the probation. The guard is disarmed AFTER the
+        // record — and its reopen only touches a seat still in `Probation`, so this order can
+        // never undo what was just recorded.
         self.record_seat_outcome(cli, outcome.is_voted());
+        probation_guard.armed = false;
         TimedOutcome {
             outcome,
             queued_ms: queued.as_millis() as u64,
@@ -1808,6 +1859,37 @@ mod failure_diagnostics_tests {
             Some(MAX),
             "the backoff is capped at the ceiling"
         );
+    }
+
+    #[test]
+    fn an_unwound_probation_is_handed_back_rather_than_stranded() {
+        // A dispatch that claimed the probationary ballot and then unwound — a panic anywhere
+        // between the gate and the outcome record — must not leave the seat in `Probation`
+        // forever: the gate would answer "probation in flight" to every later dispatch until
+        // the process restarts, which is a permanent bench wearing a temporary one's name.
+        // Dropping the guard un-defused (exactly what an unwind does to it) hands the probe
+        // back, and the NEXT dispatch becomes the probationary ballot.
+        let d = dispatcher_with_bench(2, Duration::from_secs(1), Duration::from_secs(4));
+        let cli = shell_seat("phoenix", "echo RECOMMENDATION: 1");
+        d.seats.lock().unwrap().insert(
+            "phoenix".to_string(),
+            SeatHealth::Probation {
+                backoff: Duration::from_secs(1),
+            },
+        );
+        {
+            let _guard = ProbationGuard {
+                dispatcher: &d,
+                cli: &cli,
+                armed: true,
+            };
+        }
+        match d.dispatch_prompt(&cli, &task(), "ignored") {
+            DispatchOutcome::Voted(_) => {}
+            DispatchOutcome::Failed(f) => {
+                panic!("the handed-back probe must dispatch for real, got {f:?}")
+            }
+        }
     }
 
     #[test]
