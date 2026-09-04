@@ -1,2 +1,0 @@
-{"claim_id":"allow-1","scope":"s","phase":"exec","policy_ids":[],"decision":"allow","obligations":[],"evaluated_context_ref":"sha256:allow-1","criteria":"","evaluator_identity":"wicked-governance","evaluated_at":1788523687}
-{"claim_id":"deny-1","scope":"s","phase":"exec","policy_ids":[],"decision":"deny","obligations":[],"evaluated_context_ref":"sha256:deny-1","criteria":"","evaluator_identity":"wicked-governance","evaluated_at":1788523687}

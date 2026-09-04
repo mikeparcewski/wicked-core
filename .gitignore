@@ -15,3 +15,4 @@ coverage-report.json
 __pycache__/
 *.py[cod]
 .loop-run/
+/tmp/
