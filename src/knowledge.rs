@@ -36,6 +36,16 @@ impl RunKnowledge {
         Ok(Self { engine })
     }
 
+    /// TRUNCATE-checkpoint the knowledge store's WAL — forwards to the engine
+    /// (`SqliteStore::checkpoint_truncate`: busy-tolerant, never blocking; a `busy` result just
+    /// defers to a later idle tick). Called by the actor on its idle tick so
+    /// `<estate>.knowledge-wal` stops outgrowing its db.
+    pub fn checkpoint_truncate(&mut self) -> anyhow::Result<wicked_apps_core::WalCheckpointStats> {
+        self.engine
+            .checkpoint_truncate()
+            .map_err(|e| anyhow::anyhow!("checkpoint knowledge store: {e}"))
+    }
+
     /// Ingest a document (title + chunks) into the knowledge base. Returns the chunk count.
     pub fn ingest(&mut self, title: &str, chunks: &[String], now: i64) -> anyhow::Result<usize> {
         let (_doc, chunk_syms) = self

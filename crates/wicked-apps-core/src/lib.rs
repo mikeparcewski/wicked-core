@@ -58,7 +58,7 @@ pub use wicked_estate_core::{
     SymbolId,
 };
 
-pub use wicked_estate_store::SqliteStore;
+pub use wicked_estate_store::{SqliteStore, WalCheckpointStats};
 
 // The Postgres backend is compiled only under the `postgres` feature (it pulls in sqlx + tokio).
 // It implements the SAME sync `GraphRead`/`GraphWrite` (hence `GraphStore`) surface as SqliteStore

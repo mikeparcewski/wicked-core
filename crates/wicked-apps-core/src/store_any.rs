@@ -15,7 +15,7 @@
 
 #[cfg(feature = "postgres")]
 use wicked_estate_store::PostgresStore;
-use wicked_estate_store::SqliteStore;
+use wicked_estate_store::{SqliteStore, WalCheckpointStats};
 
 use wicked_estate_core::{
     Annotation, Change, ChangeOp, Direction, Edge, GraphRead, GraphStats, GraphWrite,
@@ -42,6 +42,19 @@ impl AnyStore {
     #[cfg(feature = "postgres")]
     pub fn postgres(store: PostgresStore) -> Self {
         AnyStore::Postgres(store)
+    }
+
+    /// TRUNCATE-checkpoint the backend's WAL (`SqliteStore::checkpoint_truncate`: busy-tolerant,
+    /// never blocking — a concurrent `open_readonly` holder yields `busy: true` and the checkpoint
+    /// simply defers to a later call). The Postgres backend has no SQLite WAL, so that arm is a
+    /// no-op returning the `-1` no-WAL sentinel stats (`WalCheckpointStats::default`). Like `compact`, an operational method — deliberately NOT part
+    /// of the `GraphWrite` contract.
+    pub fn checkpoint_truncate(&mut self) -> Result<WalCheckpointStats> {
+        match self {
+            AnyStore::Sqlite(s) => s.checkpoint_truncate(),
+            #[cfg(feature = "postgres")]
+            AnyStore::Postgres(_) => Ok(WalCheckpointStats::default()),
+        }
     }
 }
 
