@@ -339,12 +339,15 @@ pub struct Verdict {
     pub seated: u32,
     /// The recommendation the most votes converged on (the winner), if any.
     pub winning_recommendation: Option<String>,
-    /// Agreement ratio in `[0.0, 1.0]`: winning vote count / votes **cast**.
+    /// Agreement ratio in `[0.0, 1.0]`: winning vote count / votes that **answered** (cast a
+    /// non-empty recommendation — a tolerant parse of a hollow exit-0 return is not an answer).
     ///
     /// Deliberately NOT quorum-adjusted — it answers "of the seats that answered, how many
-    /// agreed?", which is what drives the runoff loop. Quorum is a separate axis and lives on
-    /// `consensus` + `seated`; folding it in here would silently re-scope the approval
-    /// threshold and send every degraded council to a runoff that loses the same seats again.
+    /// agreed?". Observability only: the runoff loop's exit is measured separately, as the
+    /// winner's share of the LIVE council (`synthesis::live_agreement`, winner / seated −
+    /// benched), and quorum is a third axis again, living on `consensus` + `seated`. Three
+    /// denominators, three questions — this one is the conversation among those who spoke,
+    /// and folding either of the others into it would misstate that.
     /// Emitted on `wicked.council.voted`. Counts agreement, NOT averaged confidence.
     pub agreement_ratio: f32,
     /// Risk convergence: each distinct `top_risk` and how many CLIs cited it,
@@ -499,6 +502,16 @@ pub enum SeatFailureKind {
     /// thread — turns one bad seat into a failed distribution, which is the opposite of what a
     /// quorum is for.
     Panicked,
+    /// The seat is benched by the dispatcher's health gate: it failed consecutively and is
+    /// sitting out its backoff, so the dispatch short-circuited before spawning anything.
+    ///
+    /// This is an ABSTENTION, not an error: the seat was seated, was asked, and cost the ballot
+    /// nothing. The council counts it separately from the failure kinds above — a benched seat
+    /// shrinks the *live* majority denominator, while a timed-out seat is an answer that was
+    /// lost and still counts against it. Recovery is a real ballot round-trip (a probationary
+    /// dispatch on bench expiry), never a `--version` probe: a binary that prints its version is
+    /// alive, not ready.
+    Benched,
 }
 
 impl SeatFailureKind {
@@ -515,6 +528,7 @@ impl SeatFailureKind {
             SeatFailureKind::NonZeroExit => "non_zero_exit",
             SeatFailureKind::Unreported => "unreported",
             SeatFailureKind::Panicked => "panicked",
+            SeatFailureKind::Benched => "benched",
         }
     }
 }
@@ -644,6 +658,19 @@ impl DispatchOutcome {
     /// Whether the seat voted, without consuming the outcome.
     pub fn is_voted(&self) -> bool {
         matches!(self, DispatchOutcome::Voted(_))
+    }
+
+    /// Whether the seat cast a USABLE vote — parsed, with a non-empty recommendation.
+    ///
+    /// The one predicate health, ranking and telemetry share, so they cannot drift:
+    /// [`DispatchOutcome::is_voted`] says a `Vote` value exists, which tolerant parsing
+    /// guarantees for ANY exit-0 (a help screen, an auth banner), while this says the vote can
+    /// actually count — synthesis tallies exactly the votes this accepts. A seat must never be
+    /// penalized by seat health for a hollow return and simultaneously credited for it in the
+    /// ranking store; that inconsistency biases future seat selection toward CLIs that exit 0
+    /// without answering.
+    pub fn is_usable_vote(&self) -> bool {
+        matches!(self, DispatchOutcome::Voted(v) if !v.recommendation.trim().is_empty())
     }
 }
 

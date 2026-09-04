@@ -21,7 +21,7 @@ use std::thread::JoinHandle;
 
 use crate::store::{Ledger, SeatFailureRecord, TaskRecord};
 use crate::synthesis;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::types::{
     AgenticCli, BallotContext, CouncilTask, DispatchOutcome, Dispatcher, EventSink, RankSignal,
@@ -72,6 +72,24 @@ pub const APPROVAL_THRESHOLD: f32 = 0.75;
 /// Below-threshold after the final ballot degrades to plurality, exactly as before.
 pub const MAX_BALLOTS: u32 = 3;
 
+/// Env var overriding the council's wall-clock deadline, in whole seconds.
+pub const ENV_DEADLINE_SECS: &str = "WICKED_COUNCIL_DEADLINE_SECS";
+
+/// Default wall-clock deadline across ALL of a council's ballots.
+///
+/// `MAX_BALLOTS` caps deliberation in rounds; this caps it in time, because a round has no
+/// fixed cost — under permit contention (several units convening councils at once) a single
+/// ballot can stretch to minutes of queueing, and three such ballots were measured holding a
+/// unit's first REAL dispatch to a p50 of 473 s. The deadline is checked between ballots, never
+/// mid-ballot: the ballot that is out collects its votes in full (the seat threads have no
+/// cancel, and half a tally is worth less than a whole one), and then the loop stops instead of
+/// starting the next round. The degrade is exactly the `MAX_BALLOTS` degrade: the final
+/// ballot's plurality stands.
+///
+/// 180 s fits three worst-case ballots of the default 40 s budget with queueing slack; the env
+/// override serves rosters and hosts that deliberate slower.
+const DEFAULT_DEADLINE: Duration = Duration::from_secs(180);
+
 /// The detached worker. Holds the shared ledger plus the injected seams (dispatcher, rank
 /// store, event sink) so the same engine wiring serves both the real CLI and the
 /// deterministic E2E test (which injects fakes).
@@ -84,6 +102,8 @@ pub struct Worker {
     roster: Arc<Vec<AgenticCli>>,
     /// The work-kind this council counts toward in ranking (criteria-derived).
     work_kind: String,
+    /// Wall-clock budget across all ballots (see [`DEFAULT_DEADLINE`]).
+    deadline: Duration,
 }
 
 impl Worker {
@@ -103,7 +123,19 @@ impl Worker {
             events,
             roster: Arc::new(roster),
             work_kind: work_kind.into(),
+            deadline: crate::dispatch::secs_or(
+                std::env::var(ENV_DEADLINE_SECS).ok(),
+                DEFAULT_DEADLINE,
+            ),
         }
+    }
+
+    /// Override the wall-clock deadline (the constructor reads [`ENV_DEADLINE_SECS`], falling
+    /// back to [`DEFAULT_DEADLINE`]). For callers that know their council's time budget —
+    /// and for tests, which cannot set the env var without racing every other test thread.
+    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// **Non-blocking.** Persist the task as `Queued`, emit `wicked.council.requested`,
@@ -146,6 +178,7 @@ impl Worker {
         let events = Arc::clone(&self.events);
         let roster = Arc::clone(&self.roster);
         let work_kind = self.work_kind.clone();
+        let deadline = self.deadline;
         let task_for_thread = task;
 
         let ledger_for_panic = ledger.clone();
@@ -164,6 +197,7 @@ impl Worker {
                     events.as_ref(),
                     &roster,
                     &work_kind,
+                    deadline,
                     &task_for_thread,
                 );
             }));
@@ -257,9 +291,14 @@ fn run_council(
     events: &dyn EventSink,
     roster: &[AgenticCli],
     work_kind: &str,
+    deadline: Duration,
     task: &CouncilTask,
 ) {
     ledger.update(&task.id, |rec| rec.state = TaskState::Running);
+    // The wall clock the deadline is measured against starts when the council starts, so it
+    // covers everything a round can cost — permit queueing included, which is the cost
+    // `MAX_BALLOTS` cannot see.
+    let convened_at = Instant::now();
 
     // No usable CLIs → fail honestly (quorum 0).
     if roster.is_empty() {
@@ -358,7 +397,12 @@ fn run_council(
             } = timed;
             let cli = &roster[i];
             let entry = signal_acc.entry(cli.key.clone()).or_insert((false, 0));
-            entry.0 = outcome.is_voted();
+            // USABLE, not merely voted: `RankSignal::success` is documented as "did the CLI
+            // produce a usable vote?", and tolerant parsing yields a Vote for any exit-0. A
+            // hollow return is already a failure to seat health; counting it as a ranking
+            // success would bias `RankStore::best_for` toward CLIs that exit 0 without
+            // answering — penalized on one axis, promoted on the other.
+            entry.0 = outcome.is_usable_vote();
             // Rank on run time only. Queue time measures how busy the council was, not how fast
             // this CLI is, and charging it to the seat would rank whichever seat happened to wait.
             entry.1 += ran_ms;
@@ -413,10 +457,39 @@ fn run_council(
         // Synthesize the verdict (layer c) for this ballot. The roster length is the QUORUM
         // denominator: every seat that did not vote is already accounted for in `failures`, and
         // without that count a one-of-three ballot is arithmetically identical to a one-seat
-        // council (FINDING-026 D).
-        let verdict = synthesis::synthesize(&task.id, &votes, roster.len() as u32);
+        // council (FINDING-026 D). Benched seats are passed separately as ABSTENTIONS: the
+        // dispatcher's health gate turned them away before anything spawned, so they could not
+        // have voted, and the consensus arithmetic measures the majority against the seats
+        // that could (with an absolute floor — see `synthesis::synthesize`).
+        let abstained = failures
+            .iter()
+            .filter(|f| f.failure.kind == SeatFailureKind::Benched)
+            .count() as u32;
+        let verdict = synthesis::synthesize(&task.id, &votes, roster.len() as u32, abstained);
 
-        if verdict.agreement_ratio >= APPROVAL_THRESHOLD || ballot >= MAX_BALLOTS {
+        // The council stops deliberating when the winner clears the approval bar over the
+        // LIVE council — seated minus the benched abstentions — or when a budget is spent
+        // (rounds or wall clock) and the plurality stands, the degrade both caps share.
+        //
+        // The bar itself never moves: it is APPROVAL_THRESHOLD, always. What the abstentions
+        // change is only the DENOMINATOR it is measured against — a benched seat could not
+        // have voted, so it does not hold the bar hostage, while a seat whose answer was
+        // merely lost this round (timed out, crashed) still counts against it: it might have
+        // been the dissent that mattered, and if it keeps failing, the health gate benches it
+        // and it becomes an abstention. Anything weaker here — a strict-majority exit, say —
+        // would quietly lower the 75% bar for fully-live councils (3A/2B halting in one
+        // ballot at 60%), which is a different decision procedure, not a perf fix.
+        // `verdict.consensus` (strict majority of live, floored) remains a verdict/telemetry
+        // fact and deliberately NOT an exit.
+        //
+        // The deadline is only ever consulted BETWEEN ballots: the ballot that is out
+        // finishes and its votes all count — there is no mid-ballot cancel, by design (the
+        // seat threads in the scope above cannot be safely torn down mid-run).
+        let live_agreement = synthesis::live_agreement(&votes, roster.len() as u32, abstained);
+        if live_agreement >= APPROVAL_THRESHOLD
+            || ballot >= MAX_BALLOTS
+            || convened_at.elapsed() >= deadline
+        {
             break (votes, verdict);
         }
 
@@ -427,7 +500,12 @@ fn run_council(
             &serde_json::json!({
                 "task_id": task.id,
                 "round": ballot,
-                "agreement_ratio": verdict.agreement_ratio,
+                // The ratio the gate actually judged (winner / live seats), not the
+                // cast-only `verdict.agreement_ratio` — this event exists to explain why a
+                // runoff is happening, and emitting a ratio that can sit ABOVE the threshold
+                // beside it (a lost answer shrinks the cast, never the live count) would
+                // read as a runoff over nothing.
+                "agreement_ratio": live_agreement,
                 "votes": votes.len(),
                 "threshold": APPROVAL_THRESHOLD,
             }),
@@ -649,6 +727,11 @@ mod tests {
             keys.iter().map(|k| cli(k)).collect(),
             "general",
         )
+        // Hermetic: `Worker::new` reads WICKED_COUNCIL_DEADLINE_SECS, and these tests assert
+        // BALLOT-count behavior — a tight deadline exported in a developer's or CI's
+        // environment must not be able to end a deliberation early and flip an assertion.
+        // Tests about the deadline itself override this again with their own value.
+        .with_deadline(Duration::from_secs(600))
     }
 
     fn task() -> CouncilTask {
@@ -875,7 +958,9 @@ mod tests {
             Arc::new(NoopEventSink),
             ["a", "b", "c"].iter().map(|k| cli(k)).collect(),
             "general",
-        );
+        )
+        // Hermetic against an exported WICKED_COUNCIL_DEADLINE_SECS, like `worker_with_parts`.
+        .with_deadline(Duration::from_secs(600));
         let id = worker.queue_blocking(task());
         worker.poll(&id).expect("the council must still resolve");
 
@@ -889,6 +974,56 @@ mod tests {
             *latency_ms >= WORK.as_millis() as u64,
             "a seat that worked for {WORK:?} before panicking must not be ranked as instant, \
              got {latency_ms}ms"
+        );
+    }
+
+    /// One seat "answers" with a hollow exit-0 vote (tolerant parsing: empty recommendation);
+    /// the rest cast real ballots.
+    struct HollowSeatDispatcher {
+        victim: String,
+    }
+    impl Dispatcher for HollowSeatDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            if cli.key == self.victim {
+                Some(vote(&cli.key, ""))
+            } else {
+                Some(vote(&cli.key, "2 — best"))
+            }
+        }
+    }
+
+    #[test]
+    fn a_hollow_vote_is_not_ranked_as_a_success() {
+        // `RankSignal::success` is documented as "did the CLI produce a USABLE vote?", and the
+        // dispatcher's health gate already counts a hollow exit-0 as a failure. Ranking it as
+        // a success would split the two: the same return penalized on one axis and promoted on
+        // the other, biasing `best_for` toward CLIs that exit 0 without answering.
+        let rank = Arc::new(RecordingRank::default());
+        let worker = worker_with_parts(
+            Arc::new(HollowSeatDispatcher {
+                victim: "b".to_string(),
+            }),
+            rank.clone(),
+            Arc::new(NoopEventSink),
+            &["a", "b", "c"],
+        );
+        let id = worker.queue_blocking(task());
+        assert_eq!(worker.poll(&id).expect("status").state, TaskState::Voted);
+
+        let seen = rank.seen.lock().unwrap().clone();
+        let (_, success, _) = seen
+            .iter()
+            .find(|(k, _, _)| k == "b")
+            .expect("the hollow seat is still ranked");
+        assert!(
+            !success,
+            "an exit-0 with no usable ballot must not count as a ranking success: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .filter(|(k, _, _)| k != "b")
+                .all(|(_, success, _)| *success),
+            "the seats that actually answered still rank as successes: {seen:?}"
         );
     }
 
@@ -1133,6 +1268,341 @@ mod tests {
         assert!(
             seen.iter().all(|(_, agreed)| *agreed),
             "all four voted option 1: {seen:?}"
+        );
+    }
+
+    /// Some seats vote, some abstain the way the real dispatcher's health gate reports a
+    /// benched seat (a `Benched` failure, no subprocess behind it), and some FAIL the way a
+    /// live seat does (a timeout — an answer lost, not an abstention). Ballot 1 votes come
+    /// from `first_ballot`; any later ballot converges on option 1, so a council that
+    /// re-deliberates terminates and the test can read how many rounds it took.
+    struct BenchedSeatsDispatcher {
+        benched: Vec<&'static str>,
+        failed: Vec<&'static str>,
+        first_ballot: fn(&str) -> &'static str,
+        max_ballot: Mutex<u32>,
+    }
+    impl Dispatcher for BenchedSeatsDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot_detailed");
+        }
+        fn dispatch_ballot_detailed(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> DispatchOutcome {
+            {
+                let mut max = self.max_ballot.lock().unwrap();
+                *max = (*max).max(ctx.ballot);
+            }
+            if self.benched.contains(&cli.key.as_str()) {
+                return DispatchOutcome::Failed(SeatFailure::new(
+                    SeatFailureKind::Benched,
+                    "seat benched after consecutive failures",
+                ));
+            }
+            if self.failed.contains(&cli.key.as_str()) {
+                return DispatchOutcome::Failed(SeatFailure::new(
+                    SeatFailureKind::TimedOut,
+                    "exceeded the dispatch budget",
+                ));
+            }
+            let rec = if ctx.ballot == 1 {
+                (self.first_ballot)(&cli.key)
+            } else {
+                "1 — converged"
+            };
+            DispatchOutcome::Voted(vote(&cli.key, rec))
+        }
+    }
+
+    #[test]
+    fn a_benched_abstention_does_not_reopen_deliberation() {
+        // Six seats: e dissents, f is benched. The 4A/1B among the five LIVE seats must land
+        // the same winner in the same single ballot as the full-roster 5A/1B control — a
+        // benched seat abstained, it did not lose the council its quorum, and re-opening
+        // deliberation over it would re-ask the seats that already agreed and re-abstain the
+        // benched one, round after round (the measured shape: one dead seat forcing runoffs).
+        //
+        // The arithmetic this pins is the DENOMINATOR: 4 of 5 live = 80% clears the bar, while
+        // 4 of 6 seated = 67% does not — an exit measured against the seated count would send
+        // this council to a runoff and turn `max_ballot == 1` below red.
+        let dissent_ballot = |key: &str| -> &'static str {
+            if key == "e" {
+                "2 — other"
+            } else {
+                "1 — fits"
+            }
+        };
+        let abstaining = Arc::new(BenchedSeatsDispatcher {
+            benched: vec!["f"],
+            failed: vec![],
+            first_ballot: dissent_ballot,
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(abstaining.clone(), &["a", "b", "c", "d", "e", "f"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        let verdict = status.verdict.expect("verdict");
+
+        let full = Arc::new(BenchedSeatsDispatcher {
+            benched: vec![],
+            failed: vec![],
+            first_ballot: dissent_ballot,
+            max_ballot: Mutex::new(0),
+        });
+        let full_worker = worker_with(full.clone(), &["a", "b", "c", "d", "e", "f"]);
+        let full_id = full_worker.queue_blocking(task());
+        let full_verdict = full_worker
+            .poll(&full_id)
+            .expect("status")
+            .verdict
+            .expect("verdict");
+
+        assert_eq!(
+            *abstaining.max_ballot.lock().unwrap(),
+            1,
+            "one ballot — the abstention must not re-open deliberation"
+        );
+        assert_eq!(*full.max_ballot.lock().unwrap(), 1, "control: one ballot");
+        assert_eq!(
+            synthesis::rec_key(verdict.winning_recommendation.as_deref().expect("winner")),
+            synthesis::rec_key(
+                full_verdict
+                    .winning_recommendation
+                    .as_deref()
+                    .expect("winner")
+            ),
+            "the abstention must not change WHO wins"
+        );
+        assert!(
+            verdict.consensus,
+            "4 of the 5 live seats is a strict majority: {verdict:?}"
+        );
+        // The abstention is on the record as one, not silently missing.
+        assert_eq!(status.seat_failures.len(), 1);
+        assert_eq!(status.seat_failures[0].cli, "f");
+        assert_eq!(
+            status.seat_failures[0].failure.kind,
+            SeatFailureKind::Benched
+        );
+    }
+
+    #[test]
+    fn a_real_split_among_live_seats_still_redeliberates() {
+        // 2-2 among the live seats with two benched: a genuine disagreement, not a quorum
+        // artifact. Abstentions must not hand either side the bar — the council goes to a
+        // runoff exactly as a full-roster split would.
+        let dispatcher = Arc::new(BenchedSeatsDispatcher {
+            benched: vec!["e", "f"],
+            failed: vec![],
+            first_ballot: |key| match key {
+                "a" | "b" => "1 — fits",
+                _ => "2 — other",
+            },
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e", "f"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert!(
+            *dispatcher.max_ballot.lock().unwrap() >= 2,
+            "a genuine split among the live seats must still re-deliberate"
+        );
+    }
+
+    #[test]
+    fn a_lone_survivor_below_the_floor_degrades_in_one_ballot_without_consensus() {
+        // Five of six benched. The lone vote is a 100% agreement ratio among the cast, so
+        // deliberation does not re-open (there is no one new to ask) — but it is NOT a
+        // consensus: below the answering floor the council degrades honestly, and the
+        // plurality stands for routing.
+        let dispatcher = Arc::new(BenchedSeatsDispatcher {
+            benched: vec!["b", "c", "d", "e", "f"],
+            failed: vec![],
+            first_ballot: |_| "1 — fits",
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e", "f"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(
+            status.state,
+            TaskState::Voted,
+            "the plurality still resolves"
+        );
+        assert_eq!(
+            *dispatcher.max_ballot.lock().unwrap(),
+            1,
+            "a runoff would re-ask one seat and re-abstain five — nothing to gain"
+        );
+        let verdict = status.verdict.expect("verdict");
+        assert!(
+            !verdict.consensus,
+            "1 answering seat of 6 convened is below the floor: {verdict:?}"
+        );
+        assert!(
+            verdict.kind.contains("quorum lost"),
+            "the record must name what was lost: {:?}",
+            verdict.kind
+        );
+        assert!(
+            verdict
+                .winning_recommendation
+                .as_deref()
+                .expect("the plurality stands")
+                .starts_with('1'),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_fully_live_majority_below_the_bar_still_redeliberates() {
+        // Five seats, everyone answers, 3A/2B: a strict majority — and 15 points below the
+        // 75% approval bar. The bar is the decision procedure the voters are told about, and
+        // with no abstentions in play NOTHING here may move: this council deliberates again,
+        // exactly as it did before seat health existed. This is the mutation-killer for the
+        // loop-exit — any exit softer than the bar (a strict-majority-of-live test, say)
+        // halts this council in one ballot at 60% and turns the assertion red.
+        let dispatcher = Arc::new(BenchedSeatsDispatcher {
+            benched: vec![],
+            failed: vec![],
+            first_ballot: |key| match key {
+                "a" | "b" | "c" => "1 — fits",
+                _ => "2 — other",
+            },
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert!(
+            *dispatcher.max_ballot.lock().unwrap() >= 2,
+            "a fully-live 3A/2B is below the 75% bar and must re-deliberate"
+        );
+    }
+
+    #[test]
+    fn a_lost_answer_still_counts_against_the_bar() {
+        // Six seats: f is benched (abstains), e times out (an answer LOST), and the cast
+        // splits 3A/1B. Of the seats that answered the winner has exactly 75% — but the bar
+        // is measured against the LIVE council, and e is live: it was asked, it may have been
+        // the dissent that mattered, and 3 of 5 live is 60%. The council re-deliberates,
+        // giving e another chance to answer — and if e keeps failing, the health gate benches
+        // it and only THEN does it stop counting. An exit measured against the votes cast
+        // would close this council in one ballot and turn the assertion red.
+        let dispatcher = Arc::new(BenchedSeatsDispatcher {
+            benched: vec!["f"],
+            failed: vec!["e"],
+            first_ballot: |key| match key {
+                "a" | "b" | "c" => "1 — fits",
+                _ => "2 — other",
+            },
+            max_ballot: Mutex::new(0),
+        });
+        let worker = worker_with(dispatcher.clone(), &["a", "b", "c", "d", "e", "f"]);
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+        assert_eq!(status.state, TaskState::Voted);
+        assert!(
+            *dispatcher.max_ballot.lock().unwrap() >= 2,
+            "3 of 5 live seats is below the bar however many of the CAST agreed"
+        );
+    }
+
+    /// Splits 1-1 forever and burns real time per seat, so only a budget — rounds or wall
+    /// clock — can end it. Records the highest ballot dispatched.
+    struct SlowSplitDispatcher {
+        per_seat: Duration,
+        max_ballot: Mutex<u32>,
+    }
+    impl Dispatcher for SlowSplitDispatcher {
+        fn dispatch(&self, _cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            unreachable!("deliberation must flow through dispatch_ballot");
+        }
+        fn dispatch_ballot(
+            &self,
+            cli: &AgenticCli,
+            _task: &CouncilTask,
+            ctx: &BallotContext,
+        ) -> Option<Vote> {
+            {
+                let mut max = self.max_ballot.lock().unwrap();
+                *max = (*max).max(ctx.ballot);
+            }
+            std::thread::sleep(self.per_seat);
+            let rec = if cli.key == "a" {
+                "1 — mine"
+            } else {
+                "2 — mine"
+            };
+            Some(vote(&cli.key, rec))
+        }
+    }
+
+    #[test]
+    fn the_deadline_finishes_the_current_ballot_and_does_not_start_the_next() {
+        // Ballot 1 outlives the deadline WHILE it runs. Precedence, pinned: the ballot in
+        // flight completes and every vote in it counts (there is no mid-ballot cancel, by
+        // design), the next ballot never starts, and the verdict is ballot 1's plurality —
+        // the exact degrade MAX_BALLOTS produces, reached through time instead of rounds.
+        let dispatcher = Arc::new(SlowSplitDispatcher {
+            per_seat: Duration::from_millis(120),
+            max_ballot: Mutex::new(0),
+        });
+        let worker =
+            worker_with(dispatcher.clone(), &["a", "b"]).with_deadline(Duration::from_millis(50));
+        let id = worker.queue_blocking(task());
+        let status = worker.poll(&id).expect("status");
+
+        assert_eq!(
+            status.state,
+            TaskState::Voted,
+            "the deadline degrades to plurality, never to failure: {status:?}"
+        );
+        assert_eq!(
+            status.returned, 2,
+            "the ballot that was out finished — its votes all count"
+        );
+        assert_eq!(
+            *dispatcher.max_ballot.lock().unwrap(),
+            1,
+            "the next ballot never started"
+        );
+        let verdict = status.verdict.expect("verdict");
+        assert!(
+            !verdict.consensus,
+            "a 1-1 split did not become an agreement at the deadline: {verdict:?}"
+        );
+        assert!(
+            verdict
+                .winning_recommendation
+                .as_deref()
+                .expect("winner")
+                .starts_with('1'),
+            "ballot 1's plurality stands (tie-break low): {verdict:?}"
+        );
+
+        // The control: the identical split with a deadline too generous to ever fire
+        // deliberates to the round cap — proving the deadline is what stopped round 2 above,
+        // not the split resolving. Pinned explicitly (over the pin `worker_with` already
+        // applies) so this control is hermetic against the process environment on its face:
+        // only MAX_BALLOTS can end it.
+        let control = Arc::new(SlowSplitDispatcher {
+            per_seat: Duration::from_millis(1),
+            max_ballot: Mutex::new(0),
+        });
+        let control_worker =
+            worker_with(control.clone(), &["a", "b"]).with_deadline(Duration::from_secs(600));
+        control_worker.queue_blocking(task());
+        assert_eq!(
+            *control.max_ballot.lock().unwrap(),
+            MAX_BALLOTS,
+            "without the deadline the same split runs to the round cap"
         );
     }
 }
