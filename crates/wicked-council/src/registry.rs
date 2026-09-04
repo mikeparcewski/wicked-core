@@ -7,7 +7,10 @@
 //!
 //! The registry record is the de-drift source of truth — flags are encoded here, never
 //! re-derived per call. The built-in roster uses the CLIs that actually exist in this
-//! environment (**claude, agy, codex, copilot, opencode, pi**) so a real probe can detect them.
+//! environment (**claude, agy, codex, copilot, opencode, pi**) so a real probe can detect
+//! them. agy stays listed but council-disabled: it has no working headless/ACP path, so
+//! seating it only buys dispatch timeouts (liveness ≠ readiness — `agy --version` answering
+//! proves nothing about completing a ballot).
 
 use std::path::{Path, PathBuf};
 
@@ -77,8 +80,9 @@ impl From<TomlCli> for AgenticCli {
 }
 
 /// The built-in, hand-verified registry. These are the agentic CLIs available in this
-/// environment (**claude, agy, codex, copilot, opencode, pi**). The full roster is data, not logic; it grows by
-/// appending records here or via the user TOML.
+/// environment (**claude, agy, codex, copilot, opencode, pi**; agy listed but
+/// council-disabled — no working headless/ACP path). The full roster is data, not logic;
+/// it grows by appending records here or via the user TOML.
 pub fn builtin() -> Vec<AgenticCli> {
     vec![
         AgenticCli {
@@ -119,7 +123,10 @@ pub fn builtin() -> Vec<AgenticCli> {
             trust_flags: vec![],
             alt_binaries: vec![],
             confidence: Confidence::Verified,
-            enabled_for_council: true,
+            // Disabled 2026-09: agy never establishes an ACP session, so every seating
+            // costs a full dispatch-budget timeout and re-deliberation pressure.
+            // Re-enable once an agy bridge completes a real ballot round-trip.
+            enabled_for_council: false,
             // wicked-crew's own bridge (packages/agent-acp-bridges) — no ecosystem
             // adapter exists for Antigravity yet.
             acp: Some(AcpConfig {
@@ -298,6 +305,11 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                 // governed unit REFUSES to edit/test/network (crew#419). An explicit `[]` stays
                 // deliberately-untrusted.
                 let omitted_trust = tcli.trust_flags.is_none();
+                // Same omission-vs-specified distinction for `enabled_for_council`: the
+                // `From` default is `true`, so a metadata-only override of a DISABLED
+                // built-in (agy) would silently re-seat it. An omission inherits the
+                // built-in's value; re-enabling takes an explicit `enabled_for_council = true`.
+                let omitted_enabled = tcli.enabled_for_council.is_none();
                 let mut cli: AgenticCli = tcli.into();
                 if let Some(slot) = merged.iter_mut().find(|c| c.key == cli.key) {
                     // User record overrides a built-in with the same key.
@@ -309,6 +321,15 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                              {:?} (specify `trust_flags = []` to run it deliberately untrusted; \
                              crew#419)",
                             cli.key, cli.trust_flags
+                        );
+                    }
+                    if omitted_enabled && !slot.enabled_for_council {
+                        cli.enabled_for_council = false;
+                        eprintln!(
+                            "wicked-council: seat '{}' overrides a council-disabled built-in \
+                             but the override omits enabled_for_council — staying disabled \
+                             (set `enabled_for_council = true` to re-seat it deliberately)",
+                            cli.key
                         );
                     }
                     *slot = cli;
@@ -343,6 +364,13 @@ mod tests {
         assert!(keys.contains(&"claude"), "claude must be a built-in seat");
         assert!(keys.contains(&"agy"), "agy must be a built-in seat");
         assert!(keys.contains(&"pi"), "pi must be a built-in seat");
+        // agy stays listed (roster completeness) but council-disabled: it has no working
+        // headless/ACP path, so seating it only buys dispatch timeouts.
+        let agy = clis.iter().find(|c| c.key == "agy").unwrap();
+        assert!(
+            !agy.enabled_for_council,
+            "agy must stay council-disabled until its bridge completes a real ballot"
+        );
         // Built-ins ship Verified confidence.
         assert!(clis.iter().all(|c| c.confidence == Confidence::Verified));
     }
@@ -386,6 +414,55 @@ enabled_for_council = false
         let claude = merged.iter().find(|c| c.key == "claude").unwrap();
         assert_eq!(claude.display_name, "Claude (overridden)");
         assert!(!claude.enabled_for_council);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metadata_override_of_a_disabled_builtin_stays_disabled() {
+        // A user TOML that tweaks agy metadata but OMITS enabled_for_council must not
+        // silently re-seat it (the From default is `true`); re-enabling is explicit.
+        let dir = std::env::temp_dir().join(format!("wc-registry-agy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("clis.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[cli]]
+key = "agy"
+display_name = "Antigravity (renamed)"
+binary = "agy"
+headless_invocation = "agy -p \"{PROMPT}\""
+"#,
+        )
+        .unwrap();
+        let merged = load(Some(&path)).expect("load must succeed");
+        let agy = merged.iter().find(|c| c.key == "agy").unwrap();
+        assert_eq!(agy.display_name, "Antigravity (renamed)");
+        assert!(
+            !agy.enabled_for_council,
+            "an omitted enabled_for_council must inherit the built-in's disabled state"
+        );
+
+        // An EXPLICIT re-enable still wins.
+        std::fs::write(
+            &path,
+            r#"
+[[cli]]
+key = "agy"
+display_name = "Antigravity"
+binary = "agy"
+headless_invocation = "agy -p \"{PROMPT}\""
+enabled_for_council = true
+"#,
+        )
+        .unwrap();
+        let merged = load(Some(&path)).expect("load must succeed");
+        let agy = merged.iter().find(|c| c.key == "agy").unwrap();
+        assert!(
+            agy.enabled_for_council,
+            "an explicit true must re-seat the CLI"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
