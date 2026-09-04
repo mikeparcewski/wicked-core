@@ -15,6 +15,11 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.12** — npm release carrying #361 (issue #358): `ReassignUnit` now kills an
+  in-flight WRAPPED-fallback worker via an identity-keyed cancel registry (`run_id`, epoch,
+  `launch_seq`) with a reassign tombstone covering the dispatch-to-registration race — the
+  superseded zombie can no longer mutate the run worktree until the 2h ceiling. Reassign kills
+  report `Cancelled` (never `TimedOut`); operator cancel and the turn ceiling are unchanged.
 - **core-ts 0.7.11** — npm release carrying the perf-program engine changes since 0.7.10:
   the agy seat council-disabled by default (#354), the actor-scoped seat-health bench +
   abstention-aware quorum + one-wave dispatch (#355), `StepStatus::TimedOut` distinguishing
