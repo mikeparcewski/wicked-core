@@ -34,6 +34,13 @@ option listings), kept whole because they document the exact adapter configurati
 and, decisively, every `tool_call`/`tool_call_update` and every `session/request_permission`
 (there were none — that is the finding), plus the harness's summary.
 
+## Envelope schemas
+
+Two NDJSON envelope shapes coexist: `capture-*.ndjson` frames carry `direction`
+('client->agent' | 'agent->client' | 'harness-meta') while the `probe-*.ndjson` files use the
+shorter `dir` key — an artifact of the two harness variants that produced them. Parse per-file,
+not with one shared schema.
+
 ## Redaction note
 
 The raw captures were produced by actually spawning `codex-acp` (which spawns the real, locally
