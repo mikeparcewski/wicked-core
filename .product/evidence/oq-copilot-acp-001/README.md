@@ -8,13 +8,14 @@ gated behind a real, rejectable client permission request).
   environment, capture method.
 - `verdict.md` — the per-property analysis and the recommended admission decision. **This is a
   CLARIFY-phase deliverable: it records the evidence and a recommended verdict but does not modify
-  `crates/wicked-council/src/registry.rs`. That registry comment update is applied in this same
-  change (the copilot seat entry cites this verdict).**
+  `crates/wicked-council/src/registry.rs`. The clarify phase recorded evidence only; the run's later implementation phase
+  applied the comment-only registry update citing this verdict — both land in this PR.**
 - `capture-harness.mjs` — the reproducible capture harness for the four-step read/edit/bash/write
   turn (allow, reject, and `--allow-all-tools` scenarios). Re-run with:
   `node capture-harness.mjs copilot <empty-fixture-dir-seeded-with-seed.txt> <output.ndjson> <allow|reject> ["extra --flags"]`
-- `probe-outside-read.mjs` — probes whether a read of a path outside the session cwd escalates to a
-  permission request. Re-run with: `node probe-outside-read.mjs copilot <fixture-cwd>
+- `probe-outside-read.mjs` — probes reads outside the session cwd. The committed capture shows the
+  outside read gated by a permission request and failing ungranted, and the model's in-cwd retry
+  completing ungated (see verdict). Re-run with: `node probe-outside-read.mjs copilot <fixture-cwd>
   <path-outside-fixture-cwd> <output.ndjson>`
 - `probe-risky.mjs` / `probe-network.mjs` — single-command probes (`rm -rf`, `curl`) used to check
   whether a destructive or network action escalates to a permission request or is resolved

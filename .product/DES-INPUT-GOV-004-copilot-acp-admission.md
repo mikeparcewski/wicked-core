@@ -1,7 +1,7 @@
 # DES-INPUT-GOV-004 — Resolve OQ-COPILOT-ACP-001: copilot ACP input-governance admission
 
 **Issue:** wicked-core #369
-**Phase:** design (analysis + design + plan). **No production code in this deliverable.**
+**Phase:** design (analysis + design + plan). **No production code in this design deliverable** — the run's later implementation phase applies the accepted outcome as a comment-only registry.rs update (no behavior change; `acp_input_governance` stays `false`).
 **Predecessors:**
 - DES-INPUT-GOV-001 (recon, #360) — §OQ table defines OQ-COPILOT-ACP-001 and its proof properties
   (blocking request / canonical name+rawInput / reject honoured / disableable auto-approve; plus

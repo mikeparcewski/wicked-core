@@ -1,10 +1,11 @@
 # OQ-COPILOT-ACP-001 verdict
 
 **Recommended admission: NOT ADMITTED (for now) — but this is a materially different, much
-closer-to-passing result than `codex`/`pi`.** This is a **clarify-phase** deliverable: it records
-evidence and a recommendation only. `acp_input_governance` for `copilot` in
-`crates/wicked-council/src/registry.rs` (the copilot seat entry) is **not modified by this work** — that edit (if this
-recommendation is accepted) is applied in this same change — see the copilot seat entry in `crates/wicked-council/src/registry.rs`. See `manifest.md` for
+closer-to-passing result than `codex`/`pi`.** The clarify phase produced this
+evidence and recommendation; the run's later implementation phase then applied the accepted
+outcome — a comment-only update to the copilot seat entry in
+`crates/wicked-council/src/registry.rs` citing this verdict (`acp_input_governance` itself stays
+`false`). Both land in this PR. See `manifest.md` for
 the exact pinned artifact and the six `*.ndjson` capture files for the raw (redacted) frames this
 verdict is based on.
 
@@ -55,13 +56,14 @@ mutating/executing call observed.
 
 `capture-allow.ndjson` and `capture-reject.ndjson` both include a `read` tool call ("Viewing
 seed.txt") that goes straight from `pending` to `completed` with **zero** permission requests —
-consistent across both runs. `probe-outside-read.ndjson`, which asks Copilot to read a file at an
-absolute path outside the session's cwd, shows the opposite: a `session/request_permission` **does**
-arrive, `kind: "read"`, `title: "Access paths outside trusted directories"`, `rawInput: {path:
-"<the real absolute path>"}` — and, notably, the request is for the *harness's absolute-path
-rewrite* of the same read the model first attempted with the caller-given relative-looking path
-(the tool_call sequence shows two `read` tool_calls: the first `failed`, the second — reissued
-against the resolved outside path — is the one that was gated and, once allowed, `completed`).
+consistent across both runs. `probe-outside-read.ndjson`, which asks Copilot to read a file at a
+path outside the session's cwd, shows the opposite: for the genuinely-outside path
+(`/tmp/...`) a `session/request_permission` **does** arrive (`title: "Access paths outside
+trusted directories"`, `rawInput` carrying that exact outside path) and that gated `read`
+**failed** (the request was not granted). The model then retried against the same relative
+subpath resolved UNDER the worktree — an in-cwd read — which `completed` with **no** permission
+request. So the capture shows both findings at once: outside-cwd reads are gated (and an
+ungranted request prevents the read), while in-cwd reads are never gated.
 
 This matches Copilot's documented path-permission model (`copilot help permissions`): "By default,
 file access is restricted to paths within the current working directory and its subdirectories,

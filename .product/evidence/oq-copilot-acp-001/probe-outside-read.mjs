@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolve } from 'node:path'
 // OQ-COPILOT-ACP-001 probe: does a READ of a path OUTSIDE the session cwd escalate to a
 // blocking session/request_permission (path-scoped read gating), given the plain "read
 // seed.txt in cwd" case in capture-allow.ndjson never did?
@@ -8,7 +9,7 @@ import { writeFileSync, appendFileSync } from 'node:fs'
 
 const COPILOT_BIN = process.argv[2]
 const FIXTURE_CWD = process.argv[3]
-const OUTSIDE_PATH = process.argv[4]
+const OUTSIDE_PATH = resolve(process.argv[4]) // resolved to absolute so the prompt's claim holds regardless of caller input
 const CAPTURE_FILE = process.argv[5]
 
 writeFileSync(CAPTURE_FILE, '')
