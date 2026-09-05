@@ -2577,7 +2577,9 @@ mod tests {
                 reason: s(),
             },
             "sandboxUnenforced",
-            &["type", "session", "ord", "attempt", "cli", "level", "reason"],
+            &[
+                "type", "session", "ord", "attempt", "cli", "level", "reason",
+            ],
         );
         // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
         check(
