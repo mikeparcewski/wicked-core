@@ -844,6 +844,12 @@ struct AcpProcess {
     /// opencode Homebrew auto-update landed mid-session) — that instance is treated as
     /// disclosed-ungoverned regardless of what the registry says (DES-INPUT-GOV-006 §3.4).
     governance_verified: bool,
+    /// (DES-GOV-008 Boundary 1 / A1) `Some((level, reason))` when `os_sandbox` was requested but the
+    /// kernel WRITE-containment floor could NOT arm (no launcher on PATH, firejail-only, or a
+    /// canonicalize failure), so this session spawned uncontained. Computed ONCE at spawn — the
+    /// session is cached and reused across turns — and read by the caller to emit exactly one
+    /// `SandboxUnenforced` disclosure per spawn. `None` when the floor armed OR the flag was OFF.
+    sandbox_downgrade: Option<(String, String)>,
 }
 
 impl Drop for AcpProcess {
@@ -1416,12 +1422,20 @@ fn start_acp_process_with_write_roots(
         extra_write_roots,
         graph_write.as_deref(),
     );
-    let worker_sandbox = if config.os_sandbox {
-        Some(crate::validator::detect_worker_sandbox(
-            &worker_write_roots,
-        )?)
+    // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than failing the
+    // spawn. `detect_worker_sandbox` returns a best-effort (empty-wrapper) sandbox with a downgrade
+    // reason on the no-launcher hosts (all of Windows), firejail-only Linux, and a canonicalize
+    // failure. We wrap ONLY when the floor actually armed, and surface the gap on the `AcpProcess`
+    // so the caller emits exactly ONE `SandboxUnenforced` per spawn (the session is cached and
+    // reused across turns, so the disclosure belongs to the spawn, not each turn).
+    let (worker_sandbox, sandbox_downgrade) = if config.os_sandbox {
+        let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
+        match ws.downgrade_reason {
+            Some(reason) => (None, Some((ws.level.as_wire().to_string(), reason))),
+            None => (Some(ws), None),
+        }
     } else {
-        None
+        (None, None)
     };
     let worker_write_roots_env = std::env::join_paths(&worker_write_roots)
         .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
@@ -1771,6 +1785,7 @@ fn start_acp_process_with_write_roots(
         next_id,
         elicitation_advertised: form_enabled,
         governance_verified,
+        sandbox_downgrade,
     })
 }
 
@@ -4256,6 +4271,9 @@ impl AcpStepRunner {
                 ) {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
+                        // A1: captured before `proc` moves into the Arc so the once-per-spawn
+                        // `SandboxUnenforced` disclosure can be emitted in the `did_insert` arm.
+                        let sandbox_downgrade = proc.sandbox_downgrade.clone();
                         let arc = Arc::new(Mutex::new(proc));
                         let session_handles = {
                             let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -4293,6 +4311,22 @@ impl AcpStepRunner {
                                 cli_key: cli_key.clone(),
                                 acp_session_id,
                             });
+                            // A1: this seat requested the kernel WRITE-containment floor but it
+                            // could not arm, so the bridge spawned uncontained. Disclose it exactly
+                            // once per spawn (the ACP-path convention names the registry seat key as
+                            // `cli`, like `GovernanceUnenforced`) — the WRITE-containment sibling of
+                            // `GovernanceUnenforced`, never a silent gap. Suppressed when the floor
+                            // armed or `os_sandbox` was OFF (`sandbox_downgrade` is then `None`).
+                            if let Some((level, reason)) = &sandbox_downgrade {
+                                self.emit_event(CoreEvent::SandboxUnenforced {
+                                    session: run_id.clone(),
+                                    ord: input.unit.ord,
+                                    attempt: input.attempt,
+                                    cli: cli_key.clone(),
+                                    level: level.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
                         }
                         result
                     }
@@ -5243,7 +5277,9 @@ sleep 30
         let outside = base.join("outside");
         std::fs::create_dir_all(&cwd).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        if crate::validator::detect_worker_sandbox(&[cwd.clone()]).is_err() {
+        if crate::validator::detect_worker_sandbox(std::slice::from_ref(&cwd)).level
+            != crate::validator::SandboxLevel::Sandboxed
+        {
             let _ = std::fs::remove_dir_all(&base);
             return;
         }

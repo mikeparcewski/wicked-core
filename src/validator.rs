@@ -343,6 +343,19 @@ pub enum SandboxLevel {
     BestEffort,
 }
 
+impl SandboxLevel {
+    /// The lower-cased, hyphenated wire spelling carried on `CoreEvent::SandboxUnenforced.level`
+    /// (DES-GOV-008 Boundary 1 §2.1). Kept flat (a `&'static str`) rather than embedding the enum
+    /// so the event's wire shape stays scalar and matches how other events stringify small enums.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            SandboxLevel::Sandboxed => "sandboxed",
+            SandboxLevel::NetworkOnly => "network-only",
+            SandboxLevel::BestEffort => "best-effort",
+        }
+    }
+}
+
 /// Per-validator wall-clock bound. A validator check (`test`/`grep`/`find` …) is fast; a script that
 /// hangs or loops is KILLED at this bound and the run reports a fail-closed [`ValidatorOutcome::TimedOut`].
 pub(crate) const VALIDATOR_TIMEOUT: Duration = Duration::from_secs(120);
@@ -663,27 +676,78 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
     detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny)
 }
 
+/// A probed worker OS sandbox: the prependable wrapper argv (EMPTY ⇒ no wrap, the floor), the level
+/// ACTUALLY applied, and — when below `Sandboxed` — the human-readable reason for the gap that feeds
+/// `CoreEvent::SandboxUnenforced` (DES-GOV-008 Boundary 1 §2/A1). Boundary 1 is WRITE containment
+/// only; worker network stays OPEN by necessity, so this is not exfiltration/DLP protection nor a
+/// read jail.
+#[derive(Debug)]
+pub(crate) struct WorkerSandbox {
+    pub(crate) wrapper: Vec<String>,
+    pub(crate) level: SandboxLevel,
+    /// `Some` iff `level != Sandboxed` — the disclosure text (A1). `None` when the kernel floor armed.
+    pub(crate) downgrade_reason: Option<String>,
+}
+
 /// Build the OS wrapper for an opted-in CLI worker. Unlike validators, workers keep network open
 /// for model traffic. This is a WRITE-containment floor only, not exfiltration protection.
 ///
-/// A missing launcher or an uncanonicalizable primary worktree is an error rather than a silent
-/// best-effort launch: the caller requested kernel containment and must disclose/fail closed.
-pub(crate) fn detect_worker_sandbox(
-    write_roots: &[std::path::PathBuf],
-) -> anyhow::Result<SandboxLauncher> {
+/// A1 (DES-GOV-008 Boundary 1 §2): the DEGRADED path DISCLOSES AND CONTINUES rather than failing
+/// the unit. When the kernel floor cannot arm — no launcher on PATH (all of Windows; a host without
+/// `sandbox-exec`/`bwrap`), a `firejail`-only host (network-only buys a WORKER nothing, and worker
+/// network is deliberately open anyway), or the primary worktree root failing to canonicalize — this
+/// returns a best-effort `WorkerSandbox` with an EMPTY `wrapper` and a `downgrade_reason`. The spawn
+/// path then emits a `SandboxUnenforced` disclosure and proceeds unsandboxed (ungrounded but
+/// running), mirroring the `GovernanceUnenforced` "loud, never silent" precedent. It NEVER claims
+/// `Sandboxed` when the wrapper did not actually arm.
+pub(crate) fn detect_worker_sandbox(write_roots: &[std::path::PathBuf]) -> WorkerSandbox {
     let roots: Vec<&Path> = write_roots
         .iter()
         .map(std::path::PathBuf::as_path)
         .collect();
     let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Allow);
-    if launcher.level != SandboxLevel::Sandboxed {
-        let (level, tool) = sandbox_availability();
-        anyhow::bail!(
-            "OS write sandbox requested but could not arm (level={level:?}, tool={tool:?}); \
-             refusing unsandboxed worker launch"
-        );
+    if launcher.level == SandboxLevel::Sandboxed {
+        return WorkerSandbox {
+            wrapper: launcher.wrapper,
+            level: SandboxLevel::Sandboxed,
+            downgrade_reason: None,
+        };
     }
-    Ok(launcher)
+    // Below `Sandboxed`: name the specific gap so an operator can see WHY the floor is absent. The
+    // level ON THE WIRE is what was actually applied (never `Sandboxed` here): `NetworkOnly` for a
+    // firejail-only host (disclosed as write-uncontained), else `BestEffort` — including the case
+    // where a supported tool IS on PATH but the profile could not be built (primary root failed to
+    // canonicalize), so nothing was applied.
+    let (avail_level, tool) = sandbox_availability();
+    let (level, reason) = match (avail_level, tool) {
+        (SandboxLevel::NetworkOnly, _) => (
+            SandboxLevel::NetworkOnly,
+            "firejail is network-only (no write containment for a worker)".to_string(),
+        ),
+        (SandboxLevel::Sandboxed, tool) => {
+            let primary = write_roots
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string());
+            (
+                SandboxLevel::BestEffort,
+                format!(
+                    "OS-sandbox tool present ({}) but worktree root {primary} failed to \
+                     canonicalize; arming skipped",
+                    tool.unwrap_or("os-sandbox")
+                ),
+            )
+        }
+        _ => (
+            SandboxLevel::BestEffort,
+            "no OS-sandbox tool on PATH".to_string(),
+        ),
+    };
+    WorkerSandbox {
+        wrapper: Vec::new(),
+        level,
+        downgrade_reason: Some(reason),
+    }
 }
 
 /// Apply the cross-platform env FLOOR: clear the child environment, then re-add only the non-secret
@@ -3185,16 +3249,29 @@ mod worker_sandbox_tests {
     }
 
     #[test]
-    fn worker_sandbox_refuses_to_claim_containment_when_it_cannot_arm() {
+    fn worker_sandbox_discloses_and_degrades_when_it_cannot_arm() {
         let missing = std::env::temp_dir().join(format!(
             "wicked-missing-worker-root-{}-{}",
             std::process::id(),
             std::thread::current().name().unwrap_or("test")
         ));
-        let err = detect_worker_sandbox(&[missing]).expect_err(
-            "a missing primary root cannot produce a kernel write jail; fail closed rather than run unsandboxed",
+        // A1: a missing primary root cannot produce a kernel write jail, so the worker sandbox
+        // DISCLOSES AND CONTINUES (empty wrapper, a downgrade reason, never a `Sandboxed` claim)
+        // rather than failing the unit — the caller emits `SandboxUnenforced` and runs on.
+        let sandbox = detect_worker_sandbox(&[missing]);
+        assert_ne!(
+            sandbox.level,
+            SandboxLevel::Sandboxed,
+            "a root that cannot canonicalize must never be reported as kernel-contained"
         );
-        assert!(err.to_string().contains("could not arm"));
+        assert!(
+            sandbox.wrapper.is_empty(),
+            "a degraded worker sandbox wraps nothing — the spawn proceeds unsandboxed"
+        );
+        assert!(
+            sandbox.downgrade_reason.is_some(),
+            "the degraded path must carry a disclosure reason for SandboxUnenforced"
+        );
     }
 
     /// This is an end-to-end kernel proof, not merely an argv assertion. It skips on hosts that
@@ -3210,13 +3287,13 @@ mod worker_sandbox_tests {
         for dir in [&worktree, &estate, &outside] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let launcher = match detect_worker_sandbox(&[worktree.clone(), estate.clone()]) {
-            Ok(launcher) => launcher,
-            Err(_) => {
-                let _ = std::fs::remove_dir_all(&base);
-                return;
-            }
-        };
+        let launcher = detect_worker_sandbox(&[worktree.clone(), estate.clone()]);
+        if launcher.level != SandboxLevel::Sandboxed {
+            // No usable launcher on this host — the kernel proof cannot run; the disclose-and-degrade
+            // path is covered by `worker_sandbox_discloses_and_degrades_when_it_cannot_arm`.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
         let outside_file = outside.join("pwned");
         let worktree_file = worktree.join("ok");
         let estate_file = estate.join("wal");
