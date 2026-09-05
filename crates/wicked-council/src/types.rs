@@ -92,6 +92,30 @@ pub struct AcpConfig {
     /// an adapter to the core ACP gate; it does not claim a sandbox.
     #[serde(default)]
     pub acp_input_governance: bool,
+    /// An environment variable `(name, value)` the engine sets on this seat's ACP child process,
+    /// UNCONDITIONALLY, at every spawn — never gated on whether the particular unit being run is
+    /// itself governed. A cached, already-spawned session cannot retroactively gain an env var
+    /// once a later turn turns out to need it, so conditioning this on a per-turn governance
+    /// decision would leave a governed turn running against a process spawned before governance
+    /// was known to apply (DES-INPUT-GOV-006 §3.3). Exists so an adapter whose default ruleset
+    /// resolves every core intent to "allow" (opencode: OQ-OPENCODE-ACP-001) can be forced to
+    /// route every intent through `session/request_permission` instead, where wicked-core's own
+    /// `AcpGate` answers for real. The injected value is a FORCING FUNCTION, not a policy
+    /// statement: it does not need to match wicked-core's own allow/deny verdict, only to keep
+    /// the adapter from resolving any core intent to "allow" before ever asking
+    /// (DES-INPUT-GOV-006 §1.1). `None` for a seat needing no such injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_governance_env: Option<(String, String)>,
+    /// The exact `--version` output this seat's `acp_input_governance` admission was proven
+    /// against (e.g. opencode: oq-opencode-acp-002). `None` for a seat admitted without a version
+    /// dependency. When set, the engine re-probes the ACTUAL binary about to be spawned
+    /// immediately before spawn and refuses to treat the resulting session as governed —
+    /// falling back to the same disclosed-ungoverned path as `acp_input_governance: false` —
+    /// if the live output does not match byte-for-byte (trimmed). Guards against an unpinned,
+    /// auto-updating distribution (opencode's Homebrew tap has no lockfile) silently reopening a
+    /// gap this admission closed against one specific build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_version: Option<String>,
 }
 
 /// How the scaffold prompt is delivered to the CLI process.

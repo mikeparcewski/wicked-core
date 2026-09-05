@@ -78,6 +78,12 @@ impl From<TomlAcpConfig> for AcpConfig {
             transport: t.transport,
             auth_method: t.auth_method,
             acp_input_governance: t.acp_input_governance.unwrap_or(false),
+            // Neither is user-settable: both are an evidence-gated engine decision proven
+            // against one specific pinned binary (DES-INPUT-GOV-006), not something an operator
+            // TOML override can inherit. An override of a seat that has both built in loses them,
+            // same as it already loses `acp_input_governance: true` unless restated.
+            acp_governance_env: None,
+            verified_version: None,
         }
     }
 }
@@ -132,6 +138,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 auth_method: None,
                 // claude-agent-acp's pinned adapter proof passed DES-INPUT-GOV-001 §3.
                 acp_input_governance: true,
+                acp_governance_env: None,
+                verified_version: None,
             }),
             capabilities: Some(
                 "broad reasoning, architecture design, TypeScript/React/web, \
@@ -166,6 +174,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 auth_method: None,
                 // Unadmitted pending its ACP permission-round-trip proof.
                 acp_input_governance: false,
+                acp_governance_env: None,
+                verified_version: None,
             }),
             capabilities: Some(
                 "fast iteration, multi-language code generation, open-source models, \
@@ -228,6 +238,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // basis for admission. Stays disclosed-ungoverned
                 // until a pinned adapter version proves per-call gating for every core intent.
                 acp_input_governance: false,
+                acp_governance_env: None,
+                verified_version: None,
             }),
             capabilities: Some(
                 "algorithm implementation, Python/JavaScript code generation, \
@@ -263,6 +275,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // never for tool execution. Stays disclosed-ungoverned until a fixed
                 // adapter version proves otherwise.
                 acp_input_governance: false,
+                acp_governance_env: None,
+                verified_version: None,
             }),
             capabilities: Some(
                 "conversational reasoning, nuanced analysis, cross-language tasks, \
@@ -307,6 +321,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // Stays disclosed-ungoverned until either the read gap closes or scoped admission
                 // ships.
                 acp_input_governance: false,
+                acp_governance_env: None,
+                verified_version: None,
             }),
             capabilities: Some(
                 "GitHub context, pull request review, commit-level changes, \
@@ -333,19 +349,33 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec!["acp".into()],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
-                // OQ-OPENCODE-ACP-001 resolved NOT admitted (see .product/evidence/
-                // oq-opencode-acp-001/ and .product/DES-INPUT-GOV-005-opencode-acp-admission.md).
-                // Live captures against native `opencode acp` 1.17.18 (no separate adapter)
-                // show the registry's exact, unconfigured invocation never emits
-                // session/request_permission for any in-worktree core read/edit/bash/write
-                // intent: an allow-client and reject-client therefore behave identically, and a
-                // destructive rm -rf and network curl proceed unconditionally. The native
-                // permission machinery can be tightened by an opencode permission config, but
-                // that is not currently provisioned by wicked and its requests still expose only
-                // free-text titles rather than canonical tool names. Stays disclosed-ungoverned
-                // until wicked supplies and protects a tightened config and the identity gap is
-                // normalized or the upstream protocol carries a canonical name.
-                acp_input_governance: false,
+                // ADMITTED. OQ-OPENCODE-ACP-001 (see .product/evidence/oq-opencode-acp-001/ and
+                // .product/DES-INPUT-GOV-005-opencode-acp-admission.md) found the registry's
+                // *unconfigured* invocation never emits session/request_permission for any
+                // in-worktree core intent: opencode's default "build" agent ships a baked
+                // "*": "allow" ruleset, so Permission.ask() returns before the client is ever
+                // asked. OQ-OPENCODE-ACP-PROVISION-001 (DES-INPUT-GOV-006, oq-opencode-acp-002)
+                // closed that gap: `acp_governance_env` below forces every core intent through a
+                // real session/request_permission round-trip, verified live to (a) gate all four
+                // of read/edit/bash/write, (b) survive a target repo shipping its OWN permissive
+                // opencode.json (the env var loads strictly after project config in opencode's
+                // documented precedence order, so a colliding file cannot defeat it), and
+                // (c) genuinely block a destructive `rm -rf` on reject. Once asked, wicked-core's
+                // own AcpGate decides allow/deny — the injected value is a forcing function, not
+                // a policy (DES-INPUT-GOV-006 §1.1). Requests still carry only a free-text
+                // `toolCall.title`, never a canonical name; this admission accepts title-as-name
+                // as pretool_payload's identity basis (same gap codex/copilot's own verdicts
+                // recorded) rather than blocking on the separate toolCall.kind-normalization
+                // follow-up DES-INPUT-GOV-006 §4 files. `verified_version` below fails this
+                // seat's governance closed (not the spawn) if the actual resolved binary is not
+                // the exact build this was proven against — opencode's Homebrew tap auto-updates
+                // with no lockfile.
+                acp_input_governance: true,
+                acp_governance_env: Some((
+                    "OPENCODE_CONFIG_CONTENT".into(),
+                    r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask"}}"#.into(),
+                )),
+                verified_version: Some("1.17.18".into()),
             }),
             capabilities: Some(
                 "open-source models, local/private code, broad language support, \
@@ -493,15 +523,44 @@ mod tests {
     }
 
     #[test]
-    fn only_claudes_proven_acp_adapter_is_admitted_in_the_builtin_roster() {
+    fn only_proven_acp_adapters_are_admitted_in_the_builtin_roster() {
+        // claude: DES-INPUT-GOV-001 §3. opencode: DES-INPUT-GOV-006 / oq-opencode-acp-002 —
+        // admitted via the harness-provisioned `acp_governance_env` forcing function, not the
+        // registry's unconfigured invocation OQ-OPENCODE-ACP-001 found ungoverned.
         for cli in builtin() {
             let admitted = cli.acp.as_ref().is_some_and(|acp| acp.acp_input_governance);
             assert_eq!(
                 admitted,
-                cli.key == "claude",
-                "only the pinned Claude adapter has passed ACP input-governance proof"
+                cli.key == "claude" || cli.key == "opencode",
+                "only claude and opencode's pinned adapters have passed ACP input-governance proof"
             );
         }
+    }
+
+    #[test]
+    fn opencode_admission_carries_its_governance_env_and_version_pin() {
+        // Admission without the forcing-function env (or without the version pin that keeps an
+        // auto-updating build from silently invalidating the proof) would be a bare, unverified
+        // `acp_input_governance: true` — exactly the gap DES-INPUT-GOV-006 closes.
+        let opencode = builtin()
+            .into_iter()
+            .find(|cli| cli.key == "opencode")
+            .and_then(|cli| cli.acp)
+            .expect("opencode must ship an ACP config");
+        assert!(opencode.acp_input_governance);
+        let (env_key, env_val) = opencode
+            .acp_governance_env
+            .as_ref()
+            .expect("admitted opencode must carry its forcing-function env var");
+        assert_eq!(env_key, "OPENCODE_CONFIG_CONTENT");
+        assert!(env_val.contains("\"read\":\"ask\""));
+        assert!(env_val.contains("\"edit\":\"ask\""));
+        assert!(env_val.contains("\"bash\":\"ask\""));
+        assert_eq!(
+            opencode.verified_version.as_deref(),
+            Some("1.17.18"),
+            "admission is pinned to the exact build oq-opencode-acp-002 proved, not a range"
+        );
     }
 
     #[test]
