@@ -142,8 +142,10 @@ with:
                 // essentially every core read/edit/bash/write intent itself before that machinery is
                 // reached — confirmed across ordinary, sandbox-denied, and destructive turns, and
                 // even under ReadOnly. Secondary gap: its permission requests carry no canonical
-                // tool name, only a human-readable title (often the literal shell command),
-                // incompatible with acp_permission::pretool_payload. Stays disclosed-ungoverned
+                // tool name, only a human-readable title (often the literal shell command) —
+                // pretool_payload can still parse that (title becomes the name), but policy then
+                // matches on free shell text instead of a canonical tool identity, a degraded
+                // basis for admission. Stays disclosed-ungoverned
                 // until a pinned adapter version proves per-call gating for every core intent.
                 acp_input_governance: false,
             }),

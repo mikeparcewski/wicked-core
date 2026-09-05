@@ -28,9 +28,11 @@ tool call it makes is gated behind a real, rejectable client permission request)
 Every capture's `session/new` handshake triggers a large `available_commands_update` notification
 (codex-acp's full locally-installed skills/commands catalog dump, ~95-105KB per capture,
 unrelated to permission-request analysis). That one frame per file has been replaced with a short
-elision marker (`_elided: "ELIDED for evidence size — ... (<N> bytes original)"`) so each file stays
-reviewable; every other frame — every `tool_call`/`tool_call_update`, every `session/request_permission`
-(there were none — that is the finding), and the harness's summary — is verbatim.
+elision marker (`_elided: "ELIDED for evidence size — ... (<N> bytes original)"`). Everything else
+is verbatim — including the still-sizeable `initialize`/`session/new` results (full model and
+option listings), kept whole because they document the exact adapter configuration under test —
+and, decisively, every `tool_call`/`tool_call_update` and every `session/request_permission`
+(there were none — that is the finding), plus the harness's summary.
 
 ## Redaction note
 
