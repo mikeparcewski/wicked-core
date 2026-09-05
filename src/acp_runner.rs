@@ -1338,12 +1338,24 @@ const VERSION_PIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// auto-updates with no lockfile), not a range, so an unreadable or different version must
 /// downgrade this spawn's governance claim rather than assume it still holds.
 fn resolved_binary_version_matches(binary: &str, expected: &str) -> bool {
-    match wicked_council::probe::run_bounded(
-        binary,
-        &["--version".to_string()],
-        VERSION_PIN_PROBE_TIMEOUT,
-    ) {
-        Ok((true, combined)) => combined.lines().next().map(str::trim) == Some(expected),
+    // The version pin must probe the SAME binary the spawn path will actually launch. On Windows,
+    // npm shims install as `<name>.cmd` and a bare-name spawn returns NotFound (the exact case the
+    // spawn below retries with an explicit `.cmd`). Without the same retry here, `run_bounded`
+    // fails to resolve the shim → this returns false → governance is downgraded to
+    // disclosed-ungoverned even though the bridge spawns fine. That is fail-SAFE (it discloses
+    // rather than falsely claiming governance) but it defeats admission for every npm-shim ACP
+    // adapter on Windows (#377 review). Mirror the spawn's retry so the check matches the spawn.
+    let probe = |b: &str| {
+        wicked_council::probe::run_bounded(b, &["--version".to_string()], VERSION_PIN_PROBE_TIMEOUT)
+    };
+    let matches = |combined: &str| combined.lines().next().map(str::trim) == Some(expected);
+    match probe(binary) {
+        Ok((true, combined)) => matches(&combined),
+        Err(wicked_council::probe::ProbeError::Spawn)
+            if cfg!(windows) && std::path::Path::new(binary).extension().is_none() =>
+        {
+            matches!(probe(&format!("{binary}.cmd")), Ok((true, c)) if matches(&c))
+        }
         _ => false,
     }
 }

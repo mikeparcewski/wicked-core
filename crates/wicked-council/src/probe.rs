@@ -187,6 +187,9 @@ impl Prober for RealProber {
 }
 
 /// `pub` alongside `run_bounded` — both cross the crate boundary for the same reason.
+/// Derives `Debug`/`Clone`/`Copy`/`PartialEq`/`Eq` so cross-crate callers can `unwrap`/`expect`
+/// and match on the variant when diagnosing a failed bounded probe (#377 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeError {
     Timeout,
     Spawn,
