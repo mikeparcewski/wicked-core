@@ -204,13 +204,29 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec![],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // Official ACP-org adapter (@agentclientprotocol/codex-acp, Rust).
+            // Official ACP-org adapter (@agentclientprotocol/codex-acp) — a TS/Node bridge
+            // around the `codex` CLI, not a Rust binary.
             acp: Some(AcpConfig {
                 binary: "codex-acp".into(),
                 start_args: vec![],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
-                // OQ-CODEX-ACP-001 must prove permission coverage before admission.
+                // OQ-CODEX-ACP-001 resolved NOT admitted. Five live captures against the pinned
+                // codex-acp@1.9.0 (gitHead 67db0d3d) driving codex-cli 0.153.3
+                // (see .product/evidence/oq-codex-acp-001/) show the adapter OBSERVE an action's
+                // risk and proceed anyway — worse than absent plumbing: an explicit `rm -rf` turn
+                // logged codex's own internal reviewer ("Risk: medium, Authorization: high,
+                // Approved") and self-deleted the directory with zero session/request_permission
+                // round-trips to the client. The permission machinery (CodexApprovalHandler) exists
+                // and works, but the default AgentMode's approvalsReviewer:"auto_review" resolves
+                // essentially every core read/edit/bash/write intent itself before that machinery is
+                // reached — confirmed across ordinary, sandbox-denied, and destructive turns, and
+                // even under ReadOnly. Secondary gap: its permission requests carry no canonical
+                // tool name, only a human-readable title (often the literal shell command) —
+                // pretool_payload can still parse that (title becomes the name), but policy then
+                // matches on free shell text instead of a canonical tool identity, a degraded
+                // basis for admission. Stays disclosed-ungoverned
+                // until a pinned adapter version proves per-call gating for every core intent.
                 acp_input_governance: false,
             }),
             capabilities: Some(
