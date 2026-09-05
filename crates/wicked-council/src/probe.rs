@@ -186,7 +186,8 @@ impl Prober for RealProber {
     }
 }
 
-enum ProbeError {
+/// `pub` alongside `run_bounded` — both cross the crate boundary for the same reason.
+pub enum ProbeError {
     Timeout,
     Spawn,
 }
@@ -195,8 +196,10 @@ enum ProbeError {
 /// `timeout`. Returns `(exit_success, combined_output)`.
 ///
 /// The bound is enforced by a watcher loop that kills the child if it overruns;
-/// std-only (no tokio).
-fn run_bounded(
+/// std-only (no tokio). `pub` so `wicked-core`'s ACP runner can reuse this exact bounded
+/// probe for its own spawn-time version-pin check (`AcpConfig::verified_version`,
+/// DES-INPUT-GOV-006 §3.4) instead of re-implementing a watcher loop.
+pub fn run_bounded(
     program: &str,
     args: &[String],
     timeout: Duration,

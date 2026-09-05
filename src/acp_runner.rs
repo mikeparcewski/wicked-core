@@ -835,6 +835,15 @@ struct AcpProcess {
     /// `cli_key`, so the stock `claude` seat — key `claude`, binary `claude-agent-acp` —
     /// advertised the capability and then cancelled every `elicitation/create`).
     elicitation_advertised: bool,
+    /// Whether `AcpConfig::verified_version` (if any) matched the ACTUAL resolved binary this
+    /// process was spawned from, computed ONCE in `start_acp_process` before spawn — never
+    /// re-probed per turn, since this field describes a fact about the running process, not
+    /// about any later turn. `true` when the seat carries no version pin at all. Consulted at the
+    /// turn-time gate alongside the registry's static `acp_input_governance`: a seat can be
+    /// statically admitted yet have this `false` for one particular process instance (e.g. an
+    /// opencode Homebrew auto-update landed mid-session) — that instance is treated as
+    /// disclosed-ungoverned regardless of what the registry says (DES-INPUT-GOV-006 §3.4).
+    governance_verified: bool,
 }
 
 impl Drop for AcpProcess {
@@ -1310,6 +1319,35 @@ fn remove_entry_no_follow(p: &std::path::Path) -> anyhow::Result<()> {
 /// `code_graph.rs`), or `None` for an ungoverned / repo-less session. When present, the worker's `session/new` advertises the
 /// estate MCP server scoped to that store (FINDING-122) — the ACP-array twin of the wrapped path's
 /// `settings.json` injection. `None` ⇒ no estate server (never the daemon store; see FINDING-067).
+/// Bounded budget for the spawn-time version-pin probe (`AcpConfig::verified_version`,
+/// DES-INPUT-GOV-006 §3.4). Generous, not tuned: a `--version` probe is a trivial command and
+/// this only bounds an ALREADY-degraded path (a pathological binary hanging here downgrades this
+/// spawn to disclosed-ungoverned, per [`resolved_binary_version_matches`] — it does not block the
+/// spawn itself).
+const VERSION_PIN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the ACTUAL binary about to be spawned for this seat (`config.binary` — the same
+/// string `start_acp_process` passes to `Command::new`) reports exactly `expected` from
+/// `--version`, trimmed. Reuses wicked-council's own bounded subprocess runner rather than
+/// re-implementing a watcher loop.
+///
+/// `false` on ANY probe failure — spawn error, timeout, non-zero exit, or a mismatched value.
+/// A probe that cannot PROVE the match must not be treated as one (the same fail-closed posture
+/// `worker_claude_config_dir` already documents for FINDING-061): this seat's `acp_governance_env`
+/// forcing function was proven against one specific pinned build (opencode's Homebrew tap
+/// auto-updates with no lockfile), not a range, so an unreadable or different version must
+/// downgrade this spawn's governance claim rather than assume it still holds.
+fn resolved_binary_version_matches(binary: &str, expected: &str) -> bool {
+    match wicked_council::probe::run_bounded(
+        binary,
+        &["--version".to_string()],
+        VERSION_PIN_PROBE_TIMEOUT,
+    ) {
+        Ok((true, combined)) => combined.lines().next().map(str::trim) == Some(expected),
+        _ => false,
+    }
+}
+
 fn start_acp_process(
     config: &AcpConfig,
     cwd: &std::path::Path,
@@ -1337,6 +1375,16 @@ fn start_acp_process(
             ))
         }
     };
+    // Computed ONCE per spawn — not re-probed per turn — because the session this spawn starts
+    // is cached and reused across every turn of its lifetime (`probe_cached_session`); "the same
+    // resolved ACP binary that is spawned" means the binary this exact process came from, so the
+    // check belongs here, at the one point the spawn decision is made, not scattered across
+    // later per-turn governance lookups that cannot see which binary actually started this
+    // process.
+    let governance_verified = match &config.verified_version {
+        None => true,
+        Some(expected) => resolved_binary_version_matches(&config.binary, expected),
+    };
     let build_cmd = |binary: &str| {
         let mut cmd = std::process::Command::new(binary);
         // The engine's internal environment is stripped through the one chokepoint (FINDING-067): an
@@ -1351,6 +1399,17 @@ fn start_acp_process(
         // frequently exactly that variable.
         if let Some(dir) = &worker_config_dir {
             cmd.env(CLAUDE_CONFIG_DIR_ENV, dir);
+        }
+        // UNCONDITIONAL — never gated on whether THIS unit is governed (DES-INPUT-GOV-006 §3.3).
+        // A session is spawned once and cached/reused across turns (`probe_cached_session`); a
+        // process spawned before a later turn's governance decision would have no way to
+        // retroactively gain this env var, so conditioning it on a per-turn check could leave a
+        // governed turn running against an unprotected, already-spawned process. Injecting
+        // unconditionally costs an ungoverned session nothing beyond extra
+        // session/request_permission round-trips — the shared ACP client already answers those
+        // with an unconditional allow (`acp_ungoverned_event`'s own "allow_result, unchecked").
+        if let Some((k, v)) = &config.acp_governance_env {
+            cmd.env(k, v);
         }
         // In-boundary scratch for unit sessions (core#264) — tools the bridge spawns inherit
         // this, so `mktemp`/`$TMPDIR` writes land inside the unit instead of the system temp.
@@ -1661,6 +1720,7 @@ fn start_acp_process(
         session_id,
         next_id,
         elicitation_advertised: form_enabled,
+        governance_verified,
     })
 }
 
@@ -3953,10 +4013,19 @@ impl AcpStepRunner {
             .workdir
             .clone()
             .unwrap_or_else(|| crate::execute_wrapped::sandbox_for(input));
-        // Read once and reused below, both to decide the unadmitted-disclosure scope and (past
-        // the match) to decide the ACP-vs-fallback route for this same seat.
+        // Read ONCE and reused below — both to decide the unadmitted-disclosure scope and (past
+        // the match) to decide the ACP-vs-fallback route for this same seat. Admission is derived
+        // from THIS SAME resolved value (`acp_cfg_probe.is_some_and(...)`), not a second,
+        // independent `registry_record` lookup: once the admission predicate asserts a fact about
+        // a specific launched executable (DES-INPUT-GOV-006 §3.4/§3.5 — `verified_version` pins
+        // opencode to one build), a second reload of the disk-backed merged registry could in
+        // principle race a concurrent clis.toml edit and diverge from the config that actually
+        // gets spawned a few lines below. Binding both to one resolution closes that.
         let acp_cfg_probe = acp_config_for(&cli_key);
-        let gate_ctx = match (&input.governance, cli_acp_input_governed(&cli_key)) {
+        let acp_admitted = acp_cfg_probe
+            .as_ref()
+            .is_some_and(|c| c.acp_input_governance);
+        let gate_ctx = match (&input.governance, acp_admitted) {
             (Some(g), true) => {
                 let scope =
                     crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
@@ -4191,9 +4260,30 @@ impl AcpStepRunner {
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
         let prompt = unit_prompt(input);
 
-        let gate = gate_ctx
-            .as_ref()
-            .map(|(scope, phase, decisions_path, db, boundary)| {
+        // A statically-admitted seat (`gate_ctx.is_some()`) can still fail its per-process
+        // version pin (`AcpProcess::governance_verified`, computed once at spawn — DES-INPUT-
+        // GOV-006 §3.4): an auto-updating distribution (opencode's Homebrew tap has no lockfile)
+        // may have changed underneath the pinned proof between admission and this spawn. Downgrade
+        // to disclosed-ungoverned for THIS process rather than trust a registry claim this
+        // specific binary did not prove — and say so on the audit wire, the same way an
+        // unadmitted-but-configured seat already discloses (`acp_ungoverned_event`), so this
+        // never silently reads as "governed" when it is not.
+        if gate_ctx.is_some() && !proc.governance_verified {
+            self.emit_event(CoreEvent::GovernanceUnenforced {
+                session: run_id.clone(),
+                ord: input.unit.ord,
+                attempt: input.attempt,
+                cli: cli_key.clone(),
+                reason: format!(
+                    "unit is governed and '{cli_key}' is admitted to input governance, but the \
+                     resolved ACP binary did not match its pinned verified_version at spawn \
+                     time; this session is treated as unadmitted (answered by allow_result, \
+                     unchecked) until a fresh admission re-proves the currently-installed build"
+                ),
+            });
+        }
+        let gate = gate_ctx.as_ref().filter(|_| proc.governance_verified).map(
+            |(scope, phase, decisions_path, db, boundary)| {
                 crate::acp_permission::AcpGate {
                     scope,
                     phase,
@@ -4213,7 +4303,8 @@ impl AcpStepRunner {
                         pre_build_scope: boundary.pre_build_scope,
                     }),
                 }
-            });
+            },
+        );
         let turn = exec_turn_acp(
             &mut proc,
             &prompt,
@@ -4502,15 +4593,6 @@ fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
     // so its [cli.acp] table (or its absence) must decide the transport here exactly as
     // it does everywhere else.
     registry_record(cli_key).and_then(|c| c.acp)
-}
-
-/// Whether this seat's merged ACP configuration is admitted to input governance. The capability
-/// records a proof about this pinned adapter rather than guessing from the CLI name or binary.
-fn cli_acp_input_governed(cli_key: &str) -> bool {
-    registry_record(cli_key)
-        .and_then(|c| c.acp)
-        .map(|acp| acp.acp_input_governance)
-        .unwrap_or(false)
 }
 
 /// Make the wire-visible disclosure for a governed unit using an ACP adapter that has not passed
@@ -5059,6 +5141,316 @@ sleep 30
         script
     }
 
+    /// [`stub_bridge`], plus one line: before the handshake, dump the named env var's value to
+    /// `capture_file` (OUTSIDE the unit cwd, so this observation step itself cannot be mistaken
+    /// for the thing under test — DES-INPUT-GOV-006's `acp_governance_env` injection). Proves the
+    /// env var the engine sets actually reaches the child process, independent of whether
+    /// anything landed in the cwd.
+    #[cfg(unix)]
+    fn stub_bridge_capturing_env(
+        dir: &std::path::Path,
+        env_var: &str,
+        capture_file: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let script = dir.join("stub-acp-bridge-capture-env.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s' "${env_var}" > "{capture}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"stub"}}}}'
+sleep 30
+"#,
+                capture = capture_file.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// The task's own "prove with a test" requirement for the zero-file-write claim
+    /// (DES-INPUT-GOV-006 §1, §5 condition 1): `acp_governance_env` is an environment variable,
+    /// never a file drop, so a governed seat's unit cwd — the same directory a real repo's
+    /// TRACKED, committed files live in — must come out of a spawn byte-for-byte identical to how
+    /// it went in. Also proves the env var actually reaches the child (a test that only checked
+    /// "no new file" but never confirmed injection happened would pass just as well with the
+    /// injection code deleted).
+    #[test]
+    #[cfg(unix)]
+    fn governance_env_injection_reaches_the_child_and_writes_nothing_into_the_unit_cwd() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!(
+            "wicked-acp-governance-env-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // The "tracked fixture": a unit cwd standing in for a real repo worktree, seeded with a
+        // file that would be a repo-committed tracked file in the real thing.
+        let fixture_cwd = base.join("fixture");
+        std::fs::create_dir_all(&fixture_cwd).unwrap();
+        let tracked_file = fixture_cwd.join("tracked.txt");
+        std::fs::write(&tracked_file, "committed content\n").unwrap();
+        let before: std::collections::BTreeSet<String> = std::fs::read_dir(&fixture_cwd)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+
+        let capture_file = base.join("observed-env.txt");
+        let script = stub_bridge_capturing_env(&base, "WICKED_TEST_GOVERNANCE_ENV", &capture_file);
+
+        let config = AcpConfig {
+            binary: script.to_string_lossy().to_string(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: true,
+            acp_governance_env: Some((
+                "WICKED_TEST_GOVERNANCE_ENV".into(),
+                "governance-forcing-value".into(),
+            )),
+            verified_version: None,
+        };
+
+        let proc =
+            start_acp_process(&config, &fixture_cwd, None, None).expect("stub bridge must start");
+
+        // 1. The injection actually reached the child process.
+        let observed = std::fs::read_to_string(&capture_file).unwrap_or_default();
+        assert_eq!(
+            observed, "governance-forcing-value",
+            "the child must observe the governance-env value the engine set, not an empty/\
+             inherited one"
+        );
+
+        // 2. The tracked fixture directory is UNCHANGED: same file set, same content — no
+        // opencode.json or any other file was ever dropped into it.
+        let after: std::collections::BTreeSet<String> = std::fs::read_dir(&fixture_cwd)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            before, after,
+            "acp_governance_env must never add or remove a file in the unit's tracked cwd"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked_file).unwrap(),
+            "committed content\n",
+            "a pre-existing tracked file must be byte-for-byte unchanged"
+        );
+
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The collision/precedence proof AND the regression guard for the crew#434 tracked-file-leak
+    /// class, in one test: a git-tracked, permissive `opencode.json` — a target repo actively
+    /// shipping its own config, exactly like oq-opencode-acp-002's collision fixtures — run through
+    /// the REAL `start_acp_process` spawn path with `acp_governance_env` set, then asserted clean
+    /// by `git diff --exit-code` and `git status --porcelain`, not merely a directory listing.
+    /// `acp_governance_env` is an environment variable, never a file drop, so this must pass
+    /// without any restore-before-deliver step — that fallback clause the task named never
+    /// triggers because there is nothing to restore.
+    #[test]
+    #[cfg(unix)]
+    fn provisioned_governance_env_leaves_a_tracked_permissive_config_git_clean() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!(
+            "wicked-acp-governance-env-git-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let fixture_cwd = base.join("fixture");
+        std::fs::create_dir_all(&fixture_cwd).unwrap();
+        let run_git = |args: &[&str]| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.hardened();
+            let out = cmd
+                .args(args)
+                .current_dir(&fixture_cwd)
+                .output()
+                .expect("git must be on PATH for this test");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out
+        };
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "wicked-test@example.invalid"]);
+        run_git(&["config", "user.name", "wicked-test"]);
+        // The tracked, permissive config a target repo might ship — the SAME collision shape
+        // oq-opencode-acp-002's capture-cc-collision-*.ndjson proves the env var wins against.
+        std::fs::write(
+            fixture_cwd.join("opencode.json"),
+            r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"allow","edit":"allow","bash":"allow"}}"#,
+        )
+        .unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "seed with permissive tracked config"]);
+
+        let capture_file = base.join("observed-env.txt");
+        let script = stub_bridge_capturing_env(&base, "WICKED_TEST_GOVERNANCE_ENV", &capture_file);
+        let config = AcpConfig {
+            binary: script.to_string_lossy().to_string(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: true,
+            acp_governance_env: Some((
+                "WICKED_TEST_GOVERNANCE_ENV".into(),
+                "governance-forcing-value".into(),
+            )),
+            verified_version: None,
+        };
+
+        let proc =
+            start_acp_process(&config, &fixture_cwd, None, None).expect("stub bridge must start");
+        assert_eq!(
+            std::fs::read_to_string(&capture_file).unwrap_or_default(),
+            "governance-forcing-value",
+            "the injection must reach the child even with a tracked opencode.json present"
+        );
+        drop(proc);
+
+        // The proof this test adds beyond the plain-directory-listing check: `git` itself, not a
+        // hand-rolled comparison, confirms the tracked file is unmodified and the tree carries no
+        // untracked additions.
+        let diff = run_git(&["diff", "--exit-code"]);
+        assert!(diff.status.success());
+        let status = run_git(&["status", "--porcelain"]);
+        assert!(
+            status.stdout.is_empty(),
+            "git status must be clean after a governed spawn: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A stub bridge that answers `--version` distinctly from the ACP handshake (branching on
+    /// `$1`), so a single script doubles as both the spawned ACP binary and the thing the
+    /// spawn-time version-pin probe (`resolved_binary_version_matches`) runs `--version` against —
+    /// exactly how `AcpConfig::verified_version` checks the SAME resolved binary that gets spawned.
+    #[cfg(unix)]
+    fn stub_bridge_with_version(dir: &std::path::Path, version: &str) -> std::path::PathBuf {
+        let script = dir.join("stub-acp-bridge-versioned.sh");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo '{version}'
+  exit 0
+fi
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"stub"}}}}'
+sleep 30
+"#
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolved_binary_version_matches_the_exact_pinned_string_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-version-pin-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = stub_bridge_with_version(&dir, "1.17.18");
+        let bin = script.to_string_lossy().to_string();
+
+        assert!(resolved_binary_version_matches(&bin, "1.17.18"));
+        assert!(
+            !resolved_binary_version_matches(&bin, "1.18.21"),
+            "a different reported version must not match a stale pin"
+        );
+        assert!(
+            !resolved_binary_version_matches("wicked-no-such-binary-xyzzy", "1.17.18"),
+            "a probe that cannot even spawn must not be treated as a match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end version-pin downgrade: a seat whose `verified_version` does NOT match the
+    /// actual resolved binary must have `AcpProcess::governance_verified == false` even though the
+    /// spawn itself succeeds — the unit still runs, only the governance CLAIM is downgraded
+    /// (DES-INPUT-GOV-006 §3.4). A matching pin, and no pin at all, must both leave it `true`.
+    #[test]
+    #[cfg(unix)]
+    fn version_pin_mismatch_downgrades_governance_verified_without_failing_the_spawn() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-version-pin-e2e-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = stub_bridge_with_version(&dir, "1.17.18");
+        let bin = script.to_string_lossy().to_string();
+
+        let base_config = AcpConfig {
+            binary: bin,
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: true,
+            acp_governance_env: None,
+            verified_version: None,
+        };
+
+        // No pin at all: always verified.
+        let proc = start_acp_process(&base_config, &dir, None, None).unwrap();
+        assert!(proc.governance_verified);
+        drop(proc);
+
+        // Matching pin: verified.
+        let matching = AcpConfig {
+            verified_version: Some("1.17.18".into()),
+            ..base_config.clone()
+        };
+        let proc = start_acp_process(&matching, &dir, None, None).unwrap();
+        assert!(proc.governance_verified);
+        drop(proc);
+
+        // Mismatched pin: the spawn still succeeds, but governance is downgraded for this process.
+        let mismatched = AcpConfig {
+            verified_version: Some("1.18.21".into()),
+            ..base_config
+        };
+        let proc = start_acp_process(&mismatched, &dir, None, None).unwrap();
+        assert!(
+            !proc.governance_verified,
+            "a resolved binary reporting a different version must not be trusted as admitted"
+        );
+        drop(proc);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The fix that matters most. `session/new` cost scales with how many bridges start at once
     /// (1.67s at K=1 → 7.12s median / 11.57s max at K=8), and a handshake that outruns its budget
     /// does not fail the unit — it silently downgrades it to ungoverned execution. Bounding the
@@ -5088,6 +5480,8 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: false,
+            acp_governance_env: None,
+            verified_version: None,
         };
 
         let handles: Vec<_> = (0..8)
@@ -5254,6 +5648,8 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: auth_method.map(str::to_string),
             acp_input_governance: false,
+            acp_governance_env: None,
+            verified_version: None,
         }
     }
 
@@ -6545,9 +6941,11 @@ sleep 30
     }
 
     /// ACP input governance is an explicit adapter-proof capability, not a CLI-name heuristic.
-    /// The built-in registry admits only Claude today; every other built-in fails safely to the
-    /// explicitly disclosed ungoverned posture. Asserted against `builtin()` — never the merged
-    /// registry, whose answer would depend on the operator's real clis.toml (review, #371).
+    /// The built-in registry admits claude (DES-INPUT-GOV-001 §3) and opencode (DES-INPUT-GOV-006
+    /// / oq-opencode-acp-002, via the harness-provisioned `acp_governance_env` forcing function)
+    /// today; every other built-in fails safely to the explicitly disclosed ungoverned posture.
+    /// Asserted against `builtin()` — never the merged registry, whose answer would depend on the
+    /// operator's real clis.toml (review, #371).
     #[test]
     fn acp_input_governance_is_admitted_by_capability_only() {
         for cli in wicked_council::registry::builtin() {
@@ -6556,10 +6954,11 @@ sleep 30
                 .as_ref()
                 .map(|a| a.acp_input_governance)
                 .unwrap_or(false);
-            if cli.key == "claude" {
+            if cli.key == "claude" || cli.key == "opencode" {
                 assert!(
                     admitted,
-                    "claude's pinned adapter passed the admission proof"
+                    "{}'s pinned adapter passed the admission proof",
+                    cli.key
                 );
             } else {
                 assert!(
@@ -6624,6 +7023,8 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: false,
+            acp_governance_env: None,
+            verified_version: None,
         };
         let admitted = AcpConfig {
             acp_input_governance: true,
@@ -7751,6 +8152,8 @@ else:
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: false,
+            acp_governance_env: None,
+            verified_version: None,
         };
         // The spawn resolves WICKED_WORKER_HOME mid-call (`ensure_worker_config_home`), so hold
         // the env read-lock across the start (core#285): without it, a start landing inside a
