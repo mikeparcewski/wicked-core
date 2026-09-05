@@ -1133,6 +1133,12 @@ pub(crate) fn build_worker_command(
         Some(s) => s.wrapper.iter().chain(argv.iter()).collect(),
         None => argv.iter().collect(),
     };
+    // Self-documenting invariant (Copilot #384): callers guard `argv.is_empty()`, but this is
+    // `pub(crate)` and now reached from tests — a clear assert beats a bare `full[0]` index panic.
+    assert!(
+        !full.is_empty(),
+        "build_worker_command requires a non-empty argv (wrapper + argv)"
+    );
     let mut cmd = Command::new(full[0]);
     cmd.args(&full[1..]);
     cmd.hardened();
@@ -3464,9 +3470,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
             return;
         };
-        assert_eq!(
-            status, "1",
-            "the wrapped child must observe an OS denial for its outside write"
+        // A permission-denied redirect exits non-zero, but the exact code varies across `/bin/sh`
+        // implementations (1/2/126/…); assert non-zero, not literal "1" (Copilot #384). Containment
+        // itself is proven by the file-absence check below.
+        let code = status.trim();
+        assert!(
+            !code.is_empty() && code != "0",
+            "the wrapped child must observe a non-zero (OS-denied) exit for its outside write, got {status:?}"
         );
         assert!(
             !outside_file.exists(),

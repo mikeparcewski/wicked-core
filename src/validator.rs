@@ -714,15 +714,18 @@ pub(crate) fn detect_worker_sandbox(write_roots: &[std::path::PathBuf]) -> Worke
         };
     }
     // Below `Sandboxed`: name the specific gap so an operator can see WHY the floor is absent. The
-    // level ON THE WIRE is what was actually applied (never `Sandboxed` here): `NetworkOnly` for a
-    // firejail-only host (disclosed as write-uncontained), else `BestEffort` — including the case
-    // where a supported tool IS on PATH but the profile could not be built (primary root failed to
-    // canonicalize), so nothing was applied.
+    // level ON THE WIRE is what was ACTUALLY applied — and this whole path leaves the worker UNWRAPPED
+    // (`wrapper: Vec::new()` below, to keep network open), so NOTHING is applied: it is always
+    // `BestEffort` here (never `NetworkOnly`, which would falsely claim a network jail armed when the
+    // worker in fact runs unwrapped — Copilot #384). The `reason` carries the specific gap (firejail
+    // is network-only / profile-build-failed / no tool on PATH).
     let (avail_level, tool) = sandbox_availability();
     let (level, reason) = match (avail_level, tool) {
         (SandboxLevel::NetworkOnly, _) => (
-            SandboxLevel::NetworkOnly,
-            "firejail is network-only (no write containment for a worker)".to_string(),
+            SandboxLevel::BestEffort,
+            "firejail is network-only (denies network, no write containment) and is not applied \
+             since workers keep network open — no OS sandbox armed"
+                .to_string(),
         ),
         (SandboxLevel::Sandboxed, tool) => {
             let primary = write_roots

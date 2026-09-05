@@ -5324,10 +5324,13 @@ sleep 30
             }
             Err(err) => panic!("the sandbox-wrapped ACP bridge must complete its handshake: {err}"),
         };
-        assert_eq!(
-            std::fs::read_to_string(cwd.join("acp-outside-write-status")).unwrap(),
-            "1",
-            "the ACP child observed an OS denial for its outside write"
+        // Non-zero exit, not literal "1": permission-denied redirect codes vary across `/bin/sh`
+        // (Copilot #384). Containment is proven by the file-absence check below.
+        let acp_status = std::fs::read_to_string(cwd.join("acp-outside-write-status")).unwrap();
+        let acp_code = acp_status.trim();
+        assert!(
+            !acp_code.is_empty() && acp_code != "0",
+            "the ACP child must observe a non-zero (OS-denied) exit for its outside write, got {acp_status:?}"
         );
         assert!(
             !outside_file.exists(),
