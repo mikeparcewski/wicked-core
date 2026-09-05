@@ -105,7 +105,14 @@ impl From<TomlCli> for AgenticCli {
             enabled_for_council: t.enabled_for_council.unwrap_or(true),
             // A user record without [cli.acp] falls back to single-shot; note that an
             // overlay REPLACES its built-in wholesale, so overriding a CLI that has a
-            // built-in ACP config requires restating [cli.acp] in the TOML.
+            // built-in ACP config requires restating [cli.acp] in the TOML — INCLUDING
+            // `acp_input_governance = true` for an admitted adapter. Omitting the block does not
+            // just drop multi-turn ACP: it silently drops the seat's INPUT-GOVERNANCE admission,
+            // so a governed unit on that seat runs the wrapped path unchecked and discloses
+            // `GovernanceUnenforced`. Verified live 2026-09-05: an opencode override without
+            // [cli.acp] ran ungoverned until the block (with acp_input_governance) was restated.
+            // core#379 tracks warning on this silent-drop; there is no inheritance for a missing
+            // block (the wholesale-replace is the deliberate escape hatch to run a seat wrapped).
             acp: t.acp.map(Into::into),
             capabilities: t.capabilities,
             login_invocation: t.login_invocation,
