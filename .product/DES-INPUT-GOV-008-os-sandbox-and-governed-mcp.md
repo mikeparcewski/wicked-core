@@ -97,7 +97,7 @@ not consulted — wicked's `AcpGate` is. This design extends that stance to its 
    ┌─────────────────────────────────────────────────────────────────────────────┐
    │ BOUNDARY 1 (DENY): wicked-owned OS sandbox wraps the ENTIRE worker process    │
    │   macOS sandbox-exec SBPL   |   Linux bwrap: ro-bind / + rw-bind <worktree>   │
-    │   • deny file-write* except writable set: worktree + estate dir + scratch    │
+   │   • deny file-write* except writable set: worktree + estate dir + scratch     │
    │   • deny network* (unshare, if chosen) • block reads of a curated secret-dir  │
    │     denylist (~/.aws,~/.ssh,…) — NOT a read jail; NOT exfiltration protection │
    │   ENFORCED BY THE KERNEL regardless of what the CLI or its tools "approve".   │
