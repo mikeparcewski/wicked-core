@@ -13,6 +13,15 @@ tools gets **Boundary-1 DENY only, disclosed contained-NOT-audited** — never f
 functionality probe + App Sandbox vs. Endpoint Security), not a hand-wave. (4) §6/§8 keep the
 default-OFF `mcp_input_governance` capability with **no admission without a live capture**, mirroring
 the `oq-opencode-acp-002` re-proof discipline.
+**Adversarial-review corrections folded in (this revision):** (5) §2/§3.4/§9 now state plainly that
+Boundary 1 is a **WRITE-containment floor, not exfiltration protection** — the model-API network
+channel and the non-curated-dir read surface stay open by necessity, so anything the agent
+legitimately reads can still leave via ordinary model traffic; exfiltration/DLP is explicitly OUT OF
+SCOPE, a separate egress-proxy problem. (6) §4.2's second "safety net" (claiming `wicked-tools`
+uniquely widens writes to the estate graph dir) is struck as false — Boundary 1's own sandbox profile
+grants that write at the kernel level to every process, native or governed, so the only real
+asymmetry native-tool-disable buys is that a governed call is *recorded* and an un-disabled native
+call is not.
 **Predecessors (the dead end this reframes away from):**
 - DES-INPUT-GOV-001 (recon, #360) — established that per-call input governance is Claude-name-gated,
   and that admitting other seats requires each ACP adapter to surface a blocking
@@ -89,7 +98,8 @@ not consulted — wicked's `AcpGate` is. This design extends that stance to its 
    │ BOUNDARY 1 (DENY): wicked-owned OS sandbox wraps the ENTIRE worker process    │
    │   macOS sandbox-exec SBPL   |   Linux bwrap: ro-bind / + rw-bind <worktree>   │
    │   • deny file-write* except <worktree> (+ curated scratch)                    │
-   │   • deny network* (unshare)   • block reads of secret dirs (~/.aws,~/.ssh,…)   │
+   │   • deny network* (unshare, if chosen) • block reads of a curated secret-dir  │
+   │     denylist (~/.aws,~/.ssh,…) — NOT a read jail; NOT exfiltration protection │
    │   ENFORCED BY THE KERNEL regardless of what the CLI or its tools "approve".   │
    │  ┌────────────────────────────────────────────────────────────────────────┐  │
    │  │ agent CLI (claude/codex/copilot/opencode/pi), native FS/bash tools OFF  │  │
@@ -103,12 +113,27 @@ not consulted — wicked's `AcpGate` is. This design extends that stance to its 
 ```
 
 **Separation of concerns.**
-- Boundary 1 answers *"can this process physically damage anything outside the worktree / exfiltrate
-  over the network?"* — **No, by kernel policy.** It requires **nothing** from the adapter. It is the
-  fail-closed floor: even a fully-ungoverned, native-tools-on adapter cannot escape it.
+- Boundary 1 answers *"can this process physically damage anything outside the worktree?"* — **No, by
+  kernel policy.** It requires **nothing** from the adapter. It is the fail-closed floor: even a
+  fully-ungoverned, native-tools-on adapter cannot write outside the worktree. **This is a
+  WRITE-containment floor, not exfiltration protection** — see the scope note below and §3.3.
 - Boundary 2 answers *"what did the worker try to do, was it allowed by policy, and is there durable
   evidence?"* — the per-call **audit + policy** trail (`ConformanceClaim`s) that the store folds. It
   requires two adapter *config* capabilities (§4), not a protocol behaviour.
+
+**Exfiltration is explicitly OUT OF SCOPE for Boundary 1 — a separate egress-proxy problem.** The
+agent CLI must keep a network path open to its own model backend for the run to function at all
+(§3.2 sub-option (A) or (B) — some model-host egress is unconditionally required); that channel is
+exactly how the agent already sends anything it *read* to the model provider as ordinary conversation
+traffic, and Boundary 1's file-read side is a curated denylist of a handful of secret dirs
+(`secret_read_block_dirs()`), not a read jail — reads of everything else (source, other repos on
+disk, non-curated credential files) stay open **on purpose**, carried forward unchanged from the
+validator module's own HONEST LIMITS note (`validator.rs:46-58`: "a script can still READ the rest of
+the filesystem ... and could exfiltrate a file that is NOT on the block list"). So Boundary 1 denies
+*writes* outside the worktree and blocks reads of the handful of curated secret dirs; it does **not**
+and **cannot**, by itself, stop state the agent legitimately read from leaving over the model-API
+channel that is always open. Preventing that is a distinct, unaddressed egress-proxy/DLP problem, not
+a property this design claims.
 
 Neither replaces the other. Boundary 1 without Boundary 2 is contained-but-unaudited (a worker can
 still thrash inside its worktree with no per-call record). Boundary 2 without Boundary 1 is
@@ -230,9 +255,13 @@ scratch carve-out becomes the in-boundary `<cwd>/tmp` the wrapped/ACP paths alre
 
 Every seat — including `pi`/`codex`/`copilot` that failed ACP admission, on a platform with a real
 sandbox tool — gets, **today, with no upstream research**: no writes outside the worktree, no network
-(if we choose deny-all), no reads of `~/.aws`/`~/.ssh`/credential stores. That is a strictly stronger
-*containment* floor than any of them has now (three of them have `SandboxLevel::BestEffort`-equivalent
-today — "neither" in the DES-001 matrix). This is the biggest buildable-now win in this document.
+(if we choose deny-all), no reads of the curated `~/.aws`/`~/.ssh`/credential-store denylist. That is
+a strictly stronger *write-containment* floor than any of them has now (three of them have
+`SandboxLevel::BestEffort`-equivalent today — "neither" in the DES-001 matrix). **It is not an
+exfiltration or general read-containment floor** — see the scope note in §2 and the honest limits in
+§3.3: reads outside the curated denylist stay open, and the model-API network channel stays open, so
+anything the agent legitimately reads can still leave via ordinary model traffic. This is the biggest
+buildable-now *write*-containment win in this document, not a data-loss-prevention control.
 
 ---
 
@@ -275,13 +304,24 @@ working tool path.** This is the single per-seat variable that decides feasibili
 **config** question (can the CLI be told "no built-in file tools"?), not a *protocol-behaviour*
 question — which is precisely why it is more tractable than ACP-permission admission.
 
-Two safety nets make "native tools OFF" fail-safe rather than fail-open:
-1. Even if disabling is *incomplete*, Boundary 1's kernel sandbox still contains any native write to
-   the worktree and denies everything outside it. A native-tool bypass degrades Boundary 2's *audit
-   completeness*, not the *containment* guarantee.
-2. `wicked-tools` being the only tool that *succeeds* outside the worktree (because it is the only
-   path that can, e.g., legitimately widen to the estate graph dir) creates a usability gradient
-   pushing the model onto the governed path.
+One safety net makes "native tools OFF" fail-safe rather than fail-open: even if disabling is
+*incomplete*, Boundary 1's kernel sandbox still contains any native write to outside the worktree. A
+native-tool bypass degrades Boundary 2's *audit completeness*, not the write-*containment* guarantee.
+
+**Correction (this doc previously claimed a second safety net that does not hold — struck, not
+carried forward):** an earlier draft argued `wicked-tools` would be "the only tool that succeeds
+outside the worktree" because only it could widen writes to the estate graph dir, creating a
+usability gradient toward the governed path. That is false as designed: §3.2 point 1 requires
+Boundary 1's own sandbox profile to include the estate graph dir in its writable set (the same
+`WICKED_WRITE_ROOTS`-derived set), so that write permission is granted **at the kernel level to any
+process in the sandbox** — native or MCP-mediated — not to `wicked-tools` exclusively. For claude
+specifically, the existing native Write/Edit path already reaches the graph dir today via the
+PreToolUse hook reading that same env (`src/execute_wrapped.rs:824-881`, core#217). So there is no
+filesystem-access asymmetry to lean on here; the *only* asymmetry native-tool-disable buys is that a
+governed call is **recorded** (`ConformanceClaim`) and a native call, if left enabled, is not. That
+recording gap — not a write-access gap — is the entire reason native-tool-disable must be a hard gate
+(below), and it is why there is no fallback "usability" argument to soften an incomplete disable: an
+incompletely-disabled native surface is simply unaudited, with no compensating access restriction.
 
 **Native-tool-disable is a HARD per-seat gate — the central admission rule for Boundary 2.** If a seat
 cannot be *forced* off its native file/bash tools, then the governed `wicked-tools` path is
@@ -294,11 +334,11 @@ therefore categorical:
 > (confirmed by live capture, §7). A seat where they cannot be fully disabled gets Boundary-1 DENY
 > ONLY, and is disclosed as "contained, NOT audited" — never marked governed/audited.**
 
-This is why the safety nets above are framed as *degradation*, not *rescue*: net (1) means a
-native-tool bypass never breaks *containment*, and net (2) *encourages* the governed path — but neither
-lets a seat claim an audit trail it does not fully own. The §5 matrix marks this failure mode
-explicitly per seat, and the default-OFF `mcp_input_governance` capability (§6/§8) is what mechanically
-prevents an unproven seat from being treated as audited.
+This is why the one safety net above is framed as *degradation*, not *rescue*: it means a native-tool
+bypass never breaks *write-containment* — but it does not lessen the audit loss, and it is not a
+reason to relax the gate. The §5 matrix marks this failure mode explicitly per seat, and the
+default-OFF `mcp_input_governance` capability (§6/§8) is what mechanically prevents an unproven seat
+from being treated as audited.
 
 ### 4.3 Identity is canonical here (unlike ACP title-as-name)
 
@@ -449,6 +489,9 @@ ungoverned on the audit dimension; never a quiet governance gap (ORCHESTRATOR.md
   **audited** iff it has a working per-call carrier — *either* an existing one that is KEPT (claude
   PreToolUse, opencode provisioned ACP) *or* Boundary 2 (native tools provably OFF + `wicked-tools`).
   "Governed" = contained **and** audited; Boundary-1-only is honestly labelled contained-NOT-audited.
+  "Contained" itself means *write*-contained (§2, §3.3–3.4): it is not an exfiltration or DLP claim —
+  the model-API network channel and the non-curated-dir read surface stay open on every seat, by
+  design, regardless of Boundary-1/2 status.
 - **`wicked-tools` MCP re-implements file/bash tool ergonomics.** The model must be as productive via
   `wicked-tools/edit` as via a native edit tool, or task success drops. Mitigation: keep the tool
   schemas close to the adapters' native shapes; the reference-seat proof (Phase B) measures this.
