@@ -12,8 +12,8 @@ const OUTSIDE_PATH = process.argv[4]
 const CAPTURE_FILE = process.argv[5]
 
 writeFileSync(CAPTURE_FILE, '')
-function record(dir, raw) {
-  appendFileSync(CAPTURE_FILE, JSON.stringify({ ts: new Date().toISOString(), dir, raw }) + '\n')
+function record(direction, raw) {
+  appendFileSync(CAPTURE_FILE, JSON.stringify({ ts: new Date().toISOString(), direction, raw }) + '\n')
 }
 
 const child = spawn(COPILOT_BIN, ['--acp'], { cwd: FIXTURE_CWD, stdio: ['pipe', 'pipe', 'pipe'], env: process.env })

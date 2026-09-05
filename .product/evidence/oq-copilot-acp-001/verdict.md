@@ -3,8 +3,8 @@
 **Recommended admission: NOT ADMITTED (for now) — but this is a materially different, much
 closer-to-passing result than `codex`/`pi`.** This is a **clarify-phase** deliverable: it records
 evidence and a recommendation only. `acp_input_governance` for `copilot` in
-`crates/wicked-council/src/registry.rs:294` is **not modified by this work** — that edit (if this
-recommendation is accepted) is production code and belongs to a later phase. See `manifest.md` for
+`crates/wicked-council/src/registry.rs` (the copilot seat entry) is **not modified by this work** — that edit (if this
+recommendation is accepted) is applied in this same change — see the copilot seat entry in `crates/wicked-council/src/registry.rs`. See `manifest.md` for
 the exact pinned artifact and the six `*.ndjson` capture files for the raw (redacted) frames this
 verdict is based on.
 
@@ -104,7 +104,7 @@ drops from `3` (the default-invocation `capture-allow.ndjson`) to `0`, and all f
 complete without a single client round-trip — confirming this flag is in fact the mechanism that
 suppresses per-call gating, exactly as documented.
 
-Critically, the registry's actual built-in invocation (`crates/wicked-council/src/registry.rs:290`,
+Critically, the registry's actual built-in invocation (`crates/wicked-council/src/registry.rs` (the copilot seat entry),
 `start_args: ["--acp"]`) does **not** pass `--allow-all-tools`, `--allow-all`, `--yolo`, or set
 `COPILOT_ALLOW_ALL` — so the control is disabled by default in the exact configuration a governed
 wicked-council seat would actually run under, and `capture-allow.ndjson`/`capture-reject.ndjson`
@@ -141,7 +141,7 @@ every observed occurrence (ordinary, destructive, and network-adjacent) with rea
 auto-approve control is off by default in the registry's actual invocation and provably suppresses
 gating when turned on, and — uniquely among the three seats evaluated — a reject was proven to
 actually prevent the action. The registry's existing `acp_input_governance: false` for `copilot`
-(`crates/wicked-council/src/registry.rs:294`) is therefore still correct and should be left
+(`crates/wicked-council/src/registry.rs` (the copilot seat entry)) is therefore still correct and should be left
 unchanged by any implementation phase that acts on this recommendation; the comment there should be
 updated to cite this evidence directory instead of "must prove permission coverage before
 admission" (a later, implementation-phase edit, not made here per phase scope).

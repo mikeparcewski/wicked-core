@@ -23,7 +23,7 @@ alone.
 | Cask formula | `copilot-cli` 1.0.83 (`auto_updates`; originally cask-installed as 1.0.5 on 2026-03-16, the binary self-updates independent of the cask's tracked version — the self-reported `1.0.83` above is what was actually invoked for this capture, and is the authoritative version pin) |
 | Installed binary sha256 | `15f218a936f693a6b73df248824b9f7f528c2c61949ff446e4ca6062ee48b084` |
 | Corresponding npm package (same upstream release channel, for cross-reference) | `@github/copilot@1.0.83` (`npm view @github/copilot version` resolves to the identical `1.0.83`; `dist.shasum 1418990ba2f811d45c04ec74e4de3e352b16e1c9`, repository `github/copilot-cli`) — the npm package is a *parallel* distribution of the same CLI, not the artifact actually invoked here (the invoked artifact is the Homebrew-cask compiled binary) |
-| Registry comment cited version at authoring time | `v1.0.75` (`crates/wicked-council/src/registry.rs:287`) — **stale**; this evidence is scoped to the newer `1.0.83` actually installed on the evidence host, not the version the comment names |
+| Registry comment cited version at authoring time | `v1.0.75` (the PRE-change comment, replaced in this same change) — this evidence is scoped to the newer `1.0.83` actually installed on the evidence host |
 
 **Implementation language / architecture note**: unlike `codex-acp`/`pi-acp`, this is not a
 TypeScript/Node bridge process wrapping a separate agent CLI. `copilot --acp` is the same compiled

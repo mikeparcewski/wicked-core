@@ -8,8 +8,8 @@ gated behind a real, rejectable client permission request).
   environment, capture method.
 - `verdict.md` — the per-property analysis and the recommended admission decision. **This is a
   CLARIFY-phase deliverable: it records the evidence and a recommended verdict but does not modify
-  `crates/wicked-council/src/registry.rs`. That registry edit (if the recommendation is accepted) is
-  production code and belongs to a later phase.**
+  `crates/wicked-council/src/registry.rs`. That registry comment update is applied in this same
+  change (the copilot seat entry cites this verdict).**
 - `capture-harness.mjs` — the reproducible capture harness for the four-step read/edit/bash/write
   turn (allow, reject, and `--allow-all-tools` scenarios). Re-run with:
   `node capture-harness.mjs copilot <empty-fixture-dir-seeded-with-seed.txt> <output.ndjson> <allow|reject> ["extra --flags"]`

@@ -74,7 +74,7 @@ started in JSON-RPC-over-stdio server mode instead of one-shot prompt mode.
   bridge process).
 - **Version actually invoked:** `1.0.83` (self-reported by `copilot --version`), sha256
   `15f218a936f693a6b73df248824b9f7f528c2c61949ff446e4ca6062ee48b084`.
-- **Correction to record:** the current registry comment cites `v1.0.75` — stale. The comment update
+- **Correction to record:** the pre-change registry comment (replaced by this change) cited `v1.0.75` — stale. The comment update
   in §5 does not need to restate an exact version (see §5.2's rationale for why), but the evidence
   directory pins the actual version tested.
 
