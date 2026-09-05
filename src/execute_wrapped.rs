@@ -1187,12 +1187,14 @@ fn resolve_estate_mcp_exe() -> String {
 /// WHICH graph this is, is decided upstream by `actor::run_code_graph_db`: the run repo's own, or —
 /// for a run filed into a project whose co-located graph the engine could verify — the PROJECT's.
 ///
-/// WRITE SCOPE, unresolved. The handle is writable, and on the project path the file is shared by
-/// every concurrent run in the project. The repo-local case bounded the damage to the graph of the
-/// repo the worker was already editing; the project case does not. A worker that points the estate
-/// indexer at this `--db` (FINDING-067's exact behaviour) with only its own repo checked out gets
-/// the indexer's delete-sweep over the SIBLING repos' rows as well. Nothing here prevents that
-/// today — the binding is verified, the subsequent writes are not.
+/// WRITE SCOPE, partly closed. The handle is writable, and on the project path the file is shared by
+/// every concurrent run in the project. `--readonly` (appended below, DES-GROUNDING-001 §3.0) shuts
+/// the estate MCP *tool surface*, so a worker can no longer mutate the graph THROUGH the MCP — closing
+/// the FINDING-067 delete-sweep via the indexer/write tools. What is NOT yet closed: this `--db` path
+/// is written into the worker-readable inbox mcp-config, so a worker that runs `wicked-estate index
+/// --db <path>` via Bash could still delete-sweep the shared project graph (the binding is verified; a
+/// bash-level indexer write is governed only by the gate-hook, not this path). Fully bounding that —
+/// a read-only DB open, or denying the estate CLI in the boundary — is the follow-up.
 pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(String, Vec<String>)> {
     code_graph_db
         .map(str::trim)
