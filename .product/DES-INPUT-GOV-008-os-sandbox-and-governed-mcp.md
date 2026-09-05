@@ -97,7 +97,7 @@ not consulted — wicked's `AcpGate` is. This design extends that stance to its 
    ┌─────────────────────────────────────────────────────────────────────────────┐
    │ BOUNDARY 1 (DENY): wicked-owned OS sandbox wraps the ENTIRE worker process    │
    │   macOS sandbox-exec SBPL   |   Linux bwrap: ro-bind / + rw-bind <worktree>   │
-   │   • deny file-write* except <worktree> (+ curated scratch)                    │
+    │   • deny file-write* except writable set: worktree + estate dir + scratch    │
    │   • deny network* (unshare, if chosen) • block reads of a curated secret-dir  │
    │     denylist (~/.aws,~/.ssh,…) — NOT a read jail; NOT exfiltration protection │
    │   ENFORCED BY THE KERNEL regardless of what the CLI or its tools "approve".   │
@@ -124,7 +124,7 @@ not consulted — wicked's `AcpGate` is. This design extends that stance to its 
 **Exfiltration is explicitly OUT OF SCOPE for Boundary 1 — a separate egress-proxy problem.** The
 agent CLI must keep a network path open to its own model backend for the run to function at all
 (§3.2 sub-option (A) or (B) — some model-host egress is unconditionally required); that channel is
-exactly how the agent already sends anything it *read* to the model provider as ordinary conversation
+exactly how the agent already sends anything it *has read* to the model provider as ordinary conversation
 traffic, and Boundary 1's file-read side is a curated denylist of a handful of secret dirs
 (`secret_read_block_dirs()`), not a read jail — reads of everything else (source, other repos on
 disk, non-curated credential files) stay open **on purpose**, carried forward unchanged from the
@@ -192,7 +192,7 @@ jail validator script runs, not CLI workers:
 **The design is: generalize this from `run the validator script` to `wrap the agent CLI worker
 spawn`.** The write-root becomes the unit's **worktree** instead of the validator run dir; the
 scratch carve-out becomes the in-boundary `<cwd>/tmp` the wrapped/ACP paths already mint
-(`execute_wrapped` / `start_acp_process`'s `scratch_tmp`, `src/acp_runner.rs:1420ish`).
+(`execute_wrapped` / `start_acp_process`'s `scratch_tmp` param, `src/acp_runner.rs` — the `scratch_tmp` binding around the session-spawn env setup).
 
 ### 3.2 What changes vs. the validator use
 
