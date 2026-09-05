@@ -1370,6 +1370,19 @@ fn start_acp_process(
     // dropping a `tmp/` dir into a user's own working directory would be intrusive.
     scratch_tmp: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
+    start_acp_process_with_write_roots(config, cwd, code_graph_db, scratch_tmp, &[])
+}
+
+/// The actual ACP spawn chokepoint. `extra_write_roots` comes from the same launch-validated
+/// governance context used to arm `WICKED_WRITE_ROOTS`; Boundary 1 is WRITE containment only,
+/// not exfiltration protection, a read jail, or a replacement for ACP governance.
+fn start_acp_process_with_write_roots(
+    config: &AcpConfig,
+    cwd: &std::path::Path,
+    code_graph_db: Option<&str>,
+    scratch_tmp: Option<&std::path::Path>,
+    extra_write_roots: &[String],
+) -> anyhow::Result<AcpProcess> {
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
     // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
     // that proceeded without the override would run under the operator's own configuration,
@@ -1397,14 +1410,39 @@ fn start_acp_process(
         None => true,
         Some(expected) => resolved_binary_version_matches(&config.binary, expected),
     };
+    let graph_write = crate::execute_wrapped::graph_write_dir(code_graph_db);
+    let worker_write_roots = crate::execute_wrapped::armed_write_root_paths(
+        cwd,
+        extra_write_roots,
+        graph_write.as_deref(),
+    );
+    let worker_sandbox = if config.os_sandbox {
+        Some(crate::validator::detect_worker_sandbox(
+            &worker_write_roots,
+        )?)
+    } else {
+        None
+    };
+    let worker_write_roots_env = std::env::join_paths(&worker_write_roots)
+        .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
     let build_cmd = |binary: &str| {
-        let mut cmd = std::process::Command::new(binary);
+        let mut cmd = if let Some(sandbox) = &worker_sandbox {
+            let mut cmd = std::process::Command::new(&sandbox.wrapper[0]);
+            cmd.args(&sandbox.wrapper[1..]);
+            cmd.arg(binary);
+            cmd
+        } else {
+            std::process::Command::new(binary)
+        };
         // The engine's internal environment is stripped through the one chokepoint (FINDING-067): an
         // agent CLI that inherits `WICKED_ESTATE_DB` has every estate tool it can spawn pointed at the
         // engine's operational store by default. Governed units do not come through here (they take the
         // wrapped path, FINDING-060), but an ungoverned worker in a repo runs the same
         // `wicked-estate index .`. Harden FIRST — anything set below is set deliberately.
         cmd.hardened();
+        if config.os_sandbox {
+            cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, &worker_write_roots_env);
+        }
         // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear
         // to a known slate, then set exactly what this path intends. This also overrides any
         // CLAUDE_CONFIG_DIR the daemon itself inherited — the operator's live config dir is
@@ -4205,7 +4243,17 @@ impl AcpStepRunner {
                     .governance
                     .as_ref()
                     .and_then(|g| g.code_graph_db.as_deref());
-                match start_acp_process(&acp_config, &cwd, code_graph_db, Some(&cwd.join("tmp"))) {
+                let extra_write_roots = input
+                    .governance
+                    .as_ref()
+                    .map_or(&[][..], |g| g.extra_write_roots.as_slice());
+                match start_acp_process_with_write_roots(
+                    &acp_config,
+                    &cwd,
+                    code_graph_db,
+                    Some(&cwd.join("tmp")),
+                    extra_write_roots,
+                ) {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
                         let arc = Arc::new(Mutex::new(proc));
@@ -5185,6 +5233,74 @@ sleep 30
         script
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn acp_spawn_kernel_denies_an_outside_write_when_os_sandbox_is_enabled() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("wicked-acp-os-sandbox-{}", std::process::id()));
+        let cwd = base.join("worktree");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        if crate::validator::detect_worker_sandbox(&[cwd.clone()]).is_err() {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let script = base.join("sandbox-probe-acp-bridge.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+printf x > "$WICKED_TEST_OUTSIDE"
+printf '%s' "$?" > acp-outside-write-status
+read _init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read _new
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"stub"}}'
+sleep 30
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let outside_file = outside.join("pwned");
+        let config = AcpConfig {
+            binary: script.to_string_lossy().into_owned(),
+            start_args: vec![],
+            transport: AcpTransport::Stdio,
+            auth_method: None,
+            acp_input_governance: false,
+            os_sandbox: true,
+            acp_governance_env: Some((
+                "WICKED_TEST_OUTSIDE".to_string(),
+                outside_file.to_string_lossy().into_owned(),
+            )),
+            verified_version: None,
+        };
+        let proc = match start_acp_process(&config, &cwd, None, Some(&cwd.join("tmp"))) {
+            Ok(proc) => proc,
+            // A launcher may be installed but disabled by the outer CI/container sandbox. Its
+            // refusal means the real child never ran; production surfaces this startup error
+            // rather than silently falling back, and this kernel test skips that host honestly.
+            Err(err) if err.to_string().contains("Operation not permitted") => {
+                let _ = std::fs::remove_dir_all(&base);
+                return;
+            }
+            Err(err) => panic!("the sandbox-wrapped ACP bridge must complete its handshake: {err}"),
+        };
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("acp-outside-write-status")).unwrap(),
+            "1",
+            "the ACP child observed an OS denial for its outside write"
+        );
+        assert!(
+            !outside_file.exists(),
+            "the ACP child cannot create outside files"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The task's own "prove with a test" requirement for the zero-file-write claim
     /// (DES-INPUT-GOV-006 §1, §5 condition 1): `acp_governance_env` is an environment variable,
     /// never a file drop, so a governed seat's unit cwd — the same directory a real repo's
@@ -5224,6 +5340,7 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: true,
+            os_sandbox: false,
             acp_governance_env: Some((
                 "WICKED_TEST_GOVERNANCE_ENV".into(),
                 "governance-forcing-value".into(),
@@ -5320,6 +5437,7 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: true,
+            os_sandbox: false,
             acp_governance_env: Some((
                 "WICKED_TEST_GOVERNANCE_ENV".into(),
                 "governance-forcing-value".into(),
@@ -5430,6 +5548,7 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: true,
+            os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
         };
@@ -5492,6 +5611,7 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: false,
+            os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
         };
@@ -5660,6 +5780,7 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: auth_method.map(str::to_string),
             acp_input_governance: false,
+            os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
         }
@@ -7035,6 +7156,7 @@ sleep 30
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: false,
+            os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
         };
@@ -8164,6 +8286,7 @@ else:
             transport: AcpTransport::default(),
             auth_method: None,
             acp_input_governance: false,
+            os_sandbox: false,
             acp_governance_env: None,
             verified_version: None,
         };

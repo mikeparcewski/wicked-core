@@ -784,7 +784,52 @@ impl WrappedCliStepRunner {
             } else {
                 Box::new(Passthrough)
             };
-            let mut cmd = Command::new(&argv[0]);
+            // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP
+            // admission, and wrapped deny fence. It is WRITE containment only — not a read jail
+            // or exfiltration/DLP protection; worker model egress remains open.
+            let graph_write = input
+                .governance
+                .as_ref()
+                .and_then(|g| graph_write_dir(g.code_graph_db.as_deref()));
+            let worker_write_roots = input.governance.as_ref().map_or_else(
+                || vec![cwd.clone()],
+                |g| armed_write_root_paths(&cwd, &g.extra_write_roots, graph_write.as_deref()),
+            );
+            let os_sandbox = worker_os_sandbox_enabled(&cli_key);
+            let sandbox = if os_sandbox {
+                match crate::validator::detect_worker_sandbox(&worker_write_roots) {
+                    Ok(sandbox) => Some(sandbox),
+                    // A requested kernel floor must never silently degrade. The explicit failure
+                    // is the containment-gap disclosure on platforms without a usable launcher,
+                    // including Windows' BestEffort path.
+                    Err(e) => {
+                        return StepOutput {
+                            run_id: input.run_id.clone(),
+                            unit_ix: input.unit_ix,
+                            attempt: input.attempt,
+                            output: format!("(could not arm OS write sandbox: {e})"),
+                            status: StepStatus::Failed,
+                            usage: None,
+                            files: Vec::new(),
+                            tools: Vec::new(),
+                            governed: gov_env.is_some(),
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+            let mut cmd = if let Some(sandbox) = sandbox {
+                let mut sandbox_argv = sandbox.wrapper;
+                sandbox_argv.extend(argv.iter().cloned());
+                let mut command = Command::new(&sandbox_argv[0]);
+                command.args(&sandbox_argv[1..]);
+                command
+            } else {
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]);
+                command
+            };
             // No estate tool the worker spawns may inherit a store from the environment (FINDING-067).
             // Stripped UNCONDITIONALLY — governed or not, set by us or exported by whoever started the
             // daemon. `wicked-estate`, `wicked-estate-mcp` and `wicked-core` all resolve `--db` ELSE
@@ -793,7 +838,7 @@ impl WrappedCliStepRunner {
             // top of itself. A boundary that depends on the daemon's environment is not a boundary.
             // Harden FIRST so the gate-hook variables set below survive as deliberate exceptions.
             cmd.hardened();
-            cmd.args(&argv[1..]).current_dir(&cwd);
+            cmd.current_dir(&cwd);
             // Point EVERY seat's scratch INSIDE the boundary (core#264, widened for crew#427): this
             // used to live in the claude-only `gov_env` arm, so a non-claude evaluator (codex, under
             // its own `--sandbox workspace-write`) got no in-boundary scratch and its `mktemp` /
@@ -803,6 +848,16 @@ impl WrappedCliStepRunner {
             // convenience, not a governance control, and every seat benefits from temp that is
             // reaped with the worktree and inside its own write root.
             redirect_scratch_into_boundary(&mut cmd, &cwd);
+            // Even seats without a hook receive the exact root set the kernel launcher got. This
+            // does not turn the env into a boundary; it keeps descendant tools and diagnostics
+            // aligned with Boundary 1's source of truth.
+            if os_sandbox {
+                let roots = std::env::join_paths(
+                    worker_write_roots.iter().map(std::path::PathBuf::as_path),
+                )
+                .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
+                cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, roots);
+            }
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
             // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
             // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
@@ -835,7 +890,6 @@ impl WrappedCliStepRunner {
                 // (byte-identical pre-ADR boundary): the extractor's annotation writes ride
                 // `wicked-estate annotate` (a Bash call), which `boundary_denial` does not
                 // path-judge; only Write/Edit/Read tool-calls carrying a `path` are judged.
-                let graph_write = graph_write_dir(g.code_graph_db.as_deref());
                 cmd.env(
                     crate::gate_hook::WRITE_ROOTS_ENV,
                     armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref()),
@@ -1034,16 +1088,49 @@ fn armed_write_roots(
     if extras.is_empty() && graph_dir.is_none() {
         return cwd.as_os_str().to_os_string();
     }
-    let mut write_roots: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
-    write_roots.extend(extras.iter().map(std::ffi::OsString::from));
-    write_roots.extend(graph_dir.map(|d| d.as_os_str().to_os_string()));
+    let paths = armed_write_root_paths(cwd, extras, graph_dir);
+    let write_roots: Vec<std::ffi::OsString> = paths
+        .iter()
+        .map(|path| path.as_os_str().to_os_string())
+        .collect();
     match std::env::join_paths(&write_roots) {
         Ok(joined) => joined,
-        Err(e) => {
-            eprintln!("[wicked-core] write-root list not joinable ({e}); arming cwd only");
-            cwd.as_os_str().to_os_string()
-        }
+        // `armed_write_root_paths` already narrowed to cwd on this condition. Keep this fallback
+        // defensive: the kernel profile must never become wider than the advertised env boundary.
+        Err(_) => cwd.as_os_str().to_os_string(),
     }
+}
+
+/// The one source of truth for both `WICKED_WRITE_ROOTS` and Boundary 1's kernel profile.
+/// The in-boundary scratch directory is a child of `cwd`, so no extra writable carve-out exists.
+pub(crate) fn armed_write_root_paths(
+    cwd: &Path,
+    extras: &[String],
+    graph_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    // Keep the worktree spelling first: this is both the policy boundary's primary root and the
+    // kernel profile's primary root. The source-level guard in gate_hook pins this ordering.
+    let mut root_strings: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
+    root_strings.extend(extras.iter().map(std::ffi::OsString::from));
+    root_strings.extend(graph_dir.map(|dir| dir.as_os_str().to_os_string()));
+    let roots: Vec<PathBuf> = root_strings.iter().map(PathBuf::from).collect();
+    if roots.len() == 1 || std::env::join_paths(roots.iter().map(|root| root.as_os_str())).is_ok() {
+        roots
+    } else {
+        eprintln!("[wicked-core] write-root list not joinable; arming cwd only");
+        vec![cwd.to_path_buf()]
+    }
+}
+
+/// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
+pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
+    let user = wicked_council::registry::default_user_path();
+    wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin())
+        .into_iter()
+        .find(|cli| cli.key == cli_key)
+        .and_then(|cli| cli.acp)
+        .is_some_and(|acp| acp.os_sandbox)
 }
 
 /// Point a worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at `<cwd>/tmp` (core#264, crew#427):

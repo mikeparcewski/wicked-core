@@ -419,9 +419,19 @@ pub(crate) fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
 
 /// A probed OS-sandbox launcher for `cwd`: the wrapper argv that must PRECEDE the `sh -c <script>` tail,
 /// plus the level it grants. An empty `wrapper` ⇒ no OS sandbox (the floor, `BestEffort`).
-struct SandboxLauncher {
-    wrapper: Vec<String>,
-    level: SandboxLevel,
+#[derive(Debug)]
+pub(crate) struct SandboxLauncher {
+    pub(crate) wrapper: Vec<String>,
+    pub(crate) level: SandboxLevel,
+}
+
+/// Whether the sandbox profile denies network. Validator scripts retain their historical network
+/// denial; CLI workers deliberately allow model egress. Worker containment is WRITE containment
+/// only — it is not exfiltration/DLP protection or a read jail.
+#[derive(Clone, Copy)]
+enum NetworkPolicy {
+    Deny,
+    Allow,
 }
 
 /// The curated set of high-value secret directories whose READS the OS sandbox blocks (macOS
@@ -472,9 +482,15 @@ fn sbpl_quote(p: &Path) -> String {
 /// the system temp dir, and the std stdio devices; reads/exec stay open (`allow default`). `None` if the
 /// run dir can't be canonicalized (→ caller degrades to the floor). Canonicalization matters on macOS
 /// where `/var/folders/…` is a symlink to `/private/var/folders/…`; SBPL `subpath` needs the real path.
-fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<String> {
-    let rcwd = cwd.canonicalize().ok()?;
-    let mut p = String::from("(version 1)\n(allow default)\n(deny network*)\n");
+fn macos_sandbox_profile_for_roots(
+    write_roots: &[&Path],
+    network: NetworkPolicy,
+) -> Option<String> {
+    let primary = write_roots.first()?.canonicalize().ok()?;
+    let mut p = String::from("(version 1)\n(allow default)\n");
+    if matches!(network, NetworkPolicy::Deny) {
+        p.push_str("(deny network*)\n");
+    }
     // C3: explicitly DENY reads of the curated high-value secret dirs (after `allow default`, so the
     // deny wins for those paths). Resolved from HOME; SBPL-quoted like the cwd. Missing HOME ⇒ no rules.
     for dir in secret_read_block_dirs() {
@@ -486,7 +502,7 @@ fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<Strin
     p.push_str("(deny file-write*)\n");
     p.push_str(&format!(
         "(allow file-write* (subpath {}))\n",
-        sbpl_quote(&rcwd)
+        sbpl_quote(&primary)
     ));
     // `extra_write`: a directory OUTSIDE the run dir the validator legitimately writes into. Coverage
     // is the case — its store is the repo's engine-resolved graph (in-tree `.codegraph/` for a
@@ -494,17 +510,25 @@ fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<Strin
     // that WAL-mode SQLite db needs to create `-wal`/`-shm`/journal files IN ITS DIRECTORY. Without this
     // the deny-writes floor blocks the open ("unable to open database file") and the coverage gate can
     // never pass on the governed daemon path despite a fully-covered store (P8 #9 / core#217).
-    if let Some(ex) = extra_write.and_then(|e| e.canonicalize().ok()) {
+    for root in write_roots
+        .iter()
+        .skip(1)
+        .filter_map(|root| root.canonicalize().ok())
+    {
         p.push_str(&format!(
             "(allow file-write* (subpath {}))\n",
-            sbpl_quote(&ex)
+            sbpl_quote(&root)
         ));
     }
-    if let Ok(tmp) = std::env::temp_dir().canonicalize() {
-        p.push_str(&format!(
-            "(allow file-write* (subpath {}))\n",
-            sbpl_quote(&tmp)
-        ));
+    // Validators historically receive a system-temp carve-out. Workers do not: their scratch is
+    // `<worktree>/tmp`, already below the primary root, so the kernel writable set stays exact.
+    if matches!(network, NetworkPolicy::Deny) {
+        if let Ok(tmp) = std::env::temp_dir().canonicalize() {
+            p.push_str(&format!(
+                "(allow file-write* (subpath {}))\n",
+                sbpl_quote(&tmp)
+            ));
+        }
     }
     p.push_str("(allow file-write-data (literal \"/dev/null\"))\n");
     p.push_str("(allow file-write-data (literal \"/dev/stdout\"))\n");
@@ -512,17 +536,33 @@ fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<Strin
     Some(p)
 }
 
+#[cfg(test)]
+fn macos_sandbox_profile(cwd: &Path, extra_write: Option<&Path>) -> Option<String> {
+    let mut roots = vec![cwd];
+    if let Some(extra) = extra_write {
+        roots.push(extra);
+    }
+    macos_sandbox_profile_for_roots(&roots, NetworkPolicy::Deny)
+}
+
 /// Resolve the OS-sandbox wrapper for `cwd`, or the floor (`BestEffort`, empty wrapper) when none is
 /// available/usable. macOS `sandbox-exec` is preferred, then Linux `bwrap`, then `firejail`.
-fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLauncher {
+fn detect_sandbox_launcher_for_roots(
+    write_roots: &[&Path],
+    network: NetworkPolicy,
+) -> SandboxLauncher {
     let floor = SandboxLauncher {
         wrapper: Vec::new(),
         level: SandboxLevel::BestEffort,
     };
-    if find_on_path("sandbox-exec").is_some() {
-        if let Some(profile) = macos_sandbox_profile(cwd, extra_write) {
+    if let Some(tool) = find_on_path("sandbox-exec") {
+        if let Some(profile) = macos_sandbox_profile_for_roots(write_roots, network) {
             return SandboxLauncher {
-                wrapper: vec!["sandbox-exec".to_string(), "-p".to_string(), profile],
+                wrapper: vec![
+                    tool.to_string_lossy().into_owned(),
+                    "-p".to_string(),
+                    profile,
+                ],
                 level: SandboxLevel::Sandboxed,
             };
         }
@@ -530,11 +570,21 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
     // Linux bwrap: read-only-bind the whole FS, rw-bind ONLY the run dir, unshare the network, mask the
     // curated secret dirs with an empty tmpfs, give a writable tmpfs at the system temp dir (C8), and put
     // the sandbox in its own PID namespace tied to the launcher so the whole tree dies on timeout (C4).
-    if find_on_path("bwrap").is_some() {
-        if let Ok(rcwd) = cwd.canonicalize() {
-            let c = rcwd.to_string_lossy().to_string();
+    if let Some(tool) = find_on_path("bwrap") {
+        if let Some(primary) = write_roots
+            .first()
+            .and_then(|root| root.canonicalize().ok())
+        {
+            let roots: Vec<_> = std::iter::once(primary)
+                .chain(
+                    write_roots
+                        .iter()
+                        .skip(1)
+                        .filter_map(|root| root.canonicalize().ok()),
+                )
+                .collect();
             let mut w: Vec<String> = vec![
-                "bwrap".to_string(),
+                tool.to_string_lossy().into_owned(),
                 "--ro-bind".to_string(),
                 "/".to_string(),
                 "/".to_string(),
@@ -545,14 +595,18 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
                 // C4: the whole process tree dies with the launcher — no orphaned/backgrounded survivors.
                 "--die-with-parent".to_string(),
                 "--unshare-pid".to_string(),
-                "--unshare-net".to_string(),
             ];
+            if matches!(network, NetworkPolicy::Deny) {
+                w.push("--unshare-net".to_string());
+            }
             // C8: a fresh writable tmpfs at the system temp dir so validators writing to $TMPDIR work
             // (parity with the macOS profile that allows temp writes). Placed BEFORE the run-dir bind so a
             // run dir living under the temp dir is re-exposed by the later bind rather than masked.
-            if let Ok(tmp) = std::env::temp_dir().canonicalize() {
-                w.push("--tmpfs".to_string());
-                w.push(tmp.to_string_lossy().to_string());
+            if matches!(network, NetworkPolicy::Deny) {
+                if let Ok(tmp) = std::env::temp_dir().canonicalize() {
+                    w.push("--tmpfs".to_string());
+                    w.push(tmp.to_string_lossy().to_string());
+                }
             }
             // C3: mask each curated secret dir with an empty tmpfs so its real contents are unreadable.
             for dir in secret_read_block_dirs() {
@@ -562,13 +616,14 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
             // P8 #9 / core#217: rw-bind the coverage store's dir (outside the run dir) so opening its
             // WAL-mode SQLite db can create -wal/-shm/journal there. `--ro-bind / /` above makes it
             // READABLE but not writable; SQLite needs write access to the db's DIRECTORY to open it.
-            if let Some(ex) = extra_write.and_then(|e| e.canonicalize().ok()) {
-                let exs = ex.to_string_lossy().to_string();
+            for root in roots.iter().skip(1) {
+                let exs = root.to_string_lossy().to_string();
                 w.push("--bind".to_string());
                 w.push(exs.clone());
                 w.push(exs);
             }
-            // The run dir is bound LAST so it wins over any overlapping tmpfs above (writes land here).
+            // The primary root is bound LAST so it wins over any overlapping tmpfs above.
+            let c = roots[0].to_string_lossy().to_string();
             w.push("--bind".to_string());
             w.push(c.clone());
             w.push(c.clone());
@@ -583,10 +638,13 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
     }
     // Linux firejail: NETWORK-ONLY jail (does NOT restrict writes or mask secrets — see the module SAFETY
     // note). Reports its own weaker `NetworkOnly` level so it never overclaims write containment (C6).
-    if find_on_path("firejail").is_some() {
+    if let Some(tool) = find_on_path("firejail") {
+        if matches!(network, NetworkPolicy::Allow) {
+            return floor;
+        }
         return SandboxLauncher {
             wrapper: vec![
-                "firejail".to_string(),
+                tool.to_string_lossy().into_owned(),
                 "--quiet".to_string(),
                 "--noprofile".to_string(),
                 "--net=none".to_string(),
@@ -595,6 +653,37 @@ fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLau
         };
     }
     floor
+}
+
+fn detect_sandbox_launcher(cwd: &Path, extra_write: Option<&Path>) -> SandboxLauncher {
+    let mut roots = vec![cwd];
+    if let Some(extra) = extra_write {
+        roots.push(extra);
+    }
+    detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Deny)
+}
+
+/// Build the OS wrapper for an opted-in CLI worker. Unlike validators, workers keep network open
+/// for model traffic. This is a WRITE-containment floor only, not exfiltration protection.
+///
+/// A missing launcher or an uncanonicalizable primary worktree is an error rather than a silent
+/// best-effort launch: the caller requested kernel containment and must disclose/fail closed.
+pub(crate) fn detect_worker_sandbox(
+    write_roots: &[std::path::PathBuf],
+) -> anyhow::Result<SandboxLauncher> {
+    let roots: Vec<&Path> = write_roots
+        .iter()
+        .map(std::path::PathBuf::as_path)
+        .collect();
+    let launcher = detect_sandbox_launcher_for_roots(&roots, NetworkPolicy::Allow);
+    if launcher.level != SandboxLevel::Sandboxed {
+        let (level, tool) = sandbox_availability();
+        anyhow::bail!(
+            "OS write sandbox requested but could not arm (level={level:?}, tool={tool:?}); \
+             refusing unsandboxed worker launch"
+        );
+    }
+    Ok(launcher)
 }
 
 /// Apply the cross-platform env FLOOR: clear the child environment, then re-add only the non-secret
@@ -3072,6 +3161,103 @@ mod core_exe_tests {
              floor then never runs. Resolve through \
              execute_wrapped::resolve_wicked_core_exe_opt(), which exists for this reason."
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_sandbox_tests {
+    use super::*;
+
+    #[test]
+    fn worker_profile_keeps_network_open_but_validator_profile_denies_it() {
+        let root =
+            std::env::temp_dir().join(format!("wicked-worker-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let worker = macos_sandbox_profile_for_roots(&[root.as_path()], NetworkPolicy::Allow)
+            .expect("existing worktree canonicalizes");
+        let validator = macos_sandbox_profile(&root, None).expect("existing run dir canonicalizes");
+        assert!(
+            !worker.contains("(deny network*)"),
+            "worker model egress remains open; Boundary 1 is write containment, not DLP"
+        );
+        assert!(validator.contains("(deny network*)"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn worker_sandbox_refuses_to_claim_containment_when_it_cannot_arm() {
+        let missing = std::env::temp_dir().join(format!(
+            "wicked-missing-worker-root-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let err = detect_worker_sandbox(&[missing]).expect_err(
+            "a missing primary root cannot produce a kernel write jail; fail closed rather than run unsandboxed",
+        );
+        assert!(err.to_string().contains("could not arm"));
+    }
+
+    /// This is an end-to-end kernel proof, not merely an argv assertion. It skips on hosts that
+    /// have no usable `sandbox-exec`/`bwrap`; the separate fail-closed test above covers that
+    /// honest BestEffort path.
+    #[cfg(unix)]
+    #[test]
+    fn worker_sandbox_kernel_denies_outside_and_allows_worktree_and_estate_writes() {
+        let base = std::env::temp_dir().join(format!("wicked-worker-jail-{}", std::process::id()));
+        let worktree = base.join("worktree");
+        let estate = base.join("estate-graph");
+        let outside = base.join("outside");
+        for dir in [&worktree, &estate, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let launcher = match detect_worker_sandbox(&[worktree.clone(), estate.clone()]) {
+            Ok(launcher) => launcher,
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&base);
+                return;
+            }
+        };
+        let outside_file = outside.join("pwned");
+        let worktree_file = worktree.join("ok");
+        let estate_file = estate.join("wal");
+        let mut argv = launcher.wrapper;
+        argv.extend([
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf x > \"$1\"; denied=$?; printf y > \"$2\"; printf z > \"$3\"; exit $denied"
+                .to_string(),
+            "worker-sandbox-test".to_string(),
+            outside_file.to_string_lossy().into_owned(),
+            worktree_file.to_string_lossy().into_owned(),
+            estate_file.to_string_lossy().into_owned(),
+        ]);
+        // spawn-audit: test-only — this directly exercises the already-built sandbox wrapper;
+        // inheriting test-process env is irrelevant because the fixture's assertion is kernel I/O.
+        let output = Command::new(&argv[0]).args(&argv[1..]).output();
+        let Ok(output) = output else {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        if !worktree_file.exists() || !estate_file.exists() {
+            // A launcher binary can exist but be unavailable at runtime (notably bwrap without
+            // user namespaces). This is a clean environmental skip, never a false kernel claim.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        assert!(
+            !output.status.success(),
+            "outside write must be denied by the OS sandbox"
+        );
+        assert!(
+            !outside_file.exists(),
+            "outside write must not land on disk"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Permission denied") || stderr.contains("Operation not permitted"),
+            "the child must observe an OS permission denial, got: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 
