@@ -333,7 +333,18 @@ pub fn builtin() -> Vec<AgenticCli> {
                 start_args: vec!["acp".into()],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
-                // OQ-OPENCODE-ACP-001 must prove permission coverage before admission.
+                // OQ-OPENCODE-ACP-001 resolved NOT admitted (see .product/evidence/
+                // oq-opencode-acp-001/ and .product/DES-INPUT-GOV-005-opencode-acp-admission.md).
+                // Live captures against native `opencode acp` 1.17.18 (no separate adapter)
+                // show the registry's exact, unconfigured invocation never emits
+                // session/request_permission for any in-worktree core read/edit/bash/write
+                // intent: an allow-client and reject-client therefore behave identically, and a
+                // destructive rm -rf and network curl proceed unconditionally. The native
+                // permission machinery can be tightened by an opencode permission config, but
+                // that is not currently provisioned by wicked and its requests still expose only
+                // free-text titles rather than canonical tool names. Stays disclosed-ungoverned
+                // until wicked supplies and protects a tightened config and the identity gap is
+                // normalized or the upstream protocol carries a canonical name.
                 acp_input_governance: false,
             }),
             capabilities: Some(
