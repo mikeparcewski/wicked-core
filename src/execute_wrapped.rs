@@ -1565,7 +1565,15 @@ fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .open(path)
         .or_else(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
-                let _ = std::fs::remove_file(path);
+                // Remove the existing entry (the symlink itself, not its target) before re-creating
+                // with O_EXCL. Propagate a real unlink failure (permission/FS) so a re-arm failure is
+                // diagnosable — only a concurrent removal (NotFound) is benign. TOCTOU safety is
+                // unchanged: the re-create is still O_EXCL (Copilot #383).
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(rm) if rm.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(rm) => return Err(rm),
+                }
                 std::fs::OpenOptions::new()
                     .create_new(true)
                     .write(true)
@@ -1703,14 +1711,14 @@ fn arm_input_governance(
     // Insert `--mcp-config <path>` FIRST so it parses as a flag (never demoted past the prompt / a `--`
     // guard). It is variadic and takes a FILE PATH — not comma-joinable — so it cannot ride the
     // append-or-before-`--` path of `inject_isolation_flags` (a bare positional prompt could be swallowed
-    // as a second config); it goes at argv position 1 exactly like `--settings`. Injected
-    // UNCONDITIONALLY, like `--settings` below: the engine always arms its own governed grounding, and a
-    // deference guard here would have to scan the built argv — which carries the model-authored prompt as
-    // a bare positional, so a prompt token `--mcp-config` could suppress the injection and silently
-    // un-ground the worker (the same untrusted-text-flips-a-boundary hazard `inject_isolation_flags`
-    // avoids by scanning the TEMPLATE, not argv). `--mcp-config` is variadic, so an operator template that
-    // also pins one merges rather than conflicts — there is nothing to defer to. Injected before
-    // `--settings` so `--settings` ends up first — keeping the argv layout other callers read.
+    // as a second config); it goes at argv position 1 exactly like `--settings`. Injected with NO
+    // argv-scan deference guard, like `--settings` below (its one condition is a bound graph — `Some`
+    // below; `None` ⇒ no file, no flag, FINDING-067). A guard scanning the built argv would carry the
+    // model-authored prompt as a bare positional, so a prompt token `--mcp-config` could suppress the
+    // injection and silently un-ground the worker (the untrusted-text-flips-a-boundary hazard
+    // `inject_isolation_flags` avoids by scanning the TEMPLATE, not argv); and `--mcp-config` is variadic,
+    // so an operator template that also pins one merges rather than conflicts — nothing to defer to.
+    // Injected before `--settings` so `--settings` ends up first — keeping the argv layout other callers read.
     if let Some(path) = mcp_config_path {
         argv.insert(1, path.to_string_lossy().into_owned());
         argv.insert(1, "--mcp-config".to_string());
