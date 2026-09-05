@@ -15,6 +15,11 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.14** — npm release carrying #377 (umbrella #360): opencode is the FIRST admitted
+  non-claude ACP seat, input-governed via a harness-provisioned config (`OPENCODE_CONFIG_CONTENT`,
+  no tracked-file mutation), re-proven against the provisioned config, version-pin guarded; the
+  version-pin probe now mirrors the spawn's Windows `.cmd`-shim retry so npm-shim adapters are
+  not spuriously downgraded on Windows.
 - **core-ts 0.7.13** — npm release carrying #371 (issue #364, umbrella #360): ACP
   input-governance admission is an explicit, evidence-gated adapter capability
   (`acp_input_governance`, default false) instead of the `cli_runs_claude` name predicate.
