@@ -244,6 +244,24 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // matches on free shell text instead of a canonical tool identity, a degraded
                 // basis for admission. Stays disclosed-ungoverned
                 // until a pinned adapter version proves per-call gating for every core intent.
+                // OQ-CODEX-ACP-PROVISION-001 (see .product/DES-INPUT-GOV-007-codex-acp-provision-research.md)
+                // asked the opencode-style follow-up:
+                // is there a config/flag/env that routes approvals to the client instead of
+                // auto_review, the way OPENCODE_CONFIG_CONTENT did for opencode (DES-INPUT-GOV-006)?
+                // Source-verified across codex-acp@1.9.0 and @1.10.0 (identical on this surface):
+                // NO. session/setMode, session/setConfigOption, and INITIAL_AGENT_MODE all resolve
+                // to the same 3 hardcoded AgentMode presets; none pairs approvalsReviewer:"user"
+                // with a sandbox that actually denies the write (ReadOnly asks but its
+                // workspaceWrite sandbox lets writes through anyway, so nothing ever escalates).
+                // CODEX_CONFIG only merges model_provider/mcp_servers, never approval/sandbox
+                // fields. A richer app-server permission-profile surface (PermissionProfile /
+                // RequestPermissionProfile / ActivePermissionProfile) is vendored in codex-acp's
+                // own repo but never called from its compiled dist/index.js (zero references) —
+                // the protocol capability exists, this adapter just doesn't bridge to it yet.
+                // Genuinely blocked-on-upstream, not unresearched: forward path is either an
+                // upstream codex-acp release wiring up what it already vendors, or a wicked-owned
+                // bridge speaking the codex app-server protocol directly. No re-proof evidence
+                // directory was produced — there was no provisioning mechanism to re-prove.
                 acp_input_governance: false,
                 acp_governance_env: None,
                 verified_version: None,
