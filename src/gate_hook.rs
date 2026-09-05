@@ -619,6 +619,21 @@ fn bash_write_targets(command: &str) -> Vec<String> {
 /// not yet have it.
 ///
 /// Returns the offending pipeline/sequence segment (so the deny message can NAME it), or `None`.
+///
+/// `is_env_assignment`: a `NAME=value` token with a shell-identifier NAME — a leading env-assignment
+/// prefix (`X=1 cmd`) that runs `cmd` with `X` set, so it is not the program word. `=foo`, `1a=b`, or
+/// a bare `foo` are NOT assignments (the first is the program).
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
 fn bash_denied_estate_indexer(command: &str) -> Option<String> {
     let owned = shell_tokens(command);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
@@ -643,7 +658,15 @@ fn bash_denied_estate_indexer(command: &str) -> Option<String> {
         segments.push(seg);
     }
     for words in &segments {
-        let Some(prog) = words.first() else { continue };
+        // The program is the first word that is NOT a leading `NAME=value` env-assignment prefix:
+        // `X=1 wicked-estate …` runs wicked-estate with `X` exported, so the assignment is not the
+        // program word (Copilot #385 — a common, legitimate shell form, not just evasion). A no-space
+        // GLUED operator (`a&&wicked-estate`) is a different matter: the shared FINDING-045 tokenizer
+        // only splits `;`/`(`/`)` glued, not `&`/`|`, so `bash_write_targets` carries the identical
+        // limit — the documented defense-in-depth boundary (renamed binary / raw-SQLite also evade).
+        let Some(prog) = words.iter().find(|w| !is_env_assignment(w)) else {
+            continue;
+        };
         // Basename with the SAME logic [`bash_write_targets`] uses for command programs, so an
         // absolute or `\`-separated path to the binary resolves to the same family name.
         let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
@@ -2869,6 +2892,9 @@ mod boundary_tests {
             format!("wicked-estate-mcp --db {shared}"),
             "wicked-estate.exe index .".to_string(),
             "wicked-estate-mcp.exe --db x".to_string(),
+            // Env-assignment prefixes do not hide the program (Copilot #385):
+            format!("WICKED_X=1 wicked-estate index . --db {shared}"),
+            "A=b C=d wicked-estate index .".to_string(),
         ] {
             let cmd = json!({ "command": c.clone() });
             let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
@@ -2881,7 +2907,10 @@ mod boundary_tests {
             json!({ "command": format!("cat notes.txt; wicked-estate index . --db {shared}") });
         let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
             .expect("an estate invocation after `;` must still be denied");
-        assert!(fatal, "the estate deny scans every pipeline/sequence segment");
+        assert!(
+            fatal,
+            "the estate deny scans every pipeline/sequence segment"
+        );
 
         // No false positive: ordinary read-only commands are NOT denied by this rule — including
         // one where `wicked-estate` appears only as an ARGUMENT (grep pattern), not the program.
