@@ -645,12 +645,21 @@ fn bash_denied_estate_indexer(command: &str) -> Option<String> {
     const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
     let mut segments: Vec<Vec<&str>> = Vec::new();
     let mut seg: Vec<&str> = Vec::new();
+    let mut skip_redirect_target = false;
     for &t in &toks {
         if SEPS.contains(&t) {
             if !seg.is_empty() {
                 segments.push(std::mem::take(&mut seg));
             }
-        } else if redirect_glob(t).is_none() {
+            skip_redirect_target = false;
+        } else if skip_redirect_target {
+            // The spaced target of a redirect operator (`> file`): drop it too, so a PREFIX redirect
+            // (`> /dev/null wicked-estate …`) cannot make the target look like the program.
+            skip_redirect_target = false;
+        } else if let Some(glued) = redirect_glob(t) {
+            // Redirect OPERATOR: drop it; if its filename is not glued on, the NEXT token is the target.
+            skip_redirect_target = glued.is_empty();
+        } else {
             seg.push(t);
         }
     }
@@ -658,23 +667,47 @@ fn bash_denied_estate_indexer(command: &str) -> Option<String> {
         segments.push(seg);
     }
     for words in &segments {
-        // The program is the first word that is NOT a leading `NAME=value` env-assignment prefix:
-        // `X=1 wicked-estate …` runs wicked-estate with `X` exported, so the assignment is not the
-        // program word (Copilot #385 — a common, legitimate shell form, not just evasion). A no-space
-        // GLUED operator (`a&&wicked-estate`) is a different matter: the shared FINDING-045 tokenizer
-        // only splits `;`/`(`/`)` glued, not `&`/`|`, so `bash_write_targets` carries the identical
-        // limit — the documented defense-in-depth boundary (renamed binary / raw-SQLite also evade).
-        let Some(prog) = words.iter().find(|w| !is_env_assignment(w)) else {
-            continue;
-        };
-        // Basename with the SAME logic [`bash_write_targets`] uses for command programs, so an
-        // absolute or `\`-separated path to the binary resolves to the same family name.
-        let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
-        if matches!(
-            base,
-            "wicked-estate" | "wicked-estate.exe" | "wicked-estate-mcp" | "wicked-estate-mcp.exe"
-        ) {
-            return Some(words.join(" "));
+        // Find the program word, seeing through the common, LEGITIMATE prefixes that would otherwise
+        // hide it (Copilot #385): leading `NAME=value` env-assignments (`X=1 wicked-estate …`) and an
+        // `env [flags] [NAME=value]... cmd` wrapper (`env X=1 wicked-estate …`). Prefix redirects were
+        // already dropped above.
+        //
+        // BEST-EFFORT BY DESIGN: a literal scan cannot see through every invocation form (a renamed
+        // binary, `sh -c '…'`, `xargs`/`nice`/`timeout` wrappers, `env -u VAR …`, raw SQLite via
+        // python, or the no-space glued operator `a&&wicked-estate` — the shared FINDING-045 tokenizer
+        // limit `bash_write_targets` also carries). The HERMETIC containment is Boundary 1's OS
+        // sandbox: the shared graph db lives OUTSIDE the worktree, so a kernel write-deny stops EVERY
+        // form when the sandbox is armed. This scan is the secondary layer for sandbox-less hosts.
+        let mut idx = 0;
+        loop {
+            while idx < words.len() && is_env_assignment(words[idx]) {
+                idx += 1;
+            }
+            let Some(prog) = words.get(idx) else { break };
+            // Basename with the SAME logic [`bash_write_targets`] uses, so an absolute or
+            // `\`-separated path resolves to the same family name.
+            let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+            if base == "env" {
+                // Unwrap `env [flags] [NAME=value]... cmd`: skip env, its flags, and assignments; the
+                // next word is the real program (arg-taking flags like `-u VAR` are not modeled — best-effort).
+                idx += 1;
+                while idx < words.len()
+                    && (words[idx].starts_with('-') || is_env_assignment(words[idx]))
+                {
+                    idx += 1;
+                }
+                continue;
+            }
+            if matches!(
+                base,
+                "wicked-estate"
+                    | "wicked-estate.exe"
+                    | "wicked-estate-mcp"
+                    | "wicked-estate-mcp.exe"
+            ) {
+                return Some(words.join(" "));
+            }
+            break;
         }
     }
     None
@@ -2892,9 +2925,14 @@ mod boundary_tests {
             format!("wicked-estate-mcp --db {shared}"),
             "wicked-estate.exe index .".to_string(),
             "wicked-estate-mcp.exe --db x".to_string(),
-            // Env-assignment prefixes do not hide the program (Copilot #385):
+            // Env-assignment prefixes, the `env` wrapper, and prefix redirects do not hide the
+            // program (Copilot #385):
             format!("WICKED_X=1 wicked-estate index . --db {shared}"),
             "A=b C=d wicked-estate index .".to_string(),
+            "env wicked-estate index .".to_string(),
+            format!("env WICKED_X=1 wicked-estate index . --db {shared}"),
+            "env -i wicked-estate index .".to_string(),
+            format!("> /dev/null wicked-estate index . --db {shared}"),
         ] {
             let cmd = json!({ "command": c.clone() });
             let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
@@ -2914,7 +2952,13 @@ mod boundary_tests {
 
         // No false positive: ordinary read-only commands are NOT denied by this rule — including
         // one where `wicked-estate` appears only as an ARGUMENT (grep pattern), not the program.
-        for benign in ["ls", "cat file.txt", "grep -r wicked-estate ."] {
+        for benign in [
+            "ls",
+            "cat file.txt",
+            "grep -r wicked-estate .",
+            "env ls",
+            "env X=1 ls",
+        ] {
             let cmd = json!({ "command": benign });
             assert!(
                 boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash").is_none(),
