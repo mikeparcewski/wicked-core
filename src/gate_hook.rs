@@ -333,6 +333,23 @@ fn boundary_denial_with(
                     return Some((format!("Bash write leaves the unit boundary: {d}"), fatal));
                 }
             }
+            // Close the residual bash-indexer write path on the SHARED project graph
+            // (DES-GROUNDING-001 §6). The estate `--db` path rides the worker-readable inbox
+            // mcp-config, and the MCP `--readonly` mode closed only the tool surface — a raw
+            // `wicked-estate index --db <that path>` via Bash would delete-sweep the graph
+            // concurrent runs share. Engine-level deny, unit-FATAL. Same defense-in-depth limit
+            // as bash_write_targets above (a renamed binary or raw-SQLite python still evades it).
+            if let Some(segment) = bash_denied_estate_indexer(command) {
+                return Some((
+                    format!(
+                        "Bash invokes the wicked-estate CLI, which can rewrite the SHARED \
+                         project graph (DES-GROUNDING-001 §6): `{segment}`. Grounding reaches \
+                         the graph through the estate MCP; the CLI is not available to a \
+                         governed unit."
+                    ),
+                    true,
+                ));
+            }
         }
     }
 
@@ -582,6 +599,62 @@ fn bash_write_targets(command: &str) -> Vec<String> {
     // leaving the worktree, not a ban on discarding output.
     targets.retain(|t| !is_safe_write_sink(t));
     targets
+}
+
+/// Deny an in-run invocation of the wicked-estate CLI from Bash (DES-GROUNDING-001 §6).
+///
+/// Grounding a governed run reaches the project graph through the estate MCP, whose config the
+/// worker sees over the inbox mcp-config. That config carries the graph's `--db` path, and the
+/// MCP's `--readonly` mode closed only the TOOL surface — it does nothing to a raw
+/// `wicked-estate index --db <that path>` run through Bash, which would delete-sweep and reindex
+/// the graph that concurrent runs SHARE. This closes that residual write path at the worker's Bash
+/// boundary by denying the estate binary family outright: a governed unit has no legitimate reason
+/// to drive the estate CLI in-run (grounding is via the MCP), so the WHOLE family is refused —
+/// not just the mutating subcommands — which is simplest and future-proof.
+///
+/// DEFENSE-IN-DEPTH, not a hermetic sandbox — the SAME honest limit [`bash_write_targets`] and its
+/// caller document: the shell is Turing-complete, so a worker who copies/renames the binary, or
+/// writes raw SQLite via `python`, still evades a scan of the literal command. This closes the
+/// DIRECT, named escape; OS-level containment is the only hermetic guarantee and this codebase does
+/// not yet have it.
+///
+/// Returns the offending pipeline/sequence segment (so the deny message can NAME it), or `None`.
+fn bash_denied_estate_indexer(command: &str) -> Option<String> {
+    let owned = shell_tokens(command);
+    let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
+
+    // Split into pipeline/sequence SEGMENTS on the same shell separators [`bash_write_targets`]
+    // uses, so an estate invocation after a pipe / `;` / `&&` is checked as its own program — not
+    // missed because the first word of the whole line was something else. Redirect operators (and
+    // their glued targets) are dropped so a leading redirect cannot hide the program word.
+    const SEPS: [&str; 8] = ["|", "||", "&&", ";", "&", "|&", "(", ")"];
+    let mut segments: Vec<Vec<&str>> = Vec::new();
+    let mut seg: Vec<&str> = Vec::new();
+    for &t in &toks {
+        if SEPS.contains(&t) {
+            if !seg.is_empty() {
+                segments.push(std::mem::take(&mut seg));
+            }
+        } else if redirect_glob(t).is_none() {
+            seg.push(t);
+        }
+    }
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
+    for words in &segments {
+        let Some(prog) = words.first() else { continue };
+        // Basename with the SAME logic [`bash_write_targets`] uses for command programs, so an
+        // absolute or `\`-separated path to the binary resolves to the same family name.
+        let base = prog.rsplit(['/', '\\']).next().unwrap_or(prog);
+        if matches!(
+            base,
+            "wicked-estate" | "wicked-estate.exe" | "wicked-estate-mcp" | "wicked-estate-mcp.exe"
+        ) {
+            return Some(words.join(" "));
+        }
+    }
+    None
 }
 
 /// A standard character-device write sink (not a filesystem location that can hold an escaped file).
@@ -2761,6 +2834,63 @@ mod boundary_tests {
             )
             .expect("blocked");
             assert!(fatal, "a non-temp escape stays unit-FATAL");
+        }
+    }
+
+    /// DES-GROUNDING-001 §6 — a worker cannot reach the SHARED project graph by running the
+    /// wicked-estate CLI from Bash. The estate `--db` path rides the worker-readable inbox
+    /// mcp-config, and the MCP `--readonly` mode closed only the tool surface, so a raw
+    /// `wicked-estate index --db <shared>` would delete-sweep and reindex the graph concurrent
+    /// runs share. The engine denies the estate binary family outright (grounding is via the MCP),
+    /// unit-FATAL; benign read-only commands are untouched.
+    #[test]
+    fn a_bash_wicked_estate_invocation_is_denied_fatal() {
+        let wt = std::env::temp_dir().join("wicked-boundary-wt-estate");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let shared = "/srv/estate/project.db";
+
+        // The named escape: index the shared graph via the CLI → blocked, unit-FATAL.
+        let cmd = json!({ "command": format!("wicked-estate index . --db {shared}") });
+        let (reason, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
+            .expect("a Bash wicked-estate invocation must be denied");
+        assert!(
+            fatal,
+            "invoking the estate CLI on the shared graph is unit-FATAL: {reason}"
+        );
+
+        // Absolute-path program, and the `-mcp` / `.exe` basename variants — all one family,
+        // and the whole family is denied even without a `--db` (a worker has no in-run use for it).
+        for c in [
+            format!("/usr/local/bin/wicked-estate index . --db {shared}"),
+            format!("wicked-estate-mcp --db {shared}"),
+            "wicked-estate.exe index .".to_string(),
+            "wicked-estate-mcp.exe --db x".to_string(),
+        ] {
+            let cmd = json!({ "command": c.clone() });
+            let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
+                .unwrap_or_else(|| panic!("estate CLI variant must be denied: {c}"));
+            assert!(fatal, "every estate CLI variant is unit-FATAL: {c}");
+        }
+
+        // A segment in a `;` sequence (or a pipeline) is caught, not just the leading program.
+        let cmd =
+            json!({ "command": format!("cat notes.txt; wicked-estate index . --db {shared}") });
+        let (_, fatal) = boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash")
+            .expect("an estate invocation after `;` must still be denied");
+        assert!(fatal, "the estate deny scans every pipeline/sequence segment");
+
+        // No false positive: ordinary read-only commands are NOT denied by this rule — including
+        // one where `wicked-estate` appears only as an ARGUMENT (grep pattern), not the program.
+        for benign in ["ls", "cat file.txt", "grep -r wicked-estate ."] {
+            let cmd = json!({ "command": benign });
+            assert!(
+                boundary_denial_with(&roots, &wt, None, None, &cmd, "Bash").is_none(),
+                "a benign Bash command must not trip the estate deny: {benign}"
+            );
         }
     }
 
