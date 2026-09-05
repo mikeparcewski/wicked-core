@@ -33,9 +33,11 @@ admission routes off that distinction, each independently gateable by a future c
   file writes, wins over project config) and shipped `acp_input_governance: true`. This design ran
   the same question against codex-acp and reached the opposite, equally well-evidenced conclusion.
 
-**Carrier:** `src/acp_permission.rs` (`pretool_payload`) and `crates/wicked-council/src/registry.rs`
-(the `codex` `AcpConfig` block, `registry.rs:219-243`) are the sites a YES answer would have touched.
-Neither is touched by this deliverable.
+**Carrier:** `src/acp_permission.rs` (`pretool_payload`) and the `codex` `AcpConfig` block in
+`crates/wicked-council/src/registry.rs` are the sites a YES answer would have touched. Neither is
+touched behaviorally here — `acp_permission.rs` is untouched entirely, and the only change to
+`registry.rs` is the codex seat's rationale COMMENT (no field or `AcpConfig` change). (Line numbers
+omitted deliberately: they drift; the seat is identified by its `key = "codex"` entry.)
 
 **No `ASSUMPTION[external-transform]` applies** — same reasoning as DES-INPUT-GOV-002 §8 and
 DES-INPUT-GOV-006: this design evaluates whether a third-party adapter's *own* config surface can be
