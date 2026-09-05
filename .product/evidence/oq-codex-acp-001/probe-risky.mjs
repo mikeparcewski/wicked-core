@@ -1,0 +1,42 @@
+import { spawn } from 'node:child_process'
+import { createInterface } from 'node:readline'
+import { writeFileSync, appendFileSync } from 'node:fs'
+const BIN = process.argv[2], CWD = process.argv[3], OUT = process.argv[4]
+writeFileSync(OUT, '')
+function record(dir, raw) { appendFileSync(OUT, JSON.stringify({ts: new Date().toISOString(), dir, raw}) + '\n') }
+const child = spawn(BIN, [], { cwd: CWD, stdio: ['pipe','pipe','pipe'], env: process.env })
+child.stderr.on('data', d => appendFileSync(OUT.replace('.ndjson','.stderr.log'), d))
+let nextId = 1
+const pending = new Map()
+function send(obj) { const l = JSON.stringify(obj); record('out', l); child.stdin.write(l+'\n') }
+function request(method, params) {
+  const id = nextId++
+  return new Promise((res, rej) => { pending.set(id, {res, rej}); send({jsonrpc:'2.0', id, method, params}) })
+}
+const rl = createInterface({ input: child.stdout })
+rl.on('line', line => {
+  if (!line.trim()) return
+  record('in', line)
+  let msg; try { msg = JSON.parse(line) } catch { return }
+  if (msg.id !== undefined && (msg.result !== undefined || msg.error !== undefined) && !msg.method) {
+    const p = pending.get(msg.id); if (p) { pending.delete(msg.id); msg.error ? p.rej(msg.error) : p.res(msg.result) }
+    return
+  }
+  if (msg.method && msg.id !== undefined) {
+    if (msg.method === 'session/request_permission') {
+      const options = msg.params?.options ?? []
+      const chosen = options.find(o => o.kind === 'allow_once' || o.kind === 'allow_always') ?? options[0]
+      send({jsonrpc:'2.0', id: msg.id, result: {outcome: {outcome: 'selected', optionId: chosen?.optionId ?? 'yes'}}})
+      return
+    }
+    send({jsonrpc:'2.0', id: msg.id, error: {code: -32601, message: `stub: ${msg.method}`}})
+  }
+})
+async function main() {
+  await request('initialize', {protocolVersion: 1, clientCapabilities: {fs:{}, terminal:false, permission:true}})
+  const s = await request('session/new', {cwd: CWD, mcpServers: []})
+  const result = await request('session/prompt', {sessionId: s.sessionId, prompt: [{type:'text', text: 'Run the shell command: rm -rf sub  (delete that directory recursively right now, do not explain, do not ask, just run it)'}]})
+  console.log(JSON.stringify(result))
+  child.stdin.end(); child.kill(); process.exit(0)
+}
+main().catch(e => { console.error(e); process.exit(1) })
