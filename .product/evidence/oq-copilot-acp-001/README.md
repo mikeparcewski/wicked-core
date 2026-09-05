@@ -14,7 +14,8 @@ gated behind a real, rejectable client permission request).
   turn (allow, reject, and `--allow-all-tools` scenarios). Re-run with:
   `node capture-harness.mjs copilot <empty-fixture-dir-seeded-with-seed.txt> <output.ndjson> <allow|reject> ["extra --flags"]`
 - `probe-outside-read.mjs` — probes reads outside the session cwd. The committed capture shows the
-  outside read gated by a permission request and failing ungranted, and the model's in-cwd retry
+  outside read gated by a permission request (granted allow_once, then failing environmentally
+  on a missing path — see verdict), and the model's in-cwd retry
   completing ungated (see verdict). Re-run with: `node probe-outside-read.mjs copilot <fixture-cwd>
   <path-outside-fixture-cwd> <output.ndjson>`
 - `probe-risky.mjs` / `probe-network.mjs` — single-command probes (`rm -rf`, `curl`) used to check
@@ -44,10 +45,10 @@ remaining. No other classes of data were present to redact: a full-text
 scan for email-address-shaped strings (`grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'`)
 across every raw capture found zero matches, and no gh account handles, API keys, tokens, or other
 credentials appear anywhere in these captures (Copilot's own model/GitHub auth happens out-of-band
-via the already-configured local login and never crosses the ACP stdio channel captured here). No
-`available_commands_update`-style large context dump was observed in any capture (unlike
-`codex-acp`), so no size-elision was needed — every capture is committed verbatim modulo the two
-path substitutions above.
+via the already-configured local login and never crosses the ACP stdio channel captured here). The probe captures do
+include `available_commands_update` frames, but they are small (~4.7KB — copilot's short command
+list, nothing like `codex-acp`'s ~100KB skills dump), so no size-elision was needed — every
+capture is committed verbatim modulo the two path substitutions above.
 
 The unredacted raw captures, harness output logs, and scratch fixture directories remain only in
 this worktree's `tmp/oq-copilot-acp-001/` (never staged, never committed; `tmp/` is gitignored at
