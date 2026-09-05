@@ -27,7 +27,7 @@ But at runtime the tools **never reach the worker's function set**. A proof run'
 | **E** | `--mcp-config` | `acceptEdits` + `permissions.allow:["mcp__wicked-estate"]` | ✅ **Works** — real cross-repo results |
 
 **Proven conclusions:**
-1. **Gap #1 (keystone).** claude only surfaces MCP tools loaded via **`--mcp-config`**, not via `--settings` `mcpServers`; and in `acceptEdits`/headless mode a registered MCP tool is still blocked unless allow-listed. Both are required; the current config has **neither**. (`grep mcp-config src/` → zero hits.)
+1. **Gap #1 (keystone).** claude only surfaces MCP tools loaded via **`--mcp-config`**, not via `--settings` `mcpServers`; and in `acceptEdits`/headless mode a registered MCP tool is still blocked unless allow-listed. Both are required; the pre-change config had **neither** (before this change, `grep mcp-config src/` returned zero hits — the estate MCP rode only the inert `--settings` `mcpServers` key).
 2. **Gap #2 (smaller than first written).** The interactive-draft launch already resolves and passes a `projectGraph` binding and runs **repo-less** (`draft-events.ts:859-889`), so `run_code_graph_db` binds the labeled 145 MB project graph, not a single repo (`actor.rs:498-510`; repo-less ⇒ `repo_code_graph_db(None)=None`, `:169-173`). The single-repo graph seen in the proof (`wicked-core/.codegraph/estate.db`) was an artifact of a **generic** `chat` run via `POST /runs`, which does **not** pass the binding. So the draft path needs no gap-#2 code change — only a live check; passing the binding on generic runs is a follow-on.
 3. **Gap #3.** The interactive-draft prompt still names only the file snapshot (`draft-events.ts:287-290 draftProblem`); nothing instructs the worker to ground via the estate tools.
 

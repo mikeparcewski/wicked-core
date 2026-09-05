@@ -1703,14 +1703,17 @@ fn arm_input_governance(
     // Insert `--mcp-config <path>` FIRST so it parses as a flag (never demoted past the prompt / a `--`
     // guard). It is variadic and takes a FILE PATH — not comma-joinable — so it cannot ride the
     // append-or-before-`--` path of `inject_isolation_flags` (a bare positional prompt could be swallowed
-    // as a second config); it goes at argv position 1 exactly like `--settings`. An operator template
-    // that already pins `--mcp-config` wins (suppression guard). We inject `--mcp-config` before
+    // as a second config); it goes at argv position 1 exactly like `--settings`. Injected
+    // UNCONDITIONALLY, like `--settings` below: the engine always arms its own governed grounding, and a
+    // deference guard here would have to scan the built argv — which carries the model-authored prompt as
+    // a bare positional, so a prompt token `--mcp-config` could suppress the injection and silently
+    // un-ground the worker (the same untrusted-text-flips-a-boundary hazard `inject_isolation_flags`
+    // avoids by scanning the TEMPLATE, not argv). `--mcp-config` is variadic, so an operator template that
+    // also pins one merges rather than conflicts — there is nothing to defer to. Injected before
     // `--settings` so `--settings` ends up first — keeping the argv layout other callers read.
     if let Some(path) = mcp_config_path {
-        if !argv_states(argv, &["--mcp-config"]) {
-            argv.insert(1, path.to_string_lossy().into_owned());
-            argv.insert(1, "--mcp-config".to_string());
-        }
+        argv.insert(1, path.to_string_lossy().into_owned());
+        argv.insert(1, "--mcp-config".to_string());
     }
     // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
     // prompt / a `--` guard).
