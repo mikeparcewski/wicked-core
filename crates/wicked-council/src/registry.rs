@@ -283,14 +283,29 @@ pub fn builtin() -> Vec<AgenticCli> {
             alt_binaries: vec!["gh-copilot".into()],
             confidence: Confidence::Verified,
             enabled_for_council: true,
-            // copilot speaks native ACP over stdio (`copilot --acp`): verified initialize /
-            // session/new / session/prompt with agent_message_chunk streaming (v1.0.75).
+            // Native ACP over stdio (`copilot --acp`, no bridge — same binary as headless mode).
             acp: Some(AcpConfig {
                 binary: "copilot".into(),
                 start_args: vec!["--acp".into()],
                 transport: AcpTransport::Stdio,
                 auth_method: None,
-                // OQ-COPILOT-ACP-001 must prove permission coverage before admission.
+                // OQ-COPILOT-ACP-001 resolved NOT admitted (see .product/evidence/
+                // oq-copilot-acp-001/ and .product/DES-INPUT-GOV-004-copilot-acp-admission.md).
+                // Unlike pi (no permission plumbing) and codex (plumbing exists but is
+                // short-circuited by an internal reviewer), copilot's default invocation — this
+                // exact one, no extra flags — genuinely blocks on session/request_permission for
+                // every edit and every bash-class call observed, including a destructive `rm -rf`
+                // and a network `curl`, and a selected reject was proven to actually prevent the
+                // action (the only one of pi/codex/copilot where that held). The gap: in-workspace
+                // reads complete with zero permission requests (only out-of-workspace reads are
+                // gated), and every request carries a free-text title, never a canonical tool
+                // name. The read gap does not change worktree-boundary allow/deny outcomes (the
+                // gate would allow an in-worktree read anyway) but leaves no audit claim for those
+                // calls and is a standing gap the moment a content/path-pattern read policy exists.
+                // A scoped (edit/execute-only) admission is possible in principle but needs a
+                // capability-shape change beyond a single bool (OQ-ACP-GOV-SCOPE-001, unresolved).
+                // Stays disclosed-ungoverned until either the read gap closes or scoped admission
+                // ships.
                 acp_input_governance: false,
             }),
             capabilities: Some(
