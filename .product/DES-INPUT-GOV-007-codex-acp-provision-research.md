@@ -1,9 +1,10 @@
 # DES-INPUT-GOV-007 — OQ-CODEX-ACP-PROVISION-001: does codex-acp expose a provisionable route to client-side approval?
 
 **Issue:** wicked-core #367 (follow-up to OQ-CODEX-ACP-001).
-**Phase:** clarify (research + analysis) → **design (this amendment)**. **No production code in
-this deliverable** — `crates/wicked-council/src/registry.rs`'s `codex` `AcpConfig` is unchanged; the
-flag stays `acp_input_governance: false`, exactly as `DES-INPUT-GOV-003` left it. Operator-approved
+**Phase:** clarify (research + analysis) → **design (this amendment)**. **No behavior or field
+change in this deliverable** — the only touch to `crates/wicked-council/src/registry.rs` is the
+codex seat's rationale COMMENT recording this verdict; its `AcpConfig` is unchanged and the flag
+stays `acp_input_governance: false`, exactly as `DES-INPUT-GOV-003` left it. Operator-approved
 disposition: the clarify phase's NOT-ADMITTED verdict below is correct and well-evidenced (no config
 seam decouples approval-routing from sandbox in codex-acp's *compiled* runtime, and the
 finer-grained `PermissionProfile` surface, while present in the upstream *repository*, is

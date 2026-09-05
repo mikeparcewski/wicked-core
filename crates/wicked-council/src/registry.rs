@@ -244,7 +244,8 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // matches on free shell text instead of a canonical tool identity, a degraded
                 // basis for admission. Stays disclosed-ungoverned
                 // until a pinned adapter version proves per-call gating for every core intent.
-                // OQ-CODEX-ACP-PROVISION-001 (DES-INPUT-GOV-007) asked the opencode-style follow-up:
+                // OQ-CODEX-ACP-PROVISION-001 (see .product/DES-INPUT-GOV-007-codex-acp-provision-research.md)
+                // asked the opencode-style follow-up:
                 // is there a config/flag/env that routes approvals to the client instead of
                 // auto_review, the way OPENCODE_CONFIG_CONTENT did for opencode (DES-INPUT-GOV-006)?
                 // Source-verified across codex-acp@1.9.0 and @1.10.0 (identical on this surface):
