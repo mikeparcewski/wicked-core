@@ -9,7 +9,7 @@ real, rejectable client permission request).
   ("strict") fixture variant was captured alongside the registry's literal invocation.
 - `verdict.md` — the per-property analysis and the recommended admission decision. **This is a
   CLARIFY-phase deliverable: it records the evidence and a recommended verdict but does not modify
-  `crates/wicked-council/src/registry.rs`. Any registry comment update is deferred to a later phase.**
+  `crates/wicked-council/src/registry.rs`. The run's later implementation phase applied the comment-only registry update citing this verdict — both land in this PR.**
 - `capture-harness.mjs` — the reproducible capture harness for the four-step read/edit/bash/write
   turn (allow and reject scenarios, against either a plain or a `permission`-configured fixture).
   Re-run with:

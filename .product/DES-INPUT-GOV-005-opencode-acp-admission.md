@@ -48,7 +48,7 @@ OQ-ACP-GOV-SCOPE-001 under #360.
 **opencode is NOT ADMITTED. `acp_input_governance` stays `false` for the built-in `opencode` seat.**
 
 The decision requires **no field change** — the flag is already `false` (DES-INPUT-GOV-002 set it so
-for every non-claude seat). The only production change deferred to the implementation phase is the
+for every non-claude seat). The only production change — applied by the run's later implementation phase and included in this same PR — is the
 **registry comment** on the `opencode` `AcpConfig`, updated to cite this verdict and the headline
 finding, mirroring the OQ-CODEX-ACP-001 / OQ-COPILOT-ACP-001 → `registry.rs` updates.
 

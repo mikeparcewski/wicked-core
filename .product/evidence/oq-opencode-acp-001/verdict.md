@@ -2,7 +2,7 @@
 
 **Recommended admission: NOT ADMITTED.** `acp_input_governance` stays `false` for opencode's built-in
 `AcpConfig`. This clarify phase produced this evidence and recommendation; any registry comment
-update is deferred to a later, implementation phase (`acp_input_governance` itself is not touched).
+update was applied by the run's later implementation phase and ships in this same PR (`acp_input_governance` itself stays `false`).
 See `manifest.md` for the exact pinned artifact and the eight `*.ndjson` capture files for the raw
 (redacted) frames this verdict is based on.
 
@@ -178,7 +178,7 @@ reviewer overrides the client" — opencode is the first of the four seats evalu
 forward path is "ship a config the wicked side controls" rather than "wait for or request an upstream
 change".
 
-## Registry disposition (deferred to the implementation phase)
+## Registry disposition (applied by the implementation phase, in this PR)
 
 This clarify-phase deliverable makes **no edit** to `crates/wicked-council/src/registry.rs`. If this
 recommendation is accepted, the implementation phase should: (1) leave `acp_input_governance: false`
