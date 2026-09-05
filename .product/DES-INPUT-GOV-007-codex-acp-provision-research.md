@@ -1,9 +1,18 @@
 # DES-INPUT-GOV-007 — OQ-CODEX-ACP-PROVISION-001: does codex-acp expose a provisionable route to client-side approval?
 
 **Issue:** wicked-core #367 (follow-up to OQ-CODEX-ACP-001).
-**Phase:** clarify (research + analysis + forward-path design). **No production code in this
-deliverable** — `crates/wicked-council/src/registry.rs`'s `codex` `AcpConfig` is unchanged; the flag
-stays `acp_input_governance: false`, exactly as `DES-INPUT-GOV-003` left it.
+**Phase:** clarify (research + analysis) → **design (this amendment)**. **No production code in
+this deliverable** — `crates/wicked-council/src/registry.rs`'s `codex` `AcpConfig` is unchanged; the
+flag stays `acp_input_governance: false`, exactly as `DES-INPUT-GOV-003` left it. Operator-approved
+disposition: the clarify phase's NOT-ADMITTED verdict below is correct and well-evidenced (no config
+seam decouples approval-routing from sandbox in codex-acp's *compiled* runtime, and the
+finer-grained `PermissionProfile` surface, while present in the upstream *repository*, is
+unreachable through that runtime). This design amendment's job is narrow: make the forward path
+concrete and dual-sourced — §5 now distinguishes the **compiled-runtime surface** (what `codex-acp`
+actually ships and executes, source of the NOT-ADMITTED verdict) from the **repo type surface**
+(what the vendored types in the same repo suggest the underlying `codex` app-server protocol
+*already supports*, just not wired through this adapter) and names two concrete, non-speculative
+admission routes off that distinction, each independently gateable by a future capture.
 
 **Predecessors:**
 - DES-INPUT-GOV-001 (recon, #360) — defines the OQ proof bar (blocking request / canonical name +
@@ -193,31 +202,60 @@ an assumption.
 
 ---
 
-## 5. Forward path — genuinely blocked on upstream, not on wicked-core's own design
+## 5. Forward path — two sourced tiers, not one undifferentiated "ask upstream"
 
-Both non-mutually-exclusive paths `DES-INPUT-GOV-003 §6` already named remain the only ways forward,
-now confirmed to require an **upstream** change (no wicked-owned config/env can substitute):
+The NOT-ADMITTED verdict (§1–§4) is about one specific artifact: **the compiled runtime `codex-acp`
+actually ships** (`dist/index.js`, what `wicked-council` spawns). That artifact's own **source
+repository** — same package, same `gitHead`, checked in the same research pass (§2.1, §2.5) — vendors
+a materially larger app-server type surface (`src/app-server/v2/PermissionProfile.ts`,
+`ActivePermissionProfile.ts`, `RequestPermissionProfile.ts`, `AdditionalFileSystemPermissions.ts`,
+`GuardianApprovalReview.ts`, `AutoReviewRequirements.ts`, ~500 files total) that the compiled
+runtime never calls into (§2.5's exhaustive grep: zero references to any of those four types in
+`dist/index.js`, only `GuardianApprovalReview`'s one-way notification path is wired). That gap — a
+richer protocol vendored but not exposed — is the load-bearing fact behind both routes below. It
+means the blocker is **not** "codex's protocol is incapable of this," it is **"codex-acp (this
+adapter) does not currently bridge to the part of the protocol that is capable of this."** That
+distinction is what makes both routes below concrete rather than speculative:
 
-1. **An upstream `codex-acp` change** adding a fourth `AgentMode` (or extending
-   `setSessionConfigOption` with an independent knob) that pairs `approvalsReviewer: "user"` with a
-   `sandboxPolicy` that actually denies workspace writes by default (so `on-request` has something to
-   escalate) while still permitting them once approved — i.e., a real ask-then-allow loop, not
-   `ReadOnly`'s ask-that-never-fires or `Agent`'s allow-without-asking. This is a request to file
-   upstream (`agentclientprotocol/codex-acp`), not something wicked-core can provision around, because
-   the pairing is hardcoded in the adapter's own three static objects, not exposed as decomposable
-   config.
-2. **Close the tool-name identity gap regardless of (1)** — `presentation.ts`'s `toolCall` still
+1. **Route A — upstream `codex-acp` wires up what it already vendors.** File upstream
+   (`agentclientprotocol/codex-acp`) asking it to surface a `PermissionProfile`/
+   `RequestPermissionProfile`-shaped session option (or a fourth `AgentMode`) that decouples
+   `approvalsReviewer: "user"` from `sandboxPolicy` — i.e., a profile that actually **denies**
+   workspace writes by default (so `on-request` has something to escalate, unlike today's
+   `ReadOnly`) while still permitting them once the client approves. This is a smaller ask than "add
+   a new feature": the request-response shapes already exist in their repo
+   (`RequestPermissionProfile.ts`, `PermissionProfileModificationParams.ts`,
+   `ActivePermissionProfileModification.ts`) as *generated types for the app-server protocol they
+   already talk to* — the work is wiring, not invention. **Evidence anchor for this claim**:
+   §2.1's GitHub tree listing (source repo, `gitHead 061f9a4a…`) vs §2.5's `dist/index.js` grep
+   (compiled runtime) — the same commit, two different surfaces, one wired and one not.
+2. **Route B — a wicked-owned bridge that speaks the codex app-server protocol directly, bypassing
+   `codex-acp` as the ACP layer entirely.** Since the underlying `codex` app-server protocol is what
+   `codex-acp` itself shells out to and translates (per `oq-codex-acp-001/manifest.md`'s own
+   `ASSUMPTION[external-transform]` line: `codex-acp` "receives its app-server JSON-RPC events and
+   approval decisions, and presents ACP session updates and permission requests to the client"), a
+   wicked-owned adapter could speak that same JSON-RPC app-server protocol directly — using the v2
+   `PermissionProfile`/`ActivePermissionProfile`/`RequestPermissionProfile` RPCs `codex-acp` already
+   vendors types for but never calls — and translate *that* into `session/request_permission` itself,
+   the same shape `src/acp_permission.rs`'s `pretool_payload` already consumes. This is materially
+   more implementation work than Route A (a new, wicked-maintained protocol bridge, not a config
+   flip) and duplicates ACP-protocol responsibilities `codex-acp` otherwise handles for free
+   (auth, session lifecycle, model/provider selection) — it should be the fallback if Route A stalls
+   upstream, not the first move.
+3. **Close the tool-name identity gap regardless of (1)/(2)** — `presentation.ts`'s `toolCall` still
    carries no canonical `toolName`/`toolCall.name`, only a free-text `title` (often the literal shell
-   command). Even if (1) lands, `pretool_payload` would key policy on that free text, same gap
-   `codex`/`copilot`/`opencode`'s own verdicts each recorded independently. A shared, cross-adapter
-   normalization (keyed on `toolCall.kind` rather than `title`) is the durable fix `DES-INPUT-GOV-006
-   §4` already flagged as a shared follow-up across all three.
+   command). Even if Route A or B lands, `pretool_payload` would key policy on that free text, same
+   gap `codex`/`copilot`/`opencode`'s own verdicts each recorded independently. A shared,
+   cross-adapter normalization (keyed on `toolCall.kind` rather than `title`) is the durable fix
+   `DES-INPUT-GOV-006 §4` already flagged as a shared follow-up across all three.
 
-Until (1) ships upstream and a fresh live capture (a new `oq-codex-acp-00N` evidence set, mirroring
+Until Route A ships upstream (preferred — no new wicked-owned protocol surface to maintain) or
+Route B is built, and a fresh live capture (a new `oq-codex-acp-00N` evidence set, mirroring
 `oq-opencode-acp-002`'s re-proof structure) shows a blocking `session/request_permission` for every
 core intent **with the write actually landing on approval**, flipping `acp_input_governance = true`
 for `codex` is not justified. This OQ is closed as **blocked-on-upstream**, not as
-**unresearched** — the distinction this design exists to establish.
+**unresearched** — the distinction this design exists to establish, and the two named routes (rather
+than one undifferentiated "wait for upstream") are what keep it actionable.
 
 ---
 
