@@ -57,13 +57,16 @@ mutating/executing call observed.
 `capture-allow.ndjson` and `capture-reject.ndjson` both include a `read` tool call ("Viewing
 seed.txt") that goes straight from `pending` to `completed` with **zero** permission requests —
 consistent across both runs. `probe-outside-read.ndjson`, which asks Copilot to read a file at a
-path outside the session's cwd, shows the opposite: for the genuinely-outside path
-(`/tmp/...`) a `session/request_permission` **does** arrive (`title: "Access paths outside
-trusted directories"`, `rawInput` carrying that exact outside path) and that gated `read`
-**failed** (the request was not granted). The model then retried against the same relative
-subpath resolved UNDER the worktree — an in-cwd read — which `completed` with **no** permission
-request. So the capture shows both findings at once: outside-cwd reads are gated (and an
-ungranted request prevents the read), while in-cwd reads are never gated.
+path outside the session's cwd, shows the opposite for the gating half: for the
+genuinely-outside path (`/tmp/...`) a `session/request_permission` **does** arrive
+(`title: "Access paths outside trusted directories"`, `rawInput` carrying that exact outside
+path). The harness answered `allow_once`, and the granted read then **failed environmentally**
+(`"Path does not exist"` — the probe file was not present at that path in this run), so this
+probe demonstrates the GATE for outside reads but says nothing about reject-prevents-read
+(property (c) evidence comes from `capture-reject.ndjson`'s write/bash scenarios instead). The
+model then retried against the same relative subpath resolved UNDER the worktree — an in-cwd
+read — which `completed` with **no** permission request. Net: outside-cwd reads are gated;
+in-cwd reads are never gated.
 
 This matches Copilot's documented path-permission model (`copilot help permissions`): "By default,
 file access is restricted to paths within the current working directory and its subdirectories,
