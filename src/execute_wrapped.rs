@@ -1200,7 +1200,14 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
         .map(|db| {
             (
                 resolve_estate_mcp_exe(),
-                vec!["--db".to_string(), db.to_string()],
+                // `--readonly` (DES-GROUNDING-001 §3.0): the estate MCP defaults its memory/knowledge
+                // domains to the OPERATOR's global stores ($WICKED_HOME/{memory,knowledge}.db), so a
+                // worker allow-listed onto the whole server could erase them (FINDING-067 class). The
+                // read-only binary mode advertises and dispatches only read/query tools, hard-rejecting
+                // every write. Enforced in the binary so BOTH carriers (wrapped `--mcp-config` here and
+                // the ACP `session/new` array) are covered identically — the ACP carrier has no
+                // `permissions.allow` analogue, so binary enforcement is the only remedy that reaches it.
+                vec!["--db".to_string(), db.to_string(), "--readonly".to_string()],
             )
         })
 }
@@ -1543,6 +1550,33 @@ pub(crate) fn assemble_read_roots(
     roots
 }
 
+/// Write `bytes` to `path` with the O_EXCL (`create_new`) TOCTOU discipline arming relies on. A local
+/// attacker who predicts the deterministic per-unit path could otherwise pre-place a symlink and
+/// redirect the write (council [6] TOCTOU). On a clash we UNLINK the existing entry — `remove_file`
+/// removes a SYMLINK itself, never its target — then re-create fresh with O_EXCL, tolerating a
+/// legitimate re-arm without ever writing through a pre-placed symlink. A truncate-reopen would FOLLOW
+/// such a symlink and overwrite an arbitrary file (gemini/Copilot security-critical). Shared by the
+/// `settings-{phase}.json` and `mcp-{phase}.json` writes so the two cannot drift apart.
+fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(path);
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(path)
+            } else {
+                Err(e)
+            }
+        })?;
+    f.write_all(bytes)
+}
+
 /// Arm INPUT governance for a governed claude unit (DES-OUTGOV-003 §2): derive the unit's REAL
 /// `resolve_scope(...)` / `unit-{ord}` (so the hook's policy `select` + the recorded `claim.phase` match
 /// the run engine's own per-unit gate, findings #1/#7), write a per-(unit,attempt) `--settings` file
@@ -1586,9 +1620,10 @@ fn arm_input_governance(
     // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
     // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
     let command = quote_exe_command(&exe);
-    // Include the wicked-estate MCP server so governed workers have access to the 23 estate tools
-    // (graph-view, code-graph, memory recall, etc.), pointed at the run's REPO-LOCAL graph. Using the
-    // resolved exe directory to find wicked-estate-mcp avoids hardcoding a PATH dependency.
+    // Include the wicked-estate MCP server so governed workers can GROUND their work in the estate
+    // index (code-graph, and — once wired — memory/knowledge/rules recall), pointed at the run's
+    // REPO-LOCAL (or PROJECT) graph. Using the resolved exe directory to find wicked-estate-mcp avoids
+    // hardcoding a PATH dependency.
     //
     // This USED to pass `gov.db_path` — the operational store — "so no separate lookup is needed".
     // That handed every governed worker a writable handle to the platform's own state, and FINDING-067
@@ -1598,70 +1633,85 @@ fn arm_input_governance(
     // files, so "the file is gone" is true of every one of them). The store it wiped held zero source
     // files, so the worker got nothing out of it either.
     //
-    // `None` ⇒ NO estate MCP. Falling back to `gov.db_path` is the bug; falling back to a scratch db
-    // is worse than nothing (tools that answer "not found" for a repo that plainly has the symbol are
-    // how an agent concludes the code does not exist — estate's own R3).
-    // Claude's `settings.json` wants a name-keyed object; the ACP path formats the same parts as an
-    // array (see `acp_runner`). One helper, one repo-scoped store, two shapes (FINDING-122).
-    let estate_mcp = repo_estate_mcp_parts(gov.code_graph_db.as_deref()).map(|(command, args)| {
-        serde_json::json!({
-            "wicked-estate": {
-                "command": command,
-                "args": args
-            }
-        })
-    });
+    // `None` ⇒ NO estate MCP (and no mcp-config file below). Falling back to `gov.db_path` is the bug;
+    // falling back to a scratch db is worse than nothing (tools that answer "not found" for a repo that
+    // plainly has the symbol are how an agent concludes the code does not exist — estate's own R3).
+    //
+    // DES-GROUNDING-001 §3.1: load the server via a SEPARATE `--mcp-config` file, NOT the `--settings`
+    // `mcpServers` key. Proven live: claude only surfaces MCP tools registered through `--mcp-config`;
+    // a server named under `--settings` `mcpServers` never enters the worker's function set (the worker
+    // reported "the MCP tools aren't wired into this session's function set" and fell back to reading
+    // files). `--settings` no longer carries `mcpServers` — it was inert and misleading there. The ACP
+    // path still formats the same parts (from the same `repo_estate_mcp_parts` helper) as its
+    // `session/new` array — one repo-scoped store, two carrier shapes (FINDING-122).
+    let estate_mcp_config =
+        repo_estate_mcp_parts(gov.code_graph_db.as_deref()).map(|(command, args)| {
+            serde_json::json!({
+                "mcpServers": {
+                    "wicked-estate": {
+                        "command": command,
+                        "args": args
+                    }
+                }
+            })
+        });
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
                 { "matcher": "*", "hooks": [ { "type": "command", "command": command } ] }
             ]
         },
-        // The same boundary `inject_isolation_flags` puts on argv, restated in the file. Belt and
+        // deny: the same boundary `inject_isolation_flags` puts on argv, restated in the file. Belt and
         // braces on purpose: the flag is the one that survives if this file fails to arm, and the
         // file is the one that survives an operator template that pins its own `--disallowedTools`.
-        "permissions": { "deny": deny_rules() },
-        "mcpServers": estate_mcp.unwrap_or_else(|| serde_json::json!({}))
+        //
+        // allow `mcp__wicked-estate` (DES-GROUNDING-001 §3.1): a registered MCP tool is still BLOCKED
+        // under `acceptEdits`/headless unless allow-listed — a non-interactive session can't answer the
+        // approval prompt. Whole-server allow is safe because the server runs `--readonly`
+        // (`repo_estate_mcp_parts` / §3.0): there is nothing destructive left to allow.
+        "permissions": { "deny": deny_rules(), "allow": ["mcp__wicked-estate"] }
     });
     let dir = decisions_path
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
     crate::gate_hook::create_dir_all_private(&dir)?;
-    // Per-unit settings file. Written with `create_new` (O_EXCL) so a local attacker who predicts the
-    // deterministic temp path can't pre-place a symlink and redirect the write (council [6] TOCTOU). On a
-    // clash we UNLINK the existing entry (removing a symlink itself, not its target) and re-create fresh
-    // with O_EXCL — tolerating a legitimate re-arm without ever writing through a pre-placed symlink.
+    // Per-unit settings file, written with the O_EXCL (symlink-safe) discipline (see
+    // `write_private_exclusive`) so a local attacker who predicts the deterministic temp path can't
+    // redirect the write.
     let settings_path = dir.join(format!("settings-{phase}.json"));
     let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&settings_path)
-            .or_else(|e| {
-                // On a clash, UNLINK the existing entry (remove_file removes a SYMLINK itself, never its
-                // target) then re-create fresh with O_EXCL. A truncate-reopen would FOLLOW a pre-placed
-                // symlink and overwrite an arbitrary file (gemini/Copilot security-critical); unlink+
-                // create_new tolerates a legitimate re-arm without ever writing through a symlink.
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    let _ = std::fs::remove_file(&settings_path);
-                    std::fs::OpenOptions::new()
-                        .create_new(true)
-                        .write(true)
-                        .open(&settings_path)
-                } else {
-                    Err(e)
-                }
-            })?;
-        f.write_all(&bytes)?;
-    }
+    write_private_exclusive(&settings_path, &bytes)?;
+    // Per-unit mcp-config file, ONLY when an estate graph is bound (`None` ⇒ no file, no flag — the
+    // FINDING-067 invariant that a worker never gets the operational store). Same O_EXCL discipline and
+    // same private dir as the settings file. It carries the estate server under its own `mcpServers`
+    // key because `--mcp-config` is the only channel claude surfaces MCP tools from (§3.1).
+    let mcp_config_path = match estate_mcp_config {
+        Some(cfg) => {
+            let path = dir.join(format!("mcp-{phase}.json"));
+            let bytes = serde_json::to_vec(&cfg).map_err(std::io::Error::other)?;
+            write_private_exclusive(&path, &bytes)?;
+            Some(path)
+        }
+        None => None,
+    };
     // Write the ARMED marker BEFORE the CLI runs: its presence lets the actor-side fold distinguish a
     // governed unit that legitimately made no tool-calls (marker only) from one whose evidence was erased
     // or whose hook never fired (marker absent → fail closed). Closes the council evidence-integrity blocker.
     crate::gate_hook::write_armed_marker(&decisions_path, &phase)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
+    // Insert `--mcp-config <path>` FIRST so it parses as a flag (never demoted past the prompt / a `--`
+    // guard). It is variadic and takes a FILE PATH — not comma-joinable — so it cannot ride the
+    // append-or-before-`--` path of `inject_isolation_flags` (a bare positional prompt could be swallowed
+    // as a second config); it goes at argv position 1 exactly like `--settings`. An operator template
+    // that already pins `--mcp-config` wins (suppression guard). We inject `--mcp-config` before
+    // `--settings` so `--settings` ends up first — keeping the argv layout other callers read.
+    if let Some(path) = mcp_config_path {
+        if !argv_states(argv, &["--mcp-config"]) {
+            argv.insert(1, path.to_string_lossy().into_owned());
+            argv.insert(1, "--mcp-config".to_string());
+        }
+    }
     // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
     // prompt / a `--` guard).
     argv.insert(1, settings_path.to_string_lossy().into_owned());
@@ -3120,6 +3170,8 @@ mod tests {
             g.scope
         );
         // `--settings <file>` inserted right after the binary (parses as a flag, before the prompt).
+        // `--mcp-config` is injected FIRST, so `--settings` still lands at position 1/2 — the layout
+        // other callers read (DES-GROUNDING-001 §3.1).
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "--settings");
         let settings_path = std::path::PathBuf::from(&argv[2]);
@@ -3127,6 +3179,20 @@ mod tests {
         assert!(
             settings_path.starts_with(std::env::temp_dir()),
             "settings live OUTSIDE any worktree (no repo pollution): {settings_path:?}"
+        );
+        // This unit binds a graph, so the estate MCP is armed via `--mcp-config <file>` (position 3/4).
+        assert_eq!(argv[3], "--mcp-config");
+        let mcp_config_path = std::path::PathBuf::from(&argv[4]);
+        assert!(mcp_config_path.exists(), "the mcp-config file was written");
+        assert!(
+            mcp_config_path.starts_with(std::env::temp_dir()),
+            "the mcp-config file lives OUTSIDE any worktree: {mcp_config_path:?}"
+        );
+        let mcp_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mcp_config_path).unwrap()).unwrap();
+        assert_eq!(
+            mcp_json["mcpServers"]["wicked-estate"]["args"][2], "--readonly",
+            "the estate MCP is loaded read-only via --mcp-config"
         );
         assert!(
             g.decisions_path.starts_with(std::env::temp_dir()),
@@ -3790,12 +3856,26 @@ mod tests {
             };
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
             arm_input_governance(&input, gov, &mut argv).unwrap();
-            let raw = std::fs::read(std::path::PathBuf::from(&argv[2])).unwrap();
+            // Locate each injected config file from the argv (never index a fixed position — arming
+            // now injects both `--settings` and, when a graph is bound, `--mcp-config`).
+            let file_after = |flag: &str| {
+                argv.iter()
+                    .position(|a| a == flag)
+                    .and_then(|i| argv.get(i + 1))
+                    .map(|p| {
+                        let raw = std::fs::read(std::path::PathBuf::from(p)).unwrap();
+                        (
+                            serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
+                            String::from_utf8(raw).unwrap(),
+                        )
+                    })
+            };
+            let (settings_json, settings_raw) =
+                file_after("--settings").expect("arming inserts `--settings <path>`");
+            // `--mcp-config <path>` is present ONLY when an estate graph is bound.
+            let mcp = file_after("--mcp-config");
             let _ = std::fs::remove_dir_all(gov_run_dir_for_test(run_id));
-            (
-                serde_json::from_slice::<serde_json::Value>(&raw).unwrap(),
-                String::from_utf8(raw).unwrap(),
-            )
+            (settings_json, settings_raw, mcp)
         };
 
         let op_db = "/abs/operational-core.db";
@@ -3805,8 +3885,9 @@ mod tests {
             .into_owned();
         let graph_db = graph_db.as_str();
 
-        // WITH a registered repo: the estate MCP is armed, pointed at the REPO-LOCAL graph.
-        let (json, raw) = read_settings(
+        // WITH a registered repo: the estate MCP is armed via a SEPARATE `--mcp-config` file (NOT the
+        // `--settings` `mcpServers` key — DES-GROUNDING-001 §3.1), pointed at the REPO-LOCAL graph.
+        let (json, raw, mcp) = read_settings(
             &crate::workflow::GovernanceContext {
                 db_path: op_db.to_string(),
                 code_graph_db: Some(graph_db.to_string()),
@@ -3815,18 +3896,43 @@ mod tests {
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
-        let args = json["mcpServers"]["wicked-estate"]["args"]
+        let (mcp_json, mcp_raw) =
+            mcp.expect("the estate MCP is armed via `--mcp-config` when a repo-local graph exists");
+        let args = mcp_json["mcpServers"]["wicked-estate"]["args"]
             .as_array()
-            .expect("the estate MCP is armed when a repo-local graph exists");
+            .expect("the mcp-config file carries the estate server");
         assert_eq!(args[0], "--db");
         assert_eq!(args[1], graph_db, "the MCP opens the repo-local graph");
+        assert_eq!(
+            args[2], "--readonly",
+            "the estate MCP runs read-only so whole-server allow is safe (§3.0)"
+        );
+        // The `--settings` object no longer carries `mcpServers` (inert there) and MUST allow the
+        // estate tools so they are callable under `acceptEdits`/headless.
+        assert!(
+            json.get("mcpServers").is_none(),
+            "the settings object must not carry `mcpServers` any more: {json}"
+        );
+        let allow = json["permissions"]["allow"]
+            .as_array()
+            .expect("the settings object allow-lists the estate tools");
+        assert!(
+            allow.iter().any(|v| v == "mcp__wicked-estate"),
+            "permissions.allow must include mcp__wicked-estate: {json}"
+        );
+        // The operational store appears NOWHERE — not in the settings file, not in the mcp-config file.
         assert!(
             !raw.contains(op_db),
             "the operational store must not appear ANYWHERE in the worker's settings: {raw}"
         );
+        assert!(
+            !mcp_raw.contains(op_db),
+            "the operational store must not appear in the mcp-config file: {mcp_raw}"
+        );
 
-        // WITHOUT one: NO estate MCP. Not the operational store, not a scratch db beside it.
-        let (json, raw) = read_settings(
+        // WITHOUT one: NO estate MCP. No mcp-config file at all — not the operational store, not a
+        // scratch db beside it (FINDING-067).
+        let (json, raw, mcp) = read_settings(
             &crate::workflow::GovernanceContext {
                 db_path: op_db.to_string(),
                 code_graph_db: None,
@@ -3836,8 +3942,12 @@ mod tests {
             &format!("mcptest-norepo-{}", std::process::id()),
         );
         assert!(
-            json["mcpServers"]["wicked-estate"].is_null(),
-            "no repo-local graph ⇒ no estate MCP: {json}"
+            mcp.is_none(),
+            "no repo-local graph ⇒ no `--mcp-config` file at all"
+        );
+        assert!(
+            json.get("mcpServers").is_none(),
+            "the settings object never carries `mcpServers`: {json}"
         );
         assert!(
             !raw.contains(op_db),
@@ -4913,11 +5023,12 @@ mod tests {
 /// hand-built `GovernanceContext`. None of them shows the value SURVIVING the whole trip, and the
 /// trip is where a binding gets dropped: `LaunchSpec` → actor → `AgentSession` → `dispatch_unit`
 /// → `run_code_graph_db` → `StepInput.governance` → `arm_input_governance` →
-/// `repo_estate_mcp_parts` → `mcpServers.wicked-estate.args` → the argv a worker is launched with.
+/// `repo_estate_mcp_parts` → the `--mcp-config` file's `mcpServers.wicked-estate.args` → the argv a
+/// worker is launched with.
 ///
 /// This drives a REAL run through a REAL actor against a file-backed store (so governance arms),
 /// with a real registered git repo that has its OWN graph on disk — so a broken preference shows
-/// up as the repo graph rather than as nothing — and reads the answer out of the settings file the
+/// up as the repo graph rather than as nothing — and reads the answer out of the mcp-config file the
 /// engine wrote.
 #[cfg(test)]
 mod project_graph_end_to_end_tests {
@@ -4963,7 +5074,7 @@ mod project_graph_end_to_end_tests {
     }
 
     /// The LAST hop, done for real: arm governance exactly as the wrapped path does and record the
-    /// `--db` the estate MCP server is given in the settings file the engine writes.
+    /// `--db` the estate MCP server is given in the `--mcp-config` file the engine writes.
     struct ArmingRunner {
         mcp_db: Arc<Mutex<Vec<Option<String>>>>,
     }
@@ -4976,18 +5087,19 @@ mod project_graph_end_to_end_tests {
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
             let settings_db = match arm_input_governance(input, &gov, &mut argv) {
                 Ok(_) => {
-                    // FIND the settings path rather than indexing `argv[2]` (Copilot on #299).
-                    // The index is a guess about where arming inserted `--settings`; if arming
-                    // ever inserts elsewhere this reads the PROMPT as json and the test fails
-                    // with a parse error that says nothing about the real change.
-                    let settings_path = argv
+                    // FIND the mcp-config path rather than indexing a fixed argv slot (Copilot on
+                    // #299). The estate server now lives in the `--mcp-config` file (DES-GROUNDING-001
+                    // §3.1), not the `--settings` `mcpServers` key. If arming ever inserts elsewhere
+                    // this reads the PROMPT as json and the test fails with a parse error that says
+                    // nothing about the real change.
+                    let mcp_config_path = argv
                         .iter()
-                        .position(|a| a == "--settings")
+                        .position(|a| a == "--mcp-config")
                         .and_then(|i| argv.get(i + 1))
-                        .expect("arming must insert `--settings <path>` into the argv");
-                    let settings: serde_json::Value =
-                        serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
-                    settings["mcpServers"]["wicked-estate"]["args"][1]
+                        .expect("arming must insert `--mcp-config <path>` when a graph is bound");
+                    let mcp_config: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(mcp_config_path).unwrap()).unwrap();
+                    mcp_config["mcpServers"]["wicked-estate"]["args"][1]
                         .as_str()
                         .map(str::to_string)
                 }
