@@ -35,12 +35,11 @@ operator's pre-existing local GitHub Copilot CLI login), which means `session/ne
 params, `tool_call` `rawInput`/`locations` fields, and diff bodies embed environment identity: the
 operator's home directory and this worktree's absolute path appear throughout.
 
-Before committing, every occurrence of the worktree-specific absolute path prefix
-(`/Users/<redacted-username>/Projects/wicked/wicked-core/wicked-worktrees/243ab76b-.../`) was
-replaced with `<WORKTREE_ROOT>`, and every occurrence of the operator's absolute home directory
-(`/Users/<redacted-username>`) was replaced with `<HOME>`, via plain Python string `.replace()` over
-the full NDJSON text, verified afterwards by grepping the output for the raw username and for
-`/Users/` with zero matches remaining. No other classes of data were present to redact: a full-text
+Before committing, every occurrence of the worktree-specific absolute path prefix was replaced
+with `<WORKTREE_ROOT>`, and every occurrence of the operator's absolute home-directory prefix was
+replaced with `<HOME>`, via plain Python string `.replace()` over the full NDJSON text, verified
+afterwards by grepping the output for the raw username and home-prefix marker with zero matches
+remaining. No other classes of data were present to redact: a full-text
 scan for email-address-shaped strings (`grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'`)
 across every raw capture found zero matches, and no gh account handles, API keys, tokens, or other
 credentials appear anywhere in these captures (Copilot's own model/GitHub auth happens out-of-band

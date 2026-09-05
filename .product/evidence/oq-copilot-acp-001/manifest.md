@@ -18,6 +18,7 @@ alone.
 | Field | Value |
 |---|---|
 | Distribution | GitHub Copilot CLI, installed via Homebrew cask `copilot-cli` (`/opt/homebrew/bin/copilot`, a compiled native Mach-O arm64 binary — **not** an npm/Node bridge process) |
+| Official ACP source | GitHub Docs, ["Copilot CLI ACP server"](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server): `copilot --acp` starts the CLI's ACP server and defaults to stdio when no transport is selected |
 | Self-reported version (`copilot --version`) | `GitHub Copilot CLI 1.0.83` |
 | Cask formula | `copilot-cli` 1.0.83 (`auto_updates`; originally cask-installed as 1.0.5 on 2026-03-16, the binary self-updates independent of the cask's tracked version — the self-reported `1.0.83` above is what was actually invoked for this capture, and is the authoritative version pin) |
 | Installed binary sha256 | `15f218a936f693a6b73df248824b9f7f528c2c61949ff446e4ca6062ee48b084` |
@@ -44,7 +45,7 @@ its semver range.
 | Node.js | not applicable — the invoked binary is a compiled native executable, not spawned via `node` |
 | OS | Darwin 25.5.0, arm64 (macOS) |
 | Transport | stdio, cwd = isolated fixture directory per run |
-| Auth | pre-existing local GitHub Copilot CLI login (`~/.copilot/session-store.db`, `~/.copilot/config.json` already present); no credentials cross the captured ACP stdio channel |
+| Auth | pre-existing local GitHub Copilot CLI login (local session store and configuration already present); no credentials cross the captured ACP stdio channel |
 
 ## Capture method
 
