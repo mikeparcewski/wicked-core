@@ -15,6 +15,13 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **core-ts 0.7.15** — npm release carrying DES-GROUNDING-001 + gov-008 Boundary 1: governed workers
+  now ground in the wicked-estate index — the estate MCP is loaded via `--mcp-config` (not the inert
+  `--settings` `mcpServers` key) and allow-listed (`permissions.allow`), run `--readonly` so the tool
+  surface is read-only (#383); the OS-sandbox write-deny floor is generalized from validator scripts
+  to wrap the CLI worker spawn (worktree = only writable root, default-OFF `os_sandbox`), disclosing
+  a new `SandboxUnenforced` CoreEvent and continuing when it cannot arm (#384); and the worker Bash
+  boundary fatally denies the `wicked-estate` CLI family (#385).
 - **core-ts 0.7.14** — npm release carrying #377 (umbrella #360): opencode is the FIRST admitted
   non-claude ACP seat, input-governed via a harness-provisioned config (`OPENCODE_CONFIG_CONTENT`,
   no tracked-file mutation), re-proven against the provisioned config, version-pin guarded; the
