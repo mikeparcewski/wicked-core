@@ -68,6 +68,8 @@ struct TomlAcpConfig {
     auth_method: Option<String>,
     #[serde(default)]
     acp_input_governance: Option<bool>,
+    #[serde(default)]
+    os_sandbox: Option<bool>,
 }
 
 impl From<TomlAcpConfig> for AcpConfig {
@@ -78,6 +80,7 @@ impl From<TomlAcpConfig> for AcpConfig {
             transport: t.transport,
             auth_method: t.auth_method,
             acp_input_governance: t.acp_input_governance.unwrap_or(false),
+            os_sandbox: t.os_sandbox.unwrap_or(false),
             // Neither is user-settable: both are an evidence-gated engine decision proven
             // against one specific pinned binary (DES-INPUT-GOV-006), not something an operator
             // TOML override can inherit. An override of a seat that has both built in loses them,
@@ -145,6 +148,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 auth_method: None,
                 // claude-agent-acp's pinned adapter proof passed DES-INPUT-GOV-001 §3.
                 acp_input_governance: true,
+                os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
             }),
@@ -181,6 +185,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 auth_method: None,
                 // Unadmitted pending its ACP permission-round-trip proof.
                 acp_input_governance: false,
+                os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
             }),
@@ -263,6 +268,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // bridge speaking the codex app-server protocol directly. No re-proof evidence
                 // directory was produced — there was no provisioning mechanism to re-prove.
                 acp_input_governance: false,
+                os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
             }),
@@ -300,6 +306,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // never for tool execution. Stays disclosed-ungoverned until a fixed
                 // adapter version proves otherwise.
                 acp_input_governance: false,
+                os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
             }),
@@ -346,6 +353,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // Stays disclosed-ungoverned until either the read gap closes or scoped admission
                 // ships.
                 acp_input_governance: false,
+                os_sandbox: false,
                 acp_governance_env: None,
                 verified_version: None,
             }),
@@ -396,6 +404,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                 // the exact build this was proven against — opencode's Homebrew tap auto-updates
                 // with no lockfile.
                 acp_input_governance: true,
+                os_sandbox: false,
                 acp_governance_env: Some((
                     "OPENCODE_CONFIG_CONTENT".into(),
                     r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask","edit":"ask","bash":"ask"}}"#.into(),
@@ -460,6 +469,13 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                     .acp
                     .as_ref()
                     .is_some_and(|acp| acp.acp_input_governance.is_none());
+                // Boundary 1 is an operator-selected per-seat capability. Preserve an opted-in
+                // built-in setting for a same-binary metadata override, while an explicit false
+                // remains an opt-out and a binary swap requires an explicit re-enable.
+                let omitted_os_sandbox = tcli
+                    .acp
+                    .as_ref()
+                    .is_some_and(|acp| acp.os_sandbox.is_none());
                 let mut cli: AgenticCli = tcli.into();
                 if let Some(slot) = merged.iter_mut().find(|c| c.key == cli.key) {
                     // User record overrides a built-in with the same key.
@@ -500,6 +516,20 @@ pub fn load(user_path: Option<&Path>) -> Result<Vec<AgenticCli>, String> {
                                      acp_input_governance = false to opt out deliberately; \
                                      wicked-core#364)",
                                     cli.key, builtin_acp.binary
+                                );
+                            }
+                        }
+                    }
+                    if omitted_os_sandbox {
+                        if let (Some(new_acp), Some(builtin_acp)) =
+                            (cli.acp.as_mut(), slot.acp.as_ref())
+                        {
+                            if builtin_acp.os_sandbox && new_acp.binary == builtin_acp.binary {
+                                new_acp.os_sandbox = true;
+                                eprintln!(
+                                    "wicked-council: seat '{}' override omits os_sandbox — \
+                                     inheriting the built-in kernel write-containment setting",
+                                    cli.key
                                 );
                             }
                         }
@@ -560,6 +590,13 @@ mod tests {
                 "only claude and opencode's pinned adapters have passed ACP input-governance proof"
             );
         }
+    }
+
+    #[test]
+    fn os_write_sandbox_rollout_is_default_off_for_every_builtin_seat() {
+        assert!(builtin()
+            .into_iter()
+            .all(|cli| { cli.acp.as_ref().is_none_or(|acp| !acp.os_sandbox) }));
     }
 
     #[test]

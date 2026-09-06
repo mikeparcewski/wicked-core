@@ -784,16 +784,55 @@ impl WrappedCliStepRunner {
             } else {
                 Box::new(Passthrough)
             };
-            let mut cmd = Command::new(&argv[0]);
-            // No estate tool the worker spawns may inherit a store from the environment (FINDING-067).
-            // Stripped UNCONDITIONALLY — governed or not, set by us or exported by whoever started the
-            // daemon. `wicked-estate`, `wicked-estate-mcp` and `wicked-core` all resolve `--db` ELSE
-            // this variable, so leaving it in place is the difference between a worker's `wicked-estate
-            // index .` building its repo's graph and it re-indexing the platform's operational store on
-            // top of itself. A boundary that depends on the daemon's environment is not a boundary.
-            // Harden FIRST so the gate-hook variables set below survive as deliberate exceptions.
-            cmd.hardened();
-            cmd.args(&argv[1..]).current_dir(&cwd);
+            // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP
+            // admission, and wrapped deny fence. It is WRITE containment only — not a read jail
+            // or exfiltration/DLP protection; worker model egress remains open.
+            let graph_write = input
+                .governance
+                .as_ref()
+                .and_then(|g| graph_write_dir(g.code_graph_db.as_deref()));
+            let worker_write_roots = input.governance.as_ref().map_or_else(
+                || vec![cwd.clone()],
+                |g| armed_write_root_paths(&cwd, &g.extra_write_roots, graph_write.as_deref()),
+            );
+            let os_sandbox = worker_os_sandbox_enabled(&cli_key);
+            // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
+            // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
+            // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
+            // WRITE-containment sibling of `GovernanceUnenforced`) before proceeding unsandboxed.
+            // This covers the no-launcher hosts (all of Windows), firejail-only Linux, and a
+            // canonicalize failure. It NEVER fires when `os_sandbox` is OFF or the floor armed.
+            let sandbox = if os_sandbox {
+                let ws = crate::validator::detect_worker_sandbox(&worker_write_roots);
+                if let Some(reason) = &ws.downgrade_reason {
+                    if let Some(cli) = argv.first() {
+                        self.emit_event(crate::event::CoreEvent::SandboxUnenforced {
+                            session: input.run_id.clone(),
+                            ord: input.unit.ord,
+                            attempt: input.attempt,
+                            cli: cli.clone(),
+                            level: ws.level.as_wire().to_string(),
+                            reason: reason.clone(),
+                        });
+                    }
+                    None
+                } else {
+                    Some(ws)
+                }
+            } else {
+                None
+            };
+            // `build_worker_command` HARDENS at construction (FINDING-067): no estate tool the worker
+            // spawns may inherit a store from the environment. Stripped UNCONDITIONALLY — governed or
+            // not, set by us or exported by whoever started the daemon. `wicked-estate`,
+            // `wicked-estate-mcp` and `wicked-core` all resolve `--db` ELSE this variable, so leaving
+            // it in place is the difference between a worker's `wicked-estate index .` building its
+            // repo's graph and it re-indexing the platform's operational store on top of itself. A
+            // boundary that depends on the daemon's environment is not a boundary. Hardening happens
+            // FIRST (in the builder) so the gate-hook variables set below survive as deliberate
+            // exceptions.
+            let mut cmd = build_worker_command(&argv, sandbox.as_ref());
+            cmd.current_dir(&cwd);
             // Point EVERY seat's scratch INSIDE the boundary (core#264, widened for crew#427): this
             // used to live in the claude-only `gov_env` arm, so a non-claude evaluator (codex, under
             // its own `--sandbox workspace-write`) got no in-boundary scratch and its `mktemp` /
@@ -803,6 +842,16 @@ impl WrappedCliStepRunner {
             // convenience, not a governance control, and every seat benefits from temp that is
             // reaped with the worktree and inside its own write root.
             redirect_scratch_into_boundary(&mut cmd, &cwd);
+            // Even seats without a hook receive the exact root set the kernel launcher got. This
+            // does not turn the env into a boundary; it keeps descendant tools and diagnostics
+            // aligned with Boundary 1's source of truth.
+            if os_sandbox {
+                let roots = std::env::join_paths(
+                    worker_write_roots.iter().map(std::path::PathBuf::as_path),
+                )
+                .unwrap_or_else(|_| cwd.as_os_str().to_os_string());
+                cmd.env(crate::gate_hook::WRITE_ROOTS_ENV, roots);
+            }
             // The gate-hook subprocess (spawned by claude) reads these: the append-only decisions log,
             // the absolute operational store path, and the unit's scope/phase. Scope/phase travel via
             // ENV (NOT interpolated into the shell hook command) so caller-controlled ids can never
@@ -835,7 +884,6 @@ impl WrappedCliStepRunner {
                 // (byte-identical pre-ADR boundary): the extractor's annotation writes ride
                 // `wicked-estate annotate` (a Bash call), which `boundary_denial` does not
                 // path-judge; only Write/Edit/Read tool-calls carrying a `path` are judged.
-                let graph_write = graph_write_dir(g.code_graph_db.as_deref());
                 cmd.env(
                     crate::gate_hook::WRITE_ROOTS_ENV,
                     armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref()),
@@ -1034,16 +1082,78 @@ fn armed_write_roots(
     if extras.is_empty() && graph_dir.is_none() {
         return cwd.as_os_str().to_os_string();
     }
-    let mut write_roots: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
-    write_roots.extend(extras.iter().map(std::ffi::OsString::from));
-    write_roots.extend(graph_dir.map(|d| d.as_os_str().to_os_string()));
+    let paths = armed_write_root_paths(cwd, extras, graph_dir);
+    let write_roots: Vec<std::ffi::OsString> = paths
+        .iter()
+        .map(|path| path.as_os_str().to_os_string())
+        .collect();
     match std::env::join_paths(&write_roots) {
         Ok(joined) => joined,
-        Err(e) => {
-            eprintln!("[wicked-core] write-root list not joinable ({e}); arming cwd only");
-            cwd.as_os_str().to_os_string()
-        }
+        // `armed_write_root_paths` already narrowed to cwd on this condition. Keep this fallback
+        // defensive: the kernel profile must never become wider than the advertised env boundary.
+        Err(_) => cwd.as_os_str().to_os_string(),
     }
+}
+
+/// The one source of truth for both `WICKED_WRITE_ROOTS` and Boundary 1's kernel profile.
+/// The in-boundary scratch directory is a child of `cwd`, so no extra writable carve-out exists.
+pub(crate) fn armed_write_root_paths(
+    cwd: &Path,
+    extras: &[String],
+    graph_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    // Keep the worktree spelling first: this is both the policy boundary's primary root and the
+    // kernel profile's primary root. The source-level guard in gate_hook pins this ordering.
+    let mut root_strings: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
+    root_strings.extend(extras.iter().map(std::ffi::OsString::from));
+    root_strings.extend(graph_dir.map(|dir| dir.as_os_str().to_os_string()));
+    let roots: Vec<PathBuf> = root_strings.iter().map(PathBuf::from).collect();
+    if roots.len() == 1 || std::env::join_paths(roots.iter().map(|root| root.as_os_str())).is_ok() {
+        roots
+    } else {
+        eprintln!("[wicked-core] write-root list not joinable; arming cwd only");
+        vec![cwd.to_path_buf()]
+    }
+}
+
+/// Build the worker's hardened `Command` from its resolved `argv`, prepending the Boundary 1
+/// OS-sandbox wrapper argv when one armed. When `sandbox` is `Some`, the child becomes
+/// `<wrapper-abs-path> <wrapper-tail…> <argv…>` (the wrapper's `find_on_path` entry is absolute, so
+/// it still resolves after `.hardened()` resets the child `PATH`); when `None`, it is the bare
+/// `argv`. Hardens at construction (FINDING-067: no worker inherits an engine-internal store var) so
+/// the caller's deliberate gate-hook/scratch env, set AFTER, survives as the intended exception.
+/// Extracted so the wrapped-CLI spawn wiring is exercised end-to-end by
+/// `wrapped_spawn_kernel_denies_an_outside_write_when_os_sandbox_is_enabled` without depending on the
+/// registry-derived rollout flag.
+pub(crate) fn build_worker_command(
+    argv: &[String],
+    sandbox: Option<&crate::validator::WorkerSandbox>,
+) -> Command {
+    let full: Vec<&String> = match sandbox {
+        Some(s) => s.wrapper.iter().chain(argv.iter()).collect(),
+        None => argv.iter().collect(),
+    };
+    // Self-documenting invariant (Copilot #384): callers guard `argv.is_empty()`, but this is
+    // `pub(crate)` and now reached from tests — a clear assert beats a bare `full[0]` index panic.
+    assert!(
+        !full.is_empty(),
+        "build_worker_command requires a non-empty argv (wrapper + argv)"
+    );
+    let mut cmd = Command::new(full[0]);
+    cmd.args(&full[1..]);
+    cmd.hardened();
+    cmd
+}
+
+/// Resolve the default-OFF per-seat Boundary 1 rollout flag from the merged registry.
+pub(crate) fn worker_os_sandbox_enabled(cli_key: &str) -> bool {
+    let user = wicked_council::registry::default_user_path();
+    wicked_council::registry::load(user.as_deref())
+        .unwrap_or_else(|_| wicked_council::registry::builtin())
+        .into_iter()
+        .find(|cli| cli.key == cli_key)
+        .and_then(|cli| cli.acp)
+        .is_some_and(|acp| acp.os_sandbox)
 }
 
 /// Point a worker's platform temp env (`TMPDIR`/`TMP`/`TEMP`) at `<cwd>/tmp` (core#264, crew#427):
@@ -3293,6 +3403,86 @@ mod tests {
             out.output
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GOV-008 Boundary 1, wrapped-CLI carrier — the sibling of the ACP path's
+    /// `acp_spawn_kernel_denies_an_outside_write_when_os_sandbox_is_enabled`. An END-TO-END KERNEL
+    /// proof, NOT an argv assertion: it drives the SAME command-building the wrapped `exec` uses
+    /// (`build_worker_command`, then `.hardened()` + `current_dir`, exactly as the production path),
+    /// spawns the sandboxed child, and asserts a write OUTSIDE the worktree write-root is DENIED BY
+    /// THE KERNEL (non-zero `$?` observed by the child) AND the file never lands. Applying
+    /// `.hardened()` also proves the wrapper's ABSOLUTE path survives the child `PATH` reset (design
+    /// §4.4). Skips cleanly on hosts with no usable `sandbox-exec`/`bwrap` (the disclose-and-degrade
+    /// path is covered by A1's `worker_sandbox_discloses_and_degrades_when_it_cannot_arm`). Uses no
+    /// global env (no HOME/registry mutation), so it cannot race other modules' HOME-sensitive tests.
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_spawn_kernel_denies_an_outside_write_when_os_sandbox_is_enabled() {
+        let base =
+            std::env::temp_dir().join(format!("wicked-wrapped-os-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let worktree = base.join("worktree");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // The write root the real ungoverned wrapped path arms is `[cwd]` (worktree only). No usable
+        // launcher on this host → the kernel proof cannot run; skip honestly, like the ACP sibling.
+        let sandbox = crate::validator::detect_worker_sandbox(std::slice::from_ref(&worktree));
+        if sandbox.level != crate::validator::SandboxLevel::Sandboxed {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        // The outside target is baked into the script (the wrapped path injects no per-unit env the
+        // way ACP's `acp_governance_env` does). The status file is written RELATIVE to cwd — i.e.
+        // inside the worktree write-root — so the child's own view of the denial is captured.
+        let outside_file = outside.join("pwned");
+        let script = base.join("wrapped-sandbox-probe.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf x > \"{outside}\"\n\
+                 printf '%s' \"$?\" > wrapped-outside-write-status\n",
+                outside = outside_file.display()
+            ),
+        )
+        .unwrap();
+
+        // Exactly the wrapped-CLI argv shape (`build_argv` output), fed through the production
+        // command builder — which HARDENS at construction (resetting the child `PATH`, so this also
+        // proves the wrapper's ABSOLUTE path still resolves) — plus the same `current_dir` the spawn
+        // site applies.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            script.to_string_lossy().into_owned(),
+            "prompt".to_string(),
+        ];
+        let mut cmd = build_worker_command(&argv, Some(&sandbox));
+        cmd.current_dir(&worktree);
+        let spawned = cmd.output();
+
+        let status = std::fs::read_to_string(worktree.join("wrapped-outside-write-status"));
+        // A launcher can be installed yet unavailable at runtime (e.g. bwrap without user
+        // namespaces): the child never really ran, so there is no status file. Clean skip.
+        let (Ok(_), Ok(status)) = (spawned, status) else {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        // A permission-denied redirect exits non-zero, but the exact code varies across `/bin/sh`
+        // implementations (1/2/126/…); assert non-zero, not literal "1" (Copilot #384). Containment
+        // itself is proven by the file-absence check below.
+        let code = status.trim();
+        assert!(
+            !code.is_empty() && code != "0",
+            "the wrapped child must observe a non-zero (OS-denied) exit for its outside write, got {status:?}"
+        );
+        assert!(
+            !outside_file.exists(),
+            "the wrapped child cannot create files outside its worktree write-root"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// crew#427, part 2 (the BOUNDED default). The built-in codex seat is the seat the

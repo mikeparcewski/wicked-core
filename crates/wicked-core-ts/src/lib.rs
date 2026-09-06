@@ -2567,6 +2567,20 @@ mod tests {
             "governanceUnenforced",
             &["type", "session", "ord", "attempt", "cli", "reason"],
         );
+        check(
+            CoreEvent::SandboxUnenforced {
+                session: s(),
+                ord: 4,
+                attempt: 0,
+                cli: s(),
+                level: "best-effort".to_string(),
+                reason: s(),
+            },
+            "sandboxUnenforced",
+            &[
+                "type", "session", "ord", "attempt", "cli", "level", "reason",
+            ],
+        );
         // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
         check(
             CoreEvent::WorkflowSelected {

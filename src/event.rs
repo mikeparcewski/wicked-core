@@ -541,6 +541,29 @@ pub enum CoreEvent {
         cli: String,
         reason: String,
     },
+    /// (DES-GOV-008 Boundary 1 / A1) A CLI worker spawned WITHOUT the kernel write-containment
+    /// floor armed, on a run that requested it (the default-OFF `os_sandbox` capability was ON).
+    /// Fires at spawn time on either carrier when the applied level is below `Sandboxed` for WRITE
+    /// containment: `BestEffort` (no sandbox tool on PATH — all of Windows; a host without
+    /// `sandbox-exec`/`bwrap`; or a supported tool present but the worktree root failed to
+    /// canonicalize so arming was skipped), or `NetworkOnly` (`firejail` denies network only, which
+    /// is not write-containment for a WORKER whose network is deliberately open anyway). This is the
+    /// WRITE-containment sibling of `GovernanceUnenforced` — a unit running without the deny floor is
+    /// never silent. It is NOT an exfiltration or audit claim. It does NOT fire when `os_sandbox` is
+    /// OFF (the feature was not requested) or when the floor armed (`Sandboxed`).
+    SandboxUnenforced {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        /// Which CLI ran uncontained — same per-carrier convention as `GovernanceUnenforced`:
+        /// the wrapped path emits `argv[0]`; the ACP path emits the registry seat key.
+        cli: String,
+        /// The level ACTUALLY applied (`best-effort` / `network-only`), lower-cased on the wire.
+        level: String,
+        /// Human-readable why: "no OS-sandbox tool on PATH", "firejail is network-only (no write
+        /// containment for a worker)", or "…worktree root <p> failed to canonicalize; arming skipped".
+        reason: String,
+    },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
     /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
@@ -1323,6 +1346,22 @@ impl CoreEvent {
                 "ord": ord,
                 "attempt": attempt,
                 "cli": cli,
+                "reason": reason,
+            }),
+            CoreEvent::SandboxUnenforced {
+                session,
+                ord,
+                attempt,
+                cli,
+                level,
+                reason,
+            } => json!({
+                "type": "sandboxUnenforced",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "level": level,
                 "reason": reason,
             }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).

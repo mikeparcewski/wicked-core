@@ -92,6 +92,11 @@ pub struct AcpConfig {
     /// an adapter to the core ACP gate; it does not claim a sandbox.
     #[serde(default)]
     pub acp_input_governance: bool,
+    /// Enable wicked-core's OS write-containment floor for this worker, defaulting to off for
+    /// staged rollout. This is a kernel write jail where supported, not an audit trail, read jail,
+    /// or exfiltration/DLP control: model egress and non-curated reads remain available.
+    #[serde(default)]
+    pub os_sandbox: bool,
     /// An environment variable `(name, value)` the engine sets on this seat's ACP child process,
     /// UNCONDITIONALLY, at every spawn — never gated on whether the particular unit being run is
     /// itself governed. A cached, already-spawned session cannot retroactively gain an env var
