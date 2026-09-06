@@ -1337,9 +1337,9 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
 /// (`acp_runner`), the two carrier shapes of one repo-scoped store (FINDING-122).
 ///
 /// The run id and unit ordinal are always present on a `StepInput`, so both are always set. The agent
-/// key is set ONLY when the unit carries an `assigned_cli`: an internal/ungoverned call may not, and
-/// the estate side treats an absent var as empty — omitting the key is the honest signal, never a
-/// synthesized default.
+/// key is ALSO always set: it mirrors the engine's default-seat resolution (`exec`'s `cli_key`,
+/// `assigned_cli.as_deref().unwrap_or("claude")`), so a default-seat unit (no `assigned_cli`, or a
+/// blank one) names the real worker — `claude` — in its proposal provenance rather than going blank.
 pub(crate) fn estate_provenance_env(
     run_id: &str,
     unit_ord: u32,
