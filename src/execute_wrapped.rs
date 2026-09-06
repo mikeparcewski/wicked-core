@@ -1324,6 +1324,42 @@ pub(crate) fn repo_estate_mcp_parts(code_graph_db: Option<&str>) -> Option<(Stri
         })
 }
 
+/// Provenance the worker's estate MCP stamps onto anything it submits (DES-MEM-FACETED-001 follow-on).
+///
+/// The estate-mcp `proposal.submit` tool server-stamps provenance from `WICKED_RUN_ID` /
+/// `WICKED_RUN_UNIT` / `WICKED_RUN_AGENT` read from its OWN process env — it stamps whatever is set and
+/// leaves the rest empty. wicked-core is the only party that knows which run/unit/agent a worker's
+/// proposals belong to, so it sets those on the estate MCP server it launches; without this a promoted
+/// proposal carries empty provenance and is unattributable.
+///
+/// Returns ORDERED `(name, value)` pairs so each carrier formats them into its own shape — the wrapped
+/// `--mcp-config` `env` OBJECT (`arm_input_governance`) and the ACP `session/new` `env` ARRAY
+/// (`acp_runner`), the two carrier shapes of one repo-scoped store (FINDING-122).
+///
+/// The run id and unit ordinal are always present on a `StepInput`, so both are always set. The agent
+/// key is ALSO always set: it mirrors the engine's default-seat resolution (`exec`'s `cli_key`,
+/// `assigned_cli.as_deref().unwrap_or("claude")`), so a default-seat unit (no `assigned_cli`, or a
+/// blank one) names the real worker — `claude` — in its proposal provenance rather than going blank.
+pub(crate) fn estate_provenance_env(
+    run_id: &str,
+    unit_ord: u32,
+    assigned_cli: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("WICKED_RUN_ID".to_string(), run_id.to_string()),
+        ("WICKED_RUN_UNIT".to_string(), unit_ord.to_string()),
+    ];
+    // The worker CLI: mirror the engine's default-seat resolution (`exec`'s `cli_key`,
+    // `assigned_cli.as_deref().unwrap_or("claude")`) so a default-seat unit's proposal provenance
+    // names the real worker (claude) instead of going blank.
+    let agent = assigned_cli
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or("claude");
+    env.push(("WICKED_RUN_AGENT".to_string(), agent.to_string()));
+    env
+}
+
 /// Locate a binary on PATH using the same search the shell would do.
 /// Probe the resolved `wicked-core` CLI for the gate protocol it speaks, ONCE per process.
 ///
@@ -1766,11 +1802,24 @@ fn arm_input_governance(
     // `session/new` array — one repo-scoped store, two carrier shapes (FINDING-122).
     let estate_mcp_config =
         repo_estate_mcp_parts(gov.code_graph_db.as_deref()).map(|(command, args)| {
+            // Server-side provenance for the estate MCP's `proposal.submit` (DES-MEM-FACETED-001
+            // follow-on): the tool reads these from its own process env and stamps promoted proposals
+            // with the run/unit/agent that produced them. The `--mcp-config` carrier takes an `env`
+            // OBJECT ({name: value}); the ACP carrier formats the same pairs as its {name,value} array.
+            let env: serde_json::Map<String, serde_json::Value> = estate_provenance_env(
+                &input.run_id,
+                input.unit.ord,
+                input.unit.assigned_cli.as_deref(),
+            )
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
             serde_json::json!({
                 "mcpServers": {
                     "wicked-estate": {
                         "command": command,
-                        "args": args
+                        "args": args,
+                        "env": env
                     }
                 }
             })
@@ -3317,6 +3366,22 @@ mod tests {
             mcp_json["mcpServers"]["wicked-estate"]["args"][2], "--readonly",
             "the estate MCP is loaded read-only via --mcp-config"
         );
+        // The estate MCP carries the run/unit/agent provenance the `proposal.submit` tool stamps
+        // (DES-MEM-FACETED-001 follow-on). run id + unit ord are always present; this unit assigns a
+        // CLI, so the agent key is set too.
+        let env = &mcp_json["mcpServers"]["wicked-estate"]["env"];
+        assert_eq!(
+            env["WICKED_RUN_ID"], input.run_id,
+            "the worker's estate MCP is stamped with the run id"
+        );
+        assert_eq!(
+            env["WICKED_RUN_UNIT"], "3",
+            "the worker's estate MCP is stamped with the unit ordinal"
+        );
+        assert_eq!(
+            env["WICKED_RUN_AGENT"], "claude",
+            "the worker's estate MCP is stamped with the assigned CLI"
+        );
         assert!(
             g.decisions_path.starts_with(std::env::temp_dir()),
             "the decisions log lives outside any worktree"
@@ -3351,6 +3416,43 @@ mod tests {
             "the exe path is quoted per-platform ({q}) so $/backtick/space can't be expanded: {cmd}"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir_for_test(&input.run_id));
+    }
+
+    /// The estate MCP's `proposal.submit` server-stamps provenance from its own process env
+    /// (DES-MEM-FACETED-001 follow-on); `estate_provenance_env` is what wicked-core hands it. Run id and
+    /// unit ordinal are always present on a `StepInput`, so both are always emitted; the agent key is
+    /// emitted ONLY when the unit names an `assigned_cli` — the estate side reads an absent var as empty,
+    /// so omitting it is the honest signal rather than inventing a default.
+    #[test]
+    fn estate_provenance_env_sets_run_unit_and_agent_when_present() {
+        let with_agent = estate_provenance_env("run-42", 3, Some("claude"));
+        assert_eq!(
+            with_agent,
+            vec![
+                ("WICKED_RUN_ID".to_string(), "run-42".to_string()),
+                ("WICKED_RUN_UNIT".to_string(), "3".to_string()),
+                ("WICKED_RUN_AGENT".to_string(), "claude".to_string()),
+            ]
+        );
+
+        // No assigned CLI ⇒ the DEFAULT SEAT (claude), matching the engine's cli_key resolution
+        // (`assigned_cli.as_deref().unwrap_or("claude")`) — provenance names the real worker, not blank.
+        let no_agent = estate_provenance_env("run-42", 7, None);
+        assert_eq!(
+            no_agent,
+            vec![
+                ("WICKED_RUN_ID".to_string(), "run-42".to_string()),
+                ("WICKED_RUN_UNIT".to_string(), "7".to_string()),
+                ("WICKED_RUN_AGENT".to_string(), "claude".to_string()),
+            ]
+        );
+
+        // A blank assigned CLI is also the default seat (never an empty-string agent stamp).
+        let blank_agent = estate_provenance_env("run-42", 1, Some("  "));
+        assert_eq!(
+            blank_agent.iter().find(|(k, _)| k == "WICKED_RUN_AGENT"),
+            Some(&("WICKED_RUN_AGENT".to_string(), "claude".to_string()))
+        );
     }
 
     /// FINDING-067, the channel the settings file does not cover. The gate-hook is a GRANDCHILD of the

@@ -1376,7 +1376,7 @@ fn start_acp_process(
     // dropping a `tmp/` dir into a user's own working directory would be intrusive.
     scratch_tmp: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
-    start_acp_process_with_write_roots(config, cwd, code_graph_db, scratch_tmp, &[])
+    start_acp_process_with_write_roots(config, cwd, code_graph_db, scratch_tmp, &[], &[])
 }
 
 /// The actual ACP spawn chokepoint. `extra_write_roots` comes from the same launch-validated
@@ -1388,6 +1388,10 @@ fn start_acp_process_with_write_roots(
     code_graph_db: Option<&str>,
     scratch_tmp: Option<&std::path::Path>,
     extra_write_roots: &[String],
+    // Ordered `(name, value)` provenance for the estate MCP the worker's `session/new` advertises
+    // (`execute_wrapped::estate_provenance_env`) — stamped onto its `proposal.submit`s. Empty for a
+    // repo-less session (no estate server is advertised at all) or an ungoverned/chat caller.
+    estate_provenance: &[(String, String)],
 ) -> anyhow::Result<AcpProcess> {
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
     // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
@@ -1713,11 +1717,19 @@ fn start_acp_process_with_write_roots(
     // repo-less session keeps the empty array exactly as before.
     let mcp_servers = crate::execute_wrapped::repo_estate_mcp_parts(code_graph_db)
         .map(|(command, args)| {
+            // Server-side provenance for the estate MCP's `proposal.submit` (DES-MEM-FACETED-001
+            // follow-on): the ACP `env` is the spec's `{name,value}` ARRAY (vs the wrapped carrier's
+            // object) — same pairs, formatted for this carrier so a proposal from an ACP worker carries
+            // the run/unit/agent that produced it.
+            let env: Vec<serde_json::Value> = estate_provenance
+                .iter()
+                .map(|(name, value)| json!({ "name": name, "value": value }))
+                .collect();
             json!([{
                 "name": "wicked-estate",
                 "command": command,
                 "args": args,
-                "env": []
+                "env": env
             }])
         })
         .unwrap_or_else(|| json!([]));
@@ -4262,12 +4274,21 @@ impl AcpStepRunner {
                     .governance
                     .as_ref()
                     .map_or(&[][..], |g| g.extra_write_roots.as_slice());
+                // Provenance for the estate MCP's `proposal.submit`, stamped from the run/unit/agent
+                // that owns this session (DES-MEM-FACETED-001 follow-on) — same source fields and helper
+                // as the wrapped carrier, formatted into the ACP `env` array by the spawn.
+                let estate_provenance = crate::execute_wrapped::estate_provenance_env(
+                    &input.run_id,
+                    input.unit.ord,
+                    input.unit.assigned_cli.as_deref(),
+                );
                 match start_acp_process_with_write_roots(
                     &acp_config,
                     &cwd,
                     code_graph_db,
                     Some(&cwd.join("tmp")),
                     extra_write_roots,
+                    &estate_provenance,
                 ) {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
@@ -6465,6 +6486,81 @@ sleep 30
             "a repo-less session must advertise no estate server: {seen2}"
         );
         drop(proc2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DES-MEM-FACETED-001 follow-on, ACP half: the estate MCP the worker's `session/new` advertises
+    /// must carry the run/unit/agent provenance the `proposal.submit` tool server-stamps, formatted as
+    /// the ACP `{name,value}` env array. Mirrors the wrapped carrier's `--mcp-config` env object over
+    /// the same `estate_provenance_env` pairs. The stub echoes the `session/new` frame it received.
+    #[test]
+    #[cfg(unix)]
+    fn session_new_stamps_estate_mcp_provenance_env() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("estate-prov");
+        let ledger = dir.join("session-new.json");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read new
+printf '%s\n' "$new" > "{ledger}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"prov"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+
+        let graph_db = std::path::Path::new("/tmp/wicked-prov-repo")
+            .join(crate::code_graph::code_graph_rel())
+            .to_string_lossy()
+            .into_owned();
+        let provenance =
+            crate::execute_wrapped::estate_provenance_env("run-prov", 5, Some("codex"));
+        let proc = start_acp_process_with_write_roots(
+            &stub_config(&script, None),
+            &dir,
+            Some(graph_db.as_str()),
+            None,
+            &[],
+            &provenance,
+        )
+        .expect("start");
+        let seen = std::fs::read_to_string(&ledger).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&seen).unwrap();
+        let env = &frame["params"]["mcpServers"][0]["env"];
+        // The ACP env is an array of {name, value} — collect it into a lookup for order-independent checks.
+        let pairs: std::collections::HashMap<String, String> = env
+            .as_array()
+            .expect("estate MCP env must be an array on the ACP carrier")
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap().to_string(),
+                    e["value"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs.get("WICKED_RUN_ID").map(String::as_str),
+            Some("run-prov"),
+            "session/new must stamp the run id: {seen}"
+        );
+        assert_eq!(
+            pairs.get("WICKED_RUN_UNIT").map(String::as_str),
+            Some("5"),
+            "session/new must stamp the unit ordinal: {seen}"
+        );
+        assert_eq!(
+            pairs.get("WICKED_RUN_AGENT").map(String::as_str),
+            Some("codex"),
+            "session/new must stamp the assigned CLI: {seen}"
+        );
+        drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
