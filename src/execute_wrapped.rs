@@ -1349,9 +1349,14 @@ pub(crate) fn estate_provenance_env(
         ("WICKED_RUN_ID".to_string(), run_id.to_string()),
         ("WICKED_RUN_UNIT".to_string(), unit_ord.to_string()),
     ];
-    if let Some(cli) = assigned_cli.map(str::trim).filter(|c| !c.is_empty()) {
-        env.push(("WICKED_RUN_AGENT".to_string(), cli.to_string()));
-    }
+    // The worker CLI: mirror the engine's default-seat resolution (`exec`'s `cli_key`,
+    // `assigned_cli.as_deref().unwrap_or("claude")`) so a default-seat unit's proposal provenance
+    // names the real worker (claude) instead of going blank.
+    let agent = assigned_cli
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or("claude");
+    env.push(("WICKED_RUN_AGENT".to_string(), agent.to_string()));
     env
 }
 
@@ -3430,25 +3435,23 @@ mod tests {
             ]
         );
 
-        // No assigned CLI (an internal/ungoverned call) ⇒ the agent key is omitted, never defaulted.
+        // No assigned CLI ⇒ the DEFAULT SEAT (claude), matching the engine's cli_key resolution
+        // (`assigned_cli.as_deref().unwrap_or("claude")`) — provenance names the real worker, not blank.
         let no_agent = estate_provenance_env("run-42", 7, None);
         assert_eq!(
             no_agent,
             vec![
                 ("WICKED_RUN_ID".to_string(), "run-42".to_string()),
                 ("WICKED_RUN_UNIT".to_string(), "7".to_string()),
+                ("WICKED_RUN_AGENT".to_string(), "claude".to_string()),
             ]
         );
-        assert!(
-            !no_agent.iter().any(|(k, _)| k == "WICKED_RUN_AGENT"),
-            "WICKED_RUN_AGENT must be omitted, not invented, when no CLI is assigned"
-        );
 
-        // A blank assigned CLI is treated as absent (no empty-string agent stamp).
+        // A blank assigned CLI is also the default seat (never an empty-string agent stamp).
         let blank_agent = estate_provenance_env("run-42", 1, Some("  "));
-        assert!(
-            !blank_agent.iter().any(|(k, _)| k == "WICKED_RUN_AGENT"),
-            "a blank assigned CLI must not produce an empty WICKED_RUN_AGENT"
+        assert_eq!(
+            blank_agent.iter().find(|(k, _)| k == "WICKED_RUN_AGENT"),
+            Some(&("WICKED_RUN_AGENT".to_string(), "claude".to_string()))
         );
     }
 
