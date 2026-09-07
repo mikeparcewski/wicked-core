@@ -1,3 +1,4 @@
+<!-- historical-doc: core composition-runtime design record, kept as written (predates the Phase-6 consolidations: knowledge/overlay/xedge → estate, wicked-agent → core) -->
 # wicked-core — in-process composition runtime for the core services
 
 ## Why
