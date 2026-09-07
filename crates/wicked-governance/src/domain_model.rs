@@ -285,8 +285,11 @@ fn is_behavior_out_edge(kind: &wicked_apps_core::EdgeKind) -> bool {
     match kind {
         Calls | References | Evaluates | Produces | Governs => true,
         Other(t) => matches!(t.as_str(), "uses" | "accesses" | "invokes"),
+        // `SatisfiedBy` is a requirement→code TRACEABILITY edge — its source is always a synthetic
+        // requirement node, never a code module, so it can never contribute to a code module's
+        // behavior-out set. Structural for this test (like `Contains`), not a code-behavior edge.
         Contains | Defines | Imports | Instantiates | Implements | Extends | Overrides
-        | HasType | Returns | InvokedBy => false,
+        | HasType | Returns | InvokedBy | SatisfiedBy => false,
     }
 }
 
@@ -917,17 +920,22 @@ pub fn build_domain_model(
 /// Idempotent: stable synthetic SymbolIds (ADR-002 — never content-hash) mean a re-run upserts the
 /// same nodes rather than stacking duplicates. Returns `(nodes_written, edges_written)`.
 ///
-/// NOT YET wired: edges from a requirement to the actual code nodes it derives from
-/// (`legacy_components`). Those are carried as node metadata here; resolving each `file#name` to its
-/// code SymbolId and adding `References` edges is the next increment (it needs a store name+file
-/// lookup, kept out of this first cut so the mapping stays pure and testable).
+/// Requirement→code satisfaction is wired: each `legacy_components` entry (`file#name`) is resolved
+/// to its code SymbolId via `find_symbols` and emitted as a `SatisfiedBy` edge (source = requirement,
+/// target = code — the dependent→dependency invariant, so `BlastRadius(code)` surfaces the
+/// requirements a change may break). Entries that resolve to no code node in this graph emit NO edge
+/// (never a dangling one) and need NO separate field — drift is derivable as the `legacy_components`
+/// provenance (kept on the node) minus the SatisfiedBy edges, and is re-resolved on the next persist
+/// relink once the code is indexed. The edge is the first-class `EdgeKind::SatisfiedBy` (estate-core
+/// 0.16.7), mirroring the `Governs` rule→code precedent so `BlastRadius` and bounded traversal can
+/// filter requirement satisfaction by kind.
 pub fn persist_domain_model(
     store: &mut dyn wicked_apps_core::GraphStore,
     model: &DomainModel,
 ) -> anyhow::Result<(usize, usize)> {
     use wicked_apps_core::{
         synthetic_symbol, Edge, EdgeKind, Language, Location, Node, NodeKind, ResolutionTier, Span,
-        SYMBOL_SCHEME,
+        SymbolQuery, SYMBOL_SCHEME,
     };
 
     let lang = Language::new(SYMBOL_SCHEME);
@@ -983,12 +991,56 @@ pub fn persist_domain_model(
                     .metadata
                     .insert("status".to_string(), serde_json::Value::String(s.clone()));
             }
-            // The code links are preserved as metadata until the resolve-to-SymbolId increment lands.
+            // The raw code links are kept as provenance regardless of which entries resolve; the
+            // resolve-to-SymbolId + SatisfiedBy edge emission happens just below.
             if !req.legacy_components.is_empty() {
                 rnode.metadata.insert(
                     "legacy_components".to_string(),
                     serde_json::json!(req.legacy_components),
                 );
+                // Resolve each `file#name` to a code SymbolId and emit requirement --SatisfiedBy--> code
+                // as a first-class estate edge. Split from the RIGHT (a symbol name never contains '#').
+                // An entry that resolves to no code node in this graph gets NO edge (never a dangling
+                // one) and needs no separate record: it stays in the raw `legacy_components` metadata
+                // above, so drift is derivable as the entries with no SatisfiedBy edge, and it is
+                // re-resolved on the next persist relink once the code is indexed. A store read error
+                // fails the whole persist closed — a partial satisfaction graph is worse than none.
+                for comp in &req.legacy_components {
+                    // BOTH sides must be non-empty: an empty file part (e.g. "#parse") would make
+                    // `n.location.file.ends_with(file)` trivially true and wrongly satisfy the
+                    // requirement from an arbitrary same-named symbol.
+                    let Some((file, name)) = comp
+                        .rsplit_once('#')
+                        .filter(|(f, n)| !f.is_empty() && !n.is_empty())
+                    else {
+                        continue;
+                    };
+                    let hits = store.find_symbols(&SymbolQuery {
+                        exact_name: Some(name.to_string()),
+                        ..Default::default()
+                    })?;
+                    // Prefer an exact file match; fall back to a path-suffix match (the extractor's
+                    // relative path vs the graph's canonical path).
+                    if let Some(code) =
+                        hits.iter().find(|n| n.location.file == file).or_else(|| {
+                            hits.iter().find(|n| {
+                                n.location.file.ends_with(file)
+                                    || file.ends_with(n.location.file.as_str())
+                            })
+                        })
+                    {
+                        // A first-class `EdgeKind::SatisfiedBy` (estate-core 0.16.7) — the requirements
+                        // overlay is a real consumer that filters traversal by this kind, mirroring the
+                        // `Governs` rule→code precedent.
+                        edges.push(Edge::new(
+                            rsym.clone(),
+                            code.symbol.clone(),
+                            EdgeKind::SatisfiedBy,
+                            inferred,
+                            "domain-graph",
+                        ));
+                    }
+                }
             }
             // Dependencies are part of the wire contract and can name external services or
             // cross-domain keys that have no node here. Preserve the raw list on the node so the
@@ -1199,6 +1251,97 @@ mod tests {
             "external dependency must not emit a dangling References edge, got {all:?}"
         );
     }
+
+    #[test]
+    fn persist_wires_satisfied_by_edges_to_resolved_code_and_derives_drift() {
+        use std::collections::BTreeMap;
+        use wicked_apps_core::{
+            synthetic_symbol, EdgeKind, GraphRead, GraphWrite, Language, Location, Node, NodeKind,
+            Span, SqliteStore,
+        };
+
+        let mut st = SqliteStore::in_memory().unwrap();
+        // Seed a REAL code node named `parse` at `a.py` so the requirement's `a.py#parse` resolves
+        // through `find_symbols` — this is the keystone: a requirement wired to actual code, not an
+        // orphan island.
+        let code_sym = synthetic_symbol("py", "a.py:parse");
+        let code = Node::new(
+            code_sym.clone(),
+            NodeKind::Other("function".to_string()),
+            "parse".to_string(),
+            Language::new("py"),
+            Location::new("a.py".to_string(), Span::ZERO),
+        );
+        st.begin_batch().unwrap();
+        st.upsert_nodes(&[code]).unwrap();
+        st.commit_batch().unwrap();
+
+        // REQ-001 names one RESOLVABLE component (a.py#parse) and one DANGLING one (ghost.py#nope).
+        let mut reqs = BTreeMap::new();
+        reqs.insert(
+            "REQ-001".to_string(),
+            Requirement {
+                title: "Parse".to_string(),
+                description: "parse the page".to_string(),
+                legacy_components: vec![
+                    "a.py#parse".to_string(),
+                    "ghost.py#nope".to_string(),
+                    "#parse".to_string(),
+                ],
+                ..Default::default()
+            },
+        );
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            "pageindex".to_string(),
+            Domain {
+                requirements: reqs,
+                ..Default::default()
+            },
+        );
+        let model = DomainModel {
+            metadata: Metadata {
+                schema_version: "1.0.0".to_string(),
+                migration_mode: "functional".to_string(),
+                source: None,
+            },
+            domains,
+        };
+
+        persist_domain_model(&mut st, &model).unwrap();
+
+        let rsym = synthetic_symbol("requirement", "pageindex/REQ-001");
+        let all = st.all_edges().unwrap();
+        let satisfied = EdgeKind::SatisfiedBy;
+        // The resolvable component becomes requirement --SatisfiedBy--> code (source = requirement,
+        // target = code: the dependent→dependency invariant, so BlastRadius(code) surfaces the
+        // requirement a change may break).
+        assert!(
+            all.iter()
+                .any(|e| e.source == rsym && e.target == code_sym && e.kind == satisfied),
+            "requirement --SatisfiedBy--> code edge for the resolvable component, got {all:?}"
+        );
+        // Exactly one SatisfiedBy edge — the dangling `ghost.py#nope` NEVER emits a dangling edge.
+        assert_eq!(
+            all.iter().filter(|e| e.kind == satisfied).count(),
+            1,
+            "the dangling component must NOT emit an edge, got {all:?}"
+        );
+        // Drift is DERIVABLE — no invented parallel field. The raw provenance stays on the node, and
+        // the unresolved entry is simply the one with no SatisfiedBy edge (re-tried next relink).
+        let node = st.get_node(&rsym).unwrap().expect("requirement node");
+        assert!(
+            node.metadata.get("satisfied_by_unresolved").is_none(),
+            "no invented drift field — drift derives from legacy_components minus SatisfiedBy edges"
+        );
+        assert_eq!(
+            node.metadata.get("legacy_components").cloned(),
+            Some(serde_json::json!(["a.py#parse", "ghost.py#nope", "#parse"])),
+            "raw legacy_components provenance is preserved on the node — including the malformed \
+             empty-file `#parse`, which is kept as provenance but (see the count above) emits NO edge"
+        );
+    }
+
     use wicked_estate_core::ValidationClaim;
 
     #[test]
