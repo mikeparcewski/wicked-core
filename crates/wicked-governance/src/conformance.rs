@@ -218,6 +218,12 @@ pub struct ConformanceRule {
     /// Frozen acceptance-criteria text (merged `Policy.criteria` — becomes the claim's criteria).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub criteria: String,
+    /// Unix-seconds timestamp of when this rule FIRST entered the store — the "added" time the
+    /// governance surface sorts + date-filters on (NOT the time of the latest edit). Stamped once by
+    /// [`register_rule`] on first create and preserved across updates. `None` for rules written
+    /// before the field existed (read back honestly as "unknown", never a fabricated now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<i64>,
 }
 
 /// The all-defaults rule — INVALID as-is (empty id), useful as `..Default::default()` filler so
@@ -243,6 +249,7 @@ impl Default for ConformanceRule {
             trigger: None,
             obligations: Vec::new(),
             criteria: String::new(),
+            created_at: None,
         }
     }
 }
@@ -402,11 +409,32 @@ impl FromNode for ConformanceRule {
 /// the durable record is the rule node just committed.
 pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyhow::Result<()> {
     rule.validate()?;
+    // Stamp `created_at` once on first create and preserve it on every later update — the rule keeps
+    // the time it FIRST entered the store (the dashboard's "added" / date-filter key), never the time
+    // of the latest edit. The caller need not set it: if unset, reuse the existing node's timestamp
+    // (an update) or stamp now (a create).
+    let mut rule = rule.clone();
+    if rule.created_at.is_none() {
+        let symbol = synthetic_symbol(CONFORMANCE_RULE, &rule.id);
+        let existing = store
+            .get_node(&symbol)?
+            .and_then(|n| ConformanceRule::from_node(&n).ok())
+            .and_then(|r| r.created_at);
+        rule.created_at = Some(existing.unwrap_or_else(now_secs));
+    }
     store.begin_batch()?;
     store.upsert_nodes(&[rule.to_node()])?;
     store.commit_batch()?;
-    let _ = crate::events::emit_rule_ingested(rule);
+    let _ = crate::events::emit_rule_ingested(&rule);
     Ok(())
+}
+
+/// Unix-seconds wall clock for stamping a rule's first-seen `created_at`.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Withdraw `id` from recall. Returns `false` if no such rule exists.
@@ -1500,6 +1528,54 @@ mod tests {
         assert!(
             all.iter().find(|r| r.id == "PAT-701").unwrap().retired,
             "the listed row still says it is retired"
+        );
+    }
+
+    #[test]
+    fn register_rule_stamps_created_at_on_create_and_preserves_it_on_update() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let sym = synthetic_symbol(CONFORMANCE_RULE, "PAT-500");
+        let read = |s: &dyn GraphRead| {
+            ConformanceRule::from_node(&s.get_node(&sym).unwrap().unwrap()).unwrap()
+        };
+
+        // Create: the caller leaves created_at None; register_rule stamps a real timestamp.
+        let r = rule(
+            "PAT-500",
+            RuleType::Pattern,
+            ConfSeverity::Warn,
+            lang("rust"),
+        );
+        assert_eq!(r.created_at, None, "the caller need not set created_at");
+        register_rule(&mut store, &r).unwrap();
+        let first = read(&store)
+            .created_at
+            .expect("created_at is stamped on first register");
+        assert!(
+            first > 0,
+            "a real unix-seconds timestamp, not the None default"
+        );
+
+        // Update: re-register the SAME id (still no created_at) with a changed field. The timestamp
+        // is PRESERVED (first-seen time), not reset to a later now; the edit itself DOES apply.
+        let updated = rule(
+            "PAT-500",
+            RuleType::Pattern,
+            ConfSeverity::Critical,
+            lang("rust"),
+        );
+        assert_eq!(updated.created_at, None);
+        register_rule(&mut store, &updated).unwrap();
+        let after = read(&store);
+        assert_eq!(
+            after.created_at,
+            Some(first),
+            "created_at is the first-seen time, preserved across the update"
+        );
+        assert_eq!(
+            after.severity,
+            ConfSeverity::Critical,
+            "the update still applied — only created_at is sticky"
         );
     }
 }
