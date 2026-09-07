@@ -923,11 +923,12 @@ pub fn build_domain_model(
 /// Requirement→code satisfaction is wired: each `legacy_components` entry (`file#name`) is resolved
 /// to its code SymbolId via `find_symbols` and emitted as a `SatisfiedBy` edge (source = requirement,
 /// target = code — the dependent→dependency invariant, so `BlastRadius(code)` surfaces the
-/// requirements a change may break). Entries that resolve to no code node in this graph are kept as
-/// explicit `satisfied_by_unresolved` drift on the requirement node — a requirement pointing at code
-/// the graph doesn't have is surfaced, never silently dropped (honest coverage). The edge rides the
-/// first-class `EdgeKind::SatisfiedBy` edge (estate-core 0.16.7), mirroring the `Governs` rule→code
-/// precedent so `BlastRadius` and bounded traversal can filter requirement satisfaction by kind.
+/// requirements a change may break). Entries that resolve to no code node in this graph emit NO edge
+/// (never a dangling one) and need NO separate field — drift is derivable as the `legacy_components`
+/// provenance (kept on the node) minus the SatisfiedBy edges, and is re-resolved on the next persist
+/// relink once the code is indexed. The edge is the first-class `EdgeKind::SatisfiedBy` (estate-core
+/// 0.16.7), mirroring the `Governs` rule→code precedent so `BlastRadius` and bounded traversal can
+/// filter requirement satisfaction by kind.
 pub fn persist_domain_model(
     store: &mut dyn wicked_apps_core::GraphStore,
     model: &DomainModel,
@@ -1005,7 +1006,12 @@ pub fn persist_domain_model(
                 // re-resolved on the next persist relink once the code is indexed. A store read error
                 // fails the whole persist closed — a partial satisfaction graph is worse than none.
                 for comp in &req.legacy_components {
-                    let Some((file, name)) = comp.rsplit_once('#').filter(|(_, n)| !n.is_empty())
+                    // BOTH sides must be non-empty: an empty file part (e.g. "#parse") would make
+                    // `n.location.file.ends_with(file)` trivially true and wrongly satisfy the
+                    // requirement from an arbitrary same-named symbol.
+                    let Some((file, name)) = comp
+                        .rsplit_once('#')
+                        .filter(|(f, n)| !f.is_empty() && !n.is_empty())
                     else {
                         continue;
                     };
@@ -1277,7 +1283,11 @@ mod tests {
             Requirement {
                 title: "Parse".to_string(),
                 description: "parse the page".to_string(),
-                legacy_components: vec!["a.py#parse".to_string(), "ghost.py#nope".to_string()],
+                legacy_components: vec![
+                    "a.py#parse".to_string(),
+                    "ghost.py#nope".to_string(),
+                    "#parse".to_string(),
+                ],
                 ..Default::default()
             },
         );
@@ -1326,8 +1336,9 @@ mod tests {
         );
         assert_eq!(
             node.metadata.get("legacy_components").cloned(),
-            Some(serde_json::json!(["a.py#parse", "ghost.py#nope"])),
-            "raw legacy_components provenance is preserved on the requirement node"
+            Some(serde_json::json!(["a.py#parse", "ghost.py#nope", "#parse"])),
+            "raw legacy_components provenance is preserved on the node — including the malformed \
+             empty-file `#parse`, which is kept as provenance but (see the count above) emits NO edge"
         );
     }
 
