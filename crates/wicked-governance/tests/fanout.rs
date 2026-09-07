@@ -157,7 +157,7 @@ fn one_import_lands_in_every_lane_a_governed_run_reads() {
     // (3) knowledge — guidance recall by the enforceable twin's id, source = the wiki URI.
     let mut know =
         KnowledgeEngine::open(&format!("{}", base.join("knowledge.db").display())).unwrap();
-    let hits = know.recall("PAT-001", 1024, 1_750_000_000).unwrap();
+    let hits = know.recall("PAT-001", 1024, None, 1_750_000_000).unwrap();
     let hit = hits
         .iter()
         .find(|h| h.content.contains("PAT-001"))
@@ -189,7 +189,7 @@ fn refanning_out_is_idempotent_in_every_lane() {
 
     let know = KnowledgeEngine::open(&format!("{}", base.join("knowledge.db").display())).unwrap();
     assert_eq!(
-        know.count(Some(KClass::Chunk)).unwrap(),
+        know.count(Some(KClass::Chunk), None).unwrap(),
         2,
         "one rationale chunk per rule id, refreshed in place"
     );

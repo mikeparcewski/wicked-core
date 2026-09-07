@@ -65,7 +65,7 @@ impl RunKnowledge {
         let budget = k.saturating_mul(128).max(128);
         let hits = self
             .engine
-            .recall(query, budget, now)
+            .recall(query, budget, None, now)
             .map_err(|e| anyhow::anyhow!("recall knowledge: {e}"))?;
         Ok(hits
             .into_iter()

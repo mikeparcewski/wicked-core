@@ -437,7 +437,7 @@ fn smoke_knowledge_lane(
     let mut missing = Vec::new();
     for id in expect_rules {
         let hits = engine
-            .recall(id, 1024, now)
+            .recall(id, 1024, None, now)
             .map_err(|e| anyhow::anyhow!("knowledge recall for {id}: {e}"))?;
         if !hits.iter().any(|h| h.content.contains(id.as_str())) {
             missing.push(id.clone());

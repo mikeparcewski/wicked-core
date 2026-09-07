@@ -64,7 +64,7 @@ pub fn relate_linked_rules(
         (KClass::Doc, &mut docs_by_source),
     ] {
         for k in knowledge
-            .all_nodes(Some(class))
+            .all_nodes(Some(class), None)
             .map_err(|e| anyhow::anyhow!("knowledge store scan failed: {e}"))?
         {
             map.entry(k.source.clone())
