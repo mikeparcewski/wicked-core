@@ -409,18 +409,26 @@ impl FromNode for ConformanceRule {
 /// the durable record is the rule node just committed.
 pub fn register_rule(store: &mut dyn GraphStore, rule: &ConformanceRule) -> anyhow::Result<()> {
     rule.validate()?;
-    // Stamp `created_at` once on first create and preserve it on every later update — the rule keeps
-    // the time it FIRST entered the store (the dashboard's "added" / date-filter key), never the time
-    // of the latest edit. The caller need not set it: if unset, reuse the existing node's timestamp
-    // (an update) or stamp now (a create).
+    // Stamp `created_at` once on first create and preserve it verbatim on every later update — the
+    // rule keeps the time it FIRST entered the store (the dashboard's "added" / date-filter key),
+    // never the time of the latest edit, and a caller cannot overwrite it. An EXISTING rule's stored
+    // value is authoritative and preserved AS-IS — including `None`, so a legacy row written before
+    // the field existed stays honestly "unknown" and is never back-fabricated to `now`. Only a
+    // genuinely NEW rule (no node yet) with no caller-supplied value gets stamped `now` (a caller may
+    // still supply an explicit timestamp on create, e.g. a dated backfill import).
     let mut rule = rule.clone();
-    if rule.created_at.is_none() {
-        let symbol = synthetic_symbol(CONFORMANCE_RULE, &rule.id);
-        let existing = store
-            .get_node(&symbol)?
-            .and_then(|n| ConformanceRule::from_node(&n).ok())
-            .and_then(|r| r.created_at);
-        rule.created_at = Some(existing.unwrap_or_else(now_secs));
+    let symbol = synthetic_symbol(CONFORMANCE_RULE, &rule.id);
+    match store.get_node(&symbol)? {
+        Some(node) => {
+            rule.created_at = ConformanceRule::from_node(&node)
+                .ok()
+                .and_then(|r| r.created_at);
+        }
+        None => {
+            if rule.created_at.is_none() {
+                rule.created_at = Some(now_secs());
+            }
+        }
     }
     store.begin_batch()?;
     store.upsert_nodes(&[rule.to_node()])?;
@@ -1576,6 +1584,53 @@ mod tests {
             after.severity,
             ConfSeverity::Critical,
             "the update still applied — only created_at is sticky"
+        );
+
+        // A caller CANNOT overwrite created_at on update — the stored first-seen time wins even when
+        // the update carries an explicit, different timestamp.
+        let mut forged = rule(
+            "PAT-500",
+            RuleType::Pattern,
+            ConfSeverity::Warn,
+            lang("rust"),
+        );
+        forged.created_at = Some(first + 999_999);
+        register_rule(&mut store, &forged).unwrap();
+        assert_eq!(
+            read(&store).created_at,
+            Some(first),
+            "an update cannot overwrite the first-seen created_at"
+        );
+
+        // Legacy row: a rule persisted with NO created_at (pre-field) stays honestly UNKNOWN across an
+        // update — never back-fabricated to now.
+        let legsym = synthetic_symbol(CONFORMANCE_RULE, "PAT-600");
+        let mut legacy = rule(
+            "PAT-600",
+            RuleType::Pattern,
+            ConfSeverity::Info,
+            lang("rust"),
+        );
+        legacy.created_at = None;
+        store.begin_batch().unwrap();
+        store.upsert_nodes(&[legacy.to_node()]).unwrap(); // direct persist: created_at absent (skip_if None)
+        store.commit_batch().unwrap();
+        let leg = |s: &dyn GraphRead| {
+            ConformanceRule::from_node(&s.get_node(&legsym).unwrap().unwrap()).unwrap()
+        };
+        assert_eq!(leg(&store).created_at, None, "legacy row starts unknown");
+        let mut leg_update = rule(
+            "PAT-600",
+            RuleType::Pattern,
+            ConfSeverity::Critical,
+            lang("rust"),
+        );
+        leg_update.created_at = None;
+        register_rule(&mut store, &leg_update).unwrap();
+        assert_eq!(
+            leg(&store).created_at,
+            None,
+            "unknown stays unknown — a legacy row is never back-fabricated to now"
         );
     }
 }
