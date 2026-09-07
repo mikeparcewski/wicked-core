@@ -56,6 +56,8 @@ pub use wicked_estate_core::{
     Suffix,
     Symbol,
     SymbolId,
+    // Read-side query (find_symbols): apps resolve names/files to nodes through this.
+    SymbolQuery,
 };
 
 pub use wicked_estate_store::{SqliteStore, WalCheckpointStats};
