@@ -34,7 +34,10 @@ Two release tracks share this file, newest entry first regardless of track:
   (the launch template) — never the roster record's own fields, so a seat that passes routing as
   claude cannot run as anything else; `wicked-core-ts` declares `UnitDistributedEventJson`
   (literal `type`, `seatConstraint: string | null`) with compile-time assertions
-  (`types-test/`, `npm run typecheck`) and a cargo lockstep test over `index.d.ts`.
+  (`types-test/`, `npm run typecheck`) and a cargo lockstep test over `index.d.ts` that reads a
+  CRLF checkout as LF; `finalize-dts.mjs` normalizes `index.d.ts` to LF, and `.gitattributes` pins
+  the binding's hand-authored files to `eol=lf`. Every test that drives the wrapped/ACP exec path
+  or a seat resolution now holds `test_env::ENV_LOCK` (audited).
 - **Skills snapshot on both worker paths (#396)** — the engine consumes one skills input,
   `WICKED_SKILLS_SNAPSHOT` (the ABSOLUTE path of a crew-published, immutable garden-shaped plugin
   root; pinned to its canonical real path — relative paths and symlinks at ANY component, the last

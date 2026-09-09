@@ -1961,13 +1961,50 @@ mod tests {
     /// `types-test/` (`npm run typecheck`); this pins the lockstep on cargo alone, which CI runs.
     #[test]
     fn hand_authored_dts_is_in_lockstep_and_declares_every_unit_distributed_key() {
+        let (from_mjs, from_dts) = hand_authored_blocks(
+            include_str!("../scripts/finalize-dts.mjs"),
+            include_str!("../index.d.ts"),
+        );
+        assert_eq!(
+            from_mjs.trim(),
+            from_dts.trim(),
+            "index.d.ts drifted from finalize-dts.mjs — rerun `node scripts/finalize-dts.mjs`"
+        );
+        assert_unit_distributed_declared(&from_dts);
+    }
+
+    /// A checkout with `core.autocrlf` (the Windows CI runner, #402 review pass 3) hands
+    /// `include_str!` CRLF content: the line-anchored extraction must read it exactly as LF —
+    /// same blocks, no `\r` left to defeat a `\n`-anchored match — and the declaration checks
+    /// must still pass over it. (`.gitattributes` pins these files to LF as well; this makes the
+    /// test independent of that.)
+    #[test]
+    fn the_lockstep_check_reads_a_crlf_checkout_the_same_as_lf() {
         let mjs = include_str!("../scripts/finalize-dts.mjs");
         let dts = include_str!("../index.d.ts");
+        let (lf_mjs, lf_dts) = hand_authored_blocks(mjs, dts);
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        let (crlf_mjs, crlf_dts) = hand_authored_blocks(&crlf(mjs), &crlf(dts));
+        assert!(
+            crlf(mjs).contains("${BEGIN}\r\n"),
+            "the CRLF copy really does break the LF-anchored opener"
+        );
+        assert_eq!(crlf_mjs, lf_mjs, "CRLF script reads as LF");
+        assert_eq!(crlf_dts, lf_dts, "CRLF index.d.ts reads as LF");
+        assert!(!crlf_dts.contains('\r') && !crlf_mjs.contains('\r'));
+        assert_unit_distributed_declared(&crlf_dts);
+    }
+
+    /// The hand-authored block as the script declares it (`HAND_AUTHORED`, a template literal
+    /// opened with `${BEGIN}` and closed with `${END}`, backticks escaped as \`) and as
+    /// `index.d.ts` ships it (between the two sentinel lines) — both normalized to LF first, so a
+    /// CRLF checkout compares equal to an LF one.
+    fn hand_authored_blocks(mjs: &str, dts: &str) -> (String, String) {
+        let mjs = mjs.replace("\r\n", "\n");
+        let dts = dts.replace("\r\n", "\n");
         const BEGIN: &str =
             "// ─── hand-authored (not napi-generated): see scripts/finalize-dts.mjs ───";
         const END: &str = "// ─── end hand-authored ───";
-        // The script holds the block in a template literal opened with `${BEGIN}` and closed with
-        // `${END}`, backticks escaped as \`.
         let mjs_open = "const HAND_AUTHORED = `${BEGIN}\n";
         let start = mjs
             .find(mjs_open)
@@ -1986,13 +2023,13 @@ mod tests {
             .find(END)
             .expect("index.d.ts closes the block")
             + dts_start;
-        let from_dts = &dts[dts_start..dts_end];
-        assert_eq!(
-            from_mjs.trim(),
-            from_dts.trim(),
-            "index.d.ts drifted from finalize-dts.mjs — rerun `node scripts/finalize-dts.mjs`"
-        );
+        (from_mjs, dts[dts_start..dts_end].to_string())
+    }
 
+    /// `UnitDistributedEventJson` in the shipped block names EVERY key `event_to_json` emits for
+    /// `unitDistributed`, with the literal tag, `seatConstraint: string | null` and the four
+    /// routing methods `pipeline::apply_distributions` emits.
+    fn assert_unit_distributed_declared(from_dts: &str) {
         let iface_start = from_dts
             .find("export interface UnitDistributedEventJson extends CoreEventJson {")
             .expect("unitDistributed is declared as a named, discriminated shape");

@@ -83,7 +83,10 @@ if (!existsSync(dtsPath)) {
   process.exit(1)
 }
 
-let dts = readFileSync(dtsPath, 'utf8')
+// LF throughout: a checkout with `core.autocrlf` (the Windows CI runner) hands us CRLF, and the
+// block we append is LF — normalizing first keeps the committed file single-EOL and byte-identical
+// across OSes (the binding's lockstep test compares this file's block to the script's on every OS).
+let dts = readFileSync(dtsPath, 'utf8').replace(/\r\n/g, '\n')
 
 // Strip any previously-appended block so reruns are idempotent.
 const beginIdx = dts.indexOf(BEGIN)

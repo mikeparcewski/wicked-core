@@ -698,6 +698,12 @@ mod tests {
     /// (calls > 0), failing the first assertion.
     #[test]
     fn a_single_seat_roster_skips_the_council_and_dispatches_nothing() {
+        // `distribute_units_on` resolves the skills ladder from the process environment when a
+        // unit names a skill (none here) — held under the env READ lock regardless, so it can
+        // never observe a variable another test is pinning under the write lock (#402 pass 3).
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
 
         // Single seat → short-circuit.

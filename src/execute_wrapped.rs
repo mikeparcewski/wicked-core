@@ -3530,6 +3530,11 @@ mod tests {
     #[test]
     fn reassign_cancels_the_matching_wrapped_worker_and_stops_its_worktree_writes() {
         use std::time::{Duration, Instant};
+        // Drives the wrapped exec path, which resolves the skills ladder from the process
+        // environment: hold the env WRITE lock and pin "no snapshot", or a snapshot another test
+        // pins under the write lock is observed here and refuses the launch (#402 pass 3).
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
 
         let root =
             std::env::temp_dir().join(format!("wicked-reassign-wrapped-{}", std::process::id()));
@@ -3747,6 +3752,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_governed_unit_on_a_cli_that_cannot_be_armed_says_so_instead_of_going_quiet() {
+        // Wrapped exec path ⇒ env write lock + "no snapshot" pinned (#402 pass 3; see
+        // `scratch_redirect_applies_to_a_nonclaude_seat`).
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (tx, rx) = std::sync::mpsc::channel();
         let runner = WrappedCliStepRunner::with_tx(tx);
 
@@ -3817,6 +3826,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_unit_that_never_asked_for_governance_stays_silent() {
+        // Wrapped exec path ⇒ env write lock + "no snapshot" pinned (#402 pass 3; see
+        // `scratch_redirect_applies_to_a_nonclaude_seat`).
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (tx, rx) = std::sync::mpsc::channel();
         let runner = WrappedCliStepRunner::with_tx(tx);
         let mut u = WorkUnit::pending("s:u1", "s", 1, "just run");
@@ -4849,6 +4862,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn scratch_redirect_applies_to_a_nonclaude_seat() {
+        // The wrapped exec path resolves the skills ladder from the process environment
+        // (`admit_unit` → `resolve_ladder`): on ubuntu CI (#402 pass 3) this test observed the
+        // `WICKED_SKILLS_SNAPSHOT` another test had pinned under the write lock — a fixture whose
+        // state home the fence refuses — and got the skills refusal instead of its probe's output.
+        // Hold the env WRITE lock and pin "no snapshot" for the whole test: the module rule at
+        // `ENV_LOCK`'s definition, which this test predated.
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let dir = std::env::temp_dir().join(format!(
             "wicked-scratch-{}-{:?}",
             std::process::id(),
@@ -5664,6 +5685,9 @@ mod tests {
 
     #[test]
     fn unknown_cli_falls_back_to_key_as_binary() {
+        // `resolve_invocation` reads the merged registry under `$HOME`: hold the env READ lock so
+        // a HOME-swapping test cannot move it mid-call (#402 pass 3 audit).
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         // A key not in the registry becomes `<key> {PROMPT}`.
         let inv = resolve_invocation("definitely-not-a-registered-cli-xyz");
         assert_eq!(inv, "definitely-not-a-registered-cli-xyz {PROMPT}");
@@ -6338,6 +6362,12 @@ mod tests {
     /// where `{PROMPT}` is a literal placeholder and prompt content cannot appear.
     #[test]
     fn a_prompt_that_looks_like_a_flag_cannot_suppress_the_isolation() {
+        // `inject_isolation_flags` reads the inherit hatch from the process environment: pin "no
+        // hatch" under the env write lock, so neither the ambient environment nor a concurrent
+        // hatch test can make the isolation flags disappear for a reason this test is not about
+        // (#402 pass 3 audit).
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_hatch = VarGuard::unset(INHERIT_OPERATOR_CONFIG_ENV);
         for hostile in [
             "--setting-sources=user",
             "--setting-sources",
@@ -6423,7 +6453,9 @@ mod tests {
     /// with the same discipline as [`HomeGuard`]: hold [`ENV_LOCK`] (write) and declare the guard
     /// after the lock guard. Platform-independent: the hatch sub-case of the plugin-flag test runs
     /// on every CI OS.
-    struct VarGuard {
+    /// `pub(super)`: the sibling `project_graph_end_to_end_tests` module drives the wrapped exec
+    /// path too and pins "no snapshot" with the same guard (#402 pass 3 audit).
+    pub(super) struct VarGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
     }
@@ -6435,7 +6467,7 @@ mod tests {
         }
         /// Pin the variable UNSET (restored on drop) — a scenario that needs "no hatch" cannot rely
         /// on the developer's or CI's environment not carrying one.
-        fn unset(key: &'static str) -> Self {
+        pub(super) fn unset(key: &'static str) -> Self {
             let prev = std::env::var_os(key);
             std::env::remove_var(key);
             Self { key, prev }
@@ -8074,6 +8106,14 @@ mod project_graph_end_to_end_tests {
     /// preference that silently stopped working cannot pass as "the fallback is fine".
     #[test]
     fn the_bound_project_graph_reaches_the_workers_settings_json_as_its_estate_db() {
+        // Drives the wrapped exec path (`run_unit` → skills ladder from the process environment):
+        // env write lock + "no snapshot" pinned, like every other exec-path test (#402 pass 3
+        // audit — this one predated the rule and ran unguarded).
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot =
+            super::tests::VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         seed_probe_for_test(
             &resolve_wicked_core_exe(),
             Ok((
