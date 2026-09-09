@@ -174,9 +174,10 @@ pub use schemas::{
 pub use evals::{
     default_knowledge_db, governance_corpus_import, governance_evals, import_corpus, load_corpus,
     pretool_context, pretool_event_from_signals, run_evals, sample_chunk_id, CorpusSource,
-    EvalReport, EvalSample, EvalSummary, Expected, ImportReceipt, NearestRule, SampleKind,
-    SampleRef, SampleResult, SampleSignals, Verdict, DEFAULT_CORPUS_NAME, DEFAULT_EVAL_PHASE,
-    DEGRADED_FACET_ONLY, EVAL_SAMPLE_PREFIX, EVAL_SCOPE_PREFIX,
+    EvalReport, EvalSample, EvalSummary, Expected, ImportReceipt, NearestRule, RuleCoverage,
+    SampleKind, SampleRef, SampleResult, SampleSignals, TypeCoverage, UnexercisedRule, Verdict,
+    DEFAULT_CORPUS_NAME, DEFAULT_EVAL_PHASE, DEGRADED_FACET_ONLY, EVAL_SAMPLE_PREFIX,
+    EVAL_SCOPE_PREFIX,
 };
 
 // Re-export the claim wire type so callers program against one path.

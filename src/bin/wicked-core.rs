@@ -38,12 +38,12 @@
 //!       # unresolvable refs are REPORTED as drift, never dropped. With --knowledge/--xedge (or
 //!       # $WICKED_KNOWLEDGE_DB/$WICKED_XEDGE_DB) also writes knowledge→code about-xedges
 //!       # (the knowledge.relate_code seam) for docs ingested into the knowledge domain
-//!   wicked-core rules eval [--corpus <evals:scope | dir>] [--type <t>] [--db <F>] \
+//!   wicked-core rules eval [--corpus <evals:scope | dir | file.json>] [--type <t>] [--db <F>] \
 //!       [--knowledge-db <F>] [--json]              # replay a behavior corpus through the REAL
 //!       # SELECT→DECIDE gate path and score caught/gap/false-positive per sample; gaps carry
 //!       # nearest non-firing rules by embedding similarity (facet-only keyword hints, marked,
 //!       # when no usable embeddings exist). Read-only on the rules store.
-//!   wicked-core rules eval --import <name> [<dir>] [--knowledge-db <F>]   # ingest a corpus into
+//!   wicked-core rules eval --import <name> [<dir | file.json>] [--knowledge-db <F>]   # ingest a corpus into
 //!       # the estate knowledge store under evals:<name> (id-keyed, WITH embeddings) and print
 //!       # the {imported, scope, embedded} receipt
 //!   wicked-core rules drift [--dir <docs>] [--json]  # report the residue re-ingest can't self-heal
@@ -210,7 +210,7 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          epoch, denial claims citing wiki rules (evidenced_by edges / Governs evidence_count), and \
          recall volume (documented unavailable in-band — the store keeps no recall telemetry). \
          READ-ONLY, strictly a report: exit 0 = report produced, 1 = operational error.\n\
-         wicked-core rules eval [--corpus <evals:scope | dir>] [--type <steering-type>] \
+         wicked-core rules eval [--corpus <evals:scope | dir | file.json>] [--type <steering-type>] \
          [--db <rules.db>] [--knowledge-db <F>] [--json]\n  \
          Replay a behavior corpus (default: the built-in dev-behaviors corpus) through the REAL \
          SELECT→DECIDE gate path against the rules in --db: a bad sample a blocking rule fires for \
@@ -219,8 +219,9 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          facet-only keyword hints, marked on the report, when no usable embeddings exist), and a \
          good sample a blocking rule fires for is a FALSE POSITIVE. READ-ONLY on the rules store, \
          strictly a report: exit 0 = report produced (gaps included), 1 = operational error.\n\
-         wicked-core rules eval --import <name> [<dir>] [--knowledge-db <F>]\n  \
-         Ingest a corpus (a dir of sample *.json, or the built-in corpus when <dir> is omitted) \
+         wicked-core rules eval --import <name> [<dir | file.json>] [--knowledge-db <F>]\n  \
+         Ingest a corpus (a dir of sample *.json files, one corpus *.json file, or the built-in \
+         corpus when the path is omitted) \
          into the estate KNOWLEDGE store under scope evals:<name>, id-keyed WITH embeddings, and \
          print the {imported, scope, embedded} receipt. WRITES to the knowledge store only \
          (default ~/.wicked-estate/knowledge.db — always overridable via --knowledge-db).",
@@ -2358,7 +2359,16 @@ fn rules_eval_cmd(args: &[String]) {
     // ── import mode: corpus → estate knowledge store, receipt out ──
     if let Some(name) = guarded("--import") {
         let source = match positional() {
-            Some(dir) => wicked_governance::CorpusSource::Dir(std::path::PathBuf::from(dir)),
+            Some(path) => match corpus_path_source(&path) {
+                Some(source) => source,
+                None => {
+                    fail(&format!(
+                        "rules eval --import: {path:?} is neither an existing directory of sample \
+                         *.json files nor an existing corpus *.json file"
+                    ));
+                    return;
+                }
+            },
             None => wicked_governance::CorpusSource::Builtin,
         };
         let samples = match wicked_governance::load_corpus(&source, Some(&knowledge_db)) {
@@ -2391,18 +2401,16 @@ fn rules_eval_cmd(args: &[String]) {
         Some(c) if c.starts_with(wicked_governance::EVAL_SCOPE_PREFIX) => {
             wicked_governance::CorpusSource::Scope(c)
         }
-        Some(c) => {
-            let p = std::path::PathBuf::from(&c);
-            if p.is_dir() {
-                wicked_governance::CorpusSource::Dir(p)
-            } else {
+        Some(c) => match corpus_path_source(&c) {
+            Some(source) => source,
+            None => {
                 fail(&format!(
-                    "rules eval: --corpus {c:?} is neither an evals:<name> knowledge scope nor an \
-                     existing directory of sample *.json files"
+                    "rules eval: --corpus {c:?} is neither an evals:<name> knowledge scope, an \
+                     existing directory of sample *.json files, nor an existing corpus *.json file"
                 ));
                 return;
             }
-        }
+        },
     };
     let steering_type = guarded("--type");
     let samples = match wicked_governance::load_corpus(&source, Some(&knowledge_db)) {
@@ -2484,6 +2492,41 @@ fn rules_eval_cmd(args: &[String]) {
     }
     if s.total == 0 {
         println!("  no samples matched — check --type / --corpus");
+    }
+    // Rule coverage (core#394): the rules the verdict rows cannot show. `recall_only` is the
+    // core#395 truth — rules without an effect never reach the gate, so the eval cannot measure
+    // them; when nothing is decide-lane the verdicts above are the corpus split, not enforcement.
+    let c = &report.rule_coverage;
+    println!(
+        "  rule coverage: {} exercised, {} unexercised, {} recall-only (no effect — the gate never \
+         fires them)",
+        c.exercised,
+        c.unexercised.len(),
+        c.recall_only
+    );
+    if c.exercised == 0 && c.unexercised.is_empty() {
+        println!(
+            "    no decide-lane rules in scope — the verdicts above measure the corpus split, not \
+             steering; author `effect: deny` (STEERING.md § Import) to make a rule measurable"
+        );
+    }
+    for u in &c.unexercised {
+        println!("    UNEXERCISED  {} ({})", u.rule_id, u.steering_type);
+    }
+}
+
+/// `--corpus <path>` / `--import <name> <path>`: an existing directory of sample `*.json` files or
+/// one existing corpus `*.json` file (`{name, samples}`, a bare array, or a sample — a
+/// script-derived corpus replays without an import). `None` when the path is neither, so the
+/// caller fails with its own flag's wording.
+fn corpus_path_source(path: &str) -> Option<wicked_governance::CorpusSource> {
+    let p = std::path::PathBuf::from(path);
+    if p.is_dir() {
+        Some(wicked_governance::CorpusSource::Dir(p))
+    } else if p.is_file() {
+        Some(wicked_governance::CorpusSource::File(p))
+    } else {
+        None
     }
 }
 

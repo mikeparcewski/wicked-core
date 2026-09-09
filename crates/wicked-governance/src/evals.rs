@@ -24,6 +24,16 @@
 //! embedder families apart), the report degrades HONESTLY to facet/keyword-only matching and
 //! stamps `degraded: "facet-only"`; a similarity number is never fabricated.
 //!
+//! Rule coverage (core#394 — the blind spot the verdict rows cannot show): a decide-lane rule NO
+//! sample fires produces no result row and is invisible to `summary.gaps`, so a store can look
+//! healthy while merely untested. `rule_coverage` partitions the decide-lane rules eligible for
+//! the run into `exercised` (fired for ≥1 sample — caught, false positive, or a non-blocking
+//! effect alike) and `unexercised` (fired for none: either the corpus lacks a sample with that
+//! behavior/phase, or the rule's trigger/`applies_to` does not match the behavior it was written
+//! for), and counts the `recall_only` rules the eval structurally cannot measure (core#395: a rule
+//! without an effect never enters the gate, so zero decide-lane rules ⇒ the verdicts are exactly
+//! the corpus split, not a measurement of steering).
+//!
 //! Corpora live in the estate knowledge store under `evals:<name>` scopes ([`import_corpus`]
 //! writes them id-keyed WITH embeddings, through the same [`KnowledgeEngine`] the fan-out's
 //! knowledge lane uses), or as JSON files on disk, or as the built-in default corpus embedded
@@ -32,7 +42,7 @@
 //! Read-only over the rules store: `run_evals` never writes a claim (`conform` is the live gate's
 //! recorder, not the eval's) — evaluate with a read-only store handle beside a live daemon.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +55,7 @@ use crate::conformance::{list_rules, ConformanceRule, RuleQuery, STEERING_TYPES}
 use crate::domain::Effect;
 use crate::engine::{decide, select_any};
 use crate::fanout::{rationale_chunk, rationale_chunk_id};
+use crate::steering::{legacy_policies, steering_type_for_policy_kind};
 
 /// Every eval corpus scope in the knowledge store is `evals:<name>` (the arch-R5 `wiki:<area>`
 /// convention, evals lane).
@@ -277,15 +288,58 @@ pub struct EvalSummary {
     pub false_positives: usize,
 }
 
+/// One decide-lane rule NO sample in the run fired (pinned wire shape, snake_case).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnexercisedRule {
+    pub rule_id: String,
+    pub steering_type: String,
+}
+
+/// The per-steering-type rule-coverage row (`rule_coverage.per_type[<type>]`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeCoverage {
+    pub exercised: usize,
+    pub unexercised: usize,
+}
+
+/// Rule coverage over the decide-lane rules ELIGIBLE for the run (module docs, core#394). The
+/// eligible set is every ACTIVE effect-bearing rule the gate could fire — the same two lanes
+/// [`select_any`] funnels (unified steering rules + legacy policy rows with no unified twin),
+/// minus its phase filter (a rule whose phase no sample runs at is a corpus finding, not an
+/// exclusion) — narrowed to the `--type` slice when one is given: the slice asks about ONE type,
+/// so a rule of another type not firing for the slice's samples is not a finding about it.
+///
+/// - `exercised` + `unexercised.len()` = the eligible set. A rule is exercised when it fired
+///   (appeared in the claim's `policy_ids`) for at least one evaluated sample — whatever the
+///   verdict, whatever its effect: a false positive still tests the rule.
+/// - `unexercised` is sorted by `rule_id`; each row carries the rule's `steering_type` so an
+///   operator can see WHICH doctrine is untested.
+/// - `recall_only` counts the active rules (in the slice) carrying NO effect — outside the
+///   partition because the gate never fires them (core#395); when the eligible set is empty the
+///   verdicts measure the corpus split, not enforcement.
+/// - `per_type` carries all seven [`STEERING_TYPES`] (zeros included — a pinned shape, never a
+///   sometimes-absent key).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleCoverage {
+    pub exercised: usize,
+    pub unexercised: Vec<UnexercisedRule>,
+    pub recall_only: usize,
+    pub per_type: BTreeMap<String, TypeCoverage>,
+}
+
 /// The full eval report (pinned wire shape). `degraded` is ALWAYS serialized — `null` when gap
 /// hints ran on real embeddings, `"facet-only"` when they degraded to keyword matching (Option
 /// without `skip_serializing_if` is deliberate: the TS side reads `degraded: string | null`, and
-/// an absent key would read as `undefined` — pin the shape producer-side).
+/// an absent key would read as `undefined` — pin the shape producer-side). `rule_coverage` is
+/// likewise always serialized; the `serde(default)` only lets a report recorded BEFORE the field
+/// existed (crew's eval history) still parse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EvalReport {
     pub results: Vec<SampleResult>,
     pub summary: EvalSummary,
     pub degraded: Option<String>,
+    #[serde(default)]
+    pub rule_coverage: RuleCoverage,
 }
 
 /// The corpus-import receipt (pinned wire shape).
@@ -305,10 +359,58 @@ pub struct ImportReceipt {
 pub enum CorpusSource {
     /// The compiled-in `evals/dev-behaviors` corpus.
     Builtin,
-    /// A directory of `*.json` files, each holding one sample or an array of samples.
+    /// A directory of `*.json` corpus files, each in any shape [`CorpusSource::File`] accepts.
     Dir(std::path::PathBuf),
+    /// One `*.json` corpus file on disk: the documented `{ "name", "samples" }` corpus (the
+    /// `POST /testing/corpora/import` body — a corpus authored for crew replays from disk
+    /// unchanged), a bare array of samples, or a single sample. Replays WITHOUT an import: nothing
+    /// is written, and gap hints come from the knowledge store's rule-rationale vectors exactly as
+    /// for every other source.
+    File(std::path::PathBuf),
     /// An estate knowledge-store scope (`evals:<name>`), read from the knowledge db.
     Scope(String),
+}
+
+/// Parse one corpus file (the [`CorpusSource::File`] shapes). The top-level JSON shape picks the
+/// parser — an array is samples, an object with a `samples` key is the corpus object, any other
+/// object is one sample — so the error names the field that is actually wrong instead of the last
+/// shape tried.
+fn read_corpus_file(path: &Path) -> anyhow::Result<Vec<EvalSample>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read eval corpus file {path:?}: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("eval corpus file {path:?} is not JSON: {e}"))?;
+    match value {
+        serde_json::Value::Array(_) => {
+            serde_json::from_value::<Vec<EvalSample>>(value).map_err(|e| {
+                anyhow::anyhow!("eval corpus file {path:?}: invalid sample in array: {e}")
+            })
+        }
+        serde_json::Value::Object(mut corpus) if corpus.contains_key("samples") => {
+            // The documented corpus object. `name` is documentation on disk (the scope is named
+            // at import time, `--import <name>`) and is accepted; any other key is a typo — fail
+            // loud, exactly as an unknown sample field does.
+            corpus.remove("name");
+            let samples = corpus
+                .remove("samples")
+                .expect("checked by the match guard");
+            if let Some(unknown) = corpus.keys().next() {
+                anyhow::bail!(
+                    "eval corpus file {path:?}: unknown corpus key {unknown:?} — a corpus is \
+                     {{\"name\", \"samples\"}}"
+                );
+            }
+            serde_json::from_value::<Vec<EvalSample>>(samples)
+                .map_err(|e| anyhow::anyhow!("eval corpus file {path:?}: invalid `samples`: {e}"))
+        }
+        serde_json::Value::Object(_) => serde_json::from_value::<EvalSample>(value)
+            .map(|one| vec![one])
+            .map_err(|e| anyhow::anyhow!("eval corpus file {path:?} is not a sample: {e}")),
+        _ => anyhow::bail!(
+            "eval corpus file {path:?} must be a {{\"name\", \"samples\"}} corpus, an array of \
+             samples, or one sample"
+        ),
+    }
 }
 
 /// The default knowledge db (`~/.wicked-estate/knowledge.db`) — ALWAYS overridable via
@@ -360,18 +462,17 @@ pub fn load_corpus(
             }
             let mut samples = Vec::new();
             for f in files {
-                let text = std::fs::read_to_string(&f)
-                    .map_err(|e| anyhow::anyhow!("read eval corpus file {f:?}: {e}"))?;
-                // A file is either one sample or an array of samples.
-                match serde_json::from_str::<Vec<EvalSample>>(&text) {
-                    Ok(mut many) => samples.append(&mut many),
-                    Err(_) => match serde_json::from_str::<EvalSample>(&text) {
-                        Ok(one) => samples.push(one),
-                        Err(e) => anyhow::bail!(
-                            "eval corpus file {f:?} is neither a sample nor an array of samples: {e}"
-                        ),
-                    },
-                }
+                samples.extend(read_corpus_file(&f)?);
+            }
+            samples
+        }
+        CorpusSource::File(path) => {
+            if !path.is_file() {
+                anyhow::bail!("eval corpus file {path:?} does not exist");
+            }
+            let samples = read_corpus_file(path)?;
+            if samples.is_empty() {
+                anyhow::bail!("eval corpus file {path:?} holds no samples");
             }
             samples
         }
@@ -707,14 +808,87 @@ fn nearest_rules(
     scored
 }
 
+/// The decide-lane rules eligible for a run as `(rule_id, steering_type)` pairs, sorted by id
+/// (see [`RuleCoverage`] for the definition). Mirrors [`select_any`]'s two lanes WITHOUT its
+/// phase filter: every effect-bearing unified row CLAIMS its id (retired or not — its legacy twin
+/// must never resurface, exactly as in SELECT), active ones are eligible; legacy `Other(POLICY)`
+/// rows with no unified twin are eligible too, typed through the documented kind mapping.
+fn decide_lane_rules(
+    store: &dyn GraphRead,
+    steering_type: Option<&str>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let in_slice = |t: &str| steering_type.is_none_or(|s| s == t);
+    // Retired rows INCLUDED: a retired effect-bearing unified row still claims its id.
+    let unified = list_rules(store, &RuleQuery::default(), true)?;
+    let unified_effect_ids: BTreeSet<&str> = unified
+        .iter()
+        .filter(|r| r.effect.is_some())
+        .map(|r| r.id.as_str())
+        .collect();
+    let mut eligible: Vec<(String, String)> = unified
+        .iter()
+        .filter(|r| r.effect.is_some() && !r.retired && in_slice(&r.steering_type))
+        .map(|r| (r.id.clone(), r.steering_type.clone()))
+        .collect();
+    for policy in legacy_policies(store)? {
+        if policy.retired || unified_effect_ids.contains(policy.id.as_str()) {
+            continue;
+        }
+        let steering_type = steering_type_for_policy_kind(&policy.kind);
+        if in_slice(steering_type) {
+            eligible.push((policy.id, steering_type.to_string()));
+        }
+    }
+    eligible.sort();
+    Ok(eligible)
+}
+
+/// Partition the eligible decide-lane rules by whether any evaluated sample fired them
+/// ([`RuleCoverage`] docs). `candidates` is the active unified store (the hint candidates);
+/// `triggered` is the union of every evaluated claim's `policy_ids`.
+fn rule_coverage(
+    store: &dyn GraphRead,
+    candidates: &[ConformanceRule],
+    steering_type: Option<&str>,
+    triggered: &BTreeSet<String>,
+) -> anyhow::Result<RuleCoverage> {
+    let mut coverage = RuleCoverage {
+        per_type: STEERING_TYPES
+            .iter()
+            .map(|t| (t.to_string(), TypeCoverage::default()))
+            .collect(),
+        ..Default::default()
+    };
+    for (rule_id, rule_type) in decide_lane_rules(store, steering_type)? {
+        let row = coverage.per_type.entry(rule_type.clone()).or_default();
+        if triggered.contains(&rule_id) {
+            coverage.exercised += 1;
+            row.exercised += 1;
+        } else {
+            row.unexercised += 1;
+            coverage.unexercised.push(UnexercisedRule {
+                rule_id,
+                steering_type: rule_type,
+            });
+        }
+    }
+    coverage.recall_only = candidates
+        .iter()
+        .filter(|r| r.effect.is_none() && steering_type.is_none_or(|t| r.steering_type == t))
+        .count();
+    Ok(coverage)
+}
+
 /// Evaluate ONE sample through the real gate path against `store`. Returns the result row minus
-/// gap hints (the caller owns the hint mode). Read-only.
+/// gap hints (the caller owns the hint mode) plus EVERY rule id the claim fired — blocking or not
+/// (the rule-coverage "exercised" evidence; the row's `fired` keeps the pinned deny-only
+/// semantics). Read-only.
 fn evaluate_sample(
     store: &dyn GraphRead,
     sample: &EvalSample,
     scope: &str,
     now: i64,
-) -> anyhow::Result<SampleResult> {
+) -> anyhow::Result<(SampleResult, Vec<String>)> {
     let phase = sample
         .signals
         .phase
@@ -765,18 +939,22 @@ fn evaluate_sample(
         ),
     };
 
-    Ok(SampleResult {
-        sample: SampleRef::from(sample),
-        expected,
-        fired,
-        verdict,
-        nearest_rules: None,
-    })
+    Ok((
+        SampleResult {
+            sample: SampleRef::from(sample),
+            expected,
+            fired,
+            verdict,
+            nearest_rules: None,
+        },
+        claim.policy_ids,
+    ))
 }
 
-/// Run a corpus through the REAL gate path against the rules in `store`, scoring each sample and
-/// attaching gap hints. `steering_type` (validated against the 7) slices the corpus;
-/// `knowledge_db` powers embedding hints (absent/unusable ⇒ the report degrades to
+/// Run a corpus through the REAL gate path against the rules in `store`, scoring each sample,
+/// attaching gap hints, and reporting rule coverage over the decide-lane rules the run was
+/// eligible to fire. `steering_type` (validated against the 7) slices the corpus AND the coverage
+/// denominator; `knowledge_db` powers embedding hints (absent/unusable ⇒ the report degrades to
 /// `"facet-only"`). Strictly read-only on both stores.
 pub fn run_evals(
     store: &dyn GraphRead,
@@ -806,8 +984,11 @@ pub fn run_evals(
     let scope = "governance-evals";
     let mut results = Vec::with_capacity(selected_samples.len());
     let mut summary = EvalSummary::default();
+    // Every rule id any evaluated claim fired — the rule-coverage "exercised" evidence.
+    let mut triggered: BTreeSet<String> = BTreeSet::new();
     for sample in selected_samples {
-        let mut result = evaluate_sample(store, sample, scope, now)?;
+        let (mut result, fired_ids) = evaluate_sample(store, sample, scope, now)?;
+        triggered.extend(fired_ids);
         summary.total += 1;
         match result.verdict {
             Verdict::Caught => summary.caught += 1,
@@ -833,6 +1014,7 @@ pub fn run_evals(
             HintMode::Embedding { .. } => None,
             HintMode::FacetOnly => Some(DEGRADED_FACET_ONLY.to_string()),
         },
+        rule_coverage: rule_coverage(store, &candidates, steering_type, &triggered)?,
     })
 }
 
@@ -1369,6 +1551,24 @@ mod tests {
             v["summary"],
             serde_json::json!({"total": 2, "caught": 1, "gaps": 1, "false_positives": 0})
         );
+        // Rule coverage: ALWAYS present, snake_case, all seven types in the rollup.
+        assert_eq!(
+            v["rule_coverage"],
+            serde_json::json!({
+                "exercised": 1,
+                "unexercised": [],
+                "recall_only": 0,
+                "per_type": {
+                    "architecture": {"exercised": 0, "unexercised": 0},
+                    "compliance": {"exercised": 0, "unexercised": 0},
+                    "design-ux": {"exercised": 0, "unexercised": 0},
+                    "development": {"exercised": 0, "unexercised": 0},
+                    "operations": {"exercised": 0, "unexercised": 0},
+                    "security": {"exercised": 1, "unexercised": 0},
+                    "testing": {"exercised": 0, "unexercised": 0},
+                },
+            })
+        );
         let caught = &v["results"][0];
         assert_eq!(caught["expected"], "deny");
         assert_eq!(caught["verdict"], "caught");
@@ -1471,6 +1671,448 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("estate scope name"), "{err}");
+    }
+
+    /// A fresh temp dir for on-disk corpus fixtures.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-gov-evals-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `--corpus <file.json>`: one corpus file replays from disk without an import — in the
+    /// documented `{name, samples}` shape (the import body), as a bare array, or as one sample —
+    /// through the same validation every other source gets; a directory of such files reads the
+    /// same shapes.
+    #[test]
+    fn file_corpus_loads_the_documented_corpus_object_an_array_and_one_sample() {
+        let a = sample(
+            "wicked-crew@abc1234",
+            SampleKind::Bad,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push --force origin main",
+        );
+        let b = sample(
+            "wicked-crew@def5678",
+            SampleKind::Good,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push origin fix/null-guard",
+        );
+        let dir = temp_dir("file-corpus");
+
+        let corpus = dir.join("corpus.json");
+        let object = serde_json::json!({ "name": "ours", "samples": [&a, &b] });
+        std::fs::write(&corpus, serde_json::to_string(&object).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::File(corpus), None).unwrap(),
+            vec![a.clone(), b.clone()],
+            "the corpus object, in file order"
+        );
+
+        let array = dir.join("array.json");
+        std::fs::write(&array, serde_json::to_string(&[&a, &b]).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::File(array), None).unwrap(),
+            vec![a.clone(), b.clone()]
+        );
+
+        let one = dir.join("one.json");
+        std::fs::write(&one, serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::File(one), None).unwrap(),
+            vec![a.clone()]
+        );
+
+        // The directory of all three repeats ids across files — the shared validation refuses it…
+        let err = load_corpus(&CorpusSource::Dir(dir.clone()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate sample id"), "{err}");
+        // …and with only the corpus object left, the Dir source reads the documented shape too.
+        std::fs::remove_file(dir.join("array.json")).unwrap();
+        std::fs::remove_file(dir.join("one.json")).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::Dir(dir), None).unwrap(),
+            vec![a, b]
+        );
+    }
+
+    /// File-corpus malformations fail loud with the path: a missing file, an empty corpus, a
+    /// corpus object with a typo key, an invalid sample inside `samples`, a non-JSON file, a
+    /// scalar top level, and (via the shared sample validation) a blank id.
+    #[test]
+    fn file_corpus_malformations_fail_loud_with_the_path() {
+        let dir = temp_dir("file-corpus-bad");
+        let missing = dir.join("missing.json");
+        let err = load_corpus(&CorpusSource::File(missing), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing.json") && err.contains("does not exist"),
+            "{err}"
+        );
+
+        let cases: [(&str, &str, &str); 5] = [
+            ("empty.json", "[]", "holds no samples"),
+            (
+                "typo-key.json",
+                r#"{"nam": "x", "samples": []}"#,
+                "unknown corpus key \"nam\"",
+            ),
+            (
+                "bad-sample.json",
+                r#"{"name": "x", "samples": [{"id": "s1", "kind": "bad"}]}"#,
+                "invalid `samples`",
+            ),
+            ("not-json.json", "{", "is not JSON"),
+            ("scalar.json", "42", "must be a"),
+        ];
+        for (name, text, needle) in cases {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let err = load_corpus(&CorpusSource::File(path), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(name), "{name}: names the file: {err}");
+            assert!(
+                err.contains(needle),
+                "{name}: expected {needle:?} in: {err}"
+            );
+        }
+
+        let mut blank = sample(
+            "dev-a",
+            SampleKind::Good,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "ok",
+        );
+        blank.id = "  ".into();
+        let path = dir.join("blank-id.json");
+        let object = serde_json::json!({ "name": "x", "samples": [blank] });
+        std::fs::write(&path, serde_json::to_string(&object).unwrap()).unwrap();
+        let err = load_corpus(&CorpusSource::File(path), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blank id"), "{err}");
+    }
+
+    /// A frontmattered doc under a fresh temp dir, ingested through the markdown lane — the
+    /// operator authoring path core#395 opens. Returns the minted rules.
+    fn ingest_doc(tag: &str, doc: &str) -> Vec<ConformanceRule> {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-gov-evals-doc-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("doctrine.md"), doc).unwrap();
+        crate::ingest::ingest_from(&crate::markdown::MarkdownAdapter::new(&dir)).unwrap()
+    }
+
+    const FORCE_PUSH_DOC_HEAD: &str = "---\n\
+        id: git-hygiene\n\
+        title: Git hygiene\n\
+        steering_type: development\n\
+        applies_to: [build]\n";
+    const FORCE_PUSH_DOC_RULE: &str = "---\n\n## Rules\n\n\
+        - POL-060 (critical): Never force-push a shared branch.\n";
+
+    /// core#395 END TO END: the SAME markdown rule, with `effect: deny` in its frontmatter, catches
+    /// the bad sample through the real gate path; without the key it is recall-only and the sample
+    /// is a gap — the exact structural inertness the issue describes, now an operator choice.
+    #[test]
+    fn markdown_rule_with_effect_deny_catches_and_the_same_rule_without_effect_gaps() {
+        crate::events::hermetic_test_spool();
+        let s = sample(
+            "dev-force-push",
+            SampleKind::Bad,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push --force origin main",
+        );
+
+        // With `effect: deny` (+ a trigger the sample's command matches).
+        let deny_doc = format!(
+            "{FORCE_PUSH_DOC_HEAD}effect: deny\n{FORCE_PUSH_DOC_RULE}  trigger: push\\s+--force\n"
+        );
+        let mut store = open_store(Some(":memory:")).unwrap();
+        for r in ingest_doc("deny", &deny_doc) {
+            register_rule(&mut store, &r).unwrap();
+        }
+        let report = run_evals(&store, std::slice::from_ref(&s), None, None, 1_000).unwrap();
+        assert_eq!(report.results[0].verdict, Verdict::Caught);
+        assert_eq!(report.results[0].fired, vec!["POL-060".to_string()]);
+        assert_eq!(report.summary.caught, 1);
+        assert_eq!(
+            report.rule_coverage.exercised, 1,
+            "the doc rule was exercised"
+        );
+        assert!(report.rule_coverage.unexercised.is_empty());
+        assert_eq!(report.rule_coverage.recall_only, 0);
+
+        // The same doc WITHOUT the key: recall-only ⇒ nothing can fire ⇒ gap, and the coverage
+        // block says so honestly (0 decide-lane rules, 1 recall-only).
+        let recall_doc = format!("{FORCE_PUSH_DOC_HEAD}{FORCE_PUSH_DOC_RULE}");
+        let mut store = open_store(Some(":memory:")).unwrap();
+        for r in ingest_doc("recall", &recall_doc) {
+            assert!(r.effect.is_none(), "no key ⇒ recall-only (the default)");
+            register_rule(&mut store, &r).unwrap();
+        }
+        let report = run_evals(&store, &[s], None, None, 1_000).unwrap();
+        assert_eq!(report.results[0].verdict, Verdict::Gap);
+        assert!(report.results[0].fired.is_empty());
+        assert_eq!(report.rule_coverage.exercised, 0);
+        assert!(report.rule_coverage.unexercised.is_empty());
+        assert_eq!(
+            report.rule_coverage.recall_only, 1,
+            "the eval cannot measure a recall-only rule — say so, don't count it as a gap"
+        );
+        // …and it is still the nearest keyword hint for the gap (unchanged hinting).
+        assert_eq!(
+            report.results[0].nearest_rules.as_ref().unwrap()[0].rule_id,
+            "POL-060"
+        );
+    }
+
+    /// core#394: a decide-lane rule NO sample fires appears in `unexercised` with its
+    /// steering_type; a rule that fired for ANY sample (here a false positive) is exercised; a
+    /// non-blocking effect that fires is exercised too; retired rules are out of the partition;
+    /// the per-type rollup carries all seven types.
+    #[test]
+    fn rules_no_sample_fires_are_reported_unexercised() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        // Fires for the sample (a bad force-push): exercised.
+        register_policy(
+            &mut store,
+            &deny_policy("GOV-FORCE-PUSH", &["build"], Some(r"push\s+--force")),
+        )
+        .unwrap();
+        // Phase-selected but never triggered: unexercised.
+        let mut rm = deny_policy("GOV-RM-RF", &["build"], Some(r"rm\s+-rf"));
+        rm.kind = "operations".to_string();
+        register_policy(&mut store, &rm).unwrap();
+        // Applies to a phase no sample runs at: unexercised (the corpus lacks that phase).
+        register_policy(
+            &mut store,
+            &deny_policy("GOV-REVIEW-ONLY", &["review"], None),
+        )
+        .unwrap();
+        // A non-blocking effect that fires (blanket trigger): exercised, and NOT in `fired`.
+        let mut warn = deny_policy("GOV-WARN", &["build"], None);
+        warn.effect = Effect::AllowWithConditions;
+        register_policy(&mut store, &warn).unwrap();
+        // Retired: outside the partition entirely.
+        let mut old = deny_policy("GOV-RETIRED", &["build"], Some("never-matches"));
+        old.retired = true;
+        register_policy(&mut store, &old).unwrap();
+        // A recall-only rule: counted, not partitioned.
+        register_rule(&mut store, &recall_rule("R-UTC", "timestamps are UTC")).unwrap();
+
+        let s = sample(
+            "dev-force-push",
+            SampleKind::Bad,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push --force origin main",
+        );
+        let report = run_evals(&store, &[s], None, None, 1_000).unwrap();
+        assert_eq!(report.results[0].verdict, Verdict::Caught);
+        assert_eq!(
+            report.results[0].fired,
+            vec!["GOV-FORCE-PUSH".to_string()],
+            "`fired` keeps the pinned deny-only semantics"
+        );
+        let c = &report.rule_coverage;
+        assert_eq!(c.exercised, 2, "GOV-FORCE-PUSH + GOV-WARN");
+        assert_eq!(
+            c.unexercised,
+            vec![
+                UnexercisedRule {
+                    rule_id: "GOV-REVIEW-ONLY".into(),
+                    steering_type: "security".into(),
+                },
+                UnexercisedRule {
+                    rule_id: "GOV-RM-RF".into(),
+                    steering_type: "operations".into(),
+                },
+            ],
+            "sorted by rule id, each with its steering_type"
+        );
+        assert_eq!(c.recall_only, 1);
+        assert_eq!(
+            c.per_type.len(),
+            STEERING_TYPES.len(),
+            "all seven types, always"
+        );
+        assert_eq!(
+            c.per_type["security"],
+            TypeCoverage {
+                exercised: 2,
+                unexercised: 1,
+            }
+        );
+        assert_eq!(
+            c.per_type["operations"],
+            TypeCoverage {
+                exercised: 0,
+                unexercised: 1,
+            }
+        );
+        assert_eq!(c.per_type["design-ux"], TypeCoverage::default());
+    }
+
+    /// The `--type` slice narrows the coverage denominator to that type's rules: a rule of another
+    /// type that did not fire for the slice's samples is not reported as unexercised.
+    #[test]
+    fn type_slice_narrows_the_coverage_denominator_honestly() {
+        crate::events::hermetic_test_spool();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut dev = deny_policy("GOV-FORCE-PUSH", &["build"], Some(r"push\s+--force"));
+        dev.kind = "development".to_string();
+        register_policy(&mut store, &dev).unwrap();
+        let mut sec = deny_policy("GOV-AWS-KEY", &["build"], Some("AKIA"));
+        sec.kind = "security".to_string();
+        register_policy(&mut store, &sec).unwrap();
+        register_rule(&mut store, &recall_rule("R-UTC", "timestamps are UTC")).unwrap();
+
+        let dev_sample = sample(
+            "dev-small-pr",
+            SampleKind::Good,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push origin fix/null-guard",
+        );
+        let sec_sample = sample(
+            "sec-aws-key",
+            SampleKind::Bad,
+            "security",
+            "build",
+            "Write",
+            &[".env"],
+            "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+        );
+        let corpus = [dev_sample, sec_sample];
+
+        let dev_only = run_evals(&store, &corpus, Some("development"), None, 1_000).unwrap();
+        assert_eq!(dev_only.summary.total, 1);
+        assert_eq!(dev_only.rule_coverage.exercised, 0);
+        assert_eq!(
+            dev_only
+                .rule_coverage
+                .unexercised
+                .iter()
+                .map(|u| u.rule_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GOV-FORCE-PUSH"],
+            "the security rule is not a finding about the development slice"
+        );
+        assert_eq!(
+            dev_only.rule_coverage.recall_only, 0,
+            "R-UTC is architecture-typed — outside the slice"
+        );
+
+        let sec_only = run_evals(&store, &corpus, Some("security"), None, 1_000).unwrap();
+        assert_eq!(sec_only.rule_coverage.exercised, 1, "GOV-AWS-KEY fired");
+        assert!(sec_only.rule_coverage.unexercised.is_empty());
+
+        let all = run_evals(&store, &corpus, None, None, 1_000).unwrap();
+        assert_eq!(all.rule_coverage.exercised, 1);
+        assert_eq!(all.rule_coverage.unexercised.len(), 1);
+        assert_eq!(all.rule_coverage.recall_only, 1);
+    }
+
+    /// An un-migrated store: a legacy `Other(POLICY)` row with no unified twin is what SELECT
+    /// fires, so coverage counts it (typed through the documented kind mapping).
+    #[test]
+    fn legacy_policy_rows_without_a_unified_twin_count_toward_coverage() {
+        crate::events::hermetic_test_spool();
+        use wicked_apps_core::{GraphWrite, ToNode};
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut legacy = deny_policy("pol-legacy-gate", &["build"], Some("never-matches"));
+        legacy.kind = "gate".to_string();
+        store.begin_batch().unwrap();
+        store.upsert_nodes(&[legacy.to_node()]).unwrap();
+        store.commit_batch().unwrap();
+
+        let s = sample(
+            "dev-small-pr",
+            SampleKind::Good,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push origin fix/null-guard",
+        );
+        let report = run_evals(&store, &[s], None, None, 1_000).unwrap();
+        assert_eq!(
+            report.rule_coverage.unexercised,
+            vec![UnexercisedRule {
+                rule_id: "pol-legacy-gate".into(),
+                steering_type: "operations".into(),
+            }],
+            "legacy `gate` kind → operations, per steering_type_for_policy_kind"
+        );
+    }
+
+    /// S12: the hint mode is decided by RULE-RATIONALE vectors, not by corpus-sample embeddings —
+    /// a knowledge db holding a fully embedded corpus but no rationale chunks still degrades to
+    /// facet-only, and the verdict is unchanged across hint modes.
+    #[test]
+    fn degraded_is_decided_by_rationale_vectors_not_corpus_embeddings() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        register_rule(
+            &mut store,
+            &recall_rule(
+                "R-FORCE-PUSH",
+                "never force push a protected branch like main",
+            ),
+        )
+        .unwrap();
+        let s = sample(
+            "dev-force-push",
+            SampleKind::Bad,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push --force origin main",
+        );
+
+        // The corpus IS embedded in this knowledge db (import verifies it)…
+        let kdb = temp_db("embedded-corpus-no-rationale");
+        let receipt = import_corpus(&kdb, "smoke", std::slice::from_ref(&s), 1_000).unwrap();
+        assert!(receipt.embedded, "the corpus vectors exist");
+
+        // …but no rule-rationale chunk does, so hints must degrade — corpus vectors are not
+        // evidence that rationale vectors are comparable.
+        let loaded = load_corpus(&CorpusSource::Scope("evals:smoke".into()), Some(&kdb)).unwrap();
+        let report = run_evals(&store, &loaded, None, Some(&kdb), 1_000).unwrap();
+        assert_eq!(report.degraded.as_deref(), Some(DEGRADED_FACET_ONLY));
+        assert_eq!(report.results[0].verdict, Verdict::Gap);
+        let hints = report.results[0].nearest_rules.as_ref().unwrap();
+        assert_eq!(hints[0].rule_id, "R-FORCE-PUSH", "keyword hints still work");
+
+        // Verdicts do not depend on the hint mode: the same run with no knowledge db at all.
+        let bare = run_evals(&store, &loaded, None, None, 1_000).unwrap();
+        assert_eq!(bare.results[0].verdict, report.results[0].verdict);
+        assert_eq!(bare.summary, report.summary);
+        assert_eq!(bare.rule_coverage, report.rule_coverage);
     }
 
     #[test]
