@@ -77,8 +77,10 @@
 //! `SKILL.md` under `skills/` must be indexed (a disabled or unpublished skill copied in is refused
 //! by path), every indexed entry must exist, `views/` may hold only the copilot view (judged whole,
 //! `copilot_view_for`), and NO symlink may sit anywhere in the generation — the one exception is
-//! crew's root-level `.venv` link, accepted only when it resolves inside canonical
-//! `<state home>/skills/baseline/<64-hex>/.venv` (crew's own rule).
+//! crew's root-level `.venv` link, accepted only when `snapshot.json.venv` is `synced` and it
+//! resolves inside canonical `<state home>/skills/baseline/<recorded baseline>/.venv` — the
+//! `gardenSource.baseline` the same file records, never any other bundle's env (crew's own
+//! `verifyCurrent` rule; review pass 11). A `synced` generation without the link is refused too.
 //!
 //! # Admission — before any process starts
 //!
@@ -432,6 +434,49 @@ fn json_kind(v: &Value) -> &'static str {
     }
 }
 
+/// The baseline env's state crew records in `snapshot.json.venv` at publish (`SkillVenvState`):
+/// `synced` ⇒ the generation carries the root `.venv` link into the recorded baseline's env;
+/// `skipped` ⇒ nothing to provision, no link; `pending`/`failed` ⇒ no link either (a failed
+/// provisioning is blocking on crew's side, so a published generation should not carry it, but
+/// the engine reads whatever was written and binds the link to it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VenvState {
+    Pending,
+    Synced,
+    Failed,
+    Skipped,
+}
+
+impl VenvState {
+    const SPELLINGS: &'static str = "pending|synced|failed|skipped";
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "synced" => Some(Self::Synced),
+            "failed" => Some(Self::Failed),
+            "skipped" => Some(Self::Skipped),
+            _ => None,
+        }
+    }
+
+    fn spelled(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Synced => "synced",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+/// Is `s` a sha256 content hash as crew spells one — exactly 64 lowercase hex digits?
+fn is_content_hash(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// A resolved skills root: WHERE it is, where it came from, and WHAT it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillsSnapshot {
@@ -452,6 +497,16 @@ pub(crate) struct SkillsSnapshot {
     /// The worker Read fence over that directory is the registry (`execute_wrapped::deny_rules`).
     /// `None` for a fallback root, which has no state home (it sits in the claude config dir).
     pub state_home: Option<PathBuf>,
+    /// `snapshot.json.gardenSource.baseline` — the sha256 content hash of the bundle this
+    /// generation was published from, which names the ONE baseline env its `.venv` link may reach
+    /// (`<state home>/skills/baseline/<baseline>/.venv`; review pass 11 — crew's `verifyCurrent`
+    /// binds the link to the recorded hash, never to any hash that happens to exist). 64 lowercase
+    /// hex digits, validated at load; `None` for a fallback root.
+    pub baseline: Option<String>,
+    /// `snapshot.json.venv` — whether crew provisioned the baseline env for this generation: the
+    /// `.venv` link may exist only when it is `synced`, and a `synced` generation must carry it.
+    /// `None` for a fallback root.
+    pub venv: Option<VenvState>,
     skills: Vec<SkillEntry>,
 }
 
@@ -851,9 +906,11 @@ impl SkillsSnapshot {
     /// lever would deliver, is refused by path); (2) `views/` may hold only `copilot`, whose whole
     /// tree is then judged by [`copilot_view_for`](Self::copilot_view_for) (indexed portable
     /// skills only, no links, no strays); (3) NO symlink anywhere in the generation — the one
-    /// exception is crew's root-level `.venv` link, accepted only when it resolves inside
-    /// canonical `<state home>/skills/baseline/<64-hex>/.venv` (crew's own rule for the one link a
-    /// generation may carry). Everything else at the root (crew's support closure — `scripts/`,
+    /// exception is crew's root-level `.venv` link, accepted only when `snapshot.json.venv` is
+    /// `synced` and it resolves inside canonical `<state home>/skills/baseline/<recorded
+    /// baseline>/.venv` — the `gardenSource.baseline` the metadata records (crew's `verifyCurrent`
+    /// rule for the one link a generation may carry; review pass 11), and a `synced` generation
+    /// must carry it. Everything else at the root (crew's support closure — `scripts/`,
     /// `schemas/`, `docs/`, `pyproject.toml`, `uv.lock` …) is not enumerated against a list
     /// (crew's bundle is crew's), only contained.
     pub(crate) fn verify_delivered_tree(&self) -> Result<(), SkillsError> {
@@ -865,6 +922,22 @@ impl SkillsSnapshot {
         let mut found: BTreeSet<String> = BTreeSet::new();
         self.walk_delivered(&self.root, "", &mut found)
             .map_err(config)?;
+        // (review pass 11) A `synced` generation WITHOUT the `.venv` link is not what publish
+        // wrote either (crew's `verifyCurrent`): the walk above judged the link when present; its
+        // absence is judged here, by lstat of the one root name it may have.
+        if self.venv == Some(VenvState::Synced) {
+            let is_link = std::fs::symlink_metadata(self.root.join(".venv"))
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if !is_link {
+                return Err(config(
+                    "snapshot.json records the baseline env as synced but the generation has no \
+                     .venv link — a synced generation carries crew's root-level .venv into its \
+                     recorded baseline env"
+                        .to_string(),
+                ));
+            }
+        }
         let indexed: BTreeSet<&str> = self.skills.iter().map(|s| s.dir.as_str()).collect();
         let unindexed: Vec<String> = found
             .iter()
@@ -905,6 +978,20 @@ impl SkillsSnapshot {
                 .map_err(|e| format!("{child_rel} cannot be inspected ({e})"))?;
             if meta.file_type().is_symlink() {
                 if rel.is_empty() && name == ".venv" {
+                    // (review pass 11) The link may exist only when snapshot.json says an env was
+                    // provisioned (`venv: synced`) — crew's `verifyCurrent` rule; a live-cache
+                    // root records nothing and is refused below for having no state home.
+                    if let Some(state) = self.venv.filter(|s| *s != VenvState::Synced) {
+                        let target = std::fs::read_link(&child)
+                            .map(|t| t.display().to_string())
+                            .unwrap_or_default();
+                        return Err(format!(
+                            ".venv -> `{target}` is present although snapshot.json records the \
+                             env as `{}` — only a `synced` generation carries the baseline env \
+                             link",
+                            state.spelled()
+                        ));
+                    }
                     self.check_venv_link(&child)?;
                     continue;
                 }
@@ -951,7 +1038,9 @@ impl SkillsSnapshot {
 
     /// The one link a generation may carry (crew's rule, mirrored): root-level `.venv`, resolving
     /// INSIDE canonical `<state home>/skills/baseline/<64-hex>/.venv` — the shared, read-only
-    /// baseline env crew provisions once per bundle hash. Anything else it points at is refused.
+    /// baseline env crew provisions once per bundle hash — where the `<64-hex>` IS the baseline
+    /// `snapshot.json.gardenSource.baseline` records (review pass 11). Anything else it points at
+    /// is refused; the caller has already required `venv: synced`.
     fn check_venv_link(&self, link: &Path) -> Result<(), String> {
         let Some(state_home) = &self.state_home else {
             return Err(
@@ -1018,12 +1107,20 @@ impl SkillsSnapshot {
         let [hash, venv] = parts.as_slice() else {
             return Err(outside());
         };
-        let hash_ok = hash.len() == 64
-            && hash
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !hash_ok || *venv != ".venv" {
+        if !is_content_hash(hash) || *venv != ".venv" {
             return Err(outside());
+        }
+        // (review pass 11) BOUND to the metadata: the env the link reaches must be the one
+        // `gardenSource.baseline` records — never any baseline that happens to exist (crew's
+        // `verifyCurrent`: an altered link into a sibling bundle's env would otherwise verify).
+        if self.baseline.as_deref() != Some(*hash) {
+            return Err(format!(
+                ".venv is a symlink to `{}`, whose baseline env `{hash}` is not the baseline \
+                 snapshot.json records (`{}`); the link may only reach the env crew provisioned \
+                 for this generation's own bundle",
+                target.display(),
+                self.baseline.as_deref().unwrap_or("none recorded")
+            ));
         }
         real_dir(
             &baseline.join(hash),
@@ -1982,6 +2079,44 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
             }
         }
     }
+    // The recorded baseline AUTHORIZES the `.venv` link (review pass 11; crew's `verifyCurrent`):
+    // it must be a sha256 content hash — never free text, which could carry `..` — and the env
+    // state must be one of the four crew writes, so the link can be bound to both.
+    let baseline = match source_obj.get("baseline").and_then(Value::as_str) {
+        Some(s) if is_content_hash(s) => s.to_string(),
+        Some(s) => {
+            return Err(config_err(format!(
+                "{SNAPSHOT_INDEX} `gardenSource.baseline` `{s}` is not a sha256 content hash (64 \
+                 lowercase hex digits) — the recorded baseline authorizes the `.venv` link and is \
+                 never trusted as free text"
+            )))
+        }
+        None => unreachable!("checked above: gardenSource.baseline is a non-empty string"),
+    };
+    let venv = match index.get("venv") {
+        Some(Value::String(s)) => VenvState::parse(s).ok_or_else(|| {
+            config_err(format!(
+                "{SNAPSHOT_INDEX} `venv` is `{s}`, not one of {} — crew records the baseline \
+                 env's state in every published generation",
+                VenvState::SPELLINGS
+            ))
+        })?,
+        Some(other) => {
+            return Err(config_err(format!(
+                "{SNAPSHOT_INDEX} `venv` is a JSON {}, not a string ({})",
+                json_kind(other),
+                VenvState::SPELLINGS
+            )))
+        }
+        None => {
+            return Err(config_err(format!(
+                "{SNAPSHOT_INDEX} has no `venv` — crew records the baseline env's state ({}) in \
+                 every published generation; it decides whether the generation may carry the \
+                 `.venv` link",
+                VenvState::SPELLINGS
+            )))
+        }
+    };
     let entries = index
         .get("skills")
         .and_then(Value::as_array)
@@ -2106,6 +2241,8 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
         gen: Some(gen),
         content_hash: Some(content_hash),
         state_home: Some(state_home),
+        baseline: Some(baseline),
+        venv: Some(venv),
         skills,
     };
     // Exact index/tree PARITY over the whole delivered closure (codex round 7): every `SKILL.md`
@@ -2192,6 +2329,8 @@ fn load_live(root: PathBuf, source: SnapshotSource) -> Result<SkillsSnapshot, St
         gen: None,
         content_hash: None,
         state_home: None,
+        baseline: None,
+        venv: None,
         skills,
     };
     // The same whole-tree containment a published generation gets: no link anywhere in the
@@ -2971,6 +3110,13 @@ pub(crate) mod test_support {
         snapshot_root_with(root, gen, &entries)
     }
 
+    /// The bundle hash the fixture's `snapshot.json` records as `gardenSource.baseline` — a
+    /// sha256-shaped 64-hex value (review pass 11: the recorded baseline authorizes the `.venv`
+    /// link, so a fixture that plants one must target THIS hash).
+    pub(crate) fn fixture_baseline() -> String {
+        format!("{:0>64}", "ab12")
+    }
+
     /// The `gardenSource` crew writes into every `snapshot.json` (`SnapshotManifest`), as a
     /// fixture value — required at load (codex round 6).
     pub(crate) fn garden_source() -> serde_json::Value {
@@ -2978,21 +3124,35 @@ pub(crate) mod test_support {
             "kind": "directory",
             "path": "/fixture/garden",
             "plugin_version": "0.0.0",
-            "baseline": "fixture-baseline"
+            "baseline": fixture_baseline()
         })
     }
 
     /// A complete `snapshot.json` for `gen` over `skills` (JSON rows) — the required identity
-    /// fields (`gen`, `contentHash`, `gardenSource`) plus the rows — for tests that hand-write an
-    /// index to say exactly what is wrong with ITS rows.
+    /// fields (`gen`, `contentHash`, `gardenSource`, `venv: skipped` — no env, no link) plus the
+    /// rows — for tests that hand-write an index to say exactly what is wrong with ITS rows.
     pub(crate) fn index_json(gen: &str, skills: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
             "gen": gen,
             "contentHash": format!("sha256:{gen}"),
             "gardenSource": garden_source(),
+            "venv": "skipped",
             "skills": skills
         }))
         .unwrap()
+    }
+
+    /// Rewrite ONE top-level field of the fixture's `snapshot.json` at `root` (`venv`, say) —
+    /// the engine does not re-hash the metadata, so a test can state the recorded env state.
+    /// `#[cfg(unix)]`: its only caller is the symlink (`.venv`) section of the parity test, so on
+    /// Windows it would be dead code under `-D warnings`.
+    #[cfg(unix)]
+    pub(crate) fn set_index_field(root: &Path, key: &str, value: serde_json::Value) {
+        let path = root.join(super::SNAPSHOT_INDEX);
+        let mut index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        index[key] = value;
+        std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
     }
 
     /// [`snapshot_root`] with per-skill `portable` and `mandates` (declared in the frontmatter,
@@ -3330,14 +3490,43 @@ mod tests {
         )
         .unwrap();
         expect_err(&bad, "`gardenSource.baseline` is empty");
+        // (review pass 11) The recorded baseline must be a sha256 content hash — it authorizes
+        // the `.venv` link — and `venv` is required, one of crew's four states.
+        let hex = fixture_baseline();
+        let with_source = |baseline: &str, venv: &str| {
+            format!(
+                r#"{{"gen":3,"contentHash":"sha256:3","gardenSource":{{"kind":"directory","path":"","plugin_version":"","baseline":"{baseline}"}}{venv},"skills":[{{"name":"wicked-garden-core","dir":"skills/core","portable":true}}]}}"#
+            )
+        };
+        std::fs::write(bad.join(SNAPSHOT_INDEX), with_source("b", "")).unwrap();
+        expect_err(
+            &bad,
+            "`gardenSource.baseline` `b` is not a sha256 content hash",
+        );
+        std::fs::write(bad.join(SNAPSHOT_INDEX), with_source(&hex, "")).unwrap();
+        expect_err(&bad, "has no `venv`");
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            with_source(&hex, r#","venv":"maybe""#),
+        )
+        .unwrap();
+        expect_err(
+            &bad,
+            "`venv` is `maybe`, not one of pending|synced|failed|skipped",
+        );
+        std::fs::write(bad.join(SNAPSHOT_INDEX), with_source(&hex, r#","venv":7"#)).unwrap();
+        expect_err(&bad, "`venv` is a JSON number, not a string");
         // Empty `path` / `plugin_version` are what crew writes for a source without them: fine
         // (the row for the fixture's one skill rides along — the tree and the index must agree).
         std::fs::write(
             bad.join(SNAPSHOT_INDEX),
-            r#"{"gen":3,"contentHash":"sha256:3","gardenSource":{"kind":"directory","path":"","plugin_version":"","baseline":"b"},"skills":[{"name":"wicked-garden-core","dir":"skills/core","portable":true}]}"#,
+            with_source(&hex, r#","venv":"skipped""#),
         )
         .unwrap();
-        assert_eq!(published(&bad).unwrap().unwrap().gen.as_deref(), Some("3"));
+        let loaded = published(&bad).unwrap().unwrap();
+        assert_eq!(loaded.gen.as_deref(), Some("3"));
+        assert_eq!(loaded.baseline.as_deref(), Some(hex.as_str()));
+        assert_eq!(loaded.venv, Some(VenvState::Skipped));
         let not_a_gen = snapshot_root(
             &base
                 .join("named")
@@ -3628,7 +3817,7 @@ mod tests {
         let numeric = snapshot_root(&gen_dir(&base.join("num"), "9"), "9", &[]);
         let with_gen = |gen: u64| {
             format!(
-                r#"{{"gen":{gen},"contentHash":"sha256:9","gardenSource":{},"skills":[]}}"#,
+                r#"{{"gen":{gen},"contentHash":"sha256:9","gardenSource":{},"venv":"skipped","skills":[]}}"#,
                 garden_source()
             )
         };
@@ -5136,6 +5325,7 @@ mod tests {
             "gen": "31",
             "contentHash": "sha256:31",
             "gardenSource": garden_source(),
+            "venv": "skipped",
             "skills": [
                 {"name": "wicked-garden-domain", "dir": "skills/domain", "portable": true},
                 {"name": "/etc", "dir": "skills/domain", "portable": true},
@@ -5571,14 +5761,18 @@ mod tests {
             std::fs::remove_dir_all(root.join("views")).unwrap();
             // .venv: with NO baseline env root in the state home, any link is refused naming the
             // missing root; with one, a link elsewhere ⇒ refused ("not exactly"); crew's link into
-            // `<state home>/skills/baseline/<64-hex>/.venv` — RELATIVE as crew writes it, or
-            // absolute — ⇒ fine; a non-hex baseline name ⇒ refused; dangling ⇒ refused; (codex
+            // `<state home>/skills/baseline/<RECORDED baseline>/.venv` — RELATIVE as crew writes
+            // it, or absolute — ⇒ fine once snapshot.json records the env as `synced` (review
+            // pass 11: the link is BOUND to the metadata — `gardenSource.baseline` names the one
+            // env it may reach and `venv` says whether one was provisioned; crew's
+            // `verifyCurrent`); a non-hex baseline name ⇒ refused; dangling ⇒ refused; (codex
             // round 8) a target with a component BEYOND `.venv` (`<hash>/.venv/bin`), one that
             // climbs back out (`<hash>/.venv/../x`), and a SYMLINKED `baseline` are refused.
             let venv = root.join(".venv");
             std::os::unix::fs::symlink(&outside, &venv).unwrap();
+            set_index_field(&root, "venv", serde_json::json!("synced"));
             refused("has no baseline env root");
-            let hash = format!("{:0>64}", "ab12");
+            let hash = fixture_baseline();
             let env = base
                 .join(SKILLS_DIR)
                 .join("baseline")
@@ -5590,7 +5784,7 @@ mod tests {
             std::os::unix::fs::symlink(&env, &venv).unwrap();
             assert!(
                 published(&root).is_ok(),
-                "crew's .venv link into the baseline env is the one accepted link: {:?}",
+                "crew's .venv link into the RECORDED baseline env is the one accepted link: {:?}",
                 published(&root).err()
             );
             std::fs::remove_file(&venv).unwrap();
@@ -5600,7 +5794,33 @@ mod tests {
                 "the RELATIVE spelling crew writes is accepted: {:?}",
                 published(&root).err()
             );
+            // (review pass 11) A link into ANOTHER valid baseline env (B) while snapshot.json
+            // records A ⇒ refused naming both hashes — B exists, is a real env, spells the exact
+            // shape, and is still not this generation's.
+            let other = format!("{:0>64}", "beef");
+            let other_env = base
+                .join(SKILLS_DIR)
+                .join("baseline")
+                .join(&other)
+                .join(".venv");
+            std::fs::create_dir_all(&other_env).unwrap();
             std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(format!("../../baseline/{other}/.venv"), &venv).unwrap();
+            refused(&format!("baseline env `{other}`"));
+            refused(&format!("snapshot.json records (`{hash}`)"));
+            // The RIGHT link while the env is recorded as NOT provisioned ⇒ refused, whatever the
+            // recorded state …
+            std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(format!("../../baseline/{hash}/.venv"), &venv).unwrap();
+            for state in ["skipped", "pending", "failed"] {
+                set_index_field(&root, "venv", serde_json::json!(state));
+                refused(&format!("records the env as `{state}`"));
+            }
+            set_index_field(&root, "venv", serde_json::json!("synced"));
+            assert!(published(&root).is_ok());
+            // … and `synced` WITHOUT the link is not what publish wrote either.
+            std::fs::remove_file(&venv).unwrap();
+            refused("records the baseline env as synced but the generation has no .venv link");
             std::os::unix::fs::symlink(env.join("bin"), &venv).unwrap();
             refused("not exactly");
             std::fs::remove_file(&venv).unwrap();
@@ -5629,11 +5849,14 @@ mod tests {
             std::fs::remove_file(&venv).unwrap();
             std::fs::remove_file(base.join(SKILLS_DIR).join("baseline")).unwrap();
             std::fs::rename(&real_baseline, base.join(SKILLS_DIR).join("baseline")).unwrap();
-            // A .venv link that is NOT at the root is an ordinary (refused) link.
+            // A .venv link that is NOT at the root is an ordinary (refused) link (the root one,
+            // valid and recorded `synced`, is back in place).
+            std::os::unix::fs::symlink(&env, &venv).unwrap();
             std::os::unix::fs::symlink(&env, skill_dir(&root, "domain").join(".venv")).unwrap();
             refused("skills/domain/.venv is a symlink");
             std::fs::remove_file(skill_dir(&root, "domain").join(".venv")).unwrap();
-            assert!(published(&root).is_ok());
+            let loaded = published(&root).expect("the recorded, synced link verifies");
+            assert_eq!(loaded.unwrap().venv, Some(VenvState::Synced));
         }
         let _ = std::fs::remove_dir_all(&base);
     }

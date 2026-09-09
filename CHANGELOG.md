@@ -288,6 +288,15 @@ Two release tracks share this file, newest entry first regardless of track:
   delivers nothing and refuses skill-bearing codex units by name; `CODEX_HOME` isolation is
   core#400. Windows: the two test-module wrappers used only by Unix tests are `#[cfg(unix)]`, and
   the cfg audit ignores path-qualified and commented mentions (it had missed exactly those two).
+  **Review pass 11 (confirmation review, one wire mismatch + one Copilot thread):** the snapshot's
+  `.venv` link is BOUND to its metadata as crew's `verifyCurrent` binds it — the link's `<64-hex>`
+  must equal `snapshot.json.gardenSource.baseline` (a link into another, equally valid baseline
+  env is refused naming both hashes), the link may exist only when `snapshot.json.venv` is
+  `synced` (present while `skipped`/`pending`/`failed` ⇒ refused), and a `synced` generation
+  without the link is refused too; `gardenSource.baseline` must be a sha256 content hash and
+  `venv` one of crew's four states, both required at load (`SkillsSnapshot::{baseline, venv}`).
+  The gate-hook wiring audit matches the stable prefix of the `assemble_read_roots` call, not
+  rustfmt's trailing comma.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`
