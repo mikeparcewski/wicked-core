@@ -32,12 +32,19 @@
 //! ([`derive`]); the explicit value is fenced on its own even when no snapshot is handed. The
 //! default `~/.wicked-crew` keeps its blanket rule whenever it is not the state home in play.
 //!
-//! The only non-denied path under the state home is the resolved `skills/snapshots/<gen>/`.
+//! The only non-denied path under the state home is the HANDED `skills/snapshots/<gen>/` — and
+//! only that one (design v3.3 §1; codex round 4). `skills/snapshots/` is the ONE directory listed
+//! at launch to BUILD rules: one deny per sibling entry — every older and newer generation, every
+//! staging and temp dir mid-publish — in addition to the static registry rules, and it fails
+//! closed: an unlistable slot refuses the launch, and so does an entry that is neither a
+//! generation directory nor a recognised staging name. A worker handed generation 7 cannot read
+//! generation 6 (nor the skills a later publish disabled) — round 3 left every sibling readable,
+//! which exceeded the single-generation exception v3.1 grants.
+//!
 //! Residuals, stated: a top-level entry created WHILE a session runs is fenced at the next launch
-//! (crew is the only writer of that directory, and the listing refuses it then); sibling
-//! immutable generations under `skills/snapshots/` stay readable until crew reaps them — a static
-//! rule cannot deny "every sibling but this one" without the enumeration this module exists to
-//! remove, and a published generation holds nothing but plugin files.
+//! (crew is the only writer of that directory, and the listing refuses it then); a generation
+//! published while a session runs is readable by that session until its next launch —
+//! generations are immutable and hold only the enabled skills of a newer publish.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -347,21 +354,29 @@ pub(crate) fn base_under(dir: &Path, root: &Path) -> Option<PathBuf> {
     root.starts_with(&canonical).then_some(canonical)
 }
 
-/// The Read rules for `state_home` with the snapshot in its read slot as the ONLY non-denied
-/// path: one rule per registered top-level entry (plus `/**` for anything that can have
-/// children), and for the skills root one rule per denied child (`baseline/**`, `effective/**`,
-/// `manifest.json`, `current`, `.uv-cache/**`, `snapshots/.staging-*/**`, …). `spell` renders a
-/// path in the permission-rule syntax (`execute_wrapped::rule_path`).
+/// The Read rules for `state_home` with the HANDED generation (`handed_gen`, the final component
+/// of the snapshot root) in its read slot as the ONLY non-denied path: one rule per registered
+/// top-level entry (plus `/**` for anything that can have children); for the skills root one rule
+/// per denied child (`baseline/**`, `effective/**`, `manifest.json`, `current`, `.uv-cache/**`,
+/// `snapshots/.staging-*/**`, …); and — design v3.3 §1 — one rule per SIBLING entry of the read
+/// slot, every entry of `skills/snapshots/` but `handed_gen`: older and newer generations,
+/// staging and temp dirs mid-publish. `spell` renders a path in the permission-rule syntax
+/// (`execute_wrapped::rule_path`).
 ///
 /// FAILS CLOSED — `Err` names the reason and the caller keeps the blanket rule — when: the
-/// registry does not parse; the state home (or its skills root) cannot be listed; a top-level
-/// entry, or a child of the skills root other than the read slot, is not classified by the
-/// registry; or a rule path cannot be spelled. The listing NEVER adds a rule: it only decides
-/// whether the static list is allowed to stand in for the blanket. Nothing under
-/// `skills/snapshots/` is listed — generations are the read slot and the staging patterns are
-/// static rules.
+/// registry does not parse; the state home, its skills root or the read slot cannot be listed; a
+/// top-level entry, or a child of the skills root other than the read slot, is not classified by
+/// the registry; an entry of the read slot is neither a GENERATION DIRECTORY (a real directory —
+/// not a link, not a file — named by decimal digits, as crew publishes them: `000007`) nor a
+/// recognised STAGING/TEMP name (the registry's `snapshots/<pattern>` denied children: `.staging-*`
+/// and `.tmp-*`); or a rule path cannot be spelled. The read-slot listing is the ONE runtime
+/// listing that BUILDS rules, and it only ever ADDS denies — an entry it cannot classify refuses
+/// the launch rather than being left readable. Residual (accepted, documented): a generation
+/// published WHILE a session runs is readable by that session until its next launch —
+/// generations are immutable and contain only the enabled skills of a newer publish.
 pub(crate) fn read_rules_around_snapshot(
     state_home: &Path,
+    handed_gen: &str,
     spell: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<Vec<String>, String> {
     let registry = registry().map_err(|e| format!("the state-home registry is unusable ({e})"))?;
@@ -398,8 +413,67 @@ pub(crate) fn read_rules_around_snapshot(
             }
         }
     }
+    // (c) v3.3 §1: the read slot itself — the ONE listing that builds rules. Every entry but the
+    // handed generation is denied by name; an entry that is neither a generation directory nor a
+    // recognised staging/temp name refuses the launch, and so does an unlistable slot.
+    let slot_dir = skills_dir.join(slot);
+    let patterns = slot_patterns(skills, slot);
+    let mut siblings: Vec<PathBuf> = Vec::new();
+    for name in list_names(&slot_dir)? {
+        if name == handed_gen {
+            continue;
+        }
+        let path = slot_dir.join(&name);
+        if patterns.iter().any(|p| p.matches(&name)) {
+            siblings.push(path);
+            continue;
+        }
+        if is_generation_name(&name) {
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(format!(
+                        "`{name}` under {} is a symlink where a generation directory is expected; \
+                         the worker Read fence cannot classify it — the launch is refused rather \
+                         than leaving it readable; remove it (a generation is a real, immutable \
+                         directory)",
+                        slot_dir.display()
+                    ))
+                }
+                Ok(m) if m.is_dir() => {
+                    siblings.push(path);
+                    continue;
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "`{name}` under {} is not a directory where a generation directory is \
+                         expected; the worker Read fence cannot classify it — the launch is \
+                         refused rather than leaving it readable; remove it",
+                        slot_dir.display()
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "cannot inspect `{name}` under {} to check the Read fence ({e})",
+                        slot_dir.display()
+                    ))
+                }
+            }
+        }
+        return Err(format!(
+            "`{name}` under {} is neither a generation directory (decimal digits) nor a \
+             staging/temp entry ({}); the worker Read fence cannot classify it — the launch is \
+             refused rather than leaving it readable; remove it, or publish it as a generation",
+            slot_dir.display(),
+            patterns
+                .iter()
+                .map(SlotPattern::spelled)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
 
-    // The static rules. Deterministic order: registry order, then the skills children in order.
+    // The static rules. Deterministic order: registry order, then the skills children in order,
+    // then (v3.3) the read slot's siblings in listing (sorted) order.
     let mut rules = Vec::new();
     let mut push = |path: PathBuf, tree: bool| -> Result<(), String> {
         let p = spell(&path).ok_or_else(|| {
@@ -425,7 +499,65 @@ pub(crate) fn read_rules_around_snapshot(
         let tree = entry.kind != "file";
         push(state_home.join(entry.rule_name()), tree)?;
     }
+    for sibling in siblings {
+        push(sibling, true)?;
+    }
     Ok(rules)
+}
+
+/// A generation directory's name as crew publishes it — decimal digits (`000007`, zero-padded so a
+/// lexical listing is the generation order; core accepts any non-empty run of ASCII digits). The
+/// read-slot listing denies such an entry as a sibling generation and refuses anything else it
+/// cannot recognise ([`read_rules_around_snapshot`]).
+fn is_generation_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// One `snapshots/<pattern>` denied child of the skills root, as the read-slot listing recognises
+/// a staging/temp entry: a trailing `*` matches any suffix (`.staging-*`, `.tmp-*`), else the exact
+/// name.
+struct SlotPattern {
+    stem: String,
+    glob: bool,
+}
+
+impl SlotPattern {
+    fn matches(&self, name: &str) -> bool {
+        if self.glob {
+            name.starts_with(self.stem.as_str())
+        } else {
+            name == self.stem
+        }
+    }
+
+    fn spelled(&self) -> String {
+        if self.glob {
+            format!("{}*", self.stem)
+        } else {
+            self.stem.clone()
+        }
+    }
+}
+
+/// The read slot's staging/temp patterns from the skills entry's `denied_children`: the entries
+/// spelled `<slot>/<pattern>` with nothing deeper.
+fn slot_patterns(skills: &Entry, slot: &str) -> Vec<SlotPattern> {
+    skills
+        .denied_children
+        .iter()
+        .filter_map(|c| c.strip_prefix(slot)?.strip_prefix('/'))
+        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+        .map(|rest| match rest.strip_suffix('*') {
+            Some(stem) => SlotPattern {
+                stem: stem.to_string(),
+                glob: true,
+            },
+            None => SlotPattern {
+                stem: rest.to_string(),
+                glob: false,
+            },
+        })
+        .collect()
 }
 
 /// `base` joined with a `/`-separated relative spelling, component by component (a `/` inside a
@@ -535,6 +667,26 @@ mod tests {
         }
         assert!(r.classify("scratch.txt").is_none());
         assert!(r.classify(".DS_Store").is_none());
+        // v3.3: what the read-slot listing recognises — generation names are decimal digits; the
+        // staging/temp patterns are the registry's `snapshots/<pattern>` denied children.
+        for gen in ["000007", "1", "42"] {
+            assert!(is_generation_name(gen), "{gen}");
+        }
+        for not in ["", ".staging-x", "7a", "gen-7", "-1"] {
+            assert!(!is_generation_name(not), "{not}");
+        }
+        let patterns = slot_patterns(skills, "snapshots");
+        assert_eq!(
+            patterns
+                .iter()
+                .map(SlotPattern::spelled)
+                .collect::<Vec<_>>(),
+            vec![".staging-*".to_string(), ".tmp-*".to_string()]
+        );
+        assert!(patterns.iter().any(|p| p.matches(".staging-ab12")));
+        assert!(patterns.iter().any(|p| p.matches(".tmp-x")));
+        assert!(!patterns.iter().any(|p| p.matches("000001")));
+        assert!(!patterns.iter().any(|p| p.matches("staging-x")));
         // Parse strictness.
         assert!(parse_registry("{\"version\":1,\"entries\":[{\"kind\":\"dir\"}]}").is_err());
         assert!(parse_registry(
@@ -601,9 +753,12 @@ mod tests {
 
     /// Fail closed: an unclassified top-level entry (or an unclassified child of the skills
     /// root) refuses by name; a classified tree yields the static rules — one per entry, the
-    /// skills root per denied child, nothing enumerated, nothing for the read slot. Exercised
-    /// on a state home that is NOT called `.wicked-crew`: the fence follows the directory, not
-    /// its name.
+    /// skills root per denied child, nothing enumerated at those levels, nothing for the handed
+    /// generation — plus (v3.3 §1) one deny per SIBLING entry of the read slot: the older
+    /// generation and the staging dir each get their own rule pair, an entry that is neither a
+    /// generation nor a staging name refuses by name, a FILE named like a generation refuses,
+    /// and an unlistable slot refuses. Exercised on a state home that is NOT called
+    /// `.wicked-crew`: the fence follows the directory, not its name.
     #[test]
     fn rules_are_static_and_an_unclassified_entry_refuses_by_name() {
         let base = std::env::temp_dir().join(format!(
@@ -617,6 +772,7 @@ mod tests {
         let home = base.join("crew-state");
         let skills = home.join("skills");
         std::fs::create_dir_all(skills.join("snapshots").join("000007")).unwrap();
+        std::fs::create_dir_all(skills.join("snapshots").join("000006")).unwrap();
         std::fs::create_dir_all(skills.join("snapshots").join(".staging-x")).unwrap();
         std::fs::create_dir_all(skills.join("effective")).unwrap();
         std::fs::create_dir_all(skills.join("baseline")).unwrap();
@@ -631,7 +787,7 @@ mod tests {
             of_snapshot(&skills.join("snapshots").join("000007")),
             Some(home.clone())
         );
-        let rules = read_rules_around_snapshot(&home, &spell).expect("classified tree");
+        let rules = read_rules_around_snapshot(&home, "000007", &spell).expect("classified tree");
         let s = |p: &Path| p.to_str().unwrap().to_string();
         assert!(rules.contains(&format!("Read({}/**)", s(&skills.join("effective")))));
         assert!(rules.contains(&format!("Read({})", s(&skills.join("manifest.json")))));
@@ -640,6 +796,21 @@ mod tests {
             "Read({}/**)",
             s(&skills.join("snapshots").join(".staging-*"))
         )));
+        // v3.3 §1: the read slot's SIBLINGS are denied by name — the older generation and the
+        // staging dir each get their own rule pair (the staging dir on top of the static pattern).
+        let gen6 = skills.join("snapshots").join("000006");
+        assert!(rules.contains(&format!("Read({})", s(&gen6))), "{rules:?}");
+        assert!(
+            rules.contains(&format!("Read({}/**)", s(&gen6))),
+            "{rules:?}"
+        );
+        assert!(
+            rules.contains(&format!(
+                "Read({}/**)",
+                s(&skills.join("snapshots").join(".staging-x"))
+            )),
+            "{rules:?}"
+        );
         assert!(rules.contains(&format!("Read({}*)", s(&home.join("core.db")))));
         assert!(rules.contains(&format!("Read({}*/**)", s(&home.join("core.db")))));
         assert!(rules.contains(&format!("Read({}*)", s(&home.join("daemon-")))));
@@ -655,13 +826,35 @@ mod tests {
             "{rules:?}"
         );
         let n = rules.len();
-        // Deterministic and enumeration-free: adding a CLASSIFIED sidecar changes nothing.
+        // Deterministic and enumeration-free at the top level: adding a CLASSIFIED sidecar
+        // changes nothing …
         std::fs::write(home.join("core.db.mem"), "").unwrap();
-        assert_eq!(read_rules_around_snapshot(&home, &spell).unwrap().len(), n);
+        assert_eq!(
+            read_rules_around_snapshot(&home, "000007", &spell)
+                .unwrap()
+                .len(),
+            n
+        );
+        // … while a new sibling generation in the read slot adds exactly its own pair (v3.3), and
+        // handing THAT generation instead denies 000007 and not 000005.
+        std::fs::create_dir_all(skills.join("snapshots").join("000005")).unwrap();
+        let more = read_rules_around_snapshot(&home, "000007", &spell).unwrap();
+        assert_eq!(more.len(), n + 2, "{more:?}");
+        let other = read_rules_around_snapshot(&home, "000005", &spell).unwrap();
+        assert!(
+            other.contains(&format!(
+                "Read({}/**)",
+                s(&skills.join("snapshots").join("000007"))
+            )) && !other
+                .iter()
+                .any(|r| r.contains(&s(&skills.join("snapshots").join("000005")))),
+            "{other:?}"
+        );
+        std::fs::remove_dir_all(skills.join("snapshots").join("000005")).unwrap();
 
         // An unclassified top-level entry refuses, naming it.
         std::fs::write(home.join("stray.txt"), "").unwrap();
-        let err = read_rules_around_snapshot(&home, &spell).expect_err("unclassified");
+        let err = read_rules_around_snapshot(&home, "000007", &spell).expect_err("unclassified");
         assert!(
             err.contains("`stray.txt`") && err.contains("refused"),
             "{err}"
@@ -669,11 +862,41 @@ mod tests {
         std::fs::remove_file(home.join("stray.txt")).unwrap();
         // …and so does an unclassified child of the skills root.
         std::fs::create_dir_all(skills.join("scratch")).unwrap();
-        let err = read_rules_around_snapshot(&home, &spell).expect_err("unclassified child");
+        let err =
+            read_rules_around_snapshot(&home, "000007", &spell).expect_err("unclassified child");
         assert!(err.contains("`scratch`"), "{err}");
         std::fs::remove_dir_all(skills.join("scratch")).unwrap();
-        // A state home that cannot be listed refuses too.
-        assert!(read_rules_around_snapshot(&base.join("absent"), &spell).is_err());
+        // …and (v3.3) an entry of the read slot that is neither a generation nor a staging name,
+        // and a FILE where a generation directory is expected.
+        std::fs::write(skills.join("snapshots").join("junk.txt"), "").unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect_err("unclassified read-slot entry");
+        assert!(
+            err.contains("`junk.txt`")
+                && err.contains("neither a generation")
+                && err.contains(".staging-*"),
+            "{err}"
+        );
+        std::fs::remove_file(skills.join("snapshots").join("junk.txt")).unwrap();
+        std::fs::write(skills.join("snapshots").join("000004"), "").unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect_err("a file where a generation is expected");
+        assert!(
+            err.contains("`000004`") && err.contains("not a directory"),
+            "{err}"
+        );
+        std::fs::remove_file(skills.join("snapshots").join("000004")).unwrap();
+        assert_eq!(
+            read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
+            rules
+        );
+        // A state home that cannot be listed refuses too — and so does an unlistable read slot.
+        assert!(read_rules_around_snapshot(&base.join("absent"), "1", &spell).is_err());
+        let slotless = base.join("slotless");
+        std::fs::create_dir_all(slotless.join("skills")).unwrap();
+        let err =
+            read_rules_around_snapshot(&slotless, "1", &spell).expect_err("no read slot to list");
+        assert!(err.contains("cannot list"), "{err}");
         // `same_dir`: identical spellings agree; a real path and its own spelling agree; two
         // distinct directories do not.
         assert!(same_dir(&home, &home));

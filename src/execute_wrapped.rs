@@ -550,10 +550,14 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 /// classify fails admission by name ([`fence_check`]), and should `deny_rules` still meet one
 /// here, the state home keeps its blanket rule (the snapshot is then denied too, loudly). A
 /// snapshot under any other fenced directory, or under the state home outside the read slot, is a
-/// config error at admission. Residual (documented): an entry created under the state home WHILE
-/// a session runs is fenced at the next launch, not mid-session — crew is the only writer of that
-/// directory; sibling immutable generations under `skills/snapshots/` are readable until crew
-/// reaps them (a static rule cannot deny every sibling but the handed one without enumeration).
+/// config error at admission. The handed generation is the ONLY non-denied path (design v3.3 §1,
+/// codex round 4): `skills/snapshots/` is the one directory listed at launch to build rules — one
+/// deny per sibling entry (every other generation, every staging/temp dir), failing closed on an
+/// unlistable slot or an entry that is neither a generation nor a recognised staging name.
+/// Residuals (documented): an entry created under the state home WHILE a session runs is fenced at
+/// the next launch, not mid-session — crew is the only writer of that directory; a generation
+/// published while a session runs is readable by that session until its next launch (generations
+/// are immutable and hold only the enabled skills of a newer publish).
 pub(crate) fn deny_rules(skills_root: Option<&Path>) -> Vec<String> {
     // The state home whose fence opens around the handed snapshot: DERIVED from the root's own
     // shape (`<state home>/skills/snapshots/<gen>`, `state_home::of_snapshot`), never from a
@@ -578,13 +582,25 @@ pub(crate) fn deny_rules(skills_root: Option<&Path>) -> Vec<String> {
             .as_deref()
             .is_some_and(|sh| crate::state_home::same_dir(&dir, sh));
         if is_state_home {
-            match crate::state_home::read_rules_around_snapshot(&dir, &rule_path) {
+            // The handed generation's name keeps its own slot open (v3.3 §1); every sibling
+            // entry of `skills/snapshots/` is denied by name.
+            let opened = skills_root
+                .and_then(|r| r.file_name())
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| {
+                    "the handed snapshot root has no generation name to keep open".to_string()
+                })
+                .and_then(|gen| {
+                    crate::state_home::read_rules_around_snapshot(&dir, gen, &rule_path)
+                });
+            match opened {
                 Ok(read) => {
                     eprintln!(
                         "[wicked-core] skills.notice the Read fence for {} is the state-home \
                          registry ({} rules); the skills snapshot at {} is the one non-denied path \
-                         under it — an entry created there while this session runs is fenced at \
-                         the next launch",
+                         under it (every sibling generation and staging entry is denied by name) \
+                         — an entry created there while this session runs is fenced at the next \
+                         launch",
                         dir.display(),
                         read.len(),
                         skills_root
@@ -685,7 +701,10 @@ pub(crate) fn fence_check(root: &Path) -> Result<(), String> {
                 .to_string(),
         );
     };
-    crate::state_home::read_rules_around_snapshot(&state_home, &rule_path).map(|_| ())
+    let gen = root.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        "its final component is not a generation name the worker Read fence can spell".to_string()
+    })?;
+    crate::state_home::read_rules_around_snapshot(&state_home, gen, &rule_path).map(|_| ())
 }
 
 /// The directories that can be a launch's state home while the daemon publishes the snapshots:
@@ -6426,12 +6445,30 @@ mod tests {
                 p.display()
             );
         }
-        // Documented residual: a SIBLING generation (immutable, reaped by crew) is not denied — a
-        // static rule cannot say "every sibling but this one" without the enumeration this fence
-        // exists to remove. Pinned so a change here is a decision, not an accident.
+        // v3.3 §1 (codex round 4): a SIBLING generation is DENIED by name — the read slot is the
+        // one directory listed at launch to build rules, one deny per entry but the handed
+        // generation — and the staging dir is denied by its own rule as well as the static
+        // pattern. Round 3 pinned the opposite ("readable until crew reaps it"); that exceeded
+        // v3.1's single-generation exception and is withdrawn.
         assert!(
-            denying(&fenced, "Read", &gen6.join("snapshot.json")).is_empty(),
+            !denying(&fenced, "Read", &gen6.join("snapshot.json")).is_empty(),
+            "a sibling generation must not be readable: {fenced:?}"
+        );
+        let gen6_rule = rule_path(&gen6).expect("expressible");
+        assert!(
+            fenced.contains(&format!("Read({gen6_rule})"))
+                && fenced.contains(&format!("Read({gen6_rule}/**)")),
             "{fenced:?}"
+        );
+        let staging_rule =
+            rule_path(&skills.join("snapshots").join(".staging-ab12")).expect("expressible");
+        assert!(
+            fenced.contains(&format!("Read({staging_rule}/**)")),
+            "{fenced:?}"
+        );
+        assert!(
+            !fenced.iter().any(|r| r.contains("snapshots/000007")),
+            "nothing names the handed generation: {fenced:?}"
         );
         // The state home's blanket rule is gone from Read ONLY; every other fenced home is untouched.
         let crew_rule = rule_path(&crew).expect("expressible");
@@ -6454,6 +6491,40 @@ mod tests {
         }
         // Enumeration-free: a classified sidecar appearing changes NOTHING in the rule list.
         std::fs::write(crew.join("core.db.mem"), b"").unwrap();
+        assert_eq!(deny_rules(Some(&gen7)), fenced);
+        // …while a new sibling GENERATION appearing does add its deny pair (v3.3 §1 — the one
+        // listing that builds rules), an entry of the read slot that is neither a generation nor
+        // a staging name refuses admission by name and closes the fence, and so does a symlink
+        // where a generation directory is expected.
+        let gen8 = snapshot_root(
+            &skills.join("snapshots").join("000008"),
+            "8",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let with_gen8 = deny_rules(Some(&gen7));
+        assert_eq!(with_gen8.len(), fenced.len() + 2, "{with_gen8:?}");
+        assert!(
+            !denying(&with_gen8, "Read", &gen8.join("snapshot.json")).is_empty(),
+            "{with_gen8:?}"
+        );
+        std::fs::remove_dir_all(&gen8).unwrap();
+        assert_eq!(deny_rules(Some(&gen7)), fenced);
+        std::fs::write(skills.join("snapshots").join("notes.txt"), b"").unwrap();
+        let why = fence_check(&gen7).expect_err("an unclassified read-slot entry");
+        assert!(
+            why.contains("`notes.txt`") && why.contains("neither a generation"),
+            "{why}"
+        );
+        assert!(
+            deny_rules(Some(&gen7)).contains(&format!("Read({crew_rule}/**)")),
+            "closed again"
+        );
+        std::fs::remove_file(skills.join("snapshots").join("notes.txt")).unwrap();
+        std::os::unix::fs::symlink("000007", skills.join("snapshots").join("000009")).unwrap();
+        let why = fence_check(&gen7).expect_err("a linked generation");
+        assert!(why.contains("`000009`") && why.contains("symlink"), "{why}");
+        std::fs::remove_file(skills.join("snapshots").join("000009")).unwrap();
+        assert_eq!(fence_check(&gen7), Ok(()));
         assert_eq!(deny_rules(Some(&gen7)), fenced);
 
         // No snapshot ⇒ the blanket fence, byte-identical to before; a snapshot outside every

@@ -1286,21 +1286,14 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
         remove_entry_no_follow(&dir.join(entry))?;
     }
     // settings.json is re-written every spawn; clear any planted entry (symlink included)
-    // first so the write can never travel through a link — and sweep a temp file a crashed
-    // earlier spawn left behind.
-    let settings_path = dir.join("settings.json");
+    // first so the write can never travel through a link — and sweep the temp files THIS
+    // process's earlier spawns left behind (a crash between create and rename). Only this
+    // process's: the worker home is shared by every engine process on the host, and another
+    // process's temp file is its in-flight write, which its own rename is about to consume —
+    // unlinking it under that process fails ITS isolation setup (codex round 4).
+    let settings_path = dir.join(SETTINGS_FILENAME);
     remove_entry_no_follow(&settings_path)?;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(SETTINGS_TMP_PREFIX)
-            {
-                remove_entry_no_follow(&entry.path())?;
-            }
-        }
-    }
+    sweep_own_settings_temps(&dir)?;
     let settings = json!({
         "permissions": { "deny": crate::execute_wrapped::shared_deny_rules() }
     });
@@ -1312,7 +1305,52 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
 /// [`WORKER_HOME_SANITIZED`]: concurrent sessions live here, and a spawn must never delete
 /// another session's settings.
 const SESSIONS_DIRNAME: &str = "sessions";
-const SETTINGS_TMP_PREFIX: &str = ".settings.json.tmp-";
+const SETTINGS_FILENAME: &str = "settings.json";
+/// The suffix of an atomic writer's temp file: `<name>.<pid>.<seq>.tmp` ([`settings_temp_name`]).
+const SETTINGS_TMP_SUFFIX: &str = ".tmp";
+
+/// The temp file [`write_atomic`] writes `file` through: `<file>.<pid>.<seq>.tmp` — the pid so
+/// concurrent engine processes sharing a directory never collide AND so a sweep can tell its own
+/// leftovers from another process's in-flight write ([`sweep_own_settings_temps`]); the sequence
+/// for this process's own concurrent writes.
+fn settings_temp_name(file: &str, pid: u32, seq: u64) -> String {
+    format!("{file}.{pid}.{seq}{SETTINGS_TMP_SUFFIX}")
+}
+
+/// The pid a temp name carries when it has exactly the shape [`settings_temp_name`] produces for
+/// `file`; `None` for every other name (the final file itself, a foreign or legacy shape).
+fn settings_temp_pid(name: &str, file: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix(file)?
+        .strip_prefix('.')?
+        .strip_suffix(SETTINGS_TMP_SUFFIX)?;
+    let (pid, seq) = rest.split_once('.')?;
+    if seq.is_empty() || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Remove the `settings.json` temp files in `dir` that THIS process left behind (its pid in the
+/// name) — never another process's, whose temp is an in-flight write its rename is about to
+/// consume. A directory that cannot be listed is left alone: the settings write that follows
+/// fails loudly on its own if the directory is unusable.
+fn sweep_own_settings_temps(dir: &std::path::Path) -> anyhow::Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    let me = std::process::id();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if settings_temp_pid(name, SETTINGS_FILENAME) == Some(me) {
+            remove_entry_no_follow(&entry.path())?;
+        }
+    }
+    Ok(())
+}
 
 /// (v3.1 §3) Write THIS session's Claude settings — the full fence for this launch
 /// (`execute_wrapped::deny_rules`: the state-home registry when the snapshot sits in its read
@@ -1460,16 +1498,21 @@ fn private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
 }
 
 /// Write `bytes` to `path` atomically: an exclusively-created private temp file in the same
-/// directory, then `rename` over `path` — a reader sees the old file or the new one, never a torn
-/// one, and a planted link at `path` is replaced as a link (rename does not follow its target).
+/// directory (`<name>.<pid>.<seq>.tmp`, [`settings_temp_name`]), then `rename` over `path` — a
+/// reader sees the old file or the new one, never a torn one, and a planted link at `path` is
+/// replaced as a link (rename does not follow its target).
 fn write_atomic(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let tmp = dir.join(format!(
-        "{SETTINGS_TMP_PREFIX}{}-{}",
+    let file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(SETTINGS_FILENAME);
+    let tmp = dir.join(settings_temp_name(
+        file,
         std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
+        SEQ.fetch_add(1, Ordering::Relaxed),
     ));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -4470,34 +4513,29 @@ impl AcpStepRunner {
             &cli_key,
         );
         // core#396 / v3.1 §4 — admission, BEFORE the operator messages below are consumed
-        // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST: a
-        // session this run already holds for this seat is admitted against the snapshot it was
-        // OPENED with (`proc.skills`), never against a re-resolved `current` — the bridge holds
-        // the plugin it loaded, and a `current` that has since moved to a generation dropping a
-        // skill the pinned one still has must not refuse a turn that can succeed. Only a FRESH
-        // session resolves the ambient snapshot (`admit_unit`: the ladder + the fence check). The
-        // run's whole skill set must EXIST (plan-wide, transitive mandates included) and what
-        // THIS seat invokes must be deliverable to it, or the unit is REFUSED by name.
+        // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST and ONE
+        // policy for cached and fresh alike (`admit_turn`, codex round 4): a session this run
+        // already holds for this seat is admitted against the snapshot it was OPENED with
+        // (`proc.skills`), never against a re-resolved `current` — the bridge holds the plugin it
+        // loaded, and a `current` that has since moved to a generation dropping a skill the pinned
+        // one still has must not refuse a turn that can succeed. A session opened with NOTHING
+        // pinned (the inherit-config escape hatch; no root anywhere) is judged exactly as a fresh
+        // launch would be — the hatch bypass, else the ladder + the fence check — so the same
+        // configuration gives the same verdict on every turn. The run's whole skill set must
+        // EXIST (plan-wide, transitive mandates included) and what THIS seat invokes must be
+        // deliverable to it, or the unit is REFUSED by name.
         let session_key = (run_id.clone(), cli_key.clone());
         let probe = self.probe_cached_session(&session_key);
-        let refs = crate::skills_snapshot::RequiredRefs::of(input);
-        let skills = match &probe {
+        let pinned = match &probe {
             SessionProbe::Live(arc) => {
-                let pinned = {
-                    let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
-                    proc.skills.clone()
-                };
-                match crate::skills_snapshot::admit_refs(pinned, &refs, &worker_cli) {
-                    Ok(s) => s,
-                    Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
-                }
+                let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+                proc.skills.clone()
             }
-            SessionProbe::Vacant | SessionProbe::FailedStartup => {
-                match crate::skills_snapshot::admit_unit(input, &worker_cli) {
-                    Ok(s) => s,
-                    Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
-                }
-            }
+            SessionProbe::Vacant | SessionProbe::FailedStartup => None,
+        };
+        let skills = match crate::skills_snapshot::admit_turn(pinned, input, &worker_cli) {
+            Ok(s) => s,
+            Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
         };
         // Handed to real work units; an engine-internal judge/triage session only when it names a
         // skill (the same rule as the wrapped runner — a plugin's whole catalog in a byte-exact
@@ -4929,9 +4967,9 @@ impl AcpStepRunner {
         };
         if reused {
             // Already judged above for a session the probe found; this catches the race where a
-            // concurrent turn opened the session first (`did_insert` false) — same check, its
-            // snapshot. Idempotent.
-            if let Err(e) = crate::skills_snapshot::admit_refs(bound.clone(), &refs, &worker_cli) {
+            // concurrent turn opened the session first (`did_insert` false) — same policy
+            // (`admit_turn`), its snapshot. Idempotent.
+            if let Err(e) = crate::skills_snapshot::admit_turn(bound.clone(), input, &worker_cli) {
                 drop(proc);
                 return crate::execute_wrapped::skills_refusal(input, &e);
             }
@@ -6398,8 +6436,8 @@ sleep 30
     static REAL_STARTS: Mutex<()> = Mutex::new(());
 
     /// A fresh scratch dir per test — these stubs run concurrently under `cargo test`, so a
-    /// shared dir would interleave ledgers.
-    #[cfg(unix)]
+    /// shared dir would interleave ledgers. Platform-independent (codex round 4 / Windows CI):
+    /// the per-session settings and temp-sweep tests run on every platform and use it too.
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("wicked-acp-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -7400,6 +7438,72 @@ cat >/dev/null
             .collect()
     }
 
+    /// (codex round 4) The shared worker home's temp sweep removes only THIS process's leftover
+    /// settings temps — `settings.json.<pid>.<seq>.tmp` carrying our pid — never another engine
+    /// process's (its in-flight write, which its own rename is about to consume), never the
+    /// settings file itself, and never a file of another shape; and `write_atomic` leaves no temp
+    /// of ours behind after its rename.
+    #[test]
+    fn the_settings_temp_sweep_removes_only_this_process_s_temps() {
+        let dir = scratch("tmp-sweep");
+        let me = std::process::id();
+        let other = if me == u32::MAX { me - 1 } else { me + 1 };
+        let ours = dir.join(settings_temp_name(SETTINGS_FILENAME, me, 7));
+        let theirs = dir.join(settings_temp_name(SETTINGS_FILENAME, other, 0));
+        let legacy = dir.join(".settings.json.tmp-1-2");
+        let settings = dir.join(SETTINGS_FILENAME);
+        for p in [&ours, &theirs, &legacy, &settings] {
+            std::fs::write(p, b"{}").unwrap();
+        }
+        assert_eq!(
+            settings_temp_pid(
+                ours.file_name().unwrap().to_str().unwrap(),
+                SETTINGS_FILENAME
+            ),
+            Some(me)
+        );
+        assert_eq!(
+            settings_temp_pid(
+                theirs.file_name().unwrap().to_str().unwrap(),
+                SETTINGS_FILENAME
+            ),
+            Some(other)
+        );
+        for not_ours in [
+            "settings.json",
+            ".settings.json.tmp-1-2",
+            "settings.json.12.x.tmp",
+            "settings.json.12.tmp",
+            "settings.json.abc.1.tmp",
+            "other.json.12.1.tmp",
+        ] {
+            assert_eq!(
+                settings_temp_pid(not_ours, SETTINGS_FILENAME),
+                None,
+                "{not_ours}"
+            );
+        }
+        sweep_own_settings_temps(&dir).expect("sweep");
+        assert!(!ours.exists(), "our leftover is swept");
+        assert!(
+            theirs.exists(),
+            "another process's in-flight temp is never unlinked"
+        );
+        assert!(legacy.exists(), "a foreign shape is left alone");
+        assert!(settings.exists());
+        write_atomic(&dir, &settings, b"{\"x\":1}").expect("atomic write");
+        assert_eq!(std::fs::read(&settings).unwrap(), b"{\"x\":1}");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| settings_temp_pid(n, SETTINGS_FILENAME) == Some(me))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(theirs.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (v3.1 §3 × codex round 3) Per-session settings storage is COLLISION-FREE: launches whose
     /// ids sanitize to the SAME stem (`campaign:one` and `campaign_one` both become
     /// `campaign_one`), released together on one barrier, each get their own directory under the
@@ -8140,13 +8244,21 @@ transport = "stdio"
         // session carries ITS snapshot as the plugin, ITS fence as `disallowedTools`, and ITS OWN
         // settings file (distinct per session, under the worker home's `sessions/`) holding the
         // same rules; the fence is the state-home REGISTRY (no blanket over `~/.wicked-crew`, so
-        // the snapshot in the read slot is readable) and names no snapshot; and the SHARED
-        // worker-home `settings.json` carries no state-home rule at all — nothing generation- or
+        // the snapshot in the read slot is readable), never names the session's OWN generation
+        // and — v3.3 §1 (codex round 4) — DOES deny the SIBLING generation by name, so two live
+        // sessions on two generations each read exactly theirs (round 3 asserted "names no
+        // snapshot", which left every sibling readable); and the SHARED worker-home
+        // `settings.json` carries no state-home rule at all — nothing generation- or
         // launch-dependent lives in a file two launches share.
         let worker_home = worker_config_home().expect("worker home");
         let crew_blanket = format!("Read({}/**)", home.join(".wicked-crew").display());
         let mut settings_paths = Vec::new();
         for (frame, gen) in news.iter().zip([&gen1, &gen2]) {
+            let sibling = if gen.as_path() == gen1.as_path() {
+                &gen2
+            } else {
+                &gen1
+            };
             let options = &frame["new"]["_meta"]["claudeCode"]["options"];
             assert_eq!(
                 options["plugins"][0]["path"],
@@ -8188,9 +8300,13 @@ transport = "stdio"
                 "the registry rules fence the worker state: {deny:?}"
             );
             assert!(
-                !deny.iter().any(|r| r.contains(&gen1.display().to_string())
-                    || r.contains(&gen2.display().to_string())),
-                "no rule names a snapshot: {deny:?}"
+                !deny.iter().any(|r| r.contains(&gen.display().to_string())),
+                "no rule names the session's own generation: {deny:?}"
+            );
+            assert!(
+                deny.contains(&format!("Read({})", sibling.display()))
+                    && deny.contains(&format!("Read({}/**)", sibling.display())),
+                "the sibling generation is denied by name (v3.3 §1): {deny:?}"
             );
             settings_paths.push(path);
         }
@@ -8237,6 +8353,165 @@ transport = "stdio"
                 p.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// codex round 4 — ONE admission policy for fresh and cached sessions (`admit_turn`), end to
+    /// end through `run_unit` against the recording bridge. A session's FIRST turn names no
+    /// skill; its second names one, under the SAME configuration:
+    ///
+    /// 1. under the inherit-config escape hatch the session opens with nothing pinned
+    ///    (`proc.skills = None` — the worker runs on the operator's own plugins, no snapshot is
+    ///    handed) and round 3 refused turn 2 as "no skills root is available" while a fresh
+    ///    launch under the same hatch would have been admitted; now turn 2 is admitted (the
+    ///    bypass applies to cached and fresh alike) and its directive names the skill in the
+    ///    plugin form;
+    /// 2. under a snapshot the session opens PINNED to the handed generation even though turn 1
+    ///    invokes nothing (the bridge received it as its local plugin at `session/new`), turn 2 is
+    ///    admitted against that pinned generation with the directive discovered from its index,
+    ///    and a skill the pinned generation lacks is still refused against IT, by name.
+    #[test]
+    #[cfg(unix)]
+    fn a_cached_session_opened_without_skills_is_admitted_like_a_fresh_launch_on_later_turns() {
+        use crate::skills_snapshot::test_support::{scratch as canonical_scratch, snapshot_root};
+        use crate::workflow::{StepInput, StepRunner};
+
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-turns");
+        let _home = EnvPin::set("HOME", &home);
+        let skills = home.join(".wicked-crew").join("skills");
+        let gen = snapshot_root(
+            &skills.join("snapshots").join("000001"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen);
+
+        let ledger = home.join("ledger.ndjson");
+        let bridge = write_recording_bridge(&home);
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "skills-seat"
+display_name = "Skills seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let unit = |run: &str, ord: u32, skill: Option<&str>| -> StepInput {
+            let mut u =
+                crate::domain::WorkUnit::pending(format!("{run}:u{ord}"), run, ord, "do the thing");
+            u.assigned_cli = Some("skills-seat".to_string());
+            u.skill_ref = skill.map(str::to_string);
+            StepInput {
+                run_id: run.to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-skills".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+
+        // 1. The inherit-config escape hatch, pinned for the whole of run I (both turns).
+        {
+            let _hatch = EnvPin::set(
+                crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
+                std::path::Path::new("1"),
+            );
+            let out = runner.run_unit(&unit("run-I", 1, None));
+            assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+            let entries = ledger_entries(&ledger);
+            assert_eq!(entries.len(), 2, "session/new + one prompt: {entries:?}");
+            assert!(
+                entries[0]["new"]["_meta"]["claudeCode"]["options"]["plugins"].is_null(),
+                "under the hatch no snapshot is handed: {}",
+                entries[0]
+            );
+            let out = runner.run_unit(&unit("run-I", 2, Some("wicked-garden-domain")));
+            assert_eq!(
+                out.status,
+                StepStatus::Ok,
+                "turn 2 of a session opened with nothing pinned is admitted under the same \
+                 configuration a fresh launch is: {}",
+                out.output
+            );
+            let entries = ledger_entries(&ledger);
+            assert_eq!(entries.len(), 3, "the turn reached the bridge: {entries:?}");
+            assert!(
+                entries[2]["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Invoke your skill \"wicked-garden:domain\""),
+                "{}",
+                entries[2]
+            );
+        }
+
+        // 2. A snapshot: run S opens PINNED to the generation with a turn that invokes nothing.
+        let out = runner.run_unit(&unit("run-S", 1, None));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        assert_eq!(entries.len(), 5, "{entries:?}");
+        assert_eq!(
+            entries[3]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
+            serde_json::json!([{"type": "local", "path": gen.to_string_lossy()}]),
+            "the session is opened on the generation even though turn 1 invokes nothing: {}",
+            entries[3]
+        );
+        let out = runner.run_unit(&unit("run-S", 2, Some("wicked-garden-domain")));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        assert_eq!(entries.len(), 6, "{entries:?}");
+        assert!(
+            entries[5]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("\"wicked-garden:domain\""),
+            "the directive is discovered from the pinned generation's index: {}",
+            entries[5]
+        );
+        let out = runner.run_unit(&unit("run-S", 3, Some("wicked-garden-search")));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("wicked-garden-search")
+                && out.output.contains(&gen.display().to_string()),
+            "a skill the pinned generation lacks is refused against IT: {}",
+            out.output
+        );
+        assert_eq!(
+            ledger_entries(&ledger).len(),
+            6,
+            "the refusal never reached the bridge"
+        );
+        runner.on_run_complete("run-I");
+        runner.on_run_complete("run-S");
         let _ = std::fs::remove_dir_all(&home);
     }
 

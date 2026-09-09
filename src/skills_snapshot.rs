@@ -75,7 +75,9 @@
 //!
 //! On the ACP path a CACHED session is admitted against ITS pinned snapshot before any ambient
 //! resolution happens (v3.1 §4) — `acp_runner::exec_turn_inner` consults the session cache first
-//! and calls [`admit_unit`] (which resolves) only for a fresh session.
+//! and hands what it pinned to [`admit_turn`], ONE policy for fresh and cached turns alike: the
+//! inherit-config escape hatch first, then the pinned generation if there is one, else the
+//! ambient root through the ladder and the fence check (codex round 4).
 //!
 //! The generation in use is reported at every launch — the `skills.snapshot gen=…` log line
 //! ([`SkillsSnapshot::report`]) and the [`CoreEvent::SkillsSnapshotHanded`] event
@@ -210,6 +212,20 @@ impl SkillsLever {
             "opencode" => SkillsLever::OpencodeConfig,
             _ => SkillsLever::Absent,
         }
+    }
+
+    /// Does this lever hand the CLI ORIGINAL skill directories that the CLI then scans itself —
+    /// pi's `--skill <dir>`, opencode's `skills.paths` (recursive `**/SKILL.md`)? Only such a
+    /// lever carries a parent's nested children along with the parent, so only such a lever is
+    /// judged by [`SkillsError::NestsNonPortable`] (codex round 4). Copilot is handed a PUBLISHED
+    /// VIEW, judged as a whole tree on what it actually holds
+    /// ([`SkillsSnapshot::copilot_view_for`]); Claude's plugin loader and an absent lever hand over
+    /// no directory at all.
+    pub(crate) fn delivers_directories(self) -> bool {
+        matches!(
+            self,
+            SkillsLever::PiSkillFlags | SkillsLever::OpencodeConfig
+        )
     }
 }
 
@@ -582,19 +598,29 @@ impl SkillsSnapshot {
         Some(view)
     }
 
-    /// The copilot view VERIFIED for the skills a copilot seat will invoke (codex round 3; pass 2
-    /// checked only that `views/copilot` existed, which followed a link at `views` and admitted
-    /// an empty view). Every component from `views` down is lstat-walked — `views`,
-    /// `views/copilot`, `.github`, `.github/skills`, each required skill's directory and its
-    /// `SKILL.md` — and none may be a symlink: a link at `views` would hand the worker an
-    /// external tree through `--add-dir`. Every required skill must be PRESENT in the view as
-    /// `.github/skills/<name>/SKILL.md` with a frontmatter `name` equal to the skill's.
+    /// The copilot view VERIFIED as a WHOLE tree (design v3.3 §2; codex rounds 3 and 4). The
+    /// launch hands the ENTIRE `views/copilot` to copilot through `--add-dir`, so admission judges
+    /// everything that directory holds, not only what the seat invokes — round 3 checked the
+    /// required skills' entries and left an extra non-portable copy, an unindexed entry or a
+    /// symlinked one unexamined (and, for a unit invoking nothing, examined no entry at all).
+    ///
+    /// Every component from `views` down is lstat-walked — `views`, `views/copilot`, `.github`,
+    /// `.github/skills`, then EVERY entry of `.github/skills/` and every file below each — and
+    /// none may be a symlink anywhere: a link would hand the worker an external tree. Each entry
+    /// must be a directory whose name is a safe single path segment ([`safe_segments`]) that the
+    /// index lists as a PORTABLE skill, holding a `SKILL.md` whose frontmatter `name` equals the
+    /// entry's; a nested `SKILL.md` deeper inside an entry must itself name an indexed portable
+    /// skill (the Claude-only child a directory lever would leak is, for copilot, judged on the
+    /// view crew published: present in the copy ⇒ refused by name; excluded ⇒ the parent is
+    /// admitted). Every joined path is checked for canonical containment in the view before it is
+    /// read ([`contained_under`], v3.3 §3).
     ///
     /// `Ok(None)` when the generation publishes no view at all (`views` or `views/copilot`
-    /// absent — the caller decides whether that matters); `Err(Config)` for a symlink or a
-    /// non-directory on the walk (containment, not absence); `Err(Missing)` naming the skills the
-    /// view does not hold as stated — an EMPTY or partial view is missing every required skill it
-    /// lacks.
+    /// absent — the caller decides whether that matters); `Err(Config)` naming the entry for any
+    /// unexpected content — a symlink, a stray file, an unindexed or non-portable entry, a name
+    /// mismatch, a leaked nested child — whether or not the unit invokes anything; `Err(Missing)`
+    /// naming the required skills a well-formed view does not hold — an EMPTY view (`.github` or
+    /// `.github/skills` absent) is missing every one of them.
     pub(crate) fn copilot_view_for(
         &self,
         required: &[&SkillEntry],
@@ -603,9 +629,6 @@ impl SkillsSnapshot {
             var: SKILLS_SNAPSHOT_ENV,
             path: self.root.clone(),
             why,
-        };
-        let linked = |rel: &str| {
-            format!("{rel} is a symlink — a snapshot's views must be contained in it, not linked")
         };
         let views = self.root.join("views");
         let view = views.join("copilot");
@@ -618,12 +641,13 @@ impl SkillsSnapshot {
                 Ok(_) => {}
             }
         }
+        const SKILLS_REL: &str = "views/copilot/.github/skills";
         let skills_dir = view.join(".github").join("skills");
         // `.github` / `.github/skills` absent ⇒ an EMPTY view: every required skill is missing.
         let mut empty = false;
         for (p, rel) in [
             (view.join(".github"), "views/copilot/.github"),
-            (skills_dir.clone(), "views/copilot/.github/skills"),
+            (skills_dir.clone(), SKILLS_REL),
         ] {
             match std::fs::symlink_metadata(&p) {
                 Err(_) => {
@@ -635,42 +659,75 @@ impl SkillsSnapshot {
                 Ok(_) => {}
             }
         }
-        let mut missing: Vec<String> = Vec::new();
-        for entry in required {
-            if empty {
-                missing.push(entry.name.clone());
-                continue;
-            }
-            let rel_dir = format!("views/copilot/.github/skills/{}", entry.name);
-            let dir = skills_dir.join(&entry.name);
-            match std::fs::symlink_metadata(&dir) {
-                Ok(m) if m.file_type().is_symlink() => return Err(config(linked(&rel_dir))),
-                Ok(m) if m.is_dir() => {}
-                _ => {
-                    missing.push(entry.name.clone());
-                    continue;
+        let mut held: BTreeSet<String> = BTreeSet::new();
+        if !empty {
+            let names = list_sorted(&skills_dir)
+                .map_err(|e| config(format!("{SKILLS_REL} cannot be listed ({e})")))?;
+            for name in names {
+                let rel_dir = format!("{SKILLS_REL}/{name}");
+                // Hygiene BEFORE the join (v3.3 §3): a listed name is a real file name, but the
+                // spelling is still required to be a plain single segment before it is joined.
+                safe_segments(&name, false, "view entry")
+                    .map_err(|why| config(format!("{SKILLS_REL}: {why}")))?;
+                let dir = skills_dir.join(&name);
+                match std::fs::symlink_metadata(&dir) {
+                    Ok(m) if m.file_type().is_symlink() => return Err(config(linked(&rel_dir))),
+                    Ok(m) if m.is_dir() => {}
+                    Ok(_) => {
+                        return Err(config(format!(
+                            "{rel_dir} is not a directory — the copilot view holds only skill \
+                             directories, one per enabled portable skill"
+                        )))
+                    }
+                    Err(e) => return Err(config(format!("{rel_dir} cannot be inspected ({e})"))),
                 }
-            }
-            let file = dir.join(SKILL_FILE);
-            match std::fs::symlink_metadata(&file) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(config(linked(&format!("{rel_dir}/{SKILL_FILE}"))))
+                contained_under(&view, &dir, &rel_dir).map_err(config)?;
+                let Some(entry) = self.skills.iter().find(|s| s.name == name) else {
+                    return Err(config(format!(
+                        "{rel_dir} is not a skill this snapshot indexes — the copilot view may \
+                         hold only the enabled portable skills"
+                    )));
+                };
+                if !entry.portable {
+                    return Err(config(format!(
+                        "{rel_dir} is `{name}`, which the index marks portable: false \
+                         (Claude-only); the copilot view may hold only portable skills"
+                    )));
                 }
-                Ok(m) if m.is_file() => {}
-                _ => {
-                    missing.push(entry.name.clone());
-                    continue;
+                let file = dir.join(SKILL_FILE);
+                let rel_file = format!("{rel_dir}/{SKILL_FILE}");
+                match std::fs::symlink_metadata(&file) {
+                    Ok(m) if m.file_type().is_symlink() => return Err(config(linked(&rel_file))),
+                    Ok(m) if m.is_file() => {}
+                    Ok(_) => return Err(config(format!("{rel_file} is not a regular file"))),
+                    Err(e) => return Err(config(format!("{rel_file} is missing ({e})"))),
                 }
-            }
-            let held = read_no_follow(&file)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|text| parse_frontmatter(&text).ok())
-                .and_then(|fm| fm.name);
-            if held.as_deref() != Some(entry.name.as_str()) {
-                missing.push(entry.name.clone());
+                contained_under(&view, &file, &rel_file).map_err(config)?;
+                match view_skill_name(&file) {
+                    Some(n) if n == name => {}
+                    Some(n) => {
+                        return Err(config(format!(
+                            "{rel_file} declares name `{n}`, not `{name}` — the entry is not the \
+                             skill its directory says it is"
+                        )))
+                    }
+                    None => {
+                        return Err(config(format!(
+                            "{rel_file} has no parseable frontmatter `name` to match `{name}` \
+                             against"
+                        )))
+                    }
+                }
+                self.walk_view_entry(&view, &dir, &rel_dir, true)
+                    .map_err(config)?;
+                held.insert(name);
             }
         }
+        let mut missing: Vec<String> = required
+            .iter()
+            .filter(|e| !held.contains(&e.name))
+            .map(|e| e.name.clone())
+            .collect();
         missing.sort();
         missing.dedup();
         if !missing.is_empty() {
@@ -680,6 +737,51 @@ impl SkillsSnapshot {
             });
         }
         Ok(Some(view))
+    }
+
+    /// Everything below one validated view entry, recursively (v3.3 §2): no symlink anywhere
+    /// (the launch `--add-dir`s the whole view), every path canonically contained in the view,
+    /// and a NESTED `SKILL.md` — any but the entry's own top-level one (`top`) — must name an
+    /// indexed PORTABLE skill: a `portable: false` child copied into the view, or a skill the
+    /// index does not know, refuses the launch by path.
+    fn walk_view_entry(&self, view: &Path, dir: &Path, rel: &str, top: bool) -> Result<(), String> {
+        for name in list_sorted(dir).map_err(|e| format!("{rel} cannot be listed ({e})"))? {
+            let child = dir.join(&name);
+            let child_rel = format!("{rel}/{name}");
+            let m = std::fs::symlink_metadata(&child)
+                .map_err(|e| format!("{child_rel} cannot be inspected ({e})"))?;
+            if m.file_type().is_symlink() {
+                return Err(linked(&child_rel));
+            }
+            contained_under(view, &child, &child_rel)?;
+            if m.is_dir() {
+                self.walk_view_entry(view, &child, &child_rel, false)?;
+            } else if name == SKILL_FILE && !top {
+                let held = view_skill_name(&child);
+                match held
+                    .as_deref()
+                    .and_then(|n| self.skills.iter().find(|s| s.name == n))
+                {
+                    Some(e) if e.portable => {}
+                    Some(e) => {
+                        return Err(format!(
+                            "{child_rel} is `{}`, which the index marks portable: false — a \
+                             Claude-only skill nested inside a copilot view entry; publish the \
+                             view without it",
+                            e.name
+                        ))
+                    }
+                    None => {
+                        return Err(format!(
+                            "{child_rel} is a nested {SKILL_FILE} that names no indexed skill \
+                             ({}) — the copilot view holds only enabled portable skills",
+                            held.as_deref().unwrap_or("no parseable frontmatter `name`")
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// What a launch on `cli` is handed from this root, in its lever's shape (v3.2 §2).
@@ -1081,6 +1183,108 @@ fn contained(path: &Path, rel: &str, want_file: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// A persisted spelling — an index entry's `name` or `dir`, a view entry's name — validated as
+/// a SAFE RELATIVE segment set BEFORE it is joined onto any root (codex round 4; design v3.3 §3).
+/// Refused, with the reason: empty; absolute (`/x`); any backslash (a Windows separator, a `\\?\`
+/// verbatim or a UNC prefix); any colon (a drive or stream prefix on Windows — `C:/x`, `C:x`);
+/// a NUL; an empty, `.` or `..` component; and any `/` at all unless `nested` allows the nested
+/// `dir` form. On the target platform each component must also parse as exactly one `Normal`
+/// path component, so a prefix spelling this portable list does not anticipate is refused where
+/// it would bite. `what` names the field in the error. Returns the components.
+fn safe_segments<'a>(spelling: &'a str, nested: bool, what: &str) -> Result<Vec<&'a str>, String> {
+    let bad = |why: &str| format!("{what} `{spelling}` is not a clean relative path: {why}");
+    if spelling.is_empty() {
+        return Err(bad("it is empty"));
+    }
+    if spelling.contains('\\') {
+        return Err(bad(
+            "it contains a backslash (a Windows separator, a verbatim or a UNC prefix)",
+        ));
+    }
+    if spelling.contains(':') {
+        return Err(bad(
+            "it contains a colon (a drive or stream prefix on Windows)",
+        ));
+    }
+    if spelling.contains('\0') {
+        return Err(bad("it contains a NUL byte"));
+    }
+    if spelling.starts_with('/') {
+        return Err(bad("it is absolute"));
+    }
+    if !nested && spelling.contains('/') {
+        return Err(bad("it must be a single path component"));
+    }
+    let components: Vec<&str> = spelling.split('/').collect();
+    for c in &components {
+        if c.is_empty() {
+            return Err(bad("it has an empty component (a doubled or trailing `/`)"));
+        }
+        if *c == "." || *c == ".." {
+            return Err(bad("it contains a `.` or `..` component"));
+        }
+        let mut parts = Path::new(c).components();
+        match (parts.next(), parts.next()) {
+            (Some(std::path::Component::Normal(_)), None) => {}
+            _ => return Err(bad("a component is not a plain name on this platform")),
+        }
+    }
+    Ok(components)
+}
+
+/// Belt to the lstat walk's braces (codex round 4; v3.3 §3): `path`, joined from `root` and
+/// already walked link-free, must ALSO canonicalize to a real path under `root` — which is
+/// canonical by construction (a published root is pinned at load, the live cache at resolution,
+/// a view sits under real directories of such a root) — so a spelling the walk did not anticipate
+/// cannot land outside. Checked BEFORE any read of `path`; `rel` names the entry in the error.
+fn contained_under(root: &Path, path: &Path, rel: &str) -> Result<(), String> {
+    let real = std::fs::canonicalize(path)
+        .map(simplify_verbatim)
+        .map_err(|e| format!("{rel} cannot be resolved to a real path ({e})"))?;
+    if !real.starts_with(root) {
+        return Err(format!(
+            "{rel} resolves to `{}`, outside the root `{}` it was joined onto",
+            real.display(),
+            root.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The entry names of `dir`, sorted (so every walk and every error is the same on every platform,
+/// whatever order the directory iterates in). A name that is not UTF-8 is an error: it cannot be
+/// matched against an index or spelled in a refusal.
+fn list_sorted(dir: &Path) -> std::io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(std::io::Error::other(format!(
+                "entry `{}` has a non-UTF-8 name",
+                name.to_string_lossy()
+            )));
+        };
+        names.push(name.to_string());
+    }
+    names.sort();
+    Ok(names)
+}
+
+/// The containment refusal for a linked component of a view, worded once.
+fn linked(rel: &str) -> String {
+    format!("{rel} is a symlink — a snapshot's views must be contained in it, not linked")
+}
+
+/// The frontmatter `name` of a view's `SKILL.md`, read without following a link; `None` when the
+/// file is unreadable, not UTF-8, or has no parseable frontmatter name.
+fn view_skill_name(file: &Path) -> Option<String> {
+    read_no_follow(file)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| parse_frontmatter(&text).ok())
+        .and_then(|fm| fm.name)
+}
+
 /// Read a regular file WITHOUT following a final-component symlink. On unix the open itself
 /// carries `O_NOFOLLOW`, so the lstat→open window cannot be raced into a link; elsewhere the
 /// lstat is re-done immediately before the read.
@@ -1230,6 +1434,12 @@ fn load_published(
         if !names.insert(name.clone()) {
             defects.push(format!("skills[{i}]: duplicate name `{name}`"));
         }
+        // v3.3 §3: the name is joined onto the copilot view (`.github/skills/<name>/`) and the
+        // dir onto `skills/`; both are validated as safe relative spellings HERE, at index
+        // verification, before anything is ever joined (the dir inside `verify_skill_file`).
+        if let Err(why) = safe_segments(&name, false, "name") {
+            defects.push(format!("skills[{i}]: {why}"));
+        }
         match verify_skill_file(path, &dir) {
             Ok(fm) => {
                 match &fm.name {
@@ -1277,23 +1487,16 @@ fn load_published(
     })
 }
 
-/// The `SKILL.md` an index entry names, verified: `dir` is a clean relative `/`-path, EVERY
+/// The `SKILL.md` an index entry names, verified: `dir` is a safe relative `/`-path
+/// ([`safe_segments`] — no absolute, drive, verbatim or UNC spelling, no `.`/`..`; v3.3 §3), EVERY
 /// component from the root down — `skills/` itself first, then each directory of `dir`, then the
 /// leaf — exists and is NOT a symlink (lstat walk — the file must be contained in the root, not
 /// pointed at from it; a `skills -> /outside` link is refused at `skills`, before anything under
-/// it is looked at), the leaf is a regular file, and it is readable (no-follow) with a
+/// it is looked at), the leaf is a regular file that canonicalizes to a path INSIDE the root
+/// ([`contained_under`], checked before the read), and it is readable (no-follow) with a
 /// frontmatter block. Returns the frontmatter.
 fn verify_skill_file(root: &Path, dir: &str) -> Result<Frontmatter, String> {
-    let components: Vec<&str> = dir.split('/').collect();
-    if dir.contains('\\')
-        || components
-            .iter()
-            .any(|c| c.is_empty() || *c == "." || *c == "..")
-    {
-        return Err(format!(
-            "dir `{dir}` is not a clean relative `/`-separated path under {SKILLS_DIR}/"
-        ));
-    }
+    let components = safe_segments(dir, true, "dir")?;
     let mut at = root.to_path_buf();
     let rel = |p: &Path| {
         p.strip_prefix(root)
@@ -1309,6 +1512,7 @@ fn verify_skill_file(root: &Path, dir: &str) -> Result<Frontmatter, String> {
         at.push(component);
         contained(&at, &rel(&at), i == last)?;
     }
+    contained_under(root, &at, &rel(&at))?;
     let bytes = read_no_follow(&at).map_err(|e| format!("{} is not readable ({e})", rel(&at)))?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", rel(&at)))?;
     parse_frontmatter(&text).map_err(|e| match e {
@@ -1734,24 +1938,30 @@ pub(crate) fn admit_refs(
                 });
             }
             // A portable skill whose directory nests a non-portable one is undeliverable to a
-            // directory lever — the parent's directory would carry the Claude-only child into a
-            // recursive scan (codex round 3). Refused by name, parent and child both.
-            let nesting: Vec<(String, String)> = invoked
-                .required
-                .iter()
-                .flat_map(|e| {
-                    snapshot
-                        .nonportable_nested(e)
-                        .into_iter()
-                        .map(move |n| (e.name.clone(), n.dir.clone()))
-                })
-                .collect();
-            if !nesting.is_empty() {
-                return Err(SkillsError::NestsNonPortable {
-                    root: snapshot.root.clone(),
-                    cli: key.clone(),
-                    skills: nesting,
-                });
+            // DIRECTORY lever — the parent's directory would carry the Claude-only child into a
+            // recursive scan (codex round 3). Refused by name, parent and child both — but only
+            // for the levers that hand over original directories (pi, opencode; codex round 4):
+            // copilot is judged on the VIEW crew published, whose whole tree is validated below
+            // (a child copied into it refuses there; one excluded from it does not refuse the
+            // parent), and an absent lever delivers no directory at all.
+            if lever.delivers_directories() {
+                let nesting: Vec<(String, String)> = invoked
+                    .required
+                    .iter()
+                    .flat_map(|e| {
+                        snapshot
+                            .nonportable_nested(e)
+                            .into_iter()
+                            .map(move |n| (e.name.clone(), n.dir.clone()))
+                    })
+                    .collect();
+                if !nesting.is_empty() {
+                    return Err(SkillsError::NestsNonPortable {
+                        root: snapshot.root.clone(),
+                        cli: key.clone(),
+                        skills: nesting,
+                    });
+                }
             }
             // v3.2 §3: the seat must have a wicked-owned way to DELIVER what it invokes — a unit
             // that needs no skill on a lever-less seat runs (without skills); one that names a
@@ -1792,17 +2002,37 @@ pub(crate) fn admit_refs(
     Ok(Some(snapshot))
 }
 
-/// The launch admission for one FRESH launch, on either spawn path: resolve the root (the
-/// ladder), refuse a root the worker Read fence would deny ([`fence_admit`]), then require every
-/// skill the run names — see [`admit_refs`]. `Ok(None)` ⇒ the unit needs no skill and there is no
-/// root to hand it. A CACHED ACP session does not come through here: it is admitted against its
-/// pinned snapshot with [`admit_refs`] directly (v3.1 §4).
-///
-/// Under the operator's inherit-config escape hatch
-/// (`execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`) the worker runs with the operator's OWN
-/// plugins, so no snapshot is handed to it and none is required of it — said out loud, since a
-/// set-but-ignored `WICKED_SKILLS_SNAPSHOT` would otherwise read as a silent no-op.
+/// The launch admission for one FRESH launch, on either spawn path — [`admit_turn`] with nothing
+/// pinned: resolve the root (the ladder), refuse a root the worker Read fence would deny
+/// ([`fence_admit`]), then require every skill the run names — see [`admit_refs`]. `Ok(None)` ⇒
+/// the unit needs no skill and there is no root to hand it.
 pub(crate) fn admit_unit(
+    input: &StepInput,
+    cli: &WorkerCli,
+) -> Result<Option<SkillsSnapshot>, SkillsError> {
+    admit_turn(None, input, cli)
+}
+
+/// ONE admission policy for every turn on either carrier — a fresh launch and a cached ACP session
+/// alike (codex round 4). Round 3 sent a cached session straight to [`admit_refs`] against
+/// `proc.skills` while a fresh one went through [`admit_unit`], so the two disagreed exactly where
+/// the cache held NO snapshot: under the operator's inherit-config escape hatch a session's first
+/// turn opens with nothing pinned (`proc.skills = None`, correctly — the worker runs on the
+/// operator's own plugins) and its next turn, naming a skill, was refused as "no skills root"
+/// under configuration a fresh launch admits.
+///
+/// - The inherit-config escape hatch (`execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`) comes first,
+///   fresh or cached: the worker runs with the operator's OWN plugins, so no snapshot is handed and
+///   none is required — said out loud, since a set-but-ignored `WICKED_SKILLS_SNAPSHOT` would
+///   otherwise read as a silent no-op.
+/// - `pinned` = the generation a CACHED session was opened with (v3.1 §4): judged against THAT, and
+///   never against a re-resolved `current` — the bridge holds the plugin it loaded. Its fence was
+///   checked when it was opened.
+/// - Nothing pinned — a fresh launch, or a cached session that opened without a snapshot — resolves
+///   the ambient root (the ladder), passes it through the fence check, and is admitted against it:
+///   the same configuration yields the same verdict whichever turn of a session it is.
+pub(crate) fn admit_turn(
+    pinned: Option<SkillsSnapshot>,
     input: &StepInput,
     cli: &WorkerCli,
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
@@ -1816,10 +2046,16 @@ pub(crate) fn admit_unit(
         );
         return Ok(None);
     }
-    let snapshot = resolve()?;
-    if let Some(s) = &snapshot {
-        fence_admit(s)?;
-    }
+    let snapshot = match pinned {
+        Some(pinned) => Some(pinned),
+        None => {
+            let snapshot = resolve()?;
+            if let Some(s) = &snapshot {
+                fence_admit(s)?;
+            }
+            snapshot
+        }
+    };
     admit_refs(snapshot, &RequiredRefs::of(input), cli)
 }
 
@@ -3154,15 +3390,19 @@ mod tests {
                 missing: vec!["wicked-garden-engineering-frontend".to_string()],
             }
         );
-        // A copy whose frontmatter disagrees is not that skill.
+        // A copy whose frontmatter disagrees is not that skill — and (v3.3 §2) a view entry that
+        // is not the skill its directory says it is refuses the launch as a CONFIG error naming
+        // the mismatch, not merely as a missing skill: the view was published wrong.
         copy(
             "wicked-garden-engineering-frontend",
             "wicked-garden-something-else",
         );
         let err = admit_refs(Some(s.clone()), &both, &copilot).expect_err("name mismatch");
         assert!(
-            matches!(&err, SkillsError::Missing { missing, .. }
-                if missing == &vec!["wicked-garden-engineering-frontend".to_string()]),
+            matches!(&err, SkillsError::Config { why, .. }
+                if why.contains("wicked-garden-engineering-frontend/SKILL.md declares name \
+                                 `wicked-garden-something-else`, not \
+                                 `wicked-garden-engineering-frontend`")),
             "{err:?}"
         );
         copy(
@@ -3179,6 +3419,75 @@ mod tests {
         assert_eq!(
             handed.delivery(&copilot).argv_flags(),
             vec!["--add-dir".to_string(), view.to_string_lossy().into_owned()]
+        );
+        // v3.3 §2 (codex round 4): the WHOLE view is judged, invoked or not. An entry the index
+        // does not list, a copy of a non-portable skill, a stray file, and a Claude-only child
+        // nested inside a portable parent's copy each refuse by name as a config error — for a
+        // unit that invokes nothing too, since the launch would `--add-dir` the whole view.
+        let none = RequiredRefs::seat([]);
+        assert!(
+            admit_refs(Some(s.clone()), &none, &copilot)
+                .unwrap()
+                .is_some(),
+            "a well-formed view admits a unit invoking nothing"
+        );
+        let refused = |needle: &str| {
+            for refs in [&none, &both] {
+                let err = admit_refs(Some(s.clone()), refs, &copilot).expect_err(needle);
+                assert!(
+                    matches!(&err, SkillsError::Config { why, .. } if why.contains(needle)),
+                    "{needle}: {err:?}"
+                );
+            }
+        };
+        copy("wicked-garden-unknown", "wicked-garden-unknown");
+        refused("wicked-garden-unknown is not a skill this snapshot indexes");
+        std::fs::remove_dir_all(view_skills.join("wicked-garden-unknown")).unwrap();
+        copy(
+            "wicked-garden-domain-extractor",
+            "wicked-garden-domain-extractor",
+        );
+        refused(
+            "wicked-garden-domain-extractor is `wicked-garden-domain-extractor`, which the index \
+             marks portable: false",
+        );
+        std::fs::remove_dir_all(view_skills.join("wicked-garden-domain-extractor")).unwrap();
+        std::fs::write(view_skills.join("README.md"), b"stray").unwrap();
+        refused("README.md is not a directory");
+        std::fs::remove_file(view_skills.join("README.md")).unwrap();
+        let nested = view_skills.join("wicked-garden-domain").join("legacy");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join(SKILL_FILE),
+            "---\nname: wicked-garden-domain-extractor\n---\n",
+        )
+        .unwrap();
+        refused(
+            "wicked-garden-domain/legacy/SKILL.md is `wicked-garden-domain-extractor`, which the \
+             index marks portable: false",
+        );
+        std::fs::write(
+            nested.join(SKILL_FILE),
+            "---\nname: wicked-garden-nobody\n---\n",
+        )
+        .unwrap();
+        refused(
+            "wicked-garden-domain/legacy/SKILL.md is a nested SKILL.md that names no indexed skill",
+        );
+        std::fs::remove_dir_all(&nested).unwrap();
+        // A symlink ANYWHERE in the view — deep inside an entry — is a containment defect.
+        #[cfg(unix)]
+        {
+            let deep = view_skills.join("wicked-garden-domain").join("ref.md");
+            std::os::unix::fs::symlink(root.join(SNAPSHOT_INDEX), &deep).unwrap();
+            refused("wicked-garden-domain/ref.md is a symlink");
+            std::fs::remove_file(&deep).unwrap();
+        }
+        assert!(
+            admit_refs(Some(s.clone()), &both, &copilot)
+                .unwrap()
+                .is_some(),
+            "well-formed again"
         );
         // Containment: a view reached through a symlink is an EXTERNAL tree — refused as a config
         // error, even for a unit that invokes nothing (the launch would still `--add-dir` it), and
@@ -3664,6 +3973,268 @@ mod tests {
             .is_some(),
             "another seat's use of the parent does not refuse this unit"
         );
+        // codex round 4: the nesting rule is scoped to the DIRECTORY levers. Copilot is handed
+        // the published VIEW and judged on it (v3.3 §2): a view whose copy of the parent EXCLUDES
+        // the Claude-only child admits the parent with `--add-dir <view>`; one that carries the
+        // child refuses by path. Codex (no lever) is refused as NoLever, not NestsNonPortable.
+        let copilot = WorkerCli::for_binaries("copilot", "copilot", "copilot");
+        let codex = WorkerCli::for_binaries("codex", "codex", "codex");
+        let parent = RequiredRefs::seat(["wicked-garden-engineering"]);
+        assert!(matches!(
+            admit_refs(Some(s.clone()), &parent, &codex),
+            Err(SkillsError::NoLever { .. })
+        ));
+        let view = root.join("views").join("copilot");
+        let parent_copy = view
+            .join(".github")
+            .join("skills")
+            .join("wicked-garden-engineering");
+        std::fs::create_dir_all(&parent_copy).unwrap();
+        std::fs::write(
+            parent_copy.join(SKILL_FILE),
+            "---\nname: wicked-garden-engineering\n---\n",
+        )
+        .unwrap();
+        let handed = admit_refs(Some(s.clone()), &parent, &copilot)
+            .expect("the view excludes the child")
+            .expect("handed");
+        assert_eq!(
+            handed.delivery(&copilot),
+            SkillsDelivery::CopilotAddDir(view.clone())
+        );
+        assert!(
+            matches!(
+                admit_refs(Some(s.clone()), &parent, &pi),
+                Err(SkillsError::NestsNonPortable { .. })
+            ),
+            "the directory levers are still refused"
+        );
+        std::fs::create_dir_all(parent_copy.join("legacy")).unwrap();
+        std::fs::write(
+            parent_copy.join("legacy").join(SKILL_FILE),
+            "---\nname: wicked-garden-engineering-legacy\n---\n",
+        )
+        .unwrap();
+        let err =
+            admit_refs(Some(s.clone()), &parent, &copilot).expect_err("the view carries the child");
+        assert!(
+            matches!(&err, SkillsError::Config { why, .. }
+                if why.contains("wicked-garden-engineering/legacy/SKILL.md")
+                    && why.contains("portable: false")),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// v3.3 §3 (codex round 4): every persisted spelling the engine joins onto a root — an index
+    /// entry's `name` (joined onto the copilot view) and `dir` (joined onto `skills/`) — is
+    /// validated as a safe relative segment set AT INDEX VERIFICATION, before any join: an
+    /// absolute name, `..`, a drive prefix, a UNC/verbatim prefix, a name with a separator are
+    /// each refused, all listed in one config error. After a join, the walked path must also
+    /// canonicalize INSIDE the root before it is read (`contained_under`).
+    #[test]
+    fn persisted_names_and_dirs_are_safe_relative_segments_refused_at_index_verification() {
+        let base = scratch("hygiene");
+        let root = snapshot_root(
+            &gen_dir(&base, "31"),
+            "31",
+            &[("domain", "wicked-garden-domain")],
+        );
+        // Overwrite the index with hostile spellings; the valid `domain` entry stays.
+        let index = serde_json::json!({
+            "gen": "31",
+            "skills": [
+                {"name": "wicked-garden-domain", "dir": "domain", "portable": true},
+                {"name": "/etc", "dir": "domain", "portable": true},
+                {"name": "wicked-garden-dotdot", "dir": "../outside", "portable": true},
+                {"name": "wicked-garden-drive", "dir": "C:/outside", "portable": true},
+                {"name": "wicked-garden-unc", "dir": r"\\?\C:\outside", "portable": true},
+                {"name": "a/b", "dir": "domain", "portable": true},
+                {"name": "wicked-garden-colon", "dir": "C:outside", "portable": true},
+            ]
+        });
+        std::fs::write(
+            root.join(SNAPSHOT_INDEX),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        let err = published(&root).expect_err("hostile spellings are refused at load");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        for needle in [
+            "name `/etc`",
+            "is absolute",
+            "dir `../outside`",
+            "`.` or `..`",
+            "dir `C:/outside`",
+            "colon",
+            r"dir `\\?\C:\outside`",
+            "backslash",
+            "name `a/b`",
+            "single path component",
+            "dir `C:outside`",
+            "not a clean relative",
+        ] {
+            assert!(why.contains(needle), "{needle}: {why}");
+        }
+        // `safe_segments` itself: the nested `dir` form and the single-segment `name` form.
+        assert_eq!(
+            safe_segments("engineering/frontend", true, "dir"),
+            Ok(vec!["engineering", "frontend"])
+        );
+        assert_eq!(
+            safe_segments("wicked-garden-domain", false, "name"),
+            Ok(vec!["wicked-garden-domain"])
+        );
+        for bad in [
+            "", "/x", "x/", "a//b", "./x", "x/..", "..", r"a\b", "C:", "a:b", "x\0y",
+        ] {
+            assert!(safe_segments(bad, true, "dir").is_err(), "{bad:?}");
+        }
+        assert!(safe_segments("engineering/frontend", false, "name").is_err());
+        // Containment after the join: a path that canonicalizes OUTSIDE the root is refused
+        // before any read; one inside passes.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("file"), b"").unwrap();
+        assert_eq!(
+            contained_under(&root, &root.join(SNAPSHOT_INDEX), SNAPSHOT_INDEX),
+            Ok(())
+        );
+        let err = contained_under(&root, &outside.join("file"), "x").unwrap_err();
+        assert!(err.contains("outside the root"), "{err}");
+        // A valid snapshot still loads exactly as before — the belt does not tighten the braces.
+        let root2 = snapshot_root(
+            &gen_dir(&base, "32"),
+            "32",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("engineering/frontend", "wicked-garden-engineering-frontend"),
+            ],
+        );
+        assert_eq!(published(&root2).unwrap().unwrap().skills().len(), 2);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// codex round 4: ONE admission policy for a fresh launch and a cached session (`admit_turn`).
+    /// The inherit-config escape hatch bypasses admission whatever is pinned; a pinned generation
+    /// is judged and never the ambient one; nothing pinned resolves the ambient root through the
+    /// ladder and the fence — so a session opened with nothing pinned is admitted on a later turn
+    /// exactly as a fresh launch is.
+    #[test]
+    fn admit_turn_applies_one_policy_to_fresh_and_cached_sessions() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Pin(&'static str, Option<std::ffi::OsString>);
+        impl Pin {
+            fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+                let prev = std::env::var_os(key);
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                Pin(key, prev)
+            }
+        }
+        impl Drop for Pin {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let base = scratch("turn");
+        // The fence over the fixture's state home (`base`) must classify it: HOME is pinned to the
+        // base so no default fenced directory can contain the scratch, and no explicit state home
+        // can disagree with the derived one.
+        let _home = Pin::set("HOME", Some(base.as_os_str()));
+        let _state = Pin::set(crate::state_home::STATE_HOME_ENV, None);
+        let ambient = snapshot_root(
+            &gen_dir(&base, "2"),
+            "2",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("search", "wicked-garden-search"),
+            ],
+        );
+        let pinned_root = snapshot_root(
+            &gen_dir(&base, "1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let pinned = load(&pinned_root);
+        let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, Some(ambient.as_os_str()));
+        let input = |skill: &str| {
+            let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
+            u.skill_ref = Some(skill.to_string());
+            StepInput {
+                run_id: "r".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let claude = WorkerCli::Claude;
+        // Nothing pinned: the ambient generation is resolved, fenced and handed.
+        let fresh = admit_turn(None, &input("wicked-garden-search"), &claude)
+            .unwrap()
+            .expect("handed");
+        assert_eq!(fresh.root, ambient);
+        // Pinned: judged against the pinned generation ONLY — `search` lives in the ambient one
+        // and is refused naming the PINNED root; `domain` is admitted from it.
+        let err = admit_turn(
+            Some(pinned.clone()),
+            &input("wicked-garden-search"),
+            &claude,
+        )
+        .expect_err("the pinned generation wins over the ambient one");
+        assert!(
+            matches!(&err, SkillsError::Missing { root: Some(r), .. } if r == &pinned_root),
+            "{err:?}"
+        );
+        assert_eq!(
+            admit_turn(
+                Some(pinned.clone()),
+                &input("wicked-garden-domain"),
+                &claude
+            )
+            .unwrap()
+            .unwrap()
+            .root,
+            pinned_root
+        );
+        // The escape hatch: bypassed, pinned or not, even with a snapshot handed and a skill the
+        // run names nowhere — the worker runs on the operator's own plugins.
+        {
+            let _hatch = Pin::set(
+                crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
+                Some(std::ffi::OsStr::new("1")),
+            );
+            assert_eq!(
+                admit_turn(None, &input("wicked-garden-absent"), &claude),
+                Ok(None)
+            );
+            assert_eq!(
+                admit_turn(
+                    Some(pinned.clone()),
+                    &input("wicked-garden-absent"),
+                    &claude
+                ),
+                Ok(None)
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

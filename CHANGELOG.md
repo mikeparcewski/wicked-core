@@ -41,7 +41,8 @@ Two release tracks share this file, newest entry first regardless of track:
   admission by name (`fence_check`), and a snapshot under the state home outside the slot or under
   any other fenced directory is a config error naming both paths. Documented residuals: an entry
   created under the state home while a session runs is fenced at the next launch (crew is that
-  directory's only writer); sibling immutable generations stay readable until crew reaps them. The
+  directory's only writer); a generation published while a session runs is readable by that
+  session until its next launch (v3.3 — see review pass 4 below; sibling generations are DENIED). The
   published index is VERIFIED at load (every component from the root down — `.claude-plugin/`,
   `plugin.json`, `snapshot.json`, `skills/`, each skill directory, each `SKILL.md` — is lstat-checked
   not to be a symlink and read without following one (`O_NOFOLLOW` on unix); a `skills -> /outside`
@@ -120,7 +121,36 @@ Two release tracks share this file, newest entry first regardless of track:
   <fixture>` with the unit's `skill_ref` set and asserts exit `Ok` plus the fixture skill's unique
   marker in the output; `acp_runner::tests::the_real_acp_bridge_…` drives the real
   `claude-agent-acp` through the real `AcpStepRunner` (`session/new` with the plugins option, then
-  the prompt) and asserts the same marker in the streamed output.
+  the prompt) and asserts the same marker in the streamed output. **Review pass 4 (codex round 4
+  on #399; design amendment v3.3):** the handed generation is the ONLY readable path under the state
+  home — `skills/snapshots/` is the one directory listed at launch to BUILD rules, one deny per
+  sibling entry (every other generation, every `.staging-*`/`.tmp-*` entry; in addition to the
+  static registry rules), failing closed on an unlistable slot or an entry that is neither a
+  generation directory (a real directory named by decimal digits, as crew publishes them) nor a
+  recognised staging name — round 3 left every sibling generation readable, which the fence test
+  now asserts the opposite of; residual: a generation published while a session runs is readable by
+  that session until its next launch. Path hygiene everywhere a persisted spelling is joined (v3.3
+  §3): an index entry's `name` (joined onto the copilot view) and `dir` (onto `skills/`) and every
+  view entry must be safe relative segments — no absolute, drive (`C:/x`), verbatim/UNC (`\\?\…`,
+  any backslash), `.`/`..` or extra separators — refused at index verification, all defects listed;
+  after every join the lstat-walked path must also canonicalize INSIDE its root before it is read.
+  The copilot view is validated as a WHOLE tree (v3.3 §2): every entry of `views/copilot/.github/skills/`
+  must be an indexed PORTABLE skill whose `SKILL.md` name matches, no symlink anywhere below the
+  view, no stray file, no unindexed or non-portable entry, no Claude-only child nested inside a
+  copy — each refuses the launch by name as a config error, whether or not the unit invokes a skill
+  (the launch `--add-dir`s the whole view). The recursive-nesting restriction
+  (`SkillsError::NestsNonPortable`) applies only to the levers that hand over ORIGINAL directories
+  (pi `--skill`, opencode `skills.paths`); copilot is judged on its published view (a copy that
+  excludes the non-portable child admits the parent), and a lever-less seat gets `NoLever`. ONE
+  admission policy for fresh and cached ACP sessions (`skills_snapshot::admit_turn`): the
+  inherit-config escape hatch bypasses both, a cached session is judged against its pinned
+  generation, and a session opened with nothing pinned (the hatch) is admitted on later turns under
+  the same configuration a fresh launch is — round 3 refused its second, skill-bearing turn as "no
+  skills root". The shared worker-home settings writer's temp files are `settings.json.<pid>.<seq>.tmp`
+  and the sweep removes only THIS process's leftovers — never another engine process's in-flight
+  temp, whose rename it would otherwise race. Windows CI: the acp_runner test scratch helper is
+  platform-independent (a non-`cfg(unix)` test used a `cfg(unix)` helper and the lib tests did not
+  compile).
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`
