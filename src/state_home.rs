@@ -570,7 +570,11 @@ mod tests {
         assert_eq!(of("/h/.wicked-crew/skills/effective"), None);
         assert_eq!(of("/h/.wicked-crew/evals/7"), None);
         assert_eq!(of("/h/elsewhere/snapshots/7"), None, "no skills component");
-        assert_eq!(of("/skills/snapshots/7"), None, "the filesystem root is no state home");
+        assert_eq!(
+            of("/skills/snapshots/7"),
+            None,
+            "the filesystem root is no state home"
+        );
         assert_eq!(
             of("/h/.claude/plugins/cache/wicked-garden/wicked-garden/12.32.0"),
             None,
@@ -579,10 +583,7 @@ mod tests {
         // Agreement with an explicit statement: the same directory (by spelling) agrees, a
         // different one fails naming BOTH, and a shapeless root fails naming the shape.
         let root = Path::new("/h/.wicked-crew/skills/snapshots/000007");
-        assert_eq!(
-            derive(root, None),
-            Ok(PathBuf::from("/h/.wicked-crew"))
-        );
+        assert_eq!(derive(root, None), Ok(PathBuf::from("/h/.wicked-crew")));
         assert_eq!(
             derive(root, Some(Path::new("/h/.wicked-crew"))),
             Ok(PathBuf::from("/h/.wicked-crew"))

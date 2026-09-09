@@ -308,10 +308,7 @@ impl SkillsDelivery {
     /// logged a notice, which turned a configuration error into a launch with defaults: the
     /// governance content the seat depends on was dropped, and the contract requires composition
     /// WITH the existing content, never replacement.
-    pub(crate) fn opencode_config(
-        &self,
-        existing: Option<&str>,
-    ) -> Result<Option<String>, String> {
+    pub(crate) fn opencode_config(&self, existing: Option<&str>) -> Result<Option<String>, String> {
         let SkillsDelivery::OpencodeConfig(dirs) = self else {
             return Ok(None);
         };
@@ -781,9 +778,7 @@ pub(crate) enum SkillsError {
 impl std::fmt::Display for SkillsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkillsError::Config { var, path, why }
-                if *var == crate::state_home::STATE_HOME_ENV =>
-            {
+            SkillsError::Config { var, path, why } if *var == crate::state_home::STATE_HOME_ENV => {
                 write!(
                     f,
                     "{var}={} is not a usable crew state home ({why}); pass the daemon's actual \
@@ -927,13 +922,14 @@ pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
     // The daemon's explicit state home (crew#480), when stated: resolved here so a malformed
     // value — set but empty, relative, unresolvable — refuses the launch as a config error
     // naming it, whether or not a snapshot is handed (the fence over it depends on it).
-    let state_home = crate::state_home::explicit_state_home().map_err(|why| SkillsError::Config {
-        var: crate::state_home::STATE_HOME_ENV,
-        path: std::env::var_os(crate::state_home::STATE_HOME_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_default(),
-        why,
-    })?;
+    let state_home =
+        crate::state_home::explicit_state_home().map_err(|why| SkillsError::Config {
+            var: crate::state_home::STATE_HOME_ENV,
+            path: std::env::var_os(crate::state_home::STATE_HOME_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_default(),
+            why,
+        })?;
     resolve_in(
         explicit,
         state_home.as_deref(),
@@ -1270,8 +1266,7 @@ fn load_published(
     // is opened around it is derived from the root's own shape (three components up), and must
     // be the one the daemon states when it states one. Checked last so an operator pointing at
     // something that is not a snapshot at all is told that first.
-    let state_home =
-        crate::state_home::derive(path, explicit_state_home).map_err(config_err)?;
+    let state_home = crate::state_home::derive(path, explicit_state_home).map_err(config_err)?;
     Ok(SkillsSnapshot {
         root,
         source: SnapshotSource::Published,
@@ -2049,9 +2044,15 @@ mod tests {
             ],
         );
         let mut lines = Vec::new();
-        let s = resolve_in(Some(root.clone()), None, None, None, &mut collect(&mut lines))
-            .unwrap()
-            .unwrap();
+        let s = resolve_in(
+            Some(root.clone()),
+            None,
+            None,
+            None,
+            &mut collect(&mut lines),
+        )
+        .unwrap()
+        .unwrap();
         assert!(
             lines.is_empty(),
             "an explicit path logs no fallback: {lines:?}"
@@ -2524,8 +2525,7 @@ mod tests {
             assert_eq!(*var, STATE_HOME, "{err}");
             assert!(why.contains(needle), "{why}");
             assert!(
-                err.to_string().contains(STATE_HOME)
-                    && err.to_string().contains("crew state home"),
+                err.to_string().contains(STATE_HOME) && err.to_string().contains("crew state home"),
                 "{err}"
             );
         };
@@ -2549,8 +2549,7 @@ mod tests {
         };
         assert_eq!(*var, SKILLS_SNAPSHOT_ENV);
         assert!(
-            why.contains(&base.display().to_string())
-                && why.contains(&other.display().to_string()),
+            why.contains(&base.display().to_string()) && why.contains(&other.display().to_string()),
             "names both directories: {why}"
         );
         for (k, v) in saved {
@@ -3145,7 +3144,8 @@ mod tests {
         };
         copy("wicked-garden-domain", "wicked-garden-domain");
         // Partial: only what the view lacks is named.
-        let both = RequiredRefs::seat(["wicked-garden-domain", "wicked-garden-engineering-frontend"]);
+        let both =
+            RequiredRefs::seat(["wicked-garden-domain", "wicked-garden-engineering-frontend"]);
         let err = admit_refs(Some(s.clone()), &both, &copilot).expect_err("a partial view");
         assert_eq!(
             err,
@@ -3155,15 +3155,23 @@ mod tests {
             }
         );
         // A copy whose frontmatter disagrees is not that skill.
-        copy("wicked-garden-engineering-frontend", "wicked-garden-something-else");
+        copy(
+            "wicked-garden-engineering-frontend",
+            "wicked-garden-something-else",
+        );
         let err = admit_refs(Some(s.clone()), &both, &copilot).expect_err("name mismatch");
         assert!(
             matches!(&err, SkillsError::Missing { missing, .. }
                 if missing == &vec!["wicked-garden-engineering-frontend".to_string()]),
             "{err:?}"
         );
-        copy("wicked-garden-engineering-frontend", "wicked-garden-engineering-frontend");
-        let handed = admit_refs(Some(s.clone()), &both, &copilot).unwrap().unwrap();
+        copy(
+            "wicked-garden-engineering-frontend",
+            "wicked-garden-engineering-frontend",
+        );
+        let handed = admit_refs(Some(s.clone()), &both, &copilot)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             handed.delivery(&copilot),
             SkillsDelivery::CopilotAddDir(view.clone())
@@ -3265,7 +3273,11 @@ mod tests {
                 .starts_with(&root.to_string_lossy().to_string())),
             "{composed}"
         );
-        assert!(handed.delivery(&pi).opencode_config(None).unwrap().is_none());
+        assert!(handed
+            .delivery(&pi)
+            .opencode_config(None)
+            .unwrap()
+            .is_none());
         let bare: Value = serde_json::from_str(
             &handed
                 .delivery(&opencode)
@@ -3282,7 +3294,10 @@ mod tests {
             ("not json", "not valid JSON"),
             ("[1, 2]", "JSON array, not an object"),
             (r#"{"skills": "x"}"#, "skills is not an object"),
-            (r#"{"skills": {"paths": "x"}}"#, "skills.paths is not an array"),
+            (
+                r#"{"skills": {"paths": "x"}}"#,
+                "skills.paths is not an array",
+            ),
         ] {
             let err = handed
                 .delivery(&opencode)
@@ -3469,12 +3484,21 @@ mod tests {
                 "---\nname: x\nmandates: [wicked-garden-a, wicked-garden-b\n---\n",
                 "not valid YAML",
             ),
-            ("---\nname: x\nmandates:\n\t- wicked-garden-a\n---\n", "not valid YAML"),
+            (
+                "---\nname: x\nmandates:\n\t- wicked-garden-a\n---\n",
+                "not valid YAML",
+            ),
             ("---\nname: x\nmandates: [a]\n", "not terminated"),
             ("---\nname: [x]\n---\n", "`name` is a YAML sequence"),
             ("---\nname: 12\n---\n", "`name` is a YAML number"),
-            ("---\nmandates: {a: b}\n---\n", "`mandates` is a YAML mapping"),
-            ("---\nmandates: [a, 1]\n---\n", "`mandates` holds a YAML number"),
+            (
+                "---\nmandates: {a: b}\n---\n",
+                "`mandates` is a YAML mapping",
+            ),
+            (
+                "---\nmandates: [a, 1]\n---\n",
+                "`mandates` holds a YAML number",
+            ),
             ("---\n- just\n- a list\n---\n", "not a mapping"),
         ] {
             match parse_frontmatter(doc) {
@@ -3567,10 +3591,7 @@ mod tests {
         );
         let parent = skill_dir(&root, "engineering");
         let flags = s.delivery(&pi).argv_flags();
-        assert!(
-            !flags.iter().any(|f| Path::new(f) == parent),
-            "{flags:?}"
-        );
+        assert!(!flags.iter().any(|f| Path::new(f) == parent), "{flags:?}");
         let composed: Value = serde_json::from_str(
             &s.delivery(&opencode)
                 .opencode_config(None)
@@ -3618,10 +3639,7 @@ mod tests {
         ));
         assert!(admit_refs(
             Some(s.clone()),
-            &RequiredRefs::seat([
-                "wicked-garden-engineering-frontend",
-                "wicked-garden-domain"
-            ]),
+            &RequiredRefs::seat(["wicked-garden-engineering-frontend", "wicked-garden-domain"]),
             &opencode
         )
         .unwrap()
@@ -3668,9 +3686,15 @@ mod tests {
             Some(crew_state.as_path()),
             "a custom state home is derived from the shape, not from a directory name"
         );
-        let same = resolve_in(Some(root.clone()), Some(&crew_state), None, None, &mut |_| {})
-            .unwrap()
-            .unwrap();
+        let same = resolve_in(
+            Some(root.clone()),
+            Some(&crew_state),
+            None,
+            None,
+            &mut |_| {},
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(same.state_home.as_deref(), Some(crew_state.as_path()));
         let other = base.join("other-state");
         std::fs::create_dir_all(&other).unwrap();

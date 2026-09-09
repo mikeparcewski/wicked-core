@@ -1398,7 +1398,11 @@ fn create_session_dir(
 fn session_suffix() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    format!("{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+    format!(
+        "{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// `<run_id>-<cli_key>`, each component reduced to `[A-Za-z0-9._-]` (a campaign run id carries
@@ -7434,9 +7438,19 @@ cat >/dev/null
             .iter()
             .map(|(_, p)| p.parent().expect("settings.json has a dir"))
             .collect();
-        assert_eq!(dirs.len(), 2 * n, "every launch has its own directory: {outcomes:?}");
+        assert_eq!(
+            dirs.len(),
+            2 * n,
+            "every launch has its own directory: {outcomes:?}"
+        );
         for (rule, path) in &outcomes {
-            let name = path.parent().unwrap().file_name().unwrap().to_str().unwrap();
+            let name = path
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
             assert!(
                 name.starts_with("campaign_one-claude-")
                     && name.contains(&format!("-{}-", std::process::id())),
@@ -7458,7 +7472,11 @@ cat >/dev/null
         let sessions = home.join(SESSIONS_DIRNAME);
         std::fs::create_dir_all(sessions.join("stem-taken")).unwrap();
         std::fs::write(sessions.join("stem-taken").join("settings.json"), b"theirs").unwrap();
-        let mut suffixes = vec!["fresh".to_string(), "taken".to_string(), "taken".to_string()];
+        let mut suffixes = vec![
+            "fresh".to_string(),
+            "taken".to_string(),
+            "taken".to_string(),
+        ];
         let dir = create_session_dir(&sessions, "stem", &mut || suffixes.pop().unwrap())
             .expect("a fresh suffix is found");
         assert_eq!(dir, sessions.join("stem-fresh"));
@@ -7595,7 +7613,10 @@ cat >/dev/null
         assert!(marker.exists());
         let composed: Value =
             serde_json::from_str(&std::fs::read_to_string(&env_dump).unwrap()).unwrap();
-        assert_eq!(composed["permission"]["read"], "ask", "governance kept: {composed}");
+        assert_eq!(
+            composed["permission"]["read"], "ask",
+            "governance kept: {composed}"
+        );
         assert_eq!(
             composed["skills"]["paths"],
             serde_json::json!([skill_dir.to_string_lossy()]),
@@ -7750,7 +7771,9 @@ transport = "stdio"
             .filter(|p| p.is_file())
             .or_else(|| on_path("claude-agent-acp"))
         else {
-            eprintln!("SKIP: no claude-agent-acp (WICKED_SKILLS_LIVE_ACP_BRIDGE unset, none on PATH)");
+            eprintln!(
+                "SKIP: no claude-agent-acp (WICKED_SKILLS_LIVE_ACP_BRIDGE unset, none on PATH)"
+            );
             return;
         };
         let real_home = std::env::var_os("HOME")

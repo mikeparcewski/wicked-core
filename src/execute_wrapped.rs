@@ -699,7 +699,10 @@ fn state_home_candidates() -> Vec<PathBuf> {
         .into_iter()
         .collect();
     if let Ok(Some(explicit)) = crate::state_home::explicit_state_home() {
-        if !out.iter().any(|c| crate::state_home::same_dir(c, &explicit)) {
+        if !out
+            .iter()
+            .any(|c| crate::state_home::same_dir(c, &explicit))
+        {
             out.push(explicit);
         }
     }
@@ -725,9 +728,7 @@ fn denied_dirs() -> Vec<PathBuf> {
              from workers (the Bash verb rules still apply)"
         );
     }
-    let explicit_state_home = crate::state_home::explicit_state_home()
-        .ok()
-        .flatten();
+    let explicit_state_home = crate::state_home::explicit_state_home().ok().flatten();
     let mut unique: Vec<PathBuf> = Vec::new();
     for dir in std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
@@ -738,10 +739,7 @@ fn denied_dirs() -> Vec<PathBuf> {
                 .flat_map(|h| DENIED_HOME_SUBDIRS.iter().map(|d| h.join(d))),
         )
     {
-        if !unique
-            .iter()
-            .any(|u| crate::state_home::same_dir(u, &dir))
-        {
+        if !unique.iter().any(|u| crate::state_home::same_dir(u, &dir)) {
             unique.push(dir);
         }
     }
@@ -6529,7 +6527,10 @@ mod tests {
         // keeps that directory's blanket.
         std::fs::create_dir_all(custom.join("wt")).unwrap();
         let why = fence_check(&custom_gen).expect_err("unclassified sibling");
-        assert!(why.contains("`wt`") && why.contains(&custom.display().to_string()), "{why}");
+        assert!(
+            why.contains("`wt`") && why.contains(&custom.display().to_string()),
+            "{why}"
+        );
         assert!(
             deny_rules(Some(&custom_gen)).contains(&format!("Read({custom_rule}/**)")),
             "closed again"

@@ -241,10 +241,7 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
         .join(format!("wicked-skills-live-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let state_home = base.join("crew-state");
-    let snapshot = state_home
-        .join("skills")
-        .join("snapshots")
-        .join("000001");
+    let snapshot = state_home.join("skills").join("snapshots").join("000001");
     let skill = snapshot.join("skills").join("wicked-probe");
     std::fs::create_dir_all(snapshot.join(".claude-plugin")).unwrap();
     std::fs::create_dir_all(&skill).unwrap();
