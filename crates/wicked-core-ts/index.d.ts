@@ -439,7 +439,12 @@ export declare class Core {
    * passes it through verbatim as the pinned wire contract):
    * `{ results: [{ sample: { id, description, kind, steering_type }, expected: "deny"|"allow",
    * fired: [rule-id…], verdict: "caught"|"gap"|"false_positive", nearest_rules? }],
-   * summary: { total, caught, gaps, false_positives }, degraded: "facet-only"|null }`.
+   * summary: { total, caught, gaps, false_positives }, degraded: "facet-only"|null,
+   * rule_coverage: { exercised, unexercised: [{ rule_id, steering_type }], recall_only,
+   * per_type: { <steering-type>: { exercised, unexercised } } } }` — `rule_coverage` (core#394)
+   * partitions the decide-lane rules eligible for the run (narrowed to `type` when given) by
+   * whether any sample fired them; `recall_only` counts the effect-less rules the gate never
+   * fires (core#395 — zero decide-lane rules means the verdicts are the corpus split).
    *
    * Fail-closed: malformed args, an unknown steering type, a corpus name outside the
    * `evals:` scope, or a missing store reject the Promise with the engine's reason — crew maps

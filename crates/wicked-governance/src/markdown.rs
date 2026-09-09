@@ -33,6 +33,10 @@
 //!                               #   architecture); the studio Steering sub-page the rules file under
 //! weight: 2.5                   # optional, finite ≥ 0 (default 1.0) — recall order within a
 //!                               #   severity band + stored gate priority; applies to every rule
+//! effect: deny                  # optional: deny|warn|allow — makes EVERY rule the doc mints
+//!                               #   DECIDE-lane (the gate fires it); absent ⇒ recall-only, exactly
+//!                               #   as before the key existed. Needs `applies_to` (INV-S3). A
+//!                               #   per-rule `effect:` continuation directive (below) overrides it.
 //! scope: wiki:architecture      # optional
 //! supersedes: [old-doc-id]      # optional list
 //! domain: agent-behavior        # optional — RuleSet parent (grouping is AW-9/AW-13)
@@ -54,6 +58,9 @@
 //! - `POL-002` (critical): All writes go through the single-writer actor,
 //!   continuation lines are indented by two or more spaces.
 //! - `OPS-CUSTOM-10` (warn): Custom id families import through the same lane.
+//! - `POL-003` (critical): Never force-push a shared branch.
+//!   effect: deny
+//!   trigger: push\s+--force
 //! ```
 //!
 //! Each rule item is `- <ID> (<severity>): <statement>` (backticks around the id optional),
@@ -90,6 +97,27 @@
 //! `symbol_ref:` is therefore a reserved prefix on continuation lines; statement prose never
 //! legitimately starts with it.
 //!
+//! Two more continuation DIRECTIVES author the enforcement half of a rule (core#395 — until they
+//! existed no operator-facing path could mint a rule the gate fires, so evals measured nothing
+//! about operator steering):
+//!
+//! - `effect: <deny|warn|allow>` sets THIS rule's effect, overriding the doc-level `effect` key
+//!   (a doc can stay mostly doctrine and make one rule a gate). The vocabulary is the operator
+//!   spelling of the merged Policy model's [`Effect`]: `deny` ⇒ `Deny` (a triggered rule BLOCKS
+//!   the gate — the only effect evals credit as a catch), `warn` ⇒ `AllowWithConditions` (a
+//!   triggered rule is recorded on the decision — `policy_ids`, criteria — without blocking; the
+//!   doc lane authors no obligations, so the decision itself stays allow), `allow` ⇒ `Allow`.
+//! - `trigger: <regex>` sets `trigger.contains` — the regex the gate tests over the canonical
+//!   JSON of the evaluated context. Validated at parse (a malformed regex fails CLOSED in the
+//!   engine — never fires — so it is refused here with its line, INV-S3). Without a trigger an
+//!   effect-bearing rule fires whenever it is phase-selected (the merged model's blanket policy),
+//!   so a doc-level `effect: deny` with no per-rule triggers denies EVERYTHING in `applies_to` —
+//!   author triggers. A `trigger:` on a rule that ends up with no effect is refused: a trigger
+//!   only matters to the gate, so that rule would be a silent no-op.
+//!
+//! An effect-bearing rule needs a non-empty `applies_to` (INV-S3, surfaced here with the doc and
+//! rule): selected for no phase, it would register and enforce nothing — the silent fail-open.
+//!
 //! `provenance.ref` is
 //! `<root-relative path>@<git blob sha>#<RULE-ID>` (forward slashes on every platform; the sha is
 //! the doc's content digest per [`crate::provenance::git_blob_sha1`] — equal to
@@ -105,6 +133,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use crate::domain::Effect;
 use crate::ingest::SourceAdapter;
 
 // The severity vocabulary (`info|warn|error|critical`, the conformance-rules wire enum) is
@@ -113,11 +142,14 @@ use crate::ingest::SourceAdapter;
 const STATUSES: [&str; 4] = ["active", "draft", "superseded", "retired"];
 /// Doc `enforcement_class` vocabulary (arch-R4; the class→lane typing itself lands in AW-7).
 const ENFORCEMENT_CLASSES: [&str; 3] = ["policy", "validator", "guidance"];
+/// The `effect` vocabulary (doc key and per-rule directive alike) — the operator spelling of the
+/// merged Policy model's [`Effect`]; see [`parse_effect`] for the mapping.
+const EFFECTS: [&str; 3] = ["deny", "warn", "allow"];
 /// Frontmatter keys the convention knows. Anything else fails loud (a typo must surface).
-/// `steering_type` / `excludes` / `weight` are the STEERING keys (optional, doc-level — applied
-/// to every rule the doc mints, like `confidence` and `targets`); `applies_to` now also rides
-/// onto each minted rule (the unified model's inclusion field), not just the doc metadata.
-const KNOWN_KEYS: [&str; 14] = [
+/// `steering_type` / `excludes` / `weight` / `effect` are the STEERING keys (optional, doc-level —
+/// applied to every rule the doc mints, like `confidence` and `targets`); `applies_to` now also
+/// rides onto each minted rule (the unified model's inclusion field), not just the doc metadata.
+const KNOWN_KEYS: [&str; 15] = [
     "id",
     "title",
     "status",
@@ -132,6 +164,7 @@ const KNOWN_KEYS: [&str; 14] = [
     "targets",
     "steering_type",
     "weight",
+    "effect",
 ];
 /// Keys allowed under `targets:` (the wildcard facets of [`crate::Targets`]).
 const TARGET_KEYS: [&str; 3] = ["language", "layer", "framework"];
@@ -279,6 +312,7 @@ struct FrontMatter {
     confidence: Option<f64>,
     steering_type: Option<String>,
     weight: Option<f64>,
+    effect: Option<Effect>,
     targets_language: Option<String>,
     targets_layer: Option<String>,
     targets_framework: Option<String>,
@@ -323,6 +357,9 @@ fn parse_doc(text: &str, ref_path: &str, sha: &str) -> anyhow::Result<serde_json
     }
     if let Some(v) = fm.weight {
         doc_meta.insert("weight".into(), v.into());
+    }
+    if let Some(v) = fm.effect {
+        doc_meta.insert("effect".into(), serde_json::to_value(v)?);
     }
     if let Some(v) = &fm.supersedes {
         doc_meta.insert("supersedes".into(), v.clone().into());
@@ -432,6 +469,15 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
                 fm.weight = Some(w);
                 i += 1;
             }
+            "effect" => {
+                let v = parse_scalar(rest, line_no, key)?;
+                fm.effect = Some(parse_effect(&v).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "frontmatter line {line_no}: `effect` {v:?} is not one of {EFFECTS:?}"
+                    )
+                })?);
+                i += 1;
+            }
             "applies_to" | "supersedes" | "excludes" => {
                 let (list, consumed) = parse_list(lines, i, close, rest, key)?;
                 match key {
@@ -524,6 +570,19 @@ fn parse_frontmatter(lines: &[&str]) -> anyhow::Result<(FrontMatter, usize)> {
         }
     }
     Ok((fm, close + 1))
+}
+
+/// The `effect` vocabulary → the merged Policy model's [`Effect`] (module docs): `deny` blocks,
+/// `warn` is recorded on the decision without blocking (`AllowWithConditions` carrying no
+/// obligations), `allow` permits. `None` for anything outside [`EFFECTS`] — the caller fails loud
+/// with its own location (frontmatter line vs. directive line).
+fn parse_effect(value: &str) -> Option<Effect> {
+    match value {
+        "deny" => Some(Effect::Deny),
+        "warn" => Some(Effect::AllowWithConditions),
+        "allow" => Some(Effect::Allow),
+        _ => None,
+    }
 }
 
 /// A scalar value: bare (trimmed) or wrapped in one pair of matching quotes. Never empty.
@@ -654,12 +713,23 @@ fn parse_rules_section(
 
     let mut rules: Vec<serde_json::Value> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
-    // (id, severity, statement, symbol_ref) of the item currently being assembled (continuations
-    // may extend the statement; a `symbol_ref:` continuation DIRECTIVE sets the fourth field).
-    type CurrentItem = (String, String, String, Option<String>);
-    let mut current: Option<CurrentItem> = None;
-    let flush = |current: &mut Option<CurrentItem>, rules: &mut Vec<serde_json::Value>| {
-        if let Some((id, severity, statement, symbol_ref)) = current.take() {
+    /// The rule item currently being assembled: continuations extend `statement`; the
+    /// `symbol_ref:` / `effect:` / `trigger:` continuation DIRECTIVES set the other fields.
+    struct Item {
+        id: String,
+        severity: String,
+        statement: String,
+        symbol_ref: Option<String>,
+        effect: Option<Effect>,
+        trigger: Option<String>,
+    }
+    let mut current: Option<Item> = None;
+    let flush =
+        |current: &mut Option<Item>, rules: &mut Vec<serde_json::Value>| -> anyhow::Result<()> {
+            let Some(item) = current.take() else {
+                return Ok(());
+            };
+            let id = item.id;
             // Reserved namespace: the prefix IS the type (module docs / INV-C1). Custom families
             // spell no type — infer from the doc's `enforcement_class` frontmatter (documented
             // rule): `policy` ⇒ policy (deterministically-enforced doctrine), anything else ⇒
@@ -674,8 +744,8 @@ fn parse_rules_section(
             let mut rule = serde_json::json!({
                 "id": id,
                 "rule_type": rule_type,
-                "statement": statement,
-                "severity": severity,
+                "statement": item.statement,
+                "severity": item.severity,
                 "confidence": confidence,
                 // `<path>@<blob sha>#<id>` — the AW-10 digest-bearing ref (crate::provenance).
                 "provenance": {
@@ -686,7 +756,7 @@ fn parse_rules_section(
             if !targets.is_empty() {
                 rule["targets"] = serde_json::Value::Object(targets.clone());
             }
-            if let Some(sref) = symbol_ref {
+            if let Some(sref) = item.symbol_ref {
                 rule["symbol_ref"] = serde_json::Value::String(sref);
             }
             if retired {
@@ -707,9 +777,34 @@ fn parse_rules_section(
             if let Some(w) = fm.weight {
                 rule["weight"] = serde_json::json!(w);
             }
+            // The enforcement half (core#395): a per-rule `effect:` directive overrides the doc-level
+            // key; absent both ⇒ recall-only, the pre-#395 shape byte-for-byte. INV-S3 is surfaced
+            // HERE with the doc and rule id (register would refuse it later, context-free): an
+            // effect-bearing rule selected for no phase enforces nothing — the silent fail-open.
+            let effect = item.effect.or(fm.effect);
+            if let Some(effect) = effect {
+                if fm.applies_to.as_ref().is_none_or(Vec::is_empty) {
+                    anyhow::bail!(
+                    "rule {id} carries `effect` but the doc has no non-empty `applies_to` — it \
+                     would be selected for no phase and enforce nothing (INV-S3; refusing the \
+                     silent fail-open)"
+                );
+                }
+                rule["effect"] = serde_json::to_value(effect)?;
+            }
+            if let Some(pattern) = item.trigger {
+                if effect.is_none() {
+                    anyhow::bail!(
+                        "rule {id} carries a `trigger:` directive but no effect — a trigger only \
+                     matters to the gate, so this rule would never fire (refusing to silently \
+                     register a no-op: add `effect:` or drop the trigger)"
+                    );
+                }
+                rule["trigger"] = serde_json::json!({ "contains": pattern });
+            }
             rules.push(rule);
-        }
-    };
+            Ok(())
+        };
 
     for (ix, l) in lines.iter().enumerate().skip(start + 1) {
         let line_no = ix + 1;
@@ -722,7 +817,7 @@ fn parse_rules_section(
             continue;
         }
         if let Some(caps) = item_re.captures(l) {
-            flush(&mut current, &mut rules);
+            flush(&mut current, &mut rules)?;
             let id = caps[1].to_string();
             // INV-C1 surfaced at parse (with the line): an id in the reserved `PAT-`/`POL-`
             // namespace must match the strict wire shape — a near-miss (`PAT-1`,
@@ -740,23 +835,31 @@ fn parse_rules_section(
             if !seen_ids.insert(id.clone()) {
                 anyhow::bail!("line {line_no}: duplicate rule id {id:?} within this doc (INV-C3)");
             }
-            current = Some((id, caps[2].to_string(), caps[3].trim().to_string(), None));
+            current = Some(Item {
+                id,
+                severity: caps[2].to_string(),
+                statement: caps[3].trim().to_string(),
+                symbol_ref: None,
+                effect: None,
+                trigger: None,
+            });
         } else if let (true, Some(cur)) = (l.starts_with("  "), current.as_mut()) {
-            // Continuation line. `symbol_ref: <ref>` is a DIRECTIVE (sets the rule's durable
-            // rule→code key, validated as a QUALIFIED ref — module docs); anything else joins
-            // the open statement with a space. An indented line with NO open item falls through
-            // to the fail-loud arm below.
+            // Continuation line. `symbol_ref: <ref>` / `effect: <effect>` / `trigger: <regex>` are
+            // DIRECTIVES (module docs) — each validated NOW, with the doc line, and each at most
+            // once per rule (a second one would silently overwrite); anything else joins the open
+            // statement with a space. An indented line with NO open item falls through to the
+            // fail-loud arm below.
             if let Some(raw_ref) = t.strip_prefix("symbol_ref:") {
                 let raw_ref = raw_ref.trim();
                 if raw_ref.is_empty() {
                     anyhow::bail!("line {line_no}: `symbol_ref:` directive with no value");
                 }
-                if cur.3.is_some() {
+                if cur.symbol_ref.is_some() {
                     anyhow::bail!(
                         "line {line_no}: rule {} carries a second `symbol_ref:` directive — a \
                          rule has at most one durable rule→code key (refusing to silently \
                          overwrite)",
-                        cur.0
+                        cur.id
                     );
                 }
                 // Shape-validate NOW (fail loud with the doc line) — an unqualified ref would
@@ -764,12 +867,47 @@ fn parse_rules_section(
                 if let Err(reason) = crate::relink::parse_symbol_ref(raw_ref) {
                     anyhow::bail!("line {line_no}: invalid `symbol_ref:` — {reason}");
                 }
-                cur.3 = Some(raw_ref.to_string());
-            } else {
-                if !cur.2.is_empty() {
-                    cur.2.push(' ');
+                cur.symbol_ref = Some(raw_ref.to_string());
+            } else if let Some(raw_effect) = t.strip_prefix("effect:") {
+                let raw_effect = raw_effect.trim();
+                if cur.effect.is_some() {
+                    anyhow::bail!(
+                        "line {line_no}: rule {} carries a second `effect:` directive (refusing \
+                         to silently overwrite)",
+                        cur.id
+                    );
                 }
-                cur.2.push_str(t);
+                cur.effect = Some(parse_effect(raw_effect).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "line {line_no}: `effect:` {raw_effect:?} is not one of {EFFECTS:?}"
+                    )
+                })?);
+            } else if let Some(raw_trigger) = t.strip_prefix("trigger:") {
+                let raw_trigger = raw_trigger.trim();
+                if raw_trigger.is_empty() {
+                    anyhow::bail!("line {line_no}: `trigger:` directive with no value");
+                }
+                if cur.trigger.is_some() {
+                    anyhow::bail!(
+                        "line {line_no}: rule {} carries a second `trigger:` directive (refusing \
+                         to silently overwrite)",
+                        cur.id
+                    );
+                }
+                // INV-S3 surfaced at parse: a malformed regex fails CLOSED in the engine (never
+                // fires) — a silent dead effect, so refuse it here with the doc line.
+                if let Err(e) = regex::Regex::new(raw_trigger) {
+                    anyhow::bail!(
+                        "line {line_no}: `trigger:` {raw_trigger:?} is not a valid regex — it \
+                         would never fire (INV-S3): {e}"
+                    );
+                }
+                cur.trigger = Some(raw_trigger.to_string());
+            } else {
+                if !cur.statement.is_empty() {
+                    cur.statement.push(' ');
+                }
+                cur.statement.push_str(t);
             }
         } else {
             anyhow::bail!(
@@ -780,7 +918,7 @@ fn parse_rules_section(
             );
         }
     }
-    flush(&mut current, &mut rules);
+    flush(&mut current, &mut rules)?;
 
     // A rule with an EMPTY statement (even after continuations) is malformed — normalize_bundle
     // would accept the field as present; the convention says a rule states something.
@@ -1119,7 +1257,10 @@ mod tests {
             assert_eq!(r.applies_to, vec!["build", "review"]);
             assert_eq!(r.excludes, vec!["clarify"]);
             assert!((r.weight - 2.5).abs() < 1e-6);
-            assert!(r.effect.is_none(), "doc rules stay recall-only");
+            assert!(
+                r.effect.is_none() && r.trigger.is_none(),
+                "no `effect` key ⇒ recall-only — the DEFAULT is unchanged by core#395"
+            );
         }
 
         // A doc WITHOUT the keys mints defaulted rules (the pre-steering shape).
@@ -1158,6 +1299,202 @@ mod tests {
                 err.contains("bad-weight.md") && err.contains("weight"),
                 "{bad:?}: {err}"
             );
+        }
+    }
+
+    /// core#395: a doc-level `effect: deny` makes every minted rule DECIDE-lane — `policy_view`
+    /// yields a Policy, `select_any` picks it up at an `applies_to` phase, and it round-trips
+    /// through register → store → re-register (a re-ingest is a non-event that keeps the effect).
+    #[test]
+    fn effect_frontmatter_key_makes_doc_rules_decide_lane_and_round_trips() {
+        crate::events::hermetic_test_spool();
+        use wicked_apps_core::SqliteStore;
+        let doc = "---\n\
+            id: git-hygiene\n\
+            title: Git hygiene gates\n\
+            steering_type: development\n\
+            applies_to: [build]\n\
+            effect: deny\n\
+            ---\n\n\
+            ## Rules\n\n\
+            - POL-060 (critical): Never force-push a shared branch.\n  \
+              trigger: push\\s+--force\n\
+            - POL-061 (error): Never delete a remote branch you do not own.\n";
+        let dir = dir_with(&[("git-hygiene.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules.len(), 2);
+        for r in &rules {
+            assert_eq!(
+                r.effect,
+                Some(Effect::Deny),
+                "the doc-level key rides onto every rule"
+            );
+            assert!(
+                crate::steering::policy_view(r).is_some(),
+                "an effect-bearing doc rule IS decide-lane"
+            );
+        }
+        assert_eq!(
+            rules[0]
+                .trigger
+                .as_ref()
+                .and_then(|t| t.contains.as_deref()),
+            Some("push\\s+--force"),
+            "the `trigger:` directive lands as trigger.contains"
+        );
+        assert!(
+            rules[1].trigger.is_none(),
+            "no directive ⇒ no trigger (fires whenever phase-selected, the merged model)"
+        );
+        assert_eq!(
+            rules[0].statement, "Never force-push a shared branch.",
+            "directives never leak into the statement"
+        );
+
+        // Round-trip: register, select at the applies_to phase, re-register (re-ingest).
+        let mut store = SqliteStore::in_memory().unwrap();
+        for r in &rules {
+            crate::register_rule(&mut store, r).unwrap();
+        }
+        let ctx = serde_json::json!({});
+        let selected = crate::engine::select_any(&store, "s", &["build"], &ctx).unwrap();
+        assert_eq!(
+            selected.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["POL-060", "POL-061"],
+            "SELECT sees both doc rules as policies at the applies_to phase"
+        );
+        assert_eq!(selected[0].effect, Effect::Deny);
+        assert_eq!(
+            selected[0].trigger.contains.as_deref(),
+            Some("push\\s+--force")
+        );
+        assert!(
+            crate::engine::select_any(&store, "s", &["review"], &ctx)
+                .unwrap()
+                .is_empty(),
+            "not selected outside applies_to"
+        );
+        // Recall (the doctrine funnel) must NOT attach them again — they are gate rules now.
+        assert!(crate::recall_rules(&store, &crate::RuleQuery::default())
+            .unwrap()
+            .is_empty());
+
+        let reingested = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        for r in &reingested {
+            crate::register_rule(&mut store, r).unwrap();
+        }
+        let listed = crate::list_rules(&store, &crate::RuleQuery::default(), true).unwrap();
+        assert_eq!(listed.len(), 2, "re-ingest is id-keyed, not an append");
+        assert!(
+            listed.iter().all(|r| r.effect == Some(Effect::Deny)),
+            "the effect survives the store round-trip and the re-ingest"
+        );
+    }
+
+    /// The vocabulary is `deny|warn|allow` (the operator spelling of the merged Policy effects);
+    /// a per-rule `effect:` directive overrides the doc-level key, and a doc WITHOUT the key can
+    /// still make ONE rule a gate while the rest stay doctrine.
+    #[test]
+    fn effect_vocabulary_maps_to_policy_effects_and_per_rule_directive_overrides_doc_key() {
+        let doc = "---\n\
+            id: mixed\n\
+            title: Mixed doctrine and gates\n\
+            applies_to: [build]\n\
+            effect: warn\n\
+            ---\n\n\
+            ## Rules\n\n\
+            - PAT-070 (warn): doc-level warn rides here.\n\
+            - PAT-071 (error): this one blocks.\n  \
+              effect: deny\n  \
+              trigger: rm\\s+-rf\n\
+            - PAT-072 (info): this one permits explicitly.\n  \
+              effect: allow\n";
+        let dir = dir_with(&[("mixed.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert_eq!(rules[0].effect, Some(Effect::AllowWithConditions), "warn");
+        assert_eq!(
+            rules[1].effect,
+            Some(Effect::Deny),
+            "per-rule deny overrides doc warn"
+        );
+        assert_eq!(rules[2].effect, Some(Effect::Allow), "allow");
+        assert_eq!(
+            rules[1].trigger.as_ref().unwrap().contains.as_deref(),
+            Some("rm\\s+-rf")
+        );
+
+        // No doc-level key: only the directive-bearing rule becomes a gate.
+        let doc = "---\nid: one-gate\ntitle: One gate\napplies_to: [build]\n---\n\n## Rules\n\n\
+            - PAT-073 (info): doctrine.\n\
+            - POL-074 (critical): the gate.\n  effect: deny\n";
+        let dir = dir_with(&[("one-gate.md", doc)]);
+        let rules = ingest_from(&MarkdownAdapter::new(&dir)).unwrap();
+        assert!(
+            rules[0].effect.is_none(),
+            "untouched rules stay recall-only"
+        );
+        assert_eq!(rules[1].effect, Some(Effect::Deny));
+    }
+
+    /// Fail-loud arms of the enforcement directives: unknown vocabulary (key and directive),
+    /// an effect with no `applies_to` (INV-S3 with the doc + rule), a malformed trigger regex, a
+    /// trigger on a rule with no effect (a silent no-op), and duplicate directives.
+    #[test]
+    fn effect_and_trigger_malformations_fail_loud_with_path_and_line() {
+        let cases: [(&str, &str, &[&str]); 7] = [
+            (
+                "bad-effect-key.md",
+                "---\nid: x\ntitle: y\napplies_to: [build]\neffect: block\n---\n",
+                &["frontmatter line 5", "block", "deny"],
+            ),
+            (
+                "bad-effect-directive.md",
+                "---\nid: x\ntitle: y\napplies_to: [build]\n---\n\n## Rules\n\n\
+                 - PAT-080 (error): s.\n  effect: block\n",
+                &["line 10", "block", "deny"],
+            ),
+            (
+                "no-applies-to.md",
+                "---\nid: x\ntitle: y\neffect: deny\n---\n\n## Rules\n\n- PAT-081 (error): s.\n",
+                &["PAT-081", "applies_to", "INV-S3"],
+            ),
+            (
+                "bad-regex.md",
+                "---\nid: x\ntitle: y\napplies_to: [build]\neffect: deny\n---\n\n## Rules\n\n\
+                 - PAT-082 (error): s.\n  trigger: (unclosed\n",
+                &["line 11", "trigger", "INV-S3"],
+            ),
+            (
+                "trigger-no-effect.md",
+                "---\nid: x\ntitle: y\napplies_to: [build]\n---\n\n## Rules\n\n\
+                 - PAT-083 (error): s.\n  trigger: push\n",
+                &["PAT-083", "trigger", "no effect"],
+            ),
+            (
+                "double-effect.md",
+                "---\nid: x\ntitle: y\napplies_to: [build]\n---\n\n## Rules\n\n\
+                 - PAT-084 (error): s.\n  effect: deny\n  effect: allow\n",
+                &["line 11", "second `effect:`"],
+            ),
+            (
+                "double-trigger.md",
+                "---\nid: x\ntitle: y\napplies_to: [build]\neffect: deny\n---\n\n## Rules\n\n\
+                 - PAT-085 (error): s.\n  trigger: a\n  trigger: b\n",
+                &["line 12", "second `trigger:`"],
+            ),
+        ];
+        for (name, doc, needles) in cases {
+            let dir = dir_with(&[(name, doc)]);
+            let err = ingest_from(&MarkdownAdapter::new(&dir))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(name), "{name}: names the file: {err}");
+            for needle in needles {
+                assert!(
+                    err.contains(needle),
+                    "{name}: expected {needle:?} in: {err}"
+                );
+            }
         }
     }
 

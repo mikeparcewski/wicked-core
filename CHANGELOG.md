@@ -15,6 +15,21 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
+  The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
+  `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`
+  and `trigger: <regex>` continuation directives, so an operator can author a rule the gate
+  actually fires — until now no operator-facing path yielded an effect, every doc rule landed
+  recall-only, and evals (which credit only `deny` firings) measured exactly the corpus's
+  good/bad split. Absent the key nothing changes (every existing doc stays recall-only);
+  INV-S3 is surfaced at parse with the doc + rule (`effect` without `applies_to`, malformed
+  trigger regex, `trigger:` on an effect-less rule). `EvalReport` gains `rule_coverage`
+  `{ exercised, unexercised: [{rule_id, steering_type}], recall_only, per_type }` — the
+  decide-lane rules eligible for the run (narrowed by `--type`) that some sample fired vs.
+  none did (the second blind spot: a rule no sample exercises produced no row and was
+  invisible to `summary.gaps`), plus the count of effect-less rules the eval structurally
+  cannot measure. `rules eval` prints the block and warns when nothing is decide-lane. Public
+  wire shape change (additive) — crew/studio consume it via the next core-ts release.
 - **core-ts 0.7.16** — run-provenance env: wicked-core stamps `WICKED_RUN_ID`, `WICKED_RUN_UNIT`, and `WICKED_RUN_AGENT` into the worker's estate-mcp launch env (both carriers) so proposal.submit (DES-MEM-FACETED-001) attributes proposals to the run/unit/agent.
 - **core-ts 0.7.15** — npm release carrying DES-GROUNDING-001 + gov-008 Boundary 1: governed workers
   now ground in the wicked-estate index — the estate MCP is loaded via `--mcp-config` (not the inert

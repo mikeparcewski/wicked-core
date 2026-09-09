@@ -2485,6 +2485,26 @@ fn rules_eval_cmd(args: &[String]) {
     if s.total == 0 {
         println!("  no samples matched — check --type / --corpus");
     }
+    // Rule coverage (core#394): the rules the verdict rows cannot show. `recall_only` is the
+    // core#395 truth — rules without an effect never reach the gate, so the eval cannot measure
+    // them; when nothing is decide-lane the verdicts above are the corpus split, not enforcement.
+    let c = &report.rule_coverage;
+    println!(
+        "  rule coverage: {} exercised, {} unexercised, {} recall-only (no effect — the gate never \
+         fires them)",
+        c.exercised,
+        c.unexercised.len(),
+        c.recall_only
+    );
+    if c.exercised == 0 && c.unexercised.is_empty() {
+        println!(
+            "    no decide-lane rules in scope — the verdicts above measure the corpus split, not \
+             steering; author `effect: deny` (STEERING.md § Import) to make a rule measurable"
+        );
+    }
+    for u in &c.unexercised {
+        println!("    UNEXERCISED  {} ({})", u.rule_id, u.steering_type);
+    }
 }
 
 fn rules_retire_cmd(args: &[String]) {

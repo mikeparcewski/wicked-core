@@ -1588,7 +1588,12 @@ impl Core {
     /// passes it through verbatim as the pinned wire contract):
     /// `{ results: [{ sample: { id, description, kind, steering_type }, expected: "deny"|"allow",
     /// fired: [rule-id…], verdict: "caught"|"gap"|"false_positive", nearest_rules? }],
-    /// summary: { total, caught, gaps, false_positives }, degraded: "facet-only"|null }`.
+    /// summary: { total, caught, gaps, false_positives }, degraded: "facet-only"|null,
+    /// rule_coverage: { exercised, unexercised: [{ rule_id, steering_type }], recall_only,
+    /// per_type: { <steering-type>: { exercised, unexercised } } } }` — `rule_coverage` (core#394)
+    /// partitions the decide-lane rules eligible for the run (narrowed to `type` when given) by
+    /// whether any sample fired them; `recall_only` counts the effect-less rules the gate never
+    /// fires (core#395 — zero decide-lane rules means the verdicts are the corpus split).
     ///
     /// Fail-closed: malformed args, an unknown steering type, a corpus name outside the
     /// `evals:` scope, or a missing store reject the Promise with the engine's reason — crew maps
@@ -3042,7 +3047,8 @@ mod tests {
     /// - import: `{ imported, scope: "evals:<name>", embedded }`, with `embedded` verified true
     ///   (the default hash embedder stores vectors on write);
     /// - eval: `{ results: [{ sample{id,description,kind,steering_type}, expected, fired,
-    ///   verdict }], summary{total,caught,gaps,false_positives}, degraded }`, run against the
+    ///   verdict }], summary{total,caught,gaps,false_positives}, degraded,
+    ///   rule_coverage{exercised,unexercised,recall_only,per_type} }`, run against the
     ///   imported `evals:` scope with a real deny policy firing through the gate path;
     /// - fail-closed: an unknown steering type and a non-`evals:` corpus name both reject with
     ///   the engine's reason (crew's 400 lane), never an empty report.
@@ -3157,6 +3163,21 @@ mod tests {
         assert_eq!(good["expected"], "allow");
         assert_eq!(good["verdict"], "caught");
         assert_eq!(good["fired"], serde_json::json!([]));
+        // Rule coverage (core#394) rides the same report, snake_case: the one decide-lane rule
+        // fired for a sample, nothing is unexercised, nothing is recall-only.
+        let coverage = &report["rule_coverage"];
+        assert_eq!(coverage["exercised"], 1);
+        assert_eq!(coverage["unexercised"], serde_json::json!([]));
+        assert_eq!(coverage["recall_only"], 0);
+        assert_eq!(
+            coverage["per_type"]["development"],
+            serde_json::json!({ "exercised": 1, "unexercised": 0 })
+        );
+        assert_eq!(
+            coverage["per_type"].as_object().map(|m| m.len()),
+            Some(7),
+            "the per-type rollup always carries all seven steering types"
+        );
 
         // Fail-closed (crew's 400 lane): unknown steering type / non-`evals:` corpus reject.
         let bad_type = wicked_core::governance_evals(

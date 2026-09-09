@@ -33,9 +33,48 @@ One eval run = one corpus × one rule store:
 3. **Verdict each sample** by comparing what fired against what the sample's `kind`
    expects (`bad` ⇒ `deny`, `good` ⇒ `allow`), and hint every gap with the semantically
    nearest rules.
+4. **Report rule coverage** — which of the rules that *can* fire were actually exercised by
+   some sample, which were not, and how many rules cannot fire at all (§ Rule coverage).
 
 The output is one report (§ The wire contract) — the same JSON whether you ran it from the
 CLI, through crew, or from studio's Testing pages. One shape, three surfaces.
+
+## What an eval measures — and what it cannot
+
+Only a rule that carries an **`effect`** enters the gate: `select` → `decide` fire
+effect-bearing rules; a rule without one is **recall-only** doctrine — it informs an agent, it
+never decides. Verdicts key on *blocking* firings (`effect: deny`), so:
+
+- **Zero effect-bearing rules in the store ⇒ the eval measures nothing about your steering.**
+  Every `bad` sample is a gap and every `good` sample is "caught" by definition — the numbers
+  are the corpus's good/bad split, not coverage. The report says so: `rule_coverage.recall_only`
+  is your whole store and `exercised + unexercised` is `0`; the CLI prints the same warning.
+- A `warn`/`allow_with_conditions` rule that fires is *exercised* (§ Rule coverage) but never
+  *catches* — catching means blocking.
+
+Making a rule measurable is one frontmatter line. In the markdown doc that mints it
+([STEERING.md § Import](./STEERING.md#1-import-bulk--the-doc-format)):
+
+```markdown
+---
+id: git-hygiene
+title: Git hygiene gates
+steering_type: development
+applies_to: [build]            # required with an effect — the phases the gate selects it for
+effect: deny                   # deny|warn|allow — every rule in this doc, unless overridden
+---
+## Rules
+
+- `POL-060` (critical): Never force-push a shared branch.
+  trigger: push\s+--force      # the regex the gate tests over the evaluated context
+- `PAT-061` (warn): Prefer small PRs.
+  effect: warn                 # per-rule override — recorded on the decision, never blocks
+```
+
+Without `effect` nothing changes: every existing doc stays recall-only. Without a `trigger:`
+an effect-bearing rule fires whenever it is phase-selected — a doc-level `effect: deny` with
+no triggers denies everything in `applies_to`, and the eval will show that as false positives
+on every `good` sample. That is the eval doing its job.
 
 ## Verdicts — caught / gap / false_positive
 
@@ -53,6 +92,36 @@ The partition is total: `summary.total = caught + gaps + false_positives`. A hig
 on day one is the expected shape of a young corpus, not an alarm — it is the to-do list.
 The number to treat as urgent is `false_positives`: every one is a rule that would block a
 legitimate run today.
+
+## Rule coverage — the blind spot verdicts cannot show
+
+Verdicts are per **sample**. A rule that no sample fires produces no row at all, so a store
+can look healthy while merely being untested — `summary.gaps` cannot go up for a behavior
+nobody wrote a sample for. `rule_coverage` is the inverse view, per **rule**:
+
+| Field | Meaning |
+|---|---|
+| `exercised` | decide-lane rules some sample in the run **fired** — whatever the verdict (a false positive still tests the rule) and whatever the effect (a fired `warn` counts) |
+| `unexercised` | decide-lane rules **no** sample fired — `[{ rule_id, steering_type }]`, sorted by id |
+| `recall_only` | active rules with **no effect** — the gate never fires them, so they are outside the partition (§ What an eval measures) |
+| `per_type` | the `exercised`/`unexercised` counts per steering type — all seven keys, always |
+
+`exercised + unexercised.length` is the set of rules the run was *eligible* to fire: every
+active effect-bearing rule in the store, narrowed to one steering type when you pass
+`type`/`--type` (the slice asks about one type, so a rule of another type that did not fire
+for that slice's samples is not a finding about it). Phase is deliberately **not** a filter:
+a `review`-phase rule in a corpus with no `review` samples is unexercised — that *is* the
+finding.
+
+Two different failures produce a healthy-looking report, and coverage is what tells them apart:
+
+| Symptom | Reading | Fix |
+|---|---|---|
+| a `bad` sample is a `gap` | **the store lacks the rule** (or the rule cannot fire — check `recall_only`) — the corpus describes a behavior no effect-bearing rule matches | author or tighten a rule (`nearest_rules` says which); give it an `effect` |
+| a rule is `unexercised` | **the corpus lacks the behavior** — nothing you replay trips this rule, so you do not know whether it works (or its `trigger`/`applies_to` misses the behavior it was written for) | write a `bad` sample that should trip it (and a `good` twin), or fix the trigger |
+
+Neither number is complete without the other: gaps enumerate untested *behaviors*,
+`unexercised` enumerates untested *rules*.
 
 ## The sample format
 
@@ -111,8 +180,10 @@ wicked-core rules eval --db <store>
 
 Its job is the floor — the day-one answer to "does my steering catch anything at all?".
 Expect gaps: they enumerate what the shipped
-[seed corpus](./seed/README.md) deliberately does not legislate. Your own corpus
-(§ above) is where eval value compounds.
+[seed corpus](./seed/README.md) deliberately does not legislate — and note that the seed
+docs carry no `effect`, so against an unmodified seed store *every* `bad` sample is a gap
+and `rule_coverage.exercised` is `0` (§ What an eval measures). Your own corpus (§ above)
+and your own effect-bearing rules are where eval value compounds.
 
 ## Where corpora live
 
@@ -229,15 +300,32 @@ The report (serde passthrough, snake_case):
     }
   ],
   "summary": { "total": 2, "caught": 1, "gaps": 1, "false_positives": 0 },
-  "degraded": null
+  "degraded": null,
+  "rule_coverage": {
+    "exercised": 1,
+    "unexercised": [{ "rule_id": "POL-4002", "steering_type": "security" }],
+    "recall_only": 47,
+    "per_type": {
+      "architecture": { "exercised": 0, "unexercised": 0 },
+      "development":  { "exercised": 0, "unexercised": 0 },
+      "security":     { "exercised": 1, "unexercised": 1 },
+      "testing":      { "exercised": 0, "unexercised": 0 },
+      "operations":   { "exercised": 0, "unexercised": 0 },
+      "compliance":   { "exercised": 0, "unexercised": 0 },
+      "design-ux":    { "exercised": 0, "unexercised": 0 }
+    }
+  }
 }
 ```
 
 - `expected` is `"deny"` or `"allow"` (derived from `kind`); `verdict` is
   `"caught"`/`"gap"`/`"false_positive"` (§ Verdicts); `fired` lists the rule ids that
-  fired.
+  fired with a blocking effect.
 - `nearest_rules` is present on gaps (empty array allowed).
 - `degraded` is `"facet-only"` or `null` (§ the honest degrade).
+- `rule_coverage` is always present (§ Rule coverage): `exercised`/`unexercised` partition
+  the decide-lane rules eligible for the run (narrowed by `type`), `recall_only` counts the
+  rules the gate never fires, `per_type` carries all seven steering types.
 
 ### `POST /api/v1/testing/corpora/import`
 
@@ -276,8 +364,10 @@ what crew returns and computes no verdicts of its own:
 - **Run** — pick a steering type (or all) and a corpus (built-in, or any imported
   `evals:` scope), run, read the report: summary tiles (total / caught / gaps /
   false positives), per-sample rows with the fired rule ids, gap rows carrying their
-  nearest-rule hints, and a visible banner when the report says `"degraded":
-  "facet-only"`.
+  nearest-rule hints, a visible banner when the report says `"degraded":
+  "facet-only"`, and the rule-coverage block (exercised / unexercised / recall-only) —
+  when no rule can fire, the surface must say the eval cannot measure enforcement rather
+  than present the corpus split as coverage.
 - **Corpora** — import a corpus: name + samples JSON (the Sample shape above); the receipt
   shows the count, the `evals:<name>` scope, and whether embedding happened.
 
