@@ -3501,12 +3501,17 @@ mod boundary_tests {
     fn the_launcher_arms_the_launch_declared_read_roots() {
         // The wrapped carrier: extras enter WICKED_READ_ROOTS through `assemble_read_roots` —
         // never through `armed_write_roots`, whose exact argument list the test above pins.
-        let launcher = include_str!("execute_wrapped.rs");
+        // Whitespace-collapsed so the audit pins the CALL, not rustfmt's line breaks. The third
+        // argument is the skills snapshot (core#396): the same one assembly read-widens to it.
+        let launcher: String = include_str!("execute_wrapped.rs")
+            .split_whitespace()
+            .collect();
         assert!(
-            launcher
-                .contains("assemble_read_roots(g.code_graph_db.as_deref(), &g.extra_read_roots)"),
-            "the wrapped launcher no longer joins the launch-declared extra_read_roots into \
-             WICKED_READ_ROOTS (core#294)"
+            launcher.contains(
+                "assemble_read_roots(g.code_graph_db.as_deref(),&g.extra_read_roots,g.skills_root.as_deref(),)"
+            ),
+            "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
+             skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"
         );
         // The ACP carrier builds its BoundaryCtx from the same assembly (core#260's one-assembly
         // rule): dropping the extras there would make the read grant depend on which seat the run

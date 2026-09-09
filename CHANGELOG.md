@@ -15,6 +15,21 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Skills snapshot on both worker paths (#396)** — the engine consumes exactly one skills input,
+  `WICKED_SKILLS_SNAPSHOT` (the concrete path of a crew-published, immutable garden-shaped plugin
+  root), and hands it to each worker through the mechanism its CLI has, copying nothing: Claude over
+  ACP gets it in `session/new` as `_meta.claudeCode.options.plugins = [{type:"local", path}]`
+  (merged into the existing options); wrapped Claude gets exactly one `--plugin-dir <snapshot>`,
+  with any `--plugin-dir` a `clis.toml` template carried stripped and logged as superseded. The
+  snapshot joins the READ roots on both governance carriers (never a write root). The skill
+  directive is CLI-aware (`wicked-garden:<dir>` + the Skill-tool clause for Claude; the mirrored
+  frontmatter name, no Skill-tool clause, for codex/pi/opencode/copilot). Degradation ladder: env
+  unset → the live installed plugin cache with a `skills.fallback` log (never the hand copy);
+  explicit path invalid → the launch fails as a config error; a run whose `skill_ref`s (plan-wide,
+  via `StepInput.required_skills`) are missing from the snapshot is refused naming them. A
+  `current`-style symlink is pinned to its concrete generation at load. New `CoreEvent::
+  SkillsSnapshotHanded` (`skillsSnapshotHanded`: session/ord/attempt/path/cli/gen/contentHash/root/
+  source) reports the generation each launch used so crew can reap old generations safely.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 
 use crate::command::Command;
 use crate::event::CoreEvent;
-use crate::execute_wrapped::{unit_prompt, WrappedCliStepRunner};
+use crate::execute_wrapped::{unit_prompt, SkillForm, WrappedCliStepRunner};
 use crate::workflow::{
     DeltaSink, PriorUnitOutput, StepInput, StepOutput, StepRunner, StepStatus, Usage,
 };
@@ -1134,7 +1134,7 @@ fn death_context_with(proc: &AcpProcess, status: Option<std::process::ExitStatus
 /// so this variable decides WHOSE configuration a worker runs under. It is the carrier the
 /// bridge honours where argv is not: flags the bridge does not parse are discarded, which is how
 /// FINDING-060 happened.
-const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 
 /// Decide the [`CLAUDE_CONFIG_DIR_ENV`] override for an ACP worker spawn — `None` means inherit
 /// the operator's own configuration (the explicit escape hatch only).
@@ -1376,7 +1376,59 @@ fn start_acp_process(
     // dropping a `tmp/` dir into a user's own working directory would be intrusive.
     scratch_tmp: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
-    start_acp_process_with_write_roots(config, cwd, code_graph_db, scratch_tmp, &[], &[])
+    // No skills snapshot: CHAT sessions (and the tests that use this shape) are not run units —
+    // the snapshot handoff belongs to the unit path, which calls the chokepoint directly.
+    start_acp_process_with_write_roots(config, cwd, code_graph_db, scratch_tmp, &[], &[], None)
+}
+
+/// The `session/new` params: the spec fields every ACP agent reads (`cwd`, `mcpServers`) plus,
+/// when a skills snapshot is in hand, the Claude bridge's `_meta.claudeCode.options` extension
+/// carrying it as a local plugin (core#396) — see [`attach_skills_plugin`]. Pure, so the frame the
+/// bridge receives is pinned by a test rather than inferred from a live handshake.
+fn session_new_params(
+    cwd: &std::path::Path,
+    mcp_servers: Value,
+    skills_plugin: Option<&std::path::Path>,
+) -> Value {
+    let mut params = json!({
+        "cwd": cwd.to_string_lossy().as_ref(),
+        "mcpServers": mcp_servers
+    });
+    if let Some(root) = skills_plugin {
+        attach_skills_plugin(&mut params, root);
+    }
+    params
+}
+
+/// MERGE the skills snapshot into `params._meta.claudeCode.options.plugins` as the Agent SDK's
+/// own `SdkPluginConfig { type: "local", path }`. The bridge spreads that `options` object into
+/// its session options, so it is the one channel it honours for plugins (argv it does not parse
+/// is discarded — FINDING-060 — and the worker home's `plugins/` is re-sanitized on every spawn).
+///
+/// Merge, never replace: every object on the way down is created only where absent, sibling keys
+/// (`settingSources`, a future permission option) are kept, and an existing `plugins` list gains
+/// our entry rather than losing its own. A non-object where an object is needed is a shape this
+/// engine never produced; it is replaced so the plugin lands rather than being silently dropped.
+fn attach_skills_plugin(params: &mut Value, root: &std::path::Path) {
+    let mut node = params;
+    for key in ["_meta", "claudeCode", "options"] {
+        if !node.is_object() {
+            *node = json!({});
+        }
+        node = node
+            .as_object_mut()
+            .expect("made an object just above")
+            .entry(key)
+            .or_insert_with(|| json!({}));
+    }
+    if !node.is_object() {
+        *node = json!({});
+    }
+    let entry = json!({ "type": "local", "path": root.to_string_lossy().as_ref() });
+    match node.get_mut("plugins").and_then(Value::as_array_mut) {
+        Some(plugins) => plugins.push(entry),
+        None => node["plugins"] = json!([entry]),
+    }
 }
 
 /// The actual ACP spawn chokepoint. `extra_write_roots` comes from the same launch-validated
@@ -1392,24 +1444,30 @@ fn start_acp_process_with_write_roots(
     // (`execute_wrapped::estate_provenance_env`) — stamped onto its `proposal.submit`s. Empty for a
     // repo-less session (no estate server is advertised at all) or an ungoverned/chat caller.
     estate_provenance: &[(String, String)],
+    // core#396: the immutable skills snapshot to hand this session as a LOCAL PLUGIN, or `None`.
+    // Carried in `session/new` under `_meta.claudeCode.options.plugins` — the bridge passes that
+    // object through to the Agent SDK's `Options` (`plugins: [{type: "local", path}]`), the one
+    // channel it honours for plugins (argv it does not parse is discarded, FINDING-060, and the
+    // worker home's `plugins/` is re-sanitized on every spawn). `Some` only for a claude seat: the
+    // `claudeCode` namespace is that bridge's, and this path spawns other agents too.
+    skills_plugin: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
     // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
     // that proceeded without the override would run under the operator's own configuration,
     // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
     // carries its own isolation.
-    let worker_config_dir = match worker_claude_config_dir(
-        std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some(),
-    ) {
-        None => None,
-        Some(Ok(dir)) => Some(dir),
-        Some(Err(e)) => {
-            return Err(anyhow::anyhow!(
-                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+    let worker_config_dir =
+        match worker_claude_config_dir(crate::execute_wrapped::inherits_operator_config()) {
+            None => None,
+            Some(Ok(dir)) => Some(dir),
+            Some(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
                  under the operator's own CLI configuration (FINDING-061)"
-            ))
-        }
-    };
+                ))
+            }
+        };
     // Computed ONCE per spawn — not re-probed per turn — because the session this spawn starts
     // is cached and reused across every turn of its lifetime (`probe_cached_session`); "the same
     // resolved ACP binary that is spawned" means the binary this exact process came from, so the
@@ -1733,17 +1791,10 @@ fn start_acp_process_with_write_roots(
             }])
         })
         .unwrap_or_else(|| json!([]));
+    let session_new = session_new_params(cwd, mcp_servers, skills_plugin);
     let session_new_id = next_id;
     next_id += 1;
-    if let Err(e) = rpc_send(
-        &mut stdin,
-        session_new_id,
-        "session/new",
-        json!({
-            "cwd": cwd.to_string_lossy().as_ref(),
-            "mcpServers": mcp_servers
-        }),
-    ) {
+    if let Err(e) = rpc_send(&mut stdin, session_new_id, "session/new", session_new) {
         handshake_err!(child, e);
     }
     let resp = match rpc_expect(&rx, &mut stdin, session_new_id, session_new_budget()) {
@@ -4013,6 +4064,34 @@ impl AcpStepRunner {
             .unwrap_or("claude")
             .to_string();
 
+        // core#396: admit the launch against the skills snapshot FIRST — before the operator
+        // messages below are consumed (at-most-once) and before any session is opened. The run's
+        // whole skill set must be present or the unit is REFUSED by name; the root it resolves is
+        // what the directive, the `session/new` plugin handshake, and the read carrier all use.
+        let skills = match crate::skills_snapshot::admit_unit(input) {
+            Ok(s) => s,
+            Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
+        };
+        // Handed to real work units; an engine-internal judge/triage session only when it names a
+        // skill (the same rule as the wrapped runner — a plugin's whole catalog in a byte-exact
+        // verdict session costs context for a method it never invokes).
+        let handed = skills.as_ref().filter(|_| {
+            !crate::execute_wrapped::is_engine_internal(&input.unit)
+                || input.unit.skill_ref.is_some()
+        });
+        // The seat's registry record, read ONCE for this turn: its `binary` decides whether this
+        // is a claude seat — the only one the plugin handshake and the Claude directive form apply
+        // to (`binary_is_claude`, the same test the wrapped runner applies to its template) — and
+        // its `[cli.acp]` table decides the transport and admission below. An unregistered key is
+        // its own binary, exactly as `resolve_invocation` treats it.
+        let seat = registry_record(&cli_key);
+        let seat_is_claude = crate::execute_wrapped::binary_is_claude(
+            seat.as_ref()
+                .map_or(cli_key.as_str(), |c| c.binary.as_str()),
+        );
+        let skill_form = SkillForm::for_claude(seat_is_claude);
+        let skills_plugin = handed.filter(|_| seat_is_claude);
+
         // Deliver queued operator messages on this turn (the inject path for ACP runs):
         // appended AFTER the cross-CLI context blocks so they read as the most recent
         // guidance. Consumed here even if the turn later falls back to the wrapped path —
@@ -4097,8 +4176,9 @@ impl AcpStepRunner {
         // a specific launched executable (DES-INPUT-GOV-006 §3.4/§3.5 — `verified_version` pins
         // opencode to one build), a second reload of the disk-backed merged registry could in
         // principle race a concurrent clis.toml edit and diverge from the config that actually
-        // gets spawned a few lines below. Binding both to one resolution closes that.
-        let acp_cfg_probe = acp_config_for(&cli_key);
+        // gets spawned a few lines below. Binding both to one resolution closes that — the same
+        // `seat` record whose binary decided the skill form above.
+        let acp_cfg_probe = seat.and_then(|c| c.acp);
         let acp_admitted = acp_cfg_probe
             .as_ref()
             .is_some_and(|c| c.acp_input_governance);
@@ -4149,11 +4229,13 @@ impl AcpStepRunner {
                             ))
                             .collect(),
                         // READ = the shared assembly: evidence-derived roots + the
-                        // launch-validated `extra_read_roots` (core#294) — read-only, so the
-                        // widening never touches the write list above.
+                        // launch-validated `extra_read_roots` (core#294) + the skills snapshot
+                        // handed to this unit (core#396) — read-only, so the widening never
+                        // touches the write list above.
                         read: crate::execute_wrapped::assemble_read_roots(
                             g.code_graph_db.as_deref(),
                             &g.extra_read_roots,
+                            handed.map(|s| s.root.as_path()),
                         ),
                     },
                     cwd: unit_cwd.clone(),
@@ -4289,6 +4371,7 @@ impl AcpStepRunner {
                     Some(&cwd.join("tmp")),
                     extra_write_roots,
                     &estate_provenance,
+                    skills_plugin.map(|s| s.root.as_path()),
                 ) {
                     Ok(proc) => {
                         let acp_session_id = proc.session_id.clone();
@@ -4332,6 +4415,20 @@ impl AcpStepRunner {
                                 cli_key: cli_key.clone(),
                                 acp_session_id,
                             });
+                            // core#396: the generation this session was handed, once per spawn
+                            // (the session is cached and reused across the run's turns) — the log
+                            // line for the operator and the event crew consults before reaping an
+                            // old generation.
+                            if let Some(s) = skills_plugin {
+                                s.report(&format!("path=acp run={run_id} cli={cli_key}"));
+                                self.emit_event(s.handed_event(
+                                    &run_id,
+                                    input.unit.ord,
+                                    input.attempt,
+                                    "acp",
+                                    &cli_key,
+                                ));
+                            }
                             // A1: this seat requested the kernel WRITE-containment floor but it
                             // could not arm, so the bridge spawned uncontained. Disclose it exactly
                             // once per spawn (the ACP-path convention names the registry seat key as
@@ -4373,7 +4470,7 @@ impl AcpStepRunner {
         };
 
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let prompt = unit_prompt(input);
+        let prompt = unit_prompt(input, skill_form, handed);
 
         // A statically-admitted seat (`gate_ctx.is_some()`) can still fail its per-process
         // version pin (`AcpProcess::governance_verified`, computed once at spawn — DES-INPUT-
@@ -6528,6 +6625,7 @@ sleep 30
             None,
             &[],
             &provenance,
+            None,
         )
         .expect("start");
         let seen = std::fs::read_to_string(&ledger).unwrap();
@@ -6559,6 +6657,168 @@ sleep 30
             pairs.get("WICKED_RUN_AGENT").map(String::as_str),
             Some("codex"),
             "session/new must stamp the assigned CLI: {seen}"
+        );
+        drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#396, the ACP lever, pinned on the pure frame builder: the snapshot rides `session/new`
+    /// as `_meta.claudeCode.options.plugins = [{type: "local", path}]` — the SDK's own plugin shape
+    /// under the extension the bridge spreads into its session options — MERGED into whatever
+    /// options are already there (sibling keys such as `settingSources` and an existing `plugins`
+    /// list survive), never replacing them; the spec fields every agent reads stay put; and with no
+    /// snapshot the frame carries no `_meta` at all. Two generations yield two frames naming their
+    /// own roots.
+    #[test]
+    fn session_new_merges_the_snapshot_into_the_claude_code_options_as_a_local_plugin() {
+        let cwd = std::path::Path::new("/wt");
+        let servers = serde_json::json!([{"name": "wicked-estate"}]);
+
+        let bare = session_new_params(cwd, servers.clone(), None);
+        assert_eq!(bare["cwd"], "/wt");
+        assert_eq!(bare["mcpServers"], servers);
+        assert!(
+            bare.get("_meta").is_none(),
+            "no snapshot ⇒ no extension: {bare}"
+        );
+
+        let gen7 = std::path::Path::new("/snapshots/7");
+        let handed = session_new_params(cwd, servers.clone(), Some(gen7));
+        assert_eq!(
+            handed["cwd"], "/wt",
+            "the spec params are beside the extension, not under it"
+        );
+        assert_eq!(handed["mcpServers"], servers);
+        assert_eq!(
+            handed["_meta"]["claudeCode"]["options"]["plugins"],
+            serde_json::json!([{"type": "local", "path": "/snapshots/7"}]),
+            "{handed}"
+        );
+
+        // A second generation names ITS root — nothing is shared between the two frames.
+        let gen8 = session_new_params(cwd, servers, Some(std::path::Path::new("/snapshots/8")));
+        assert_eq!(
+            gen8["_meta"]["claudeCode"]["options"]["plugins"][0]["path"],
+            "/snapshots/8"
+        );
+        assert_ne!(handed, gen8);
+
+        // MERGE: options that already exist keep every sibling key and their own plugin entries.
+        let mut params = serde_json::json!({
+            "cwd": "/wt",
+            "mcpServers": [],
+            "_meta": {
+                "claudeCode": {
+                    "options": {
+                        "settingSources": ["project", "local"],
+                        "plugins": [{"type": "local", "path": "/some/other/plugin"}]
+                    }
+                },
+                "otherExtension": {"keep": true}
+            }
+        });
+        attach_skills_plugin(&mut params, gen7);
+        let options = &params["_meta"]["claudeCode"]["options"];
+        assert_eq!(
+            options["settingSources"],
+            serde_json::json!(["project", "local"]),
+            "sibling options survive the merge: {params}"
+        );
+        assert_eq!(
+            options["plugins"],
+            serde_json::json!([
+                {"type": "local", "path": "/some/other/plugin"},
+                {"type": "local", "path": "/snapshots/7"}
+            ]),
+            "an existing plugins list gains our entry rather than being replaced: {params}"
+        );
+        assert_eq!(params["_meta"]["otherExtension"]["keep"], true);
+        assert_eq!(params["cwd"], "/wt");
+    }
+
+    /// core#396 end to end through the real spawn: the frame the bridge RECEIVES carries the
+    /// snapshot as the local plugin (positive), the engine-owned worker home holds no `plugins/`
+    /// when the bridge starts — a stale hand copy planted there is sanitized away, so the ONLY
+    /// skills root a Claude ACP worker can load is the one in the handshake (negative exclusion) —
+    /// and the snapshot tree itself is byte-identical afterwards (nothing is copied or written
+    /// into it). The stub echoes the `session/new` frame it received.
+    #[test]
+    #[cfg(unix)]
+    fn session_new_hands_the_snapshot_and_the_worker_home_holds_no_stale_plugins() {
+        use crate::skills_snapshot::test_support::{snapshot_root, tree_fingerprint};
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("skills-handshake");
+        let snapshot = snapshot_root(
+            &dir.join("snapshots").join("12"),
+            "12",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("qe/a11y", "wicked-garden-qe-a11y"),
+            ],
+        );
+        let before = tree_fingerprint(&snapshot);
+        // A prior worker (or the operator's stop-gap) left a hand copy in the worker home.
+        let home = worker_config_home().expect("the hermetic worker home resolves");
+        let stale = home.join("plugins").join("wicked-garden");
+        std::fs::create_dir_all(stale.join("skills/domain")).unwrap();
+        std::fs::write(
+            stale.join("skills/domain/SKILL.md"),
+            "---\nname: stale\n---\n",
+        )
+        .unwrap();
+
+        let ledger = dir.join("session-new.json");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read new
+printf '%s\n' "$new" > "{ledger}"
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"skills"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+        let proc = start_acp_process_with_write_roots(
+            &stub_config(&script, None),
+            &dir,
+            None,
+            None,
+            &[],
+            &[],
+            Some(&snapshot),
+        )
+        .expect("start");
+        let seen = std::fs::read_to_string(&ledger).unwrap();
+        let frame: serde_json::Value = serde_json::from_str(&seen).unwrap();
+        assert_eq!(frame["method"], "session/new");
+        assert_eq!(
+            frame["params"]["_meta"]["claudeCode"]["options"]["plugins"],
+            serde_json::json!([{"type": "local", "path": snapshot.to_string_lossy()}]),
+            "the bridge must receive the snapshot as the one local plugin: {seen}"
+        );
+        assert_eq!(
+            frame["params"]["cwd"],
+            dir.to_string_lossy().as_ref(),
+            "the spec params still ride the same frame: {seen}"
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join("plugins")).is_err(),
+            "the worker home's plugins/ (the stale hand copy) must be sanitized away before the \
+             bridge starts — the handshake is the only skills input"
+        );
+        assert!(
+            !seen.contains(&stale.to_string_lossy().to_string()),
+            "the handshake must not name the stale copy: {seen}"
+        );
+        assert_eq!(
+            tree_fingerprint(&snapshot),
+            before,
+            "the snapshot is immutable: the spawn wrote nothing into it"
         );
         drop(proc);
         let _ = std::fs::remove_dir_all(&dir);
@@ -6598,8 +6858,11 @@ sleep 30
 
     /// The call site must consult the SAME escape-hatch variable as the wrapped path, read from
     /// the real environment — a hardcoded `false` would pass the behavioural test above while
-    /// silently deleting the operator's opt-out. Needle built by concatenation and matched on
-    /// whitespace-stripped source so neither this test nor rustfmt can satisfy or break it.
+    /// silently deleting the operator's opt-out. Since core#396 that read is ONE shared function
+    /// (`execute_wrapped::inherits_operator_config`, also what the skills admission consults), so
+    /// the three cannot disagree; the audit pins the call to it. Needle built by concatenation and
+    /// matched on whitespace-stripped source so neither this test nor rustfmt can satisfy or break
+    /// it.
     #[test]
     fn the_acp_spawn_consults_the_same_inherit_escape_hatch_as_the_wrapped_path() {
         let src: String = include_str!("acp_runner.rs")
@@ -6607,8 +6870,8 @@ sleep 30
             .filter(|c| !c.is_whitespace())
             .collect();
         let needle = format!(
-            "worker_claude_config_dir(std::env::var_os(crate::execute_wrapped::{}).is_some()",
-            "INHERIT_OPERATOR_CONFIG_ENV"
+            "worker_claude_config_dir(crate::execute_wrapped::{}()",
+            "inherits_operator_config"
         );
         assert!(
             src.contains(&needle),
@@ -7159,6 +7422,7 @@ sleep 30
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         }
     }
     #[test]

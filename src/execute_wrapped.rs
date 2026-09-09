@@ -18,6 +18,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::domain::WorkUnit;
+use crate::skills_snapshot::SkillsSnapshot;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
 use wicked_apps_core::HardenedCommand;
 
@@ -223,6 +224,14 @@ pub(crate) fn binary_is_claude(bin: &str) -> bool {
 /// knowing this exists.
 pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPERATOR_CONFIG";
 
+/// Has the operator pulled the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch? Read in ONE place so
+/// the argv isolation, the ACP config-dir override, and the skills-snapshot handoff
+/// (`skills_snapshot::admit_unit`) cannot disagree about it: a worker that inherits the operator's
+/// configuration inherits their plugins too, and must be handed no snapshot.
+pub(crate) fn inherits_operator_config() -> bool {
+    std::env::var_os(INHERIT_OPERATOR_CONFIG_ENV).is_some()
+}
+
 /// Directories a worker has no business reading: the operator's agent-tooling state and their
 /// credentials. Relative to `$HOME` (or `$USERPROFILE` on Windows).
 ///
@@ -295,8 +304,20 @@ const DENIED_BASH: &[&str] = &[
 ///
 /// The engine's own governance is unaffected: the gate-hook rides a wicked-written `--settings`
 /// file ([`arm_input_governance`]), which is a separate source from the three scopes named here.
-pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>, invocation: &str) {
-    if std::env::var_os(INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+///
+/// `skills_plugin` (core#396) is the immutable skills snapshot admitted for this unit
+/// (`skills_snapshot::admit_unit`), or `None` when there is none to hand. Dropping user scope is
+/// what dropped the operator's marketplace plugins, so the worker was told to invoke a skill
+/// nothing had loaded; the snapshot rides `--plugin-dir` right here, with the isolation that
+/// created the gap. Nothing is copied and no permission is widened for it: writes under the
+/// snapshot stay denied by the governance boundary, and reads pass through the read roots
+/// ([`assemble_read_roots`]).
+pub(crate) fn inject_isolation_flags(
+    argv: &mut Vec<String>,
+    invocation: &str,
+    skills_plugin: Option<&Path>,
+) {
+    if inherits_operator_config() {
         return;
     }
     // Deference is decided against the TEMPLATE, not against the built argv. The argv also holds
@@ -338,6 +359,24 @@ pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>, invocation: &str) {
             flags.push(rules.join(","));
         }
     }
+    // An operator template that carries its OWN `--plugin-dir` — the `clis.toml` stop-gap that
+    // pointed workers at a stale hand copy of the plugin — is SUPERSEDED once a snapshot is in
+    // hand: stripped from the argv and said so, because two `--plugin-dir`s naming the same plugin
+    // load it twice and the stale one is the very defect. No deference here, unlike the flags
+    // above: the template's choice was a workaround for the gap this closes. Without a snapshot
+    // the template's flag is left alone — it is then the worker's only source of skills.
+    if let Some(root) = skills_plugin {
+        for superseded in strip_plugin_dir(argv, &stated) {
+            eprintln!(
+                "[wicked-core] skills.notice the invocation template carries `--plugin-dir \
+                 {superseded}`; superseded by the skills snapshot at {} and stripped — remove it \
+                 from clis.toml",
+                root.display()
+            );
+        }
+        flags.push("--plugin-dir".into());
+        flags.push(root.to_string_lossy().into_owned());
+    }
     if flags.is_empty() {
         return;
     }
@@ -349,6 +388,44 @@ pub(crate) fn inject_isolation_flags(argv: &mut Vec<String>, invocation: &str) {
         }
         None => argv.extend(flags),
     }
+}
+
+/// Remove the TEMPLATE's `--plugin-dir` (either spelling) from a built argv, returning the values
+/// stripped. Exact by construction: only the spellings the template STATES are matched — the bare
+/// form as the adjacent PAIR (`--plugin-dir`, `<value>`), the glued form as its literal token — so
+/// a template that states no `--plugin-dir` strips nothing whatever the prompt says, and the prompt
+/// element (workflow- and model-authored, placed as its own argv token) can only ever be touched if
+/// it equals the operator's own literal. Every match is removed, not the first: leaving one behind
+/// would load the stale copy after all.
+fn strip_plugin_dir(argv: &mut Vec<String>, stated: &[String]) -> Vec<String> {
+    const FLAG: &str = "--plugin-dir";
+    let mut stripped = Vec::new();
+    for (i, tok) in stated.iter().enumerate() {
+        if tok == FLAG {
+            let Some(value) = stated.get(i + 1) else {
+                continue;
+            };
+            let before = argv.len();
+            let mut k = 0;
+            while k + 1 < argv.len() {
+                if argv[k] == FLAG && &argv[k + 1] == value {
+                    argv.drain(k..k + 2);
+                } else {
+                    k += 1;
+                }
+            }
+            if argv.len() != before {
+                stripped.push(value.clone());
+            }
+        } else if let Some(value) = tok.strip_prefix(FLAG).and_then(|r| r.strip_prefix('=')) {
+            let before = argv.len();
+            argv.retain(|a| a != tok);
+            if argv.len() != before {
+                stripped.push(value.to_string());
+            }
+        }
+    }
+    stripped
 }
 
 /// Does `argv` already state any of `names`, in EITHER accepted spelling — `--flag value` or
@@ -678,17 +755,57 @@ impl WrappedCliStepRunner {
             .assigned_invocation
             .clone()
             .unwrap_or_else(|| resolve_invocation(&cli_key));
-        let mut argv = build_argv(&invocation, &unit_prompt(input), &input.unit.allowed_skills);
+        // core#396: admit the launch against the skills snapshot BEFORE anything is built. The
+        // run's whole skill set must be present or the unit is REFUSED by name (never a worker told
+        // to invoke a skill it cannot have); the root it resolves is what the directive, the
+        // `--plugin-dir` flag, and the read boundary below all use.
+        let skills = match crate::skills_snapshot::admit_unit(input) {
+            Ok(s) => s,
+            Err(e) => return skills_refusal(input, &e),
+        };
+        // The snapshot is HANDED to real work units. An engine-internal judge/triage session gets
+        // it only when it names a skill: a plugin's whole catalog in a session that returns an
+        // authored verdict byte-exact would cost context for a method it never invokes.
+        let handed = skills
+            .as_ref()
+            .filter(|_| !is_engine_internal(&input.unit) || input.unit.skill_ref.is_some());
+        // The binary decides the directive's form (and, below, the output adapter + isolation):
+        // read off the TEMPLATE's first token, before argv exists, so the prompt is spelled for
+        // the CLI that will run it.
+        let is_claude = tokenize(&invocation)
+            .first()
+            .is_some_and(|b| binary_is_claude(b));
+        let form = SkillForm::for_claude(is_claude);
+        let mut argv = build_argv(
+            &invocation,
+            &unit_prompt(input, form, handed),
+            &input.unit.allowed_skills,
+        );
 
         // Per-binary output adapter (B-runner). claude → stream-json (+ the two flags, injected before the
         // `--` guard); every other binary → passthrough (byte-identical to the pre-adapter raw-line stream).
-        let is_claude = argv.first().map(|a| binary_is_claude(a)).unwrap_or(false);
         if is_claude {
             inject_claude_stream_flags(&mut argv);
             // Before governance arms: isolation applies to EVERY claude unit, governed or not. An
             // ungoverned unit reading the operator's config is the same defect as a governed one
-            // doing it (FINDING-047/045).
-            inject_isolation_flags(&mut argv, &invocation);
+            // doing it (FINDING-047/045). The skills snapshot rides the same injection (core#396).
+            inject_isolation_flags(&mut argv, &invocation, handed.map(|s| s.root.as_path()));
+            // The generation this unit was handed: the log line for the operator and the event
+            // crew consults before reaping an old generation (one per unit — every wrapped unit
+            // is its own process).
+            if let Some(s) = handed {
+                s.report(&format!(
+                    "path=wrapped run={} unit={} cli={cli_key}",
+                    input.run_id, input.unit.ord
+                ));
+                self.emit_event(s.handed_event(
+                    &input.run_id,
+                    input.unit.ord,
+                    input.attempt,
+                    "wrapped_cli",
+                    &cli_key,
+                ));
+            }
         } else {
             // Non-claude seat (crew#427): apply its DECLARED sandbox/trust posture, exactly as the
             // council vote path does — the governed-worker path dropped it before, so a codex
@@ -708,35 +825,38 @@ impl WrappedCliStepRunner {
         // `--settings` MERGES (the user's own settings stay intact) and lives OUTSIDE the worktree.
         // Non-claude CLIs + ungoverned internal calls (`governance: None`) are untouched.
         let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
-            (Some(gov), true) => match arm_input_governance(input, gov, &mut argv) {
-                Ok(env) => {
-                    // (EVT-016) GovernanceContextArmed — wrapped-CLI path successfully armed
-                    // governance. Fires before the subprocess starts so the operator can confirm
-                    // governance is ON for this unit (distinct from GateEvaluated's signals).
-                    self.emit_event(crate::event::CoreEvent::GovernanceContextArmed {
-                        session: input.run_id.clone(),
-                        ord: input.unit.ord,
-                        attempt: input.attempt,
-                        path: "wrapped_cli".to_string(),
-                        db_path: gov.db_path.clone(),
-                    });
-                    Some(env)
+            (Some(gov), true) => {
+                match arm_input_governance(input, gov, &mut argv, handed.map(|s| s.root.as_path()))
+                {
+                    Ok(env) => {
+                        // (EVT-016) GovernanceContextArmed — wrapped-CLI path successfully armed
+                        // governance. Fires before the subprocess starts so the operator can confirm
+                        // governance is ON for this unit (distinct from GateEvaluated's signals).
+                        self.emit_event(crate::event::CoreEvent::GovernanceContextArmed {
+                            session: input.run_id.clone(),
+                            ord: input.unit.ord,
+                            attempt: input.attempt,
+                            path: "wrapped_cli".to_string(),
+                            db_path: gov.db_path.clone(),
+                        });
+                        Some(env)
+                    }
+                    // A governed unit whose governance cannot be armed must NOT run ungoverned — fail it.
+                    Err(e) => {
+                        return StepOutput {
+                            run_id: input.run_id.clone(),
+                            unit_ix: input.unit_ix,
+                            attempt: input.attempt,
+                            output: format!("(could not arm input governance: {e})"),
+                            status: StepStatus::Failed,
+                            usage: None,
+                            files: Vec::new(),
+                            tools: Vec::new(), // arming failed → nothing ran → no tools
+                            governed: false, // arming failed → not governed (and the unit fails anyway)
+                        };
+                    }
                 }
-                // A governed unit whose governance cannot be armed must NOT run ungoverned — fail it.
-                Err(e) => {
-                    return StepOutput {
-                        run_id: input.run_id.clone(),
-                        unit_ix: input.unit_ix,
-                        attempt: input.attempt,
-                        output: format!("(could not arm input governance: {e})"),
-                        status: StepStatus::Failed,
-                        usage: None,
-                        files: Vec::new(),
-                        tools: Vec::new(), // arming failed → nothing ran → no tools
-                        governed: false, // arming failed → not governed (and the unit fails anyway)
-                    };
-                }
-            },
+            }
             // A governed unit on a CLI with no gate-hook adapter. It still runs — failing it would
             // take out every `evaluator_distinct` unit, since that router exists to move the
             // evaluator OFF the creator's CLI and claude is the only governable one — but it must
@@ -916,11 +1036,14 @@ impl WrappedCliStepRunner {
                 // ONE assembly shared with the ACP carrier (core#260) — see
                 // `assemble_read_roots`. A mis-shaped `code_graph_db` is NOT widened (the
                 // helper's shape check), reported here so the operator sees why.
-                let read_roots: Vec<std::ffi::OsString> =
-                    assemble_read_roots(g.code_graph_db.as_deref(), &g.extra_read_roots)
-                        .into_iter()
-                        .map(PathBuf::into_os_string)
-                        .collect();
+                let read_roots: Vec<std::ffi::OsString> = assemble_read_roots(
+                    g.code_graph_db.as_deref(),
+                    &g.extra_read_roots,
+                    g.skills_root.as_deref(),
+                )
+                .into_iter()
+                .map(PathBuf::into_os_string)
+                .collect();
                 if let Some(db) = g.code_graph_db.as_deref() {
                     if repo_read_root(Some(db)).is_none() {
                         eprintln!(
@@ -1582,6 +1705,10 @@ struct GovLaunch {
     /// Joined into `WICKED_READ_ROOTS` via [`assemble_read_roots`], NEVER into the write roots:
     /// a read root grounds the run in content it must not touch.
     extra_read_roots: Vec<String>,
+    /// The skills snapshot handed to this unit via `--plugin-dir` (core#396), or `None`. Joins the
+    /// READ roots — a worker reads its skill's `SKILL.md`, refs and scripts there — and nothing
+    /// else: the snapshot is immutable by contract, so it is never a write root.
+    skills_root: Option<PathBuf>,
 }
 
 /// Point a GOVERNED worker's estate CLI channel at the repo's OWN graph via `$WICKED_ESTATE_DB`.
@@ -1686,10 +1813,18 @@ fn graph_write_dir_at(code_graph_db: Option<&str>, estate_root: Option<&Path>) -
 pub(crate) fn assemble_read_roots(
     code_graph_db: Option<&str>,
     extra_read_roots: &[String],
+    skills_root: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(Path::new(&home).join(".claude").join("plugins"));
+    }
+    // core#396: the skills snapshot this unit was handed. Under a skill the worker reads its
+    // `SKILL.md`, its refs, and the scripts they point at — all inside the snapshot, which the
+    // `~/.claude/plugins` root above (the pre-snapshot install) does not cover. READ only, like
+    // everything here: the snapshot is immutable by contract and joins no write list.
+    if let Some(root) = skills_root {
+        roots.push(root.to_path_buf());
     }
     if let Some(repo_root) = repo_read_root(code_graph_db) {
         roots.push(PathBuf::from(repo_root));
@@ -1749,6 +1884,9 @@ fn arm_input_governance(
     input: &StepInput,
     gov: &crate::workflow::GovernanceContext,
     argv: &mut Vec<String>,
+    // The skills snapshot handed to this unit (core#396) — carried onto the launch so the read
+    // boundary widens to it; `None` when none was handed.
+    skills_root: Option<&Path>,
 ) -> std::io::Result<GovLaunch> {
     let scope = crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
     let phase = crate::scope::unit_phase(input.unit.ord);
@@ -1897,6 +2035,7 @@ fn arm_input_governance(
         code_graph_db: gov.code_graph_db.clone(),
         extra_write_roots: gov.extra_write_roots.clone(),
         extra_read_roots: gov.extra_read_roots.clone(),
+        skills_root: skills_root.map(Path::to_path_buf),
     })
 }
 
@@ -2309,24 +2448,41 @@ fn tokenize(s: &str) -> Vec<String> {
 /// ([`crate::assumptions::PROMPT_CONVENTION`]) and, when the caller has a worktree to describe, a
 /// one-line map of it (`layout`, from [`crate::repo::worktree_layout`] — see [`unit_prompt`]);
 /// engine-internal `validator`/`triage` sessions return the authored prompt byte-exact.
-pub(crate) fn skill_prompt(unit: &WorkUnit, layout: Option<&str>) -> String {
+///
+/// The directive is CLI-AWARE (core#396): `form` picks the spelling the running CLI resolves, and
+/// `skills` (the admitted snapshot, when one is in hand) resolves the skill's identity from its
+/// index rather than from a naming convention — see [`plugin_skill_invocation`].
+pub(crate) fn skill_prompt(
+    unit: &WorkUnit,
+    layout: Option<&str>,
+    form: SkillForm,
+    skills: Option<&SkillsSnapshot>,
+) -> String {
     let base = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => {
             // NOT a slash line: plugin SKILLS are not slash commands — a "/name" prompt hits the
             // CLI's command parser and dies as "Unknown command" in ANY name form (core#126,
-            // probed live both ways). The grounded mechanic is the Skill tool: instruct the
-            // session to invoke the named skill and do the unit's work under it.
-            format!(
-                "Invoke your skill \"{}\" (via the Skill tool) and complete this task under its instructions: {}",
-                plugin_skill_invocation(skill),
-                unit.description
-            )
+            // probed live both ways). The grounded mechanic on Claude is the Skill tool: instruct
+            // the session to invoke the named skill and do the unit's work under it. Every other
+            // CLI has no Skill tool to be told about — it is asked for the skill by the name its
+            // skills directory mirrors.
+            let name = plugin_skill_invocation(skill, form, skills);
+            match form {
+                SkillForm::ClaudePlugin => format!(
+                    "Invoke your skill \"{name}\" (via the Skill tool) and complete this task under its instructions: {}",
+                    unit.description
+                ),
+                SkillForm::MirroredName => format!(
+                    "Use your skill \"{name}\" and complete this task under its instructions: {}",
+                    unit.description
+                ),
+            }
         }
         _ => unit.description.clone(),
     };
     // Engine-internal judge/triage prompts are fully authored — no conventions appendix, and no
     // layout either (their verdict contracts must stay byte-exact).
-    if matches!(unit.session_id.as_str(), "validator" | "triage") {
+    if is_engine_internal(unit) {
         return base;
     }
     // FINDING-048: the unit knows WHAT to do and nothing about WHERE. 12 of 32 pilot sessions burned
@@ -2345,17 +2501,89 @@ const LAYOUT_PREFIX: &str =
     " ||| WORKTREE LAYOUT (the root of your working copy — every path below \
      is relative to it; `dir/ [manifest]` marks a project root, `dir/ {…}` a container of them): ";
 
+/// Is this unit one of the engine's OWN sessions — the agent judge (`validator`) or failure triage
+/// (`triage`) — rather than a run's work unit? Their prompts are fully authored verdict contracts
+/// that must stay byte-exact ([`skill_prompt`]), and they are handed the skills snapshot only when
+/// they name a skill (`WrappedCliStepRunner::exec`).
+pub(crate) fn is_engine_internal(unit: &WorkUnit) -> bool {
+    matches!(unit.session_id.as_str(), "validator" | "triage")
+}
+
+/// The [`StepOutput`] for a unit the skills admission REFUSED before launch
+/// (`skills_snapshot::admit_unit`, core#396) — one constructor for the wrapped and ACP runners, so
+/// the two cannot word or shape the refusal differently. Nothing ran: no output beyond the reason,
+/// no usage, files or tools, and nothing was governed — no gate is ever armed for a launch that
+/// never happens, so the fold is told exactly that.
+pub(crate) fn skills_refusal(
+    input: &StepInput,
+    why: &crate::skills_snapshot::SkillsError,
+) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!("(skills snapshot refused the launch: {why})"),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    }
+}
+
+/// How a unit's `skill_ref` is spelled for the CLI that will run it (core#396).
+///
+/// Claude identifies a plugin's skill as `<plugin>:<skill-dir>` and invokes it through its Skill
+/// tool. Every other CLI (codex, pi, opencode, copilot) discovers a skill by the directory name
+/// its skills dir mirrors — garden's frontmatter `name`, `wicked-garden-<path-joined>` — and has no
+/// Skill tool. The earlier one-size rewrite handed all of them the Claude spelling, which none of
+/// them could resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillForm {
+    /// `wicked-garden:<skill-dir>`, invoked via the Skill tool.
+    ClaudePlugin,
+    /// The bare mirrored directory name (the frontmatter `name`).
+    MirroredName,
+}
+
+impl SkillForm {
+    /// The form for a seat already known to be (or not be) claude — the wrapped and PTY runners
+    /// decide that off the template's binary, the ACP runner off the seat's registry record.
+    pub(crate) fn for_claude(is_claude: bool) -> Self {
+        if is_claude {
+            SkillForm::ClaudePlugin
+        } else {
+            SkillForm::MirroredName
+        }
+    }
+
+    /// The form for the binary an invocation template names ([`binary_is_claude`] on its first
+    /// token) — the same fact the wrapped runner selects its output adapter and isolation by.
+    pub(crate) fn for_invocation(invocation: &str) -> Self {
+        Self::for_claude(
+            tokenize(invocation)
+                .first()
+                .is_some_and(|b| binary_is_claude(b)),
+        )
+    }
+}
+
 /// The prompt for `input`'s unit, including the worktree map when there is a worktree to map.
 ///
 /// The split exists because [`skill_prompt`] is pure and testable without a filesystem, while the map
 /// is a directory read; this is the one place the two meet, so every runner (wrapped, PTY, ACP) gets
-/// the same prompt from the same code rather than three chances to diverge.
-pub(crate) fn unit_prompt(input: &StepInput) -> String {
+/// the same prompt from the same code rather than three chances to diverge. `form` and `skills`
+/// are the caller's directive inputs (core#396) — see [`skill_prompt`].
+pub(crate) fn unit_prompt(
+    input: &StepInput,
+    form: SkillForm,
+    skills: Option<&SkillsSnapshot>,
+) -> String {
     let layout = input
         .workdir
         .as_deref()
         .and_then(crate::repo::worktree_layout);
-    skill_prompt(&input.unit, layout.as_deref())
+    skill_prompt(&input.unit, layout.as_deref(), form, skills)
 }
 
 /// Ceiling on a prompt written to a pty as a single line, with headroom under `MAX_CANON`.
@@ -2381,9 +2609,12 @@ const MIN_USEFUL_LAYOUT: usize = 40;
 /// the case no trimming can fix — a unit description that alone overruns the line — because the
 /// honest outcome there is a fast, named failure rather than a turn that burns its timeout in silence
 /// (which is what this path did for any description over ~509 bytes, before and after FINDING-048).
-pub(crate) fn pty_unit_prompt(input: &StepInput) -> Result<String, String> {
+///
+/// The PTY runner hands no skills snapshot (it is not one of the two spawn paths that carry one),
+/// so the directive resolves by convention alone; `form` still spells it for the session's CLI.
+pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<String, String> {
     // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
-    let plain = skill_prompt(&input.unit, None);
+    let plain = skill_prompt(&input.unit, None, form, None);
     // FINDING-011: a pty turn is submitted line-based — the runner appends one `\n` to end the turn,
     // so ANY newline the prompt itself carries submits the turn EARLY. The worker then gets only the
     // text up to that byte and the remainder lands as a stray follow-up that desyncs the reused
@@ -2423,23 +2654,46 @@ pub(crate) fn pty_unit_prompt(input: &StepInput) -> Result<String, String> {
                 .as_deref()
                 .and_then(|d| crate::repo::worktree_layout_within(d, budget))
         });
-    Ok(skill_prompt(&input.unit, layout.as_deref()))
+    Ok(skill_prompt(&input.unit, layout.as_deref(), form, None))
 }
 
-/// Map a dash-form `skill_ref` onto the CLI's invocable name. Claude Code invokes PLUGIN skills
-/// as `/plugin:skill` — a dash-form ref like `wicked-garden-domain-extractor` is literally
-/// "Unknown command" to it (core#126: three no-op units, caught only by the coverage validator).
-/// Refs under a known wicked plugin family are rewritten `wicked-<plugin>-<skill>` →
-/// `wicked-<plugin>:<skill>`; anything else passes through untouched.
-pub(crate) fn plugin_skill_invocation(skill_ref: &str) -> String {
-    for plugin in ["wicked-garden", "wicked-testing", "wicked-brain"] {
-        if let Some(rest) = skill_ref.strip_prefix(&format!("{plugin}-")) {
-            if !rest.is_empty() {
-                return format!("{plugin}:{rest}");
+/// Map a dash-form `skill_ref` onto the name the running CLI invokes it by (core#396).
+///
+/// [`SkillForm::ClaudePlugin`]: Claude Code identifies a PLUGIN skill as `<plugin>:<skill-dir>` —
+/// a dash-form ref like `wicked-garden-domain-extractor` is literally "Unknown command" to it
+/// (core#126: three no-op units, caught only by the coverage validator). With a snapshot in hand
+/// the dir comes from its index (`SkillsSnapshot::claude_skill_dir`, keyed by frontmatter name, so
+/// a skill whose directory diverged from its name still resolves); without one, refs under a known
+/// wicked plugin family are rewritten `wicked-<plugin>-<skill>` → `wicked-<plugin>:<skill>` — the
+/// convention garden's layout guarantees — and anything else passes through untouched.
+///
+/// [`SkillForm::MirroredName`]: every other CLI invokes the skill by the directory name its skills
+/// dir mirrors — the frontmatter `name` from the snapshot's index, else the ref itself, which is
+/// that name by convention.
+pub(crate) fn plugin_skill_invocation(
+    skill_ref: &str,
+    form: SkillForm,
+    skills: Option<&SkillsSnapshot>,
+) -> String {
+    match form {
+        SkillForm::ClaudePlugin => {
+            if let Some(dir) = skills.and_then(|s| s.claude_skill_dir(skill_ref)) {
+                return format!("{}:{dir}", crate::skills_snapshot::PLUGIN_NAME);
             }
+            for plugin in ["wicked-garden", "wicked-testing", "wicked-brain"] {
+                if let Some(rest) = skill_ref.strip_prefix(&format!("{plugin}-")) {
+                    if !rest.is_empty() {
+                        return format!("{plugin}:{rest}");
+                    }
+                }
+            }
+            skill_ref.to_string()
         }
+        SkillForm::MirroredName => skills
+            .and_then(|s| s.skill(skill_ref))
+            .map(|entry| entry.name.clone())
+            .unwrap_or_else(|| skill_ref.to_string()),
     }
-    skill_ref.to_string()
 }
 
 /// Build the argv from an invocation template, substituting `{PROMPT}` (the skill-led prompt, guarded
@@ -2632,8 +2886,8 @@ mod tests {
         #[cfg(windows)]
         let declared = "C:\\srv\\grounding-repo".to_string();
 
-        let base = assemble_read_roots(None, &[]);
-        let widened = assemble_read_roots(None, std::slice::from_ref(&declared));
+        let base = assemble_read_roots(None, &[], None);
+        let widened = assemble_read_roots(None, std::slice::from_ref(&declared), None);
         assert_eq!(
             &widened[..base.len()],
             &base[..],
@@ -2745,6 +2999,7 @@ mod tests {
             elicitation_epoch: 41,
             process_gen: None,
             launch_seq: 73,
+            required_skills: Vec::new(),
         };
         let runner = std::sync::Arc::new(WrappedCliStepRunner::default());
         let worker = std::sync::Arc::clone(&runner);
@@ -2798,6 +3053,7 @@ mod tests {
             elicitation_epoch: epoch,
             process_gen: None,
             launch_seq,
+            required_skills: Vec::new(),
         };
         let old = make_input(4, 10);
         let replacement = make_input(5, 11);
@@ -2964,6 +3220,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
 
         let out = runner.run_unit(&input);
@@ -3025,6 +3282,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let _ = runner.run_unit(&input);
         assert!(
@@ -3329,9 +3587,10 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-        let g = arm_input_governance(&input, &gov, &mut argv).unwrap();
+        let g = arm_input_governance(&input, &gov, &mut argv, None).unwrap();
 
         assert_eq!(g.db_path, "/abs/estate.db", "the child gets the store path");
         // scope/phase ride the RETURNED struct (→ env), pinned to the unit's real values.
@@ -3495,6 +3754,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
         std::env::remove_var(crate::gate_hook::ESTATE_DB_ENV);
@@ -3926,6 +4186,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
 
@@ -3999,6 +4260,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
 
@@ -4052,6 +4314,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let out = WrappedCliStepRunner::default().run_unit(&input);
 
@@ -4158,9 +4421,10 @@ mod tests {
                 elicitation_epoch: 0,
                 process_gen: None,
                 launch_seq: 0,
+                required_skills: Vec::new(),
             };
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-            arm_input_governance(&input, gov, &mut argv).unwrap();
+            arm_input_governance(&input, gov, &mut argv, None).unwrap();
             // Locate each injected config file from the argv (never index a fixed position — arming
             // now injects both `--settings` and, when a graph is bound, `--mcp-config`).
             let file_after = |flag: &str| {
@@ -4291,6 +4555,7 @@ mod tests {
                 code_graph_db: code_graph_db.map(str::to_string),
                 extra_write_roots: Vec::new(),
                 extra_read_roots: Vec::new(),
+                skills_root: None,
             };
             // spawn-audit: test-only — this Command is never spawned; it is a probe whose `get_envs`
             // we inspect to assert exactly which store the helper hands the worker's estate CLI. It
@@ -4352,23 +4617,122 @@ mod tests {
     #[test]
     fn skill_prompt_leads_with_the_headless_slash_form() {
         let appendix = crate::assumptions::PROMPT_CONVENTION;
+        let claude = SkillForm::ClaudePlugin;
         let mut u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
         // authored path: no skill → bare description + the conventions appendix.
-        assert_eq!(skill_prompt(&u, None), format!("add SSO login{appendix}"));
+        assert_eq!(
+            skill_prompt(&u, None, claude, None),
+            format!("add SSO login{appendix}")
+        );
         // skill-driven: leads with /<skill> so the harness expands the named skill deterministically.
         u.skill_ref = Some("wicked-testing-semantic-reviewer".to_string());
         assert_eq!(
-            skill_prompt(&u, None),
+            skill_prompt(&u, None, claude, None),
             format!("Invoke your skill \"wicked-testing:semantic-reviewer\" (via the Skill tool) and complete this task under its instructions: add SSO login{appendix}")
         );
         // an empty skill_ref is treated as no skill (authored path), never a bare "/ ...".
         u.skill_ref = Some(String::new());
-        assert_eq!(skill_prompt(&u, None), format!("add SSO login{appendix}"));
+        assert_eq!(
+            skill_prompt(&u, None, claude, None),
+            format!("add SSO login{appendix}")
+        );
         // Engine-internal judge/triage prompts stay byte-exact — no appendix.
         let judge = WorkUnit::pending("validator-agent", "validator", 1, "judge this");
-        assert_eq!(skill_prompt(&judge, None), "judge this");
+        assert_eq!(skill_prompt(&judge, None, claude, None), "judge this");
         let triage = WorkUnit::pending("triage-agent", "triage", 1, "triage this");
-        assert_eq!(skill_prompt(&triage, None), "triage this");
+        assert_eq!(skill_prompt(&triage, None, claude, None), "triage this");
+    }
+
+    /// core#396: the directive is spelled for the CLI that runs it. Claude gets the plugin form and
+    /// the Skill-tool clause; every other CLI gets the bare mirrored name — the frontmatter `name`
+    /// its skills directory carries — and NO Skill-tool clause (it has no such tool). With a
+    /// snapshot in hand the identity comes from its index, so a skill whose directory diverged from
+    /// its frontmatter name still resolves on both sides and a nested dir is spelled path-joined;
+    /// without one, the convention garden's layout guarantees is applied for Claude and the ref
+    /// passes through untouched for the rest.
+    #[test]
+    fn the_skill_directive_is_cli_aware() {
+        use crate::skills_snapshot::test_support::{load, scratch, snapshot_root};
+        let base = scratch("directive");
+        let root = snapshot_root(
+            &base.join("snap"),
+            "3",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("engineering/frontend", "wicked-garden-engineering-frontend"),
+                ("qe-oracle", "wicked-garden-test-oracle"),
+            ],
+        );
+        let snap = load(&root);
+        let (claude, mirrored) = (SkillForm::ClaudePlugin, SkillForm::MirroredName);
+
+        // Indexed: Claude's `<plugin>:<dir>` (nested ⇒ path-joined) vs the frontmatter name.
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-domain", claude, Some(&snap)),
+            "wicked-garden:domain"
+        );
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-engineering-frontend", claude, Some(&snap)),
+            "wicked-garden:engineering-frontend"
+        );
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-test-oracle", claude, Some(&snap)),
+            "wicked-garden:qe-oracle",
+            "the index wins over the naming convention when the dir diverged from the name"
+        );
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-qe-oracle", mirrored, Some(&snap)),
+            "wicked-garden-test-oracle",
+            "a dir-derived ref is spelled by its frontmatter name for the mirrors"
+        );
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-domain", mirrored, Some(&snap)),
+            "wicked-garden-domain"
+        );
+        // No snapshot: the convention for Claude, passthrough for everyone else.
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-domain-extractor", claude, None),
+            "wicked-garden:domain-extractor"
+        );
+        assert_eq!(
+            plugin_skill_invocation("wicked-garden-domain-extractor", mirrored, None),
+            "wicked-garden-domain-extractor"
+        );
+        assert_eq!(
+            plugin_skill_invocation("my-own-skill", claude, None),
+            "my-own-skill"
+        );
+
+        // The prompt: the Skill-tool clause is Claude's alone.
+        let mut u = WorkUnit::pending("s:build", "s", 1, "extract the rules");
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        let for_claude = skill_prompt(&u, None, claude, Some(&snap));
+        assert!(
+            for_claude.starts_with(
+                "Invoke your skill \"wicked-garden:domain\" (via the Skill tool) and complete this task under its instructions: extract the rules"
+            ),
+            "{for_claude}"
+        );
+        let for_codex = skill_prompt(&u, None, mirrored, Some(&snap));
+        assert!(
+            for_codex.starts_with(
+                "Use your skill \"wicked-garden-domain\" and complete this task under its instructions: extract the rules"
+            ),
+            "{for_codex}"
+        );
+        assert!(
+            !for_codex.contains("Skill tool") && !for_codex.contains("wicked-garden:"),
+            "no Skill-tool clause and no plugin spelling for a non-Claude CLI: {for_codex}"
+        );
+        // The form follows the template's binary, exactly as the output adapter does.
+        assert_eq!(SkillForm::for_invocation("claude -p {PROMPT}"), claude);
+        assert_eq!(
+            SkillForm::for_invocation("/opt/bin/claude.exe -p {PROMPT}"),
+            claude
+        );
+        assert_eq!(SkillForm::for_invocation("codex exec {PROMPT}"), mirrored);
+        assert_eq!(SkillForm::for_invocation("pi --skill x {PROMPT}"), mirrored);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// FINDING-048. Three things have to hold at once for the map to be worth carrying: a real unit
@@ -4380,7 +4744,7 @@ mod tests {
         let map = "src/ [Cargo.toml]; root files: README.md";
         let u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
 
-        let with = skill_prompt(&u, Some(map));
+        let with = skill_prompt(&u, Some(map), SkillForm::ClaudePlugin, None);
         assert_eq!(
             with,
             format!("add SSO login{LAYOUT_PREFIX}{map}{appendix}"),
@@ -4389,12 +4753,15 @@ mod tests {
         assert!(!with.contains('\n'), "prompts stay single-line: {with}");
         // No worktree ⇒ the prompt is byte-identical to the pre-FINDING-048 one. A caller with
         // nothing to say must say nothing, not print an empty heading.
-        assert_eq!(skill_prompt(&u, None), format!("add SSO login{appendix}"));
+        assert_eq!(
+            skill_prompt(&u, None, SkillForm::ClaudePlugin, None),
+            format!("add SSO login{appendix}")
+        );
 
         for internal in ["validator", "triage"] {
             let unit = WorkUnit::pending("agent", internal, 1, "judge this");
             assert_eq!(
-                skill_prompt(&unit, Some(map)),
+                skill_prompt(&unit, Some(map), SkillForm::ClaudePlugin, None),
                 "judge this",
                 "{internal} prompts are authored end to end — a map would corrupt the verdict contract"
             );
@@ -4425,19 +4792,24 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
-        let seen = unit_prompt(&input);
+        let claude = SkillForm::ClaudePlugin;
+        let seen = unit_prompt(&input, claude, None);
         assert!(
             seen.contains("backend/ [pyproject.toml]"),
             "the real tree must reach the prompt: {seen}"
         );
 
         input.workdir = None;
-        assert_eq!(unit_prompt(&input), skill_prompt(&unit, None));
+        assert_eq!(
+            unit_prompt(&input, claude, None),
+            skill_prompt(&unit, None, claude, None)
+        );
         input.workdir = Some(root.join("gone"));
         assert_eq!(
-            unit_prompt(&input),
-            skill_prompt(&unit, None),
+            unit_prompt(&input, claude, None),
+            skill_prompt(&unit, None, claude, None),
             "a workdir that is not there degrades to the plain prompt — it never fails the unit"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -4471,9 +4843,11 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
 
-        let p = pty_unit_prompt(&input).expect("a short description must not fail");
+        let claude = SkillForm::ClaudePlugin;
+        let p = pty_unit_prompt(&input, claude).expect("a short description must not fail");
         // The submitting newline occupies the same line buffer, so it counts against the limit.
         let line_bytes = p.len() + 1;
         assert!(
@@ -4491,14 +4865,15 @@ mod tests {
         );
         // The unbounded prompt is what would have deadlocked, so the cap has to be doing real work.
         assert!(
-            unit_prompt(&input).len() + 1 > PTY_PROMPT_LIMIT,
+            unit_prompt(&input, claude, None).len() + 1 > PTY_PROMPT_LIMIT,
             "this fixture no longer exercises the cap"
         );
 
         // A description that cannot fit fails fast and names the cause. Silence here is the bug:
         // this path burned the whole turn timeout for any description over ~509 bytes, pre-048 too.
         input.unit.description = "x".repeat(PTY_PROMPT_LIMIT);
-        let err = pty_unit_prompt(&input).expect_err("an over-long description must not be sent");
+        let err =
+            pty_unit_prompt(&input, claude).expect_err("an over-long description must not be sent");
         assert!(
             err.contains("pty turn cannot exceed"),
             "the failure must say why: {err}"
@@ -4507,7 +4882,10 @@ mod tests {
         // No worktree ⇒ same prompt the non-pty runners build; the cap changes nothing on its own.
         input.unit.description = "fix the API".to_string();
         input.workdir = None;
-        assert_eq!(pty_unit_prompt(&input).unwrap(), unit_prompt(&input));
+        assert_eq!(
+            pty_unit_prompt(&input, claude).unwrap(),
+            unit_prompt(&input, claude, None)
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4539,8 +4917,9 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
-        let err = pty_unit_prompt(&input)
+        let err = pty_unit_prompt(&input, SkillForm::ClaudePlugin)
             .expect_err("a multi-line prompt must be refused, not submitted to the terminal");
         assert!(
             err.contains("newline"),
@@ -4554,7 +4933,8 @@ mod tests {
         // The SAME content on one line is accepted — the guard rejects the newline, not the text or
         // its length. This keeps the guard from passing vacuously (e.g. if everything errored).
         input.unit.description = "map the layout then the stack".to_string();
-        let ok = pty_unit_prompt(&input).expect("a single-line prompt of the same content is fine");
+        let ok = pty_unit_prompt(&input, SkillForm::ClaudePlugin)
+            .expect("a single-line prompt of the same content is fine");
         assert!(
             !ok.contains('\n'),
             "the accepted prompt is single-line: {ok}"
@@ -4565,7 +4945,11 @@ mod tests {
     fn a_skill_prompt_flows_through_build_argv_as_one_guarded_arg() {
         let mut u = WorkUnit::pending("s:build", "s", 1, "do it");
         u.skill_ref = Some("wicked-testing-plan".to_string());
-        let argv = build_argv("claude -p {PROMPT}", &skill_prompt(&u, None), &[]);
+        let argv = build_argv(
+            "claude -p {PROMPT}",
+            &skill_prompt(&u, None, SkillForm::ClaudePlugin, None),
+            &[],
+        );
         assert_eq!(argv.len(), 3, "one guarded prompt arg");
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "-p");
@@ -5038,7 +5422,7 @@ mod tests {
     fn isolation_drops_user_scope_settings_and_lands_before_the_guard() {
         let inv = "claude {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
-        inject_isolation_flags(&mut argv, inv);
+        inject_isolation_flags(&mut argv, inv, None);
 
         assert_eq!(
             flag_value(&argv, "--setting-sources"),
@@ -5064,7 +5448,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let inv = "claude -p {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
-        inject_isolation_flags(&mut argv, inv);
+        inject_isolation_flags(&mut argv, inv, None);
 
         let denied = flag_value(&argv, "--disallowedTools").expect("a deny list");
         // One argv entry, not several: `--disallowedTools` is variadic, and a bare sequence of
@@ -5145,7 +5529,7 @@ mod tests {
     fn isolation_states_a_permission_mode_that_still_honours_the_deny_rules() {
         let inv = "claude -p {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
-        inject_isolation_flags(&mut argv, inv);
+        inject_isolation_flags(&mut argv, inv, None);
         assert_eq!(
             flag_value(&argv, "--permission-mode"),
             Some("acceptEdits"),
@@ -5162,7 +5546,7 @@ mod tests {
             "claude --setting-sources user --permission-mode plan --disallowedTools Edit -p {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
         let before = argv.clone();
-        inject_isolation_flags(&mut argv, inv);
+        inject_isolation_flags(&mut argv, inv, None);
         assert_eq!(argv, before, "nothing injected over an explicit choice");
         assert_eq!(argv.iter().filter(|a| *a == "--setting-sources").count(), 1);
     }
@@ -5185,7 +5569,7 @@ mod tests {
         ] {
             let inv = format!("claude {stated} -p {{PROMPT}}");
             let mut argv = build_argv(&inv, "hi", &[]);
-            inject_isolation_flags(&mut argv, &inv);
+            inject_isolation_flags(&mut argv, &inv, None);
             let flag = stated.split('=').next().unwrap();
             assert!(
                 !argv.iter().any(|a| a == flag),
@@ -5251,7 +5635,7 @@ mod tests {
             // `-p {PROMPT}` on purpose: that is the shape that leaves the prompt un-guarded.
             let inv = "claude -p {PROMPT}";
             let mut argv = build_argv(inv, hostile, &[]);
-            inject_isolation_flags(&mut argv, inv);
+            inject_isolation_flags(&mut argv, inv, None);
             assert!(
                 states_pair(&argv, "--setting-sources", "project,local"),
                 "prompt `{hostile}` suppressed the scope isolation: {argv:?}"
@@ -5316,6 +5700,434 @@ mod tests {
             !rules.iter().any(|r| r.starts_with("Read(")),
             "with no home there is no path to fence, and a rule claiming otherwise would be a lie: {rules:?}"
         );
+    }
+
+    // ── core#396: the skills snapshot on the wrapped path ────────────────────────────────────────
+
+    /// RAII restore of one process-global variable — the skills-snapshot input — with the same
+    /// discipline as [`HomeGuard`]: hold [`ENV_LOCK`] and declare the guard after the lock guard.
+    #[cfg(unix)]
+    struct VarGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+    #[cfg(unix)]
+    impl VarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for VarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// A fake `claude` — the stem is what selects the claude adapter and isolation — that records
+    /// its argv one token per line into `argv_file` and touches `marker`, so a test can read back
+    /// exactly what the worker was launched with and whether it was launched at all.
+    #[cfg(unix)]
+    fn fake_claude(bin_dir: &std::path::Path, argv_file: &std::path::Path) -> std::path::PathBuf {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let claude = bin_dir.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"{}\"\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        claude
+    }
+
+    /// The values of every `--plugin-dir <value>` pair in an argv, in order.
+    fn plugin_dirs(argv: &[String]) -> Vec<&str> {
+        argv.windows(2)
+            .filter(|w| w[0] == "--plugin-dir")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
+    /// The wrapped lever, pinned on the injector: with a snapshot in hand the argv carries EXACTLY
+    /// ONE `--plugin-dir`, the snapshot; a `--plugin-dir` the operator's template carried (the
+    /// `clis.toml` stop-gap at a stale hand copy) is stripped in either spelling, every copy; a
+    /// template that states none loses nothing even when the PROMPT is the flag's literal text;
+    /// and with no snapshot the template's own flag is left alone — it is then the only source.
+    #[test]
+    fn the_snapshot_rides_plugin_dir_exactly_once_and_supersedes_the_template_hand_copy() {
+        let snapshot = std::path::Path::new("/snapshots/5");
+        let stale = "/home/op/.claude/plugins/wicked-garden";
+
+        let inv = format!("claude --plugin-dir {stale} -p {{PROMPT}}");
+        let mut argv = build_argv(&inv, "hi", &[]);
+        inject_isolation_flags(&mut argv, &inv, Some(snapshot));
+        assert_eq!(
+            plugin_dirs(&argv),
+            vec!["/snapshots/5"],
+            "one --plugin-dir, the snapshot — the template's hand copy is gone: {argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == stale), "{argv:?}");
+
+        // The glued spelling, stated twice: both copies go.
+        let inv = format!("claude --plugin-dir={stale} -p {{PROMPT}} --plugin-dir={stale}");
+        let mut argv = build_argv(&inv, "hi", &[]);
+        inject_isolation_flags(&mut argv, &inv, Some(snapshot));
+        assert_eq!(plugin_dirs(&argv), vec!["/snapshots/5"], "{argv:?}");
+        assert!(!argv.iter().any(|a| a.contains(stale)), "{argv:?}");
+
+        // No template flag ⇒ the injection adds exactly one, and a prompt that IS the flag text is
+        // untouched (only the operator's stated literal is ever stripped).
+        let inv = "claude -p {PROMPT}";
+        let mut argv = build_argv(inv, "--plugin-dir", &[]);
+        inject_isolation_flags(&mut argv, inv, Some(snapshot));
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--plugin-dir").count(),
+            2,
+            "the prompt token and the injected flag, nothing stripped: {argv:?}"
+        );
+        assert!(
+            states_pair(&argv, "--plugin-dir", "/snapshots/5"),
+            "{argv:?}"
+        );
+
+        // No snapshot ⇒ the template's flag is the worker's only skills source; leave it alone.
+        let inv = format!("claude --plugin-dir {stale} -p {{PROMPT}}");
+        let mut argv = build_argv(&inv, "hi", &[]);
+        inject_isolation_flags(&mut argv, &inv, None);
+        assert_eq!(plugin_dirs(&argv), vec![stale], "{argv:?}");
+    }
+
+    /// The read boundary widens to the snapshot on the wrapped carrier — through the ONE shared
+    /// assembly, read-only — and the snapshot never joins a write list. `WICKED_READ_ROOTS` is
+    /// built from `GovLaunch.skills_root`, which `arm_input_governance` carries off its argument.
+    #[test]
+    fn the_snapshot_joins_the_read_roots_and_never_the_write_roots() {
+        // Both `assemble_read_roots` calls read HOME for the base set; hold ENV_LOCK so a
+        // HOME-swapping test cannot change it between the two (the module rule).
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let root = std::path::Path::new("/snapshots/9");
+        let base = assemble_read_roots(None, &[], None);
+        let widened = assemble_read_roots(None, &[], Some(root));
+        assert_eq!(
+            widened.len(),
+            base.len() + 1,
+            "exactly the snapshot is added: {widened:?}"
+        );
+        assert!(widened.iter().any(|r| r == root), "{widened:?}");
+        assert!(!base.iter().any(|r| r == root));
+
+        seed_probe_for_test(
+            &resolve_wicked_core_exe(),
+            Ok((
+                crate::gate_hook::GATE_PROTOCOL_VERSION,
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )),
+        );
+        let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
+        u.assigned_cli = Some("claude".to_string());
+        let gov = crate::workflow::GovernanceContext {
+            db_path: "/abs/estate.db".to_string(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: vec!["/srv/grounding".to_string()],
+        };
+        let input = StepInput {
+            run_id: format!("skillsroot-{}", std::process::id()),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: Some(gov.clone()),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
+        let g = arm_input_governance(&input, &gov, &mut argv, Some(root)).unwrap();
+        assert_eq!(g.skills_root.as_deref(), Some(root));
+        assert!(
+            g.extra_write_roots.is_empty(),
+            "the snapshot is immutable by contract: never a write root: {:?}",
+            g.extra_write_roots
+        );
+        // The exact assembly the launcher exports as WICKED_READ_ROOTS holds both the launch-
+        // declared extra and the snapshot.
+        let exported = assemble_read_roots(
+            g.code_graph_db.as_deref(),
+            &g.extra_read_roots,
+            g.skills_root.as_deref(),
+        );
+        assert!(exported.iter().any(|r| r == root), "{exported:?}");
+        assert!(
+            exported.iter().any(|r| r == Path::new("/srv/grounding")),
+            "{exported:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir_for_test(&input.run_id));
+    }
+
+    /// Two sessions on two generations: each argv, each read-root set and each admission is
+    /// judged against ITS generation alone, the two roots differ, and neither tree is written
+    /// into — the snapshot is a shared-nothing input, so reaping one generation cannot touch a
+    /// session on the other.
+    #[test]
+    fn two_sessions_on_two_generations_carry_their_own_roots_and_write_nothing() {
+        use crate::skills_snapshot::test_support::{
+            load, scratch, snapshot_root, tree_fingerprint,
+        };
+        let base = scratch("two-gens");
+        let root1 = snapshot_root(
+            &base.join("snapshots/1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let root2 = snapshot_root(
+            &base.join("snapshots/2"),
+            "2",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("mem", "wicked-garden-mem"),
+            ],
+        );
+        let (gen1, gen2) = (load(&root1), load(&root2));
+        let (fp1, fp2) = (tree_fingerprint(&root1), tree_fingerprint(&root2));
+        assert_ne!(gen1.root, gen2.root);
+        assert_ne!(gen1.gen_label(), gen2.gen_label());
+
+        let mut u = WorkUnit::pending("s:build", "s", 1, "capture what we learned");
+        u.skill_ref = Some("wicked-garden-mem".to_string());
+        let inv = "claude -p {PROMPT}";
+        let session = |snap: &crate::skills_snapshot::SkillsSnapshot| {
+            let prompt = skill_prompt(&u, None, SkillForm::ClaudePlugin, Some(snap));
+            let mut argv = build_argv(inv, &prompt, &[]);
+            inject_isolation_flags(&mut argv, inv, Some(&snap.root));
+            argv
+        };
+        let (argv1, argv2) = (session(&gen1), session(&gen2));
+        assert_eq!(plugin_dirs(&argv1), vec![root1.to_string_lossy().as_ref()]);
+        assert_eq!(plugin_dirs(&argv2), vec![root2.to_string_lossy().as_ref()]);
+
+        let reads1 = assemble_read_roots(None, &[], Some(&gen1.root));
+        let reads2 = assemble_read_roots(None, &[], Some(&gen2.root));
+        assert!(reads1.contains(&root1) && !reads1.contains(&root2));
+        assert!(reads2.contains(&root2) && !reads2.contains(&root1));
+
+        // Admission is per generation: gen 1 lacks `mem`, gen 2 holds it.
+        let refused = crate::skills_snapshot::admit_refs(
+            Some(gen1.clone()),
+            ["wicked-garden-mem"],
+            &mut |_| {},
+        )
+        .expect_err("gen 1 does not hold mem");
+        assert!(
+            refused.to_string().contains("wicked-garden-mem"),
+            "{refused}"
+        );
+        assert!(crate::skills_snapshot::admit_refs(
+            Some(gen2.clone()),
+            ["wicked-garden-mem"],
+            &mut |_| {}
+        )
+        .unwrap()
+        .is_some_and(|s| s.root == root2));
+
+        assert_eq!(tree_fingerprint(&root1), fp1, "gen 1 was not written into");
+        assert_eq!(tree_fingerprint(&root2), fp2, "gen 2 was not written into");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// END TO END through `run_unit`, the positive half and the negative exclusion: a claude unit
+    /// is launched with the snapshot as its ONE `--plugin-dir`, the stale hand copy the operator's
+    /// template pinned is stripped from the real argv, the directive names the skill in Claude's
+    /// plugin form, and the snapshot tree is byte-identical afterwards. HOME is pinned so the
+    /// deny rules and the ladder resolve deterministically.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapped_claude_unit_is_handed_the_snapshot_and_not_the_stale_hand_copy() {
+        use crate::skills_snapshot::test_support::{snapshot_root, tree_fingerprint};
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "wicked-skills-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let snapshot = snapshot_root(
+            &home.join("snapshots/5"),
+            "5",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("mem", "wicked-garden-mem"),
+            ],
+        );
+        let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let before = tree_fingerprint(&snapshot);
+        // The operator's stop-gap: a hand copy pinned by the template's own --plugin-dir.
+        let stale = home.join(".claude/plugins/wicked-garden");
+        std::fs::create_dir_all(stale.join("skills/domain")).unwrap();
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Captured INSIDE the worktree — the one root a worker may write under any sandbox floor.
+        let argv_file = dir.join("argv.txt");
+        let claude = fake_claude(&home.join("bin"), &argv_file);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "extract the rules");
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        u.assigned_invocation = Some(format!(
+            "{} --plugin-dir {} -p {{PROMPT}}",
+            claude.display(),
+            stale.display()
+        ));
+        let input = StepInput {
+            run_id: "run-skills".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(dir),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: vec![
+                "wicked-garden-domain".to_string(),
+                "wicked-garden-mem".to_string(),
+            ],
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv: Vec<String> = std::fs::read_to_string(&argv_file)
+            .expect("the fake claude ran and recorded its argv")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            plugin_dirs(&argv),
+            vec![snapshot.to_string_lossy().as_ref()],
+            "the real argv carries the snapshot as its ONE --plugin-dir: {argv:?}"
+        );
+        let stale_str = stale.to_string_lossy();
+        assert!(
+            !argv.iter().any(|a| a.contains(stale_str.as_ref())),
+            "the template's stale hand copy must not reach the worker: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|a| a.starts_with(
+                "Invoke your skill \"wicked-garden:domain\" (via the Skill tool) and complete this task under its instructions: extract the rules"
+            )),
+            "the directive names the skill in Claude's plugin form: {argv:?}"
+        );
+        assert_eq!(
+            tree_fingerprint(&snapshot),
+            before,
+            "the snapshot is immutable: the launch wrote nothing into it"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// END TO END through `run_unit`, the refusals: a run whose skill set is not fully held by the
+    /// snapshot is refused BY NAME before any process starts, and an explicit snapshot path that
+    /// is not a snapshot fails the launch as a config error naming the variable and the path —
+    /// never a silent fallback, never a worker told to invoke a skill it cannot have.
+    #[cfg(unix)]
+    #[test]
+    fn a_wrapped_launch_is_refused_by_name_for_a_missing_skill_and_fails_on_a_bad_path() {
+        use crate::skills_snapshot::test_support::snapshot_root;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "wicked-skills-refuse-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let snapshot = snapshot_root(
+            &home.join("snapshots/1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let argv_file = dir.join("argv.txt");
+        let claude = fake_claude(&home.join("bin"), &argv_file);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "extract the rules");
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
+        let input = StepInput {
+            run_id: "run-refuse".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: Some(dir),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            // The run's later phases need skills this unit does not: refused NOW, not at phase 3.
+            required_skills: vec![
+                "wicked-garden-domain".to_string(),
+                "wicked-garden-domain-extractor".to_string(),
+                "wicked-garden-mem".to_string(),
+            ],
+        };
+
+        {
+            let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+            assert!(
+                out.output
+                    .contains("requires: wicked-garden-domain-extractor, wicked-garden-mem;"),
+                "the refusal names exactly the missing skills: {}",
+                out.output
+            );
+            assert!(
+                out.output.contains(&snapshot.to_string_lossy().to_string()),
+                "and the snapshot judged against: {}",
+                out.output
+            );
+            assert!(
+                !argv_file.exists(),
+                "refused BEFORE any process was spawned"
+            );
+        }
+        {
+            let bad = home.join("no-such-snapshot");
+            let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &bad);
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+            assert!(
+                out.output
+                    .contains(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV)
+                    && out.output.contains(&bad.to_string_lossy().to_string())
+                    && out.output.contains("not a usable skills snapshot"),
+                "a bad explicit path is a named config error, not a fallback: {}",
+                out.output
+            );
+            assert!(!argv_file.exists(), "failed BEFORE any process was spawned");
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
@@ -5390,7 +6202,7 @@ mod project_graph_end_to_end_tests {
                 .clone()
                 .expect("a governed unit on a file-backed store must carry a governance context");
             let mut argv = vec!["claude".to_string(), "-p".to_string(), "hi".to_string()];
-            let settings_db = match arm_input_governance(input, &gov, &mut argv) {
+            let settings_db = match arm_input_governance(input, &gov, &mut argv, None) {
                 Ok(_) => {
                     // FIND the mcp-config path rather than indexing a fixed argv slot (Copilot on
                     // #299). The estate server now lives in the `--mcp-config` file (DES-GROUNDING-001

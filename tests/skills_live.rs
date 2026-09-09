@@ -44,6 +44,7 @@ fn a_skill_driven_unit_loads_the_named_skill_against_real_claude() {
         elicitation_epoch: 0,
         process_gen: None,
         launch_seq: 0,
+        required_skills: Vec::new(),
     };
 
     let runner = WrappedCliStepRunner::default();

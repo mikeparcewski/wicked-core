@@ -38,7 +38,7 @@ use crate::command::Command;
 use crate::event::CoreEvent;
 use crate::execute_wrapped::{
     binary_is_claude, build_argv, inject_claude_stream_flags, pty_unit_prompt, resolve_invocation,
-    AdapterOut, ClaudeStreamJson, OutputAdapter,
+    AdapterOut, ClaudeStreamJson, OutputAdapter, SkillForm,
 };
 use crate::terminal;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
@@ -139,16 +139,23 @@ impl PersistentStepRunner {
 
     // ── session argv ──────────────────────────────────────────────────────────
 
+    /// The invocation template a unit's session runs: the unit's own (an ad-hoc launch CLI not in
+    /// the registry), else the registry's for its CLI key. ONE resolution for both the session
+    /// argv and the prompt's skill form (core#396), so the two cannot name different binaries.
+    fn session_invocation(input: &StepInput) -> String {
+        let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+        input
+            .unit
+            .assigned_invocation
+            .clone()
+            .unwrap_or_else(|| resolve_invocation(cli_key))
+    }
+
     /// Build the argv for an **interactive** (multi-turn) CLI session. Like the wrapped-CLI argv
     /// but without `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
     /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
     fn session_argv(input: &StepInput) -> Vec<String> {
-        let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
-        let invocation = input
-            .unit
-            .assigned_invocation
-            .clone()
-            .unwrap_or_else(|| resolve_invocation(cli_key));
+        let invocation = Self::session_invocation(input);
         // Build argv without a real prompt — the placeholder expands to an empty string and the
         // trailing `--` + empty arg are stripped below.
         let mut argv = build_argv(&invocation, "", &input.unit.allowed_skills);
@@ -293,7 +300,10 @@ impl PersistentStepRunner {
         // Line-length is a correctness constraint here, not a nicety: an over-long line is dropped by
         // the terminal with no error, so the alternative to failing now is a turn that waits out its
         // full timeout for output the CLI was never given the chance to produce.
-        let prompt = match pty_unit_prompt(input) {
+        // The directive is spelled for the binary this session runs (core#396) — the same template
+        // resolution `session_argv` opened it with.
+        let form = SkillForm::for_invocation(&Self::session_invocation(input));
+        let prompt = match pty_unit_prompt(input, form) {
             Ok(p) => format!("{p}\n"),
             Err(e) => return failed_output(input, e),
         };
@@ -640,6 +650,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         }
     }
 

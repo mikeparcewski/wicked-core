@@ -5444,6 +5444,11 @@ fn dispatch_unit(
         elicitation_epoch,
         process_gen: Some(process_gen),
         launch_seq,
+        // core#396: the RUN's whole skill set, so the runner refuses a launch whose snapshot lacks
+        // any of them before the FIRST unit does work — not at the unit that needed it. Read off the
+        // units already fetched above (the plan copied each phase's `skill_ref` onto its unit);
+        // the worker holds no store handle, so the set has to ride the input.
+        required_skills: run_required_skills(&units),
     };
 
     // TOOL EXECUTOR: if the unit carries a tool_cmd, bypass the CLI runner entirely.
@@ -5562,6 +5567,20 @@ fn dispatch_unit(
         });
     });
     Ok(true)
+}
+
+/// Every `skill_ref` the run's units name — sorted, deduplicated, empties dropped — for
+/// [`StepInput::required_skills`] (core#396). Pure over the plan the actor already holds.
+fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
+    let mut refs: Vec<String> = units
+        .iter()
+        .filter_map(|u| u.skill_ref.as_deref())
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 /// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
@@ -7691,6 +7710,7 @@ mod deliverable_floor_tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         assert_eq!(
             crate::execute_wrapped::sandbox_for(&probe),

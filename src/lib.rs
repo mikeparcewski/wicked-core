@@ -49,6 +49,7 @@ mod repo;
 mod repo_intel;
 mod scope;
 mod session_runner;
+mod skills_snapshot;
 mod sources;
 mod spawn_audit;
 mod terminal;

@@ -141,6 +141,7 @@ pub fn author_deterministic_validator(
         elicitation_epoch: 0,
         process_gen: None,
         launch_seq: 0,
+        required_skills: Vec::new(),
     };
     let out = runner.run_unit(&input);
     runner.on_run_complete(&run_id);
@@ -1336,6 +1337,7 @@ fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
         elicitation_epoch: 0,
         process_gen: None,
         launch_seq: 0,
+        required_skills: Vec::new(),
     }
 }
 
@@ -1419,6 +1421,7 @@ pub fn triage_failure(
         elicitation_epoch: 0,
         process_gen: None,
         launch_seq: 0,
+        required_skills: Vec::new(),
     };
     let out = runner.run_unit(&input);
     // Drop any session the judge's runner opened under the triage run id.

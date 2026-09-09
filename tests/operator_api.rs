@@ -104,6 +104,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         }
     }
 
