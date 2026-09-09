@@ -236,7 +236,11 @@ Two release tracks share this file, newest entry first regardless of track:
   `tests/skills_live.rs` pins its variables with an RAII guard restored on panic;
   `PersistentStepRunner::exec_turn` resolves the session invocation ONCE and passes it to both
   the argv and the skill form (the docstring's single-resolution guarantee now holds by
-  construction).
+  construction). **Review pass 8 (windows CI on pass 7):** the integration tests compare the
+  generation an engine refusal/event names by canonical IDENTITY (`names_generation`,
+  `refused_snapshot_path` in `tests/support/skills_snapshot_fixture.rs`), never by spelling — the
+  windows runner's `temp_dir()` (an 8.3 short name) and `canonicalize` (which keeps the `\\?\`
+  verbatim prefix) spell one directory differently from the engine's `\\?\`-free canonical form.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

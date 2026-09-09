@@ -12,8 +12,41 @@
 //! and `nested`, and the `views` block), and `skills/<dir>/SKILL.md` whose frontmatter `name` is
 //! the referenced name. Included from a test binary with
 //! `#[path = "support/skills_snapshot_fixture.rs"] mod skills_fixture;`.
+//!
+//! Shared by inclusion, so each binary uses a subset of these helpers — the ones it does not call
+//! are dead code in THAT binary only (`-D warnings` on the windows clippy job otherwise fails the
+//! e2e binary over `refused_snapshot_path`).
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+
+/// Does `reported` — a path the ENGINE spelled in a refusal or an event (its canonical real path
+/// with the Windows `\\?\` verbatim prefix dropped) — name the same directory as `snapshot`, the
+/// fixture's own spelling (`canonicalize` KEEPS the verbatim prefix on Windows, and a runner's
+/// `temp_dir()` may be an 8.3 short name)? Both sides are canonicalized before comparing, so a
+/// test proves the identity of the generation named, never a spelling (review pass 8: the
+/// windows job failed on a raw-string comparison of two spellings of one directory).
+pub fn names_generation(reported: &str, snapshot: &Path) -> bool {
+    match (
+        std::fs::canonicalize(reported),
+        std::fs::canonicalize(snapshot),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The path a skills refusal names as the generation it judged the run against — the text
+/// between `the skills snapshot at ` and ` does not hold` in `SkillsError::Missing`'s wording — or
+/// `None` when the message names no snapshot (a refusal with no root at all).
+pub fn refused_snapshot_path(refusal: &str) -> Option<&str> {
+    const BEFORE: &str = "the skills snapshot at ";
+    const AFTER: &str = " does not hold";
+    let start = refusal.find(BEFORE)? + BEFORE.len();
+    let rest = &refusal[start..];
+    let end = rest.find(AFTER)?;
+    Some(&rest[..end])
+}
 
 /// The catalog's naming convention: a skill named `wicked-garden-<dir>` lives at `skills/<dir>`
 /// (the loader and crew both require the frontmatter name to be the path-derived one).

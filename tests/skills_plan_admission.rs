@@ -201,9 +201,18 @@ fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missi
         .expect("a StepFailed carries the refusal");
     assert!(
         refusal.contains("skills snapshot refused the launch")
-            && refusal.contains("wicked-garden-mem")
-            && refusal.contains(&snapshot.display().to_string()),
-        "the refusal names the missing skill and the snapshot judged against: {refusal}"
+            && refusal.contains("wicked-garden-mem"),
+        "the refusal names the missing skill: {refusal}"
+    );
+    // The generation judged against is compared by IDENTITY (both sides canonicalized), not by
+    // spelling: the engine reports the canonical real path without the Windows `\\?\` prefix,
+    // while the fixture's own spelling keeps it (review pass 8).
+    let named = skills_fixture::refused_snapshot_path(&refusal)
+        .expect("the refusal names the snapshot it judged the run against");
+    assert!(
+        skills_fixture::names_generation(named, &snapshot),
+        "the refusal names the fixture generation: `{named}` vs `{}`",
+        snapshot.display()
     );
     assert!(
         !marker.exists(),
@@ -272,14 +281,19 @@ fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missi
         })
         .collect();
     assert_eq!(
-        handed,
-        vec![(
-            "tool_cmd".to_string(),
-            Some("000001".to_string()),
-            "tool".to_string(),
-            snapshot.to_string_lossy().into_owned(),
-        )],
-        "the admitted plan reports the verified generation it was judged against"
+        handed.len(),
+        1,
+        "one report per tool-command unit: {handed:?}"
+    );
+    let (path, gen, cli, root) = &handed[0];
+    assert_eq!(
+        (path.as_str(), gen.as_deref(), cli.as_str()),
+        ("tool_cmd", Some("000001"), "tool")
+    );
+    assert!(
+        skills_fixture::names_generation(root, &snapshot),
+        "the admitted plan reports the verified generation it was judged against: `{root}` vs `{}`",
+        snapshot.display()
     );
 
     std::env::remove_var("WICKED_SKILLS_SNAPSHOT");

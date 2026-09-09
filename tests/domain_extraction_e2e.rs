@@ -453,7 +453,7 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
             && handed.iter().all(|(path, gen, root)| {
                 path == "tool_cmd"
                     && gen.as_deref() == Some("000001")
-                    && std::path::Path::new(root) == snapshot
+                    && skills_fixture::names_generation(root, &snapshot)
             }),
         "the run's skills were admitted against the fixture generation 000001 at {}: {handed:?}",
         snapshot.display()
@@ -558,7 +558,7 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
             && handed.iter().all(|(path, gen, root)| {
                 path == "tool_cmd"
                     && gen.as_deref() == Some("000001")
-                    && std::path::Path::new(root) == snapshot
+                    && skills_fixture::names_generation(root, &snapshot)
             }),
         "admitted against generation 000001 at {}: {handed:?}",
         snapshot.display()
