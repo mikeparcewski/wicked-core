@@ -102,6 +102,106 @@ fn domain_graph_help_documents_and_writes_nothing() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `rules eval --corpus <file.json>` — core#395 and core#394 through the binary: a markdown doc
+/// carrying `effect: deny` ingests into a scratch store, and a corpus FILE on disk (the documented
+/// `{name, samples}` shape, no import) replays against it — the bad sample is caught, the report
+/// carries `rule_coverage`, and with no knowledge store the hints degrade honestly. Nothing
+/// outside the temp dir is touched: HOME is redirected and the emit spool is hermetic.
+#[test]
+fn rules_eval_replays_a_corpus_file_against_an_effect_bearing_doc() {
+    let dir = std::env::temp_dir().join(format!("wc-eval-file-{}", std::process::id()));
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("git-hygiene.md"),
+        "---\nid: git-hygiene\ntitle: Git hygiene\nsteering_type: development\n\
+         applies_to: [build]\neffect: deny\n---\n\n## Rules\n\n\
+         - POL-060 (critical): Never force-push a shared branch.\n  trigger: push\\s+--force\n",
+    )
+    .unwrap();
+    let corpus = dir.join("corpus.json");
+    std::fs::write(
+        &corpus,
+        r#"{"name": "ours", "samples": [
+          {"id": "wicked-crew@abc1234", "description": "force-pushes main", "kind": "bad",
+           "steering_type": "development",
+           "signals": {"phase": "build", "tool": "Bash", "content": "git push --force origin main"}},
+          {"id": "wicked-crew@def5678", "description": "pushes a fix branch", "kind": "good",
+           "steering_type": "development",
+           "signals": {"phase": "build", "tool": "Bash", "content": "git push origin fix/x"}}
+        ]}"#,
+    )
+    .unwrap();
+    let db = dir.join("rules.db");
+    let db = db.to_str().unwrap();
+    let knowledge = dir.join("no-knowledge.db");
+
+    let ingest = Command::new(bin())
+        .args(["rules", "ingest", docs.to_str().unwrap(), "--db", db])
+        .env("HOME", &dir)
+        .current_dir(&dir)
+        .output()
+        .expect("run wicked-core rules ingest");
+    assert!(
+        ingest.status.success(),
+        "ingest failed: {}{}",
+        String::from_utf8_lossy(&ingest.stdout),
+        String::from_utf8_lossy(&ingest.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args([
+            "rules",
+            "eval",
+            "--db",
+            db,
+            "--corpus",
+            corpus.to_str().unwrap(),
+            "--knowledge-db",
+            knowledge.to_str().unwrap(),
+            "--json",
+        ])
+        .env("HOME", &dir)
+        .current_dir(&dir)
+        .output()
+        .expect("run wicked-core rules eval");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "eval failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json prints the report verbatim");
+    assert_eq!(
+        report["summary"],
+        serde_json::json!({ "total": 2, "caught": 2, "gaps": 0, "false_positives": 0 })
+    );
+    assert_eq!(report["results"][0]["sample"]["id"], "wicked-crew@abc1234");
+    assert_eq!(report["results"][0]["verdict"], "caught");
+    assert_eq!(
+        report["results"][0]["fired"],
+        serde_json::json!(["POL-060"])
+    );
+    assert_eq!(report["results"][1]["verdict"], "caught");
+    assert_eq!(report["results"][1]["fired"], serde_json::json!([]));
+    assert_eq!(report["rule_coverage"]["exercised"], 1);
+    assert_eq!(
+        report["rule_coverage"]["unexercised"],
+        serde_json::json!([])
+    );
+    assert_eq!(report["rule_coverage"]["recall_only"], 0);
+    assert_eq!(
+        report["degraded"], "facet-only",
+        "no knowledge store ⇒ the honest degrade"
+    );
+    assert!(
+        !knowledge.exists(),
+        "a read path never creates a knowledge store"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
 /// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with

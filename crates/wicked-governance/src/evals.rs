@@ -359,10 +359,58 @@ pub struct ImportReceipt {
 pub enum CorpusSource {
     /// The compiled-in `evals/dev-behaviors` corpus.
     Builtin,
-    /// A directory of `*.json` files, each holding one sample or an array of samples.
+    /// A directory of `*.json` corpus files, each in any shape [`CorpusSource::File`] accepts.
     Dir(std::path::PathBuf),
+    /// One `*.json` corpus file on disk: the documented `{ "name", "samples" }` corpus (the
+    /// `POST /testing/corpora/import` body — a corpus authored for crew replays from disk
+    /// unchanged), a bare array of samples, or a single sample. Replays WITHOUT an import: nothing
+    /// is written, and gap hints come from the knowledge store's rule-rationale vectors exactly as
+    /// for every other source.
+    File(std::path::PathBuf),
     /// An estate knowledge-store scope (`evals:<name>`), read from the knowledge db.
     Scope(String),
+}
+
+/// Parse one corpus file (the [`CorpusSource::File`] shapes). The top-level JSON shape picks the
+/// parser — an array is samples, an object with a `samples` key is the corpus object, any other
+/// object is one sample — so the error names the field that is actually wrong instead of the last
+/// shape tried.
+fn read_corpus_file(path: &Path) -> anyhow::Result<Vec<EvalSample>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read eval corpus file {path:?}: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("eval corpus file {path:?} is not JSON: {e}"))?;
+    match value {
+        serde_json::Value::Array(_) => {
+            serde_json::from_value::<Vec<EvalSample>>(value).map_err(|e| {
+                anyhow::anyhow!("eval corpus file {path:?}: invalid sample in array: {e}")
+            })
+        }
+        serde_json::Value::Object(mut corpus) if corpus.contains_key("samples") => {
+            // The documented corpus object. `name` is documentation on disk (the scope is named
+            // at import time, `--import <name>`) and is accepted; any other key is a typo — fail
+            // loud, exactly as an unknown sample field does.
+            corpus.remove("name");
+            let samples = corpus
+                .remove("samples")
+                .expect("checked by the match guard");
+            if let Some(unknown) = corpus.keys().next() {
+                anyhow::bail!(
+                    "eval corpus file {path:?}: unknown corpus key {unknown:?} — a corpus is \
+                     {{\"name\", \"samples\"}}"
+                );
+            }
+            serde_json::from_value::<Vec<EvalSample>>(samples)
+                .map_err(|e| anyhow::anyhow!("eval corpus file {path:?}: invalid `samples`: {e}"))
+        }
+        serde_json::Value::Object(_) => serde_json::from_value::<EvalSample>(value)
+            .map(|one| vec![one])
+            .map_err(|e| anyhow::anyhow!("eval corpus file {path:?} is not a sample: {e}")),
+        _ => anyhow::bail!(
+            "eval corpus file {path:?} must be a {{\"name\", \"samples\"}} corpus, an array of \
+             samples, or one sample"
+        ),
+    }
 }
 
 /// The default knowledge db (`~/.wicked-estate/knowledge.db`) — ALWAYS overridable via
@@ -414,18 +462,17 @@ pub fn load_corpus(
             }
             let mut samples = Vec::new();
             for f in files {
-                let text = std::fs::read_to_string(&f)
-                    .map_err(|e| anyhow::anyhow!("read eval corpus file {f:?}: {e}"))?;
-                // A file is either one sample or an array of samples.
-                match serde_json::from_str::<Vec<EvalSample>>(&text) {
-                    Ok(mut many) => samples.append(&mut many),
-                    Err(_) => match serde_json::from_str::<EvalSample>(&text) {
-                        Ok(one) => samples.push(one),
-                        Err(e) => anyhow::bail!(
-                            "eval corpus file {f:?} is neither a sample nor an array of samples: {e}"
-                        ),
-                    },
-                }
+                samples.extend(read_corpus_file(&f)?);
+            }
+            samples
+        }
+        CorpusSource::File(path) => {
+            if !path.is_file() {
+                anyhow::bail!("eval corpus file {path:?} does not exist");
+            }
+            let samples = read_corpus_file(path)?;
+            if samples.is_empty() {
+                anyhow::bail!("eval corpus file {path:?} holds no samples");
             }
             samples
         }
@@ -1624,6 +1671,139 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("estate scope name"), "{err}");
+    }
+
+    /// A fresh temp dir for on-disk corpus fixtures.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-gov-evals-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `--corpus <file.json>`: one corpus file replays from disk without an import — in the
+    /// documented `{name, samples}` shape (the import body), as a bare array, or as one sample —
+    /// through the same validation every other source gets; a directory of such files reads the
+    /// same shapes.
+    #[test]
+    fn file_corpus_loads_the_documented_corpus_object_an_array_and_one_sample() {
+        let a = sample(
+            "wicked-crew@abc1234",
+            SampleKind::Bad,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push --force origin main",
+        );
+        let b = sample(
+            "wicked-crew@def5678",
+            SampleKind::Good,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "git push origin fix/null-guard",
+        );
+        let dir = temp_dir("file-corpus");
+
+        let corpus = dir.join("corpus.json");
+        let object = serde_json::json!({ "name": "ours", "samples": [&a, &b] });
+        std::fs::write(&corpus, serde_json::to_string(&object).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::File(corpus), None).unwrap(),
+            vec![a.clone(), b.clone()],
+            "the corpus object, in file order"
+        );
+
+        let array = dir.join("array.json");
+        std::fs::write(&array, serde_json::to_string(&[&a, &b]).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::File(array), None).unwrap(),
+            vec![a.clone(), b.clone()]
+        );
+
+        let one = dir.join("one.json");
+        std::fs::write(&one, serde_json::to_string(&a).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::File(one), None).unwrap(),
+            vec![a.clone()]
+        );
+
+        // The directory of all three repeats ids across files — the shared validation refuses it…
+        let err = load_corpus(&CorpusSource::Dir(dir.clone()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate sample id"), "{err}");
+        // …and with only the corpus object left, the Dir source reads the documented shape too.
+        std::fs::remove_file(dir.join("array.json")).unwrap();
+        std::fs::remove_file(dir.join("one.json")).unwrap();
+        assert_eq!(
+            load_corpus(&CorpusSource::Dir(dir), None).unwrap(),
+            vec![a, b]
+        );
+    }
+
+    /// File-corpus malformations fail loud with the path: a missing file, an empty corpus, a
+    /// corpus object with a typo key, an invalid sample inside `samples`, a non-JSON file, a
+    /// scalar top level, and (via the shared sample validation) a blank id.
+    #[test]
+    fn file_corpus_malformations_fail_loud_with_the_path() {
+        let dir = temp_dir("file-corpus-bad");
+        let missing = dir.join("missing.json");
+        let err = load_corpus(&CorpusSource::File(missing), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing.json") && err.contains("does not exist"),
+            "{err}"
+        );
+
+        let cases: [(&str, &str, &str); 5] = [
+            ("empty.json", "[]", "holds no samples"),
+            (
+                "typo-key.json",
+                r#"{"nam": "x", "samples": []}"#,
+                "unknown corpus key \"nam\"",
+            ),
+            (
+                "bad-sample.json",
+                r#"{"name": "x", "samples": [{"id": "s1", "kind": "bad"}]}"#,
+                "invalid `samples`",
+            ),
+            ("not-json.json", "{", "is not JSON"),
+            ("scalar.json", "42", "must be a"),
+        ];
+        for (name, text, needle) in cases {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            let err = load_corpus(&CorpusSource::File(path), None)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(name), "{name}: names the file: {err}");
+            assert!(
+                err.contains(needle),
+                "{name}: expected {needle:?} in: {err}"
+            );
+        }
+
+        let mut blank = sample(
+            "dev-a",
+            SampleKind::Good,
+            "development",
+            "build",
+            "Bash",
+            &[],
+            "ok",
+        );
+        blank.id = "  ".into();
+        let path = dir.join("blank-id.json");
+        let object = serde_json::json!({ "name": "x", "samples": [blank] });
+        std::fs::write(&path, serde_json::to_string(&object).unwrap()).unwrap();
+        let err = load_corpus(&CorpusSource::File(path), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blank id"), "{err}");
     }
 
     /// A frontmattered doc under a fresh temp dir, ingested through the markdown lane — the

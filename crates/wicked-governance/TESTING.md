@@ -196,6 +196,12 @@ and your own effect-bearing rules are where eval value compounds.
   configured estate knowledge store.
 - The **built-in dev-behaviors corpus needs no store at all** — it ships in the binary and
   is selected by omission.
+- **A corpus file on disk replays without an import** — `--corpus path/to/corpus.json` (the
+  `{ name, samples }` shape from § The sample format, or a bare array of samples; a directory
+  of such files works too). Nothing is written anywhere; gap hints come from the knowledge
+  store's rule-rationale vectors exactly as for every other source. This is how a
+  script-derived corpus (samples generated from a repo's history, say) runs against a scratch
+  store — no import step, and the file itself is the corpus identity you pin.
 - The import receipt says what actually happened: `imported` (sample count), `scope`
   (`evals:<name>` — the string you pass back as `corpus` to run against it), and
   `embedded` (`false` = stored fine, but no embedding path was available — runs against
@@ -226,14 +232,14 @@ posture as everywhere else in steering.
 ## Run it — CLI
 
 ```sh
-wicked-core rules eval [--type <steering-type>] [--corpus <scope>] \
+wicked-core rules eval [--type <steering-type>] [--corpus <scope | corpus.json | dir>] \
     [--knowledge-db <F>] [--db <path>] [--json]
 ```
 
 | Flag | Meaning |
 |---|---|
 | `--type` | evaluate only samples of one steering type (`architecture\|development\|security\|testing\|operations\|compliance\|design-ux`) |
-| `--corpus` | the estate scope of an imported corpus (`evals:<name>`); **omitted = the built-in dev-behaviors corpus** |
+| `--corpus` | the estate scope of an imported corpus (`evals:<name>`), a corpus `*.json` file on disk (the `{ name, samples }` shape from § The sample format, or a bare array of samples — replays without importing), or a directory of such files; **omitted = the built-in dev-behaviors corpus** |
 | `--knowledge-db` | the knowledge store holding imported corpora + embeddings; default `~/.wicked-estate/knowledge.db` |
 | `--db` | the rule store the samples replay against (else `$WICKED_ESTATE_DB`, else `./wicked-estate.db` — the CLI-wide default) |
 | `--json` | emit the full report (the same serde output crew returns verbatim); default is the human summary |

@@ -30,6 +30,9 @@ Two release tracks share this file, newest entry first regardless of track:
   invisible to `summary.gaps`), plus the count of effect-less rules the eval structurally
   cannot measure. `rules eval` prints the block and warns when nothing is decide-lane. Public
   wire shape change (additive) — crew/studio consume it via the next core-ts release.
+  `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
+  (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
+  corpus replays against a scratch store without an import (`CorpusSource::File`).
 - **core-ts 0.7.16** — run-provenance env: wicked-core stamps `WICKED_RUN_ID`, `WICKED_RUN_UNIT`, and `WICKED_RUN_AGENT` into the worker's estate-mcp launch env (both carriers) so proposal.submit (DES-MEM-FACETED-001) attributes proposals to the run/unit/agent.
 - **core-ts 0.7.15** — npm release carrying DES-GROUNDING-001 + gov-008 Boundary 1: governed workers
   now ground in the wicked-estate index — the estate MCP is loaded via `--mcp-config` (not the inert
