@@ -130,7 +130,11 @@ fn marker_cmd(marker: &std::path::Path) -> Vec<String> {
         // Windows CI on 4ead6aa). The runner's temp path carries no spaces.
         vec!["cmd".into(), "/c".into(), format!("echo ran > {spelled}")]
     } else {
-        vec!["sh".into(), "-c".into(), format!("echo ran > \"{spelled}\"")]
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo ran > \"{spelled}\""),
+        ]
     }
 }
 
