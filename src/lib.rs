@@ -57,6 +57,22 @@ mod validator;
 mod validator_vault;
 mod workflow;
 
+/// The ONE lock every test in this binary takes before touching process-global environment.
+///
+/// `cargo test` runs a crate's tests on many threads in one process, and environment variables
+/// are process-global: an unsynchronized `set_var` is a flake generator at best and UB on POSIX
+/// at worst. Each module used to keep its OWN lock, which serialized its tests against each
+/// other and against nothing else — `execute_wrapped` pinning `HOME` or `WICKED_SKILLS_SNAPSHOT`
+/// could still race an `acp_runner` test resolving the same variables mid-spawn. A crate-wide
+/// lock closes that: tests that MUTATE hold `write()`; tests that only READ a variable a
+/// mutator might change (a real spawn resolving `HOME`/`WICKED_WORKER_HOME`) hold `read()`.
+/// Poison-tolerant on purpose (`unwrap_or_else(|p| p.into_inner())`): one panicking test must not
+/// cascade.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+}
+
 pub use acp_runner::AcpStepRunner;
 pub use actor::{RunBusy, RunExists};
 pub use applications::{

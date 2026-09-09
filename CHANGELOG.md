@@ -15,21 +15,42 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
-- **Skills snapshot on both worker paths (#396)** — the engine consumes exactly one skills input,
-  `WICKED_SKILLS_SNAPSHOT` (the concrete path of a crew-published, immutable garden-shaped plugin
-  root), and hands it to each worker through the mechanism its CLI has, copying nothing: Claude over
-  ACP gets it in `session/new` as `_meta.claudeCode.options.plugins = [{type:"local", path}]`
-  (merged into the existing options); wrapped Claude gets exactly one `--plugin-dir <snapshot>`,
-  with any `--plugin-dir` a `clis.toml` template carried stripped and logged as superseded. The
-  snapshot joins the READ roots on both governance carriers (never a write root). The skill
-  directive is CLI-aware (`wicked-garden:<dir>` + the Skill-tool clause for Claude; the mirrored
-  frontmatter name, no Skill-tool clause, for codex/pi/opencode/copilot). Degradation ladder: env
-  unset → the live installed plugin cache with a `skills.fallback` log (never the hand copy);
-  explicit path invalid → the launch fails as a config error; a run whose `skill_ref`s (plan-wide,
-  via `StepInput.required_skills`) are missing from the snapshot is refused naming them. A
-  `current`-style symlink is pinned to its concrete generation at load. New `CoreEvent::
-  SkillsSnapshotHanded` (`skillsSnapshotHanded`: session/ord/attempt/path/cli/gen/contentHash/root/
-  source) reports the generation each launch used so crew can reap old generations safely.
+- **Skills snapshot on both worker paths (#396)** — the engine consumes one skills input,
+  `WICKED_SKILLS_SNAPSHOT` (the ABSOLUTE path of a crew-published, immutable garden-shaped plugin
+  root; pinned to its canonical real path — relative paths and ancestor symlinks are config errors,
+  a final-component link such as crew's `current` is followed once at load), and hands it to each
+  worker through the mechanism its CLI has, copying nothing: Claude over ACP gets it in
+  `session/new` as `_meta.claudeCode.options.plugins = [{type:"local", path}]` (merged into the
+  existing options) and the snapshot is BOUND to the cached session — every later turn of that
+  session prompts, admits, read-widens and reports against the generation it was opened with, never
+  a re-resolved `current`; wrapped Claude gets exactly one `--plugin-dir <snapshot>`, and any
+  `--plugin-dir` a `clis.toml` template carries is stripped ALWAYS (snapshot or not) with a logged
+  notice — a template is not a skills input. The snapshot joins the READ roots on both governance
+  carriers (never a write root), and the `Read` deny fence is CARVED around it (`deny_rules_for`):
+  the default location sits under `~/.wicked-crew`, which the fence denies and whose deny would beat
+  any allow, so the fence now enumerates the worker-state siblings on the path down to the snapshot
+  (store, log, `effective/`, other generations, `current`) individually while `Edit`/`Write` keep the
+  blanket rule. The published index is VERIFIED at load (every `skills/<dir>/SKILL.md` exists, is a
+  regular file reached without symlink components, is readable, and its frontmatter `name` matches;
+  `portable` is required; all defects are listed in one error); the live-cache fallback skips a
+  nameless `SKILL.md` with a `skills.notice` instead of deriving an identity. Admission expands the
+  run's `skill_ref`s (plan-wide via `StepInput.required_skills`) through transitive frontmatter/index
+  `mandates`, refuses a missing skill of ANY family by name (no family is exempt — the snapshot is the
+  worker's only skills source), refuses a NESTED skill for a Claude seat (Claude Code discovers plugin
+  skills one directory deep and names them by directory — verified against the live roster: 92/92
+  top-level garden dirs, 0/50 nested — so no nested identity is invented) and refuses a
+  `portable: false` skill for every non-Claude seat. The skill directive is CLI-aware
+  (`wicked-garden:<top-level dir>` + the Skill-tool clause for Claude; the mirrored frontmatter name,
+  no Skill-tool clause, for codex/pi/opencode/copilot). Degradation ladder: `WICKED_SKILLS_SNAPSHOT`
+  unset → `WICKED_SKILLS_CURRENT` (crew's `current` pointer; loaded strictly when it resolves, logged
+  and skipped when it points at nothing yet) → the live installed plugin cache with a
+  `skills.fallback` log (never the hand copy); a set-but-EMPTY variable is a config error, not
+  "unset"; an explicit path that is not a valid snapshot fails the launch as a config error. New
+  `CoreEvent::SkillsSnapshotHanded` (`skillsSnapshotHanded`: session/ord/attempt/path/cli/gen/
+  contentHash/root/source) reports the generation each launch used so crew can reap old generations
+  safely. Tests: env mutation across the crate serializes on one crate-wide lock; the ladder's tests
+  compare paths as `Path`s (the Windows separator-spelling failure); two-generation concurrency is
+  exercised with barrier-released threads on both carriers.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

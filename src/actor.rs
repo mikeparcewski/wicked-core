@@ -647,12 +647,10 @@ mod wal_checkpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Serializes the knob-mutating test against anything else in this binary that touches
-    /// process-global env — the same rule as `execute_wrapped::tests::ENV_LOCK` (env vars are
-    /// process-global and cargo runs tests on many threads; an unsynchronized `set_var` is a
-    /// flake generator at best and UB on POSIX at worst). Poison-tolerant on purpose: one
-    /// panicking test must not cascade.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Serializes the knob-mutating test against anything else in this BINARY that touches
+    // process-global env — the crate-wide lock (`crate::test_env`), not a module-local one: env
+    // vars are process-global and cargo runs every module's tests on many threads.
+    use crate::test_env::ENV_LOCK;
 
     /// RAII restore of the process-global knob: captures the current value up front and restores
     /// the original (or unsets it) on drop — INCLUDING a panic unwind. Declared AFTER the lock
@@ -685,7 +683,7 @@ mod wal_checkpoint_tests {
     /// and restored by the [`KnobGuard`] RAII even on a panicking assertion.
     #[test]
     fn wal_checkpoint_min_interval_honors_the_env_knob() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _restore = KnobGuard::capture();
         KnobGuard::unset();
         assert_eq!(
@@ -5569,8 +5567,15 @@ fn dispatch_unit(
     Ok(true)
 }
 
-/// Every `skill_ref` the run's units name — sorted, deduplicated, empties dropped — for
-/// [`StepInput::required_skills`] (core#396). Pure over the plan the actor already holds.
+/// Every `skill_ref` the run's units name — sorted, deduplicated, empties dropped, of EVERY
+/// family — for [`StepInput::required_skills`] (core#396). Pure over the plan the actor already
+/// holds: `units` are the run's planned units, so refs from a crew-generated workflow def are
+/// here exactly like refs from a shipped one (they are units of this run either way). The
+/// transitive `mandates` closure is NOT expanded here — the actor holds no skills snapshot, and
+/// mandates are declared in each skill's frontmatter inside it — but at admission
+/// (`skills_snapshot::admit_refs`, which has the snapshot in hand), where a missing mandate is
+/// refused by its own name. No family is filtered out: the snapshot is the worker's only skills
+/// source, so a ref it does not hold is a refusal whatever its prefix, not a notice.
 fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
     let mut refs: Vec<String> = units
         .iter()

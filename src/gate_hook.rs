@@ -2791,12 +2791,14 @@ mod boundary_tests {
     use super::*;
     use serde_json::json;
 
-    /// Env is process-global and Rust runs tests in threads, so these serialize on one mutex.
-    /// Without it, two tests setting WICKED_WRITE_ROOTS race and the failure looks like a logic bug.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env is process-global and Rust runs tests in threads, so these serialize on the CRATE-WIDE
+    // lock (`crate::test_env`). Without it, two tests setting WICKED_WRITE_ROOTS race and the
+    // failure looks like a logic bug — and a module-local lock would leave the race open against
+    // every other module's env-mutating tests.
+    use crate::test_env::ENV_LOCK as ENV;
 
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV.write().unwrap_or_else(|e| e.into_inner());
         match write {
             Some(w) => std::env::set_var(WRITE_ROOTS_ENV, w),
             None => std::env::remove_var(WRITE_ROOTS_ENV),
@@ -3543,7 +3545,7 @@ mod boundary_tests {
     fn a_non_utf8_worktree_still_has_a_boundary() {
         use std::os::unix::ffi::OsStrExt;
         let raw = std::ffi::OsStr::from_bytes(b"/tmp/wicked-\xff-wt");
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV.write().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(WRITE_ROOTS_ENV, raw);
         std::env::remove_var(READ_ROOTS_ENV);
         let roots = allowed_roots_from_env();

@@ -850,6 +850,13 @@ struct AcpProcess {
     /// session is cached and reused across turns — and read by the caller to emit exactly one
     /// `SandboxUnenforced` disclosure per spawn. `None` when the floor armed OR the flag was OFF.
     sandbox_downgrade: Option<(String, String)>,
+    /// (core#396) The skills snapshot this session was OPENED with — the plugin the bridge loaded
+    /// at `session/new` — bound to the process for its lifetime. Every later turn of the cached
+    /// session prompts, admits, read-widens and reports against THIS generation, never against a
+    /// re-resolved `current`: the process holds the plugin it loaded, and a snapshot resolved
+    /// mid-session would describe a generation this bridge never saw. `None` when no snapshot was
+    /// handed (a chat session, a non-claude seat, or no root on the ladder).
+    skills: Option<crate::skills_snapshot::SkillsSnapshot>,
 }
 
 impl Drop for AcpProcess {
@@ -1149,12 +1156,16 @@ pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// `inherit_operator` is [`crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`]'s presence,
 /// read at the call site: the SAME opt-in escape hatch as the wrapped path, because two
 /// opt-outs for one boundary is how one of them silently stops working. Parameterised so both
-/// branches are testable without mutating the test process's environment.
-fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std::path::PathBuf>> {
+/// branches are testable without mutating the test process's environment. `skills_plugin` is the
+/// snapshot this spawn hands over (core#396): the worker home's deny fence is carved around it.
+fn worker_claude_config_dir(
+    inherit_operator: bool,
+    skills_plugin: Option<&std::path::Path>,
+) -> Option<anyhow::Result<std::path::PathBuf>> {
     if inherit_operator {
         return None;
     }
-    Some(ensure_worker_config_home())
+    Some(ensure_worker_config_home(skills_plugin))
 }
 
 /// Mint a fresh, engine-owned config directory for ONE ACP spawn.
@@ -1217,7 +1228,9 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 /// racing on the same home can interleave remove/write on `settings.json` into a spurious
 /// NotFound failure (caught by the 8-simultaneous-starts gate test on macOS CI). The critical
 /// section is a handful of fs ops; contention is bounded by the start gate anyway.
-fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
+fn ensure_worker_config_home(
+    skills_plugin: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
     static ENSURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = ENSURE.lock().unwrap_or_else(|p| p.into_inner());
     let dir = worker_config_home()?;
@@ -1258,8 +1271,11 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
     // first so the write can never travel through a link.
     let settings_path = dir.join("settings.json");
     remove_entry_no_follow(&settings_path)?;
+    // The SAME fence the wrapped path ships, carved around the skills snapshot this spawn hands
+    // over (core#396): the default snapshot location is under `~/.wicked-crew`, which the fence
+    // denies, and Claude's deny beats allow — see `execute_wrapped::deny_rules_for`.
     let settings = json!({
-        "permissions": { "deny": crate::execute_wrapped::deny_rules() }
+        "permissions": { "deny": crate::execute_wrapped::deny_rules_for(skills_plugin) }
     });
     std::fs::write(&settings_path, serde_json::to_vec(&settings)?)?;
     Ok(dir)
@@ -1457,17 +1473,19 @@ fn start_acp_process_with_write_roots(
     // that proceeded without the override would run under the operator's own configuration,
     // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
     // carries its own isolation.
-    let worker_config_dir =
-        match worker_claude_config_dir(crate::execute_wrapped::inherits_operator_config()) {
-            None => None,
-            Some(Ok(dir)) => Some(dir),
-            Some(Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+    let worker_config_dir = match worker_claude_config_dir(
+        crate::execute_wrapped::inherits_operator_config(),
+        skills_plugin,
+    ) {
+        None => None,
+        Some(Ok(dir)) => Some(dir),
+        Some(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
                  under the operator's own CLI configuration (FINDING-061)"
-                ))
-            }
-        };
+            ))
+        }
+    };
     // Computed ONCE per spawn — not re-probed per turn — because the session this spawn starts
     // is cached and reused across every turn of its lifetime (`probe_cached_session`); "the same
     // resolved ACP binary that is spawned" means the binary this exact process came from, so the
@@ -1849,6 +1867,9 @@ fn start_acp_process_with_write_roots(
         elicitation_advertised: form_enabled,
         governance_verified,
         sandbox_downgrade,
+        // Bound by the unit runner right after the spawn (it holds the admitted snapshot; this
+        // chokepoint only knows the path it put in the handshake).
+        skills: None,
     })
 }
 
@@ -4064,11 +4085,25 @@ impl AcpStepRunner {
             .unwrap_or("claude")
             .to_string();
 
+        // The seat's registry record, read ONCE for this turn: its `binary` decides whether this
+        // is a claude seat — the only one the plugin handshake and the Claude directive form apply
+        // to (`binary_is_claude`, the same test the wrapped runner applies to its template), and
+        // the identity the skills admission judges for — and its `[cli.acp]` table decides the
+        // transport and admission below. An unregistered key is its own binary, exactly as
+        // `resolve_invocation` treats it.
+        let seat = registry_record(&cli_key);
+        let seat_is_claude = crate::execute_wrapped::binary_is_claude(
+            seat.as_ref()
+                .map_or(cli_key.as_str(), |c| c.binary.as_str()),
+        );
+        let worker_cli = crate::skills_snapshot::WorkerCli::for_seat(seat_is_claude, &cli_key);
         // core#396: admit the launch against the skills snapshot FIRST — before the operator
         // messages below are consumed (at-most-once) and before any session is opened. The run's
-        // whole skill set must be present or the unit is REFUSED by name; the root it resolves is
-        // what the directive, the `session/new` plugin handshake, and the read carrier all use.
-        let skills = match crate::skills_snapshot::admit_unit(input) {
+        // whole skill set (transitive mandates included) must be present and loadable by THIS
+        // seat, or the unit is REFUSED by name; the root it resolves is what a NEW session's
+        // directive, `session/new` plugin handshake and read carrier use — a REUSED session is
+        // re-judged against the snapshot it was opened with, below.
+        let skills = match crate::skills_snapshot::admit_unit(input, &worker_cli) {
             Ok(s) => s,
             Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
         };
@@ -4079,16 +4114,6 @@ impl AcpStepRunner {
             !crate::execute_wrapped::is_engine_internal(&input.unit)
                 || input.unit.skill_ref.is_some()
         });
-        // The seat's registry record, read ONCE for this turn: its `binary` decides whether this
-        // is a claude seat — the only one the plugin handshake and the Claude directive form apply
-        // to (`binary_is_claude`, the same test the wrapped runner applies to its template) — and
-        // its `[cli.acp]` table decides the transport and admission below. An unregistered key is
-        // its own binary, exactly as `resolve_invocation` treats it.
-        let seat = registry_record(&cli_key);
-        let seat_is_claude = crate::execute_wrapped::binary_is_claude(
-            seat.as_ref()
-                .map_or(cli_key.as_str(), |c| c.binary.as_str()),
-        );
         let skill_form = SkillForm::for_claude(seat_is_claude);
         let skills_plugin = handed.filter(|_| seat_is_claude);
 
@@ -4182,7 +4207,7 @@ impl AcpStepRunner {
         let acp_admitted = acp_cfg_probe
             .as_ref()
             .is_some_and(|c| c.acp_input_governance);
-        let gate_ctx = match (&input.governance, acp_admitted) {
+        let mut gate_ctx = match (&input.governance, acp_admitted) {
             (Some(g), true) => {
                 let scope =
                     crate::scope::resolve_scope(input.entity_mode, &input.run_id, &input.unit.id);
@@ -4314,11 +4339,15 @@ impl AcpStepRunner {
         // immediately without re-attempting spawn (avoids repeated warnings per run).
         // A cached session is liveness-probed first (crew#340): a bridge SIGKILLed
         // between turns is purged and replaced by a fresh spawn, never written into.
-        let proc_arc: Arc<Mutex<AcpProcess>> = match self.probe_cached_session(&session_key) {
+        // `reused` ⇒ the session was opened by an earlier turn and carries the snapshot it was
+        // opened with (core#396) — see the binding below the match.
+        let (proc_arc, reused): (Arc<Mutex<AcpProcess>>, bool) = match self
+            .probe_cached_session(&session_key)
+        {
             SessionProbe::FailedStartup => {
                 return self.fallback.run_unit_streaming(input, emit);
             }
-            SessionProbe::Live(arc) => arc,
+            SessionProbe::Live(arc) => (arc, true),
             SessionProbe::Vacant => {
                 // The SAME cwd the boundary was built from (core#260) — worktree, else the
                 // per-run sandbox. The old `current_dir()` fallback ran repo-less units in the
@@ -4373,7 +4402,11 @@ impl AcpStepRunner {
                     &estate_provenance,
                     skills_plugin.map(|s| s.root.as_path()),
                 ) {
-                    Ok(proc) => {
+                    Ok(mut proc) => {
+                        // core#396: BIND the admitted snapshot to the process it was handed to.
+                        // From here on this session's turns are judged against it, not against
+                        // whatever `current` resolves to later.
+                        proc.skills = handed.cloned();
                         let acp_session_id = proc.session_id.clone();
                         // A1: captured before `proc` moves into the Arc so the once-per-spawn
                         // `SandboxUnenforced` disclosure can be emitted in the `did_insert` arm.
@@ -4446,7 +4479,9 @@ impl AcpStepRunner {
                                 });
                             }
                         }
-                        result
+                        // A racing turn may have inserted its own process first (`did_insert`
+                        // false): that session is the one reused, with ITS bound snapshot.
+                        (result, !did_insert)
                     }
                     Err(e) => {
                         let reason = format!(
@@ -4470,7 +4505,44 @@ impl AcpStepRunner {
         };
 
         let mut proc = proc_arc.lock().unwrap_or_else(|p| p.into_inner());
-        let prompt = unit_prompt(input, skill_form, handed);
+        // core#396: the snapshot THIS SESSION was opened with is the one every turn of it uses —
+        // for the prompt, the read boundary, admission and generation reporting. The bridge holds
+        // the plugin it loaded at `session/new`; a `current` re-resolved mid-session would describe
+        // a generation this process never loaded, so a REUSED session is re-admitted against its
+        // own snapshot (the run may have advanced to a unit needing a skill that generation lacks
+        // — refuse it by name rather than prompt for it), the governance boundary's read roots are
+        // rebuilt from the same root, and the generation is reported as the one in use.
+        let bound: Option<crate::skills_snapshot::SkillsSnapshot> = if reused {
+            proc.skills.clone()
+        } else {
+            handed.cloned()
+        };
+        if reused {
+            if let Err(e) = crate::skills_snapshot::admit_refs(
+                bound.clone(),
+                crate::skills_snapshot::unit_skill_refs(input),
+                &worker_cli,
+            ) {
+                drop(proc);
+                return crate::execute_wrapped::skills_refusal(input, &e);
+            }
+            if let (Some((_, _, _, _, boundary)), Some(g)) =
+                (gate_ctx.as_mut(), input.governance.as_ref())
+            {
+                boundary.roots.read = crate::execute_wrapped::assemble_read_roots(
+                    g.code_graph_db.as_deref(),
+                    &g.extra_read_roots,
+                    bound.as_ref().map(|s| s.root.as_path()),
+                );
+            }
+            if let Some(s) = bound.as_ref().filter(|_| seat_is_claude) {
+                s.report(&format!(
+                    "path=acp run={run_id} cli={cli_key} unit={} reused=true",
+                    input.unit.ord
+                ));
+            }
+        }
+        let prompt = unit_prompt(input, skill_form, bound.as_ref());
 
         // A statically-admitted seat (`gate_ctx.is_some()`) can still fail its per-process
         // version pin (`AcpProcess::governance_verified`, computed once at spawn — DES-INPUT-
@@ -4849,15 +4921,16 @@ mod tests {
     };
     use crate::workflow::StepStatus;
 
-    /// Guards process-global env (WICKED_WORKER_HOME) — cargo runs tests in one process, in
-    /// parallel. Same pattern as execute_wrapped's ENV_LOCK, plus a READ side (core#285):
-    /// tests that MUTATE the variable hold `write()`; tests that drive a REAL
-    /// `start_acp_process` hold `read()` across the start, because the spawn resolves the
-    /// ambient variable mid-call (`ensure_worker_config_home`). Without the read side, a start
-    /// landing inside a mutator's window resolves the MUTATOR's fixture home — the
-    /// symlink-refusal fixture, in the flake that motivated this — and trips the FINDING-061
-    /// guard. Lock order everywhere: ENV_LOCK before REAL_STARTS.
-    static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+    // Guards process-global env (WICKED_WORKER_HOME, HOME, WICKED_SKILLS_SNAPSHOT) — cargo runs
+    // tests in one process, in parallel. The CRATE-WIDE lock (`crate::test_env`), shared with
+    // execute_wrapped's, actor's, validator's and gate_hook's env-mutating tests: tests that
+    // MUTATE a variable hold `write()`; tests that drive a REAL `start_acp_process` hold `read()`
+    // across the start, because the spawn resolves the ambient variables mid-call
+    // (`ensure_worker_config_home`, the skills ladder). Without the read side, a start landing
+    // inside a mutator's window resolves the MUTATOR's fixture home — the symlink-refusal
+    // fixture, in the flake that motivated this (core#285) — and trips the FINDING-061 guard.
+    // Lock order everywhere: ENV_LOCK before REAL_STARTS.
+    use crate::test_env::ENV_LOCK;
 
     /// A fresh base dir for a worker-home fixture. Keyed by test name + pid + a process-wide
     /// counter — NEVER by `ThreadId` (core#285): the harness pools test threads, so a
@@ -5054,8 +5127,8 @@ mod tests {
         let base = worker_home_base("stable");
         std::env::set_var("WICKED_WORKER_HOME", &base);
 
-        let a = ensure_worker_config_home().expect("first ensure");
-        let b = ensure_worker_config_home().expect("second ensure");
+        let a = ensure_worker_config_home(None).expect("first ensure");
+        let b = ensure_worker_config_home(None).expect("second ensure");
         assert_eq!(
             a, b,
             "one persistent home, not per-spawn dirs — the login must stick"
@@ -5074,7 +5147,7 @@ mod tests {
         std::fs::write(a.join(".credentials.json"), "{\"token\":\"keep-me\"}").unwrap();
         std::fs::write(a.join(".claude.json"), "{\"oauthAccount\":{}}").unwrap();
 
-        let c = ensure_worker_config_home().expect("re-ensure sanitizes");
+        let c = ensure_worker_config_home(None).expect("re-ensure sanitizes");
         assert_eq!(c, a);
         assert!(
             !a.join("hooks").exists(),
@@ -5110,7 +5183,7 @@ mod tests {
         let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let base = worker_home_base("plant");
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        let home = ensure_worker_config_home().expect("first ensure");
+        let home = ensure_worker_config_home(None).expect("first ensure");
 
         // The victims a malicious worker would aim at.
         let victim_dir = base.join("victim-dir");
@@ -5124,7 +5197,7 @@ mod tests {
         std::fs::remove_file(home.join("settings.json")).unwrap();
         std::os::unix::fs::symlink(&victim_file, home.join("settings.json")).unwrap();
 
-        ensure_worker_config_home().expect("re-ensure sanitizes the plants");
+        ensure_worker_config_home(None).expect("re-ensure sanitizes the plants");
 
         assert!(
             victim_dir.join("precious.txt").exists(),
@@ -5158,7 +5231,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, base.join("claude")).unwrap();
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        let err = ensure_worker_config_home().expect_err("symlinked home must be refused");
+        let err = ensure_worker_config_home(None).expect_err("symlinked home must be refused");
         assert!(err.to_string().contains("symlink"), "{err}");
         restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
@@ -5185,7 +5258,7 @@ mod tests {
             "the pre-main ctor must have armed the worker-home override (and every fixture must \
              RESTORE it, never remove it)"
         );
-        let resolved = ensure_worker_config_home().expect("ensure resolves the armed base");
+        let resolved = ensure_worker_config_home(None).expect("ensure resolves the armed base");
         assert_eq!(resolved, armed.join("claude"));
         assert!(
             resolved.starts_with(std::env::temp_dir()),
@@ -6778,7 +6851,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
 read new
 printf '%s\n' "$new" > "{ledger}"
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"skills"}}}}'
-sleep 30
+cat >/dev/null
 "#,
                 ledger = ledger.display()
             ),
@@ -6824,6 +6897,311 @@ sleep 30
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A multi-turn RECORDING bridge for `run_unit`-level tests: answers `initialize`; answers
+    /// `session/new` and appends its params to the ledger (`{"new": …}`); answers every
+    /// `session/prompt` with `end_turn` and appends the prompt's text (`{"prompt": …}`); any other
+    /// request gets a JSON-RPC error. Exits on stdin EOF — no sleeps: the process lives exactly as
+    /// long as the engine keeps its stdin open.
+    #[cfg(unix)]
+    fn write_recording_bridge(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("recording-bridge");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json
+ledger = sys.argv[1]
+
+def w(obj):
+    print(json.dumps(obj), flush=True)
+
+def record(entry):
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    method = req.get("method")
+    if method == "initialize":
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "serverInfo": {"name": "recording", "version": "0"}}})
+    elif method == "session/new":
+        record({"new": req.get("params")})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "sessionId": "recording-session", "protocolVersion": "2025-03-26"}})
+    elif method == "session/prompt":
+        blocks = (req.get("params") or {}).get("prompt") or []
+        text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+        record({"prompt": text})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}}})
+    elif "id" in req and method:
+        w({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "unknown"}})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// core#396, the ACP session BINDING — end to end through `run_unit` against the recording
+    /// bridge, with `WICKED_SKILLS_SNAPSHOT` pointing at crew's `current` link:
+    ///
+    /// 1. turn 1 of run A opens the session on generation 1 — the `session/new` frame names gen 1's
+    ///    root, and the directive is DISCOVERED from gen 1's index;
+    /// 2. crew publishes generation 2 and flips `current`;
+    /// 3. turn 2 of run A — the SAME cached session — still prompts from gen 1's index (the skill
+    ///    `wicked-garden-mem` lives at `mem` in gen 1 and at `mem-v2` in gen 2, so the directive
+    ///    says `wicked-garden:mem`), still ADMITS against gen 1 (turn 3 names a skill only gen 2
+    ///    holds and is refused naming gen 1's root — never reaching the bridge), and reports gen 1
+    ///    only;
+    /// 4. a NEW run B, spawned after the flip, gets gen 2 — and its first turn runs CONCURRENTLY
+    ///    with run A's next turn (barrier-released threads on the shared runner): two live
+    ///    sessions on two generations, each prompting from its own index, one bridge each.
+    ///
+    /// Generation reporting: exactly one `SkillsSnapshotHanded` per session — (A, gen 1) and
+    /// (B, gen 2) — and no event ever names (A, gen 2). The read-boundary surface of the binding
+    /// is the same `bound` root fed to `assemble_read_roots` (see `exec_turn_inner`); ungoverned
+    /// units carry no boundary, so it is not observable through this bridge.
+    #[test]
+    #[cfg(unix)]
+    fn a_cached_acp_session_keeps_the_generation_it_was_opened_with_across_a_current_flip() {
+        use crate::skills_snapshot::test_support::{scratch as canonical_scratch, snapshot_root};
+        use crate::workflow::{StepInput, StepRunner};
+        struct EnvPin {
+            key: &'static str,
+            prev: Option<std::ffi::OsString>,
+        }
+        impl EnvPin {
+            fn set(key: &'static str, value: &std::path::Path) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, prev }
+            }
+        }
+        impl Drop for EnvPin {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+        fn ledger_entries(path: &std::path::Path) -> Vec<Value> {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("ledger line is JSON"))
+                .collect()
+        }
+
+        // ENV_LOCK (write: HOME and the snapshot variable are pinned) before REAL_STARTS — the
+        // module's lock order. Pins are declared AFTER the lock guards so they restore first.
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-bind");
+        let _home = EnvPin::set("HOME", &home);
+        let skills = home.join(".wicked-crew").join("skills");
+        let gen1 = snapshot_root(
+            &skills.join("snapshots").join("1"),
+            "1",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("mem", "wicked-garden-mem"),
+            ],
+        );
+        let gen2 = snapshot_root(
+            &skills.join("snapshots").join("2"),
+            "2",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("mem-v2", "wicked-garden-mem"),
+                ("search", "wicked-garden-search"),
+            ],
+        );
+        let current = skills.join("current");
+        std::os::unix::fs::symlink("snapshots/1", &current).unwrap();
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &current);
+
+        // A claude-binary seat over the recording bridge, through the real user-overlay seam.
+        let ledger = home.join("ledger.ndjson");
+        let bridge = write_recording_bridge(&home);
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "skills-seat"
+display_name = "Skills seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let unit = |run: &str, ord: u32, skill: &str| -> StepInput {
+            let mut u =
+                crate::domain::WorkUnit::pending(format!("{run}:u{ord}"), run, ord, "do the thing");
+            u.assigned_cli = Some("skills-seat".to_string());
+            u.skill_ref = Some(skill.to_string());
+            StepInput {
+                run_id: run.to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-skills".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+
+        // 1. Turn 1 of run A opens the session on generation 1.
+        let out = runner.run_unit(&unit("run-A", 1, "wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        assert_eq!(entries.len(), 2, "session/new + one prompt: {entries:?}");
+        assert_eq!(
+            entries[0]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
+            serde_json::json!([{"type": "local", "path": gen1.to_string_lossy()}]),
+            "the bridge received generation 1 as its local plugin: {}",
+            entries[0]
+        );
+        assert!(
+            entries[1]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Invoke your skill \"wicked-garden:domain\""),
+            "{}",
+            entries[1]
+        );
+
+        // 2. crew publishes generation 2 and flips `current`.
+        std::fs::remove_file(&current).unwrap();
+        std::os::unix::fs::symlink("snapshots/2", &current).unwrap();
+
+        // 3a. Turn 2 of run A, the SAME session: the directive still comes from gen 1's index.
+        let out = runner.run_unit(&unit("run-A", 2, "wicked-garden-mem"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        assert_eq!(entries.len(), 3, "{entries:?}");
+        let prompt = entries[2]["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("\"wicked-garden:mem\"") && !prompt.contains("mem-v2"),
+            "the reused session prompts from the generation it was opened with: {prompt}"
+        );
+
+        // 3b. Turn 3 of run A names a skill only gen 2 holds: refused against gen 1, by name,
+        //     before any frame reaches the bridge.
+        let out = runner.run_unit(&unit("run-A", 3, "wicked-garden-search"));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("wicked-garden-search")
+                && out.output.contains(&gen1.display().to_string())
+                && !out.output.contains(&gen2.display().to_string()),
+            "admission on a reused session is judged against ITS generation: {}",
+            out.output
+        );
+        assert_eq!(
+            ledger_entries(&ledger).len(),
+            3,
+            "the refusal never reached the bridge"
+        );
+
+        // 4. Concurrently: run A's turn 4 (bound to gen 1) and run B's first turn (fresh: gen 2).
+        let barrier = std::sync::Barrier::new(2);
+        let (a, b) = std::thread::scope(|s| {
+            let ta = s.spawn(|| {
+                barrier.wait();
+                runner.run_unit(&unit("run-A", 4, "wicked-garden-mem"))
+            });
+            let tb = s.spawn(|| {
+                barrier.wait();
+                runner.run_unit(&unit("run-B", 1, "wicked-garden-mem"))
+            });
+            (ta.join().unwrap(), tb.join().unwrap())
+        });
+        assert_eq!(a.status, StepStatus::Ok, "{}", a.output);
+        assert_eq!(b.status, StepStatus::Ok, "{}", b.output);
+        let entries = ledger_entries(&ledger);
+        let prompts: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e["prompt"].as_str())
+            .collect();
+        assert_eq!(prompts.len(), 4, "{entries:?}");
+        assert!(
+            prompts[2..]
+                .iter()
+                .any(|p| p.contains("\"wicked-garden:mem\"") && !p.contains("mem-v2")),
+            "run A still prompts from gen 1: {prompts:?}"
+        );
+        assert!(
+            prompts[2..]
+                .iter()
+                .any(|p| p.contains("\"wicked-garden:mem-v2\"")),
+            "run B prompts from gen 2: {prompts:?}"
+        );
+        let news: Vec<&Value> = entries.iter().filter(|e| e.get("new").is_some()).collect();
+        assert_eq!(news.len(), 2, "one spawn per session: {entries:?}");
+        assert_eq!(
+            news[1]["new"]["_meta"]["claudeCode"]["options"]["plugins"][0]["path"],
+            gen2.to_string_lossy().as_ref(),
+            "the second session was opened on generation 2"
+        );
+
+        // Generation reporting: one handoff per session, each naming its own generation; nothing
+        // ever reports (A, gen 2).
+        let handed: Vec<(String, Option<String>)> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(CoreEvent::SkillsSnapshotHanded { session, gen, .. }) => {
+                    Some((session, gen))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            handed,
+            vec![
+                ("run-A".to_string(), Some("1".to_string())),
+                ("run-B".to_string(), Some("2".to_string())),
+            ]
+        );
+        runner.drop_session("run-A");
+        runner.drop_session("run-B");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// The escape hatch: `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` set means NO override — the one
     /// legitimate case is an operator deliberately testing their own hooks/skills through a run.
     /// Tested on the decision function (both branches); the call site passing the REAL env
@@ -6842,8 +7220,8 @@ sleep 30
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let base = worker_home_base("inherit-hatch");
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        assert!(worker_claude_config_dir(true).is_none());
-        let minted = worker_claude_config_dir(false)
+        assert!(worker_claude_config_dir(true, None).is_none());
+        let minted = worker_claude_config_dir(false, None)
             .expect("isolation is the default")
             .expect("minting succeeds");
         assert!(minted.is_dir());
@@ -6889,7 +7267,7 @@ sleep 30
         let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let base = worker_home_base("fence");
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        let dir = ensure_worker_config_home().expect("ensure");
+        let dir = ensure_worker_config_home(None).expect("ensure");
         restore_hermetic_worker_home();
         let settings: Value =
             serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
@@ -6901,7 +7279,7 @@ sleep 30
             .collect();
         assert_eq!(
             deny,
-            crate::execute_wrapped::deny_rules(),
+            crate::execute_wrapped::deny_rules_for(None),
             "the ACP fence must be the wrapped path's fence, not a copy that can drift"
         );
         assert!(
