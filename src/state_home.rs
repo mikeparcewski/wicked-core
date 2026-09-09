@@ -1383,9 +1383,15 @@ mod tests {
             std::fs::remove_file(skills.join("current")).unwrap();
         }
         // The operational home of a database: its canonical parent; none for a non-file store.
-        assert_eq!(
-            operational_home_of_db(&home.join("core.db").display().to_string()),
-            Some(std::fs::canonicalize(&home).unwrap())
+        // Compared by identity (`same_dir`), not by spelling: on Windows `canonicalize` yields the
+        // `\\?\` verbatim form while the helper reports the verbatim-free canonical path.
+        let op_home = operational_home_of_db(&home.join("core.db").display().to_string())
+            .expect("a file-backed store has an operational home");
+        assert!(
+            same_dir(&op_home, &home),
+            "operational home {} is not the db's parent {}",
+            op_home.display(),
+            home.display()
         );
         assert_eq!(operational_home_of_db(":memory:"), None);
         assert_eq!(operational_home_of_db("postgres://h/db"), None);
