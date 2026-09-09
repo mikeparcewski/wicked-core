@@ -26,31 +26,70 @@ Two release tracks share this file, newest entry first regardless of track:
   a re-resolved `current`; wrapped Claude gets exactly one `--plugin-dir <snapshot>`, and any
   `--plugin-dir` a `clis.toml` template carries is stripped ALWAYS (snapshot or not) with a logged
   notice — a template is not a skills input. The snapshot joins the READ roots on both governance
-  carriers (never a write root), and the `Read` deny fence is CARVED around it (`deny_rules_for`):
-  the default location sits under `~/.wicked-crew`, which the fence denies and whose deny would beat
-  any allow, so the fence now enumerates the worker-state siblings on the path down to the snapshot
-  (store, log, `effective/`, other generations, `current`) individually while `Edit`/`Write` keep the
-  blanket rule. The published index is VERIFIED at load (every `skills/<dir>/SKILL.md` exists, is a
-  regular file reached without symlink components, is readable, and its frontmatter `name` matches;
-  `portable` is required; all defects are listed in one error); the live-cache fallback skips a
-  nameless `SKILL.md` with a `skills.notice` instead of deriving an identity. Admission expands the
-  run's `skill_ref`s (plan-wide via `StepInput.required_skills`) through transitive frontmatter/index
-  `mandates`, refuses a missing skill of ANY family by name (no family is exempt — the snapshot is the
-  worker's only skills source), refuses a NESTED skill for a Claude seat (Claude Code discovers plugin
-  skills one directory deep and names them by directory — verified against the live roster: 92/92
-  top-level garden dirs, 0/50 nested — so no nested identity is invented) and refuses a
-  `portable: false` skill for every non-Claude seat. The skill directive is CLI-aware
-  (`wicked-garden:<top-level dir>` + the Skill-tool clause for Claude; the mirrored frontmatter name,
-  no Skill-tool clause, for codex/pi/opencode/copilot). Degradation ladder: `WICKED_SKILLS_SNAPSHOT`
-  unset → `WICKED_SKILLS_CURRENT` (crew's `current` pointer; loaded strictly when it resolves, logged
-  and skipped when it points at nothing yet) → the live installed plugin cache with a
-  `skills.fallback` log (never the hand copy); a set-but-EMPTY variable is a config error, not
-  "unset"; an explicit path that is not a valid snapshot fails the launch as a config error. New
-  `CoreEvent::SkillsSnapshotHanded` (`skillsSnapshotHanded`: session/ord/attempt/path/cli/gen/
-  contentHash/root/source) reports the generation each launch used so crew can reap old generations
-  safely. Tests: env mutation across the crate serializes on one crate-wide lock; the ladder's tests
-  compare paths as `Path`s (the Windows separator-spelling failure); two-generation concurrency is
-  exercised with barrier-released threads on both carriers.
+  carriers (never a write root). **The worker Read fence over crew's state home is an explicit,
+  tested denylist (design v3.1 §1)**: the snapshot lives under crew's one storage root
+  (`~/.wicked-crew/skills/snapshots/<gen>/`), which the fence denies and whose deny would beat any
+  allow, so when the handed snapshot sits exactly in that read slot the state home's blanket
+  `Read(…/**)` is replaced by the STATIC rules of the state-home registry
+  (`tests/fixtures/state-home-subtrees.json`, embedded via `include_str!` in `state_home.rs` and
+  mirrored by crew) — one rule per registered top-level entry (`core.db*`, `bus.db*`, `daemon-*`,
+  `audit.log`, `evals/**`, `project-graphs/**`, `interactive-*` …) and one per denied child of the
+  skills root (`baseline/**`, `effective/**`, `manifest.json`, `current`, `.uv-cache/**`,
+  `snapshots/.staging-*/**`, `snapshots/.tmp-*/**`); `Edit`/`Write` keep the blanket. Fail closed,
+  never widen: no runtime listing builds a rule; the launch-time listing only REFUSES — a top-level
+  entry (or a child of `skills/` other than the read slot) the registry does not classify fails
+  admission by name (`fence_check`), and a snapshot under the state home outside the slot or under
+  any other fenced directory is a config error naming both paths. Documented residuals: an entry
+  created under the state home while a session runs is fenced at the next launch (crew is that
+  directory's only writer); sibling immutable generations stay readable until crew reaps them. The
+  published index is VERIFIED at load (every component from the root down — `.claude-plugin/`,
+  `plugin.json`, `snapshot.json`, `skills/`, each skill directory, each `SKILL.md` — is lstat-checked
+  not to be a symlink and read without following one (`O_NOFOLLOW` on unix); a `skills -> /outside`
+  link is refused at `skills`; `portable` is required; all defects are listed in one error); the
+  live-cache fallback skips a nameless `SKILL.md` with a `skills.notice` instead of deriving an
+  identity. Admission judges EXISTENCE plan-wide (the run's `skill_ref`s via
+  `StepInput.required_skills`, expanded through transitive frontmatter/index `mandates`; a missing
+  skill of ANY family is refused by name — no family is exempt, the snapshot is the worker's only
+  skills source) and INVOCABILITY per seat (v3.1 §5: only the skills THIS unit's seat invokes are
+  judged — a NESTED skill is refused for a Claude seat, since Claude Code discovers plugin skills one
+  directory deep and names them by directory (verified against the live roster: 92/92 top-level
+  garden dirs, 0/50 nested), a `portable: false` skill for every non-Claude seat — so a Codex unit
+  is not refused because a Claude unit elsewhere needs a non-portable skill, nor a Claude unit
+  because a mirror seat uses a nested one). **Design v3.2: skills reach a non-Claude seat ONLY
+  through a per-launch, wicked-owned lever, decided off the binary the launch actually runs** —
+  pi: `--no-skills` + one `--skill <snapshot>/skills/<dir>` per portable skill; copilot:
+  `--add-dir <snapshot>/views/copilot` (crew publishes that view; a generation without one has no
+  copilot lever); opencode 1.17: `OPENCODE_CONFIG_CONTENT.skills.paths` composed WITH the seat's
+  governance content (verified in the installed binary); codex 0.153 and any ACP bridge that is a
+  separate program (`pi-acp`, `codex-acp`): no lever. No lever ⇒ no skills, never a side channel: a
+  unit that invokes a skill on such a seat is REFUSED naming the skill and the reason
+  (`SkillsError::NoLever`), and nothing wicked does writes into `~/.codex`, `~/.pi`, `~/.copilot`,
+  `~/.config/opencode` or `~/.claude` (pinned by a test that launches every seat against fake copies
+  of those trees). The skill directive is CLI-aware (`wicked-garden:<top-level dir>` + the Skill-tool
+  clause for Claude; the mirrored frontmatter name, no Skill-tool clause, for a seat with a lever;
+  a "NOT loaded" form for a seat without one). **Exactly one input (v3.1 §2)**: `WICKED_SKILLS_SNAPSHOT`
+  unset → the live installed plugin cache with a `skills.fallback` log (never the hand copy; the
+  fallback sits inside the `~/.claude` fence and says so with a notice); set-but-EMPTY or invalid →
+  config error; a DANGLING final link (`current` aimed at a reaped generation) is a config error
+  naming its target. `WICKED_SKILLS_CURRENT` is withdrawn — crew resolves `current` and passes the
+  concrete generation. **Session-specific ACP configuration (v3.1 §3)**: the shared worker-home
+  `settings.json` carries only the launch-independent fence (every fenced directory except the
+  state home), written atomically; each session's fence rides its own `session/new`
+  `_meta.claudeCode.options` (`disallowedTools`, merged by the bridge; `settings` = a per-session
+  file at `<worker home>/sessions/<run_id>-<cli_key>/settings.json`, created fresh per launch,
+  tmp+rename, reaped with the run) — never a shared mutable file two launches can race on.
+  **Cached session first (v3.1 §4)**: a cached ACP session is admitted against the snapshot it was
+  opened with (`proc.skills`) BEFORE any ambient resolution; only a fresh session resolves
+  `current` — so a `current` that moves to a generation dropping a skill the pinned one has does
+  not refuse the cached session's next turn. New `CoreEvent::SkillsSnapshotHanded`
+  (`skillsSnapshotHanded`: session/ord/attempt/path/cli/gen/contentHash/root/source) reports the
+  generation each launch used (every seat with a delivery, not only Claude) so crew can reap old
+  generations safely. Tests: env mutation across the crate serializes on one crate-wide lock; the
+  ladder's tests compare paths as `Path`s (the Windows separator-spelling failure); two-generation
+  concurrency is exercised with barrier-released threads on both carriers, reading the per-session
+  settings files the fake bridge received; the pinned-harness LOADING evidence is an `#[ignore]`d
+  live test (`tests/skills_live.rs`, opt-in `WICKED_SKILLS_LIVE_TEST=1`) that launches the real
+  `claude --plugin-dir <fixture>` and asserts the fixture skill is listed.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

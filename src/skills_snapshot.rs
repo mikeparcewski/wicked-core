@@ -24,24 +24,30 @@
 //!   generation it was opened with, whatever `current` points at by then;
 //! - Claude wrapped: `--plugin-dir <snapshot>` (`execute_wrapped::inject_isolation_flags`), with
 //!   the template's own `--plugin-dir` stripped as a retired input;
-//! - both governance carriers read-widen to the snapshot (`execute_wrapped::assemble_read_roots`)
-//!   and the Read deny fence is CARVED around it (`execute_wrapped::deny_rules_for`); writes under
-//!   it stay denied — a snapshot is immutable by contract, and this module never writes into one;
+//! - both governance carriers read-widen to the snapshot (`execute_wrapped::assemble_read_roots`);
+//!   the worker Read fence over crew's state home is an EXPLICIT denylist (`state_home`,
+//!   `execute_wrapped::deny_rules`) under which the resolved `skills/snapshots/<gen>/` is the one
+//!   non-denied path, and a snapshot anywhere else inside the fence FAILS the launch
+//!   (`execute_wrapped::fence_check`, v3.1 §1); writes under it stay denied — a snapshot is
+//!   immutable by contract, and this module never writes into one;
 //! - the skill directive is CLI-aware (`execute_wrapped::plugin_skill_invocation`): the plugin
 //!   form for Claude, the mirrored directory name for every other CLI.
 //!
-//! # Where the root comes from — the degradation ladder (v3 §3), no unconditional fail-open
+//! # Where the root comes from — the degradation ladder (v3 §3 / v3.1 §2), no unconditional fail-open
+//!
+//! The engine reads exactly ONE input. (`WICKED_SKILLS_CURRENT`, a second rung pass 1 added, is
+//! withdrawn: crew resolves its `current` pointer and passes the concrete generation path.)
 //!
 //! 1. [`SKILLS_SNAPSHOT_ENV`] set ⇒ that path, strictly ([`load_published`]): it must be absolute,
 //!    no ancestor may be a symlink (a link above a pinned generation could re-aim it later), it
 //!    is pinned to its canonical real path (a FINAL-component link such as crew's `current` is
-//!    followed once, at load), and its index must describe files that actually exist. Any
+//!    followed once, at load; a DANGLING one is a config error naming the missing target), and
+//!    its index must describe files that actually exist — every component from the root down
+//!    (`.claude-plugin/`, `plugin.json`, `snapshot.json`, `skills/`, each skill directory, each
+//!    `SKILL.md`) is lstat-verified NOT to be a symlink and read without following one. Any
 //!    shortfall is a config error — a deliberately chosen snapshot is never silently swapped.
 //!    Set but EMPTY is invalid explicit configuration, not "unset".
-//! 2. Unset, [`SKILLS_CURRENT_ENV`] set ⇒ crew's `current` pointer. When it resolves it is loaded
-//!    with the same strictness; when it points at nothing yet (no snapshot published so far) the
-//!    ladder logs `skills.fallback` and continues. Set but empty ⇒ config error.
-//! 3. Neither ⇒ the LIVE installed garden: the marketplace cache's highest version under the
+//! 2. Unset ⇒ the LIVE installed garden: the marketplace cache's highest version under the
 //!    daemon's `CLAUDE_CONFIG_DIR` (else `~/.claude`), logged as `skills.fallback`. NOT the hand
 //!    copy at `<config>/plugins/wicked-garden` — that stale copy is the defect being fixed, never
 //!    a fallback. Nothing in the cache ⇒ no root at all (a run that needs a skill is then refused;
@@ -49,15 +55,23 @@
 //!
 //! # Admission — before any process starts
 //!
-//! Every `skill_ref` the run names ([`StepInput::required_skills`] plus the unit's own), expanded
-//! through each skill's transitive `mandates`, must be in the root ([`admit_refs`]). A missing
-//! skill of ANY family is a refusal naming it ([`SkillsError::Missing`]) — the snapshot is the
-//! worker's only skills source, so nothing outside it is exempt. Admission also knows WHICH CLI
-//! will run: a nested skill has no Claude identity (Claude Code discovers a plugin's skills one
-//! directory deep — verified against the live roster: 92/92 top-level garden dirs listed, 0/50
-//! nested) and is refused for a Claude seat ([`SkillsError::NotInvocable`]); a `portable: false`
-//! skill is Claude-only and is refused for every other CLI ([`SkillsError::NotPortable`]). Never a
-//! silent proceed without the required method.
+//! EXISTENCE is judged plan-wide: every `skill_ref` the run names ([`StepInput::required_skills`]
+//! plus the unit's own), expanded through each skill's transitive `mandates`, must be in the root
+//! ([`admit_refs`]). A missing skill of ANY family is a refusal naming it
+//! ([`SkillsError::Missing`]) — the snapshot is the worker's only skills source, so nothing
+//! outside it is exempt. INVOCABILITY is judged per seat (v3.1 §5): only the skills THIS unit's
+//! seat will invoke — its own `skill_ref` and what that mandates — are checked against the CLI
+//! that runs it: a nested skill has no Claude identity (Claude Code discovers a plugin's skills
+//! one directory deep — verified against the live roster: 92/92 top-level garden dirs listed,
+//! 0/50 nested) and is refused for a Claude seat ([`SkillsError::NotInvocable`]); a
+//! `portable: false` skill is Claude-only and is refused for every other CLI
+//! ([`SkillsError::NotPortable`]). A Codex unit is therefore not refused because a Claude unit
+//! elsewhere in the plan needs a non-portable skill, and vice versa. Never a silent proceed
+//! without the required method.
+//!
+//! On the ACP path a CACHED session is admitted against ITS pinned snapshot before any ambient
+//! resolution happens (v3.1 §4) — `acp_runner::exec_turn_inner` consults the session cache first
+//! and calls [`admit_unit`] (which resolves) only for a fresh session.
 //!
 //! The generation in use is reported at every launch — the `skills.snapshot gen=…` log line
 //! ([`SkillsSnapshot::report`]) and the [`CoreEvent::SkillsSnapshotHanded`] event
@@ -73,13 +87,8 @@ use crate::event::CoreEvent;
 use crate::workflow::StepInput;
 
 /// The one input crew passes: the ABSOLUTE path of the published snapshot generation to use.
+/// There is no second input — crew resolves its `current` pointer itself (v3.1 §2).
 pub(crate) const SKILLS_SNAPSHOT_ENV: &str = "WICKED_SKILLS_SNAPSHOT";
-
-/// Crew's `current` pointer (`<stateHome>/skills/current -> snapshots/<gen>`): the ladder's second
-/// rung, consulted only when [`SKILLS_SNAPSHOT_ENV`] is unset. A pointer at nothing means no
-/// generation has been published yet and the ladder continues; a pointer at something is loaded
-/// as strictly as an explicit snapshot.
-pub(crate) const SKILLS_CURRENT_ENV: &str = "WICKED_SKILLS_CURRENT";
 
 /// The plugin's name — the `<plugin>` half of the `wicked-garden:<dir>` identity Claude uses, the
 /// marketplace + cache directory name, and the prefix every shipped skill's frontmatter `name`
@@ -102,8 +111,7 @@ const SKILL_FILE: &str = "SKILL.md";
 /// generation from the installed-plugin fallback at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotSource {
-    /// The snapshot [`SKILLS_SNAPSHOT_ENV`] (or [`SKILLS_CURRENT_ENV`]) named — crew-published,
-    /// immutable.
+    /// The snapshot [`SKILLS_SNAPSHOT_ENV`] named — crew-published, immutable.
     Published,
     /// The live marketplace cache under the daemon's claude config dir (its highest version).
     LiveCache,
@@ -154,29 +162,83 @@ impl SkillEntry {
     }
 }
 
+/// How a CLI receives skills for ONE launch (design v3.2 §2): a wicked-OWNED lever the engine
+/// pulls at spawn — never a write into the user's own CLI directories (`~/.codex/skills`,
+/// `~/.pi/agent/skills`, `~/.config/opencode/skills`, `~/.copilot`, `~/.claude/plugins`), which
+/// the additive mirror of v3 would have been and which is withdrawn. Decided off the binary the
+/// launch actually runs — the CLI itself on the wrapped path, the ACP BRIDGE on the ACP path: a
+/// bridge that is a separate program (`pi-acp`, `codex-acp`) forwards no CLI flags, so it has no
+/// lever even where the CLI does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SkillsLever {
+    /// Claude: the plugin loader — `--plugin-dir <snapshot>` (wrapped) / `session/new`
+    /// `plugins: [{type: "local", path}]` (ACP).
+    ClaudePlugin,
+    /// pi 0.84: `--no-skills` + one `--skill <snapshot>/skills/<dir>` per portable skill
+    /// (`pi --help` lists both).
+    PiSkillFlags,
+    /// copilot 1.0: `--add-dir <snapshot>/views/copilot` — copilot loads `.github/skills` from an
+    /// added directory (`copilot --help`); crew publishes that immutable view in the snapshot.
+    CopilotAddDir,
+    /// opencode 1.17: `OPENCODE_CONFIG_CONTENT` with `skills.paths` (verified in the installed
+    /// 1.17.18: "Register skills from non-default locations via `skills.paths` (scanned
+    /// recursively for `**/SKILL.md`)"), composed WITH the governance content the seat already
+    /// injects.
+    OpencodeConfig,
+    /// No per-launch lever: codex 0.153 (`-c`/`--add-dir`/profiles load no skills), any ACP bridge
+    /// that is not the CLI itself, any unknown binary. No lever ⇒ no skills, never a side channel
+    /// (v3.2 §3): a unit that requires a skill on such a seat is refused by name.
+    Absent,
+}
+
+impl SkillsLever {
+    /// The lever for the binary a launch runs, by file stem (`claude`, `/usr/bin/pi`,
+    /// `copilot.exe` …) — the same test `execute_wrapped::binary_is_claude` applies.
+    pub(crate) fn for_binary(binary: &str) -> Self {
+        match Path::new(binary)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+        {
+            "claude" => SkillsLever::ClaudePlugin,
+            "pi" => SkillsLever::PiSkillFlags,
+            "copilot" => SkillsLever::CopilotAddDir,
+            "opencode" => SkillsLever::OpencodeConfig,
+            _ => SkillsLever::Absent,
+        }
+    }
+}
+
 /// The CLI a unit will run on, as admission needs to know it: Claude reaches skills through the
-/// plugin loader (top-level dirs only, portable or not); every other CLI reaches them through an
-/// additive mirror of the PORTABLE skills by frontmatter name (v3 §2/§5).
+/// plugin loader (top-level dirs only, portable or not); every other CLI reaches only the
+/// PORTABLE skills, through its own per-launch lever ([`SkillsLever`]) — or nothing at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkerCli {
     Claude,
-    Other(String),
+    Other { key: String, lever: SkillsLever },
 }
 
 impl WorkerCli {
-    /// From the fact the runners already establish — `execute_wrapped::binary_is_claude` on the
-    /// template's binary (wrapped) or the seat record's binary (ACP) — plus the seat key for the
-    /// refusal message.
-    pub(crate) fn for_seat(is_claude: bool, cli_key: &str) -> Self {
-        if is_claude {
-            WorkerCli::Claude
-        } else {
-            WorkerCli::Other(cli_key.to_string())
+    /// From the facts the runners already establish: `cli_binary` is the seat's CLI (the
+    /// template's first token on the wrapped path, the seat record's `binary` on ACP — what
+    /// `execute_wrapped::binary_is_claude` judges), `carrier_binary` is what this launch actually
+    /// spawns (the same CLI when wrapped; the ACP bridge when not), and `cli_key` names the seat
+    /// in a refusal.
+    pub(crate) fn for_binaries(cli_binary: &str, carrier_binary: &str, cli_key: &str) -> Self {
+        if crate::execute_wrapped::binary_is_claude(cli_binary) {
+            return WorkerCli::Claude;
+        }
+        WorkerCli::Other {
+            key: cli_key.to_string(),
+            lever: SkillsLever::for_binary(carrier_binary),
         }
     }
 
-    pub(crate) fn is_claude(&self) -> bool {
-        matches!(self, WorkerCli::Claude)
+    pub(crate) fn lever(&self) -> SkillsLever {
+        match self {
+            WorkerCli::Claude => SkillsLever::ClaudePlugin,
+            WorkerCli::Other { lever, .. } => *lever,
+        }
     }
 }
 
@@ -184,8 +246,111 @@ impl std::fmt::Display for WorkerCli {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WorkerCli::Claude => f.write_str("claude"),
-            WorkerCli::Other(key) => f.write_str(key),
+            WorkerCli::Other { key, .. } => f.write_str(key),
         }
+    }
+}
+
+/// What ONE launch is handed, in the shape its lever takes (v3.2 §2) — computed from the admitted
+/// snapshot and the seat by [`SkillsSnapshot::delivery`], consumed by the spawn paths. Every
+/// variant names paths INSIDE the snapshot; nothing here is ever written anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SkillsDelivery {
+    /// No lever, or no snapshot: the worker runs without wicked skills.
+    None,
+    /// The snapshot root, for Claude's plugin loader.
+    ClaudePlugin(PathBuf),
+    /// The portable skill directories, for pi's `--skill` flags (after `--no-skills`).
+    PiSkillFlags(Vec<PathBuf>),
+    /// `<snapshot>/views/copilot`, for copilot's `--add-dir`.
+    CopilotAddDir(PathBuf),
+    /// The portable skill directories, for opencode's `skills.paths`.
+    OpencodeConfig(Vec<PathBuf>),
+}
+
+/// The env var opencode reads its whole configuration from (the seat's governance content
+/// already rides it — `wicked_council::registry`); skills paths are COMPOSED into that same
+/// value, never into `~/.config/opencode`.
+pub(crate) const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+impl SkillsDelivery {
+    /// The argv flags this delivery rides, for the levers that are flags: pi's
+    /// `--no-skills --skill <dir> …` (discovery OFF first, so the user's `~/.pi/agent/skills` is
+    /// never a side channel), copilot's `--add-dir <view>`. Empty for the rest.
+    pub(crate) fn argv_flags(&self) -> Vec<String> {
+        match self {
+            SkillsDelivery::PiSkillFlags(dirs) => std::iter::once("--no-skills".to_string())
+                .chain(
+                    dirs.iter()
+                        .flat_map(|d| ["--skill".to_string(), d.to_string_lossy().into_owned()]),
+                )
+                .collect(),
+            SkillsDelivery::CopilotAddDir(view) => {
+                vec!["--add-dir".to_string(), view.to_string_lossy().into_owned()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// opencode's `OPENCODE_CONFIG_CONTENT`, composed: `existing` (the seat's governance content,
+    /// or whatever the daemon's environment carries) with `skills.paths` set to this delivery's
+    /// directories — existing paths kept, ours appended, duplicates dropped. `None` for every
+    /// other lever. An `existing` value that is not a JSON object is replaced by a bare document
+    /// and said so: a malformed value would have broken opencode's startup anyway, and the skills
+    /// paths must not be dropped silently on its account.
+    pub(crate) fn opencode_config(&self, existing: Option<&str>) -> Option<String> {
+        let SkillsDelivery::OpencodeConfig(dirs) = self else {
+            return None;
+        };
+        let mut doc = match existing.map(serde_json::from_str::<Value>) {
+            None => serde_json::json!({}),
+            Some(Ok(v)) if v.is_object() => v,
+            Some(other) => {
+                eprintln!(
+                    "[wicked-core] skills.notice {OPENCODE_CONFIG_ENV} did not hold a JSON object \
+                     ({}); the skills paths are composed onto a bare document instead",
+                    match other {
+                        Ok(v) => format!("it is a JSON {}", json_kind(&v)),
+                        Err(e) => e.to_string(),
+                    }
+                );
+                serde_json::json!({})
+            }
+        };
+        let obj = doc.as_object_mut().expect("an object by construction");
+        obj.entry("$schema")
+            .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
+        let skills = obj.entry("skills").or_insert_with(|| serde_json::json!({}));
+        if !skills.is_object() {
+            *skills = serde_json::json!({});
+        }
+        let paths = skills
+            .as_object_mut()
+            .expect("an object just above")
+            .entry("paths")
+            .or_insert_with(|| serde_json::json!([]));
+        if !paths.is_array() {
+            *paths = serde_json::json!([]);
+        }
+        let list = paths.as_array_mut().expect("an array just above");
+        for d in dirs {
+            let s = Value::String(d.to_string_lossy().into_owned());
+            if !list.contains(&s) {
+                list.push(s);
+            }
+        }
+        Some(doc.to_string())
+    }
+}
+
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -330,6 +495,51 @@ impl SkillsSnapshot {
         }
     }
 
+    /// The directory of every PORTABLE skill this root holds — `<root>/skills/<dir>`, joined
+    /// component-wise, sorted by `dir` — what the non-Claude levers deliver (v3 §5: a
+    /// `portable: false` skill leans on `${CLAUDE_PLUGIN_ROOT}` or sibling links and is
+    /// Claude-only).
+    pub(crate) fn portable_skill_dirs(&self) -> Vec<PathBuf> {
+        let mut portable: Vec<&SkillEntry> = self.skills.iter().filter(|s| s.portable).collect();
+        portable.sort_by(|a, b| a.dir.cmp(&b.dir));
+        portable
+            .into_iter()
+            .map(|s| {
+                s.dir
+                    .split('/')
+                    .fold(self.root.join(SKILLS_DIR), |p, c| p.join(c))
+            })
+            .collect()
+    }
+
+    /// The copilot view crew publishes in a snapshot — `<root>/views/copilot`, holding
+    /// `.github/skills/<name>/` copies of the enabled portable skills (v3.2 §4) — when this
+    /// generation carries one as a real directory (lstat: never a link). `None` ⇒ this generation
+    /// gives copilot nothing to load.
+    pub(crate) fn copilot_view(&self) -> Option<PathBuf> {
+        let view = self.root.join("views").join("copilot");
+        std::fs::symlink_metadata(&view)
+            .ok()
+            .filter(|m| m.is_dir())
+            .map(|_| view)
+    }
+
+    /// What a launch on `cli` is handed from this root, in its lever's shape (v3.2 §2).
+    pub(crate) fn delivery(&self, cli: &WorkerCli) -> SkillsDelivery {
+        match cli.lever() {
+            SkillsLever::ClaudePlugin => SkillsDelivery::ClaudePlugin(self.root.clone()),
+            SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags(self.portable_skill_dirs()),
+            SkillsLever::CopilotAddDir => match self.copilot_view() {
+                Some(view) => SkillsDelivery::CopilotAddDir(view),
+                None => SkillsDelivery::None,
+            },
+            SkillsLever::OpencodeConfig => {
+                SkillsDelivery::OpencodeConfig(self.portable_skill_dirs())
+            }
+            SkillsLever::Absent => SkillsDelivery::None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn skills(&self) -> &[SkillEntry] {
         &self.skills
@@ -379,6 +589,15 @@ pub(crate) enum SkillsError {
         cli: String,
         skills: Vec<String>,
     },
+    /// A seat whose launch has NO wicked-owned way to deliver skills (v3.2 §3) — codex, an ACP
+    /// bridge that forwards no flags, copilot when the generation publishes no `views/copilot` —
+    /// was asked for skills. No lever ⇒ no skills, never a side channel through the user's own
+    /// CLI directories.
+    NoLever {
+        cli: String,
+        skills: Vec<String>,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for SkillsError {
@@ -423,9 +642,9 @@ impl std::fmt::Display for SkillsError {
                 missing,
             } => write!(
                 f,
-                "no skills root is available ({SKILLS_SNAPSHOT_ENV} and {SKILLS_CURRENT_ENV} \
-                 unset and no installed {PLUGIN_NAME} found under the claude config dir) but this \
-                 run requires skills: {}; install {PLUGIN_NAME} or publish a snapshot",
+                "no skills root is available ({SKILLS_SNAPSHOT_ENV} unset and no installed \
+                 {PLUGIN_NAME} found under the claude config dir) but this run requires skills: \
+                 {}; install {PLUGIN_NAME} or publish a snapshot",
                 missing.join(", ")
             ),
             SkillsError::NotInvocable { root, skills } => write!(
@@ -452,6 +671,14 @@ impl std::fmt::Display for SkillsError {
                  ${{CLAUDE_PLUGIN_ROOT}}, cwd-relative scripts or ../ links no mirror carries), so \
                  they cannot be handed to '{cli}'; route this unit to a claude seat",
                 root.display(),
+                skills.join(", ")
+            ),
+            SkillsError::NoLever { cli, skills, why } => write!(
+                f,
+                "'{cli}' cannot be handed skills on this launch ({why}) but the unit requires {}; \
+                 wicked delivers skills only through a per-launch lever it owns — never through a \
+                 CLI's own skills directory — so route this unit to a seat with one (claude, pi, \
+                 copilot with a published copilot view, opencode) or drop its skill_ref",
                 skills.join(", ")
             ),
         }
@@ -483,10 +710,8 @@ fn env_path(var: &'static str) -> Result<Option<PathBuf>, SkillsError> {
 /// `Ok(None)` ⇒ no root anywhere (already logged). `Err` ⇒ an explicit input is misconfigured.
 pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
     let explicit = env_path(SKILLS_SNAPSHOT_ENV)?;
-    let current = env_path(SKILLS_CURRENT_ENV)?;
     resolve_in(
         explicit,
-        current,
         std::env::var_os(crate::acp_runner::CLAUDE_CONFIG_DIR_ENV).map(PathBuf::from),
         home_dir(),
         &mut |line| eprintln!("{line}"),
@@ -497,26 +722,12 @@ pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
 /// touching the process environment and the "logged" half of each step is asserted, not assumed.
 pub(crate) fn resolve_in(
     explicit: Option<PathBuf>,
-    current: Option<PathBuf>,
     claude_config_dir: Option<PathBuf>,
     home: Option<PathBuf>,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
     if let Some(path) = explicit {
         return load_published(SKILLS_SNAPSHOT_ENV, &path).map(Some);
-    }
-    if let Some(pointer) = current {
-        // A pointer at SOMETHING is loaded as strictly as an explicit path: a `current` that
-        // resolves to a broken snapshot is a misconfiguration, not a reason to fall back. A
-        // pointer at NOTHING is the ordinary pre-first-publish state and the ladder continues.
-        if std::fs::symlink_metadata(&pointer).is_ok() {
-            return load_published(SKILLS_CURRENT_ENV, &pointer).map(Some);
-        }
-        log(format!(
-            "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset and {SKILLS_CURRENT_ENV}={} \
-             points at nothing yet (no snapshot published); trying the installed plugin cache",
-            pointer.display()
-        ));
     }
     let Some(config) = claude_config_dir.or_else(|| home.map(|h| h.join(".claude"))) else {
         log(format!(
@@ -536,7 +747,12 @@ pub(crate) fn resolve_in(
     // The fallback is a directory the operator did not choose, so it too is pinned to its real
     // path; a cache dir that cannot be canonicalized is not a root.
     let latest = highest_version_dir(&cache)
-        .filter(|latest| plugin_manifest_name(latest).as_deref() == Some(PLUGIN_NAME))
+        .filter(|latest| {
+            plugin_manifest_name(latest)
+                .ok()
+                .flatten()
+                .is_some_and(|name| name == PLUGIN_NAME)
+        })
         .and_then(|latest| std::fs::canonicalize(latest).ok())
         .map(simplify_verbatim);
     let found = latest.map(|root| load_live(root, SnapshotSource::LiveCache, log));
@@ -568,7 +784,9 @@ pub(crate) fn resolve_in(
 ///   same spelling; the operator is told the real path to pass instead.
 /// - The final component MAY be a link (crew's `current -> snapshots/<gen>`): `canonicalize`
 ///   follows it once, here, so the session keeps the generation it was handed even if the link is
-///   flipped under it. A loop or a dangling link is what the OS reports.
+///   flipped under it. A DANGLING final link (`lstat` succeeds, `canonicalize` fails — crew's
+///   `current` aimed at a reaped or not-yet-published generation) is a config error that names
+///   the target it points at; a loop is what the OS reports.
 /// - On Windows the `\\?\` verbatim prefix `canonicalize` adds is dropped
 ///   ([`simplify_verbatim`]): a worker CLI is handed a spelling it can open.
 fn canonical_root(named: &Path) -> Result<PathBuf, String> {
@@ -599,9 +817,70 @@ fn canonical_root(named: &Path) -> Result<PathBuf, String> {
             }
         }
     }
-    std::fs::canonicalize(named)
-        .map(simplify_verbatim)
-        .map_err(|e| format!("cannot resolve it to a real path: {e}"))
+    match std::fs::canonicalize(named) {
+        Ok(real) => Ok(simplify_verbatim(real)),
+        Err(e) => {
+            // Both halves of the dangling case are handled explicitly: the lstat SUCCEEDS (the
+            // link exists) while canonicalize FAILS (its target does not) — so the error names
+            // the target, which is the generation the operator must publish or stop pointing at.
+            if std::fs::symlink_metadata(named).is_ok_and(|m| m.file_type().is_symlink()) {
+                let target = std::fs::read_link(named)
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_else(|_| "<unreadable>".to_string());
+                return Err(format!(
+                    "it is a symlink to `{target}`, which cannot resolve to a real path ({e}) — a \
+                     dangling link is not a snapshot; publish the generation it names or pass a \
+                     concrete generation path"
+                ));
+            }
+            Err(format!("cannot resolve it to a real path: {e}"))
+        }
+    }
+}
+
+/// `path` must exist, must NOT be a symlink, and must be a regular file (`want_file`) or a
+/// directory. lstat, never a following stat: containment means the entry IS inside the root, not
+/// pointed at from it. `rel` is how the entry is named in the error.
+fn contained(path: &Path, rel: &str, want_file: bool) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{rel} is missing ({e})"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "{rel} is a symlink — a snapshot's files must be contained in it, not linked"
+        ));
+    }
+    if want_file && !meta.is_file() {
+        return Err(format!("{rel} is not a regular file"));
+    }
+    if !want_file && !meta.is_dir() {
+        return Err(format!("{rel} is not a directory"));
+    }
+    Ok(())
+}
+
+/// Read a regular file WITHOUT following a final-component symlink. On unix the open itself
+/// carries `O_NOFOLLOW`, so the lstat→open window cannot be raced into a link; elsewhere the
+/// lstat is re-done immediately before the read.
+fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = {
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::other("is a symlink"));
+        }
+        std::fs::File::open(path)?
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Drop the `\\?\` verbatim prefix Windows `canonicalize` adds (`\\?\C:\x` → `C:\x`,
@@ -634,12 +913,14 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
     };
     let root = canonical_root(named).map_err(config_err)?;
     let path = root.as_path();
-    match std::fs::metadata(path) {
+    match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return Err(config_err("not a directory".to_string())),
         Err(e) => return Err(config_err(format!("cannot read it: {e}"))),
     }
-    match plugin_manifest_name(path) {
+    // The containment walk covers EVERY component below the (canonical, hence real) root: the
+    // manifest directory and file, the index, `skills/`, each skill directory, each `SKILL.md`.
+    match plugin_manifest_name(path).map_err(config_err)? {
         Some(name) if name == PLUGIN_NAME => {}
         Some(name) => {
             return Err(config_err(format!(
@@ -653,7 +934,8 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
         }
     }
     let index_path = path.join(SNAPSHOT_INDEX);
-    let bytes = std::fs::read(&index_path)
+    contained(&index_path, SNAPSHOT_INDEX, true).map_err(config_err)?;
+    let bytes = read_no_follow(&index_path)
         .map_err(|e| config_err(format!("cannot read {SNAPSHOT_INDEX}: {e}")))?;
     let index: Value = serde_json::from_slice(&bytes)
         .map_err(|e| config_err(format!("{SNAPSHOT_INDEX} is not valid JSON: {e}")))?;
@@ -759,10 +1041,12 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
     })
 }
 
-/// The `SKILL.md` an index entry names, verified: `dir` is a clean relative `/`-path, every
-/// component from the root down exists and is NOT a symlink (lstat walk — the file must be
-/// contained in the root, not pointed at from it), the leaf is a regular file, and it is
-/// readable with a frontmatter block. Returns the frontmatter.
+/// The `SKILL.md` an index entry names, verified: `dir` is a clean relative `/`-path, EVERY
+/// component from the root down — `skills/` itself first, then each directory of `dir`, then the
+/// leaf — exists and is NOT a symlink (lstat walk — the file must be contained in the root, not
+/// pointed at from it; a `skills -> /outside` link is refused at `skills`, before anything under
+/// it is looked at), the leaf is a regular file, and it is readable (no-follow) with a
+/// frontmatter block. Returns the frontmatter.
 fn verify_skill_file(root: &Path, dir: &str) -> Result<Frontmatter, String> {
     let components: Vec<&str> = dir.split('/').collect();
     if dir.contains('\\')
@@ -774,33 +1058,23 @@ fn verify_skill_file(root: &Path, dir: &str) -> Result<Frontmatter, String> {
             "dir `{dir}` is not a clean relative `/`-separated path under {SKILLS_DIR}/"
         ));
     }
-    let mut at = root.join(SKILLS_DIR);
+    let mut at = root.to_path_buf();
     let rel = |p: &Path| {
         p.strip_prefix(root)
             .map(|r| r.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| p.display().to_string())
     };
-    for component in components
-        .iter()
-        .copied()
-        .chain(std::iter::once(SKILL_FILE))
-    {
+    let mut walk: Vec<&str> = Vec::with_capacity(components.len() + 2);
+    walk.push(SKILLS_DIR);
+    walk.extend(components.iter().copied());
+    walk.push(SKILL_FILE);
+    let last = walk.len() - 1;
+    for (i, component) in walk.into_iter().enumerate() {
         at.push(component);
-        let meta =
-            std::fs::symlink_metadata(&at).map_err(|e| format!("{} is missing ({e})", rel(&at)))?;
-        if meta.file_type().is_symlink() {
-            return Err(format!(
-                "{} is a symlink — a snapshot's skills must be contained in it, not linked",
-                rel(&at)
-            ));
-        }
+        contained(&at, &rel(&at), i == last)?;
     }
-    let meta = std::fs::symlink_metadata(&at).map_err(|e| format!("{} ({e})", rel(&at)))?;
-    if !meta.is_file() {
-        return Err(format!("{} is not a regular file", rel(&at)));
-    }
-    let text =
-        std::fs::read_to_string(&at).map_err(|e| format!("{} is not readable ({e})", rel(&at)))?;
+    let bytes = read_no_follow(&at).map_err(|e| format!("{} is not readable ({e})", rel(&at)))?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", rel(&at)))?;
     parse_frontmatter(&text).ok_or_else(|| format!("{} has no `---` frontmatter block", rel(&at)))
 }
 
@@ -852,8 +1126,9 @@ fn walk_skills(
         let skill_md = path.join(SKILL_FILE);
         if std::fs::symlink_metadata(&skill_md).is_ok_and(|m| m.is_file()) {
             let dir = child_rel.join("/");
-            match std::fs::read_to_string(&skill_md)
+            match read_no_follow(&skill_md)
                 .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
                 .and_then(|text| parse_frontmatter(&text).map(|fm| (fm, text)))
             {
                 Some((
@@ -958,15 +1233,46 @@ fn unquote(value: &str) -> String {
         .to_string()
 }
 
-/// The `name` in `<root>/.claude-plugin/plugin.json`, or `None` when the file is absent, is not a
-/// regular file, or does not parse to an object with a string `name`.
-fn plugin_manifest_name(root: &Path) -> Option<String> {
-    let path = root.join(PLUGIN_MANIFEST);
-    if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-        return None;
+/// The `name` in `<root>/.claude-plugin/plugin.json`: `Ok(None)` when the directory or the file
+/// is absent, is not a regular file, or does not parse to an object with a string `name`;
+/// `Err` when `.claude-plugin/` or `plugin.json` IS present but is a symlink — a linked manifest
+/// is a containment defect, not "no manifest", so it is named rather than treated as absent.
+fn plugin_manifest_name(root: &Path) -> Result<Option<String>, String> {
+    let dir = root.join(".claude-plugin");
+    match std::fs::symlink_metadata(&dir) {
+        Err(_) => return Ok(None),
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(
+                ".claude-plugin is a symlink — a snapshot's files must be contained in it, not \
+                 linked"
+                    .to_string(),
+            )
+        }
+        Ok(m) if !m.is_dir() => return Ok(None),
+        Ok(_) => {}
     }
-    let manifest: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    manifest.get("name")?.as_str().map(str::to_string)
+    let path = dir.join("plugin.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(_) => return Ok(None),
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!(
+                "{PLUGIN_MANIFEST} is a symlink — a snapshot's files must be contained in it, not \
+                 linked"
+            ))
+        }
+        Ok(m) if !m.is_file() => return Ok(None),
+        Ok(_) => {}
+    }
+    let Ok(bytes) = read_no_follow(&path) else {
+        return Ok(None);
+    };
+    let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(None);
+    };
+    Ok(manifest
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string))
 }
 
 /// The highest `X.Y.Z`-named subdirectory of a marketplace cache dir, compared NUMERICALLY
@@ -998,19 +1304,89 @@ fn home_dir() -> Option<PathBuf> {
 
 // ── Admission ─────────────────────────────────────────────────────────────────
 
-/// Admit a launch on `cli` that requires `refs`: every ref — of ANY family — and everything it
+/// What one unit's launch requires of the skills root, in the two senses admission judges
+/// separately (v3.1 §5): `plan` — every ref the RUN names, whose EXISTENCE is required so a
+/// missing skill refuses the run at its first unit, not at the unit that needed it; `seat` — the
+/// refs THIS unit's seat will actually invoke, the only ones whose CLI compatibility (Claude's
+/// one-directory-deep discovery, the mirrors' `portable` requirement) is judged. `seat ⊆ plan`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RequiredRefs<'a> {
+    pub plan: Vec<&'a str>,
+    pub seat: Vec<&'a str>,
+}
+
+impl<'a> RequiredRefs<'a> {
+    /// From a launch input: the run-wide set the actor computed ([`StepInput::required_skills`])
+    /// plus the unit's own `skill_ref` (so a directly-constructed input is still admitted on its
+    /// own terms) is the plan; the unit's own `skill_ref` is the seat.
+    pub(crate) fn of(input: &'a StepInput) -> Self {
+        let seat: Vec<&str> = input
+            .unit
+            .skill_ref
+            .as_deref()
+            .filter(|r| !r.is_empty())
+            .into_iter()
+            .collect();
+        let plan: Vec<&str> = input
+            .required_skills
+            .iter()
+            .map(String::as_str)
+            .chain(seat.iter().copied())
+            .filter(|r| !r.is_empty())
+            .collect();
+        Self { plan, seat }
+    }
+
+    /// A unit judged on its own terms: what its seat invokes is the whole plan.
+    #[cfg(test)]
+    pub(crate) fn seat(refs: impl IntoIterator<Item = &'a str>) -> Self {
+        let seat: Vec<&str> = refs.into_iter().filter(|r| !r.is_empty()).collect();
+        Self {
+            plan: seat.clone(),
+            seat,
+        }
+    }
+
+    /// A plan-wide set with the seat's own subset spelled out.
+    #[cfg(test)]
+    pub(crate) fn plan_and_seat(
+        plan: impl IntoIterator<Item = &'a str>,
+        seat: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        let seat: Vec<&str> = seat.into_iter().filter(|r| !r.is_empty()).collect();
+        let plan: Vec<&str> = plan
+            .into_iter()
+            .chain(seat.iter().copied())
+            .filter(|r| !r.is_empty())
+            .collect();
+        Self { plan, seat }
+    }
+}
+
+/// Admit a launch on `cli` that requires `refs`.
+///
+/// EXISTENCE, plan-wide: every ref in `refs.plan` — of ANY family — and everything it
 /// transitively `mandates` must resolve in `snapshot`, or the launch is refused naming the
-/// missing ones. Then the CLI's own limits apply: a Claude seat cannot be handed a nested skill
-/// (no Claude identity exists for it), and a non-Claude seat cannot be handed a `portable: false`
-/// one (its mirror excludes it). `Ok(None)` ⇒ nothing required and no root to hand.
-pub(crate) fn admit_refs<'a>(
+/// missing ones. INVOCABILITY, seat-specific: for the closure of `refs.seat` only, the CLI's own
+/// limits apply — a Claude seat cannot be handed a nested skill (no Claude identity exists for
+/// it), and a non-Claude seat cannot be handed a `portable: false` one (its mirror excludes it).
+/// A skill another seat invokes is required to EXIST here but is not judged for THIS CLI: a
+/// Codex unit is not refused because a Claude unit needs a non-portable skill, and a Claude unit
+/// is not refused because a mirror seat uses a nested one. `Ok(None)` ⇒ nothing required and no
+/// root to hand.
+pub(crate) fn admit_refs(
     snapshot: Option<SkillsSnapshot>,
-    refs: impl IntoIterator<Item = &'a str>,
+    refs: &RequiredRefs<'_>,
     cli: &WorkerCli,
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
-    let refs: Vec<&str> = refs.into_iter().filter(|r| !r.is_empty()).collect();
+    let plan: Vec<&str> = refs
+        .plan
+        .iter()
+        .copied()
+        .filter(|r| !r.is_empty())
+        .collect();
     let Some(snapshot) = snapshot else {
-        let mut missing: Vec<String> = refs.into_iter().map(str::to_string).collect();
+        let mut missing: Vec<String> = plan.into_iter().map(str::to_string).collect();
         missing.sort();
         missing.dedup();
         if missing.is_empty() {
@@ -1021,59 +1397,78 @@ pub(crate) fn admit_refs<'a>(
             missing,
         });
     };
-    let closure = snapshot.closure(refs);
-    if !closure.missing.is_empty() {
+    let existence = snapshot.closure(plan);
+    if !existence.missing.is_empty() {
         return Err(SkillsError::Missing {
             root: Some(snapshot.root.clone()),
-            missing: closure.missing,
+            missing: existence.missing,
         });
     }
-    if cli.is_claude() {
-        let nested: Vec<(String, String)> = closure
-            .required
-            .iter()
-            .filter(|e| e.is_nested())
-            .map(|e| (e.name.clone(), e.dir.clone()))
-            .collect();
-        if !nested.is_empty() {
-            return Err(SkillsError::NotInvocable {
-                root: snapshot.root.clone(),
-                skills: nested,
-            });
+    let invoked = snapshot.closure(refs.seat.iter().copied());
+    match cli {
+        WorkerCli::Claude => {
+            let nested: Vec<(String, String)> = invoked
+                .required
+                .iter()
+                .filter(|e| e.is_nested())
+                .map(|e| (e.name.clone(), e.dir.clone()))
+                .collect();
+            if !nested.is_empty() {
+                return Err(SkillsError::NotInvocable {
+                    root: snapshot.root.clone(),
+                    skills: nested,
+                });
+            }
         }
-    } else {
-        let nonportable: Vec<String> = closure
-            .required
-            .iter()
-            .filter(|e| !e.portable)
-            .map(|e| e.name.clone())
-            .collect();
-        if !nonportable.is_empty() {
-            return Err(SkillsError::NotPortable {
-                root: snapshot.root.clone(),
-                cli: cli.to_string(),
-                skills: nonportable,
-            });
+        WorkerCli::Other { key, lever } => {
+            let nonportable: Vec<String> = invoked
+                .required
+                .iter()
+                .filter(|e| !e.portable)
+                .map(|e| e.name.clone())
+                .collect();
+            if !nonportable.is_empty() {
+                return Err(SkillsError::NotPortable {
+                    root: snapshot.root.clone(),
+                    cli: key.clone(),
+                    skills: nonportable,
+                });
+            }
+            // v3.2 §3: the seat must have a wicked-owned way to DELIVER what it invokes — a unit
+            // that needs no skill on a lever-less seat runs (without skills); one that names a
+            // skill is refused rather than served through the user's own CLI directories.
+            if !invoked.required.is_empty() {
+                let why = match lever {
+                    SkillsLever::Absent => Some(
+                        "this CLI has no per-launch skills lever the engine can pull".to_string(),
+                    ),
+                    SkillsLever::CopilotAddDir if snapshot.copilot_view().is_none() => {
+                        Some(format!(
+                            "the skills snapshot at {} publishes no views/copilot for `--add-dir` \
+                             to load",
+                            snapshot.root.display()
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(why) = why {
+                    return Err(SkillsError::NoLever {
+                        cli: key.clone(),
+                        skills: invoked.required.iter().map(|e| e.name.clone()).collect(),
+                        why,
+                    });
+                }
+            }
         }
     }
     Ok(Some(snapshot))
 }
 
-/// The refs one unit's launch requires: the run-wide set the actor computed
-/// ([`StepInput::required_skills`]) plus the unit's own `skill_ref`, so a directly-constructed
-/// input is still admitted on its own terms.
-pub(crate) fn unit_skill_refs(input: &StepInput) -> impl Iterator<Item = &str> {
-    input
-        .required_skills
-        .iter()
-        .map(String::as_str)
-        .chain(input.unit.skill_ref.as_deref())
-        .filter(|r| !r.is_empty())
-}
-
-/// The launch admission for one unit, on either spawn path: resolve the root (the ladder), then
-/// require every skill the run names — see [`admit_refs`]. `Ok(None)` ⇒ the unit needs no skill
-/// and there is no root to hand it.
+/// The launch admission for one FRESH launch, on either spawn path: resolve the root (the
+/// ladder), refuse a root the worker Read fence would deny ([`fence_admit`]), then require every
+/// skill the run names — see [`admit_refs`]. `Ok(None)` ⇒ the unit needs no skill and there is no
+/// root to hand it. A CACHED ACP session does not come through here: it is admitted against its
+/// pinned snapshot with [`admit_refs`] directly (v3.1 §4).
 ///
 /// Under the operator's inherit-config escape hatch
 /// (`execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`) the worker runs with the operator's OWN
@@ -1094,7 +1489,46 @@ pub(crate) fn admit_unit(
         return Ok(None);
     }
     let snapshot = resolve()?;
-    admit_refs(snapshot, unit_skill_refs(input), cli)
+    if let Some(s) = &snapshot {
+        fence_admit(s)?;
+    }
+    admit_refs(snapshot, &RequiredRefs::of(input), cli)
+}
+
+/// The fence check at admission (v3.1 §1), before any process starts and on both carriers.
+///
+/// A PUBLISHED snapshot that lies under a tree the worker Read fence denies — anywhere but the
+/// one read slot, `<state home>/skills/snapshots/<gen>/` — is a config error naming both paths:
+/// Claude's deny beats any allow, so the worker could load the plugin and never read a file in
+/// it, and the engine never widens the fence to fix that. A snapshot IN the slot is admitted only
+/// when the state home's entries are all classified by the fence registry
+/// (`execute_wrapped::fence_check` → `state_home`); an unclassified entry refuses the launch by
+/// name rather than leaving it unfenced.
+///
+/// The LIVE-CACHE fallback always sits under the daemon's claude config dir, which the fence
+/// denies: that is not a config error (day one has no snapshot yet, and refusing every run until
+/// one is published is the fail-open ladder's opposite mistake), but it is said out loud — the
+/// plugin loads, its support files stay unreadable to the worker's file tools, and the fix is to
+/// publish a snapshot.
+fn fence_admit(snapshot: &SkillsSnapshot) -> Result<(), SkillsError> {
+    match crate::execute_wrapped::fence_check(&snapshot.root) {
+        Ok(()) => Ok(()),
+        Err(why) if snapshot.source == SnapshotSource::Published => Err(SkillsError::Config {
+            var: SKILLS_SNAPSHOT_ENV,
+            path: snapshot.root.clone(),
+            why,
+        }),
+        Err(why) => {
+            eprintln!(
+                "[wicked-core] skills.notice the {} at {} is inside the worker Read fence ({why}); \
+                 the plugin loads, but the worker's file tools cannot read its support files — \
+                 publish a snapshot to hand workers a readable root",
+                snapshot.source,
+                snapshot.root.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1213,7 +1647,7 @@ pub(crate) mod test_support {
 
     /// The loaded snapshot for a fixture written by [`snapshot_root`].
     pub(crate) fn load(root: &Path) -> super::SkillsSnapshot {
-        super::resolve_in(Some(root.to_path_buf()), None, None, None, &mut |_| {})
+        super::resolve_in(Some(root.to_path_buf()), None, None, &mut |_| {})
             .expect("the fixture is a snapshot")
             .expect("an explicit path always yields a snapshot")
     }
@@ -1253,7 +1687,7 @@ mod tests {
     }
 
     fn published(root: &Path) -> Result<Option<SkillsSnapshot>, SkillsError> {
-        resolve_in(Some(root.to_path_buf()), None, None, None, &mut |_| {})
+        resolve_in(Some(root.to_path_buf()), None, None, &mut |_| {})
     }
 
     /// The explicit path is loaded from its index: gen, hash, and the skills keyed by name; a ref
@@ -1273,15 +1707,9 @@ mod tests {
             ],
         );
         let mut lines = Vec::new();
-        let s = resolve_in(
-            Some(root.clone()),
-            None,
-            None,
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap()
-        .unwrap();
+        let s = resolve_in(Some(root.clone()), None, None, &mut collect(&mut lines))
+            .unwrap()
+            .unwrap();
         assert!(
             lines.is_empty(),
             "an explicit path logs no fallback: {lines:?}"
@@ -1334,7 +1762,6 @@ mod tests {
             let mut lines = Vec::new();
             let err = resolve_in(
                 Some(path.to_path_buf()),
-                None,
                 None,
                 None,
                 &mut collect(&mut lines),
@@ -1514,6 +1941,60 @@ mod tests {
             panic!("expected Config, got {err:?}");
         };
         assert!(why.contains("skills/domain is a symlink"), "{why}");
+
+        // The walk covers EVERY component (codex round 2): `skills/` itself as a link to an
+        // outside tree whose descendants are regular files with the right names is refused AT
+        // `skills`, before anything under it is consulted.
+        let linked = snapshot_root(
+            &base.join("linked"),
+            "9",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("mem", "wicked-garden-mem"),
+            ],
+        );
+        let elsewhere = base.join("elsewhere");
+        write_skill(&elsewhere, "domain", "wicked-garden-domain");
+        write_skill(&elsewhere, "mem", "wicked-garden-mem");
+        std::fs::remove_dir_all(linked.join(SKILLS_DIR)).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join(SKILLS_DIR), linked.join(SKILLS_DIR)).unwrap();
+        let err = published(&linked).expect_err("skills -> /outside");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(
+            why.contains("skills is a symlink") && !why.contains("is missing"),
+            "refused at the skills component itself: {why}"
+        );
+        // `snapshot.json` as a link (to a valid index elsewhere) is refused, not followed.
+        let idx_linked = snapshot_root(
+            &base.join("idx"),
+            "10",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let real_index = base.join("real-index.json");
+        std::fs::rename(idx_linked.join(SNAPSHOT_INDEX), &real_index).unwrap();
+        std::os::unix::fs::symlink(&real_index, idx_linked.join(SNAPSHOT_INDEX)).unwrap();
+        let err = published(&idx_linked).expect_err("snapshot.json -> elsewhere");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(why.contains("snapshot.json is a symlink"), "{why}");
+        // …and so is `.claude-plugin/` (the manifest dir) — a linked manifest is a containment
+        // defect, not "no manifest".
+        let man_linked = snapshot_root(
+            &base.join("man"),
+            "11",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let real_manifest_dir = base.join("real-claude-plugin");
+        std::fs::rename(man_linked.join(".claude-plugin"), &real_manifest_dir).unwrap();
+        std::os::unix::fs::symlink(&real_manifest_dir, man_linked.join(".claude-plugin")).unwrap();
+        let err = published(&man_linked).expect_err(".claude-plugin -> elsewhere");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(why.contains(".claude-plugin is a symlink"), "{why}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1548,15 +2029,9 @@ mod tests {
             &[("core", "wicked-garden-core")],
         );
         let mut lines = Vec::new();
-        let picked = resolve_in(
-            None,
-            None,
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap()
-        .expect("the live cache is a root");
+        let picked = resolve_in(None, Some(config.clone()), None, &mut collect(&mut lines))
+            .unwrap()
+            .expect("the live cache is a root");
         assert_eq!(picked.source, SnapshotSource::LiveCache);
         assert_eq!(
             picked.root,
@@ -1585,14 +2060,7 @@ mod tests {
         // Cache gone, hand copy still there ⇒ NO root: the hand copy is not on the ladder.
         std::fs::remove_dir_all(config.join("plugins").join("cache")).unwrap();
         let mut lines = Vec::new();
-        let none = resolve_in(
-            None,
-            None,
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap();
+        let none = resolve_in(None, Some(config.clone()), None, &mut collect(&mut lines)).unwrap();
         assert!(
             none.is_none(),
             "the hand copy at <config>/plugins/wicked-garden must never be a fallback: {none:?}"
@@ -1613,7 +2081,7 @@ mod tests {
             .join("wicked-garden")
             .join("1.0.0");
         live_root(&home_cache, "1.0.0", &[("core", "wicked-garden-core")]);
-        let picked = resolve_in(None, None, None, Some(home.clone()), &mut |_| {})
+        let picked = resolve_in(None, None, Some(home.clone()), &mut |_| {})
             .unwrap()
             .unwrap();
         assert_eq!(picked.root, home_cache);
@@ -1626,109 +2094,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The ladder's SECOND rung: with the snapshot variable unset, crew's `current` pointer is
-    /// used when it resolves (loaded as strictly as an explicit path — a broken target is a config
-    /// error naming THAT variable), and when it points at nothing yet the ladder logs the step
-    /// and continues to the live cache.
+    /// The ONE input (v3.1 §2): a variable that is SET BUT EMPTY is invalid explicit
+    /// configuration — a config error, not "unset" — and the withdrawn second input
+    /// (`WICKED_SKILLS_CURRENT`) is not read at all: set to anything, empty included, it neither
+    /// steers the ladder nor breaks it.
     #[test]
-    fn unset_snapshot_uses_current_when_it_resolves_and_falls_through_when_it_does_not() {
-        let base = scratch("current");
-        let gen3 = snapshot_root(
-            &base.join("snapshots").join("3"),
-            "3",
-            &[("domain", "wicked-garden-domain")],
-        );
-        let config = base.join("claude-config");
-        let cache_root = config
-            .join("plugins")
-            .join("cache")
-            .join("wicked-garden")
-            .join("wicked-garden")
-            .join("1.0.0");
-        live_root(&cache_root, "1.0.0", &[("core", "wicked-garden-core")]);
-
-        // `current` resolves (here: the concrete generation dir itself) ⇒ the published root,
-        // no fallback line.
-        let mut lines = Vec::new();
-        let s = resolve_in(
-            None,
-            Some(gen3.clone()),
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(s.root, gen3);
-        assert_eq!(s.source, SnapshotSource::Published);
-        assert!(lines.is_empty(), "{lines:?}");
-
-        // `current` points at nothing ⇒ logged, then the live cache.
-        let mut lines = Vec::new();
-        let s = resolve_in(
-            None,
-            Some(base.join("skills").join("current")),
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(s.root, cache_root);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].contains(SKILLS_CURRENT_ENV) && lines[0].contains("points at nothing"),
-            "{lines:?}"
-        );
-
-        // `current` resolves to something that is NOT a snapshot ⇒ a config error naming
-        // WICKED_SKILLS_CURRENT — never a silent fall-through.
-        let broken = base.join("broken");
-        std::fs::create_dir_all(&broken).unwrap();
-        let err = resolve_in(None, Some(broken.clone()), Some(config), None, &mut |_| {})
-            .expect_err("a resolving pointer is loaded strictly");
-        let SkillsError::Config { var, path, .. } = &err else {
-            panic!("expected Config, got {err:?}");
-        };
-        assert_eq!(*var, SKILLS_CURRENT_ENV);
-        assert_eq!(path, &broken);
-        assert!(err.to_string().contains(SKILLS_CURRENT_ENV));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A variable that is SET BUT EMPTY is invalid explicit configuration — a config error, not
-    /// "unset" — for both inputs.
-    #[test]
-    fn an_empty_explicit_value_is_a_config_error_not_unset() {
+    fn an_empty_explicit_value_is_a_config_error_not_unset_and_there_is_no_second_input() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            [SKILLS_SNAPSHOT_ENV, SKILLS_CURRENT_ENV]
-                .iter()
-                .map(|k| (*k, std::env::var_os(k)))
-                .collect();
-        for var in [SKILLS_SNAPSHOT_ENV, SKILLS_CURRENT_ENV] {
-            std::env::remove_var(SKILLS_SNAPSHOT_ENV);
-            std::env::remove_var(SKILLS_CURRENT_ENV);
-            std::env::set_var(var, "");
-            let err = env_path(var).expect_err("empty is not unset");
-            let SkillsError::Config { var: v, why, .. } = &err else {
-                panic!("expected Config, got {err:?}");
-            };
-            assert_eq!(*v, var);
-            assert!(why.contains("set but empty"), "{why}");
-            assert!(
-                resolve().is_err(),
-                "the ladder itself refuses an empty {var}"
-            );
-        }
+        const WITHDRAWN: &str = "WICKED_SKILLS_CURRENT";
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [SKILLS_SNAPSHOT_ENV, WITHDRAWN]
+            .iter()
+            .map(|k| (*k, std::env::var_os(k)))
+            .collect();
+        std::env::remove_var(SKILLS_SNAPSHOT_ENV);
+        std::env::set_var(SKILLS_SNAPSHOT_ENV, "");
+        let err = env_path(SKILLS_SNAPSHOT_ENV).expect_err("empty is not unset");
+        let SkillsError::Config { var: v, why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert_eq!(*v, SKILLS_SNAPSHOT_ENV);
+        assert!(why.contains("set but empty"), "{why}");
+        assert!(
+            resolve().is_err(),
+            "the ladder itself refuses an empty {SKILLS_SNAPSHOT_ENV}"
+        );
+        // The withdrawn input: an EMPTY value used to error before explicit-path precedence was
+        // applied (codex round 2); now a valid explicit snapshot loads regardless of it.
+        let base = scratch("one-input");
+        let root = snapshot_root(
+            &base.join("snap"),
+            "2",
+            &[("domain", "wicked-garden-domain")],
+        );
+        std::env::set_var(SKILLS_SNAPSHOT_ENV, &root);
+        std::env::set_var(WITHDRAWN, "");
+        let s = resolve()
+            .expect("the withdrawn variable cannot break a valid explicit snapshot")
+            .expect("a root");
+        assert_eq!(s.root, root);
+        std::env::set_var(WITHDRAWN, base.join("nowhere"));
+        assert_eq!(resolve().unwrap().unwrap().root, root);
         for (k, v) in saved {
             match v {
                 Some(val) => std::env::set_var(k, val),
                 None => std::env::remove_var(k),
             }
         }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// An explicit path whose FINAL component is a symlink (crew's `current -> snapshots/<gen>`)
@@ -1799,6 +2213,22 @@ mod tests {
             "the error names the path the operator set, not a hop"
         );
         assert!(why.contains("cannot resolve"), "{why}");
+
+        // A DANGLING link — crew's `current` aimed at a reaped or unpublished generation: lstat
+        // succeeds (the link exists), canonicalize fails (its target does not). Both halves are
+        // handled: a config error naming the path as given AND the target it points at.
+        let dangling = base.join("current-dangling");
+        std::os::unix::fs::symlink("snapshots/99", &dangling).unwrap();
+        assert!(std::fs::symlink_metadata(&dangling).is_ok());
+        let err = published(&dangling).expect_err("a dangling link is not a snapshot");
+        let SkillsError::Config { path, why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert_eq!(path, &dangling);
+        assert!(
+            why.contains("snapshots/99") && why.contains("dangling"),
+            "names the missing target: {why}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1886,10 +2316,10 @@ mod tests {
         // A foreign-family skill that IS in the snapshot (a user-added skill) is admitted.
         let ok = admit_refs(
             Some(snapshot.clone()),
-            [
+            &RequiredRefs::seat([
                 "wicked-garden-domain",
                 "wicked-testing-acceptance-test-writer",
-            ],
+            ]),
             &claude,
         )
         .expect("both are present");
@@ -1898,7 +2328,7 @@ mod tests {
         // A foreign-family skill that is NOT is refused — there is no exemption by family.
         let err = admit_refs(
             Some(snapshot.clone()),
-            ["wicked-garden-domain", "wicked-testing-plan"],
+            &RequiredRefs::seat(["wicked-garden-domain", "wicked-testing-plan"]),
             &claude,
         )
         .expect_err("the foreign ref is missing");
@@ -1916,14 +2346,18 @@ mod tests {
             "the refusal says why the snapshot could not hold it by default: {msg}"
         );
 
+        // Plan-wide: a skill only ANOTHER seat invokes must still exist (the seat here names one
+        // skill; the plan names two more, of which two are missing).
         let err = admit_refs(
             Some(snapshot.clone()),
-            [
-                "wicked-garden-domain-coverage",
-                "wicked-garden-domain",
-                "wicked-garden-domain-extractor",
-                "wicked-garden-domain-coverage",
-            ],
+            &RequiredRefs::plan_and_seat(
+                [
+                    "wicked-garden-domain-coverage",
+                    "wicked-garden-domain-extractor",
+                    "wicked-garden-domain-coverage",
+                ],
+                ["wicked-garden-domain"],
+            ),
             &claude,
         )
         .expect_err("two skills are missing");
@@ -1946,7 +2380,8 @@ mod tests {
             "{msg}"
         );
 
-        let err = admit_refs(None, ["wicked-garden-domain"], &claude).expect_err("no root");
+        let err = admit_refs(None, &RequiredRefs::seat(["wicked-garden-domain"]), &claude)
+            .expect_err("no root");
         assert_eq!(
             err,
             SkillsError::Missing {
@@ -1956,11 +2391,15 @@ mod tests {
         );
         assert!(err.to_string().contains(SKILLS_SNAPSHOT_ENV));
         assert!(
-            admit_refs(None, [], &claude).unwrap().is_none(),
+            admit_refs(None, &RequiredRefs::seat([]), &claude)
+                .unwrap()
+                .is_none(),
             "a run that names no skill proceeds without a root"
         );
         assert!(
-            admit_refs(None, [""], &claude).unwrap().is_none(),
+            admit_refs(None, &RequiredRefs::seat([""]), &claude)
+                .unwrap()
+                .is_none(),
             "an empty ref is no ref"
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -2036,8 +2475,12 @@ mod tests {
         )
         .unwrap();
         let s = load(&root);
-        let err = admit_refs(Some(s), ["wicked-garden-repo-learn"], &WorkerCli::Claude)
-            .expect_err("a mandate two hops down is missing");
+        let err = admit_refs(
+            Some(s),
+            &RequiredRefs::seat(["wicked-garden-repo-learn"]),
+            &WorkerCli::Claude,
+        )
+        .expect_err("a mandate two hops down is missing");
         assert_eq!(
             err,
             SkillsError::Missing {
@@ -2101,12 +2544,17 @@ mod tests {
             ],
         );
         let s = load(&root);
-        let (claude, codex) = (WorkerCli::Claude, WorkerCli::Other("codex".into()));
+        // pi has a per-launch lever (`--no-skills --skill …`); codex has none (v3.2) — the
+        // portability rules are exercised on pi, the lever rule on codex below.
+        let (claude, pi) = (WorkerCli::Claude, WorkerCli::for_binaries("pi", "pi", "pi"));
+        let codex = WorkerCli::for_binaries("codex", "codex", "codex");
+        assert_eq!(pi.lever(), SkillsLever::PiSkillFlags);
+        assert_eq!(codex.lever(), SkillsLever::Absent);
 
-        // Nested: refused for Claude (directly AND through a mandate), admitted for codex.
+        // Nested: refused for Claude (directly AND through a mandate), admitted for pi.
         let err = admit_refs(
             Some(s.clone()),
-            ["wicked-garden-engineering-frontend"],
+            &RequiredRefs::seat(["wicked-garden-engineering-frontend"]),
             &claude,
         )
         .expect_err("nested on claude");
@@ -2127,46 +2575,255 @@ mod tests {
         );
         assert!(
             matches!(
-                admit_refs(Some(s.clone()), ["wicked-garden-engineering"], &claude),
+                admit_refs(
+                    Some(s.clone()),
+                    &RequiredRefs::seat(["wicked-garden-engineering"]),
+                    &claude
+                ),
                 Err(SkillsError::NotInvocable { .. })
             ),
             "a top-level skill that MANDATES a nested one is refused for claude too"
         );
         assert!(admit_refs(
             Some(s.clone()),
-            ["wicked-garden-engineering-frontend"],
-            &codex
+            &RequiredRefs::seat(["wicked-garden-engineering-frontend"]),
+            &pi
         )
         .unwrap()
         .is_some());
 
-        // Non-portable: refused for codex, admitted for Claude.
+        // Non-portable: refused for pi, admitted for Claude.
         let err = admit_refs(
             Some(s.clone()),
-            ["wicked-garden-domain", "wicked-garden-domain-extractor"],
-            &codex,
+            &RequiredRefs::seat(["wicked-garden-domain", "wicked-garden-domain-extractor"]),
+            &pi,
         )
-        .expect_err("non-portable on codex");
+        .expect_err("non-portable on pi");
         assert_eq!(
             err,
             SkillsError::NotPortable {
                 root: root.clone(),
-                cli: "codex".to_string(),
+                cli: "pi".to_string(),
                 skills: vec!["wicked-garden-domain-extractor".to_string()],
             }
         );
-        assert!(err.to_string().contains("'codex'"), "{err}");
+        assert!(err.to_string().contains("'pi'"), "{err}");
         assert!(admit_refs(
             Some(s.clone()),
-            ["wicked-garden-domain", "wicked-garden-domain-extractor"],
+            &RequiredRefs::seat(["wicked-garden-domain", "wicked-garden-domain-extractor"]),
             &claude
         )
         .unwrap()
         .is_some());
-        assert_eq!(WorkerCli::for_seat(true, "whatever"), WorkerCli::Claude);
+
+        // v3.1 §5 — existence is plan-wide, invocability is seat-specific. A MIXED-CLI plan: the
+        // Codex unit invokes `domain` (portable) while a Claude unit elsewhere in the plan needs
+        // the non-portable `domain-extractor` — the Codex unit is ADMITTED (the extractor must
+        // exist, and does; it is not judged for codex).
+        let mixed = RequiredRefs::plan_and_seat(
+            ["wicked-garden-domain-extractor", "wicked-garden-domain"],
+            ["wicked-garden-domain"],
+        );
+        assert!(
+            admit_refs(Some(s.clone()), &mixed, &pi).unwrap().is_some(),
+            "a non-portable skill another seat invokes does not refuse the pi unit"
+        );
+        // …and a Claude unit invoking `domain` while a mirror seat uses the NESTED
+        // `engineering/frontend` is admitted too: the nested skill exists, and only the Claude
+        // seat's own invocation is judged for Claude's one-directory-deep discovery.
+        let mixed = RequiredRefs::plan_and_seat(
+            ["wicked-garden-engineering-frontend", "wicked-garden-domain"],
+            ["wicked-garden-domain"],
+        );
+        assert!(
+            admit_refs(Some(s.clone()), &mixed, &claude)
+                .unwrap()
+                .is_some(),
+            "a nested skill another seat invokes does not refuse the claude unit"
+        );
+        // Existence stays plan-wide: a plan naming a skill NO seat here invokes, and the root
+        // lacks, is refused for every seat.
+        let missing =
+            RequiredRefs::plan_and_seat(["wicked-garden-absent"], ["wicked-garden-domain"]);
+        assert!(matches!(
+            admit_refs(Some(s.clone()), &missing, &pi),
+            Err(SkillsError::Missing { .. })
+        ));
+
+        // v3.2 §3 — no lever ⇒ no skills, never a side channel: a codex unit that INVOKES a skill
+        // is refused naming the skill and the reason; one that names none runs (the snapshot is
+        // handed for the record, the delivery is empty); a codex unit in a plan where OTHER seats
+        // invoke skills is admitted (existence is plan-wide, the lever rule is seat-specific).
+        let err = admit_refs(
+            Some(s.clone()),
+            &RequiredRefs::seat(["wicked-garden-domain"]),
+            &codex,
+        )
+        .expect_err("codex has no lever");
+        let SkillsError::NoLever { cli, skills, why } = &err else {
+            panic!("expected NoLever, got {err:?}");
+        };
+        assert_eq!(cli, "codex");
+        assert_eq!(skills, &vec!["wicked-garden-domain".to_string()]);
+        assert!(why.contains("no per-launch skills lever"), "{why}");
+        assert!(
+            err.to_string()
+                .contains("never through a CLI's own skills directory"),
+            "{err}"
+        );
+        let handed = admit_refs(Some(s.clone()), &RequiredRefs::seat([]), &codex)
+            .unwrap()
+            .expect("the root is still handed for the record");
+        assert_eq!(handed.delivery(&codex), SkillsDelivery::None);
+        assert!(admit_refs(
+            Some(s.clone()),
+            &RequiredRefs::plan_and_seat(["wicked-garden-domain"], []),
+            &codex
+        )
+        .unwrap()
+        .is_some());
+        // copilot's lever needs the generation to publish `views/copilot`; without it the unit is
+        // refused naming the view, with it the delivery is `--add-dir <view>`.
+        let copilot = WorkerCli::for_binaries("copilot", "copilot", "copilot");
+        let err = admit_refs(
+            Some(s.clone()),
+            &RequiredRefs::seat(["wicked-garden-domain"]),
+            &copilot,
+        )
+        .expect_err("no copilot view in this generation");
+        assert!(
+            matches!(&err, SkillsError::NoLever { why, .. } if why.contains("views/copilot")),
+            "{err:?}"
+        );
+        std::fs::create_dir_all(
+            root.join("views")
+                .join("copilot")
+                .join(".github")
+                .join("skills"),
+        )
+        .unwrap();
+        let s = load(&root);
+        let handed = admit_refs(
+            Some(s.clone()),
+            &RequiredRefs::seat(["wicked-garden-domain"]),
+            &copilot,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
-            WorkerCli::for_seat(false, "pi"),
-            WorkerCli::Other("pi".into())
+            handed.delivery(&copilot),
+            SkillsDelivery::CopilotAddDir(root.join("views").join("copilot"))
+        );
+        assert_eq!(
+            handed.delivery(&copilot).argv_flags(),
+            vec![
+                "--add-dir".to_string(),
+                root.join("views")
+                    .join("copilot")
+                    .to_string_lossy()
+                    .into_owned()
+            ]
+        );
+        // pi: discovery OFF, then one --skill per PORTABLE skill (the non-portable extractor is
+        // not delivered; nested portable skills are).
+        let pi_flags = handed.delivery(&pi).argv_flags();
+        assert_eq!(pi_flags[0], "--no-skills");
+        let delivered: Vec<&str> = pi_flags
+            .windows(2)
+            .filter(|w| w[0] == "--skill")
+            .map(|w| w[1].as_str())
+            .collect();
+        let expected = [
+            skill_dir(&root, "domain"),
+            skill_dir(&root, "engineering"),
+            skill_dir(&root, "engineering/frontend"),
+        ];
+        assert_eq!(
+            delivered,
+            expected
+                .iter()
+                .map(|p| p.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            "{pi_flags:?}"
+        );
+        // opencode: `skills.paths` composed WITH the governance content, nothing else touched.
+        let opencode = WorkerCli::for_binaries("opencode", "opencode", "opencode");
+        let composed = handed
+            .delivery(&opencode)
+            .opencode_config(Some(
+                r#"{"$schema":"https://opencode.ai/config.json","permission":{"read":"ask"}}"#,
+            ))
+            .expect("opencode has a lever");
+        let doc: Value = serde_json::from_str(&composed).unwrap();
+        assert_eq!(
+            doc["permission"]["read"], "ask",
+            "governance content survives"
+        );
+        assert_eq!(
+            doc["skills"]["paths"].as_array().unwrap().len(),
+            3,
+            "one path per portable skill: {composed}"
+        );
+        assert!(
+            doc["skills"]["paths"].as_array().unwrap().iter().all(|p| p
+                .as_str()
+                .unwrap()
+                .starts_with(&root.to_string_lossy().to_string())),
+            "{composed}"
+        );
+        assert!(handed.delivery(&pi).opencode_config(None).is_none());
+        let bare: Value =
+            serde_json::from_str(&handed.delivery(&opencode).opencode_config(None).unwrap())
+                .unwrap();
+        assert_eq!(bare["$schema"], "https://opencode.ai/config.json");
+        // The carrier decides the lever: pi's separate ACP bridge forwards no flags.
+        assert_eq!(
+            WorkerCli::for_binaries("pi", "pi-acp", "pi").lever(),
+            SkillsLever::Absent
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("copilot", "copilot", "copilot").lever(),
+            SkillsLever::CopilotAddDir
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("claude", "claude-agent-acp", "claude"),
+            WorkerCli::Claude
+        );
+        // `RequiredRefs::of` reads the plan from `required_skills` and the seat from `skill_ref`.
+        let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        let input = StepInput {
+            run_id: "r".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: vec!["wicked-garden-domain-extractor".to_string()],
+        };
+        let of = RequiredRefs::of(&input);
+        assert_eq!(of.seat, vec!["wicked-garden-domain"]);
+        assert_eq!(
+            of.plan,
+            vec!["wicked-garden-domain-extractor", "wicked-garden-domain"]
+        );
+        assert!(admit_refs(Some(s.clone()), &of, &pi).unwrap().is_some());
+        assert_eq!(
+            WorkerCli::for_binaries("/opt/bin/claude.exe", "whatever", "k"),
+            WorkerCli::Claude
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("pi", "/usr/local/bin/pi", "pi"),
+            WorkerCli::Other {
+                key: "pi".into(),
+                lever: SkillsLever::PiSkillFlags
+            }
         );
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -3234,8 +3234,11 @@ mod boundary_tests {
     fn the_governance_pin_is_outside_the_boundary() {
         let wt = std::env::temp_dir().join("wicked-boundary-wt");
         std::fs::create_dir_all(&wt).unwrap();
-        let pin = dirs_config_workflow();
         with_roots(Some(wt.to_str().unwrap()), || {
+            // Resolved INSIDE the env lock: the pin path derives from HOME, and a concurrent
+            // HOME-pinning test (the skills fixtures pin HOME to a temp scratch) would otherwise
+            // hand this test a pin under the system temp, where the core#264 carve-out applies.
+            let pin = dirs_config_workflow();
             let (denial, is_write) = boundary_denial(&ctx(&pin), "Write")
                 .expect("writing the gate's own pin must be refused");
             assert!(is_write, "writing the pin is a WRITE escape (unit-fatal)");

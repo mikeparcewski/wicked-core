@@ -350,10 +350,11 @@ pub(crate) fn inject_isolation_flags(
         flags.push("acceptEdits".into());
     }
     if !argv_states(&stated, &["--disallowedTools", "--disallowed-tools"]) {
-        // CARVED around the snapshot (`deny_rules_for`, core#396): the default snapshot location
-        // is under `~/.wicked-crew`, which this fence denies, and Claude's deny beats any allow —
-        // so the deny itself must not cover the snapshot.
-        let rules = deny_rules_for(skills_plugin);
+        // The fence for THIS launch (`deny_rules`, core#396 / v3.1 §1): over the state home it is
+        // the explicit registry when the snapshot sits in the read slot, the blanket otherwise —
+        // Claude's deny beats any allow, so the deny itself must not cover the snapshot, and
+        // admission (`fence_check`) already refused a snapshot the fence would cover.
+        let rules = deny_rules(skills_plugin);
         if !rules.is_empty() {
             flags.push("--disallowedTools".into());
             // Comma-joined into a SINGLE argv entry rather than spread across several: the flag is
@@ -479,7 +480,7 @@ fn argv_states(argv: &[String], names: &[&str]) -> bool {
 /// Glob metacharacters (`*`, `?`, `[`) are deliberately NOT refused. A directory named `a*b` yields a
 /// rule that denies MORE than intended, and on a DENY list erring wide is the safe direction; refusing
 /// it would instead open the exact hole this function exists to close.
-fn rule_path(dir: &Path) -> Option<String> {
+pub(crate) fn rule_path(dir: &Path) -> Option<String> {
     rule_path_sep(dir.to_str()?, std::path::MAIN_SEPARATOR)
 }
 
@@ -521,28 +522,150 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 /// The rule strings themselves are built by [`rule_path`], which is where the platform difference
 /// lives.
 ///
-/// # The carve-out (core#396)
+/// # The state-home registry (core#396, design v3.1 §1)
 ///
 /// `skills_root` is the skills snapshot handed to this launch, or `None` for the blanket fence.
-/// The Read fence is CARVED around the snapshot: the default snapshot location is
-/// `<crewStateHome>/skills/snapshots/<gen>` — under
-/// `~/.wicked-crew`, which this fence denies for every file tool — and Claude's deny beats any
-/// allow, so no allow rule can open it: the deny pattern itself must not cover the snapshot. For
-/// each denied directory that is an ancestor of the snapshot, the single `Read(<dir>/**)` is
-/// replaced by one Read rule per SIBLING entry on the path down to the snapshot (`core.db`,
-/// `daemon-stdout.log`, `skills/effective/**`, `skills/snapshots/6/**`, `skills/current/**`, …),
-/// enumerated from the live tree — so every other entry stays denied while no Read rule names the
-/// snapshot. `Edit`/`Write` keep the blanket `<dir>/**`: the snapshot is immutable by contract and
-/// a worker never writes under it. Both carriers use this (the `--disallowedTools` argv and the
-/// `permissions.deny` of the wrapped and ACP settings files), so the fence cannot differ by path.
+/// The snapshot lives under crew's ONE storage root — `<state home>/skills/snapshots/<gen>/`,
+/// `~/.wicked-crew` by default, which this fence denies for every file tool — and Claude's deny
+/// beats any allow, so no allow rule can open it: the deny itself must not cover the snapshot.
+/// When the snapshot sits EXACTLY in that read slot, the state home's single `Read(<dir>/**)` is
+/// replaced by the STATIC rules of the state-home registry (`state_home`, embedded from
+/// `tests/fixtures/state-home-subtrees.json`, mirrored by crew): one Read rule per registered
+/// top-level entry (`core.db*`, `daemon-*`, `evals/**`, …) and one per denied child of the skills
+/// root (`baseline/**`, `effective/**`, `manifest.json`, `current`, `.uv-cache/**`,
+/// `snapshots/.staging-*/**`), so the resolved generation is the ONLY non-denied path under the
+/// state home. `Edit`/`Write` keep the blanket `<dir>/**`: the snapshot is immutable by contract
+/// and a worker never writes under it. Both carriers use this (the `--disallowedTools` argv and
+/// the wrapped settings file; the ACP `session/new` options and per-session settings file), so
+/// the fence cannot differ by path.
 ///
-/// Stated limits: the enumeration is a point-in-time listing, so a sibling CREATED after launch is
-/// fenced by Edit/Write only until the next launch (the daemon's state home is populated at
-/// start-up; the carve is logged so an operator can see what it enumerated). No wildcard
-/// (`<dir>/*`) is used for the siblings on purpose: a matcher that read it as covering the
-/// directory's contents would deny the snapshot silently, which is the exact failure this
-/// function exists to prevent — and a boundary you cannot verify is not one.
-pub(crate) fn deny_rules_for(skills_root: Option<&Path>) -> Vec<String> {
+/// FAIL CLOSED, never widen: no runtime listing ever BUILDS a rule (pass 1 enumerated the state
+/// home's siblings and so failed open for entries created after the listing, listing errors and
+/// unspellable names). The launch-time listing only REFUSES — an entry the registry does not
+/// classify fails admission by name ([`fence_check`]), and should `deny_rules` still meet one
+/// here, the state home keeps its blanket rule (the snapshot is then denied too, loudly). A
+/// snapshot under any other fenced directory, or under the state home outside the read slot, is a
+/// config error at admission. Residual (documented): an entry created under the state home WHILE
+/// a session runs is fenced at the next launch, not mid-session — crew is the only writer of that
+/// directory; sibling immutable generations under `skills/snapshots/` are readable until crew
+/// reaps them (a static rule cannot deny every sibling but the handed one without enumeration).
+pub(crate) fn deny_rules(skills_root: Option<&Path>) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for dir in denied_dirs() {
+        // Skip what cannot be spelled, but SAY SO — see the doc comment: the hole is acceptable,
+        // hiding it is not.
+        let Some(p) = rule_path(&dir) else {
+            unspellable(&dir);
+            continue;
+        };
+        match skills_root.and_then(|root| state_home_read_rules(&dir, root)) {
+            Some(Ok(read)) => {
+                eprintln!(
+                    "[wicked-core] skills.notice the Read fence for {} is the state-home registry \
+                     ({} rules); the skills snapshot at {} is the one non-denied path under it — \
+                     an entry created there while this session runs is fenced at the next launch",
+                    dir.display(),
+                    read.len(),
+                    skills_root
+                        .map(|r| r.display().to_string())
+                        .unwrap_or_default()
+                );
+                rules.extend(read);
+            }
+            Some(Err(why)) => {
+                // Admission (`fence_check`) refuses this before any launch; reaching it here means
+                // the state home changed in between. The fence stays CLOSED: the blanket rule,
+                // snapshot included — the worker's skill reads then fail loudly, the fence never
+                // opens.
+                eprintln!(
+                    "[wicked-core] skills.notice the Read fence for {} cannot be opened around the \
+                     skills snapshot ({why}); the whole tree stays denied for Read, the snapshot \
+                     included",
+                    dir.display()
+                );
+                rules.push(format!("Read({p}/**)"));
+            }
+            None => rules.push(format!("Read({p}/**)")),
+        }
+        for tool in ["Edit", "Write"] {
+            rules.push(format!("{tool}({p}/**)"));
+        }
+    }
+    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules
+}
+
+/// The LAUNCH-INDEPENDENT part of the fence: every fenced directory EXCEPT the state home, plus
+/// the Bash verbs. This is what the ACP worker home's SHARED `settings.json` carries (its "user"
+/// scope, rewritten every spawn): deny rules merge across settings layers, so a blanket state-home
+/// rule there would deny the snapshot for every concurrent session whatever their own settings
+/// say. The state-home rule — blanket or registry — rides each session's own configuration
+/// (`acp_runner::SessionOptions`), never a file two launches share (v3.1 §3).
+pub(crate) fn shared_deny_rules() -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    for dir in denied_dirs() {
+        if crate::state_home::is_state_home(&dir) {
+            continue;
+        }
+        let Some(p) = rule_path(&dir) else {
+            unspellable(&dir);
+            continue;
+        };
+        for tool in ["Read", "Edit", "Write"] {
+            rules.push(format!("{tool}({p}/**)"));
+        }
+    }
+    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules
+}
+
+/// The admission-time fence check for a snapshot root (canonical), on both carriers, before any
+/// process starts: `Err(why)` when the worker Read fence would cover it — it lies under a fenced
+/// directory other than the state home, or under the state home outside the read slot
+/// `skills/snapshots/<gen>/`, or in the slot while the state home holds an entry the registry
+/// does not classify (named in `why`). `Ok(())` for a root outside every fenced directory, or in
+/// the slot of a fully classified state home.
+pub(crate) fn fence_check(root: &Path) -> Result<(), String> {
+    for dir in denied_dirs() {
+        let Some(base) = crate::state_home::base_under(&dir, root) else {
+            continue;
+        };
+        return match state_home_read_rules(&dir, root) {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(why)) => Err(why),
+            None => Err(format!(
+                "it lies under `{}`, which the worker Read fence denies for every file tool — and \
+                 Claude's deny beats any allow, so the worker could load the plugin but never read \
+                 a file in it; the one non-denied slot is `<state home>/{}/skills/snapshots/<gen>/` \
+                 (crew's published generations) — publish there, or outside every fenced directory",
+                base.display(),
+                crate::state_home::STATE_HOME_DIRNAME
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// The state-home registry rules for `dir`, when `dir` IS the state home AND `root` sits exactly
+/// in its read slot: `Some(Ok(rules))`, or `Some(Err(why))` when the tree cannot be classified
+/// (fail closed). `None` when this is any other fenced directory, or the snapshot is not in the
+/// slot — the caller keeps the blanket.
+fn state_home_read_rules(dir: &Path, root: &Path) -> Option<Result<Vec<String>, String>> {
+    if !crate::state_home::is_state_home(dir) {
+        return None;
+    }
+    crate::state_home::snapshot_slot(dir, root)?;
+    Some(crate::state_home::read_rules_around_snapshot(
+        dir, &rule_path,
+    ))
+}
+
+/// The directories the file tools are fenced off from, in rule order: `$CLAUDE_CONFIG_DIR` first
+/// — when the daemon inherits one it is the live config dir, frequently NOT `~/.claude` (that
+/// redirection is how the operator's own tooling stays separate), and home-independent, so it
+/// still contributes when no home resolves — then every [`DENIED_HOME_SUBDIRS`] entry under the
+/// home. Says so when no home resolves (the Bash verb rules do not need one).
+fn denied_dirs() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
@@ -553,113 +676,22 @@ pub(crate) fn deny_rules_for(skills_root: Option<&Path>) -> Vec<String> {
              from workers (the Bash verb rules still apply)"
         );
     }
-    let mut rules: Vec<String> = Vec::new();
-    // `$CLAUDE_CONFIG_DIR` first: when the daemon inherits one it is the live config dir, and it is
-    // frequently NOT `~/.claude` (that redirection is how the operator's own tooling stays separate).
-    // It is also home-independent, so it still contributes when no home resolves.
-    let dirs = std::env::var_os("CLAUDE_CONFIG_DIR")
+    std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .into_iter()
         .chain(
             home.iter()
                 .flat_map(|h| DENIED_HOME_SUBDIRS.iter().map(|d| h.join(d))),
-        );
-    for dir in dirs {
-        // Skip what cannot be spelled, but SAY SO — see the doc comment: the hole is acceptable,
-        // hiding it is not.
-        let Some(p) = rule_path(&dir) else {
-            eprintln!(
-                "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8, or it \
-                 contains a backslash or a comma); this path is NOT fenced off from workers",
-                dir.display()
-            );
-            continue;
-        };
-        match skills_root.and_then(|root| fence_base(&dir, root).map(|base| (base, root))) {
-            Some((base, root)) => {
-                rules.extend(carved_read_rules(&dir, &base, root));
-                for tool in ["Edit", "Write"] {
-                    rules.push(format!("{tool}({p}/**)"));
-                }
-            }
-            None => {
-                for tool in ["Read", "Edit", "Write"] {
-                    rules.push(format!("{tool}({p}/**)"));
-                }
-            }
-        }
-    }
-    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
-    rules
+        )
+        .collect()
 }
 
-/// The spelling of the fenced `dir` that `root` (a snapshot's canonical real path) sits under —
-/// `dir` as derived from `$HOME`, else its canonical form when the home itself is a symlink — or
-/// `None` when the fence does not cover the snapshot at all (nothing to carve).
-fn fence_base(dir: &Path, root: &Path) -> Option<PathBuf> {
-    if root.starts_with(dir) {
-        return Some(dir.to_path_buf());
-    }
-    let canonical = std::fs::canonicalize(dir).ok()?;
-    root.starts_with(&canonical).then_some(canonical)
-}
-
-/// The Read rules for `fence` with `root` carved out — see [`deny_rules_for`]. `base` is the
-/// spelling of `fence` that `root` is under. Walks from `base` down to `root`'s parent: at every
-/// level, every entry that is not the next step towards the snapshot is denied — as itself and, if
-/// it is not a plain file (a directory, or a symlink such as crew's `current`), as a tree. Sorted
-/// per level so the rule list is deterministic whatever order the directory iterates in.
-fn carved_read_rules(fence: &Path, base: &Path, root: &Path) -> Vec<String> {
-    let mut rules = Vec::new();
-    let Ok(rel) = root.strip_prefix(base) else {
-        return rules;
-    };
-    let mut level = base.to_path_buf();
-    let mut fenced = 0usize;
-    for component in rel.components() {
-        let next = level.join(component);
-        match std::fs::read_dir(&level) {
-            Ok(entries) => {
-                let mut siblings: Vec<PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| *p != next)
-                    .collect();
-                siblings.sort();
-                for sibling in siblings {
-                    let Some(sp) = rule_path(&sibling) else {
-                        eprintln!(
-                            "wicked-core: worker isolation cannot express a deny rule for {} \
-                             (non-UTF8, or it contains a backslash or a comma); this path is NOT \
-                             fenced off from workers",
-                            sibling.display()
-                        );
-                        continue;
-                    };
-                    rules.push(format!("Read({sp})"));
-                    if !std::fs::symlink_metadata(&sibling).is_ok_and(|m| m.is_file()) {
-                        rules.push(format!("Read({sp}/**)"));
-                    }
-                    fenced += 1;
-                }
-            }
-            Err(e) => eprintln!(
-                "wicked-core: worker isolation cannot list {} to carve the Read fence around the \
-                 skills snapshot ({e}); the entries at that level are NOT fenced off from Read",
-                level.display()
-            ),
-        }
-        level = next;
-    }
+fn unspellable(dir: &Path) {
     eprintln!(
-        "[wicked-core] skills.notice the Read fence for {} is carved around the skills snapshot at \
-         {}: {fenced} sibling entries denied individually; Edit/Write stay denied for the whole \
-         tree, and a sibling created after this launch is fenced by Edit/Write only until the \
-         next launch",
-        fence.display(),
-        root.display()
+        "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8, or it \
+         contains a backslash or a comma); this path is NOT fenced off from workers",
+        dir.display()
     );
-    rules
 }
 
 /// Append claude's `--output-format stream-json --verbose` flags to an already-built argv, INSERTED
@@ -873,10 +905,11 @@ impl WrappedCliStepRunner {
         // The binary decides the directive's form (and, below, the output adapter + isolation):
         // read off the TEMPLATE's first token, before argv exists, so the prompt is spelled for
         // the CLI that will run it — and so admission knows WHICH CLI it is admitting for.
-        let is_claude = tokenize(&invocation)
-            .first()
-            .is_some_and(|b| binary_is_claude(b));
-        let worker_cli = crate::skills_snapshot::WorkerCli::for_seat(is_claude, &cli_key);
+        let binary = tokenize(&invocation).first().cloned().unwrap_or_default();
+        let is_claude = binary_is_claude(&binary);
+        // On the wrapped path the CLI IS the carrier, so its lever (v3.2) is the CLI's own.
+        let worker_cli =
+            crate::skills_snapshot::WorkerCli::for_binaries(&binary, &binary, &cli_key);
         // core#396: admit the launch against the skills snapshot BEFORE anything is built. The
         // run's whole skill set (transitive mandates included) must be present — and loadable by
         // THIS CLI — or the unit is REFUSED by name (never a worker told to invoke a skill it
@@ -892,7 +925,14 @@ impl WrappedCliStepRunner {
         let handed = skills
             .as_ref()
             .filter(|_| !is_engine_internal(&input.unit) || input.unit.skill_ref.is_some());
-        let form = SkillForm::for_claude(is_claude);
+        let form = SkillForm::for_cli(&worker_cli);
+        // What this launch is handed, in its lever's shape (v3.2 §2): the snapshot root for
+        // Claude's plugin loader, `--skill` dirs for pi, the copilot view, opencode's config paths
+        // — or nothing, for a seat with no lever (which admission has already refused when the
+        // unit invokes a skill).
+        let delivery = handed
+            .map(|s| s.delivery(&worker_cli))
+            .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
         let mut argv = build_argv(
             &invocation,
             &unit_prompt(input, form, handed),
@@ -934,6 +974,31 @@ impl WrappedCliStepRunner {
             // gets `--permission-mode acceptEdits` + the gate-hook, and its `--dangerously-skip-
             // permissions` trust flag would make those deny rules inert.
             apply_seat_posture(&mut argv, &resolve_seat_posture(&cli_key));
+            // v3.2 §2: the seat's PER-LAUNCH skills delivery — pi's `--no-skills --skill <dir>…`,
+            // copilot's `--add-dir <view>` — rides the argv exactly like its posture (before any
+            // `--` guard). opencode's rides the env, set on the command below. Nothing is written
+            // into `~/.pi`, `~/.copilot`, `~/.config/opencode` or `~/.codex`; a seat without a
+            // lever gets no flags and no skills.
+            let flags = delivery.argv_flags();
+            if !flags.is_empty() {
+                apply_seat_posture(&mut argv, &flags);
+            }
+            if let (Some(s), false) = (
+                handed,
+                matches!(delivery, crate::skills_snapshot::SkillsDelivery::None),
+            ) {
+                s.report(&format!(
+                    "path=wrapped run={} unit={} cli={cli_key}",
+                    input.run_id, input.unit.ord
+                ));
+                self.emit_event(s.handed_event(
+                    &input.run_id,
+                    input.unit.ord,
+                    input.attempt,
+                    "wrapped_cli",
+                    &cli_key,
+                ));
+            }
         }
 
         // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
@@ -1070,6 +1135,17 @@ impl WrappedCliStepRunner {
             // exceptions.
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
+            // v3.2 §2, opencode's lever: `OPENCODE_CONFIG_CONTENT` composed WITH whatever the
+            // daemon's environment already carries (the operator's own content, if any), gaining
+            // `skills.paths` — one path per portable skill in the snapshot. Set AFTER `hardened()`
+            // (which strips only the engine's internal variables) so it reaches the child.
+            if let Some(content) = delivery.opencode_config(
+                std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV)
+                    .ok()
+                    .as_deref(),
+            ) {
+                cmd.env(crate::skills_snapshot::OPENCODE_CONFIG_ENV, content);
+            }
             // Point EVERY seat's scratch INSIDE the boundary (core#264, widened for crew#427): this
             // used to live in the claude-only `gov_env` arm, so a non-claude evaluator (codex, under
             // its own `--sandbox workspace-write`) got no in-boundary scratch and its `mktemp` /
@@ -2093,7 +2169,7 @@ fn arm_input_governance(
         // under `acceptEdits`/headless unless allow-listed — a non-interactive session can't answer the
         // approval prompt. Whole-server allow is safe because the server runs `--readonly`
         // (`repo_estate_mcp_parts` / §3.0): there is nothing destructive left to allow.
-        "permissions": { "deny": deny_rules_for(skills_root), "allow": ["mcp__wicked-estate"] }
+        "permissions": { "deny": deny_rules(skills_root), "allow": ["mcp__wicked-estate"] }
     });
     let dir = decisions_path
         .parent()
@@ -2593,6 +2669,14 @@ pub(crate) fn skill_prompt(
                     "Use your skill \"{name}\" and complete this task under its instructions: {}",
                     unit.description
                 ),
+                // v3.2 §3: names the method, does not claim it is loaded — this CLI has no
+                // per-launch delivery, and wicked writes nothing into its skills directory.
+                SkillForm::Unloaded => format!(
+                    "This task's method is the skill \"{name}\", which is NOT loaded in this session \
+                     (this CLI has no per-launch skills delivery); complete the task from its \
+                     description alone: {}",
+                    unit.description
+                ),
             }
         }
         _ => unit.description.clone(),
@@ -2659,29 +2743,39 @@ pub(crate) fn skills_refusal(
 pub(crate) enum SkillForm {
     /// `wicked-garden:<skill-dir>`, invoked via the Skill tool.
     ClaudePlugin,
-    /// The bare mirrored directory name (the frontmatter `name`).
+    /// The bare mirrored directory name (the frontmatter `name`) — for a seat whose lever
+    /// delivered the skill to this launch (pi, copilot, opencode).
     MirroredName,
+    /// A seat with NO per-launch lever (v3.2 §3): the directive names the skill but must not
+    /// imply it is loaded — nothing delivered it, and wicked never writes into a CLI's own skills
+    /// directory. Admission refuses such a unit before a prompt exists; this is the form the
+    /// prompt takes if one is ever built for that seat.
+    Unloaded,
 }
 
 impl SkillForm {
-    /// The form for a seat already known to be (or not be) claude — the wrapped and PTY runners
-    /// decide that off the template's binary, the ACP runner off the seat's registry record.
-    pub(crate) fn for_claude(is_claude: bool) -> Self {
-        if is_claude {
-            SkillForm::ClaudePlugin
-        } else {
-            SkillForm::MirroredName
+    /// The form for the seat a launch runs on: Claude's plugin form; the mirrored name for a
+    /// non-Claude seat with a delivery lever; the unloaded form for one without.
+    pub(crate) fn for_cli(cli: &crate::skills_snapshot::WorkerCli) -> Self {
+        use crate::skills_snapshot::{SkillsLever, WorkerCli};
+        match cli {
+            WorkerCli::Claude => SkillForm::ClaudePlugin,
+            WorkerCli::Other {
+                lever: SkillsLever::Absent,
+                ..
+            } => SkillForm::Unloaded,
+            WorkerCli::Other { .. } => SkillForm::MirroredName,
         }
     }
 
     /// The form for the binary an invocation template names ([`binary_is_claude`] on its first
-    /// token) — the same fact the wrapped runner selects its output adapter and isolation by.
+    /// token, and its lever by stem) — the same fact the wrapped runner selects its output
+    /// adapter, isolation and delivery by.
     pub(crate) fn for_invocation(invocation: &str) -> Self {
-        Self::for_claude(
-            tokenize(invocation)
-                .first()
-                .is_some_and(|b| binary_is_claude(b)),
-        )
+        let binary = tokenize(invocation).first().cloned().unwrap_or_default();
+        Self::for_cli(&crate::skills_snapshot::WorkerCli::for_binaries(
+            &binary, &binary, &binary,
+        ))
     }
 }
 
@@ -2816,7 +2910,7 @@ pub(crate) fn plugin_skill_invocation(
             }
             skill_ref.to_string()
         }
-        SkillForm::MirroredName => skills
+        SkillForm::MirroredName | SkillForm::Unloaded => skills
             .and_then(|s| s.skill(skill_ref))
             .map(|entry| entry.name.clone())
             .unwrap_or_else(|| skill_ref.to_string()),
@@ -4809,7 +4903,9 @@ mod tests {
             matches!(
                 crate::skills_snapshot::admit_refs(
                     Some(snap.clone()),
-                    ["wicked-garden-engineering-frontend"],
+                    &crate::skills_snapshot::RequiredRefs::seat([
+                        "wicked-garden-engineering-frontend"
+                    ]),
                     &crate::skills_snapshot::WorkerCli::Claude
                 ),
                 Err(crate::skills_snapshot::SkillsError::NotInvocable { .. })
@@ -4871,8 +4967,25 @@ mod tests {
             SkillForm::for_invocation("/opt/bin/claude.exe -p {PROMPT}"),
             claude
         );
-        assert_eq!(SkillForm::for_invocation("codex exec {PROMPT}"), mirrored);
+        // v3.2: codex has no per-launch lever, so its form must not imply the skill is loaded;
+        // pi (and copilot, opencode) deliver, so they get the mirrored name.
+        assert_eq!(
+            SkillForm::for_invocation("codex exec {PROMPT}"),
+            SkillForm::Unloaded
+        );
         assert_eq!(SkillForm::for_invocation("pi --skill x {PROMPT}"), mirrored);
+        assert_eq!(SkillForm::for_invocation("copilot -p {PROMPT}"), mirrored);
+        assert_eq!(SkillForm::for_invocation("opencode run {PROMPT}"), mirrored);
+        let mut u = WorkUnit::pending("s:u9", "s", 9, "extract the rules");
+        u.skill_ref = Some("wicked-garden-domain".to_string());
+        let unloaded = skill_prompt(&u, None, SkillForm::Unloaded, None);
+        assert!(
+            unloaded.contains("\"wicked-garden-domain\"")
+                && unloaded.contains("NOT loaded")
+                && !unloaded.contains("Use your skill")
+                && !unloaded.contains("Invoke your skill"),
+            "{unloaded}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5749,7 +5862,7 @@ mod tests {
     /// no rule may contain one.
     #[test]
     fn no_deny_rule_contains_the_character_that_joins_them() {
-        let rules = deny_rules_for(None);
+        let rules = deny_rules(None);
         assert!(!rules.is_empty());
         for r in &rules {
             assert!(!r.contains(','), "rule would split when joined: {r}");
@@ -5824,7 +5937,7 @@ mod tests {
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
-        let rules = deny_rules_for(None);
+        let rules = deny_rules(None);
         for (k, v) in saved {
             match v {
                 Some(val) => std::env::set_var(k, val),
@@ -5889,6 +6002,31 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
         claude
+    }
+
+    /// A fake CLI named `name` — the stem selects the seat's lever (v3.2) — that records its argv
+    /// one token per line into `argv_file`, then one `ENV OPENCODE_CONFIG_CONTENT=<value|UNSET>`
+    /// line, so a test can read back both carriers a launch used.
+    #[cfg(unix)]
+    fn fake_recorder(
+        bin_dir: &std::path::Path,
+        name: &str,
+        argv_file: &std::path::Path,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(bin_dir).unwrap();
+        let bin = bin_dir.join(name);
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n{{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; printf 'ENV \
+                 OPENCODE_CONFIG_CONTENT=%s\\n' \"${{OPENCODE_CONFIG_CONTENT:-UNSET}}\"; }} > \"{}\"\n",
+                argv_file.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
     }
 
     /// The values of every `--plugin-dir <value>` pair in an argv, in order.
@@ -6081,50 +6219,77 @@ mod tests {
         assert!(!rule_denies("Bash(sudo:*)", "Read", "/h/x"));
     }
 
-    /// core#396 × the Read deny fence (FINDING-067): the default snapshot location is
-    /// `<crewStateHome>/skills/snapshots/<gen>` — under `~/.wicked-crew`, which the fence denies for
-    /// every file tool, and Claude's deny beats allow. The fence is CARVED around the snapshot:
-    /// judged with the rule matcher's semantics, a support-file Read under the snapshot is denied by
-    /// NO rule, while every worker-state path beside it — the store, the daemon log, the editable
-    /// root, the previous generation, the `current` link — is still denied, and Edit/Write under the
-    /// snapshot stay denied. Without a snapshot the fence is the blanket it always was, and a
-    /// snapshot outside every fenced directory carves nothing. Both carriers call the same function.
+    /// core#396 × the Read deny fence (FINDING-067), design v3.1 §1: the snapshot lives under
+    /// crew's ONE storage root, `<state home>/skills/snapshots/<gen>` — under `~/.wicked-crew`,
+    /// which the fence denies for every file tool, and Claude's deny beats allow. The fence over
+    /// the state home is the STATIC registry (`tests/fixtures/state-home-subtrees.json`): judged
+    /// with the rule matcher's semantics, a support-file Read under the handed generation is
+    /// denied by NO rule, while every worker-state path — the store and its sidecars, the daemon
+    /// log, the audit log, the editable root, the baseline, the manifest, the uv cache, a staging
+    /// dir, the `current` link, a REGISTERED store that is not even on disk — is denied, and
+    /// Edit/Write under the snapshot stay denied. Nothing is enumerated to build a rule: a
+    /// classified sidecar appearing changes nothing. Fail closed: an UNCLASSIFIED entry refuses
+    /// admission by name (`fence_check`) and, should it appear between admission and launch,
+    /// `deny_rules` keeps the blanket (snapshot denied, never unfenced). A snapshot under the state
+    /// home outside the slot, or under any other fenced directory, fails `fence_check`; one outside
+    /// every fenced directory passes and leaves the blanket byte-identical. Documented residual:
+    /// a sibling immutable generation stays readable until crew reaps it.
     #[cfg(unix)]
     #[test]
-    fn the_read_fence_is_carved_around_the_snapshot_and_still_denies_the_worker_state_beside_it() {
+    fn the_state_home_fence_is_the_static_registry_and_fails_closed_on_the_unclassified() {
         use crate::skills_snapshot::test_support::{scratch, snapshot_root};
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
-        let home = scratch("carve-home");
+        let home = scratch("fence-home");
         let _home = HomeGuard::pin(&home);
         let crew = home.join(".wicked-crew");
         let skills = crew.join("skills");
         let effective = skills.join("effective").join("skills").join("domain");
         std::fs::create_dir_all(&effective).unwrap();
-        std::fs::create_dir_all(skills.join("baseline")).unwrap();
+        std::fs::create_dir_all(skills.join("baseline").join("h").join(".venv")).unwrap();
+        std::fs::create_dir_all(skills.join(".uv-cache")).unwrap();
+        std::fs::create_dir_all(skills.join("snapshots").join(".staging-ab12")).unwrap();
+        std::fs::create_dir_all(crew.join("core.db.events")).unwrap();
+        std::fs::create_dir_all(crew.join("evals")).unwrap();
         std::fs::write(crew.join("core.db"), b"sqlite").unwrap();
+        std::fs::write(crew.join("core.db-wal"), b"").unwrap();
+        std::fs::write(crew.join("core.db.events").join("r.ndjson"), b"{}").unwrap();
         std::fs::write(crew.join("daemon-stdout.log"), b"log").unwrap();
+        std::fs::write(crew.join("audit.log"), b"").unwrap();
         std::fs::write(skills.join("manifest.json"), b"{}").unwrap();
         std::fs::write(effective.join("SKILL.md"), b"---\nname: x\n---\n").unwrap();
+        std::fs::write(
+            skills
+                .join("snapshots")
+                .join(".staging-ab12")
+                .join("snapshot.json"),
+            b"{}",
+        )
+        .unwrap();
         let gen6 = snapshot_root(
-            &skills.join("snapshots").join("6"),
+            &skills.join("snapshots").join("000006"),
             "6",
             &[("domain", "wicked-garden-domain")],
         );
         let gen7 = snapshot_root(
-            &skills.join("snapshots").join("7"),
+            &skills.join("snapshots").join("000007"),
             "7",
             &[("domain", "wicked-garden-domain")],
         );
         std::fs::create_dir_all(gen7.join("scripts")).unwrap();
         std::fs::write(gen7.join("scripts").join("extract.py"), b"print()").unwrap();
-        std::os::unix::fs::symlink("snapshots/7", skills.join("current")).unwrap();
+        std::os::unix::fs::symlink("snapshots/000007", skills.join("current")).unwrap();
 
-        let carved = deny_rules_for(Some(&gen7));
-        let denying = |tool: &str, path: &Path| -> Vec<&str> {
-            carved
+        assert_eq!(
+            fence_check(&gen7),
+            Ok(()),
+            "a snapshot in the read slot is admitted"
+        );
+        let fenced = deny_rules(Some(&gen7));
+        let denying = |rules: &[String], tool: &str, path: &Path| -> Vec<String> {
+            rules
                 .iter()
-                .map(String::as_str)
                 .filter(|r| rule_denies(r, tool, &path.to_string_lossy()))
+                .cloned()
                 .collect()
         };
         // The snapshot's own files: readable — no Read rule covers them; writes stay denied.
@@ -6134,65 +6299,327 @@ mod tests {
             gen7.join("snapshot.json"),
         ] {
             assert!(
-                denying("Read", &p).is_empty(),
-                "{} must be readable under the carved fence, denied by {:?}",
+                denying(&fenced, "Read", &p).is_empty(),
+                "{} must be readable under the registry fence, denied by {:?}",
                 p.display(),
-                denying("Read", &p)
+                denying(&fenced, "Read", &p)
             );
             assert!(
-                !denying("Edit", &p).is_empty() && !denying("Write", &p).is_empty(),
+                !denying(&fenced, "Edit", &p).is_empty()
+                    && !denying(&fenced, "Write", &p).is_empty(),
                 "writes under the snapshot stay denied: {}",
                 p.display()
             );
         }
-        // Everything beside it on the way down: still denied for Read.
+        // Every worker-state path: denied for Read — including a registered store that is NOT on
+        // disk (static rules, nothing enumerated).
         for p in [
             crew.join("core.db"),
+            crew.join("core.db-wal"),
+            crew.join("core.db.events").join("r.ndjson"),
             crew.join("daemon-stdout.log"),
+            crew.join("audit.log"),
+            crew.join("evals").join("runs.jsonl"),
+            crew.join("project-graphs").join("p").join("graph.db"),
+            crew.join("project-settings.json"),
             skills.join("manifest.json"),
             effective.join("SKILL.md"),
-            gen6.join("skills").join("domain").join("SKILL.md"),
+            skills.join("baseline").join("h").join(".venv").join("bin"),
+            skills.join(".uv-cache").join("x"),
+            skills
+                .join("snapshots")
+                .join(".staging-ab12")
+                .join("snapshot.json"),
             skills
                 .join("current")
                 .join("skills")
                 .join("domain")
                 .join("SKILL.md"),
-            skills.join("baseline").join("anything"),
         ] {
             assert!(
-                !denying("Read", &p).is_empty(),
-                "{} must stay denied for Read: {carved:?}",
+                !denying(&fenced, "Read", &p).is_empty(),
+                "{} must stay denied for Read: {fenced:?}",
                 p.display()
             );
         }
-        // The crew home's blanket rule is gone from Read ONLY; every other fenced home is untouched.
+        // Documented residual: a SIBLING generation (immutable, reaped by crew) is not denied — a
+        // static rule cannot say "every sibling but this one" without the enumeration this fence
+        // exists to remove. Pinned so a change here is a decision, not an accident.
+        assert!(
+            denying(&fenced, "Read", &gen6.join("snapshot.json")).is_empty(),
+            "{fenced:?}"
+        );
+        // The state home's blanket rule is gone from Read ONLY; every other fenced home is untouched.
         let crew_rule = rule_path(&crew).expect("expressible");
         assert!(
-            !carved.contains(&format!("Read({crew_rule}/**)")),
-            "{carved:?}"
+            !fenced.contains(&format!("Read({crew_rule}/**)")),
+            "{fenced:?}"
         );
         assert!(
-            carved.contains(&format!("Edit({crew_rule}/**)"))
-                && carved.contains(&format!("Write({crew_rule}/**)")),
-            "{carved:?}"
+            fenced.contains(&format!("Edit({crew_rule}/**)"))
+                && fenced.contains(&format!("Write({crew_rule}/**)")),
+            "{fenced:?}"
         );
         let claude_rule = rule_path(&home.join(".claude")).expect("expressible");
         assert!(
-            carved.contains(&format!("Read({claude_rule}/**)")),
-            "{carved:?}"
+            fenced.contains(&format!("Read({claude_rule}/**)")),
+            "{fenced:?}"
         );
-        for r in &carved {
+        for r in &fenced {
             assert!(!r.contains(','), "rule would split when joined: {r}");
         }
-        // No snapshot ⇒ the blanket fence.
-        let blanket = deny_rules_for(None);
+        // Enumeration-free: a classified sidecar appearing changes NOTHING in the rule list.
+        std::fs::write(crew.join("core.db.mem"), b"").unwrap();
+        assert_eq!(deny_rules(Some(&gen7)), fenced);
+
+        // No snapshot ⇒ the blanket fence, byte-identical to before; a snapshot outside every
+        // fenced directory passes the check and leaves the blanket untouched.
+        let blanket = deny_rules(None);
         assert!(
             blanket.contains(&format!("Read({crew_rule}/**)")),
             "{blanket:?}"
         );
-        // A snapshot outside every fenced directory carves nothing.
         let elsewhere = snapshot_root(&home.join("elsewhere").join("7"), "7", &[]);
-        assert_eq!(deny_rules_for(Some(&elsewhere)), blanket);
+        assert_eq!(fence_check(&elsewhere), Ok(()));
+        assert_eq!(deny_rules(Some(&elsewhere)), blanket);
+        // The shared (launch-independent) subset carries no state-home rule at all.
+        let shared = shared_deny_rules();
+        assert!(!shared.iter().any(|r| r.contains(&crew_rule)), "{shared:?}");
+        assert!(shared.contains(&format!("Read({claude_rule}/**)")));
+        assert!(shared.iter().any(|r| r == "Bash(sudo:*)"));
+
+        // Under the state home but NOT in the slot, or under another fenced dir ⇒ config error
+        // naming both paths.
+        let misplaced = snapshot_root(&crew.join("evals").join("snap"), "8", &[]);
+        let why = fence_check(&misplaced).expect_err("not in the read slot");
+        assert!(
+            why.contains(&crew.display().to_string()) && why.contains("skills/snapshots/<gen>"),
+            "{why}"
+        );
+        let under_claude = home.join(".claude").join("plugins").join("wicked-garden");
+        let why = fence_check(&under_claude).expect_err("under .claude");
+        assert!(
+            why.contains(&home.join(".claude").display().to_string()),
+            "{why}"
+        );
+        assert_eq!(
+            deny_rules(Some(&misplaced)),
+            blanket,
+            "no carve for a misplaced snapshot"
+        );
+
+        // FAIL CLOSED on the unclassified: a stray entry in the state home refuses admission by
+        // name, and the rule builder keeps the blanket (snapshot denied, never unfenced).
+        std::fs::write(crew.join("stray.txt"), b"").unwrap();
+        let why = fence_check(&gen7).expect_err("unclassified entry");
+        assert!(why.contains("`stray.txt`"), "{why}");
+        assert_eq!(deny_rules(Some(&gen7)), blanket);
+        std::fs::remove_file(crew.join("stray.txt")).unwrap();
+        std::fs::create_dir_all(skills.join("scratch")).unwrap();
+        let why = fence_check(&gen7).expect_err("unclassified skills child");
+        assert!(why.contains("`scratch`"), "{why}");
+        assert_eq!(deny_rules(Some(&gen7)), blanket);
+        std::fs::remove_dir_all(skills.join("scratch")).unwrap();
+        assert_eq!(fence_check(&gen7), Ok(()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Design v3.2 — skills reach a non-Claude seat ONLY through its per-launch, wicked-owned
+    /// lever, and NOTHING wicked does touches the user's own CLI directories. Through the real
+    /// `run_unit` against fake CLIs whose stems select the lever: pi is launched with
+    /// `--no-skills` and one `--skill <dir>` per PORTABLE skill (the `portable: false` one is not
+    /// delivered; a nested portable one is); copilot with `--add-dir <snapshot>/views/copilot`;
+    /// opencode with `OPENCODE_CONFIG_CONTENT.skills.paths` naming the same portable dirs; claude
+    /// with its `--plugin-dir`. codex has no lever: a codex unit that invokes a skill is REFUSED
+    /// naming the skill and never launched, while a codex unit that names none runs with nothing
+    /// delivered. Throughout, fake `~/.codex`, `~/.pi`, `~/.copilot`, `~/.config/opencode` and
+    /// `~/.claude` trees are byte-identical before and after — no side channel, ever.
+    #[cfg(unix)]
+    #[test]
+    fn non_claude_seats_get_skills_only_through_their_lever_and_no_user_cli_dir_is_touched() {
+        use crate::skills_snapshot::test_support::{scratch, snapshot_root_with, tree_fingerprint};
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = scratch("levers-home");
+        let _home = HomeGuard::pin(&home);
+        let snapshot = snapshot_root_with(
+            &home.join("snapshots").join("3"),
+            "3",
+            &[
+                ("domain", "wicked-garden-domain", true, &[]),
+                (
+                    "domain-extractor",
+                    "wicked-garden-domain-extractor",
+                    false,
+                    &[],
+                ),
+                ("qe/a11y", "wicked-garden-qe-a11y", true, &[]),
+            ],
+        );
+        let view = snapshot.join("views").join("copilot");
+        std::fs::create_dir_all(
+            view.join(".github")
+                .join("skills")
+                .join("wicked-garden-domain"),
+        )
+        .unwrap();
+        std::fs::write(
+            view.join(".github")
+                .join("skills")
+                .join("wicked-garden-domain")
+                .join("SKILL.md"),
+            "---\nname: wicked-garden-domain\n---\n",
+        )
+        .unwrap();
+        let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let before_snapshot = tree_fingerprint(&snapshot);
+
+        // The user's own CLI state — the trees the withdrawn mirror would have written into.
+        let user_dirs: Vec<std::path::PathBuf> =
+            [".codex", ".pi", ".copilot", ".config/opencode", ".claude"]
+                .iter()
+                .map(|d| home.join(d))
+                .collect();
+        for (i, d) in user_dirs.iter().enumerate() {
+            let skills = d.join("skills").join("user-skill");
+            std::fs::create_dir_all(&skills).unwrap();
+            std::fs::write(
+                skills.join("SKILL.md"),
+                format!("---\nname: user-skill-{i}\n---\n"),
+            )
+            .unwrap();
+        }
+        let before: Vec<_> = user_dirs.iter().map(|d| tree_fingerprint(d)).collect();
+
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let launch = |seat: &str, skill: Option<&str>| -> (StepOutput, Option<Vec<String>>) {
+            let argv_file = wt.join(format!("argv-{seat}-{}.txt", skill.is_some()));
+            let _ = std::fs::remove_file(&argv_file);
+            let bin = fake_recorder(&home.join("bin"), seat, &argv_file);
+            let mut u = WorkUnit::pending(format!("s:{seat}"), "s", 1, "extract the rules");
+            u.assigned_cli = Some(seat.to_string());
+            u.skill_ref = skill.map(str::to_string);
+            u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
+            let input = StepInput {
+                run_id: format!("run-levers-{seat}"),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            let argv = std::fs::read_to_string(&argv_file)
+                .ok()
+                .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>());
+            (out, argv)
+        };
+        let env_line = |argv: &[String]| -> String {
+            argv.iter()
+                .find_map(|l| l.strip_prefix("ENV OPENCODE_CONFIG_CONTENT="))
+                .expect("the recorder writes the env line")
+                .to_string()
+        };
+        let domain = snapshot.join("skills").join("domain");
+        let a11y = snapshot.join("skills").join("qe").join("a11y");
+        let extractor = snapshot.join("skills").join("domain-extractor");
+
+        // pi: discovery OFF, then exactly the portable skills — never the extractor, never a
+        // --plugin-dir, never the user's ~/.pi.
+        let (out, argv) = launch("pi", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("pi was launched");
+        assert!(argv.iter().any(|a| a == "--no-skills"), "{argv:?}");
+        let skills_flags: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--skill")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            skills_flags,
+            vec![
+                domain.to_string_lossy().as_ref(),
+                a11y.to_string_lossy().as_ref()
+            ],
+            "{argv:?}"
+        );
+        assert!(!argv
+            .iter()
+            .any(|a| a == extractor.to_string_lossy().as_ref()));
+        assert!(plugin_dirs(&argv).is_empty());
+        assert_eq!(env_line(&argv), "UNSET");
+
+        // copilot: the published view, and only that.
+        let (out, argv) = launch("copilot", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("copilot was launched");
+        assert!(
+            states_pair(&argv, "--add-dir", view.to_string_lossy().as_ref()),
+            "{argv:?}"
+        );
+        assert!(!argv.iter().any(|a| a == "--skill" || a == "--no-skills"));
+
+        // opencode: skills.paths in the composed config, no flags.
+        let (out, argv) = launch("opencode", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("opencode was launched");
+        let composed: serde_json::Value = serde_json::from_str(&env_line(&argv)).unwrap();
+        assert_eq!(
+            composed["skills"]["paths"],
+            serde_json::json!([domain.to_string_lossy(), a11y.to_string_lossy()]),
+            "{composed}"
+        );
+        assert!(!argv.iter().any(|a| a == "--skill" || a == "--add-dir"));
+
+        // claude: its own lever, unchanged.
+        let (out, argv) = launch("claude", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert_eq!(
+            plugin_dirs(&argv.expect("claude was launched")),
+            vec![snapshot.to_string_lossy().as_ref()]
+        );
+
+        // codex: no lever. Invoking a skill ⇒ refused by name, never launched; no skill ⇒ runs
+        // with nothing delivered.
+        let (out, argv) = launch("codex", Some("wicked-garden-domain"));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("wicked-garden-domain")
+                && out.output.contains("no per-launch skills lever")
+                && out.output.contains("'codex'"),
+            "{}",
+            out.output
+        );
+        assert!(argv.is_none(), "a refused unit never launches the CLI");
+        let (out, argv) = launch("codex", None);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("codex ran");
+        assert!(
+            !argv.iter().any(|a| a == "--skill"
+                || a == "--no-skills"
+                || a == "--add-dir"
+                || a == "--plugin-dir"),
+            "{argv:?}"
+        );
+        assert_eq!(env_line(&argv), "UNSET");
+
+        // No side channel: the user's CLI trees and the snapshot are byte-identical.
+        for (d, fp) in user_dirs.iter().zip(before.iter()) {
+            assert_eq!(
+                &tree_fingerprint(d),
+                fp,
+                "{} must be untouched by a wicked launch",
+                d.display()
+            );
+        }
+        assert_eq!(tree_fingerprint(&snapshot), before_snapshot);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -6237,7 +6664,7 @@ mod tests {
             barrier.wait();
             let admitted = crate::skills_snapshot::admit_refs(
                 Some(snap.clone()),
-                ["wicked-garden-mem"],
+                &crate::skills_snapshot::RequiredRefs::seat(["wicked-garden-mem"]),
                 &WorkerCli::Claude,
             )
             .expect("mem is in both generations")
@@ -6249,7 +6676,7 @@ mod tests {
             let reads = assemble_read_roots(None, &[], Some(&admitted.root));
             let search = crate::skills_snapshot::admit_refs(
                 Some(snap.clone()),
-                ["wicked-garden-search"],
+                &crate::skills_snapshot::RequiredRefs::seat(["wicked-garden-search"]),
                 &WorkerCli::Claude,
             );
             (admitted.root.clone(), prompt, argv, reads, search.is_ok())

@@ -857,6 +857,14 @@ struct AcpProcess {
     /// mid-session would describe a generation this bridge never saw. `None` when no snapshot was
     /// handed (a chat session, a non-claude seat, or no root on the ladder).
     skills: Option<crate::skills_snapshot::SkillsSnapshot>,
+    /// (v3.1 §3) This session's own configuration directory —
+    /// `<worker home>/sessions/<run_id>-<cli_key>/`, holding the `settings.json` the bridge was
+    /// handed in `session/new` — or `None` when the launch carried none (a chat session, a
+    /// non-Claude bridge, the inherit escape hatch). Reaped with the run (`drop_session`), never
+    /// on drop: a racing replacement for the same key shares the path, and its CLI may not have
+    /// read the file yet.
+    #[allow(dead_code)]
+    session_dir: Option<std::path::PathBuf>,
 }
 
 impl Drop for AcpProcess {
@@ -1156,16 +1164,14 @@ pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// `inherit_operator` is [`crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`]'s presence,
 /// read at the call site: the SAME opt-in escape hatch as the wrapped path, because two
 /// opt-outs for one boundary is how one of them silently stops working. Parameterised so both
-/// branches are testable without mutating the test process's environment. `skills_plugin` is the
-/// snapshot this spawn hands over (core#396): the worker home's deny fence is carved around it.
-fn worker_claude_config_dir(
-    inherit_operator: bool,
-    skills_plugin: Option<&std::path::Path>,
-) -> Option<anyhow::Result<std::path::PathBuf>> {
+/// branches are testable without mutating the test process's environment. The home is
+/// launch-independent (v3.1 §3): the settings a particular launch needs — its fence, its
+/// snapshot — ride that session's own configuration ([`SessionOptions`]), never this shared dir.
+fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std::path::PathBuf>> {
     if inherit_operator {
         return None;
     }
-    Some(ensure_worker_config_home(skills_plugin))
+    Some(ensure_worker_config_home())
 }
 
 /// Mint a fresh, engine-owned config directory for ONE ACP spawn.
@@ -1228,9 +1234,16 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 /// racing on the same home can interleave remove/write on `settings.json` into a spurious
 /// NotFound failure (caught by the 8-simultaneous-starts gate test on macOS CI). The critical
 /// section is a handful of fs ops; contention is bounded by the start gate anyway.
-fn ensure_worker_config_home(
-    skills_plugin: Option<&std::path::Path>,
-) -> anyhow::Result<std::path::PathBuf> {
+///
+/// LAUNCH-INDEPENDENT by construction (v3.1 §3): the shared `settings.json` carries only what
+/// every launch agrees on — the fence over every directory EXCEPT the state home, plus the Bash
+/// verbs (`execute_wrapped::shared_deny_rules`). The state-home rule differs per launch (the
+/// registry when the snapshot sits in its read slot, the blanket otherwise), and deny rules MERGE
+/// across settings layers, so a blanket here would deny every concurrent session's snapshot
+/// whatever its own settings say; it rides each session's `session/new` options and per-session
+/// settings file instead ([`write_session_settings`]). Written atomically (tmp + rename) so a
+/// concurrent spawn's CLI never reads a torn file.
+fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
     static ENSURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = ENSURE.lock().unwrap_or_else(|p| p.into_inner());
     let dir = worker_config_home()?;
@@ -1268,17 +1281,158 @@ fn ensure_worker_config_home(
         remove_entry_no_follow(&dir.join(entry))?;
     }
     // settings.json is re-written every spawn; clear any planted entry (symlink included)
-    // first so the write can never travel through a link.
+    // first so the write can never travel through a link — and sweep a temp file a crashed
+    // earlier spawn left behind.
     let settings_path = dir.join("settings.json");
     remove_entry_no_follow(&settings_path)?;
-    // The SAME fence the wrapped path ships, carved around the skills snapshot this spawn hands
-    // over (core#396): the default snapshot location is under `~/.wicked-crew`, which the fence
-    // denies, and Claude's deny beats allow — see `execute_wrapped::deny_rules_for`.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(SETTINGS_TMP_PREFIX)
+            {
+                remove_entry_no_follow(&entry.path())?;
+            }
+        }
+    }
     let settings = json!({
-        "permissions": { "deny": crate::execute_wrapped::deny_rules_for(skills_plugin) }
+        "permissions": { "deny": crate::execute_wrapped::shared_deny_rules() }
     });
-    std::fs::write(&settings_path, serde_json::to_vec(&settings)?)?;
+    write_atomic(&dir, &settings_path, &serde_json::to_vec(&settings)?)?;
     Ok(dir)
+}
+
+/// The per-session configuration directories under the worker home (v3.1 §3). NOT in
+/// [`WORKER_HOME_SANITIZED`]: concurrent sessions live here, and a spawn must never delete
+/// another session's settings.
+const SESSIONS_DIRNAME: &str = "sessions";
+const SETTINGS_TMP_PREFIX: &str = ".settings.json.tmp-";
+
+/// (v3.1 §3) Write THIS session's Claude settings — the full fence for this launch
+/// (`execute_wrapped::deny_rules`: the state-home registry when the snapshot sits in its read
+/// slot, the blanket otherwise) — into `<worker home>/sessions/<run_id>-<cli_key>/settings.json`,
+/// created FRESH per launch (a previous spawn's directory for the same key is removed first, as
+/// a link if one was planted) and written atomically (tmp + rename). Never a shared mutable file
+/// two concurrent launches can race on: a session opened on generation A cannot load B's rules,
+/// and a session with no snapshot cannot open the state home for one that has. Returns the
+/// settings path; the bridge is handed it in `session/new` (`SessionOptions::settings`, the SDK's
+/// `settings` = `--settings`) and the same rules as `disallowedTools`. Reaped with the run
+/// (`drop_session`).
+fn write_session_settings(
+    home: &std::path::Path,
+    run_id: &str,
+    cli_key: &str,
+    deny: &[String],
+) -> anyhow::Result<std::path::PathBuf> {
+    let sessions = home.join(SESSIONS_DIRNAME);
+    match std::fs::symlink_metadata(&sessions) {
+        Ok(m) if m.file_type().is_symlink() => anyhow::bail!(
+            "refusing per-session settings: {} is a symlink",
+            sessions.display()
+        ),
+        Ok(m) if !m.is_dir() => anyhow::bail!(
+            "refusing per-session settings: {} is not a directory",
+            sessions.display()
+        ),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => private_dir(&sessions)?,
+        Err(e) => anyhow::bail!("cannot stat {} ({e})", sessions.display()),
+    }
+    let dir = sessions.join(session_dir_name(run_id, cli_key));
+    remove_entry_no_follow(&dir)?;
+    private_dir(&dir)?;
+    let settings = json!({ "permissions": { "deny": deny } });
+    let path = dir.join("settings.json");
+    write_atomic(&dir, &path, &serde_json::to_vec(&settings)?)?;
+    Ok(path)
+}
+
+/// `<run_id>-<cli_key>`, each component reduced to `[A-Za-z0-9._-]` (a campaign run id carries
+/// `:`; a registry key is free text) so the directory name is one path component everywhere.
+fn session_dir_name(run_id: &str, cli_key: &str) -> String {
+    format!(
+        "{}-{}",
+        sanitize_component(run_id),
+        sanitize_component(cli_key)
+    )
+}
+
+fn sanitize_component(s: &str) -> String {
+    let out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() || out.trim_matches('.').is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
+}
+
+/// Create `dir` (non-recursively — its parent is ours already) private to the user.
+fn private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+        .with_context(|| format!("could not create {}", dir.display()))
+}
+
+/// Write `bytes` to `path` atomically: an exclusively-created private temp file in the same
+/// directory, then `rename` over `path` — a reader sees the old file or the new one, never a torn
+/// one, and a planted link at `path` is replaced as a link (rename does not follow its target).
+fn write_atomic(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = dir.join(format!(
+        "{SETTINGS_TMP_PREFIX}{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result.map_err(|e| anyhow::anyhow!("could not write {} atomically ({e})", path.display()))
+}
+
+/// Remove the per-session settings directories of `run_id`'s sessions (`keys` = the seats it
+/// had) — best effort, no-follow: a missing worker home or an already-reaped dir is not an error.
+fn reap_session_dirs(run_id: &str, keys: &[String]) {
+    let Ok(home) = worker_config_home() else {
+        return;
+    };
+    for key in keys {
+        let dir = home
+            .join(SESSIONS_DIRNAME)
+            .join(session_dir_name(run_id, key));
+        let _ = remove_entry_no_follow(&dir);
+    }
 }
 
 /// Refuse a worker home whose leaf or parent is a symlink — a redirect here re-aims every
@@ -1392,40 +1546,102 @@ fn start_acp_process(
     // dropping a `tmp/` dir into a user's own working directory would be intrusive.
     scratch_tmp: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
-    // No skills snapshot: CHAT sessions (and the tests that use this shape) are not run units —
-    // the snapshot handoff belongs to the unit path, which calls the chokepoint directly.
-    start_acp_process_with_write_roots(config, cwd, code_graph_db, scratch_tmp, &[], &[], None)
+    // No skills delivery and no per-session settings dir: CHAT sessions (and the tests that use
+    // this shape) are not run units — the skills handoff belongs to the unit path, which calls
+    // the chokepoint directly. The fence still rides the frame (`SessionOptions::deny`).
+    start_acp_process_with_write_roots(
+        config,
+        cwd,
+        code_graph_db,
+        scratch_tmp,
+        &[],
+        &[],
+        &crate::skills_snapshot::SkillsDelivery::None,
+        None,
+    )
 }
 
-/// The `session/new` params: the spec fields every ACP agent reads (`cwd`, `mcpServers`) plus,
-/// when a skills snapshot is in hand, the Claude bridge's `_meta.claudeCode.options` extension
-/// carrying it as a local plugin (core#396) — see [`attach_skills_plugin`]. Pure, so the frame the
-/// bridge receives is pinned by a test rather than inferred from a live handshake.
+/// The per-session Claude configuration carried in `session/new` under
+/// `_meta.claudeCode.options` — the object the bridge spreads into the Agent SDK's `Options`
+/// (`@agentclientprotocol/claude-agent-acp` 0.73.0, acp-agent.js `userProvidedOptions` :5209,
+/// `...userProvidedOptions` :5312) — the ACP analog of the wrapped path's argv, field by field:
+///
+/// - `skills_plugin` → `plugins: [{type: "local", path}]` (SDK `SdkPluginConfig`), the snapshot
+///   — `--plugin-dir` on the wrapped path (core#396);
+/// - `deny` → `disallowedTools`, which the bridge MERGES with its own (:5356) — THIS launch's
+///   fence, `--disallowedTools` on the wrapped path (v3.1 §3);
+/// - `settings` → the SDK's `settings?: string` ("equivalent to the `--settings` CLI flag"), the
+///   per-session settings file carrying the same fence.
+///
+/// Every field is per SESSION: nothing generation- or launch-dependent rides a file two launches
+/// share. A non-Claude bridge ignores the `claudeCode` extension (unit paths hand it nothing).
+pub(crate) struct SessionOptions<'a> {
+    pub skills_plugin: Option<&'a std::path::Path>,
+    pub deny: &'a [String],
+    pub settings: Option<&'a std::path::Path>,
+}
+
+#[cfg(test)]
+impl SessionOptions<'_> {
+    pub(crate) const NONE: SessionOptions<'static> = SessionOptions {
+        skills_plugin: None,
+        deny: &[],
+        settings: None,
+    };
+}
+
+/// The `session/new` params: the spec fields every ACP agent reads (`cwd`, `mcpServers`) plus
+/// the Claude bridge's `_meta.claudeCode.options` extension carrying this session's
+/// [`SessionOptions`]. Pure, so the frame the bridge receives is pinned by a test rather than
+/// inferred from a live handshake.
 fn session_new_params(
     cwd: &std::path::Path,
     mcp_servers: Value,
-    skills_plugin: Option<&std::path::Path>,
+    options: &SessionOptions<'_>,
 ) -> Value {
     let mut params = json!({
         "cwd": cwd.to_string_lossy().as_ref(),
         "mcpServers": mcp_servers
     });
-    if let Some(root) = skills_plugin {
-        attach_skills_plugin(&mut params, root);
-    }
+    attach_session_options(&mut params, options);
     params
 }
 
-/// MERGE the skills snapshot into `params._meta.claudeCode.options.plugins` as the Agent SDK's
-/// own `SdkPluginConfig { type: "local", path }`. The bridge spreads that `options` object into
-/// its session options, so it is the one channel it honours for plugins (argv it does not parse
-/// is discarded — FINDING-060 — and the worker home's `plugins/` is re-sanitized on every spawn).
-///
-/// Merge, never replace: every object on the way down is created only where absent, sibling keys
-/// (`settingSources`, a future permission option) are kept, and an existing `plugins` list gains
-/// our entry rather than losing its own. A non-object where an object is needed is a shape this
-/// engine never produced; it is replaced so the plugin lands rather than being silently dropped.
-fn attach_skills_plugin(params: &mut Value, root: &std::path::Path) {
+/// MERGE `options` into `params._meta.claudeCode.options` — see [`SessionOptions`]. Merge, never
+/// replace: every object on the way down is created only where absent, sibling keys
+/// (`settingSources`, a future permission option) are kept, an existing `plugins` or
+/// `disallowedTools` list gains our entries rather than losing its own. Nothing is attached for
+/// an empty option, so a frame with no options carries no `_meta` at all.
+fn attach_session_options(params: &mut Value, options: &SessionOptions<'_>) {
+    if let Some(root) = options.skills_plugin {
+        attach_skills_plugin(params, root);
+    }
+    if !options.deny.is_empty() {
+        let node = claude_code_options(params);
+        let ours = options.deny.iter().map(|r| Value::String(r.clone()));
+        match node
+            .get_mut("disallowedTools")
+            .and_then(Value::as_array_mut)
+        {
+            Some(list) => {
+                for rule in ours {
+                    if !list.contains(&rule) {
+                        list.push(rule);
+                    }
+                }
+            }
+            None => node["disallowedTools"] = Value::Array(ours.collect()),
+        }
+    }
+    if let Some(path) = options.settings {
+        claude_code_options(params)["settings"] = json!(path.to_string_lossy().as_ref());
+    }
+}
+
+/// `params._meta.claudeCode.options`, created where absent. A non-object where an object is
+/// needed is a shape this engine never produced; it is replaced so the option lands rather than
+/// being silently dropped.
+fn claude_code_options(params: &mut Value) -> &mut Value {
     let mut node = params;
     for key in ["_meta", "claudeCode", "options"] {
         if !node.is_object() {
@@ -1440,6 +1656,15 @@ fn attach_skills_plugin(params: &mut Value, root: &std::path::Path) {
     if !node.is_object() {
         *node = json!({});
     }
+    node
+}
+
+/// MERGE the skills snapshot into `params._meta.claudeCode.options.plugins` as the Agent SDK's
+/// own `SdkPluginConfig { type: "local", path }`. The bridge spreads that `options` object into
+/// its session options, so it is the one channel it honours for plugins (argv it does not parse
+/// is discarded — FINDING-060 — and the worker home's `plugins/` is re-sanitized on every spawn).
+fn attach_skills_plugin(params: &mut Value, root: &std::path::Path) {
+    let node = claude_code_options(params);
     let entry = json!({ "type": "local", "path": root.to_string_lossy().as_ref() });
     match node.get_mut("plugins").and_then(Value::as_array_mut) {
         Some(plugins) => plugins.push(entry),
@@ -1450,6 +1675,10 @@ fn attach_skills_plugin(params: &mut Value, root: &std::path::Path) {
 /// The actual ACP spawn chokepoint. `extra_write_roots` comes from the same launch-validated
 /// governance context used to arm `WICKED_WRITE_ROOTS`; Boundary 1 is WRITE containment only,
 /// not exfiltration protection, a read jail, or a replacement for ACP governance.
+///
+/// Eight parameters, each a distinct launch fact documented inline below; bundling them into a
+/// struct would touch every test spawn in this file for no gain in clarity.
+#[allow(clippy::too_many_arguments)]
 fn start_acp_process_with_write_roots(
     config: &AcpConfig,
     cwd: &std::path::Path,
@@ -1460,32 +1689,74 @@ fn start_acp_process_with_write_roots(
     // (`execute_wrapped::estate_provenance_env`) — stamped onto its `proposal.submit`s. Empty for a
     // repo-less session (no estate server is advertised at all) or an ungoverned/chat caller.
     estate_provenance: &[(String, String)],
-    // core#396: the immutable skills snapshot to hand this session as a LOCAL PLUGIN, or `None`.
-    // Carried in `session/new` under `_meta.claudeCode.options.plugins` — the bridge passes that
-    // object through to the Agent SDK's `Options` (`plugins: [{type: "local", path}]`), the one
-    // channel it honours for plugins (argv it does not parse is discarded, FINDING-060, and the
-    // worker home's `plugins/` is re-sanitized on every spawn). `Some` only for a claude seat: the
-    // `claudeCode` namespace is that bridge's, and this path spawns other agents too.
-    skills_plugin: Option<&std::path::Path>,
+    // core#396 / v3.2: what this session is handed, in its lever's shape — the snapshot as a LOCAL
+    // PLUGIN for the Claude bridge (`session/new` `_meta.claudeCode.options.plugins`, the one
+    // channel it honours for plugins: argv it does not parse is discarded, FINDING-060, and the
+    // worker home's `plugins/` is re-sanitized on every spawn); `--no-skills --skill …` /
+    // `--add-dir …` appended to the bridge argv when the bridge IS pi / copilot; opencode's
+    // `skills.paths` composed into `OPENCODE_CONFIG_CONTENT`; or nothing.
+    delivery: &crate::skills_snapshot::SkillsDelivery,
+    // `Some((run_id, cli_key))` for a UNIT session: names its per-session settings directory
+    // (v3.1 §3). `None` for chat sessions.
+    session: Option<(&str, &str)>,
 ) -> anyhow::Result<AcpProcess> {
+    use crate::skills_snapshot::SkillsDelivery;
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
     // the Windows `.cmd` retry) carry the same isolation. Fail CLOSED on a mint failure: a spawn
     // that proceeded without the override would run under the operator's own configuration,
     // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
     // carries its own isolation.
-    let worker_config_dir = match worker_claude_config_dir(
-        crate::execute_wrapped::inherits_operator_config(),
-        skills_plugin,
-    ) {
-        None => None,
-        Some(Ok(dir)) => Some(dir),
-        Some(Err(e)) => {
-            return Err(anyhow::anyhow!(
-                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
-                 under the operator's own CLI configuration (FINDING-061)"
-            ))
-        }
+    let worker_config_dir =
+        match worker_claude_config_dir(crate::execute_wrapped::inherits_operator_config()) {
+            None => None,
+            Some(Ok(dir)) => Some(dir),
+            Some(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+                     under the operator's own CLI configuration (FINDING-061)"
+                ))
+            }
+        };
+    let skills_plugin: Option<&std::path::Path> = match delivery {
+        SkillsDelivery::ClaudePlugin(root) => Some(root.as_path()),
+        _ => None,
     };
+    // v3.1 §3: THIS launch's fence — the state-home registry when the snapshot sits in the read
+    // slot, the blanket otherwise (`execute_wrapped::deny_rules`) — computed once here and
+    // carried on this session's own configuration only: the `session/new` options and, for a
+    // unit session, its per-session settings file under the worker home. Nothing
+    // launch-dependent touches the shared worker home. Under the inherit escape hatch (no worker
+    // home minted) there is no fence, exactly as on the wrapped path. Attached for every bridge:
+    // only the Claude bridge reads `_meta.claudeCode.options`, and the others ignore the
+    // extension — one code path, exercised by every stub the tests drive.
+    let deny: Vec<String> = match &worker_config_dir {
+        Some(_) => crate::execute_wrapped::deny_rules(skills_plugin),
+        None => Vec::new(),
+    };
+    let session_settings: Option<std::path::PathBuf> = match (session, &worker_config_dir) {
+        (Some((run_id, cli_key)), Some(home)) => {
+            Some(write_session_settings(home, run_id, cli_key, &deny)?)
+        }
+        _ => None,
+    };
+    let session_options = SessionOptions {
+        skills_plugin,
+        deny: &deny,
+        settings: session_settings.as_deref(),
+    };
+    // v3.2: opencode's lever rides the SAME variable its governance content does — composed,
+    // never replaced. The seat's registry value is the base when it names that variable; else
+    // whatever the daemon's own environment carries (the operator's content), else a bare doc.
+    let opencode_config: Option<String> = delivery.opencode_config(
+        config
+            .acp_governance_env
+            .as_ref()
+            .filter(|(k, _)| k == crate::skills_snapshot::OPENCODE_CONFIG_ENV)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(crate::skills_snapshot::OPENCODE_CONFIG_ENV).ok())
+            .as_deref(),
+    );
+    let delivery_flags = delivery.argv_flags();
     // Computed ONCE per spawn — not re-probed per turn — because the session this spawn starts
     // is cached and reused across every turn of its lifetime (`probe_cached_session`); "the same
     // resolved ACP binary that is spawned" means the binary this exact process came from, so the
@@ -1553,7 +1824,14 @@ fn start_acp_process_with_write_roots(
         // session/request_permission round-trips — the shared ACP client already answers those
         // with an unconditional allow (`acp_ungoverned_event`'s own "allow_result, unchecked").
         if let Some((k, v)) = &config.acp_governance_env {
-            cmd.env(k, v);
+            // v3.2: when opencode's skills paths were composed onto this very variable, the
+            // composed value below carries the governance content too — set it once.
+            if !(opencode_config.is_some() && k == crate::skills_snapshot::OPENCODE_CONFIG_ENV) {
+                cmd.env(k, v);
+            }
+        }
+        if let Some(content) = &opencode_config {
+            cmd.env(crate::skills_snapshot::OPENCODE_CONFIG_ENV, content);
         }
         // In-boundary scratch for unit sessions (core#264) — tools the bridge spawns inherit
         // this, so `mktemp`/`$TMPDIR` writes land inside the unit instead of the system temp.
@@ -1568,6 +1846,9 @@ fn start_acp_process_with_write_roots(
             }
         }
         cmd.args(&config.start_args);
+        // v3.2: pi's `--no-skills --skill <dir>…` / copilot's `--add-dir <view>` — only when the
+        // bridge IS that CLI (`WorkerCli::for_binaries` judged the carrier); empty otherwise.
+        cmd.args(&delivery_flags);
         cmd.current_dir(cwd);
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
@@ -1809,7 +2090,7 @@ fn start_acp_process_with_write_roots(
             }])
         })
         .unwrap_or_else(|| json!([]));
-    let session_new = session_new_params(cwd, mcp_servers, skills_plugin);
+    let session_new = session_new_params(cwd, mcp_servers, &session_options);
     let session_new_id = next_id;
     next_id += 1;
     if let Err(e) = rpc_send(&mut stdin, session_new_id, "session/new", session_new) {
@@ -1868,8 +2149,12 @@ fn start_acp_process_with_write_roots(
         governance_verified,
         sandbox_downgrade,
         // Bound by the unit runner right after the spawn (it holds the admitted snapshot; this
-        // chokepoint only knows the path it put in the handshake).
+        // chokepoint only knows the delivery it put in the handshake).
         skills: None,
+        session_dir: session_settings
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf),
     })
 }
 
@@ -3909,8 +4194,15 @@ impl AcpStepRunner {
     /// [`PersistentStepRunner::drop_session`]).
     pub fn drop_session(&self, run_id: &str) {
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let keys: Vec<String> = guard
+            .keys()
+            .filter(|(rid, _)| rid == run_id)
+            .map(|(_, key)| key.clone())
+            .collect();
         guard.retain(|(rid, _), _| rid != run_id);
         drop(guard);
+        // v3.1 §3: the run's per-session settings directories go with its sessions.
+        reap_session_dirs(run_id, &keys);
         self.write_reg
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -4092,20 +4384,52 @@ impl AcpStepRunner {
         // transport and admission below. An unregistered key is its own binary, exactly as
         // `resolve_invocation` treats it.
         let seat = registry_record(&cli_key);
-        let seat_is_claude = crate::execute_wrapped::binary_is_claude(
-            seat.as_ref()
-                .map_or(cli_key.as_str(), |c| c.binary.as_str()),
+        let seat_binary = seat
+            .as_ref()
+            .map_or(cli_key.as_str(), |c| c.binary.as_str())
+            .to_string();
+        // The CARRIER this path spawns is the seat's ACP bridge (v3.2): a bridge that is a
+        // separate program (`pi-acp`, `codex-acp`) forwards no CLI flags and so has no skills
+        // lever even where the CLI itself does; a bridge that IS the CLI (`copilot --acp`,
+        // `opencode acp`) keeps it. The wrapped fallback below judges the CLI on its own terms.
+        let carrier_binary = seat
+            .as_ref()
+            .and_then(|c| c.acp.as_ref())
+            .map_or(seat_binary.clone(), |a| a.binary.clone());
+        let worker_cli = crate::skills_snapshot::WorkerCli::for_binaries(
+            &seat_binary,
+            &carrier_binary,
+            &cli_key,
         );
-        let worker_cli = crate::skills_snapshot::WorkerCli::for_seat(seat_is_claude, &cli_key);
-        // core#396: admit the launch against the skills snapshot FIRST — before the operator
-        // messages below are consumed (at-most-once) and before any session is opened. The run's
-        // whole skill set (transitive mandates included) must be present and loadable by THIS
-        // seat, or the unit is REFUSED by name; the root it resolves is what a NEW session's
-        // directive, `session/new` plugin handshake and read carrier use — a REUSED session is
-        // re-judged against the snapshot it was opened with, below.
-        let skills = match crate::skills_snapshot::admit_unit(input, &worker_cli) {
-            Ok(s) => s,
-            Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
+        // core#396 / v3.1 §4 — admission, BEFORE the operator messages below are consumed
+        // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST: a
+        // session this run already holds for this seat is admitted against the snapshot it was
+        // OPENED with (`proc.skills`), never against a re-resolved `current` — the bridge holds
+        // the plugin it loaded, and a `current` that has since moved to a generation dropping a
+        // skill the pinned one still has must not refuse a turn that can succeed. Only a FRESH
+        // session resolves the ambient snapshot (`admit_unit`: the ladder + the fence check). The
+        // run's whole skill set must EXIST (plan-wide, transitive mandates included) and what
+        // THIS seat invokes must be deliverable to it, or the unit is REFUSED by name.
+        let session_key = (run_id.clone(), cli_key.clone());
+        let probe = self.probe_cached_session(&session_key);
+        let refs = crate::skills_snapshot::RequiredRefs::of(input);
+        let skills = match &probe {
+            SessionProbe::Live(arc) => {
+                let pinned = {
+                    let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
+                    proc.skills.clone()
+                };
+                match crate::skills_snapshot::admit_refs(pinned, &refs, &worker_cli) {
+                    Ok(s) => s,
+                    Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
+                }
+            }
+            SessionProbe::Vacant | SessionProbe::FailedStartup => {
+                match crate::skills_snapshot::admit_unit(input, &worker_cli) {
+                    Ok(s) => s,
+                    Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
+                }
+            }
         };
         // Handed to real work units; an engine-internal judge/triage session only when it names a
         // skill (the same rule as the wrapped runner — a plugin's whole catalog in a byte-exact
@@ -4114,8 +4438,12 @@ impl AcpStepRunner {
             !crate::execute_wrapped::is_engine_internal(&input.unit)
                 || input.unit.skill_ref.is_some()
         });
-        let skill_form = SkillForm::for_claude(seat_is_claude);
-        let skills_plugin = handed.filter(|_| seat_is_claude);
+        let skill_form = SkillForm::for_cli(&worker_cli);
+        // What a NEW session on this carrier is handed, in its lever's shape (v3.2 §2).
+        let delivery = handed
+            .map(|s| s.delivery(&worker_cli))
+            .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
+        let delivers = !matches!(delivery, crate::skills_snapshot::SkillsDelivery::None);
 
         // Deliver queued operator messages on this turn (the inject path for ACP runs):
         // appended AFTER the cross-CLI context blocks so they read as the most recent
@@ -4334,16 +4662,13 @@ impl AcpStepRunner {
 
         // Lazily open a session for (run_id, cli_key). The global map lock is held only
         // for the brief map lookup/insert — not across the blocking spawn + handshake.
-        let session_key = (run_id.clone(), cli_key.clone());
         // `FailedStartup` means a previous startup for this key failed; fall back
         // immediately without re-attempting spawn (avoids repeated warnings per run).
-        // A cached session is liveness-probed first (crew#340): a bridge SIGKILLed
-        // between turns is purged and replaced by a fresh spawn, never written into.
-        // `reused` ⇒ the session was opened by an earlier turn and carries the snapshot it was
-        // opened with (core#396) — see the binding below the match.
-        let (proc_arc, reused): (Arc<Mutex<AcpProcess>>, bool) = match self
-            .probe_cached_session(&session_key)
-        {
+        // The cached session was liveness-probed ABOVE, before admission (crew#340 + v3.1 §4):
+        // a bridge SIGKILLed between turns is purged and replaced by a fresh spawn, never
+        // written into. `reused` ⇒ the session was opened by an earlier turn and carries the
+        // snapshot it was opened with (core#396) — see the binding below the match.
+        let (proc_arc, reused): (Arc<Mutex<AcpProcess>>, bool) = match probe {
             SessionProbe::FailedStartup => {
                 return self.fallback.run_unit_streaming(input, emit);
             }
@@ -4400,7 +4725,8 @@ impl AcpStepRunner {
                     Some(&cwd.join("tmp")),
                     extra_write_roots,
                     &estate_provenance,
-                    skills_plugin.map(|s| s.root.as_path()),
+                    &delivery,
+                    Some((run_id.as_str(), cli_key.as_str())),
                 ) {
                     Ok(mut proc) => {
                         // core#396: BIND the admitted snapshot to the process it was handed to.
@@ -4452,7 +4778,7 @@ impl AcpStepRunner {
                             // (the session is cached and reused across the run's turns) — the log
                             // line for the operator and the event crew consults before reaping an
                             // old generation.
-                            if let Some(s) = skills_plugin {
+                            if let (Some(s), true) = (handed, delivers) {
                                 s.report(&format!("path=acp run={run_id} cli={cli_key}"));
                                 self.emit_event(s.handed_event(
                                     &run_id,
@@ -4518,11 +4844,10 @@ impl AcpStepRunner {
             handed.cloned()
         };
         if reused {
-            if let Err(e) = crate::skills_snapshot::admit_refs(
-                bound.clone(),
-                crate::skills_snapshot::unit_skill_refs(input),
-                &worker_cli,
-            ) {
+            // Already judged above for a session the probe found; this catches the race where a
+            // concurrent turn opened the session first (`did_insert` false) — same check, its
+            // snapshot. Idempotent.
+            if let Err(e) = crate::skills_snapshot::admit_refs(bound.clone(), &refs, &worker_cli) {
                 drop(proc);
                 return crate::execute_wrapped::skills_refusal(input, &e);
             }
@@ -4535,7 +4860,12 @@ impl AcpStepRunner {
                     bound.as_ref().map(|s| s.root.as_path()),
                 );
             }
-            if let Some(s) = bound.as_ref().filter(|_| seat_is_claude) {
+            if let Some(s) = bound.as_ref().filter(|s| {
+                !matches!(
+                    s.delivery(&worker_cli),
+                    crate::skills_snapshot::SkillsDelivery::None
+                )
+            }) {
                 s.report(&format!(
                     "path=acp run={run_id} cli={cli_key} unit={} reused=true",
                     input.unit.ord
@@ -5127,8 +5457,8 @@ mod tests {
         let base = worker_home_base("stable");
         std::env::set_var("WICKED_WORKER_HOME", &base);
 
-        let a = ensure_worker_config_home(None).expect("first ensure");
-        let b = ensure_worker_config_home(None).expect("second ensure");
+        let a = ensure_worker_config_home().expect("first ensure");
+        let b = ensure_worker_config_home().expect("second ensure");
         assert_eq!(
             a, b,
             "one persistent home, not per-spawn dirs — the login must stick"
@@ -5147,7 +5477,7 @@ mod tests {
         std::fs::write(a.join(".credentials.json"), "{\"token\":\"keep-me\"}").unwrap();
         std::fs::write(a.join(".claude.json"), "{\"oauthAccount\":{}}").unwrap();
 
-        let c = ensure_worker_config_home(None).expect("re-ensure sanitizes");
+        let c = ensure_worker_config_home().expect("re-ensure sanitizes");
         assert_eq!(c, a);
         assert!(
             !a.join("hooks").exists(),
@@ -5183,7 +5513,7 @@ mod tests {
         let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let base = worker_home_base("plant");
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        let home = ensure_worker_config_home(None).expect("first ensure");
+        let home = ensure_worker_config_home().expect("first ensure");
 
         // The victims a malicious worker would aim at.
         let victim_dir = base.join("victim-dir");
@@ -5197,7 +5527,7 @@ mod tests {
         std::fs::remove_file(home.join("settings.json")).unwrap();
         std::os::unix::fs::symlink(&victim_file, home.join("settings.json")).unwrap();
 
-        ensure_worker_config_home(None).expect("re-ensure sanitizes the plants");
+        ensure_worker_config_home().expect("re-ensure sanitizes the plants");
 
         assert!(
             victim_dir.join("precious.txt").exists(),
@@ -5231,7 +5561,7 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::os::unix::fs::symlink(&target, base.join("claude")).unwrap();
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        let err = ensure_worker_config_home(None).expect_err("symlinked home must be refused");
+        let err = ensure_worker_config_home().expect_err("symlinked home must be refused");
         assert!(err.to_string().contains("symlink"), "{err}");
         restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
@@ -5258,7 +5588,7 @@ mod tests {
             "the pre-main ctor must have armed the worker-home override (and every fixture must \
              RESTORE it, never remove it)"
         );
-        let resolved = ensure_worker_config_home(None).expect("ensure resolves the armed base");
+        let resolved = ensure_worker_config_home().expect("ensure resolves the armed base");
         assert_eq!(resolved, armed.join("claude"));
         assert!(
             resolved.starts_with(std::env::temp_dir()),
@@ -6651,8 +6981,12 @@ sleep 30
         let proc2 =
             start_acp_process(&stub_config(&script2, None), &dir, None, None).expect("start");
         let seen2 = std::fs::read_to_string(&ledger2).unwrap();
-        assert!(
-            !seen2.contains("wicked-estate"),
+        // Judged on the `mcpServers` field, not a substring: the session's fence now rides the same
+        // frame (`_meta.claudeCode.options.disallowedTools`) and names `~/.wicked-estate` there.
+        let frame2: serde_json::Value = serde_json::from_str(&seen2).unwrap();
+        assert_eq!(
+            frame2["params"]["mcpServers"],
+            serde_json::json!([]),
             "a repo-less session must advertise no estate server: {seen2}"
         );
         drop(proc2);
@@ -6698,6 +7032,7 @@ sleep 30
             None,
             &[],
             &provenance,
+            &crate::skills_snapshot::SkillsDelivery::None,
             None,
         )
         .expect("start");
@@ -6747,16 +7082,21 @@ sleep 30
         let cwd = std::path::Path::new("/wt");
         let servers = serde_json::json!([{"name": "wicked-estate"}]);
 
-        let bare = session_new_params(cwd, servers.clone(), None);
+        let bare = session_new_params(cwd, servers.clone(), &SessionOptions::NONE);
         assert_eq!(bare["cwd"], "/wt");
         assert_eq!(bare["mcpServers"], servers);
         assert!(
             bare.get("_meta").is_none(),
-            "no snapshot ⇒ no extension: {bare}"
+            "no options ⇒ no extension: {bare}"
         );
 
         let gen7 = std::path::Path::new("/snapshots/7");
-        let handed = session_new_params(cwd, servers.clone(), Some(gen7));
+        let with_plugin = |root: &'static std::path::Path| SessionOptions {
+            skills_plugin: Some(root),
+            deny: &[],
+            settings: None,
+        };
+        let handed = session_new_params(cwd, servers.clone(), &with_plugin(gen7));
         assert_eq!(
             handed["cwd"], "/wt",
             "the spec params are beside the extension, not under it"
@@ -6769,12 +7109,58 @@ sleep 30
         );
 
         // A second generation names ITS root — nothing is shared between the two frames.
-        let gen8 = session_new_params(cwd, servers, Some(std::path::Path::new("/snapshots/8")));
+        let gen8 = session_new_params(
+            cwd,
+            servers.clone(),
+            &with_plugin(std::path::Path::new("/snapshots/8")),
+        );
         assert_eq!(
             gen8["_meta"]["claudeCode"]["options"]["plugins"][0]["path"],
             "/snapshots/8"
         );
         assert_ne!(handed, gen8);
+
+        // v3.1 §3: the session's fence and settings file ride the same extension — merged into
+        // an existing `disallowedTools` (the bridge merges its own on top), `settings` as the
+        // SDK's path form — and a frame with no snapshot still carries its fence.
+        let deny = vec![
+            "Read(/h/.wicked-crew/core.db*)".to_string(),
+            "Bash(sudo:*)".to_string(),
+        ];
+        let fenced = session_new_params(
+            cwd,
+            servers,
+            &SessionOptions {
+                skills_plugin: None,
+                deny: &deny,
+                settings: Some(std::path::Path::new("/wh/sessions/r-claude/settings.json")),
+            },
+        );
+        let options = &fenced["_meta"]["claudeCode"]["options"];
+        assert_eq!(options["disallowedTools"], serde_json::json!(deny));
+        assert_eq!(options["settings"], "/wh/sessions/r-claude/settings.json");
+        assert!(options.get("plugins").is_none(), "{fenced}");
+        let mut params = serde_json::json!({
+            "cwd": "/wt", "mcpServers": [],
+            "_meta": {"claudeCode": {"options": {"disallowedTools": ["AskUserQuestion", "Bash(sudo:*)"]}}}
+        });
+        attach_session_options(
+            &mut params,
+            &SessionOptions {
+                skills_plugin: None,
+                deny: &deny,
+                settings: None,
+            },
+        );
+        assert_eq!(
+            params["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            serde_json::json!([
+                "AskUserQuestion",
+                "Bash(sudo:*)",
+                "Read(/h/.wicked-crew/core.db*)"
+            ]),
+            "existing entries kept, ours appended once: {params}"
+        );
 
         // MERGE: options that already exist keep every sibling key and their own plugin entries.
         let mut params = serde_json::json!({
@@ -6863,7 +7249,8 @@ cat >/dev/null
             None,
             &[],
             &[],
-            Some(&snapshot),
+            &crate::skills_snapshot::SkillsDelivery::ClaudePlugin(snapshot.clone()),
+            None,
         )
         .expect("start");
         let seen = std::fs::read_to_string(&ledger).unwrap();
@@ -7021,12 +7408,13 @@ while True:
                 ("mem", "wicked-garden-mem"),
             ],
         );
+        // Generation 2 REMOVES `mem` (and adds `search`): the v3.1 §4 case — a cached session
+        // pinned to gen 1 must keep using mem after `current` moves on.
         let gen2 = snapshot_root(
             &skills.join("snapshots").join("2"),
             "2",
             &[
                 ("domain", "wicked-garden-domain"),
-                ("mem-v2", "wicked-garden-mem"),
                 ("search", "wicked-garden-search"),
             ],
         );
@@ -7110,14 +7498,23 @@ transport = "stdio"
         std::fs::remove_file(&current).unwrap();
         std::os::unix::fs::symlink("snapshots/2", &current).unwrap();
 
-        // 3a. Turn 2 of run A, the SAME session: the directive still comes from gen 1's index.
+        // 3a. Turn 2 of run A, the SAME session, names `mem` — which `current` (gen 2) no longer
+        //     holds. v3.1 §4: the cached session is admitted against ITS pinned generation BEFORE
+        //     any ambient resolution, so the turn SUCCEEDS (an ambient-first admission would have
+        //     refused it against gen 2 without ever consulting the cache) and the directive still
+        //     comes from gen 1's index.
         let out = runner.run_unit(&unit("run-A", 2, "wicked-garden-mem"));
-        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert_eq!(
+            out.status,
+            StepStatus::Ok,
+            "a cached session keeps a skill its pinned generation has even after current drops it: {}",
+            out.output
+        );
         let entries = ledger_entries(&ledger);
         assert_eq!(entries.len(), 3, "{entries:?}");
         let prompt = entries[2]["prompt"].as_str().unwrap();
         assert!(
-            prompt.contains("\"wicked-garden:mem\"") && !prompt.contains("mem-v2"),
+            prompt.contains("\"wicked-garden:mem\""),
             "the reused session prompts from the generation it was opened with: {prompt}"
         );
 
@@ -7147,7 +7544,7 @@ transport = "stdio"
             });
             let tb = s.spawn(|| {
                 barrier.wait();
-                runner.run_unit(&unit("run-B", 1, "wicked-garden-mem"))
+                runner.run_unit(&unit("run-B", 1, "wicked-garden-search"))
             });
             (ta.join().unwrap(), tb.join().unwrap())
         });
@@ -7162,13 +7559,13 @@ transport = "stdio"
         assert!(
             prompts[2..]
                 .iter()
-                .any(|p| p.contains("\"wicked-garden:mem\"") && !p.contains("mem-v2")),
+                .any(|p| p.contains("\"wicked-garden:mem\"")),
             "run A still prompts from gen 1: {prompts:?}"
         );
         assert!(
             prompts[2..]
                 .iter()
-                .any(|p| p.contains("\"wicked-garden:mem-v2\"")),
+                .any(|p| p.contains("\"wicked-garden:search\"")),
             "run B prompts from gen 2: {prompts:?}"
         );
         let news: Vec<&Value> = entries.iter().filter(|e| e.get("new").is_some()).collect();
@@ -7177,6 +7574,80 @@ transport = "stdio"
             news[1]["new"]["_meta"]["claudeCode"]["options"]["plugins"][0]["path"],
             gen2.to_string_lossy().as_ref(),
             "the second session was opened on generation 2"
+        );
+
+        // v3.1 §3 — SESSION-SPECIFIC configuration, read off the frames the bridge received: each
+        // session carries ITS snapshot as the plugin, ITS fence as `disallowedTools`, and ITS OWN
+        // settings file (distinct per session, under the worker home's `sessions/`) holding the
+        // same rules; the fence is the state-home REGISTRY (no blanket over `~/.wicked-crew`, so
+        // the snapshot in the read slot is readable) and names no snapshot; and the SHARED
+        // worker-home `settings.json` carries no state-home rule at all — nothing generation- or
+        // launch-dependent lives in a file two launches share.
+        let worker_home = worker_config_home().expect("worker home");
+        let crew_blanket = format!("Read({}/**)", home.join(".wicked-crew").display());
+        let mut settings_paths = Vec::new();
+        for (frame, gen) in news.iter().zip([&gen1, &gen2]) {
+            let options = &frame["new"]["_meta"]["claudeCode"]["options"];
+            assert_eq!(
+                options["plugins"][0]["path"],
+                gen.to_string_lossy().as_ref()
+            );
+            let deny: Vec<String> = options["disallowedTools"]
+                .as_array()
+                .expect("the fence rides the frame")
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            let path = std::path::PathBuf::from(
+                options["settings"]
+                    .as_str()
+                    .expect("a per-session settings path rides the frame"),
+            );
+            assert!(
+                path.starts_with(worker_home.join("sessions")),
+                "{}",
+                path.display()
+            );
+            let file: Value = serde_json::from_slice(
+                &std::fs::read(&path).expect("the session's settings file exists"),
+            )
+            .unwrap();
+            let file_deny: Vec<String> = file["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            assert_eq!(file_deny, deny, "file and frame carry the same fence");
+            assert!(
+                !deny.contains(&crew_blanket),
+                "no blanket over the state home: {deny:?}"
+            );
+            assert!(
+                deny.iter().any(|r| r.contains("skills/effective")),
+                "the registry rules fence the worker state: {deny:?}"
+            );
+            assert!(
+                !deny.iter().any(|r| r.contains(&gen1.display().to_string())
+                    || r.contains(&gen2.display().to_string())),
+                "no rule names a snapshot: {deny:?}"
+            );
+            settings_paths.push(path);
+        }
+        assert_ne!(
+            settings_paths[0], settings_paths[1],
+            "one settings file per session"
+        );
+        let shared: Value =
+            serde_json::from_slice(&std::fs::read(worker_home.join("settings.json")).unwrap())
+                .unwrap();
+        assert!(
+            !shared["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap().contains(".wicked-crew")),
+            "the shared worker-home file is launch-independent: {shared}"
         );
 
         // Generation reporting: one handoff per session, each naming its own generation; nothing
@@ -7199,6 +7670,13 @@ transport = "stdio"
         );
         runner.drop_session("run-A");
         runner.drop_session("run-B");
+        for p in &settings_paths {
+            assert!(
+                std::fs::symlink_metadata(p).is_err(),
+                "{} is reaped with its run",
+                p.display()
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -7220,8 +7698,8 @@ transport = "stdio"
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let base = worker_home_base("inherit-hatch");
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        assert!(worker_claude_config_dir(true, None).is_none());
-        let minted = worker_claude_config_dir(false, None)
+        assert!(worker_claude_config_dir(true).is_none());
+        let minted = worker_claude_config_dir(false)
             .expect("isolation is the default")
             .expect("minting succeeds");
         assert!(minted.is_dir());
@@ -7267,7 +7745,7 @@ transport = "stdio"
         let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let base = worker_home_base("fence");
         std::env::set_var("WICKED_WORKER_HOME", &base);
-        let dir = ensure_worker_config_home(None).expect("ensure");
+        let dir = ensure_worker_config_home().expect("ensure");
         restore_hermetic_worker_home();
         let settings: Value =
             serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
@@ -7277,11 +7755,19 @@ transport = "stdio"
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
+        // v3.1 §3: the SHARED home carries the launch-independent fence only — every fenced
+        // directory except the state home — built by the wrapped path's own function, not a copy
+        // that can drift. The state-home rule rides each session's `session/new` options.
         assert_eq!(
             deny,
-            crate::execute_wrapped::deny_rules_for(None),
-            "the ACP fence must be the wrapped path's fence, not a copy that can drift"
+            crate::execute_wrapped::shared_deny_rules(),
+            "the shared ACP settings must be the launch-independent fence, not a copy that can drift"
         );
+        assert!(
+            !deny.iter().any(|r| r.contains(".wicked-crew")),
+            "the state-home rule is per session, never in the shared file: {deny:?}"
+        );
+        assert!(deny.iter().any(|r| r.ends_with(".claude/**)")), "{deny:?}");
         assert!(
             settings["permissions"].get("defaultMode").is_none(),
             "a pinned mode that auto-approves would answer session/request_permission before \

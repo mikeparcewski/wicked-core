@@ -73,6 +73,11 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` for the skills-snapshot containment reads (`skills_snapshot::read_no_follow`): the
+# open itself refuses a final-component symlink, closing the lstat→open window.
+libc = "0.2"
+
 [features]
 default = []
 # Compile in estate's Postgres backend end-to-end (forwards to apps-core → wicked-estate-store).

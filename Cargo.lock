@@ -3522,6 +3522,7 @@ dependencies = [
  "base64 0.22.1",
  "ctor",
  "jsonschema",
+ "libc",
  "portable-pty",
  "rusqlite",
  "serde",
