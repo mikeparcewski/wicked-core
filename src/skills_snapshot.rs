@@ -1085,7 +1085,10 @@ impl SkillsSnapshot {
                 .map(|p| p.join(&target))
                 .unwrap_or(target.clone())
         };
-        let normalized = lexical_normalize(&joined);
+        // (review pass 12) The absolute target crew writes for a Windows junction is compared
+        // against a `baseline` spelled WITHOUT the verbatim prefix, so the target drops it too —
+        // one normalization on both sides of every prefix check.
+        let normalized = lexical_normalize(&simplify_verbatim(joined));
         let outside = || {
             format!(
                 ".venv is a symlink to `{}` (`{}`), which is not exactly `{}/<64-hex>/.venv` — the \
@@ -1930,7 +1933,9 @@ pub(crate) fn simplify_verbatim(path: PathBuf) -> PathBuf {
     }
 }
 
-fn simplify_verbatim_str(s: &str) -> String {
+/// [`simplify_verbatim`] on a spelling — shared with `state_home::under_spelled`, so every
+/// containment comparison in the fence drops the prefix the same way (review pass 12).
+pub(crate) fn simplify_verbatim_str(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{rest}")
     } else if let Some(rest) = s.strip_prefix(r"\\?\") {

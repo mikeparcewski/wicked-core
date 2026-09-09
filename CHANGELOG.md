@@ -296,7 +296,14 @@ Two release tracks share this file, newest entry first regardless of track:
   without the link is refused too; `gardenSource.baseline` must be a sha256 content hash and
   `venv` one of crew's four states, both required at load (`SkillsSnapshot::{baseline, venv}`).
   The gate-hook wiring audit matches the stable prefix of the `assemble_read_roots` call, not
-  rustfmt's trailing comma.
+  rustfmt's trailing comma. **Review pass 12 (one Copilot thread):** every containment and
+  identity comparison in the worker fence goes through ONE canonical spelling
+  (`state_home::canonical_spelling`: canonicalize + the Windows `\\?\` verbatim prefix dropped)
+  and a whole-component prefix check (`under_spelled`) — `base_under` compared a simplified
+  snapshot root against an UNSIMPLIFIED canonical denied directory, so on Windows a root under a
+  denied directory could escape and `fence_check` failed to refuse (fail-open on that OS only);
+  the `.venv` link's absolute target is simplified before its lexical check too. Unit-tested with
+  Windows-shaped spellings on every OS.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

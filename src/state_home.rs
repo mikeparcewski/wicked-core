@@ -450,27 +450,67 @@ fn slot_or_default() -> String {
         .map_or_else(|| "snapshots".to_string(), |(_, s)| s.to_string())
 }
 
+/// The ONE canonical spelling every containment and identity comparison in the fence uses:
+/// `canonicalize` (every link resolved) with the Windows `\\?\` verbatim prefix dropped
+/// (`skills_snapshot::simplify_verbatim`) — the same normalization a snapshot root gets at load
+/// (`canonical_root`), the live cache at discovery, and the operational home at spawn
+/// (`operational_home_of_db`). Comparing a SIMPLIFIED root against an UNSIMPLIFIED canonical
+/// directory let `base_under` miss a root that sits under a denied directory on Windows (Copilot,
+/// review pass 12 — fail-open on that OS only, `fence_check` did not refuse); both sides of every
+/// such comparison now come through here. `None` when `p` cannot be resolved.
+pub(crate) fn canonical_spelling(p: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(p)
+        .ok()
+        .map(crate::skills_snapshot::simplify_verbatim)
+}
+
+/// Is `root` `dir` itself or below it — judged on SPELLINGS, both sides stripped of any verbatim
+/// prefix first (`\\?\C:\x` and `C:\x` are one directory), with `dir` a WHOLE-component prefix
+/// (`C:\u\.claude2` is not under `C:\u\.claude`). `seps` are the characters that end a component:
+/// `MAIN_SEPARATOR` in production; a test passes the other OS's separator to exercise a
+/// Windows-shaped case on every OS. Pure — touches no filesystem; the callers canonicalize first.
+pub(crate) fn under_spelled(root: &str, dir: &str, seps: &[char]) -> bool {
+    let root = crate::skills_snapshot::simplify_verbatim_str(root);
+    let dir = crate::skills_snapshot::simplify_verbatim_str(dir);
+    let dir = dir.trim_end_matches(seps);
+    if dir.is_empty() {
+        return true; // the filesystem root: everything absolute is under it
+    }
+    match root.strip_prefix(dir) {
+        Some(rest) => rest.is_empty() || rest.starts_with(seps),
+        None => false,
+    }
+}
+
 /// Do `a` and `b` name the same directory — spelled identically, or resolving to the same real
-/// path (a home directory that is a symlink; a `\\?\`-prefixed spelling)? A path that cannot be
-/// resolved is compared by spelling only.
+/// path (a home directory that is a symlink; a `\\?\`-prefixed spelling)? Judged on
+/// [`canonical_spelling`]s. A path that cannot be resolved is compared by spelling only.
 pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
     }
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        (Ok(ra), Ok(rb)) => ra == rb,
+    match (canonical_spelling(a), canonical_spelling(b)) {
+        (Some(ra), Some(rb)) => ra == rb,
         _ => false,
     }
 }
 
-/// The spelling of `dir` that `root` sits under — `dir` itself, else its canonical form (a home
-/// directory that is a symlink) — or `None` when `root` is not under `dir` at all.
+/// The spelling of `dir` that `root` sits under — `dir` itself, else its canonical spelling (a
+/// home directory that is a symlink) — or `None` when `root` is not under `dir` at all. Both
+/// sides are compared as spelled first, then as [`canonical_spelling`]s (review pass 12): a root
+/// that IS under a denied directory cannot escape by a prefix the two spellings do not share.
 pub(crate) fn base_under(dir: &Path, root: &Path) -> Option<PathBuf> {
-    if root.starts_with(dir) {
+    let seps = [std::path::MAIN_SEPARATOR];
+    let under = |r: &Path, d: &Path| match (r.to_str(), d.to_str()) {
+        (Some(r), Some(d)) => under_spelled(r, d, &seps),
+        _ => r.starts_with(d),
+    };
+    if under(root, dir) {
         return Some(dir.to_path_buf());
     }
-    let canonical = std::fs::canonicalize(dir).ok()?;
-    root.starts_with(&canonical).then_some(canonical)
+    let canonical_dir = canonical_spelling(dir)?;
+    let canonical_root = canonical_spelling(root).unwrap_or_else(|| root.to_path_buf());
+    under(&canonical_root, &canonical_dir).then_some(canonical_dir)
 }
 
 /// The Read rules for `state_home` with the HANDED generation (`handed_gen`, the final component
@@ -1597,6 +1637,135 @@ mod tests {
             read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
             rules
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Copilot (review pass 12): containment is judged on IDENTICAL spellings. On Windows
+    /// `canonicalize` adds the `\\?\` verbatim prefix while a snapshot root is pinned WITHOUT it
+    /// (`canonical_root` simplifies), so a prefix check between the two spellings of ONE directory
+    /// silently failed: a root under a denied directory escaped `base_under`, and `fence_check`
+    /// did not refuse it. `under_spelled` drops the prefix from both sides and requires a whole
+    /// component — exercised with Windows-shaped inputs on every OS by passing the separator —
+    /// and `base_under`/`same_dir` go through the one canonical spelling on the real filesystem.
+    #[test]
+    fn containment_drops_the_verbatim_prefix_from_both_sides_before_the_prefix_check() {
+        let win = ['\\'];
+        // The Copilot case: an UNSIMPLIFIED canonical denied dir vs a SIMPLIFIED canonical root —
+        // and the other way round.
+        assert!(under_spelled(
+            r"C:\Users\me\.claude\plugins\x",
+            r"\\?\C:\Users\me\.claude",
+            &win
+        ));
+        assert!(under_spelled(
+            r"\\?\C:\Users\me\.claude\plugins\x",
+            r"C:\Users\me\.claude",
+            &win
+        ));
+        assert!(under_spelled(
+            r"\\?\C:\Users\me\.claude",
+            r"\\?\C:\Users\me\.claude",
+            &win
+        ));
+        assert!(
+            under_spelled(r"C:\Users\me\.claude\x", r"C:\Users\me\.claude\", &win),
+            "a trailing separator on the directory"
+        );
+        // UNC: `\\?\UNC\srv\share\…` is `\\srv\share\…`.
+        assert!(under_spelled(
+            r"\\srv\share\home\.claude\x",
+            r"\\?\UNC\srv\share\home\.claude",
+            &win
+        ));
+        // Whole components only: a sibling that shares the prefix as TEXT is not under it.
+        assert!(!under_spelled(
+            r"C:\Users\me\.claude2\x",
+            r"C:\Users\me\.claude",
+            &win
+        ));
+        assert!(!under_spelled(
+            r"C:\Users\me\.claud",
+            r"C:\Users\me\.claude",
+            &win
+        ));
+        assert!(!under_spelled(
+            r"D:\Users\me\.claude\x",
+            r"C:\Users\me\.claude",
+            &win
+        ));
+        // POSIX spellings: the prefix is a no-op and a backslash is a plain character.
+        let posix = ['/'];
+        assert!(under_spelled(
+            "/home/me/.claude/plugins/x",
+            "/home/me/.claude",
+            &posix
+        ));
+        assert!(under_spelled(
+            "/home/me/.claude",
+            "/home/me/.claude/",
+            &posix
+        ));
+        assert!(!under_spelled(
+            "/home/me/.claudex/y",
+            "/home/me/.claude",
+            &posix
+        ));
+        assert!(
+            !under_spelled("/home/me/.claude\\x", "/home/me/.claude", &posix),
+            "a POSIX backslash does not end a component"
+        );
+        assert!(
+            under_spelled("/home/me/.claude", "/", &posix),
+            "everything absolute is under the filesystem root"
+        );
+
+        // On the real filesystem: `base_under` names the spelling the root sits under whichever
+        // side is spelled and whichever is canonical (macOS: `/var` vs `/private/var`; Windows:
+        // the verbatim prefix), and `same_dir` agrees through the canonical spelling.
+        let base = std::env::temp_dir().join(format!(
+            "wstate-under-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let denied = base.join("denied");
+        let root = denied.join("skills").join("snapshots").join("000003");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(base_under(&denied, &root), Some(denied.clone()));
+        let canon_denied = canonical_spelling(&denied).expect("exists");
+        let canon_root = canonical_spelling(&root).expect("exists");
+        let canon = |p: Option<PathBuf>| p.map(|p| canonical_spelling(&p).unwrap());
+        assert_eq!(
+            canon(base_under(&denied, &canon_root)),
+            Some(canon_denied.clone()),
+            "spelled dir, canonical root"
+        );
+        assert_eq!(
+            canon(base_under(&canon_denied, &root)),
+            Some(canon_denied.clone()),
+            "canonical dir, spelled root"
+        );
+        assert_eq!(
+            base_under(&canon_denied, &canon_root),
+            Some(canon_denied.clone())
+        );
+        assert_eq!(base_under(&base.join("other"), &root), None);
+        assert_eq!(base_under(&denied, &base.join("elsewhere")), None);
+        assert!(same_dir(&denied, &canon_denied));
+        assert!(!same_dir(&denied, &root));
+        #[cfg(unix)]
+        {
+            let alias = base.join("alias");
+            std::os::unix::fs::symlink(&denied, &alias).unwrap();
+            assert_eq!(
+                canon(base_under(&alias, &canon_root)),
+                Some(canon_denied.clone()),
+                "a linked spelling of the denied directory still contains the root"
+            );
+            assert!(same_dir(&alias, &denied));
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 }
