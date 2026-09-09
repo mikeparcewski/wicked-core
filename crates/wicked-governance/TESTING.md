@@ -53,23 +53,36 @@ never decides. Verdicts key on *blocking* firings (`effect: deny`), so:
   *catches* — catching means blocking.
 
 Making a rule measurable is one frontmatter line. In the markdown doc that mints it
-([STEERING.md § Import](./STEERING.md#1-import-bulk--the-doc-format)):
+([STEERING.md § Import](./STEERING.md#1-import-bulk--the-doc-format)) — this example
+ingests verbatim (a test in this crate replays it against the force-push sample below):
 
 ```markdown
 ---
 id: git-hygiene
 title: Git hygiene gates
 steering_type: development
-applies_to: [build]            # required with an effect — the phases the gate selects it for
-effect: deny                   # deny|warn|allow — every rule in this doc, unless overridden
+# applies_to is required once any rule carries an effect: the phases the gate selects it for.
+applies_to: [build]
+# The doc-level effect (deny|warn|allow) rides onto every rule in this doc unless a rule overrides it.
+effect: deny
 ---
 ## Rules
 
 - `POL-060` (critical): Never force-push a shared branch.
-  trigger: push\s+--force      # the regex the gate tests over the evaluated context
+  trigger: push\s+--force
 - `PAT-061` (warn): Prefer small PRs.
-  effect: warn                 # per-rule override — recorded on the decision, never blocks
+  effect: warn
 ```
+
+- `trigger: <regex>` is the regex the gate tests over the evaluated context — `push\s+--force`
+  fires on `git push --force origin main` and stays quiet on `git push origin fix/x`.
+- A per-rule `effect:` continuation overrides the doc-level key for that rule only — `PAT-061`
+  is recorded on the decision when it fires but never blocks.
+- Keep explanations on their own lines, as above. The frontmatter grammar accepts only
+  **full-line** `#` comments, and inside `## Rules` nothing but rule items and their indented
+  continuations is legal — an inline `# …` after a value is part of the value (`applies_to:
+  [build] # …` is not a list, `effect: deny # …` is not an effect, and a comment after a
+  `trigger:` becomes literal regex text that never matches).
 
 Without `effect` nothing changes: every existing doc stays recall-only. Without a `trigger:`
 an effect-bearing rule fires whenever it is phase-selected — a doc-level `effect: deny` with
