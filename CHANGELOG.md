@@ -213,6 +213,30 @@ Two release tracks share this file, newest entry first regardless of track:
   with and without the hatch; ACP — the recording bridge (stdio JSON-RPC echoing `session/new`)
   through the real `AcpStepRunner`, `_meta.claudeCode.options.plugins == [{type: local, path}]`
   merged beside `disallowedTools` and `settings`; the live `#[ignore]` tests remain opt-in extras.
+  **Review pass 7 (CI on pass 6 + Copilot):** the loader reads a snapshot row's `dir` as crew
+  writes it — PLUGIN-relative, `skills/<dir>` (crew's row validator requires the prefix) — and
+  strips the prefix for the engine's under-`skills/` key; a row without it is a config error
+  naming crew's spelling (rounds 1–6 read the field as already relative to `skills/`, so a real
+  generation would have failed to load at its first skill — found while building the hermetic
+  e2e fixture). `tests/domain_extraction_e2e.rs` is hermetic: `setup` publishes a crew-shaped
+  fixture generation (`tests/support/skills_snapshot_fixture.rs`: gen == directory, 64-hex
+  `contentHash`, `gardenSource`, `venv`, rows with `dir: skills/<…>`/`portable`/`nested`, the
+  `views` block, `skills/<dir>/SKILL.md` per referenced name) under a canonical per-process
+  temp state home and hands it via `WICKED_SKILLS_SNAPSHOT` in its set-once block — the runs
+  passed locally only because the ladder's fallback found the developer's installed garden, an
+  ambient dependency a hermetic CI runner does not have — and both governed-run tests assert from
+  the run's events that generation `000001` was the one admitted: a TOOL-COMMAND unit's
+  plan-wide admission now reports the verified generation it judged the plan by as
+  `SkillsSnapshotHanded { path: "tool_cmd", cli: "tool" }` (crew's ledger pins the generation
+  for the session from its first unit; `admit_plan` returns the admitted root). Copilot:
+  `attach_skills_plugin` de-duplicates by canonical path (the same snapshot already in
+  `plugins` — identical or another spelling of the same real directory — gains no second entry;
+  the ACP twin of the single `--plugin-dir`); `parse_registry` refuses a non-string
+  `denied_children` entry or a non-array `denied_children` (never a silently narrower fence);
+  `tests/skills_live.rs` pins its variables with an RAII guard restored on panic;
+  `PersistentStepRunner::exec_turn` resolves the session invocation ONCE and passes it to both
+  the argv and the skill form (the docstring's single-resolution guarantee now holds by
+  construction).
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

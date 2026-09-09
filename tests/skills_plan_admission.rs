@@ -114,55 +114,9 @@ fn drain_until_terminal(
     collected
 }
 
-/// A published-snapshot fixture in the ONE shape a generation has —
-/// `<state home>/skills/snapshots/<gen>` — under a CANONICAL base (the OS temp dir is a symlink on
-/// macOS; the loader refuses an ancestor symlink), holding `skills` (dir, frontmatter name) and
-/// the identity fields crew writes (`gen`, `contentHash`, `gardenSource`).
-fn snapshot_fixture(
-    base: &std::path::Path,
-    gen: &str,
-    skills: &[(&str, &str)],
-) -> std::path::PathBuf {
-    let root = base
-        .join("crew-state")
-        .join("skills")
-        .join("snapshots")
-        .join(gen);
-    std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
-    std::fs::write(
-        root.join(".claude-plugin").join("plugin.json"),
-        "{\"name\":\"wicked-garden\",\"version\":\"0.0.0\"}",
-    )
-    .unwrap();
-    let mut rows = Vec::new();
-    for (dir, name) in skills {
-        let skill = root.join("skills").join(dir);
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(
-            skill.join("SKILL.md"),
-            format!("---\nname: {name}\ndescription: fixture\n---\n\n# {name}\n"),
-        )
-        .unwrap();
-        rows.push(serde_json::json!({
-            "name": name, "dir": dir, "kind": "fork-worker", "core": false, "portable": true
-        }));
-    }
-    std::fs::write(
-        root.join("snapshot.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "gen": gen.parse::<u64>().unwrap(),
-            "contentHash": format!("sha256:{gen}"),
-            "gardenSource": {
-                "kind": "directory", "path": "/fixture/garden",
-                "plugin_version": "0.0.0", "baseline": "fixture-baseline"
-            },
-            "skills": rows
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    root
-}
+/// The crew-shaped snapshot fixture shared with `domain_extraction_e2e.rs`.
+#[path = "support/skills_snapshot_fixture.rs"]
+mod skills_fixture;
 
 /// The platform's shell writing `ran` into `marker` — the observable that the tool command
 /// EXECUTED. Absolute path, so the unit's working directory is irrelevant.
@@ -199,7 +153,8 @@ fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missi
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
     // The handed generation holds `domain` only; the run below also names `mem`.
-    let snapshot = snapshot_fixture(&base, "000001", &[("domain", "wicked-garden-domain")]);
+    let snapshot =
+        skills_fixture::publish_fixture_snapshot(&base, "000001", &["wicked-garden-domain"]);
     std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
     std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
 
@@ -259,6 +214,12 @@ fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missi
         !agent_ran.load(Ordering::SeqCst),
         "no agent unit ran — the run was refused at unit 1"
     );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::SkillsSnapshotHanded { session, .. } if session == "plan-missing")),
+        "a refused plan reports no generation: {events:?}"
+    );
 
     // ── Admitted: the same shape with a skill the generation HOLDS runs the command. ──
     let marker_ok = base.join("ran-present.txt");
@@ -291,6 +252,34 @@ fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missi
     assert!(
         agent_ran.load(Ordering::SeqCst),
         "the agent unit ran after the admitted tool command"
+    );
+    // The generation the run was judged against is reported like a handoff (`path: "tool_cmd"`),
+    // so crew's ledger pins it for this session from the first unit on.
+    let handed: Vec<(String, Option<String>, String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            CoreEvent::SkillsSnapshotHanded {
+                session,
+                path,
+                cli,
+                gen,
+                root,
+                ..
+            } if session == "plan-present" => {
+                Some((path.clone(), gen.clone(), cli.clone(), root.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        handed,
+        vec![(
+            "tool_cmd".to_string(),
+            Some("000001".to_string()),
+            "tool".to_string(),
+            snapshot.to_string_lossy().into_owned(),
+        )],
+        "the admitted plan reports the verified generation it was judged against"
     );
 
     std::env::remove_var("WICKED_SKILLS_SNAPSHOT");

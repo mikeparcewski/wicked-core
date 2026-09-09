@@ -258,11 +258,14 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
     .unwrap();
     std::fs::write(
         snapshot.join("snapshot.json"),
-        "{\"gen\":1,\"contentHash\":\"sha256:live-fixture\",\"gardenSource\":{\"kind\":\"directory\",\"path\":\"/fixture\",\"plugin_version\":\"0.0.0\",\"baseline\":\"live-fixture\"},\"skills\":[{\"name\":\"wicked-garden-wicked-probe\",\"dir\":\"wicked-probe\",\"kind\":\"module\",\"core\":false,\"portable\":true}]}",
+        "{\"gen\":1,\"contentHash\":\"sha256:live-fixture\",\"gardenSource\":{\"kind\":\"directory\",\"path\":\"/fixture\",\"plugin_version\":\"0.0.0\",\"baseline\":\"live-fixture\"},\"skills\":[{\"name\":\"wicked-garden-wicked-probe\",\"dir\":\"skills/wicked-probe\",\"kind\":\"module\",\"core\":false,\"portable\":true,\"nested\":false}]}",
     )
     .unwrap();
-    std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
-    std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
+    // RAII pins (Copilot, review pass 7): restored on drop — a failing assertion below included —
+    // so a live run cannot leak its configuration into the rest of this binary or a developer's
+    // shell-inherited environment.
+    let _snap = EnvPin::set("WICKED_SKILLS_SNAPSHOT", &snapshot);
+    let _no_hatch = EnvPin::unset("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
 
     // A real work unit WITH the skill_ref: the engine's directive tells the worker to invoke the
     // skill, and the skill tells it what to print — the assertion is about INVOCATION.
@@ -296,7 +299,6 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
         "--- live claude reply (status {:?}) ---\n{}\n---",
         out.status, out.output
     );
-    std::env::remove_var("WICKED_SKILLS_SNAPSHOT");
     assert_eq!(
         out.status,
         wicked_core::StepStatus::Ok,
@@ -309,6 +311,33 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
         out.output
     );
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// RAII pin of one process-global variable, restored on drop — the `EnvPin` discipline of the lib
+/// tests (Copilot, review pass 7): a panicking assertion cannot leak a pin.
+struct EnvPin {
+    key: &'static str,
+    prev: Option<std::ffi::OsString>,
+}
+impl EnvPin {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+    fn unset(key: &'static str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+impl Drop for EnvPin {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
 }
 
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────

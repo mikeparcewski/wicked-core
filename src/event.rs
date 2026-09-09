@@ -568,8 +568,12 @@ pub enum CoreEvent {
     /// (`WICKED_SKILLS_SNAPSHOT`), or the live installed plugin when none was published. Fires once
     /// per handoff: per unit on the wrapped path (`path: "wrapped_cli"`, the `--plugin-dir` flag),
     /// once per spawned session on the ACP path (`path: "acp"`, the `session/new` plugins
-    /// handshake — the session is reused across the run's turns). This is the record crew consults
-    /// before reaping a snapshot generation: a `gen` still named by a live session is in use.
+    /// handshake — the session is reused across the run's turns), and once per TOOL-COMMAND unit
+    /// of a run that names skills (`path: "tool_cmd"`, `cli: "tool"` — the plan-wide admission
+    /// before the command runs; no process is handed the root, but the run was judged against
+    /// this generation, so the session pins it from its first unit). This is the record crew
+    /// consults before reaping a snapshot generation: a `gen` still named by a live session is in
+    /// use.
     /// `gen`/`content_hash` are `snapshot.json`'s for a published snapshot and `None` for the
     /// installed-plugin fallback (`source: "live-cache"`), which has nothing to reap.
     SkillsSnapshotHanded {

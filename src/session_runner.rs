@@ -151,14 +151,16 @@ impl PersistentStepRunner {
             .unwrap_or_else(|| resolve_invocation(cli_key))
     }
 
-    /// Build the argv for an **interactive** (multi-turn) CLI session. Like the wrapped-CLI argv
-    /// but without `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
+    /// Build the argv for an **interactive** (multi-turn) CLI session from the ONE resolved
+    /// `invocation` template (`session_invocation`, resolved once per turn by `exec_turn` and shared
+    /// with the prompt's skill form — Copilot, review pass 7: a second resolution could see a
+    /// reloaded registry and name another binary). Like the wrapped-CLI argv but without
+    /// `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
     /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
-    fn session_argv(input: &StepInput) -> Vec<String> {
-        let invocation = Self::session_invocation(input);
+    fn session_argv(invocation: &str, input: &StepInput) -> Vec<String> {
         // Build argv without a real prompt — the placeholder expands to an empty string and the
         // trailing `--` + empty arg are stripped below.
-        let mut argv = build_argv(&invocation, "", &input.unit.allowed_skills);
+        let mut argv = build_argv(invocation, "", &input.unit.allowed_skills);
         let is_claude = argv.first().map(|a| binary_is_claude(a)).unwrap_or(false);
         // Drop the end-of-options guard and the empty prompt arg emitted by the template.
         argv.retain(|a| a != "--" && !a.is_empty());
@@ -227,6 +229,10 @@ impl StepRunner for PersistentStepRunner {
 impl PersistentStepRunner {
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
+        // ONE resolution of the invocation template for this turn: the session argv (when a
+        // session is opened) and the prompt's skill form both read THIS value, so they cannot name
+        // different binaries even if the registry is reloaded between the two uses.
+        let invocation = Self::session_invocation(input);
 
         // Lazily open a session for this run_id. The lock covers only the map read/write — not
         // the blocking open_terminal / wait_for_opened calls — so unrelated runs are never
@@ -254,7 +260,7 @@ impl PersistentStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let cmd = Self::session_argv(input);
+                let cmd = Self::session_argv(&invocation, input);
                 // Subscribe BEFORE open so we catch the TerminalOpened event.
                 let pre = self.subscribe();
                 let tid = match self.open_terminal(cwd, cmd) {
@@ -300,9 +306,9 @@ impl PersistentStepRunner {
         // Line-length is a correctness constraint here, not a nicety: an over-long line is dropped by
         // the terminal with no error, so the alternative to failing now is a turn that waits out its
         // full timeout for output the CLI was never given the chance to produce.
-        // The directive is spelled for the binary this session runs (core#396) — the same template
-        // resolution `session_argv` opened it with.
-        let form = SkillForm::for_invocation(&Self::session_invocation(input));
+        // The directive is spelled for the binary this session runs (core#396) — the SAME resolved
+        // template `session_argv` opened it with (one `session_invocation` call per turn, above).
+        let form = SkillForm::for_invocation(&invocation);
         let prompt = match pty_unit_prompt(input, form) {
             Ok(p) => format!("{p}\n"),
             Err(e) => return failed_output(input, e),

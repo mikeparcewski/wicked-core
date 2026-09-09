@@ -180,16 +180,22 @@ pub(crate) fn parse_registry(json: &str) -> Result<Registry, String> {
         if read_slot.is_some() {
             slots += 1;
         }
-        let denied_children: Vec<String> = e
-            .get("denied_children")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Strict (Copilot, review pass 7): a `denied_children` that is not an array, or an entry
+        // that is not a string, is a parse error — never silently dropped, which would change the
+        // fence without an obvious failure.
+        let denied_children: Vec<String> = match e.get("denied_children") {
+            None => Vec::new(),
+            Some(Value::Array(a)) => a
+                .iter()
+                .enumerate()
+                .map(|(j, c)| {
+                    c.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("entries[{i}] denied_children[{j}] is not a string"))
+                })
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(format!("entries[{i}] `denied_children` is not an array")),
+        };
         if read_slot.is_none() && !denied_children.is_empty() {
             return Err(format!(
                 "entries[{i}] lists `denied_children` without a `read_slot`"
@@ -393,8 +399,37 @@ pub(crate) fn read_rules_around_snapshot(
         }
         let path = slot_dir.join(&name);
         if patterns.iter().any(|p| p.matches(&name)) {
-            siblings.push(path);
-            continue;
+            // (codex round 7) a recognised staging/temp NAME must be a real directory too, judged
+            // by lstat — a symlink or a file of that name is refused by name rather than denied
+            // as if it were the staging directory crew writes.
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(format!(
+                        "`{name}` under {} is a symlink where a staging/temp directory is \
+                         expected; the worker Read fence cannot classify it — the launch is \
+                         refused rather than leaving it readable; remove it",
+                        slot_dir.display()
+                    ))
+                }
+                Ok(m) if m.is_dir() => {
+                    siblings.push(path);
+                    continue;
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "`{name}` under {} is not a directory where a staging/temp directory is \
+                         expected; the worker Read fence cannot classify it — the launch is \
+                         refused rather than leaving it readable; remove it",
+                        slot_dir.display()
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "cannot inspect `{name}` under {} to check the Read fence ({e})",
+                        slot_dir.display()
+                    ))
+                }
+            }
         }
         if is_generation_name(&name) {
             match std::fs::symlink_metadata(&path) {
@@ -704,6 +739,20 @@ mod tests {
         assert!(!patterns.iter().any(|p| p.matches("staging-x")));
         // Parse strictness.
         assert!(parse_registry("{\"version\":1,\"entries\":[{\"kind\":\"dir\"}]}").is_err());
+        // (review pass 7) a non-string denied child, or a non-array `denied_children`, is a parse
+        // error — never a silently narrower fence.
+        let err = parse_registry(
+            "{\"version\":1,\"entries\":[{\"name\":\"a\",\"kind\":\"dir\",\"read_slot\":\"s\",\
+             \"denied_children\":[\"x\",7]}]}",
+        )
+        .expect_err("a non-string denied child");
+        assert!(err.contains("denied_children[1] is not a string"), "{err}");
+        let err = parse_registry(
+            "{\"version\":1,\"entries\":[{\"name\":\"a\",\"kind\":\"dir\",\"read_slot\":\"s\",\
+             \"denied_children\":\"x\"}]}",
+        )
+        .expect_err("a non-array denied_children");
+        assert!(err.contains("`denied_children` is not an array"), "{err}");
         assert!(parse_registry(
             "{\"version\":1,\"entries\":[{\"name\":\"a\",\"kind\":\"dir\",\"denied_children\":[\"x\"]}]}"
         )
@@ -968,6 +1017,30 @@ mod tests {
             "{err}"
         );
         std::fs::remove_file(skills.join("snapshots").join("000004")).unwrap();
+        // (codex round 7) a recognised staging/temp NAME must be a real directory too: a FILE
+        // named `.staging-file` and (unix) a SYMLINK named `.tmp-link` are refused by name.
+        std::fs::write(skills.join("snapshots").join(".staging-file"), "").unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect_err("a file where a staging directory is expected");
+        assert!(
+            err.contains("`.staging-file`") && err.contains("not a directory"),
+            "{err}"
+        );
+        std::fs::remove_file(skills.join("snapshots").join(".staging-file")).unwrap();
+        #[cfg(unix)]
+        {
+            let target = base.join("real-tmp");
+            std::fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, skills.join("snapshots").join(".tmp-link"))
+                .unwrap();
+            let err = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect_err("a symlink where a staging directory is expected");
+            assert!(
+                err.contains("`.tmp-link`") && err.contains("a symlink"),
+                "{err}"
+            );
+            std::fs::remove_file(skills.join("snapshots").join(".tmp-link")).unwrap();
+        }
         assert_eq!(
             read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
             rules

@@ -5482,7 +5482,26 @@ fn dispatch_unit(
             // a later agent unit discovered the missing skill. Same ladder, same refusal shape
             // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
-                Ok(()) => run_tool_cmd(&cmd, workdir.as_deref()),
+                Ok(admitted) => {
+                    // The generation the RUN was judged against, reported like a handoff
+                    // (`path: "tool_cmd"`): the log line for the operator and the event crew's
+                    // ledger pins the generation on for this session from its first unit —
+                    // the same record the worker runners emit when they hand the root over.
+                    if let Some(s) = &admitted {
+                        s.report(&format!(
+                            "path=tool_cmd run={} unit={ord} cli=tool",
+                            input.run_id
+                        ));
+                        let _ = tx.send(crate::command::Command::EmitEvent(s.handed_event(
+                            &input.run_id,
+                            ord,
+                            attempt,
+                            "tool_cmd",
+                            "tool",
+                        )));
+                    }
+                    run_tool_cmd(&cmd, workdir.as_deref())
+                }
                 Err(e) => {
                     let refused = crate::execute_wrapped::skills_refusal(&input, &e);
                     (refused.output, refused.status)

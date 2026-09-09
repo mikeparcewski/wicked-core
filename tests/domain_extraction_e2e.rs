@@ -33,9 +33,53 @@ use wicked_governance::{
 };
 
 use wicked_core::{
-    provision_and_approve_coverage_validator, Core, EntityMode, HumanConfirm, HumanDecision,
-    LaunchSpec, RepoSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus, UnitStatus,
+    provision_and_approve_coverage_validator, Core, CoreEvent, EntityMode, HumanConfirm,
+    HumanDecision, LaunchSpec, RepoSpec, SessionStatus, StepInput, StepOutput, StepRunner,
+    StepStatus, UnitStatus,
 };
+
+/// The crew-shaped skills snapshot fixture (shared with `skills_plan_admission.rs`): the
+/// domain-extraction workflow's units carry `skill_ref`s, and the plan-wide skills admission runs
+/// before the run's first unit — on a hermetic runner there is no snapshot and no live garden
+/// cache, so without this fixture the run is refused by name (core#396 review pass 7; the test
+/// used to pass locally only because the fallback found the developer's installed garden).
+#[path = "support/skills_snapshot_fixture.rs"]
+mod skills_fixture;
+
+/// The three skills the shipped `domain-extraction` workflow names (`workflows/domain-extraction.json`).
+const DOMAIN_EXTRACTION_SKILLS: &[&str] = &[
+    "wicked-garden-domain",
+    "wicked-garden-domain-extractor",
+    "wicked-garden-domain-coverage",
+];
+
+/// The fixture generation `setup` published once for this process — the value
+/// `WICKED_SKILLS_SNAPSHOT` carries — for asserting the run was admitted against exactly it.
+fn skills_snapshot_root() -> std::path::PathBuf {
+    std::env::var_os("WICKED_SKILLS_SNAPSHOT")
+        .map(std::path::PathBuf::from)
+        .expect("setup() published the fixture snapshot once")
+}
+
+/// Every `SkillsSnapshotHanded` the run emitted so far, as `(path, gen, root)`.
+fn handed_generations(
+    events: &std::sync::mpsc::Receiver<CoreEvent>,
+    run_id: &str,
+) -> Vec<(String, Option<String>, String)> {
+    events
+        .try_iter()
+        .filter_map(|e| match e {
+            CoreEvent::SkillsSnapshotHanded {
+                session,
+                path,
+                gen,
+                root,
+                ..
+            } if session == run_id => Some((path, gen, root)),
+            _ => None,
+        })
+        .collect()
+}
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 
@@ -321,6 +365,22 @@ fn setup(
             "WICKED_ESTATE_REPO_GRAPH_ROOT",
             std::env::temp_dir().join(format!("wicked-core-e2e-estate-{}", std::process::id())),
         );
+        // core#396: the workflow's units name skills, and the plan-wide admission runs before the
+        // FIRST unit (the domain-graph Tool phase included). Publish a fixture generation exactly as
+        // crew lays one out and hand it to the engine — never the developer's live garden cache,
+        // which a hermetic CI runner does not have. Canonical base: the loader refuses an ancestor
+        // symlink, and the OS temp dir is one on macOS.
+        let skills_base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("wicked-core-e2e-skills-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&skills_base);
+        let snapshot = skills_fixture::publish_fixture_snapshot(
+            &skills_base,
+            "000001",
+            DOMAIN_EXTRACTION_SKILLS,
+        );
+        std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
+        std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
     });
     let repo = make_git_repo(name);
     let core = Core::spawn_with_engine(db.clone(), Arc::new(StubDispatcher), Arc::new(runner));
@@ -377,11 +437,27 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         },
         true,
     );
+    let events = core.subscribe();
     launch(&core, "run-happy", &repo_id);
 
     // The domain-graph phase carries a human-confirm gate → the run parks awaiting a human.
     wait_status(&core, "run-happy", SessionStatus::AwaitingHuman)
         .expect("the run reaches the domain-graph human-confirm gate");
+    // core#396: the run was admitted against the fixture generation and against nothing else —
+    // the domain-graph Tool unit's plan-wide admission reports the verified generation it judged
+    // the plan by (`path: "tool_cmd"`), the way a worker handoff would.
+    let snapshot = skills_snapshot_root();
+    let handed = handed_generations(&events, "run-happy");
+    assert!(
+        !handed.is_empty()
+            && handed.iter().all(|(path, gen, root)| {
+                path == "tool_cmd"
+                    && gen.as_deref() == Some("000001")
+                    && std::path::Path::new(root) == snapshot
+            }),
+        "the run's skills were admitted against the fixture generation 000001 at {}: {handed:?}",
+        snapshot.display()
+    );
     let wt = worktree(&repo, "run-happy");
     assert!(
         wt.join("coverage-report.json").is_file(),
@@ -470,9 +546,23 @@ fn a_conformance_rule_is_recalled_onto_the_run_claims() {
         )
         .unwrap();
     }
+    let events = core.subscribe();
     launch(&core, "run-recall", &repo_id);
     wait_status(&core, "run-recall", SessionStatus::AwaitingHuman)
         .expect("the run reaches the domain-graph gate");
+    // core#396: admitted against the fixture generation, and only it (see TEST 1).
+    let snapshot = skills_snapshot_root();
+    let handed = handed_generations(&events, "run-recall");
+    assert!(
+        !handed.is_empty()
+            && handed.iter().all(|(path, gen, root)| {
+                path == "tool_cmd"
+                    && gen.as_deref() == Some("000001")
+                    && std::path::Path::new(root) == snapshot
+            }),
+        "admitted against generation 000001 at {}: {handed:?}",
+        snapshot.display()
+    );
 
     // The recall→gate wiring fires per unit: at least one persisted conformance claim carries the rule
     // as an obligation. Before this milestone, no run claim ever carried a recalled rule.

@@ -1788,12 +1788,41 @@ fn claude_code_options(params: &mut Value) -> &mut Value {
 /// own `SdkPluginConfig { type: "local", path }`. The bridge spreads that `options` object into
 /// its session options, so it is the one channel it honours for plugins (argv it does not parse
 /// is discarded — FINDING-060 — and the worker home's `plugins/` is re-sanitized on every spawn).
+///
+/// DE-DUPLICATED by canonical path (Copilot, review pass 7): a `plugins` list that already carries
+/// this snapshot as a local plugin — an upstream layer, a re-attached options object — gains no
+/// second entry, so the bridge never loads one generation twice (the ACP twin of the wrapped path's
+/// single `--plugin-dir`).
 fn attach_skills_plugin(params: &mut Value, root: &std::path::Path) {
     let node = claude_code_options(params);
     let entry = json!({ "type": "local", "path": root.to_string_lossy().as_ref() });
     match node.get_mut("plugins").and_then(Value::as_array_mut) {
-        Some(plugins) => plugins.push(entry),
+        Some(plugins) => {
+            let already = plugins.iter().any(|p| {
+                p.get("type").and_then(Value::as_str) == Some("local")
+                    && p.get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|existing| same_plugin_path(existing, root))
+            });
+            if !already {
+                plugins.push(entry);
+            }
+        }
         None => node["plugins"] = json!([entry]),
+    }
+}
+
+/// Do `existing` (a plugin path already in the frame) and `root` name the same directory — spelled
+/// identically, or resolving to the same real path (`/snap/.` and `/snap`; a symlinked spelling)?
+/// A spelling that cannot be resolved is compared as spelled only.
+fn same_plugin_path(existing: &str, root: &std::path::Path) -> bool {
+    let spelled = std::path::Path::new(existing);
+    if spelled == root {
+        return true;
+    }
+    match (std::fs::canonicalize(spelled), std::fs::canonicalize(root)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -7212,6 +7241,68 @@ sleep 30
             "session/new must stamp the assigned CLI: {seen}"
         );
         drop(proc);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (Copilot, review pass 7) `attach_skills_plugin` never adds the same snapshot twice: a
+    /// `plugins` list already naming it — by the identical spelling, or by another spelling of the
+    /// same real directory (`<snap>/.`) — gains no second entry; a DIFFERENT plugin path is kept
+    /// beside it; and a non-`local` entry with the same path is not mistaken for ours.
+    #[test]
+    fn attach_skills_plugin_dedupes_the_snapshot_by_canonical_path() {
+        let dir = scratch("plugin-dedupe");
+        let snap = dir.join("snap");
+        std::fs::create_dir_all(&snap).unwrap();
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let snap_str = snap.to_string_lossy().into_owned();
+        // Already present, spelled identically.
+        let mut params = json!({
+            "cwd": "/wt",
+            "_meta": {"claudeCode": {"options": {"plugins": [{"type": "local", "path": snap_str}]}}}
+        });
+        attach_skills_plugin(&mut params, &snap);
+        attach_skills_plugin(&mut params, &snap);
+        let plugins = params["_meta"]["claudeCode"]["options"]["plugins"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            plugins.len(),
+            1,
+            "no second entry for the same snapshot: {plugins:?}"
+        );
+        // Already present under ANOTHER spelling of the same real directory.
+        let dotted = snap.join(".").to_string_lossy().into_owned();
+        let mut params = json!({
+            "_meta": {"claudeCode": {"options": {"plugins": [{"type": "local", "path": dotted}]}}}
+        });
+        attach_skills_plugin(&mut params, &snap);
+        assert_eq!(
+            params["_meta"]["claudeCode"]["options"]["plugins"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the same real directory is one plugin: {params}"
+        );
+        // A different plugin stays beside ours; a non-local entry with our path is not ours.
+        let mut params = json!({
+            "_meta": {"claudeCode": {"options": {"plugins": [
+                {"type": "local", "path": other.to_string_lossy()},
+                {"type": "marketplace", "path": snap.to_string_lossy()}
+            ]}}}
+        });
+        attach_skills_plugin(&mut params, &snap);
+        let plugins = params["_meta"]["claudeCode"]["options"]["plugins"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(plugins.len(), 3, "{plugins:?}");
+        assert_eq!(
+            plugins[2],
+            json!({"type": "local", "path": snap.to_string_lossy()})
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -61,7 +61,24 @@
 //!    daemon's `CLAUDE_CONFIG_DIR` (else `~/.claude`), logged as `skills.fallback`. NOT the hand
 //!    copy at `<config>/plugins/wicked-garden` — that stale copy is the defect being fixed, never
 //!    a fallback. Nothing in the cache ⇒ no root at all (a run that needs a skill is then refused;
-//!    a run that needs none proceeds).
+//!    a run that needs none proceeds). ABSENCE is told apart from FAILURE (codex round 7,
+//!    [`Ladder`]): a cache that cannot be listed, a symlinked or unresolvable version candidate, a
+//!    malformed manifest — each is logged with its error and takes the no-root rung WITH the
+//!    reason, which rides the refusal of any run that names a skill
+//!    ([`SkillsError::FallbackFailed`]); never a silent "no installed garden". The fallback root is
+//!    CLAUDE-ONLY ([`SkillsError::FallbackClaudeOnly`]): its index carries no publish-time
+//!    portability verdict (cwd-relative script detection is crew's publish analyzer, not
+//!    re-implemented here), so no non-Claude seat is handed anything from it, and a non-Claude
+//!    unit that invokes a skill is refused naming the seat — non-Claude delivery requires a
+//!    published snapshot.
+//!
+//! A PUBLISHED root is verified for exact INDEX/TREE PARITY (codex round 7,
+//! [`SkillsSnapshot::verify_delivered_tree`]): the whole delivered closure is lstat-walked — every
+//! `SKILL.md` under `skills/` must be indexed (a disabled or unpublished skill copied in is refused
+//! by path), every indexed entry must exist, `views/` may hold only the copilot view (judged whole,
+//! `copilot_view_for`), and NO symlink may sit anywhere in the generation — the one exception is
+//! crew's root-level `.venv` link, accepted only when it resolves inside canonical
+//! `<state home>/skills/baseline/<64-hex>/.venv` (crew's own rule).
 //!
 //! # Admission — before any process starts
 //!
@@ -121,8 +138,11 @@ pub(crate) const PLUGIN_NAME: &str = "wicked-garden";
 /// directory a plugin root at all.
 const PLUGIN_MANIFEST: &str = ".claude-plugin/plugin.json";
 
-/// Crew's index of a published snapshot, relative to its root:
-/// `{gen, contentHash, skills: [{name, dir, kind, core, portable, mandates?}]}`.
+/// Crew's index of a published snapshot, relative to its root (crew's `SnapshotManifest`):
+/// `{gen, contentHash, gardenSource, venv, skills: [{name, dir, kind, core, portable, nested,
+/// mandates?}], views}`. A row's `dir` is PLUGIN-relative — `skills/<dir>`, the `skills/` prefix
+/// literal (crew's row validator requires it); the loader strips it, keying the skill by the path
+/// under `skills/` ([`SkillEntry::dir`]).
 const SNAPSHOT_INDEX: &str = "snapshot.json";
 
 /// The skills subtree of a plugin root, and the file that marks a directory as a skill.
@@ -159,7 +179,8 @@ impl std::fmt::Display for SnapshotSource {
 }
 
 /// One skill the root holds. `name` is the frontmatter `name` (the mirrored directory name every
-/// non-Claude CLI invokes it by); `dir` is its path under `skills/`, `/`-separated on every OS,
+/// non-Claude CLI invokes it by); `dir` is its path under `skills/` (the index spells it
+/// plugin-relative, `skills/<dir>`; the prefix is stripped at load), `/`-separated on every OS,
 /// nested verbatim (`engineering/frontend`) — never renamed, sibling links depend on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SkillEntry {
@@ -792,8 +813,14 @@ impl SkillsSnapshot {
         Ok(())
     }
 
-    /// What a launch on `cli` is handed from this root, in its lever's shape (v3.2 §2).
+    /// What a launch on `cli` is handed from this root, in its lever's shape (v3.2 §2). A
+    /// LIVE-CACHE fallback root hands a non-Claude seat NOTHING (codex round 7): its portability
+    /// flags are an approximation with no publish-time verdict behind them, so only Claude's
+    /// plugin loader — which does not depend on portability — is handed the root.
     pub(crate) fn delivery(&self, cli: &WorkerCli) -> SkillsDelivery {
+        if self.source == SnapshotSource::LiveCache && !matches!(cli, WorkerCli::Claude) {
+            return SkillsDelivery::None;
+        }
         match cli.lever() {
             SkillsLever::ClaudePlugin => SkillsDelivery::ClaudePlugin(self.root.clone()),
             SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags(self.portable_skill_dirs()),
@@ -806,6 +833,168 @@ impl SkillsSnapshot {
             }
             SkillsLever::Absent => SkillsDelivery::None,
         }
+    }
+
+    /// Exact INDEX/TREE PARITY over the whole delivered closure of a PUBLISHED generation (codex
+    /// round 7). The index verification ([`load_published`]) proves every indexed entry exists as
+    /// stated; this walk proves the converse and the containment of everything else the worker is
+    /// handed: the root, `.claude-plugin/**`, `skills/**` and every support file are lstat-walked
+    /// (sorted, errors propagate) — (1) every `SKILL.md` found under `skills/` must be INDEXED (a
+    /// disabled or unpublished skill copied into the generation, or a nested extra a directory
+    /// lever would deliver, is refused by path); (2) `views/` may hold only `copilot`, whose whole
+    /// tree is then judged by [`copilot_view_for`](Self::copilot_view_for) (indexed portable
+    /// skills only, no links, no strays); (3) NO symlink anywhere in the generation — the one
+    /// exception is crew's root-level `.venv` link, accepted only when it resolves inside
+    /// canonical `<state home>/skills/baseline/<64-hex>/.venv` (crew's own rule for the one link a
+    /// generation may carry). Everything else at the root (crew's support closure — `scripts/`,
+    /// `schemas/`, `docs/`, `pyproject.toml`, `uv.lock` …) is not enumerated against a list
+    /// (crew's bundle is crew's), only contained.
+    pub(crate) fn verify_delivered_tree(&self) -> Result<(), SkillsError> {
+        let config = |why: String| SkillsError::Config {
+            var: SKILLS_SNAPSHOT_ENV,
+            path: self.root.clone(),
+            why,
+        };
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        self.walk_delivered(&self.root, "", &mut found)
+            .map_err(config)?;
+        let indexed: BTreeSet<&str> = self.skills.iter().map(|s| s.dir.as_str()).collect();
+        let unindexed: Vec<String> = found
+            .iter()
+            .filter(|d| !indexed.contains(d.as_str()))
+            .map(|d| format!("{SKILLS_DIR}/{d}/{SKILL_FILE}"))
+            .collect();
+        if !unindexed.is_empty() {
+            return Err(config(format!(
+                "the generation delivers skills its index does not carry: {} — a disabled or \
+                 unpublished skill must not ride in a published generation (Claude's loader and \
+                 the directory levers would load it); the index and the tree must agree exactly",
+                unindexed.join(", ")
+            )));
+        }
+        // The copilot view, judged as a whole tree (v3.3 §2) whether or not any seat invokes it.
+        self.copilot_view_for(&[]).map(|_| ())
+    }
+
+    /// The lstat walk behind [`verify_delivered_tree`](Self::verify_delivered_tree): records the
+    /// dir of every `skills/**/SKILL.md`, refuses any symlink but the root `.venv`, refuses any
+    /// `views/` child but `copilot` (whose tree is judged separately), propagates every
+    /// enumeration error.
+    fn walk_delivered(
+        &self,
+        dir: &Path,
+        rel: &str,
+        found: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        let here = if rel.is_empty() { "the root" } else { rel };
+        for name in list_sorted(dir).map_err(|e| format!("{here} cannot be listed ({e})"))? {
+            let child = dir.join(&name);
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            let meta = std::fs::symlink_metadata(&child)
+                .map_err(|e| format!("{child_rel} cannot be inspected ({e})"))?;
+            if meta.file_type().is_symlink() {
+                if rel.is_empty() && name == ".venv" {
+                    self.check_venv_link(&child)?;
+                    continue;
+                }
+                return Err(format!(
+                    "{child_rel} is a symlink — the delivered generation must be contained: no \
+                     link anywhere in it but crew's root-level .venv into the baseline env"
+                ));
+            }
+            if rel.is_empty() && name == "views" && meta.is_dir() {
+                for view in
+                    list_sorted(&child).map_err(|e| format!("views cannot be listed ({e})"))?
+                {
+                    if view != "copilot" {
+                        return Err(format!(
+                            "views/{view} is not a delivery view this engine knows — only \
+                             views/copilot is published and delivered"
+                        ));
+                    }
+                }
+                continue; // judged whole by `copilot_view_for`
+            }
+            if meta.is_dir() {
+                self.walk_delivered(&child, &child_rel, found)?;
+                continue;
+            }
+            if name == SKILL_FILE {
+                if let Some(under) = child_rel.strip_prefix(&format!("{SKILLS_DIR}/")) {
+                    match under.strip_suffix(&format!("/{SKILL_FILE}")) {
+                        Some(skill_dir) if !skill_dir.is_empty() => {
+                            found.insert(skill_dir.to_string());
+                        }
+                        _ => {
+                            return Err(format!(
+                                "{child_rel} is a {SKILL_FILE} at the skills root itself — no \
+                                 skill directory holds it, so no index entry can name it"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The one link a generation may carry (crew's rule, mirrored): root-level `.venv`, resolving
+    /// INSIDE canonical `<state home>/skills/baseline/<64-hex>/.venv` — the shared, read-only
+    /// baseline env crew provisions once per bundle hash. Anything else it points at is refused.
+    fn check_venv_link(&self, link: &Path) -> Result<(), String> {
+        let Some(state_home) = &self.state_home else {
+            return Err(
+                ".venv is a symlink but this root has no state home whose baseline env it could \
+                 point into"
+                    .to_string(),
+            );
+        };
+        let real = std::fs::canonicalize(link)
+            .map(simplify_verbatim)
+            .map_err(|e| {
+                format!(
+                    ".venv is a symlink that does not resolve ({e}) — crew links it to the \
+                     baseline env `<state home>/skills/baseline/<hash>/.venv`"
+                )
+            })?;
+        let baseline_root = state_home.join(SKILLS_DIR).join("baseline");
+        let baseline = std::fs::canonicalize(&baseline_root)
+            .map(simplify_verbatim)
+            .map_err(|e| {
+                format!(
+                    ".venv is a symlink to `{}` but the state home has no baseline env root at \
+                     `{}` to hold it ({e})",
+                    real.display(),
+                    baseline_root.display()
+                )
+            })?;
+        let outside = || {
+            format!(
+                ".venv is a symlink to `{}`, which is not inside `{}/<64-hex>/.venv` — the one link \
+                 a generation may carry points into the baseline env crew provisioned for its \
+                 bundle hash",
+                real.display(),
+                baseline.display()
+            )
+        };
+        let rest = real.strip_prefix(&baseline).map_err(|_| outside())?;
+        let mut parts = rest.components().filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        });
+        let hash_ok = parts.next().is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        if !hash_ok || parts.next() != Some(".venv") {
+            return Err(outside());
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -897,6 +1086,21 @@ pub(crate) enum SkillsError {
     /// round 5 — resolving the ambient configuration here would admit a session against a plugin
     /// it never loaded and generate a directive for a skill it cannot invoke).
     NotDelivered { cli: String, skills: Vec<String> },
+    /// The live-cache FALLBACK root (no snapshot published) is Claude-only (codex round 7): its
+    /// index carries no publish-time portability verdict — cwd-relative script detection is crew's
+    /// publish analyzer and is not re-implemented here — so no non-Claude seat is handed anything
+    /// from it, and a non-Claude unit that invokes a skill is refused naming the seat.
+    FallbackClaudeOnly {
+        root: PathBuf,
+        cli: String,
+        skills: Vec<String>,
+    },
+    /// The ladder yielded NO root because the live-cache discovery FAILED (codex round 7) — the
+    /// cache could not be listed, a version candidate was a symlink or could not be resolved, the
+    /// highest version's manifest was malformed — as opposed to a genuine absence. A failure takes
+    /// the no-root rung like an absence but is never silent: this refusal carries the reason for a
+    /// run that names a skill.
+    FallbackFailed { why: String, missing: Vec<String> },
 }
 
 impl std::fmt::Display for SkillsError {
@@ -1025,6 +1229,26 @@ impl std::fmt::Display for SkillsError {
                  available, rather than invoking a skill the session never loaded",
                 skills.join(", ")
             ),
+            SkillsError::FallbackClaudeOnly { root, cli, skills } => write!(
+                f,
+                "the {} at {} is this launch's skills root ({SKILLS_SNAPSHOT_ENV} is unset, so the \
+                 ladder fell back to the installed {PLUGIN_NAME}) and it carries no publish-time \
+                 portability verdict — cwd-relative script detection is crew's publish analyzer, \
+                 not re-implemented by the engine — so it is Claude-only: '{cli}' cannot be handed \
+                 {}; non-Claude delivery requires a published snapshot (publish one), or route this \
+                 unit to a claude seat",
+                SnapshotSource::LiveCache,
+                root.display(),
+                skills.join(", ")
+            ),
+            SkillsError::FallbackFailed { why, missing } => write!(
+                f,
+                "no skills root is available: {SKILLS_SNAPSHOT_ENV} is unset and the installed \
+                 {PLUGIN_NAME} could not be used as the fallback ({why}) — not merely absent — but \
+                 this run requires skills: {}; repair the installation named in the reason, or \
+                 publish a snapshot",
+                missing.join(", ")
+            ),
         }
     }
 }
@@ -1052,11 +1276,41 @@ fn env_path(var: &'static str) -> Result<Option<PathBuf>, SkillsError> {
 
 /// Resolve the skills root from the process environment, logging the ladder step taken.
 /// `Ok(None)` ⇒ no root anywhere (already logged). `Err` ⇒ an explicit input is misconfigured.
+#[cfg(test)]
 pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
-    // Exactly ONE skills input (v3.1 §2, v3.4 §2): the snapshot path. The state home is derived
-    // from it; no companion variable is read.
+    resolve_ladder().map(Ladder::root)
+}
+
+/// What the ladder yielded (codex round 7): a ROOT; a genuine ABSENCE — no explicit input and no
+/// installed plugin, the documented no-root rung; or a FAILURE of the fallback discovery — a root
+/// may well be installed but could not be listed, resolved or trusted — which takes the no-root
+/// rung too, with its reason kept so the refusal of a skill-naming run says why
+/// ([`SkillsError::FallbackFailed`]). Never a failure flattened into "no installed garden".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Ladder {
+    Root(SkillsSnapshot),
+    Absent,
+    Failed(String),
+}
+
+impl Ladder {
+    /// The root, when the ladder found one (absence and failure alike are `None` — production
+    /// callers match the variants; the `Option` view serves the tests' ladder assertions).
+    #[cfg(test)]
+    pub(crate) fn root(self) -> Option<SkillsSnapshot> {
+        match self {
+            Ladder::Root(s) => Some(s),
+            Ladder::Absent | Ladder::Failed(_) => None,
+        }
+    }
+}
+
+/// The ladder from the process environment, absence and failure told apart. Exactly ONE skills
+/// input (v3.1 §2, v3.4 §2): the snapshot path; the state home is derived from it and no
+/// companion variable is read.
+pub(crate) fn resolve_ladder() -> Result<Ladder, SkillsError> {
     let explicit = env_path(SKILLS_SNAPSHOT_ENV)?;
-    resolve_in(
+    resolve_ladder_in(
         explicit,
         std::env::var_os(crate::acp_runner::CLAUDE_CONFIG_DIR_ENV).map(PathBuf::from),
         home_dir(),
@@ -1066,14 +1320,25 @@ pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
 
 /// [`resolve`] with its inputs and its log sink explicit, so the ladder is testable without
 /// touching the process environment and the "logged" half of each step is asserted, not assumed.
+#[cfg(test)]
 pub(crate) fn resolve_in(
     explicit: Option<PathBuf>,
     claude_config_dir: Option<PathBuf>,
     home: Option<PathBuf>,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
+    resolve_ladder_in(explicit, claude_config_dir, home, log).map(Ladder::root)
+}
+
+/// [`resolve_ladder`] with its inputs and its log sink explicit.
+pub(crate) fn resolve_ladder_in(
+    explicit: Option<PathBuf>,
+    claude_config_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+    log: &mut dyn FnMut(String),
+) -> Result<Ladder, SkillsError> {
     if let Some(path) = explicit {
-        return load_published(SKILLS_SNAPSHOT_ENV, &path).map(Some);
+        return load_published(SKILLS_SNAPSHOT_ENV, &path).map(Ladder::Root);
     }
     let Some(config) = claude_config_dir.or_else(|| home.map(|h| h.join(".claude"))) else {
         log(format!(
@@ -1081,7 +1346,7 @@ pub(crate) fn resolve_in(
              CLAUDE_CONFIG_DIR nor a home directory resolves; workers run WITHOUT {PLUGIN_NAME} \
              skills"
         ));
-        return Ok(None);
+        return Ok(Ladder::Absent);
     };
     // The live marketplace cache and nothing else: `<config>/plugins/wicked-garden` (the operator's
     // hand copy) is NOT a candidate — it is the stale copy the snapshot mechanism exists to retire.
@@ -1091,43 +1356,146 @@ pub(crate) fn resolve_in(
         .join(PLUGIN_NAME)
         .join(PLUGIN_NAME);
     // The fallback is a directory the operator did not choose, so it too is pinned to its real
-    // path; a cache dir that cannot be canonicalized is not a root.
-    let latest = highest_version_dir(&cache)
-        .filter(|latest| {
-            plugin_manifest_name(latest)
-                .ok()
-                .flatten()
-                .is_some_and(|name| name == PLUGIN_NAME)
-        })
-        .and_then(|latest| std::fs::canonicalize(latest).ok())
-        .map(simplify_verbatim);
+    // path — and every step of finding it either succeeds, finds NOTHING, or FAILS with a reason
+    // (codex round 7); a failure is never read as absence.
+    let root = match live_candidate(&cache) {
+        Candidate::Absent => {
+            log(format!(
+                "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset and no installed \
+                 {PLUGIN_NAME} was found in the plugin cache under {}; workers run WITHOUT \
+                 {PLUGIN_NAME} skills, and a run that names one is refused",
+                config.display()
+            ));
+            return Ok(Ladder::Absent);
+        }
+        Candidate::Failed(why) => {
+            log(format!(
+                "[wicked-core] skills.fallback FAILED: {why}; {SKILLS_SNAPSHOT_ENV} is unset and \
+                 the installed {PLUGIN_NAME} under {} could not be used as the fallback — workers \
+                 run WITHOUT {PLUGIN_NAME} skills, and a run that names one is refused with this \
+                 reason",
+                config.display()
+            ));
+            return Ok(Ladder::Failed(why));
+        }
+        Candidate::Found(root) => root,
+    };
     // A candidate that is not a CONTAINED tree (a linked `skills/`, an entry resolving outside
     // it, an unlistable directory) is REFUSED, not indexed and not skipped: the operator did not
     // choose it, but the worker would be handed its paths (codex round 5).
-    let found = match latest {
-        Some(root) => Some(
-            load_live(root.clone(), SnapshotSource::LiveCache, log)
-                .map_err(|why| SkillsError::Fallback { root, why })?,
-        ),
-        None => None,
+    let snapshot = load_live(root.clone(), SnapshotSource::LiveCache, log)
+        .map_err(|why| SkillsError::Fallback { root, why })?;
+    log(format!(
+        "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset; using the {} at {} ({} \
+         skills) — Claude-only: the installed plugin carries no publish-time portability verdict, \
+         so non-Claude seats are handed nothing from it. Publish a snapshot to pin a generation \
+         (and to deliver to non-Claude seats) — the installed plugin also carries its interactive \
+         hooks, which a snapshot excludes",
+        snapshot.source,
+        snapshot.root.display(),
+        snapshot.skills.len()
+    ));
+    Ok(Ladder::Root(snapshot))
+}
+
+/// The outcome of looking for the installed plugin in the marketplace cache (codex round 7).
+enum Candidate {
+    /// No cache directory, or no version-named directory in it — genuinely nothing installed.
+    Absent,
+    /// The highest version, verified to be this plugin, pinned to its real path.
+    Found(PathBuf),
+    /// Something is there but could not be listed, inspected, trusted or resolved — the reason.
+    Failed(String),
+}
+
+/// The highest `X.Y.Z`-named subdirectory of the marketplace cache, compared NUMERICALLY (`12.32.0`
+/// beats `12.9.0`, which a lexical sort gets wrong), verified to be this plugin and pinned to its
+/// real path. Candidates are sorted before the pick so the result — and the single line logged
+/// about it — never depends on directory iteration order. ABSENCE vs FAILURE (codex round 7): a
+/// missing cache dir or no version-named directory is `Absent`; an unlistable cache, an entry that
+/// cannot be inspected, a SYMLINKED version candidate (never followed), a highest version whose
+/// manifest is missing/malformed or names another plugin, or a candidate that cannot be resolved
+/// to a real path is `Failed` with the reason. Names that are not versions are not candidates.
+fn live_candidate(cache: &Path) -> Candidate {
+    let entries = match std::fs::read_dir(cache) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Candidate::Absent,
+        Err(e) => {
+            return Candidate::Failed(format!(
+                "the plugin cache {} cannot be listed ({e})",
+                cache.display()
+            ))
+        }
     };
-    match &found {
-        Some(snapshot) => log(format!(
-            "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset; using the {} at {} \
-             ({} skills). Publish a snapshot to pin a generation — the installed plugin also \
-             carries its interactive hooks, which a snapshot excludes",
-            snapshot.source,
-            snapshot.root.display(),
-            snapshot.skills.len()
-        )),
-        None => log(format!(
-            "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset and no installed \
-             {PLUGIN_NAME} was found in the plugin cache under {}; workers run WITHOUT \
-             {PLUGIN_NAME} skills, and a run that names one is refused",
-            config.display()
+    let mut candidates: Vec<(Vec<u64>, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                return Candidate::Failed(format!(
+                    "the plugin cache {} cannot be listed ({e})",
+                    cache.display()
+                ))
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue; // not a version name
+        };
+        let parsed: Option<Vec<u64>> = name.split('.').map(|s| s.parse().ok()).collect();
+        let Some(version) = parsed else {
+            continue;
+        };
+        let path = entry.path();
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                return Candidate::Failed(format!(
+                    "the plugin cache entry {} cannot be inspected ({e})",
+                    path.display()
+                ))
+            }
+        };
+        if meta.file_type().is_symlink() {
+            return Candidate::Failed(format!(
+                "the plugin cache entry {} is a symlink where an installed version directory is \
+                 expected; the fallback never follows a link",
+                path.display()
+            ));
+        }
+        if !meta.is_dir() {
+            continue; // a file named like a version is not an installed plugin
+        }
+        candidates.push((version, path));
+    }
+    candidates.sort();
+    let Some((_, latest)) = candidates.pop() else {
+        return Candidate::Absent;
+    };
+    match plugin_manifest_name(&latest) {
+        Err(why) => return Candidate::Failed(format!("{}: {why}", latest.display())),
+        Ok(None) => {
+            return Candidate::Failed(format!(
+                "{} has no parseable {PLUGIN_MANIFEST} with a `name` — a missing or malformed \
+                 manifest",
+                latest.display()
+            ))
+        }
+        Ok(Some(name)) if name != PLUGIN_NAME => {
+            return Candidate::Failed(format!(
+                "{} names plugin `{name}`, expected `{PLUGIN_NAME}`",
+                latest.display()
+            ))
+        }
+        Ok(Some(_)) => {}
+    }
+    match std::fs::canonicalize(&latest) {
+        Ok(real) => Candidate::Found(simplify_verbatim(real)),
+        Err(e) => Candidate::Failed(format!(
+            "{} cannot be resolved to a real path ({e})",
+            latest.display()
         )),
     }
-    Ok(found)
 }
 
 /// Pin `named` to the ABSOLUTE REAL directory it denotes, or say why it cannot be trusted.
@@ -1554,7 +1922,23 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
                 })
         };
         let name = field("name")?;
-        let dir = field("dir")?;
+        // crew's `SnapshotSkillRow.dir` is PLUGIN-relative — `skills/<dir>`, the `skills/` prefix
+        // literal (its row validator requires exactly that). The engine keys everything below by
+        // the path UNDER `skills/`, so the prefix is stripped here; a row without it was not
+        // written by crew and is a defect naming the spelling crew writes (review pass 7: rounds
+        // 1–6 read the field as already relative to `skills/`, so a real generation would have
+        // failed to load at its first skill).
+        let spelled = field("dir")?;
+        let Some(dir) = spelled
+            .strip_prefix(&format!("{SKILLS_DIR}/"))
+            .map(str::to_string)
+        else {
+            return Err(config_err(format!(
+                "{SNAPSHOT_INDEX} skills[{i}] (`{name}`) dir `{spelled}` is not plugin-relative — \
+                 crew writes `{SKILLS_DIR}/<dir>` (the `{SKILLS_DIR}/` prefix literal), and the \
+                 loader keys the skill by the path under it"
+            )));
+        };
         let portable = entry
             .get("portable")
             .and_then(Value::as_bool)
@@ -1632,14 +2016,22 @@ fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, Ski
     // nothing else. Checked last so an operator pointing at something that is not a snapshot at
     // all is told that first.
     let state_home = crate::state_home::derive(path).map_err(config_err)?;
-    Ok(SkillsSnapshot {
+    let snapshot = SkillsSnapshot {
         root,
         source: SnapshotSource::Published,
         gen: Some(gen),
         content_hash: Some(content_hash),
         state_home: Some(state_home),
         skills,
-    })
+    };
+    // Exact index/tree PARITY over the whole delivered closure (codex round 7): every `SKILL.md`
+    // the tree holds is indexed, nothing but the copilot view sits under `views/`, and no link
+    // sits anywhere but crew's `.venv` into the baseline env.
+    snapshot.verify_delivered_tree().map_err(|e| match e {
+        SkillsError::Config { why, .. } => config_err(why),
+        other => other,
+    })?;
+    Ok(snapshot)
 }
 
 /// The `SKILL.md` an index entry names, verified: `dir` is a safe relative `/`-path
@@ -1968,27 +2360,6 @@ fn plugin_manifest_name(root: &Path) -> Result<Option<String>, String> {
         .map(str::to_string))
 }
 
-/// The highest `X.Y.Z`-named subdirectory of a marketplace cache dir, compared NUMERICALLY
-/// (`12.32.0` beats `12.9.0`, which a lexical sort gets wrong). Non-numeric names and symlinked
-/// entries are ignored. Candidates are sorted before the pick so the result — and the single
-/// line logged about it — never depends on directory iteration order.
-fn highest_version_dir(cache: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(cache)
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            if !std::fs::symlink_metadata(e.path()).ok()?.is_dir() {
-                return None;
-            }
-            let name = e.file_name().to_str()?.to_string();
-            let parsed: Option<Vec<u64>> = name.split('.').map(|s| s.parse().ok()).collect();
-            parsed.map(|v| (v, e.path()))
-        })
-        .collect();
-    candidates.sort();
-    candidates.pop().map(|(_, path)| path)
-}
-
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -2099,6 +2470,19 @@ pub(crate) fn admit_refs(
             }
         }
         WorkerCli::Other { key, lever } => {
+            // codex round 7: the live-cache FALLBACK is Claude-only. Its `portable` flags are an
+            // approximation from the `SKILL.md` text (`${CLAUDE_PLUGIN_ROOT}`, `../`) that cannot
+            // see cwd-relative script invocations — crew's publish analyzer can — so nothing from
+            // it is delivered to a non-Claude seat, and a unit that invokes a skill there is
+            // refused naming the seat rather than handed a directory whose portability nobody
+            // judged. A skill-free non-Claude unit still runs (with no delivery).
+            if snapshot.source == SnapshotSource::LiveCache && !invoked.required.is_empty() {
+                return Err(SkillsError::FallbackClaudeOnly {
+                    root: snapshot.root.clone(),
+                    cli: key.clone(),
+                    skills: invoked.required.iter().map(|e| e.name.clone()).collect(),
+                });
+            }
             let nonportable: Vec<String> = invoked
                 .required
                 .iter()
@@ -2222,8 +2606,12 @@ pub(crate) fn admit_unit(
 /// launch's existence half: the ladder is resolved (an explicit path that is not a snapshot is the
 /// same config error every launch gets) and every ref the RUN names must exist, transitive
 /// mandates included; nothing seat-specific applies (no CLI runs) and no fence is opened (no
-/// worker reads the root). A run that names NO skill has nothing to admit and resolves nothing.
-pub(crate) fn admit_plan(input: &StepInput) -> Result<(), SkillsError> {
+/// worker reads the root). A run that names NO skill has nothing to admit and resolves nothing
+/// (`Ok(None)`). `Ok(Some(root))` is the generation the run was judged against — the actor
+/// reports it like a handoff (`SkillsSnapshotHanded`, `path: "tool_cmd"`), so crew's ledger pins
+/// it for the session from its first unit and the operator can see which generation admitted the
+/// plan.
+pub(crate) fn admit_plan(input: &StepInput) -> Result<Option<SkillsSnapshot>, SkillsError> {
     let refs = RequiredRefs::of(input);
     let plan: Vec<&str> = refs
         .plan
@@ -2232,10 +2620,41 @@ pub(crate) fn admit_plan(input: &StepInput) -> Result<(), SkillsError> {
         .filter(|r| !r.is_empty())
         .collect();
     if plan.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
-    let snapshot = resolve()?;
-    require_existence(snapshot.as_ref(), &plan)
+    match resolve_ladder()? {
+        Ladder::Root(s) => {
+            require_existence(Some(&s), &plan)?;
+            Ok(Some(s))
+        }
+        Ladder::Absent => {
+            require_existence(None, &plan)?;
+            Ok(None)
+        }
+        Ladder::Failed(why) => {
+            refuse_plan_on_failed_ladder(&plan, why)?;
+            Ok(None)
+        }
+    }
+}
+
+/// A FAILED fallback discovery is the no-root rung WITH its reason attached (codex round 7): a run
+/// that names no skill proceeds without a root exactly as under a genuine absence; one that names
+/// any is refused naming the skills AND why no root could be used — never "no installed garden"
+/// for a garden that is installed but unreadable, symlinked or malformed.
+fn refuse_plan_on_failed_ladder(plan: &[&str], why: String) -> Result<(), SkillsError> {
+    let mut missing: Vec<String> = plan
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| r.to_string())
+        .collect();
+    missing.sort();
+    missing.dedup();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(SkillsError::FallbackFailed { why, missing })
+    }
 }
 
 /// What a turn is judged against (codex round 5): a FRESH launch resolves the ambient root; a
@@ -2282,13 +2701,17 @@ pub(crate) fn admit_turn(
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
     let refs = RequiredRefs::of(input);
     let snapshot = match turn {
-        Turn::Fresh => {
-            let snapshot = resolve()?;
-            if let Some(s) = &snapshot {
-                fence_admit(s)?;
+        Turn::Fresh => match resolve_ladder()? {
+            Ladder::Root(s) => {
+                fence_admit(&s)?;
+                Some(s)
             }
-            snapshot
-        }
+            Ladder::Absent => None,
+            Ladder::Failed(why) => {
+                refuse_plan_on_failed_ladder(&refs.plan, why)?;
+                None
+            }
+        },
         Turn::Cached(Some(pinned)) => Some(pinned),
         Turn::Cached(None) => {
             let mut skills: Vec<String> = refs
@@ -2476,8 +2899,9 @@ pub(crate) mod test_support {
             .iter()
             .map(|(dir, name, portable, _)| {
                 serde_json::json!({
-                    "name": name, "dir": dir, "kind": "fork-worker", "core": false,
-                    "portable": portable
+                    "name": name, "dir": format!("{}/{dir}", super::SKILLS_DIR),
+                    "kind": "fork-worker", "core": false, "portable": portable,
+                    "nested": dir.contains('/')
                 })
             })
             .collect();
@@ -2705,11 +3129,23 @@ mod tests {
             bad.join(SNAPSHOT_INDEX),
             index_json(
                 "3",
-                serde_json::json!([{"name": "wicked-garden-core", "dir": "core"}]),
+                serde_json::json!([{"name": "wicked-garden-core", "dir": "skills/core"}]),
             ),
         )
         .unwrap();
         expect_err(&bad, "no boolean `portable`");
+        // crew spells a row's `dir` plugin-relative (`skills/<dir>`); a row without the prefix
+        // was not written by crew (review pass 7 — the loader used to read it as already relative
+        // to `skills/`, which no real generation is).
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            index_json(
+                "3",
+                serde_json::json!([{"name": "wicked-garden-core", "dir": "core", "portable": true}]),
+            ),
+        )
+        .unwrap();
+        expect_err(&bad, "dir `core` is not plugin-relative");
         std::fs::write(bad.join(SNAPSHOT_INDEX), "{\"skills\":[]}").unwrap();
         expect_err(&bad, "`gen`");
         std::fs::write(bad.join(SNAPSHOT_INDEX), "not json").unwrap();
@@ -2766,10 +3202,11 @@ mod tests {
         )
         .unwrap();
         expect_err(&bad, "`gardenSource.baseline` is empty");
-        // Empty `path` / `plugin_version` are what crew writes for a source without them: fine.
+        // Empty `path` / `plugin_version` are what crew writes for a source without them: fine
+        // (the row for the fixture's one skill rides along — the tree and the index must agree).
         std::fs::write(
             bad.join(SNAPSHOT_INDEX),
-            r#"{"gen":3,"contentHash":"sha256:3","gardenSource":{"kind":"directory","path":"","plugin_version":"","baseline":"b"},"skills":[]}"#,
+            r#"{"gen":3,"contentHash":"sha256:3","gardenSource":{"kind":"directory","path":"","plugin_version":"","baseline":"b"},"skills":[{"name":"wicked-garden-core","dir":"skills/core","portable":true}]}"#,
         )
         .unwrap();
         assert_eq!(published(&bad).unwrap().unwrap().gen.as_deref(), Some("3"));
@@ -2854,9 +3291,9 @@ mod tests {
             index_json(
                 "6",
                 serde_json::json!([
-                    {"name": "wicked-garden-a", "dir": "a", "portable": true},
-                    {"name": "wicked-garden-a", "dir": "b", "portable": true},
-                    {"name": "wicked-garden-c", "dir": "../escape", "portable": true}
+                    {"name": "wicked-garden-a", "dir": "skills/a", "portable": true},
+                    {"name": "wicked-garden-a", "dir": "skills/b", "portable": true},
+                    {"name": "wicked-garden-c", "dir": "skills/../escape", "portable": true}
                 ]),
             ),
         )
@@ -3541,7 +3978,7 @@ mod tests {
         index["skills"]
             .as_array_mut()
             .unwrap()
-            .retain(|e| e["dir"] != "core");
+            .retain(|e| e["dir"] != "skills/core");
         std::fs::write(
             root.join(SNAPSHOT_INDEX),
             serde_json::to_vec(&index).unwrap(),
@@ -3572,9 +4009,9 @@ mod tests {
             index_json(
                 "11",
                 serde_json::json!([
-                    {"name": "wicked-garden-a", "dir": "a", "portable": true,
+                    {"name": "wicked-garden-a", "dir": "skills/a", "portable": true,
                      "mandates": ["wicked-garden-b"]},
-                    {"name": "wicked-garden-b", "dir": "b", "portable": true}
+                    {"name": "wicked-garden-b", "dir": "skills/b", "portable": true}
                 ]),
             ),
         )
@@ -3970,24 +4407,26 @@ mod tests {
             std::fs::create_dir_all(linked_root.join("views")).unwrap();
             std::os::unix::fs::symlink(&outside, linked_root.join("views").join("copilot"))
                 .unwrap();
-            let ls = load(&linked_root);
-            let err = admit_refs(
-                Some(ls.clone()),
-                &RequiredRefs::seat(["wicked-garden-domain"]),
-                &copilot,
-            )
-            .expect_err("a linked view is an external tree");
+            // (codex round 7) refused at LOAD — the tree-parity walk refuses any link in the
+            // delivered generation — so no launch of any seat ever sees it; the admission-time
+            // view check (`copilot_view_for`) still refuses it for a snapshot struct built before
+            // the link appeared.
+            let err = published(&linked_root).expect_err("a linked view is an external tree");
             assert!(
                 matches!(&err, SkillsError::Config { why, .. }
                     if why.contains("views/copilot is a symlink")),
                 "{err:?}"
             );
+            std::fs::remove_file(linked_root.join("views").join("copilot")).unwrap();
+            let ls = load(&linked_root);
+            std::os::unix::fs::symlink(&outside, linked_root.join("views").join("copilot"))
+                .unwrap();
             assert!(
                 matches!(
                     admit_refs(Some(ls.clone()), &RequiredRefs::seat([]), &copilot),
                     Err(SkillsError::Config { .. })
                 ),
-                "refused even when nothing is invoked"
+                "refused at admission too, even when nothing is invoked"
             );
             assert_eq!(ls.delivery(&copilot), SkillsDelivery::None);
         }
@@ -4562,13 +5001,13 @@ mod tests {
             "contentHash": "sha256:31",
             "gardenSource": garden_source(),
             "skills": [
-                {"name": "wicked-garden-domain", "dir": "domain", "portable": true},
-                {"name": "/etc", "dir": "domain", "portable": true},
-                {"name": "wicked-garden-dotdot", "dir": "../outside", "portable": true},
-                {"name": "wicked-garden-drive", "dir": "C:/outside", "portable": true},
-                {"name": "wicked-garden-unc", "dir": r"\\?\C:\outside", "portable": true},
-                {"name": "a/b", "dir": "domain", "portable": true},
-                {"name": "wicked-garden-colon", "dir": "C:outside", "portable": true},
+                {"name": "wicked-garden-domain", "dir": "skills/domain", "portable": true},
+                {"name": "/etc", "dir": "skills/domain", "portable": true},
+                {"name": "wicked-garden-dotdot", "dir": "skills/../outside", "portable": true},
+                {"name": "wicked-garden-drive", "dir": "skills/C:/outside", "portable": true},
+                {"name": "wicked-garden-unc", "dir": r"skills/\\?\C:\outside", "portable": true},
+                {"name": "a/b", "dir": "skills/domain", "portable": true},
+                {"name": "wicked-garden-colon", "dir": "skills/C:outside", "portable": true},
             ]
         });
         std::fs::write(
@@ -4875,8 +5314,19 @@ mod tests {
         };
         {
             let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, root.as_os_str());
-            assert_eq!(admit_plan(&tool(&["wicked-garden-domain"])), Ok(()));
-            assert_eq!(admit_plan(&tool(&[])), Ok(()));
+            assert_eq!(
+                admit_plan(&tool(&["wicked-garden-domain"]))
+                    .unwrap()
+                    .expect("the generation the run was judged against is returned")
+                    .root,
+                root,
+                "so the actor can report it like a handoff"
+            );
+            assert_eq!(
+                admit_plan(&tool(&[])),
+                Ok(None),
+                "a skill-free run has nothing to admit and resolves nothing"
+            );
             assert_eq!(
                 admit_plan(&tool(&["wicked-garden-domain", "wicked-garden-mem"])),
                 Err(SkillsError::Missing {
@@ -4897,11 +5347,383 @@ mod tests {
             );
             assert_eq!(
                 admit_plan(&tool(&[])),
-                Ok(()),
-                "a skill-free run has nothing to admit and resolves nothing"
+                Ok(None),
+                "a skill-free run has nothing to admit and resolves nothing — the invalid path is \
+                 not even looked at"
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex round 7) Exact INDEX/TREE PARITY: a published generation may deliver nothing its index
+    /// does not carry — an unindexed `skills/disabled/SKILL.md` (a disabled skill copied in), a
+    /// nested extra `skills/domain/extra/SKILL.md`, a `SKILL.md` at the skills root, a `views/`
+    /// child other than `copilot`, a stray file in the copilot view — and no symlink anywhere in
+    /// it (a root-level `scripts -> …`, a link under `views/`), EXCEPT crew's root `.venv` link,
+    /// accepted only when it resolves inside `<state home>/skills/baseline/<64-hex>/.venv`. Support
+    /// files that are not skills (`skills/domain/refs/notes.md`, `scripts/x.py`) are fine.
+    #[test]
+    fn the_delivered_tree_must_match_the_index_exactly() {
+        let base = scratch("parity");
+        let root = snapshot_root(
+            &gen_dir(&base, "3"),
+            "3",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("engineering/frontend", "wicked-garden-engineering-frontend"),
+            ],
+        );
+        assert!(published(&root).is_ok(), "the intact fixture loads");
+        let refused = |needle: &str| {
+            let err = published(&root).expect_err(needle);
+            let SkillsError::Config { why, .. } = &err else {
+                panic!("expected Config, got {err:?}");
+            };
+            assert!(why.contains(needle), "{needle}: {why}");
+        };
+        // Support files that are not skills are part of the closure.
+        std::fs::create_dir_all(skill_dir(&root, "domain").join("refs")).unwrap();
+        std::fs::write(
+            skill_dir(&root, "domain").join("refs").join("notes.md"),
+            "x",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::write(root.join("scripts").join("x.py"), "print()").unwrap();
+        std::fs::write(root.join("pyproject.toml"), "[project]\n").unwrap();
+        assert!(
+            published(&root).is_ok(),
+            "support files are contained, not indexed"
+        );
+        // (1) an unindexed skill — disabled, copied in anyway.
+        write_skill(&root, "disabled", "wicked-garden-disabled");
+        refused("skills/disabled/SKILL.md");
+        refused("index does not carry");
+        std::fs::remove_dir_all(skill_dir(&root, "disabled")).unwrap();
+        // (2) a nested extra under an indexed skill.
+        write_skill(&root, "domain/extra", "wicked-garden-domain-extra");
+        refused("skills/domain/extra/SKILL.md");
+        std::fs::remove_dir_all(skill_dir(&root, "domain").join("extra")).unwrap();
+        // (3) a SKILL.md at the skills root itself.
+        std::fs::write(
+            root.join(SKILLS_DIR).join(SKILL_FILE),
+            "---\nname: x\n---\n",
+        )
+        .unwrap();
+        refused("skills/SKILL.md is a SKILL.md at the skills root");
+        std::fs::remove_file(root.join(SKILLS_DIR).join(SKILL_FILE)).unwrap();
+        // (4) views: only copilot; a stray inside the copilot view is judged by the view walk.
+        std::fs::create_dir_all(root.join("views").join("other")).unwrap();
+        refused("views/other is not a delivery view");
+        std::fs::remove_dir_all(root.join("views").join("other")).unwrap();
+        std::fs::create_dir_all(root.join("views").join("copilot")).unwrap();
+        std::fs::write(root.join("views").join("copilot").join("README.md"), "x").unwrap();
+        refused("views/copilot/README.md is not part of a copilot view");
+        std::fs::remove_dir_all(root.join("views")).unwrap();
+        assert!(published(&root).is_ok(), "well-formed again");
+        // (5) links: none anywhere — except crew's .venv into the baseline env.
+        #[cfg(unix)]
+        {
+            let outside = base.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("scripts").join("vendored")).unwrap();
+            refused("scripts/vendored is a symlink");
+            std::fs::remove_file(root.join("scripts").join("vendored")).unwrap();
+            std::fs::create_dir_all(root.join("views")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("views").join("copilot")).unwrap();
+            refused("views/copilot is a symlink");
+            std::fs::remove_dir_all(root.join("views")).unwrap();
+            // .venv: with NO baseline env root in the state home, any link is refused naming the
+            // missing root; with one, a link elsewhere ⇒ refused ("not inside"); into
+            // `<state home>/skills/baseline/<64-hex>/.venv` ⇒ fine; a non-hex baseline name ⇒
+            // refused; dangling ⇒ refused.
+            let venv = root.join(".venv");
+            std::os::unix::fs::symlink(&outside, &venv).unwrap();
+            refused("has no baseline env root");
+            let hash = format!("{:0>64}", "ab12");
+            let env = base
+                .join(SKILLS_DIR)
+                .join("baseline")
+                .join(&hash)
+                .join(".venv");
+            std::fs::create_dir_all(env.join("bin")).unwrap();
+            refused("not inside");
+            std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(&env, &venv).unwrap();
+            assert!(
+                published(&root).is_ok(),
+                "crew's .venv link into the baseline env is the one accepted link: {:?}",
+                published(&root).err()
+            );
+            std::fs::remove_file(&venv).unwrap();
+            let bad_env = base
+                .join(SKILLS_DIR)
+                .join("baseline")
+                .join("not-a-hash")
+                .join(".venv");
+            std::fs::create_dir_all(&bad_env).unwrap();
+            std::os::unix::fs::symlink(&bad_env, &venv).unwrap();
+            refused("not inside");
+            std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(base.join("nowhere").join(".venv"), &venv).unwrap();
+            refused("does not resolve");
+            std::fs::remove_file(&venv).unwrap();
+            // A .venv link that is NOT at the root is an ordinary (refused) link.
+            std::os::unix::fs::symlink(&env, skill_dir(&root, "domain").join(".venv")).unwrap();
+            refused("skills/domain/.venv is a symlink");
+            std::fs::remove_file(skill_dir(&root, "domain").join(".venv")).unwrap();
+            assert!(published(&root).is_ok());
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex round 7) The live-cache FALLBACK root is Claude-only: a non-Claude seat that invokes
+    /// a skill is refused naming the seat and told that non-Claude delivery requires a published
+    /// snapshot; a Claude seat is admitted; a skill-free non-Claude unit is admitted but handed
+    /// NOTHING (`delivery` is `None` for every non-Claude lever) — the `portable` approximation
+    /// from the `SKILL.md` text never becomes a delivery.
+    #[test]
+    fn the_live_cache_fallback_is_claude_only() {
+        let base = scratch("fallback-claude-only");
+        let live = load_live(
+            live_root(
+                &base.join("live"),
+                "1.0.0",
+                &[("core", "wicked-garden-core"), ("mem", "wicked-garden-mem")],
+            ),
+            SnapshotSource::LiveCache,
+            &mut |_| {},
+        )
+        .unwrap();
+        let claude = WorkerCli::Claude;
+        let pi = WorkerCli::for_binaries("pi", "pi", "pi");
+        let opencode = WorkerCli::for_binaries("opencode", "opencode", "opencode");
+        let copilot = WorkerCli::for_binaries("copilot", "copilot", "copilot");
+        assert!(
+            admit_refs(
+                Some(live.clone()),
+                &RequiredRefs::seat(["wicked-garden-core"]),
+                &claude
+            )
+            .unwrap()
+            .is_some(),
+            "Claude is the documented fallback rung"
+        );
+        for seat in [&pi, &opencode, &copilot] {
+            let err = admit_refs(
+                Some(live.clone()),
+                &RequiredRefs::seat(["wicked-garden-core"]),
+                seat,
+            )
+            .expect_err("non-Claude delivery from the fallback is refused");
+            assert_eq!(
+                err,
+                SkillsError::FallbackClaudeOnly {
+                    root: live.root.clone(),
+                    cli: seat.to_string(),
+                    skills: vec!["wicked-garden-core".to_string()],
+                },
+                "{seat}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(&seat.to_string())
+                    && text.contains("Claude-only")
+                    && text.contains("non-Claude delivery requires a published snapshot")
+                    && text.contains(&live.root.display().to_string()),
+                "{text}"
+            );
+            // Skill-free: admitted, nothing handed.
+            assert!(
+                admit_refs(Some(live.clone()), &RequiredRefs::seat([]), seat)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(live.delivery(seat), SkillsDelivery::None, "{seat}");
+        }
+        assert_eq!(
+            live.delivery(&claude),
+            SkillsDelivery::ClaudePlugin(live.root.clone())
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex round 7) Fallback discovery tells ABSENCE from FAILURE: no cache, or no version-named
+    /// directory in it ⇒ `Ladder::Absent` and the "no installed" log; a highest version with a
+    /// malformed manifest, a SYMLINKED version candidate, or a cache that cannot be listed
+    /// (permission denied) ⇒ `Ladder::Failed(reason)` with a `skills.fallback FAILED` log naming the
+    /// reason — never read as absence. Through admission, a failed ladder refuses a skill-naming run
+    /// with `FallbackFailed` carrying the reason, and admits a skill-free one with no root.
+    #[test]
+    fn fallback_discovery_distinguishes_absence_from_failure() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Pin(&'static str, Option<std::ffi::OsString>);
+        impl Pin {
+            fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
+                let prev = std::env::var_os(key);
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+                Pin(key, prev)
+            }
+        }
+        impl Drop for Pin {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let base = scratch("ladder-failure");
+        let config = base.join("claude-config");
+        let cache = config
+            .join("plugins")
+            .join("cache")
+            .join(PLUGIN_NAME)
+            .join(PLUGIN_NAME);
+        // Absent: no cache dir; then a cache dir with no version-named entry.
+        let mut lines = Vec::new();
+        assert_eq!(
+            resolve_ladder_in(None, Some(config.clone()), None, &mut collect(&mut lines)).unwrap(),
+            Ladder::Absent
+        );
+        std::fs::create_dir_all(cache.join("not-a-version")).unwrap();
+        assert_eq!(
+            resolve_ladder_in(None, Some(config.clone()), None, &mut collect(&mut lines)).unwrap(),
+            Ladder::Absent
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| l.contains("no installed") && !l.contains("FAILED")),
+            "{lines:?}"
+        );
+        // Failed: the highest version's manifest is malformed.
+        let latest = live_root(
+            &cache.join("2.0.0"),
+            "2.0.0",
+            &[("core", "wicked-garden-core")],
+        );
+        std::fs::write(
+            latest.join(".claude-plugin").join("plugin.json"),
+            "not json",
+        )
+        .unwrap();
+        let mut lines = Vec::new();
+        let ladder =
+            resolve_ladder_in(None, Some(config.clone()), None, &mut collect(&mut lines)).unwrap();
+        let Ladder::Failed(why) = &ladder else {
+            panic!("a malformed manifest is a failure, not absence: {ladder:?}");
+        };
+        assert!(
+            why.contains("2.0.0") && why.contains("malformed"),
+            "names the candidate and the defect: {why}"
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("skills.fallback FAILED") && lines[0].contains(why.as_str()),
+            "{lines:?}"
+        );
+        // Through admission (the process env): a skill-naming run is refused WITH the reason; a
+        // skill-free one proceeds with no root.
+        let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, None);
+        let _config = Pin::set(
+            crate::acp_runner::CLAUDE_CONFIG_DIR_ENV,
+            Some(config.as_os_str()),
+        );
+        let input = |skill: Option<&str>| {
+            let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
+            u.skill_ref = skill.map(str::to_string);
+            StepInput {
+                run_id: "r".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let err = admit_turn(
+            Turn::Fresh,
+            &input(Some("wicked-garden-core")),
+            &WorkerCli::Claude,
+        )
+        .expect_err("a failed ladder refuses a skill-naming run");
+        assert_eq!(
+            err,
+            SkillsError::FallbackFailed {
+                why: why.clone(),
+                missing: vec!["wicked-garden-core".to_string()],
+            }
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("could not be used as the fallback")
+                && text.contains("not merely absent")
+                && text.contains(why.as_str())
+                && text.contains("wicked-garden-core"),
+            "{text}"
+        );
+        assert_eq!(
+            admit_turn(Turn::Fresh, &input(None), &WorkerCli::Claude),
+            Ok(None),
+            "a skill-free run proceeds without a root, as under absence"
+        );
+        let mut tool = input(None);
+        tool.unit.tool_cmd = Some(vec!["true".to_string()]);
+        tool.required_skills = vec!["wicked-garden-core".to_string()];
+        assert!(
+            matches!(admit_plan(&tool), Err(SkillsError::FallbackFailed { .. })),
+            "the tool-command admission carries the reason too"
+        );
+        // A symlinked version candidate and an unlistable cache are failures too.
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                latest.join(".claude-plugin").join("plugin.json"),
+                "{\"name\":\"wicked-garden\",\"version\":\"2.0.0\"}",
+            )
+            .unwrap();
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, cache.join("3.0.0")).unwrap();
+            let ladder = resolve_ladder_in(None, Some(config.clone()), None, &mut |_| {}).unwrap();
+            assert!(
+                matches!(&ladder, Ladder::Failed(why) if why.contains("3.0.0") && why.contains("symlink")),
+                "{ladder:?}"
+            );
+            std::fs::remove_file(cache.join("3.0.0")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let ladder = resolve_ladder_in(None, Some(config.clone()), None, &mut |_| {}).unwrap();
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // root ignores mode bits: the listing succeeds there, so the failure is only
+            // observable for an unprivileged runner.
+            if !is_root_user() {
+                assert!(
+                    matches!(&ladder, Ladder::Failed(why) if why.contains("cannot be listed")),
+                    "permission denied is a failure, not absence: {ladder:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    fn is_root_user() -> bool {
+        // SAFETY: `geteuid` reads the process's effective uid; no pointers, no state.
+        unsafe { libc::geteuid() == 0 }
     }
 
     /// The snapshot's STATE HOME is derived from its own shape at load (codex round 3; v3.4 §2):
