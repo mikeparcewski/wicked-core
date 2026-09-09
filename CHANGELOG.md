@@ -150,7 +150,32 @@ Two release tracks share this file, newest entry first regardless of track:
   and the sweep removes only THIS process's leftovers — never another engine process's in-flight
   temp, whose rename it would otherwise race. Windows CI: the acp_runner test scratch helper is
   platform-independent (a non-`cfg(unix)` test used a `cfg(unix)` helper and the lib tests did not
-  compile).
+  compile). **Review pass 5 (codex round 5 on #399):** the live-cache FALLBACK root is contained
+  before it is traversed — `root` and `root/skills` are lstat-checked (no symlink component) and
+  every indexed entry must canonicalize inside the root — so a `skills -> /outside` link in the
+  installed plugin is REFUSED as a fallback (`SkillsError::Fallback`, naming the root), never
+  indexed (round 4 lstat-checked only the children and handed an external tree's paths to
+  pi/opencode); enumeration errors in the live walk propagate instead of reading as "no skills".
+  The copilot view is enumerated from `views/copilot` ITSELF: it may hold exactly `.github`, which
+  may hold exactly `skills`; any other file, directory or symlink at either level
+  (`views/copilot/leak`, `.github/copilot-instructions.md`, `.github/workflows`) refuses the launch
+  by name, since the whole directory is what `--add-dir` delivers (round 4 started at
+  `.github/skills`). A cached ACP session that was opened WITHOUT a snapshot (`proc.skills =
+  None`, no root on the ladder then) is told apart from a fresh launch (`skills_snapshot::Turn::
+  {Fresh, Cached(Option<_>)}`): a skill-bearing turn on it is REFUSED (`SkillsError::NotDelivered`,
+  naming the skills and advising a fresh session) instead of admitted off the ambient configuration
+  — the plugin reaches a session only at `session/new`, so round 4 admitted such a turn, sent no
+  handshake and still generated the invocation directive; a skill-free turn on it still runs, and a
+  fresh session under the now-available snapshot is handed it. The shared worker-home
+  `settings.json` is REPLACED, never unlinked first: the pid/seq temp is `rename`d over the target
+  (atomic; a planted link is replaced as a link), so a concurrent reader in another engine process
+  or a running CLI sees the previous or the new file and never none, and a failed write leaves the
+  previous content — only a planted non-file, non-link entry (a directory) is cleared beforehand.
+  Test hygiene: every test reading the inherit-config escape hatch or HOME through
+  `inject_isolation_flags`/`deny_rules` now holds the crate-wide env lock (read side) — the
+  round-4 plugin-flag regression raced the ACP test pinning `WICKED_WORKER_INHERIT_OPERATOR_CONFIG`
+  — and the Unix-only recording-bridge helpers (`EnvPin`, `ledger_entries`) are `#[cfg(unix)]`, which
+  is what failed the round-4 Windows clippy job (`dead_code` under `-D warnings`).
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

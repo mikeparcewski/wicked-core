@@ -5769,6 +5769,9 @@ mod tests {
     /// run stops being a property of the repo and becomes a property of the laptop.
     #[test]
     fn isolation_drops_user_scope_settings_and_lands_before_the_guard() {
+        // Every reader of the inherit-config escape hatch holds the lock (read side): a writer
+        // pinning it concurrently would make `inject_isolation_flags` inject nothing.
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         let inv = "claude {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
         inject_isolation_flags(&mut argv, inv, None);
@@ -5876,6 +5879,7 @@ mod tests {
     /// The mode must be stated or the isolation fix breaks every unit that writes anything.
     #[test]
     fn isolation_states_a_permission_mode_that_still_honours_the_deny_rules() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // reads the escape hatch
         let inv = "claude -p {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
         inject_isolation_flags(&mut argv, inv, None);
@@ -5891,6 +5895,7 @@ mod tests {
     /// Injecting a second copy of either flag is how you get a CLI that refuses to start.
     #[test]
     fn isolation_defers_to_a_template_that_already_pins_these_flags() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // reads the escape hatch
         let inv =
             "claude --setting-sources user --permission-mode plan --disallowedTools Edit -p {PROMPT}";
         let mut argv = build_argv(inv, "hi", &[]);
@@ -5910,6 +5915,7 @@ mod tests {
     /// duplicated flag in a live worker's argv.
     #[test]
     fn isolation_defers_to_the_equals_form_of_every_flag_it_would_inject() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // reads the escape hatch
         for stated in [
             "--setting-sources=user",
             "--permission-mode=plan",
@@ -5956,6 +5962,7 @@ mod tests {
     /// no rule may contain one.
     #[test]
     fn no_deny_rule_contains_the_character_that_joins_them() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner()); // deny_rules reads HOME
         let rules = deny_rules(None);
         assert!(!rules.is_empty());
         for r in &rules {
@@ -6143,6 +6150,12 @@ mod tests {
     /// skills input, and the ladder (not the operator's hand copy) decides what a worker gets.
     #[test]
     fn the_snapshot_rides_plugin_dir_exactly_once_and_supersedes_the_template_hand_copy() {
+        // `inject_isolation_flags` reads the inherit-config escape hatch (and HOME, for the deny
+        // rules): a concurrent test pinning `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` would make it
+        // return with the argv untouched — the stale hand copy still there — and fail this
+        // assertion for a reason that is not this code's (codex round 5). Read side, held for the
+        // whole body.
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         let snapshot = std::path::Path::new("/snapshots/5");
         let stale = "/home/op/.claude/plugins/wicked-garden";
 

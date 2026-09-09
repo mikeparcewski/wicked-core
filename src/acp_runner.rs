@@ -1285,14 +1285,26 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
     for entry in WORKER_HOME_SANITIZED {
         remove_entry_no_follow(&dir.join(entry))?;
     }
-    // settings.json is re-written every spawn; clear any planted entry (symlink included)
-    // first so the write can never travel through a link — and sweep the temp files THIS
-    // process's earlier spawns left behind (a crash between create and rename). Only this
-    // process's: the worker home is shared by every engine process on the host, and another
-    // process's temp file is its in-flight write, which its own rename is about to consume —
-    // unlinking it under that process fails ITS isolation setup (codex round 4).
+    // settings.json is re-written every spawn — REPLACED, never unlinked first (codex round 5):
+    // `write_atomic` writes the pid/seq temp and `rename`s it over the target, which replaces
+    // atomically and does not follow a symlinked target (a planted link is replaced AS a link),
+    // so a concurrent reader — another engine process's spawn, a CLI already running on this
+    // home — sees the previous valid file or the new one and never NO file, and a write that
+    // fails (temp create, write, sync, rename) leaves the previous valid file in place. Round 4
+    // unlinked the valid file before the write: that gap was observable across processes, which
+    // the process-local ENSURE mutex above does not cover. The one thing cleared beforehand is an
+    // entry that is NOT a file or a link — a planted DIRECTORY named `settings.json` — which
+    // rename cannot replace and which was never a valid settings file to keep. Then the temp
+    // files THIS process's earlier spawns left behind (a crash between create and rename) are
+    // swept. Only this process's: the worker home is shared by every engine process on the host,
+    // and another process's temp file is its in-flight write, which its own rename is about to
+    // consume — unlinking it under that process fails ITS isolation setup (codex round 4).
     let settings_path = dir.join(SETTINGS_FILENAME);
-    remove_entry_no_follow(&settings_path)?;
+    if let Ok(m) = std::fs::symlink_metadata(&settings_path) {
+        if !m.is_file() && !m.file_type().is_symlink() {
+            remove_entry_no_follow(&settings_path)?;
+        }
+    }
     sweep_own_settings_temps(&dir)?;
     let settings = json!({
         "permissions": { "deny": crate::execute_wrapped::shared_deny_rules() }
@@ -4518,22 +4530,27 @@ impl AcpStepRunner {
         // already holds for this seat is admitted against the snapshot it was OPENED with
         // (`proc.skills`), never against a re-resolved `current` — the bridge holds the plugin it
         // loaded, and a `current` that has since moved to a generation dropping a skill the pinned
-        // one still has must not refuse a turn that can succeed. A session opened with NOTHING
-        // pinned (the inherit-config escape hatch; no root anywhere) is judged exactly as a fresh
-        // launch would be — the hatch bypass, else the ladder + the fence check — so the same
-        // configuration gives the same verdict on every turn. The run's whole skill set must
-        // EXIST (plan-wide, transitive mandates included) and what THIS seat invokes must be
-        // deliverable to it, or the unit is REFUSED by name.
+        // one still has must not refuse a turn that can succeed. A cached session opened with
+        // NOTHING pinned (no root anywhere at the time) is judged as exactly that (codex round 5,
+        // `Turn::Cached(None)`): the plugin is handed at `session/new` and never afterwards, so a
+        // skill-bearing turn on it is REFUSED naming the skills — the ambient configuration is not
+        // re-resolved for a session that cannot receive what it now holds, and no directive is
+        // ever generated for a skill the session never loaded. Only a FRESH launch (`Turn::Fresh`)
+        // resolves the ladder + the fence check. The run's whole skill set must EXIST (plan-wide,
+        // transitive mandates included) and what THIS seat invokes must be deliverable to it, or
+        // the unit is REFUSED by name.
         let session_key = (run_id.clone(), cli_key.clone());
         let probe = self.probe_cached_session(&session_key);
-        let pinned = match &probe {
+        let turn = match &probe {
             SessionProbe::Live(arc) => {
                 let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
-                proc.skills.clone()
+                crate::skills_snapshot::Turn::Cached(proc.skills.clone())
             }
-            SessionProbe::Vacant | SessionProbe::FailedStartup => None,
+            SessionProbe::Vacant | SessionProbe::FailedStartup => {
+                crate::skills_snapshot::Turn::Fresh
+            }
         };
-        let skills = match crate::skills_snapshot::admit_turn(pinned, input, &worker_cli) {
+        let skills = match crate::skills_snapshot::admit_turn(turn, input, &worker_cli) {
             Ok(s) => s,
             Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
         };
@@ -4968,8 +4985,14 @@ impl AcpStepRunner {
         if reused {
             // Already judged above for a session the probe found; this catches the race where a
             // concurrent turn opened the session first (`did_insert` false) — same policy
-            // (`admit_turn`), its snapshot. Idempotent.
-            if let Err(e) = crate::skills_snapshot::admit_turn(bound.clone(), input, &worker_cli) {
+            // (`admit_turn`), the CACHED turn against ITS snapshot (`None` included: a session the
+            // racing turn opened without one is refused for a skill-bearing turn here too, never
+            // admitted off the ambient root — codex round 5). Idempotent.
+            if let Err(e) = crate::skills_snapshot::admit_turn(
+                crate::skills_snapshot::Turn::Cached(bound.clone()),
+                input,
+                &worker_cli,
+            ) {
                 drop(proc);
                 return crate::execute_wrapped::skills_refusal(input, &e);
             }
@@ -7406,19 +7429,127 @@ cat >/dev/null
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (codex round 5) The shared worker-home `settings.json` is REPLACED, never unlinked first:
+    /// a reader racing `ensure_worker_config_home` — another engine process's spawn, a CLI already
+    /// running on this home — sees the previous file or the new one and never NO file. A reader
+    /// thread reads the path continuously while this thread re-ensures the home many times; every
+    /// read succeeds and parses as JSON. Round 4 removed the file before the atomic write, and a
+    /// reader in that window got `NotFound`. Unix-only: on Windows a reader's open handle can make
+    /// the replacing rename fail with a sharing violation — a property of the platform's rename,
+    /// not of this ordering, and not what this test judges; the Windows job runs the failed-write
+    /// test below, which exercises the same writer without a concurrent reader.
+    #[test]
+    #[cfg(unix)]
+    fn a_concurrent_reader_of_the_shared_settings_never_sees_a_missing_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("settings-race");
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let dir = ensure_worker_config_home().expect("first ensure");
+        let path = dir.join(SETTINGS_FILENAME);
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let path = path.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let (mut reads, mut missing, mut torn) = (0u32, 0u32, 0u32);
+                while !stop.load(Ordering::Relaxed) {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => {
+                            reads += 1;
+                            if serde_json::from_slice::<Value>(&bytes).is_err() {
+                                torn += 1;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing += 1,
+                        Err(e) => panic!("unexpected read error: {e}"),
+                    }
+                }
+                (reads, missing, torn)
+            })
+        };
+        for _ in 0..120 {
+            ensure_worker_config_home().expect("re-ensure");
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (reads, missing, torn) = reader.join().expect("reader thread");
+        restore_hermetic_worker_home();
+        assert!(reads > 0, "the reader ran alongside the writer");
+        assert_eq!(
+            missing, 0,
+            "a replacement never passes through a missing file ({reads} reads saw one)"
+        );
+        assert_eq!(torn, 0, "a reader never sees a torn file ({reads} reads)");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (codex round 5) A settings write that FAILS leaves the previous valid file in place with
+    /// its previous content — not a missing file — and no temp of ours behind: `write_atomic`
+    /// creates its temp in `dir`, so a `dir` that is not a directory fails the create on every
+    /// platform before anything touches the target. (Through `ensure_worker_config_home` the same
+    /// writer runs against a home the function itself re-opens to `0o700` first, so a failure
+    /// cannot be injected there portably; the ordering it relies on — no unlink before the
+    /// rename — is what the concurrent-reader test above observes.)
+    #[test]
+    fn a_failed_settings_write_leaves_the_previous_file_intact() {
+        let dir = scratch("settings-fail");
+        let target = dir.join(SETTINGS_FILENAME);
+        std::fs::write(&target, b"{\"previous\":true}").unwrap();
+        let not_a_dir = dir.join("not-a-dir");
+        std::fs::write(&not_a_dir, b"").unwrap();
+        let err = write_atomic(&not_a_dir, &target, b"{\"next\":true}")
+            .expect_err("the temp cannot be created under a regular file");
+        assert!(
+            err.to_string().contains("atomically") && err.to_string().contains("settings.json"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"{\"previous\":true}",
+            "the previous valid file is untouched"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| settings_temp_pid(n, SETTINGS_FILENAME).is_some())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp of ours is left: {leftovers:?}"
+        );
+        // And a write that SUCCEEDS replaces the content in place, through the same path.
+        write_atomic(&dir, &target, b"{\"next\":true}").expect("a writable dir");
+        assert_eq!(std::fs::read(&target).unwrap(), b"{\"next\":true}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// RAII pin of one process-global variable, restored on drop. Hold `ENV_LOCK` (write) first
     /// and declare the pin AFTER the lock guard so it restores before the lock releases.
+    /// `#[cfg(unix)]` to match its only callers — the recording-bridge tests are Unix-only (the
+    /// bridge is a shell script), so on Windows this would otherwise be dead code (`-D warnings`;
+    /// the round-4 Windows job failed exactly here).
+    #[cfg(unix)]
     struct EnvPin {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
     }
+    #[cfg(unix)]
     impl EnvPin {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let prev = std::env::var_os(key);
             std::env::set_var(key, value);
             Self { key, prev }
         }
+        /// Pin the variable UNSET (restored on drop) — a scenario that needs "no snapshot on the
+        /// ladder" cannot rely on the developer's or CI's environment not carrying one.
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
     }
+    #[cfg(unix)]
     impl Drop for EnvPin {
         fn drop(&mut self) {
             match &self.prev {
@@ -7429,6 +7560,8 @@ cat >/dev/null
     }
 
     /// The JSON lines a recording bridge appended to its ledger (empty when it never ran).
+    /// `#[cfg(unix)]` for the same reason as [`EnvPin`]: only the Unix-only bridge tests read one.
+    #[cfg(unix)]
     fn ledger_entries(path: &std::path::Path) -> Vec<Value> {
         std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -8357,22 +8490,31 @@ transport = "stdio"
     }
 
     /// codex round 4 — ONE admission policy for fresh and cached sessions (`admit_turn`), end to
-    /// end through `run_unit` against the recording bridge. A session's FIRST turn names no
-    /// skill; its second names one, under the SAME configuration:
+    /// end through `run_unit` against the recording bridge; codex round 5 — the two KINDS of turn
+    /// are told apart, and a cached session that never received a plugin is not admitted against
+    /// one by resolving the ambient configuration. A session's FIRST turn names no skill; its
+    /// second names one:
     ///
     /// 1. under the inherit-config escape hatch the session opens with nothing pinned
     ///    (`proc.skills = None` — the worker runs on the operator's own plugins, no snapshot is
-    ///    handed) and round 3 refused turn 2 as "no skills root is available" while a fresh
-    ///    launch under the same hatch would have been admitted; now turn 2 is admitted (the
-    ///    bypass applies to cached and fresh alike) and its directive names the skill in the
-    ///    plugin form;
-    /// 2. under a snapshot the session opens PINNED to the handed generation even though turn 1
-    ///    invokes nothing (the bridge received it as its local plugin at `session/new`), turn 2 is
-    ///    admitted against that pinned generation with the directive discovered from its index,
-    ///    and a skill the pinned generation lacks is still refused against IT, by name.
+    ///    handed) and turn 2 is admitted (the bypass applies to cached and fresh alike) with its
+    ///    directive in the plugin form — the operator's own plugins are what the worker runs on;
+    /// 2. with NO root on the ladder (no snapshot variable, no plugin cache under the pinned HOME
+    ///    or the pinned, empty claude config dir) a skill-free session opens with nothing pinned;
+    ///    then a snapshot APPEARS (`WICKED_SKILLS_SNAPSHOT` set) and the same session's
+    ///    skill-bearing turn 2 is REFUSED naming the skill and advising a fresh session — round 4
+    ///    resolved the ambient root here, admitted the turn, sent no new plugin handshake
+    ///    (`proc.skills` stayed `None`) and still generated the invocation directive for a plugin
+    ///    the bridge never loaded. The refusal never reaches the bridge; a skill-free turn 3 on
+    ///    the same session still runs, still with nothing handed and no directive;
+    /// 3. a FRESH session under the same, now-available snapshot opens PINNED to it — the plugin
+    ///    handshake in `session/new` — even though its turn 1 invokes nothing; turn 2 is admitted
+    ///    against that pinned generation with the directive discovered from its index; and a
+    ///    skill the pinned generation lacks is still refused against IT, by name.
     #[test]
     #[cfg(unix)]
-    fn a_cached_session_opened_without_skills_is_admitted_like_a_fresh_launch_on_later_turns() {
+    fn a_cached_session_opened_without_a_snapshot_refuses_skill_turns_while_a_fresh_one_is_handed_it(
+    ) {
         use crate::skills_snapshot::test_support::{scratch as canonical_scratch, snapshot_root};
         use crate::workflow::{StepInput, StepRunner};
 
@@ -8380,13 +8522,20 @@ transport = "stdio"
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let home = canonical_scratch("acp-turns");
         let _home = EnvPin::set("HOME", &home);
+        // The ladder, pinned hermetic: no snapshot variable (yet), an EMPTY claude config dir (the
+        // live-cache rung looks under it, never under the developer's real one), no explicit
+        // state home (the fixture's derives from its shape).
+        let _no_snap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let config = home.join("claude-config");
+        std::fs::create_dir_all(&config).unwrap();
+        let _config = EnvPin::set(CLAUDE_CONFIG_DIR_ENV, &config);
+        let _no_state = EnvPin::unset(crate::state_home::STATE_HOME_ENV);
         let skills = home.join(".wicked-crew").join("skills");
         let gen = snapshot_root(
             &skills.join("snapshots").join("000001"),
             "1",
             &[("domain", "wicked-garden-domain")],
         );
-        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen);
 
         let ledger = home.join("ledger.ndjson");
         let bridge = write_recording_bridge(&home);
@@ -8474,28 +8623,79 @@ transport = "stdio"
             );
         }
 
-        // 2. A snapshot: run S opens PINNED to the generation with a turn that invokes nothing.
-        let out = runner.run_unit(&unit("run-S", 1, None));
+        // 2. NO root on the ladder: run N opens skill-free with nothing pinned — no plugin in the
+        //    handshake — and the session is cached.
+        let out = runner.run_unit(&unit("run-N", 1, None));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
         let entries = ledger_entries(&ledger);
-        assert_eq!(entries.len(), 5, "{entries:?}");
-        assert_eq!(
-            entries[3]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
-            serde_json::json!([{"type": "local", "path": gen.to_string_lossy()}]),
-            "the session is opened on the generation even though turn 1 invokes nothing: {}",
+        assert_eq!(entries.len(), 5, "session/new + one prompt: {entries:?}");
+        assert!(
+            entries[3]["new"]["_meta"]["claudeCode"]["options"]["plugins"].is_null(),
+            "no root on the ladder ⇒ no plugin handed at session/new: {}",
             entries[3]
         );
-        let out = runner.run_unit(&unit("run-S", 2, Some("wicked-garden-domain")));
+        // The snapshot APPEARS. The cached session for run N never received it and cannot now:
+        // its skill-bearing turn is refused naming the skill, advising a fresh session — never
+        // admitted off the ambient root, and no directive is generated for a plugin the bridge
+        // never loaded. The refusal never reaches the bridge.
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen);
+        let out = runner.run_unit(&unit("run-N", 2, Some("wicked-garden-domain")));
+        assert_eq!(
+            out.status,
+            StepStatus::Failed,
+            "a session opened without a snapshot is not admitted for a skill it never loaded: {}",
+            out.output
+        );
+        assert!(
+            out.output.contains("wicked-garden-domain")
+                && out.output.contains("opened without a skills snapshot")
+                && out.output.contains("fresh session")
+                && !out.output.contains(&gen.display().to_string()),
+            "names the skill, advises a fresh session, never names the ambient root: {}",
+            out.output
+        );
+        assert_eq!(
+            ledger_entries(&ledger).len(),
+            5,
+            "the refusal never reached the bridge — no prompt, no directive"
+        );
+        // A skill-free turn on that same session still runs — nothing handed, no directive.
+        let out = runner.run_unit(&unit("run-N", 3, None));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
         let entries = ledger_entries(&ledger);
         assert_eq!(entries.len(), 6, "{entries:?}");
         assert!(
-            entries[5]["prompt"]
+            !entries[5]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("Invoke your skill"),
+            "a skill-free turn carries no directive: {}",
+            entries[5]
+        );
+
+        // 3. A FRESH session under the same snapshot: run S opens PINNED to the generation — the
+        //    plugin handshake — with a turn that invokes nothing.
+        let out = runner.run_unit(&unit("run-S", 1, None));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        assert_eq!(entries.len(), 8, "{entries:?}");
+        assert_eq!(
+            entries[6]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
+            serde_json::json!([{"type": "local", "path": gen.to_string_lossy()}]),
+            "the fresh session is opened on the generation even though turn 1 invokes nothing: {}",
+            entries[6]
+        );
+        let out = runner.run_unit(&unit("run-S", 2, Some("wicked-garden-domain")));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        assert_eq!(entries.len(), 9, "{entries:?}");
+        assert!(
+            entries[8]["prompt"]
                 .as_str()
                 .unwrap()
                 .contains("\"wicked-garden:domain\""),
             "the directive is discovered from the pinned generation's index: {}",
-            entries[5]
+            entries[8]
         );
         let out = runner.run_unit(&unit("run-S", 3, Some("wicked-garden-search")));
         assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
@@ -8507,10 +8707,11 @@ transport = "stdio"
         );
         assert_eq!(
             ledger_entries(&ledger).len(),
-            6,
+            9,
             "the refusal never reached the bridge"
         );
         runner.on_run_complete("run-I");
+        runner.on_run_complete("run-N");
         runner.on_run_complete("run-S");
         let _ = std::fs::remove_dir_all(&home);
     }
