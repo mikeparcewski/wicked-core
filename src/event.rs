@@ -109,6 +109,13 @@ pub enum CoreEvent {
         seated: Option<u32>,
         dissent: Option<u32>,
         degraded_reason: Option<String>,
+        /// WHY the candidate seats were narrowed BEFORE the council voted (core#401): the unit's
+        /// `skill_ref` (or a transitive mandate) is `portable: false` in the handed skills
+        /// snapshot — or the root is the Claude-only live-cache fallback — so only a claude seat
+        /// could be handed it, and the council chose among those. `None` (wire `null`) when every
+        /// roster seat was a candidate. Additive: `routing_method` and its fields read exactly as
+        /// before; a one-candidate narrowing is the truthful 1-of-1 `council` verdict.
+        seat_constraint: Option<String>,
     },
     /// The council was convened to pick a CLI for a unit (distribution vote started).
     CouncilConvened {
@@ -836,6 +843,7 @@ impl CoreEvent {
                 seated,
                 dissent,
                 degraded_reason,
+                seat_constraint,
             } => {
                 json!({
                     "type": "unitDistributed",
@@ -848,6 +856,10 @@ impl CoreEvent {
                     "seated": seated,
                     "dissent": dissent,
                     "degradedReason": degraded_reason,
+                    // Emitted unconditionally (null when unconstrained), like `degradedReason`: a
+                    // consumer never has to guess whether absence means "no constraint" or "field
+                    // not sent" (core#401).
+                    "seatConstraint": seat_constraint,
                 })
             }
             CoreEvent::CouncilConvened { session, ord, clis } => json!({
@@ -1540,6 +1552,45 @@ mod tests {
         assert_eq!(j["ord"], 2);
         assert_eq!(j["attempt"], 1);
         assert_eq!(j["text"], "coalesced output");
+    }
+
+    /// core#401: `unitDistributed` carries `seatConstraint` — WHY the candidate seats were narrowed
+    /// before the council voted — as an ADDITIVE key, emitted unconditionally (`null` when every
+    /// roster seat was a candidate, the `degradedReason` rule) beside the routing fields, which
+    /// read exactly as before. Mutation: drop the key from the to_json arm and the first assertion
+    /// fails; make it skip-if-none and the second does.
+    #[test]
+    fn unit_distributed_to_json_carries_the_seat_constraint_additively() {
+        let ev = |seat_constraint: Option<&str>| CoreEvent::UnitDistributed {
+            session: "run-1".into(),
+            ord: 2,
+            cli: "claude".into(),
+            routing_method: "council".into(),
+            agreement_pct: Some(100),
+            returned: Some(1),
+            seated: Some(1),
+            dissent: Some(0),
+            degraded_reason: None,
+            seat_constraint: seat_constraint.map(str::to_string),
+        };
+        let j = ev(Some(
+            "the skills snapshot marks wicked-garden-repo-learn as portable: false",
+        ))
+        .to_json();
+        assert_eq!(j["type"], "unitDistributed");
+        assert_eq!(j["cli"], "claude");
+        assert_eq!(j["routingMethod"], "council");
+        assert_eq!(j["agreementPct"], 100);
+        assert_eq!(
+            j["seatConstraint"],
+            "the skills snapshot marks wicked-garden-repo-learn as portable: false"
+        );
+        let j = ev(None).to_json();
+        assert!(
+            j.as_object().unwrap().contains_key("seatConstraint"),
+            "emitted unconditionally: {j}"
+        );
+        assert!(j["seatConstraint"].is_null(), "{j}");
     }
 
     /// FINDING-012: the `cliUsage` wire frame must expose the cache breakdown, so the studio Burn

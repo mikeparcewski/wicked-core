@@ -1270,6 +1270,19 @@ pub(crate) enum SkillsError {
         carrier: String,
         skills: Vec<String>,
     },
+    /// The roster holds NO seat that can be handed what a unit invokes (core#401): a unit whose
+    /// skill is `portable: false` in the handed snapshot — or whose root is the Claude-only
+    /// live-cache fallback — needs a `required_seat` (today: claude), and the roster has none.
+    /// Refused at DISTRIBUTION, before the first unit does any work, naming the skills, why they
+    /// need that seat kind and the roster that lacks it — never a council pick the ladder then
+    /// refuses by name mid-run, with an escalation gate that cannot retarget the seat.
+    NoEligibleSeat {
+        ord: u32,
+        skills: Vec<String>,
+        required_seat: &'static str,
+        roster: Vec<String>,
+        why: String,
+    },
 }
 
 impl std::fmt::Display for SkillsError {
@@ -1418,6 +1431,21 @@ impl std::fmt::Display for SkillsError {
                  this run requires skills: {}; repair the installation named in the reason, or \
                  publish a snapshot",
                 missing.join(", ")
+            ),
+            SkillsError::NoEligibleSeat {
+                ord,
+                skills,
+                required_seat,
+                roster,
+                why,
+            } => write!(
+                f,
+                "unit {ord} requires {}, which only a {required_seat} seat can be handed ({why}), \
+                 and the roster [{}] holds no {required_seat} seat; add a {required_seat} seat to \
+                 the roster, or publish the skill as portable / drop the unit's skill_ref — refused \
+                 at plan time, before any unit ran",
+                skills.join(", "),
+                roster.join(", ")
             ),
         }
     }
@@ -2910,6 +2938,118 @@ fn refuse_plan_on_failed_ladder(plan: &[&str], why: String) -> Result<(), Skills
         Ok(())
     } else {
         Err(SkillsError::FallbackFailed { why, missing })
+    }
+}
+
+// ── Seat eligibility (routing) ────────────────────────────────────────────────
+
+/// What a unit's skills require of the SEAT that runs it, decided from the handed snapshot at
+/// DISTRIBUTION (core#401) — the routing-time half of what [`admit_refs`] enforces at launch, so
+/// the council is never asked to pick among seats the ladder would then refuse by name (the live
+/// case: a `capture-learnings` unit carrying `wicked-garden-repo-learn`, `portable: false`, was
+/// council-routed to copilot, refused correctly, and the escalation gate could only re-dispatch to
+/// the same seat or cancel). Judged on the unit's OWN `skill_ref` and its transitive mandates —
+/// the `seat` half of [`RequiredRefs`], exactly the closure `admit_refs` judges for the seat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SeatRequirement {
+    /// Any roster seat: the unit names no skill, names one the root does not hold (EXISTENCE is
+    /// the launch admission's refusal, plan-wide at the first unit), or every skill it invokes is
+    /// `portable: true` in a PUBLISHED snapshot. Nothing here narrows a lever-less seat (codex, a
+    /// bridge that forwards no flags): a portable skill on such a seat is still refused by name at
+    /// launch, exactly as today — this decides portability, not delivery.
+    Any,
+    /// Only a Claude seat can be handed what the unit invokes (design v3.2 §3, both carriers).
+    /// `skills` are the ones that need it; `why` is the wire account
+    /// ([`CoreEvent::UnitDistributed`]`.seat_constraint`) and the refusal's reason when no such
+    /// seat is on the roster ([`SkillsError::NoEligibleSeat`]).
+    ClaudeOnly { skills: Vec<String>, why: String },
+}
+
+/// The seat kind a non-portable requirement admits — the only CLI whose delivery loads a
+/// `portable: false` skill (the plugin loader, on both carriers).
+pub(crate) const NONPORTABLE_SEAT: &str = "claude";
+
+/// The [`SeatRequirement`] of a unit whose `skill_ref` is `skill_ref`, against `snapshot`.
+///
+/// - A published snapshot: the closure over `mandates` is taken exactly as [`admit_refs`] takes
+///   it for the seat; any `portable: false` entry in it makes the unit Claude-only, named.
+/// - The live-cache FALLBACK is Claude-only for ANY skill it holds (codex round 7 on #396: its
+///   `portable` flags are a text approximation nobody published, so `admit_refs` refuses every
+///   non-Claude seat with [`SkillsError::FallbackClaudeOnly`]) — the routing says the same thing
+///   before the council does, rather than after the ladder has.
+/// - Refs the root does not hold are not judged here: with no entry there is no portability to
+///   read, and the launch admission refuses the run by name at its first unit.
+pub(crate) fn seat_requirement(
+    snapshot: &SkillsSnapshot,
+    skill_ref: Option<&str>,
+) -> SeatRequirement {
+    let Some(skill_ref) = skill_ref.filter(|r| !r.is_empty()) else {
+        return SeatRequirement::Any;
+    };
+    let invoked = snapshot.closure([skill_ref]);
+    if invoked.required.is_empty() {
+        return SeatRequirement::Any;
+    }
+    if snapshot.source == SnapshotSource::LiveCache {
+        let skills: Vec<String> = invoked.required.iter().map(|e| e.name.clone()).collect();
+        return SeatRequirement::ClaudeOnly {
+            why: format!(
+                "the {} at {} is this run's skills root ({SKILLS_SNAPSHOT_ENV} is unset) and \
+                 carries no publish-time portability verdict, so it is Claude-only: {}",
+                SnapshotSource::LiveCache,
+                snapshot.root.display(),
+                skills.join(", ")
+            ),
+            skills,
+        };
+    }
+    let nonportable: Vec<String> = invoked
+        .required
+        .iter()
+        .filter(|e| !e.portable)
+        .map(|e| e.name.clone())
+        .collect();
+    if nonportable.is_empty() {
+        return SeatRequirement::Any;
+    }
+    SeatRequirement::ClaudeOnly {
+        why: format!(
+            "the skills snapshot at {} ({}) marks {} as portable: false (Claude-only — they lean \
+             on ${{CLAUDE_PLUGIN_ROOT}}, cwd-relative scripts or ../ links no mirror carries)",
+            snapshot.root.display(),
+            snapshot.gen_label(),
+            nonportable.join(", ")
+        ),
+        skills: nonportable,
+    }
+}
+
+/// The skills root DISTRIBUTION judges seat eligibility against (core#401): the ladder's root
+/// when it has one. `None` — the council picks among the whole roster, unconstrained — when the
+/// ladder is absent, failed or misconfigured: no seat can be handed anything then, and the launch
+/// admission refuses a skill-naming run at its FIRST unit, before work, exactly as today. The
+/// routing anticipates the ladder; it never replaces it, and it decides nothing the ladder would
+/// not. The ladder logs its own step; a config error is logged here too, since the refusal it
+/// produces belongs to the launch, not to this call.
+pub(crate) fn routing_snapshot() -> Option<SkillsSnapshot> {
+    routing_root(resolve_ladder(), &mut |line| eprintln!("{line}"))
+}
+
+/// [`routing_snapshot`] on an already-resolved ladder, with its log sink explicit.
+pub(crate) fn routing_root(
+    ladder: Result<Ladder, SkillsError>,
+    log: &mut dyn FnMut(String),
+) -> Option<SkillsSnapshot> {
+    match ladder {
+        Ok(Ladder::Root(s)) => Some(s),
+        Ok(Ladder::Absent | Ladder::Failed(_)) => None,
+        Err(e) => {
+            log(format!(
+                "[wicked-core] skills.routing the skills root could not be resolved for seat \
+                 selection ({e}); seats are unconstrained and the launch admission decides"
+            ));
+            None
+        }
     }
 }
 
@@ -6160,5 +6300,164 @@ mod tests {
         .unwrap();
         assert_eq!(live.state_home, None);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── Seat eligibility (routing, core#401) ─────────────────────────────────────────────────
+
+    /// The routing-time judgement reads portability through the SAME closure the launch admission
+    /// judges for the seat: a portable skill that MANDATES a non-portable one makes the unit
+    /// Claude-only, naming the mandated skill (the one that needs the seat), not the portable
+    /// parent; a portable skill with portable mandates is unconstrained; no ref, an empty ref and
+    /// a ref the root does not hold are unconstrained (existence is the launch admission's
+    /// refusal, by name, at the first unit). The live-cache fallback is Claude-only for ANY skill
+    /// it holds, portable by the text approximation or not — nobody published a verdict.
+    #[test]
+    fn seat_requirement_follows_mandates_reads_only_a_published_verdict_and_skips_unknown_refs() {
+        let base = scratch("seat-req");
+        let root = snapshot_root_with(
+            &gen_dir(&base, "9"),
+            "9",
+            &[
+                ("a", "wicked-garden-a", true, &["wicked-garden-b"]),
+                ("b", "wicked-garden-b", false, &[]),
+                ("c", "wicked-garden-c", true, &["wicked-garden-d"]),
+                ("d", "wicked-garden-d", true, &[]),
+            ],
+        );
+        let s = load(&root);
+        assert_eq!(seat_requirement(&s, None), SeatRequirement::Any);
+        assert_eq!(seat_requirement(&s, Some("")), SeatRequirement::Any);
+        assert_eq!(
+            seat_requirement(&s, Some("wicked-garden-c")),
+            SeatRequirement::Any,
+            "portable through portable mandates"
+        );
+        assert_eq!(
+            seat_requirement(&s, Some("wicked-garden-nope")),
+            SeatRequirement::Any,
+            "an unknown ref has no portability to read — existence refuses it at launch"
+        );
+        let SeatRequirement::ClaudeOnly { skills, why } =
+            seat_requirement(&s, Some("wicked-garden-a"))
+        else {
+            panic!("a mandates the non-portable b");
+        };
+        assert_eq!(skills, vec!["wicked-garden-b".to_string()]);
+        assert!(
+            why.contains("wicked-garden-b")
+                && !why.contains("wicked-garden-a")
+                && why.contains("portable: false")
+                && why.contains("gen=9")
+                && why.contains(&root.display().to_string()),
+            "{why}"
+        );
+        assert!(matches!(
+            seat_requirement(&s, Some("wicked-garden-b")),
+            SeatRequirement::ClaudeOnly { ref skills, .. } if skills == &["wicked-garden-b".to_string()]
+        ));
+
+        let live = load_live(
+            live_root(&base.join("live"), "1.0.0", &[("d", "wicked-garden-d")]),
+            SnapshotSource::LiveCache,
+        )
+        .unwrap();
+        assert!(live.skill("wicked-garden-d").unwrap().portable);
+        let SeatRequirement::ClaudeOnly { skills, why } =
+            seat_requirement(&live, Some("wicked-garden-d"))
+        else {
+            panic!("the fallback is Claude-only");
+        };
+        assert_eq!(skills, vec!["wicked-garden-d".to_string()]);
+        assert!(
+            why.contains("live plugin cache")
+                && why.contains("no publish-time portability verdict")
+                && why.contains("wicked-garden-d"),
+            "{why}"
+        );
+        assert_eq!(
+            seat_requirement(&live, Some("wicked-garden-nope")),
+            SeatRequirement::Any,
+            "unknown under the fallback too: existence refuses it at launch"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// What distribution judges against: the ladder's root when it has one; nothing — no
+    /// constraint, no refusal of its own — when the ladder is absent or failed (silently: the
+    /// ladder logged its own step) or misconfigured (logged here, since the refusal it produces is
+    /// the launch's). The routing anticipates the ladder and never decides what it would not.
+    #[test]
+    fn routing_root_takes_only_a_resolved_root_and_logs_a_config_error() {
+        let base = scratch("routing-root");
+        let s = load(&snapshot_root(
+            &gen_dir(&base, "3"),
+            "3",
+            &[("core", "wicked-garden-core")],
+        ));
+        let mut lines = Vec::new();
+        assert_eq!(
+            routing_root(Ok(Ladder::Root(s.clone())), &mut collect(&mut lines)),
+            Some(s)
+        );
+        assert_eq!(
+            routing_root(Ok(Ladder::Absent), &mut collect(&mut lines)),
+            None
+        );
+        assert_eq!(
+            routing_root(
+                Ok(Ladder::Failed("cache unreadable".into())),
+                &mut collect(&mut lines)
+            ),
+            None
+        );
+        assert!(
+            lines.is_empty(),
+            "absence and failure were logged by the ladder: {lines:?}"
+        );
+        let err = SkillsError::Config {
+            var: SKILLS_SNAPSHOT_ENV,
+            path: base.join("nowhere"),
+            why: "not a snapshot".into(),
+        };
+        assert_eq!(
+            routing_root(Err(err.clone()), &mut collect(&mut lines)),
+            None
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("skills.routing")
+                && lines[0].contains(&err.to_string())
+                && lines[0].contains("launch admission decides"),
+            "{}",
+            lines[0]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The plan-time refusal names everything the operator needs to act: the unit, the skills,
+    /// the seat kind only they can run on, WHY (portability, from the snapshot), and the roster
+    /// that lacks it — and says it happened before any unit ran.
+    #[test]
+    fn no_eligible_seat_names_unit_skills_seat_kind_reason_and_roster() {
+        let text = SkillsError::NoEligibleSeat {
+            ord: 1,
+            skills: vec!["wicked-garden-repo-learn".into()],
+            required_seat: NONPORTABLE_SEAT,
+            roster: vec!["copilot".into(), "pi".into()],
+            why: "the skills snapshot at /s (gen=7) marks wicked-garden-repo-learn as portable: \
+                  false"
+                .into(),
+        }
+        .to_string();
+        for needle in [
+            "unit 1 requires wicked-garden-repo-learn",
+            "only a claude seat can be handed",
+            "portable: false",
+            "roster [copilot, pi] holds no claude seat",
+            "add a claude seat to the roster",
+            "refused at plan time, before any unit ran",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
     }
 }

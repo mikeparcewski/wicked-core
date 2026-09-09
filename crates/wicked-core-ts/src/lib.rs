@@ -2062,6 +2062,7 @@ mod tests {
                 seated: None,
                 dissent: None,
                 degraded_reason: None,
+                seat_constraint: None,
             },
             "unitDistributed",
             &[
@@ -2078,6 +2079,10 @@ mod tests {
                 "seated",
                 "dissent",
                 "degradedReason",
+                // WHY the candidate seats were narrowed before the council voted (core#401) —
+                // the unit's skill is Claude-only in the handed snapshot. Additive; emitted
+                // unconditionally (null when unconstrained), the `degradedReason` rule.
+                "seatConstraint",
             ],
         );
         check(

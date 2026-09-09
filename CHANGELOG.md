@@ -15,6 +15,20 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Seat selection honours skill portability (#401)** — distribution narrows a unit's candidate
+  seats to what its skills admit BEFORE the council votes: a unit whose `skill_ref` (or a
+  transitive mandate) is `portable: false` in the handed snapshot — or whose root is the
+  Claude-only live-cache fallback — is seated only on a claude seat (both carriers; one candidate
+  takes the truthful 1-of-1 path, no ballot), and evaluator ≠ creator never moves such a unit
+  onto a seat that cannot take it. A roster with NO eligible seat is refused at plan time, before
+  the first unit does any work (`SkillsError::NoEligibleSeat`, naming the skill, its portability,
+  the seat kind required and the roster) — never a council pick the ladder then refuses by name
+  mid-run. `UnitDistributed` gains an additive `seatConstraint` (`null` when unconstrained;
+  `routingMethod` and its fields read as before), mirrored in `wicked-core-ts`'s `CoreEventJson`
+  doc. Portable skills, skill-free units, tool units and a run with no resolvable root route
+  exactly as before (the launch admission stays the enforcer). Live evidence (2026-09-09): a
+  `capture-learnings` run carrying `wicked-garden-repo-learn` (`portable: false`) was routed
+  unit 1 → copilot, refused correctly, escalated, and could only be cancelled.
 - **Skills snapshot on both worker paths (#396)** — the engine consumes one skills input,
   `WICKED_SKILLS_SNAPSHOT` (the ABSOLUTE path of a crew-published, immutable garden-shaped plugin
   root; pinned to its canonical real path — relative paths and symlinks at ANY component, the last

@@ -1,7 +1,10 @@
 //! DISTRIBUTE — convene `wicked_council` IN-PROCESS to pick the CLI assigned to each unit.
-//! Ported into COE from the retired wicked-agent. Each unit: convene the council over the roster,
-//! read the verdict; the winner names the seat, else gracefully degrade to the first seat
-//! (distribution ALWAYS yields an assignment — never fails a unit).
+//! Ported into COE from the retired wicked-agent. Each unit: convene the council over the seats
+//! its skills admit ([`seat_candidates`], core#401 — the whole roster unless the unit invokes a
+//! skill only a claude seat can be handed), read the verdict; the winner names the seat, else
+//! gracefully degrade to the first candidate. Distribution ALWAYS yields an assignment for a unit
+//! it seats; the ONE thing it refuses — at plan time, before any unit runs — is a roster with no
+//! eligible seat for a unit's skills ([`crate::skills_snapshot::SkillsError::NoEligibleSeat`]).
 
 use std::sync::Arc;
 
@@ -14,6 +17,7 @@ use wicked_council::{
 
 use crate::domain::{RoutingInfo, WorkUnit};
 use crate::event::CoreEvent;
+use crate::skills_snapshot::{SeatRequirement, SkillsError, SkillsSnapshot, NONPORTABLE_SEAT};
 
 /// The production dispatcher — spawns real CLI subprocesses to collect council votes. Injected so
 /// tests can substitute a deterministic stub (no subprocess, no flaky dispatch).
@@ -123,6 +127,10 @@ pub struct Distribution {
     pub council_task_ref: Option<String>,
     /// WHY this CLI won — the council verdict / ranking / degrade, made visible for the UI.
     pub routing: RoutingInfo,
+    /// WHY the candidate seats were narrowed before the council voted (core#401) — the unit's
+    /// skills admit only a claude seat — or `None` when every roster seat was a candidate. Rides
+    /// [`CoreEvent::UnitDistributed`]`.seat_constraint`; `routing` reads exactly as before.
+    pub seat_constraint: Option<String>,
 }
 
 /// The invocation template for `key` from the launch roster (`None` if not found).
@@ -149,16 +157,64 @@ pub fn distribute_units_on(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     relay: Option<EventRelay>,
 ) -> anyhow::Result<Vec<Distribution>> {
+    // core#401: the skills root the seats are judged against. Resolved ONLY when a seated unit
+    // names a skill — a skill-free run consults no ladder and logs no fallback line, exactly as
+    // its launches would not — and never a refusal of its own: absent, failed or misconfigured,
+    // the routing is unconstrained and the launch admission decides at the first unit, as today.
+    let names_a_skill = units
+        .iter()
+        .any(|u| u.tool_cmd.is_none() && u.skill_ref.as_deref().is_some_and(|r| !r.is_empty()));
+    let snapshot = if names_a_skill {
+        crate::skills_snapshot::routing_snapshot()
+    } else {
+        None
+    };
+    distribute_units_against(
+        units,
+        clis,
+        session_id,
+        db_path,
+        dispatcher,
+        relay,
+        snapshot.as_ref(),
+    )
+}
+
+/// The candidate seats for one unit: the roster keys and records the council votes among, and
+/// WHY they were narrowed — or `None` when every roster seat is a candidate.
+type Candidates = Option<(Vec<AgenticCli>, String)>;
+
+/// [`distribute_units_on`] against an explicit skills root (`None` ⇒ no seat is constrained), so
+/// the routing is testable without the process environment — the same split the admission has
+/// (`resolve_ladder` / `resolve_ladder_in`).
+pub(crate) fn distribute_units_against(
+    units: &[WorkUnit],
+    clis: &[AgenticCli],
+    session_id: &str,
+    db_path: Option<&str>,
+    dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
+    relay: Option<EventRelay>,
+    snapshot: Option<&SkillsSnapshot>,
+) -> anyhow::Result<Vec<Distribution>> {
+    // Plan-time refusal (core#401): a unit whose skills only a claude seat can be handed, on a
+    // roster with none, is refused HERE — before any council convenes and before any unit does
+    // work — naming the skill, its portability and the seat kind required. The ladder would have
+    // refused the same unit by name at launch; by then work may have been done and the escalation
+    // gate cannot retarget a seat, so the run could only be cancelled.
+    let candidates = seat_candidates(units, clis, snapshot)?;
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     let mut dists: Vec<Distribution> = std::thread::scope(|s| {
         // Spawn all units concurrently. Scoped-thread closures borrow from the enclosing
         // scope — `std::thread::scope` guarantees all threads finish before it returns,
         // making the borrows sound without requiring `move`.
         let relay = &relay;
+        let candidates = &candidates;
+        let roster_keys = &roster_keys;
         let handles: Vec<_> = units
             .iter()
-            .map(|unit| {
-                s.spawn(|| {
+            .zip(candidates.iter())
+            .map(|(unit, candidates)| {
+                s.spawn(move || {
                     if unit.tool_cmd.is_some() {
                         Ok(Distribution {
                             assigned_cli: unit
@@ -170,17 +226,34 @@ pub fn distribute_units_on(
                             assigned_invocation: None,
                             council_task_ref: None,
                             routing: RoutingInfo::Tool,
+                            seat_constraint: None,
                         })
                     } else {
+                        // The council votes among the CANDIDATES — the whole roster, or the seats
+                        // the unit's skills admit. A single candidate takes the single-seat path
+                        // below (a truthful 1-of-1 verdict, no ballot), so a Claude-only unit on a
+                        // roster with one claude seat convenes nothing.
+                        let (unit_clis, unit_keys, constraint) = match candidates {
+                            Some((eligible, why)) => (
+                                eligible.as_slice(),
+                                eligible.iter().map(|c| c.key.clone()).collect::<Vec<_>>(),
+                                Some(why.clone()),
+                            ),
+                            None => (clis, roster_keys.clone(), None),
+                        };
                         distribute_one(
                             unit,
-                            clis,
-                            &roster_keys,
+                            unit_clis,
+                            &unit_keys,
                             session_id,
                             db_path,
                             dispatcher,
                             relay.clone(),
                         )
+                        .map(|d| Distribution {
+                            seat_constraint: constraint,
+                            ..d
+                        })
                     }
                 })
             })
@@ -204,18 +277,83 @@ pub fn distribute_units_on(
             })
             .collect::<anyhow::Result<_>>()
     })?;
-    enforce_evaluator_distinct(units, &mut dists, &roster_keys, clis);
+    enforce_evaluator_distinct(units, &mut dists, &roster_keys, clis, &candidates);
     Ok(dists)
+}
+
+/// The candidate seats of every unit (positionally aligned), narrowed by what its skills admit
+/// (core#401): a unit whose `skill_ref` — or a transitive mandate — is `portable: false` in the
+/// handed snapshot, or whose root is the Claude-only live-cache fallback, may be seated only on a
+/// claude seat ([`crate::skills_snapshot::seat_requirement`]); every other unit, and every tool
+/// unit, is unconstrained. A roster with NO eligible seat for such a unit is refused here, by
+/// name — the plan-time half of the refusal `admit_refs` would otherwise make at launch.
+fn seat_candidates(
+    units: &[WorkUnit],
+    clis: &[AgenticCli],
+    snapshot: Option<&SkillsSnapshot>,
+) -> Result<Vec<Candidates>, SkillsError> {
+    let Some(snapshot) = snapshot else {
+        return Ok(units.iter().map(|_| None).collect());
+    };
+    units
+        .iter()
+        .map(|u| {
+            if u.tool_cmd.is_some() {
+                return Ok(None);
+            }
+            match crate::skills_snapshot::seat_requirement(snapshot, u.skill_ref.as_deref()) {
+                SeatRequirement::Any => Ok(None),
+                SeatRequirement::ClaudeOnly { skills, why } => {
+                    let eligible: Vec<AgenticCli> =
+                        clis.iter().filter(|c| seat_is_claude(c)).cloned().collect();
+                    if eligible.is_empty() {
+                        return Err(SkillsError::NoEligibleSeat {
+                            ord: u.ord,
+                            skills,
+                            required_seat: NONPORTABLE_SEAT,
+                            roster: clis.iter().map(|c| c.key.clone()).collect(),
+                            why,
+                        });
+                    }
+                    Ok(Some((eligible, why)))
+                }
+            }
+        })
+        .collect()
+}
+
+/// Is this roster seat one the delivery can hand a NON-PORTABLE skill to — a claude seat, on both
+/// carriers (design v3.2 §3)? Judged off the same facts the two runners judge at launch, with the
+/// same test (`execute_wrapped::binary_is_claude`): the wrapped runner reads the invocation
+/// template's first token, the ACP runner the seat record's `binary`, and an unregistered key is
+/// its own binary on both. Where both facts are present they must AGREE — a record that says
+/// `claude` under a template that runs something else (or the reverse) is not a seat the routing
+/// can promise the ladder will admit, so it is not a candidate for a Claude-only unit; the roster
+/// is what it is, and a misdescribed seat is refused loudly at plan time rather than seated and
+/// refused mid-run.
+fn seat_is_claude(cli: &AgenticCli) -> bool {
+    let record = (!cli.binary.trim().is_empty())
+        .then(|| crate::execute_wrapped::binary_is_claude(&cli.binary));
+    let template = (!cli.headless_invocation.trim().is_empty())
+        .then(|| crate::execute_wrapped::invocation_is_claude(&cli.headless_invocation));
+    match (record, template) {
+        (Some(record), Some(template)) => record && template,
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => crate::execute_wrapped::binary_is_claude(&cli.key),
+    }
 }
 
 /// METHODOLOGY: evaluator ≠ creator. A REVIEW/TEST unit must not run on a CLI that produced the work
 /// it checks, so after distribution we reassign any review/test unit whose council-picked CLI matches
-/// a build/recon CLI to a roster seat NOT used for building (when the roster has the seats to do so).
+/// a build/recon CLI to a roster seat NOT used for building (when the roster has the seats to do so)
+/// — a seat the unit's skills ADMIT (core#401): a Claude-only review unit is never moved onto a seat
+/// the ladder would refuse it on; with no such alternative it stays where the council put it.
 fn enforce_evaluator_distinct(
     units: &[WorkUnit],
     dists: &mut [Distribution],
     roster_keys: &[String],
     clis: &[AgenticCli],
+    candidates: &[Candidates],
 ) {
     use crate::domain::StageKind;
     let builder_clis: std::collections::HashSet<String> = units
@@ -245,14 +383,21 @@ fn enforce_evaluator_distinct(
             );
         }
     }
-    for (u, d) in units.iter().zip(dists.iter_mut()) {
+    for ((u, d), candidates) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
         if u.tool_cmd.is_some() {
             continue; // Tool phases have no CLI to distinct
         }
         if matches!(u.stage, StageKind::Review | StageKind::Test)
             && builder_clis.contains(&d.assigned_cli)
         {
-            if let Some(alt) = roster_keys.iter().find(|k| !builder_clis.contains(*k)) {
+            let admits = |k: &String| match candidates {
+                Some((eligible, _)) => eligible.iter().any(|c| &c.key == k),
+                None => true,
+            };
+            if let Some(alt) = roster_keys
+                .iter()
+                .find(|k| !builder_clis.contains(*k) && admits(k))
+            {
                 let was = std::mem::replace(&mut d.assigned_cli, alt.clone());
                 d.assigned_invocation = invocation_of(clis, alt);
                 d.routing = RoutingInfo::EvaluatorDistinct {
@@ -292,6 +437,7 @@ fn distribute_one(
                 seated: Some(1),
                 dissent: 0,
             },
+            seat_constraint: None,
         });
     }
 
@@ -369,6 +515,7 @@ fn distribute_one(
         assigned_cli,
         council_task_ref: Some(task_id),
         routing,
+        seat_constraint: None,
     })
 }
 
@@ -587,6 +734,11 @@ mod tests {
                 if winner == "solo" && *agreement_pct == 100 && *returned == 1 && *seated == Some(1) && *dissent == 0),
             "single seat records a truthful 1-of-1 verdict, got {:?}",
             dists[0].routing
+        );
+        assert!(
+            dists[0].seat_constraint.is_none(),
+            "a skill-free unit is unconstrained (core#401): {:?}",
+            dists[0].seat_constraint
         );
 
         // Two seats → the council genuinely convenes (guard is scoped to len==1).
@@ -810,5 +962,419 @@ mod tests {
             "mistyped fields → zero defaults, absent seat count → unknown, got {:?}",
             events[1]
         );
+    }
+
+    // ── Seat selection honours skill portability (core#401) ────────────────────────────────
+
+    use crate::domain::StageKind;
+    use crate::skills_snapshot::test_support::{
+        gen_dir, live_root, load, scratch, snapshot_root_with,
+    };
+
+    /// A roster seat whose record AND template both run `binary` — a claude seat when `binary` is
+    /// `claude`, exactly as both runners would judge it at launch.
+    fn seat_running(key: &str, binary: &str) -> AgenticCli {
+        AgenticCli {
+            binary: binary.into(),
+            headless_invocation: format!("{binary} -p {{PROMPT}}"),
+            ..seat(key)
+        }
+    }
+
+    /// A unit at `ord` carrying `skill_ref`.
+    fn skilled(ord: u32, skill_ref: &str) -> WorkUnit {
+        let mut u = WorkUnit::pending(format!("u{ord}"), "s1", ord, format!("Unit {ord}"));
+        u.skill_ref = Some(skill_ref.to_string());
+        u
+    }
+
+    /// A published snapshot holding a non-portable `wicked-garden-repo-learn` and a portable
+    /// `wicked-garden-search` — the live shape (design v3.2 §3; 78 of garden's 142 skills are
+    /// non-portable).
+    fn published(name: &str) -> crate::skills_snapshot::SkillsSnapshot {
+        let root = snapshot_root_with(
+            &gen_dir(&scratch(name), "7"),
+            "7",
+            &[
+                ("repo-learn", "wicked-garden-repo-learn", false, &[]),
+                ("search", "wicked-garden-search", true, &[]),
+            ],
+        );
+        load(&root)
+    }
+
+    /// The `(ord, roster keys)` of every `CouncilConvened` a relay saw.
+    type Convened = Arc<std::sync::Mutex<Vec<(u32, Vec<String>)>>>;
+
+    /// The relay + the run-scoped `CouncilConvened` events it saw, so a test can prove WHICH seats
+    /// the council was convened over (the payload's `clis` is the roster it was given).
+    fn convened_seats() -> (EventRelay, Convened) {
+        let seen: Convened = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let relay: EventRelay = Arc::new(move |ev| {
+            if let CoreEvent::CouncilConvened { ord, clis, .. } = ev {
+                sink.lock().unwrap().push((ord, clis));
+            }
+        });
+        (relay, seen)
+    }
+
+    fn spy() -> (Arc<dyn Dispatcher + Send + Sync>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(SpyDispatcher {
+            calls: calls.clone(),
+        });
+        (dispatcher, calls)
+    }
+
+    /// The live defect (core#401): a `capture-learnings` unit carrying `wicked-garden-repo-learn`
+    /// (`portable: false`) was council-routed to copilot, which the ladder then refused by name.
+    /// Now the unit's candidates are the claude seats — one here, so no ballot is dispatched and
+    /// the unit lands on claude with a truthful 1-of-1 verdict and the constraint named. A unit
+    /// whose skill IS portable is routed exactly as before: the council convenes over the WHOLE
+    /// roster and no constraint is recorded. Mutation: drop the narrowing in `seat_candidates`
+    /// and the first unit is voted onto copilot (option 1) with dispatches > 0.
+    #[test]
+    fn a_nonportable_skill_ref_is_seated_on_claude_while_a_portable_one_convenes_the_whole_roster()
+    {
+        let snapshot = published("route-nonportable");
+        let roster = [
+            seat_running("copilot", "copilot"),
+            seat_running("claude", "claude"),
+            seat_running("pi", "pi"),
+        ];
+
+        // Non-portable ⇒ claude, no council over the others.
+        let (dispatcher, calls) = spy();
+        let (relay, convened) = convened_seats();
+        let dists = distribute_units_against(
+            &[skilled(1, "wicked-garden-repo-learn")],
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            Some(relay),
+            Some(&snapshot),
+        )
+        .expect("a claude seat is on the roster: no refusal");
+        assert_eq!(dists.len(), 1);
+        assert_eq!(dists[0].assigned_cli, "claude", "{:?}", dists[0].routing);
+        assert_eq!(
+            dists[0].assigned_invocation.as_deref(),
+            Some("claude -p {PROMPT}")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "one eligible seat ⇒ nothing to elect, no ballot dispatched"
+        );
+        assert!(
+            convened.lock().unwrap().is_empty(),
+            "no council convened over a single candidate"
+        );
+        assert!(
+            matches!(&dists[0].routing, RoutingInfo::Council { winner, returned: 1, seated: Some(1), .. }
+                if winner == "claude"),
+            "the routing method reads as today (a truthful 1-of-1 verdict), got {:?}",
+            dists[0].routing
+        );
+        let why = dists[0]
+            .seat_constraint
+            .as_deref()
+            .expect("the narrowing is recorded");
+        assert!(
+            why.contains("wicked-garden-repo-learn") && why.contains("portable: false"),
+            "the constraint names the skill and its portability: {why}"
+        );
+        assert!(
+            why.contains("gen=7"),
+            "…and the generation it was read from: {why}"
+        );
+
+        // Portable ⇒ unchanged: the council convenes over the whole roster, no constraint.
+        let (dispatcher, calls) = spy();
+        let (relay, convened) = convened_seats();
+        let dists = distribute_units_against(
+            &[skilled(2, "wicked-garden-search")],
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            Some(relay),
+            Some(&snapshot),
+        )
+        .expect("portable skill: routed as before");
+        assert!(
+            dists[0].seat_constraint.is_none(),
+            "{:?}",
+            dists[0].seat_constraint
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the council genuinely convened"
+        );
+        assert_eq!(
+            *convened.lock().unwrap(),
+            vec![(2, vec!["copilot".to_string(), "claude".into(), "pi".into()])],
+            "…over every roster seat"
+        );
+        assert_eq!(
+            dists[0].assigned_cli, "copilot",
+            "the spy votes option 1 of the FULL roster"
+        );
+    }
+
+    /// A Claude-less roster cannot seat a non-portable skill anywhere, so the run is refused at
+    /// DISTRIBUTION — plan-wide, before any unit ran (the skill-free first unit included), with no
+    /// council convened — naming the skill, its portability, the seat kind required and the roster
+    /// that lacks it. Before: the council seated it, the ladder refused it mid-run, and the
+    /// escalation gate could only re-dispatch to the same seat or cancel.
+    #[test]
+    fn a_claude_less_roster_is_refused_at_plan_time_naming_skill_portability_and_seat_kind() {
+        let snapshot = published("route-refuse");
+        let roster = [seat_running("copilot", "copilot"), seat_running("pi", "pi")];
+        let mut first = WorkUnit::pending("u1", "s1", 1, "Recon: read the repo");
+        first.skill_ref = None;
+        let (dispatcher, calls) = spy();
+        let err = distribute_units_against(
+            &[first, skilled(2, "wicked-garden-repo-learn")],
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect_err("no claude seat on the roster");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "refused before ANY council convened — the skill-free first unit included"
+        );
+        let refusal = err
+            .downcast_ref::<SkillsError>()
+            .unwrap_or_else(|| panic!("a skills refusal, got {err:?}"));
+        assert!(
+            matches!(refusal, SkillsError::NoEligibleSeat { ord: 2, required_seat: "claude", skills, roster, .. }
+                if skills == &["wicked-garden-repo-learn".to_string()]
+                    && roster == &["copilot".to_string(), "pi".into()]),
+            "{refusal:?}"
+        );
+        let text = err.to_string();
+        for needle in [
+            "unit 2 requires wicked-garden-repo-learn",
+            "only a claude seat can be handed",
+            "portable: false",
+            "roster [copilot, pi] holds no claude seat",
+            "before any unit ran",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in: {text}");
+        }
+    }
+
+    /// The live-cache FALLBACK (no snapshot published) is Claude-only for ANY skill it holds —
+    /// what the ladder already enforces at launch (`FallbackClaudeOnly`, #396 codex round 7) — so
+    /// the routing seats a skill-bearing unit on claude before the council can pick otherwise,
+    /// and a Claude-less roster is refused saying so.
+    #[test]
+    fn the_live_cache_fallback_seats_every_skill_bearing_unit_on_claude() {
+        let config = scratch("route-live").join("claude-config");
+        live_root(
+            &config
+                .join("plugins")
+                .join("cache")
+                .join("wicked-garden")
+                .join("wicked-garden")
+                .join("1.0.0"),
+            "1.0.0",
+            &[("search", "wicked-garden-search")],
+        );
+        let snapshot = crate::skills_snapshot::resolve_in(None, Some(config), None, &mut |_| {})
+            .unwrap()
+            .expect("the live cache is a root");
+        assert_eq!(
+            snapshot.source,
+            crate::skills_snapshot::SnapshotSource::LiveCache
+        );
+        // The same skill is PORTABLE by the text approximation — irrelevant: nobody published it.
+        assert!(snapshot.skill("wicked-garden-search").unwrap().portable);
+
+        let (dispatcher, calls) = spy();
+        let dists = distribute_units_against(
+            &[skilled(1, "wicked-garden-search")],
+            &[seat_running("pi", "pi"), seat_running("claude", "claude")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect("a claude seat is on the roster");
+        assert_eq!(dists[0].assigned_cli, "claude");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let why = dists[0].seat_constraint.as_deref().expect("constrained");
+        assert!(
+            why.contains("live plugin cache") && why.contains("wicked-garden-search"),
+            "{why}"
+        );
+
+        let err = distribute_units_against(
+            &[skilled(1, "wicked-garden-search")],
+            &[seat_running("pi", "pi")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect_err("Claude-less roster under the fallback");
+        assert!(
+            err.to_string().contains("live plugin cache")
+                && err.to_string().contains("holds no claude seat"),
+            "{err}"
+        );
+    }
+
+    /// No root to judge against (`None`: the ladder was absent, failed or misconfigured) ⇒ no
+    /// seat is constrained and nothing is refused here — the launch admission decides at the first
+    /// unit, exactly as before this change. A tool unit is never constrained either.
+    #[test]
+    fn without_a_root_or_for_a_tool_unit_nothing_is_constrained() {
+        let (dispatcher, _) = spy();
+        let mut tool = skilled(2, "wicked-garden-repo-learn");
+        tool.tool_cmd = Some(vec!["echo".into(), "hi".into()]);
+        let dists = distribute_units_against(
+            &[skilled(1, "wicked-garden-repo-learn"), tool],
+            &[seat_running("pi", "pi"), seat_running("claude", "claude")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            None,
+        )
+        .expect("no root ⇒ no routing-time refusal");
+        assert!(
+            dists.iter().all(|d| d.seat_constraint.is_none()),
+            "{dists:?}"
+        );
+        assert_eq!(
+            dists[0].assigned_cli, "pi",
+            "the spy's option 1 of the whole roster"
+        );
+        assert!(matches!(dists[1].routing, RoutingInfo::Tool));
+
+        // A tool unit is skipped even WITH a root that would constrain an agent unit.
+        let snapshot = published("route-tool");
+        let mut tool = skilled(1, "wicked-garden-repo-learn");
+        tool.tool_cmd = Some(vec!["echo".into()]);
+        let dists = distribute_units_against(
+            &[tool],
+            &[seat_running("pi", "pi")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect("a tool unit has no seat to constrain");
+        assert!(dists[0].seat_constraint.is_none());
+    }
+
+    /// Evaluator ≠ creator must not undo the narrowing: a Claude-only REVIEW unit whose council
+    /// pick is the builder's seat is NOT moved onto a seat that cannot take it (it stays put,
+    /// exactly as when the roster has no alternative at all), while an unconstrained review unit
+    /// is still moved off the builder as before. Mutation: drop the `admits` filter and the
+    /// constrained review unit lands on pi — the refusal this change exists to prevent.
+    #[test]
+    fn evaluator_distinct_never_moves_a_claude_only_review_unit_onto_a_seat_that_cannot_take_it() {
+        let snapshot = published("route-evaluator");
+        let roster = [seat_running("claude", "claude"), seat_running("pi", "pi")];
+        let mut build = WorkUnit::pending("u1", "s1", 1, "Build the thing");
+        build.stage = StageKind::Build;
+        let mut review_nonportable = skilled(2, "wicked-garden-repo-learn");
+        review_nonportable.stage = StageKind::Review;
+        let mut review_portable = skilled(3, "wicked-garden-search");
+        review_portable.stage = StageKind::Review;
+        let (dispatcher, _) = spy();
+        let dists = distribute_units_against(
+            &[build, review_nonportable, review_portable],
+            &roster,
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect("distributed");
+        // The spy votes option 1 everywhere: the builder is claude.
+        assert_eq!(dists[0].assigned_cli, "claude");
+        // Claude-only review: claude is the builder, pi cannot take the skill ⇒ stays on claude,
+        // routing untouched (no EvaluatorDistinct claim for a move that did not happen).
+        assert_eq!(dists[1].assigned_cli, "claude");
+        assert!(
+            matches!(dists[1].routing, RoutingInfo::Council { .. }),
+            "{:?}",
+            dists[1].routing
+        );
+        assert!(dists[1].seat_constraint.is_some());
+        // Unconstrained review: moved off the builder onto pi, as before.
+        assert_eq!(dists[2].assigned_cli, "pi");
+        assert!(
+            matches!(&dists[2].routing, RoutingInfo::EvaluatorDistinct { winner, was }
+                if winner == "pi" && was == "claude"),
+            "{:?}",
+            dists[2].routing
+        );
+        assert!(dists[2].seat_constraint.is_none());
+    }
+
+    /// The seat-kind judgement mirrors BOTH runners and is conservative where they would disagree:
+    /// the wrapped runner reads the template's first token, the ACP runner the record's `binary`
+    /// (an unregistered key is its own binary on both). A quoted path with spaces is one token.
+    #[test]
+    fn seat_is_claude_mirrors_both_runners_and_refuses_a_misdescribed_seat() {
+        assert!(seat_is_claude(&seat_running("claude", "claude")));
+        assert!(seat_is_claude(&seat_running("claude", "/opt/bin/claude")));
+        // A quoted binary path with spaces is ONE token (the launch tokenizes the same way); the
+        // stem test is the runners' (`claude.exe` is claude on the record, too).
+        assert!(seat_is_claude(&AgenticCli {
+            binary: "claude.exe".into(),
+            headless_invocation: r#""/Applications/Claude Tools/claude" -p {PROMPT}"#.into(),
+            ..seat("claude")
+        }));
+        assert!(!seat_is_claude(&seat_running("pi", "pi")));
+        assert!(!seat_is_claude(&seat_running("copilot", "copilot")));
+        // The two facts disagree ⇒ not a candidate (the launch could still refuse it).
+        assert!(!seat_is_claude(&AgenticCli {
+            binary: "claude".into(),
+            headless_invocation: "codex exec {PROMPT}".into(),
+            ..seat("claude")
+        }));
+        assert!(!seat_is_claude(&AgenticCli {
+            binary: "codex".into(),
+            headless_invocation: "claude -p {PROMPT}".into(),
+            ..seat("codex")
+        }));
+        // One fact only ⇒ that fact decides; none ⇒ the key (an unregistered key is its own binary).
+        assert!(seat_is_claude(&AgenticCli {
+            binary: String::new(),
+            headless_invocation: "claude -p {PROMPT}".into(),
+            ..seat("my-claude")
+        }));
+        assert!(seat_is_claude(&AgenticCli {
+            binary: "claude".into(),
+            headless_invocation: String::new(),
+            ..seat("my-claude")
+        }));
+        assert!(seat_is_claude(&AgenticCli {
+            binary: String::new(),
+            headless_invocation: String::new(),
+            ..seat("claude")
+        }));
+        assert!(!seat_is_claude(&AgenticCli {
+            binary: String::new(),
+            headless_invocation: String::new(),
+            ..seat("pi")
+        }));
     }
 }

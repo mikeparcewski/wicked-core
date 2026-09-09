@@ -217,6 +217,16 @@ pub(crate) fn binary_is_claude(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// [`binary_is_claude`] on an invocation TEMPLATE's first token — the judgement the wrapped runner
+/// makes at launch (`exec`, before argv exists), exposed so seat selection can make the same one
+/// over the roster before the council votes (core#401). Quote-aware like the launch itself
+/// (`tokenize`): a quoted binary path with spaces is one token.
+pub(crate) fn invocation_is_claude(invocation: &str) -> bool {
+    tokenize(invocation)
+        .first()
+        .is_some_and(|bin| binary_is_claude(bin))
+}
+
 /// Set to any value to let workers run under the operator's own CLI configuration again.
 ///
 /// The escape hatch for the one legitimate case: an operator deliberately testing their own hooks

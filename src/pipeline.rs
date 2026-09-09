@@ -642,6 +642,7 @@ pub(crate) fn apply_distributions(
             seated,
             dissent,
             degraded_reason,
+            seat_constraint: dist.seat_constraint.clone(),
         });
     }
     pre.session.status = SessionStatus::Executing;
