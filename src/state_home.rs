@@ -46,11 +46,30 @@
 //! The only non-denied path under the state home is the HANDED `skills/snapshots/<gen>/` — and
 //! only that one (design v3.3 §1; codex round 4). `skills/snapshots/` is the ONE directory listed
 //! at launch to BUILD rules: one deny per sibling entry — every older and newer generation, every
-//! staging and temp dir mid-publish — in addition to the static registry rules, and it fails
+//! staging and temp entry mid-publish — in addition to the static registry rules, and it fails
 //! closed: an unlistable slot refuses the launch, and so does an entry that is neither a
 //! generation directory nor a recognised staging name. A worker handed generation 7 cannot read
 //! generation 6 (nor the skills a later publish disabled) — round 3 left every sibling readable,
 //! which exceeded the single-generation exception v3.1 grants.
+//!
+//! # Every name the store can create under `skills/` is registered, with its kind (v3.5 §2)
+//!
+//! A launch admitted WHILE a crew mutation is parked sees the store's transient names — a
+//! `.staging-*` park-and-place directory at the skills root, a `manifest.json.tmp-*` commit
+//! file, a `snapshots/.staging-*` generation being written, a `snapshots/.tmp-current-*` link
+//! before its rename — beside the settled ones (`baseline/`, `effective/`, `manifest.json`,
+//! `current`, `.uv-cache/`, `refused/`, the read slot). The registry lists EVERY one of them
+//! (`denied_children`; a trailing `*` is a prefix pattern), and `denied_children_kinds` declares
+//! each name's on-disk kind (`dir` / `file` / `link`) and whether it is transient — crew's
+//! `src/skills/root-names.ts` is the source of truth, its tests assert equality with the fixture,
+//! and core mirrors the fixture byte-for-byte. The launch-time listing of the skills root and of
+//! the read slot classifies each child by NAME (pattern) and by KIND (`lstat`): a name no pattern
+//! covers refuses the launch (a transient name missing from the registry would be a live race
+//! between a publish and a launch — codex round 9), and so does a kind that disagrees with the
+//! declaration (a `current` that is a directory, a `.staging-*` that is a file, a
+//! `.tmp-current-*` that is not a link). A recognised transient present at launch is admitted
+//! and denied like everything else under the skills root: the static pattern rule covers it, and
+//! a read-slot sibling gets its own rule pair.
 //!
 //! Residuals, stated: a top-level entry created WHILE a session runs is fenced at the next launch
 //! (crew is the only writer of that directory, and the listing refuses it then); a generation
@@ -66,10 +85,6 @@ use serde_json::Value;
 /// (`execute_wrapped::DENIED_HOME_SUBDIRS` lists it), and the state home in play only when the
 /// handed snapshot's derived state home is that very directory.
 pub(crate) const DEFAULT_STATE_HOME_DIRNAME: &str = ".wicked-crew";
-
-/// The one child of the skills root that IS a link by design: crew's `current -> snapshots/<gen>`
-/// pointer. Every other child must be a real entry (codex round 8).
-pub(crate) const CURRENT_LINK_NAME: &str = "current";
 
 /// The OPERATIONAL state home of the engine's own database (codex round 8; design v3.4 §2 stands —
 /// no new environment input): crew's `stateHomeOfDb` is `dirname(resolve(dbPath))`, the `--db`
@@ -112,6 +127,44 @@ pub(crate) enum Claim {
     Prefix(String),
 }
 
+/// The on-disk kind the registry declares for a denied child of the skills root (v3.5 §2),
+/// judged by `lstat`: a `link` IS a symlink (crew's `current` pointer, a `snapshots/
+/// .tmp-current-*` link before its rename); a `dir` or `file` is never one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildKind {
+    Dir,
+    File,
+    Link,
+}
+
+impl ChildKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dir" => Some(Self::Dir),
+            "file" => Some(Self::File),
+            "link" => Some(Self::Link),
+            _ => None,
+        }
+    }
+
+    fn spelled(self) -> &'static str {
+        match self {
+            Self::Dir => "dir",
+            Self::File => "file",
+            Self::Link => "link",
+        }
+    }
+}
+
+/// What the registry declares about one denied child: its kind, and whether the name is a
+/// TRANSIENT one a parked crew mutation leaves behind (`.staging-*`, `manifest.json.tmp-*`,
+/// `snapshots/.staging-*`, `snapshots/.tmp-current-*`) rather than a settled store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildSpec {
+    pub kind: ChildKind,
+    pub transient: bool,
+}
+
 /// One registered top-level entry of the state home.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Entry {
@@ -120,9 +173,13 @@ pub(crate) struct Entry {
     pub kind: String,
     /// The skills root only: the child directory whose generations are the read slot
     /// (`snapshots`), and the children denied beneath the entry. A child spelled with a `/` is a
-    /// PATTERN rule below the slot (`snapshots/.staging-*`), not a classified name.
+    /// PATTERN below the slot (`snapshots/.staging-*`); a trailing `*` matches any suffix, at the
+    /// root (`.staging-*`, `manifest.json.tmp-*`) as below the slot.
     pub read_slot: Option<String>,
     pub denied_children: Vec<String>,
+    /// Every denied child's declared kind and transience (v3.5 §2) — keyed by the child's exact
+    /// spelling in `denied_children`; the parser requires the two to cover each other exactly.
+    pub denied_children_kinds: std::collections::BTreeMap<String, ChildSpec>,
 }
 
 impl Entry {
@@ -238,10 +295,70 @@ pub(crate) fn parse_registry(json: &str) -> Result<Registry, String> {
                     .split('/')
                     .any(|c| c.is_empty() || c == "." || c == "..")
                 || child.contains('\\')
+                || child
+                    .strip_suffix('*')
+                    .is_some_and(|stem| stem.contains('*'))
             {
                 return Err(format!(
-                    "entries[{i}] denied child `{child}` is not a clean relative `/`-path"
+                    "entries[{i}] denied child `{child}` is not a clean relative `/`-path (with at \
+                     most one trailing `*`)"
                 ));
+            }
+        }
+        // v3.5 §2: every denied child declares its on-disk kind and transience, and the kinds
+        // block names nothing else — a name added to one list and not the other is a parse
+        // error, never a child the launch-time listing cannot classify.
+        let mut denied_children_kinds = std::collections::BTreeMap::new();
+        match e.get("denied_children_kinds") {
+            None if denied_children.is_empty() => {}
+            None => {
+                return Err(format!(
+                    "entries[{i}] lists `denied_children` without `denied_children_kinds` (v3.5 \
+                     §2: every denied child declares its kind)"
+                ))
+            }
+            Some(Value::Object(kinds)) => {
+                for (child, spec) in kinds {
+                    if !denied_children.iter().any(|c| c == child) {
+                        return Err(format!(
+                            "entries[{i}] denied_children_kinds names `{child}`, which is not a \
+                             denied child"
+                        ));
+                    }
+                    let kind = spec
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(ChildKind::parse)
+                        .ok_or_else(|| {
+                            format!(
+                                "entries[{i}] denied_children_kinds[`{child}`] has no `kind` of \
+                                 dir/file/link"
+                            )
+                        })?;
+                    let transient =
+                        spec.get("transient")
+                            .and_then(Value::as_bool)
+                            .ok_or_else(|| {
+                                format!(
+                                    "entries[{i}] denied_children_kinds[`{child}`] has no boolean \
+                                 `transient`"
+                                )
+                            })?;
+                    denied_children_kinds.insert(child.clone(), ChildSpec { kind, transient });
+                }
+                for child in &denied_children {
+                    if !denied_children_kinds.contains_key(child) {
+                        return Err(format!(
+                            "entries[{i}] denied child `{child}` has no entry in \
+                             `denied_children_kinds`"
+                        ));
+                    }
+                }
+            }
+            Some(_) => {
+                return Err(format!(
+                    "entries[{i}] `denied_children_kinds` is not an object"
+                ))
             }
         }
         entries.push(Entry {
@@ -249,6 +366,7 @@ pub(crate) fn parse_registry(json: &str) -> Result<Registry, String> {
             kind,
             read_slot,
             denied_children,
+            denied_children_kinds,
         });
     }
     if slots > 1 {
@@ -402,24 +520,18 @@ pub(crate) fn read_rules_around_snapshot(
         };
         check_entry_kind(state_home, &name, entry)?;
     }
-    // (b) Every child of the skills root must be a denied child or the read slot itself — and
-    // (codex round 8) none of them may be a SYMLINK except `current` (crew's own pointer, a link
-    // by design): a linked `baseline` would be walked through by a worker whose `.venv` resolves
-    // into it, a linked read slot would list another tree's generations. The read slot must be a
-    // real directory.
+    // (b) Every child of the skills root must be the read slot itself or a denied child — by
+    // NAME (an exact name, or a registered `<stem>*` pattern: `.staging-*`, `manifest.json.tmp-*`)
+    // AND by KIND (v3.5 §2; codex rounds 8 and 9): `lstat` must agree with the registry's
+    // declaration. `current` is the one child declared a `link` (crew's pointer), so any other
+    // symlink refuses — a linked `baseline` would be walked through by a worker whose `.venv`
+    // resolves into it — and a `current` that is a directory refuses too. The read slot must be a
+    // real directory (a linked one would list another tree's generations). A recognised TRANSIENT
+    // name present at launch — a parked crew mutation — is admitted and denied by its pattern.
     let skills_dir = state_home.join(skills_name);
     if std::fs::symlink_metadata(&skills_dir).is_ok() {
-        let known: Vec<&str> = skills
-            .denied_children
-            .iter()
-            .map(String::as_str)
-            .filter(|c| !c.contains('/'))
-            .chain(std::iter::once(slot))
-            .collect();
+        let root_children = root_patterns(skills);
         for name in list_names(&skills_dir)? {
-            if !known.iter().any(|k| *k == name) {
-                return Err(unclassified(&skills_dir, &name));
-            }
             let child = skills_dir.join(&name);
             let meta = std::fs::symlink_metadata(&child).map_err(|e| {
                 format!(
@@ -427,21 +539,22 @@ pub(crate) fn read_rules_around_snapshot(
                     skills_dir.display()
                 )
             })?;
-            if meta.file_type().is_symlink() && name != CURRENT_LINK_NAME {
-                return Err(format!(
-                    "`{name}` under {} is a symlink; only `{CURRENT_LINK_NAME}` may be a link in \
-                     the skills root (crew's pointer) — the worker Read fence would be walked \
-                     through, so the launch is refused rather than leaving it readable; remove it",
-                    skills_dir.display()
-                ));
+            if name == slot {
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(format!(
+                        "`{name}` under {} is {}, not a directory where the read slot is \
+                         expected; the worker Read fence cannot classify it — the launch is \
+                         refused; remove it",
+                        skills_dir.display(),
+                        actual_kind(&meta)
+                    ));
+                }
+                continue;
             }
-            if name == slot && !meta.is_dir() {
-                return Err(format!(
-                    "`{name}` under {} is not a directory where the read slot is expected; the \
-                     worker Read fence cannot classify it — the launch is refused; remove it",
-                    skills_dir.display()
-                ));
-            }
+            let Some(pattern) = root_children.iter().find(|p| p.matches(&name)) else {
+                return Err(unclassified(&skills_dir, &name));
+            };
+            check_child_kind(&skills_dir, &name, &meta, pattern)?;
         }
     }
     // (c) v3.3 §1: the read slot itself — the ONE listing that builds rules. Every entry but the
@@ -455,38 +568,21 @@ pub(crate) fn read_rules_around_snapshot(
             continue;
         }
         let path = slot_dir.join(&name);
-        if patterns.iter().any(|p| p.matches(&name)) {
-            // (codex round 7) a recognised staging/temp NAME must be a real directory too, judged
-            // by lstat — a symlink or a file of that name is refused by name rather than denied
-            // as if it were the staging directory crew writes.
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(format!(
-                        "`{name}` under {} is a symlink where a staging/temp directory is \
-                         expected; the worker Read fence cannot classify it — the launch is \
-                         refused rather than leaving it readable; remove it",
-                        slot_dir.display()
-                    ))
-                }
-                Ok(m) if m.is_dir() => {
-                    siblings.push(path);
-                    continue;
-                }
-                Ok(_) => {
-                    return Err(format!(
-                        "`{name}` under {} is not a directory where a staging/temp directory is \
-                         expected; the worker Read fence cannot classify it — the launch is \
-                         refused rather than leaving it readable; remove it",
-                        slot_dir.display()
-                    ))
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "cannot inspect `{name}` under {} to check the Read fence ({e})",
-                        slot_dir.display()
-                    ))
-                }
-            }
+        if let Some(pattern) = patterns.iter().find(|p| p.matches(&name)) {
+            // (codex round 7; v3.5 §2) a recognised staging/temp NAME must be on disk what the
+            // registry declares it — a `.staging-*` generation being written is a real directory,
+            // a `.tmp-current-*` pointer before its rename is a link — judged by lstat; anything
+            // else of that name is refused by name rather than denied as if it were what crew
+            // writes.
+            let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+                format!(
+                    "cannot inspect `{name}` under {} to check the Read fence ({e})",
+                    slot_dir.display()
+                )
+            })?;
+            check_child_kind(&slot_dir, &name, &meta, pattern)?;
+            siblings.push(path);
+            continue;
         }
         if is_generation_name(&name) {
             match std::fs::symlink_metadata(&path) {
@@ -526,7 +622,7 @@ pub(crate) fn read_rules_around_snapshot(
             slot_dir.display(),
             patterns
                 .iter()
-                .map(SlotPattern::spelled)
+                .map(ChildPattern::spelled)
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -620,15 +716,68 @@ pub(crate) fn is_generation_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// One `snapshots/<pattern>` denied child of the skills root, as the read-slot listing recognises
-/// a staging/temp entry: a trailing `*` matches any suffix (`.staging-*`, `.tmp-*`), else the exact
-/// name.
-struct SlotPattern {
-    stem: String,
-    glob: bool,
+/// A denied child's ACTUAL kind must be the registry's DECLARED kind (v3.5 §2; codex rounds 6–9),
+/// judged by `lstat` — never a following stat: `link` ⇒ a symlink, whatever it points at (the
+/// rule names the link); `dir` ⇒ a directory that is not a link; `file` ⇒ a regular file that is
+/// not a link. Fail closed, naming the entry and both kinds: the rule emitted follows the
+/// declaration, so an entry of another kind would pass admission and sit uncovered.
+fn check_child_kind(
+    dir: &Path,
+    name: &str,
+    meta: &std::fs::Metadata,
+    pattern: &ChildPattern,
+) -> Result<(), String> {
+    let ft = meta.file_type();
+    let ok = match pattern.spec.kind {
+        ChildKind::Link => ft.is_symlink(),
+        ChildKind::Dir => ft.is_dir(),
+        ChildKind::File => ft.is_file(),
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(format!(
+        "`{name}` under {} is {} where the state-home registry declares `{}` a {} \
+         (tests/fixtures/state-home-subtrees.json{}); the worker Read fence would fence the \
+         declared kind and leave the actual entry uncovered, so the launch is refused rather than \
+         fenced wrongly — remove it, or fix what wrote it",
+        dir.display(),
+        actual_kind(meta),
+        pattern.spelled(),
+        pattern.spec.kind.spelled(),
+        if pattern.spec.transient {
+            ", a transient name of a parked crew mutation"
+        } else {
+            ""
+        }
+    ))
 }
 
-impl SlotPattern {
+/// What an `lstat` result IS, for a refusal message.
+fn actual_kind(meta: &std::fs::Metadata) -> &'static str {
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        "a symlink"
+    } else if ft.is_dir() {
+        "a directory"
+    } else if ft.is_file() {
+        "a regular file"
+    } else {
+        "neither a regular file nor a directory"
+    }
+}
+
+/// One denied child of the skills root as the launch-time listing recognises it — at the root
+/// (`baseline`, `.staging-*`, `manifest.json.tmp-*`) or below the read slot
+/// (`snapshots/.staging-*`, `snapshots/.tmp-current-*`): a trailing `*` matches any suffix, else
+/// the exact name; with the kind and transience the registry declares for it (v3.5 §2).
+struct ChildPattern {
+    stem: String,
+    glob: bool,
+    spec: ChildSpec,
+}
+
+impl ChildPattern {
     fn matches(&self, name: &str) -> bool {
         if self.glob {
             name.starts_with(self.stem.as_str())
@@ -646,25 +795,46 @@ impl SlotPattern {
     }
 }
 
-/// The read slot's staging/temp patterns from the skills entry's `denied_children`: the entries
-/// spelled `<slot>/<pattern>` with nothing deeper.
-fn slot_patterns(skills: &Entry, slot: &str) -> Vec<SlotPattern> {
+/// The skills entry's denied children at one level — the root (`below = None`: children spelled
+/// without a `/`) or the read slot (`below = Some(slot)`: children spelled `<slot>/<pattern>` with
+/// nothing deeper) — each with its declared kind (the parser guarantees every child has one).
+fn child_patterns(skills: &Entry, below: Option<&str>) -> Vec<ChildPattern> {
     skills
         .denied_children
         .iter()
-        .filter_map(|c| c.strip_prefix(slot)?.strip_prefix('/'))
-        .filter(|rest| !rest.is_empty() && !rest.contains('/'))
-        .map(|rest| match rest.strip_suffix('*') {
-            Some(stem) => SlotPattern {
-                stem: stem.to_string(),
-                glob: true,
-            },
-            None => SlotPattern {
-                stem: rest.to_string(),
-                glob: false,
-            },
+        .filter_map(|c| {
+            let rest = match below {
+                Some(slot) => c.strip_prefix(slot)?.strip_prefix('/')?,
+                None => c.as_str(),
+            };
+            if rest.is_empty() || rest.contains('/') {
+                return None;
+            }
+            let spec = skills.denied_children_kinds.get(c).cloned()?;
+            Some(match rest.strip_suffix('*') {
+                Some(stem) => ChildPattern {
+                    stem: stem.to_string(),
+                    glob: true,
+                    spec,
+                },
+                None => ChildPattern {
+                    stem: rest.to_string(),
+                    glob: false,
+                    spec,
+                },
+            })
         })
         .collect()
+}
+
+/// The skills root's own children (settled and transient), as the root listing classifies them.
+fn root_patterns(skills: &Entry) -> Vec<ChildPattern> {
+    child_patterns(skills, None)
+}
+
+/// The read slot's staging/temp patterns.
+fn slot_patterns(skills: &Entry, slot: &str) -> Vec<ChildPattern> {
+    child_patterns(skills, Some(slot))
 }
 
 /// `base` joined with a `/`-separated relative spelling, component by component (a `/` inside a
@@ -733,17 +903,61 @@ mod tests {
         assert_eq!(skills.claim, Claim::Name("skills".into()));
         assert_eq!(skills.read_slot.as_deref(), Some("snapshots"));
         assert_eq!(r.slot_shape(), Some(("skills", "snapshots")));
-        for child in [
-            "baseline",
-            "effective",
-            "manifest.json",
-            "current",
-            ".uv-cache",
-        ] {
+        // v3.5 §2: EVERY name the store can create under `skills/` — settled and transient — with
+        // its declared kind and transience (the fixture is crew's, byte for byte).
+        let expected = [
+            ("baseline", ChildKind::Dir, false),
+            ("effective", ChildKind::Dir, false),
+            ("manifest.json", ChildKind::File, false),
+            ("manifest.json.tmp-*", ChildKind::File, true),
+            ("current", ChildKind::Link, false),
+            (".uv-cache", ChildKind::Dir, false),
+            (".staging-*", ChildKind::Dir, true),
+            ("refused", ChildKind::Dir, false),
+            ("snapshots/.staging-*", ChildKind::Dir, true),
+            ("snapshots/.tmp-current-*", ChildKind::Link, true),
+        ];
+        assert_eq!(skills.denied_children.len(), expected.len());
+        for (child, kind, transient) in expected {
             assert!(
                 skills.denied_children.iter().any(|c| c == child),
                 "{child} must be a denied child of the skills root"
             );
+            assert_eq!(
+                skills.denied_children_kinds.get(child),
+                Some(&ChildSpec { kind, transient }),
+                "{child}"
+            );
+        }
+        // The root listing classifies by pattern: a transient park-and-place dir and a commit
+        // file match their `<stem>*`; a near miss, an unknown name and the read slot do not.
+        let roots = root_patterns(skills);
+        assert_eq!(
+            roots.len(),
+            8,
+            "the eight root children, none below the slot"
+        );
+        for (name, transient) in [
+            (".staging-ab12", true),
+            ("manifest.json.tmp-17", true),
+            ("manifest.json", false),
+            ("current", false),
+            ("refused", false),
+        ] {
+            let p = roots
+                .iter()
+                .find(|p| p.matches(name))
+                .unwrap_or_else(|| panic!("{name} is a registered root child"));
+            assert_eq!(p.spec.transient, transient, "{name}");
+        }
+        for not in [
+            "manifest.json.tmp",
+            "manifest.json.bak",
+            "junk",
+            "snapshots",
+            ".staging",
+        ] {
+            assert!(!roots.iter().any(|p| p.matches(not)), "{not}");
         }
         for live in [
             "audit.log",
@@ -786,12 +1000,20 @@ mod tests {
         assert_eq!(
             patterns
                 .iter()
-                .map(SlotPattern::spelled)
+                .map(ChildPattern::spelled)
                 .collect::<Vec<_>>(),
-            vec![".staging-*".to_string(), ".tmp-*".to_string()]
+            vec![".staging-*".to_string(), ".tmp-current-*".to_string()]
         );
-        assert!(patterns.iter().any(|p| p.matches(".staging-ab12")));
-        assert!(patterns.iter().any(|p| p.matches(".tmp-x")));
+        assert!(patterns
+            .iter()
+            .any(|p| p.matches(".staging-ab12") && p.spec.kind == ChildKind::Dir));
+        assert!(patterns
+            .iter()
+            .any(|p| p.matches(".tmp-current-x") && p.spec.kind == ChildKind::Link));
+        assert!(
+            !patterns.iter().any(|p| p.matches(".tmp-x")),
+            "v3.5: the pre-rename link is `.tmp-current-*`, not any `.tmp-*`"
+        );
         assert!(!patterns.iter().any(|p| p.matches("000001")));
         assert!(!patterns.iter().any(|p| p.matches("staging-x")));
         // Parse strictness.
@@ -819,6 +1041,67 @@ mod tests {
              {\"name\":\"b\",\"kind\":\"dir\",\"read_slot\":\"t\"}]}"
         )
         .is_err());
+        // v3.5 §2: the kinds block and the children must cover each other EXACTLY — a name added
+        // to one list and not the other, an unknown kind, a missing `transient`, a malformed
+        // pattern: each a parse error, never a child the launch-time listing cannot classify.
+        let with = |children: &str, kinds: &str| {
+            parse_registry(&format!(
+                "{{\"version\":1,\"entries\":[{{\"name\":\"a\",\"kind\":\"dir\",\"read_slot\":\
+                 \"s\",\"denied_children\":{children}{kinds}}}]}}"
+            ))
+        };
+        let err = with("[\"x\"]", "").expect_err("no kinds block");
+        assert!(err.contains("without `denied_children_kinds`"), "{err}");
+        let err = with(
+            "[\"x\"]",
+            ",\"denied_children_kinds\":{\"x\":{\"kind\":\"dir\",\"transient\":false},\
+             \"y\":{\"kind\":\"dir\",\"transient\":false}}",
+        )
+        .expect_err("a kind for a name that is not a child");
+        assert!(err.contains("names `y`"), "{err}");
+        let err = with(
+            "[\"x\",\"z\"]",
+            ",\"denied_children_kinds\":{\"x\":{\"kind\":\"dir\",\"transient\":false}}",
+        )
+        .expect_err("a child without a kind");
+        assert!(err.contains("`z` has no entry"), "{err}");
+        let err = with(
+            "[\"x\"]",
+            ",\"denied_children_kinds\":{\"x\":{\"kind\":\"socket\",\"transient\":false}}",
+        )
+        .expect_err("an unknown kind");
+        assert!(err.contains("no `kind` of dir/file/link"), "{err}");
+        let err = with(
+            "[\"x\"]",
+            ",\"denied_children_kinds\":{\"x\":{\"kind\":\"link\"}}",
+        )
+        .expect_err("no transient flag");
+        assert!(err.contains("no boolean `transient`"), "{err}");
+        let err = with("[\"x\"]", ",\"denied_children_kinds\":[]").expect_err("not an object");
+        assert!(err.contains("is not an object"), "{err}");
+        let err = with(
+            "[\"a*b*\"]",
+            ",\"denied_children_kinds\":{\"a*b*\":{\"kind\":\"dir\",\"transient\":true}}",
+        )
+        .expect_err("a `*` that is not the trailing one");
+        assert!(err.contains("at most one trailing `*`"), "{err}");
+        let ok = with(
+            "[\"x\",\"t-*\",\"s/.p-*\"]",
+            ",\"denied_children_kinds\":{\"x\":{\"kind\":\"file\",\"transient\":false},\
+             \"t-*\":{\"kind\":\"dir\",\"transient\":true},\
+             \"s/.p-*\":{\"kind\":\"link\",\"transient\":true}}",
+        )
+        .expect("a covering kinds block parses");
+        let e = &ok.entries[0];
+        assert_eq!(root_patterns(e).len(), 2);
+        assert_eq!(slot_patterns(e, "s").len(), 1);
+        assert_eq!(
+            e.denied_children_kinds.get("s/.p-*"),
+            Some(&ChildSpec {
+                kind: ChildKind::Link,
+                transient: true
+            })
+        );
     }
 
     /// The state home is DERIVED from the snapshot's shape — `<state home>/skills/snapshots/<gen>`
@@ -1111,23 +1394,61 @@ mod tests {
         let err = read_rules_around_snapshot(&home, "000007", &spell)
             .expect_err("a file where a staging directory is expected");
         assert!(
-            err.contains("`.staging-file`") && err.contains("not a directory"),
+            err.contains("`.staging-file`")
+                && err.contains("a regular file")
+                && err.contains("declares `.staging-*` a dir"),
             "{err}"
         );
         std::fs::remove_file(skills.join("snapshots").join(".staging-file")).unwrap();
+        // (v3.5 §2) a `.tmp-current-*` entry is the pre-rename LINK crew writes: a directory of
+        // that name is refused by name; a name that matches no pattern (`.tmp-x`, the pre-v3.5
+        // spelling) is refused as unrecognised.
+        std::fs::create_dir_all(skills.join("snapshots").join(".tmp-current-dir")).unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect_err("a directory where the pre-rename link is expected");
+        assert!(
+            err.contains("`.tmp-current-dir`")
+                && err.contains("a directory")
+                && err.contains("declares `.tmp-current-*` a link"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(skills.join("snapshots").join(".tmp-current-dir")).unwrap();
+        std::fs::create_dir_all(skills.join("snapshots").join(".tmp-x")).unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect_err("`.tmp-*` is no longer a registered pattern");
+        assert!(
+            err.contains("`.tmp-x`") && err.contains("neither a generation"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(skills.join("snapshots").join(".tmp-x")).unwrap();
         #[cfg(unix)]
         {
             let target = base.join("real-tmp");
             std::fs::create_dir_all(&target).unwrap();
-            std::os::unix::fs::symlink(&target, skills.join("snapshots").join(".tmp-link"))
+            std::os::unix::fs::symlink(&target, skills.join("snapshots").join(".staging-link"))
                 .unwrap();
             let err = read_rules_around_snapshot(&home, "000007", &spell)
                 .expect_err("a symlink where a staging directory is expected");
             assert!(
-                err.contains("`.tmp-link`") && err.contains("a symlink"),
+                err.contains("`.staging-link`") && err.contains("a symlink"),
                 "{err}"
             );
-            std::fs::remove_file(skills.join("snapshots").join(".tmp-link")).unwrap();
+            std::fs::remove_file(skills.join("snapshots").join(".staging-link")).unwrap();
+            // …while the pre-rename `.tmp-current-*` LINK is exactly what the registry declares:
+            // admitted, and denied by its own rule pair like any read-slot sibling.
+            std::os::unix::fs::symlink("000007", skills.join("snapshots").join(".tmp-current-ab"))
+                .unwrap();
+            let with_link = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect("a pre-rename current link is a registered transient");
+            assert_eq!(with_link.len(), rules.len() + 2, "{with_link:?}");
+            assert!(
+                with_link.contains(&format!(
+                    "Read({}/**)",
+                    s(&skills.join("snapshots").join(".tmp-current-ab"))
+                )),
+                "{with_link:?}"
+            );
+            std::fs::remove_file(skills.join("snapshots").join(".tmp-current-ab")).unwrap();
         }
         assert_eq!(
             read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
@@ -1145,6 +1466,131 @@ mod tests {
         assert!(same_dir(&home, &home));
         assert!(same_dir(&home, &std::fs::canonicalize(&home).unwrap()));
         assert!(!same_dir(&home, &skills));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// v3.5 §2 / codex round 9 (H1): a launch admitted WHILE a crew mutation is parked sees every
+    /// transient name the store can leave under `skills/` — a root `.staging-*` park-and-place
+    /// directory, a `manifest.json.tmp-*` commit file, a `snapshots/.staging-*` generation being
+    /// written, a `snapshots/.tmp-current-*` link before its rename — beside the settled
+    /// `refused/` sentinel. All present at once, every one is classified by name AND kind:
+    /// admitted, and denied (the static pattern rule at the root; its own rule pair in the read
+    /// slot). A kind that disagrees with the declaration refuses by name — a `current` that is a
+    /// directory, a `.staging-*` that is a file, a `manifest.json.tmp-*` that is a directory, a
+    /// `.tmp-current-*` that is a directory — and so does a non-transient unknown name, at the
+    /// root and in the slot.
+    #[test]
+    fn a_launch_admitted_while_a_crew_mutation_is_parked_classifies_every_transient_name() {
+        let base = std::env::temp_dir().join(format!(
+            "wstate-parked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let home = base.join("crew-state");
+        let skills = home.join("skills");
+        let slot = skills.join("snapshots");
+        std::fs::create_dir_all(slot.join("000007")).unwrap();
+        std::fs::create_dir_all(slot.join(".staging-2")).unwrap();
+        std::fs::create_dir_all(skills.join(".staging-x")).unwrap();
+        std::fs::write(skills.join("manifest.json.tmp-1"), "{}").unwrap();
+        std::fs::create_dir_all(skills.join("refused")).unwrap();
+        std::fs::create_dir_all(skills.join("effective")).unwrap();
+        std::fs::create_dir_all(skills.join("baseline")).unwrap();
+        std::fs::write(skills.join("manifest.json"), "{}").unwrap();
+        std::fs::write(home.join("core.db"), "db").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("snapshots/000007", skills.join("current")).unwrap();
+            std::os::unix::fs::symlink("000007", slot.join(".tmp-current-ab")).unwrap();
+        }
+        let s = |p: &Path| p.to_str().unwrap().to_string();
+        let rules = read_rules_around_snapshot(&home, "000007", &spell)
+            .expect("every transient name a parked mutation leaves is registered");
+        // The static pattern rules cover the root transients and the sentinel …
+        for rule in [
+            format!("Read({}/**)", s(&skills.join(".staging-*"))),
+            format!("Read({})", s(&skills.join("manifest.json.tmp-*"))),
+            format!("Read({}/**)", s(&skills.join("refused"))),
+            format!("Read({}/**)", s(&slot.join(".staging-*"))),
+            format!("Read({}/**)", s(&slot.join(".tmp-current-*"))),
+        ] {
+            assert!(rules.contains(&rule), "{rule} in {rules:?}");
+        }
+        // … the read-slot siblings get their own rule pair …
+        assert!(
+            rules.contains(&format!("Read({}/**)", s(&slot.join(".staging-2")))),
+            "{rules:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            rules.contains(&format!("Read({}/**)", s(&slot.join(".tmp-current-ab")))),
+            "{rules:?}"
+        );
+        // … and nothing names the handed generation.
+        assert!(!rules.iter().any(|r| r.contains("000007")), "{rules:?}");
+
+        // Kind mismatches refuse by name, naming the actual and the declared kind.
+        let kind_err = |what: &str, actual: &str| {
+            let err = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect_err("a kind mismatch refuses");
+            assert!(
+                err.contains(&format!("`{what}`"))
+                    && err.contains(actual)
+                    && err.contains("state-home registry declares")
+                    && err.contains("refused"),
+                "{what}: {err}"
+            );
+        };
+        #[cfg(unix)]
+        std::fs::remove_file(skills.join("current")).unwrap();
+        std::fs::create_dir_all(skills.join("current")).unwrap();
+        kind_err("current", "a directory");
+        std::fs::remove_dir_all(skills.join("current")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("snapshots/000007", skills.join("current")).unwrap();
+        std::fs::remove_dir_all(skills.join(".staging-x")).unwrap();
+        std::fs::write(skills.join(".staging-x"), "").unwrap();
+        kind_err(".staging-x", "a regular file");
+        std::fs::remove_file(skills.join(".staging-x")).unwrap();
+        std::fs::create_dir_all(skills.join(".staging-x")).unwrap();
+        std::fs::remove_file(skills.join("manifest.json.tmp-1")).unwrap();
+        std::fs::create_dir_all(skills.join("manifest.json.tmp-1")).unwrap();
+        kind_err("manifest.json.tmp-1", "a directory");
+        std::fs::remove_dir_all(skills.join("manifest.json.tmp-1")).unwrap();
+        std::fs::write(skills.join("manifest.json.tmp-1"), "{}").unwrap();
+        std::fs::create_dir_all(slot.join(".tmp-current-zz")).unwrap();
+        kind_err(".tmp-current-zz", "a directory");
+        std::fs::remove_dir_all(slot.join(".tmp-current-zz")).unwrap();
+
+        // A non-transient unknown name refuses by name — an unknown directory, a near miss of a
+        // pattern, and an unrecognised read-slot entry.
+        std::fs::create_dir_all(skills.join("junk")).unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell).expect_err("unknown");
+        assert!(
+            err.contains("`junk`") && err.contains("not in the state-home registry"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(skills.join("junk")).unwrap();
+        std::fs::write(skills.join("manifest.json.bak"), "").unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell).expect_err("near miss");
+        assert!(err.contains("`manifest.json.bak`"), "{err}");
+        std::fs::remove_file(skills.join("manifest.json.bak")).unwrap();
+        std::fs::create_dir_all(slot.join(".tmp-x")).unwrap();
+        let err = read_rules_around_snapshot(&home, "000007", &spell).expect_err("unrecognised");
+        assert!(
+            err.contains("`.tmp-x`") && err.contains("neither a generation"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(slot.join(".tmp-x")).unwrap();
+
+        // With the mismatches gone the classification is the same rule set as before.
+        assert_eq!(
+            read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
+            rules
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

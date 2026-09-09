@@ -231,6 +231,13 @@ pub(crate) enum SkillsLever {
     /// No per-launch lever: codex 0.153 (`-c`/`--add-dir`/profiles load no skills), any ACP bridge
     /// that is not the CLI itself, any unknown binary. No lever ⇒ no skills, never a side channel
     /// (v3.2 §3): a unit that requires a skill on such a seat is refused by name.
+    ///
+    /// Documented residual (codex round 9, ADJUDICATED; follow-up core#400): "no skills" is what
+    /// WICKED delivers — nothing. The seat still runs under the operator's own configuration
+    /// directory (`~/.codex`), which v3.2 forbids the engine to touch, so whatever the operator
+    /// installed there is theirs to see, exactly like the rest of their codex settings; isolating
+    /// that ambient discovery needs an engine-minted `CODEX_HOME` worker home (auth relocation
+    /// included), tracked in core#400.
     Absent,
 }
 
@@ -1152,11 +1159,13 @@ pub(crate) enum SkillsError {
     /// the no-root rung like an absence but is never silent: this refusal carries the reason for a
     /// run that names a skill.
     FallbackFailed { why: String, missing: Vec<String> },
-    /// A unit that invokes a skill was routed to a CARRIER that does not load the skills snapshot
+    /// A run that invokes a skill was routed to a CARRIER that does not load the skills snapshot
     /// (codex round 8; ADJUDICATED): the persistent PTY session runner opens the raw CLI with no
     /// snapshot resolution, admission, isolation or delivery lever, so a skill directive there
     /// would tell the worker to invoke a skill nothing loaded. Refused by name; no directive is
-    /// ever emitted on that carrier.
+    /// ever emitted on that carrier. PLAN-WIDE (codex round 9): every unit carries the run's
+    /// whole skill set (`StepInput::required_skills`), so the refusal lands at the run's FIRST
+    /// unit — a skill-free first unit does no work ahead of a later unit the carrier cannot serve.
     CarrierWithoutSkills {
         carrier: String,
         skills: Vec<String>,
@@ -1274,10 +1283,11 @@ impl std::fmt::Display for SkillsError {
             ),
             SkillsError::CarrierWithoutSkills { carrier, skills } => write!(
                 f,
-                "{carrier} sessions do not load the skills snapshot, but this unit requires {}; \
-                 run skill-bearing units on the wrapped or ACP carrier (which resolve, admit and \
-                 hand the snapshot) — no invocation directive is emitted on a carrier that cannot \
-                 load the skill",
+                "{carrier} sessions do not load the skills snapshot, but this run requires {} \
+                 (every skill any of its units names — the refusal is plan-wide, at the run's \
+                 first unit); run skill-bearing units on the wrapped or ACP carrier (which \
+                 resolve, admit and hand the snapshot) — no invocation directive is emitted on a \
+                 carrier that cannot load the skill",
                 skills.join(", ")
             ),
             SkillsError::NotDelivered { cli, skills } => write!(

@@ -880,9 +880,17 @@ impl Drop for AcpProcess {
         self.kill_handle.signal();
         // The owner cleans ONLY its own per-session settings directory (v3.1 §3, codex round 3):
         // the bridge read the file at start, and no other process can hold this path — its name
-        // carries this process's pid and a per-process counter. Best effort, no-follow.
+        // carries this process's pid and a per-process counter. No-follow; a failure is SAID
+        // (codex round 9), never swallowed — the directory is left behind, and nothing else can
+        // mistake it for its own.
         if let Some(dir) = &self.session_dir {
-            let _ = remove_entry_no_follow(dir);
+            if let Err(e) = remove_entry_no_follow(dir) {
+                eprintln!(
+                    "[wicked-core] acp.warn could not remove the per-session settings directory {} \
+                     ({e}); it is left behind",
+                    dir.display()
+                );
+            }
         }
     }
 }
@@ -1313,9 +1321,11 @@ fn ensure_worker_config_home(
         }
     }
     sweep_own_settings_temps(&dir)?;
-    let settings = json!({
-        "permissions": { "deny": crate::execute_wrapped::shared_deny_rules(operational_home) }
-    });
+    // (codex round 9) an unspellable fenced directory refuses the spawn — the shared file is never
+    // written with a hole in it.
+    let shared =
+        crate::execute_wrapped::shared_deny_rules(operational_home).map_err(anyhow::Error::msg)?;
+    let settings = json!({ "permissions": { "deny": shared } });
     write_atomic(&dir, &settings_path, &serde_json::to_vec(&settings)?)?;
     Ok(dir)
 }
@@ -1352,14 +1362,22 @@ fn settings_temp_pid(name: &str, file: &str) -> Option<u32> {
 
 /// Remove the `settings.json` temp files in `dir` that THIS process left behind (its pid in the
 /// name) — never another process's, whose temp is an in-flight write its rename is about to
-/// consume. A directory that cannot be listed is left alone: the settings write that follows
-/// fails loudly on its own if the directory is unusable.
+/// consume. A directory that cannot be listed, or an entry that cannot be read while listing, is
+/// an ERROR carrying the cause (codex round 9 — round 8 returned `Ok` on an unlistable directory
+/// and dropped per-entry errors): the spawn that needs this directory refuses rather than
+/// proceeding on a worker home it could not inspect. A name that is not UTF-8 is never one of ours
+/// (ours are ASCII) and is left alone.
 fn sweep_own_settings_temps(dir: &std::path::Path) -> anyhow::Result<()> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
+    let listing = |e: std::io::Error| {
+        anyhow::anyhow!(
+            "cannot list the worker home {} to sweep this process's settings temps ({e})",
+            dir.display()
+        )
     };
+    let entries = std::fs::read_dir(dir).map_err(listing)?;
     let me = std::process::id();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(listing)?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -1912,7 +1930,10 @@ fn start_acp_process_with_write_roots(
     // `_meta.claudeCode.options`, and the others ignore the extension — one code path, exercised
     // by every stub the tests drive.
     let inherit = crate::execute_wrapped::inherits_operator_config();
-    let deny: Vec<String> = crate::execute_wrapped::deny_rules(skills_plugin, operational_home);
+    // (codex round 9) a fenced directory the rule syntax cannot spell refuses the spawn — the
+    // frame is never sent with a hole in its fence.
+    let deny: Vec<String> = crate::execute_wrapped::deny_rules(skills_plugin, operational_home)
+        .map_err(anyhow::Error::msg)?;
     let session_settings: Option<std::path::PathBuf> = match (session, &worker_config_dir) {
         (Some((run_id, cli_key)), Some(home)) => {
             Some(write_session_settings(home, run_id, cli_key, &deny)?)
@@ -5494,7 +5515,10 @@ mod tests {
     /// The spawn and worker-home entry points with NO operational state home (codex round 8 —
     /// these tests fence nothing but the defaults and the handed snapshot's home); shadow the glob
     /// imports. The operational-home cases live in `execute_wrapped::tests` against the fence
-    /// builders themselves.
+    /// builders themselves. `#[cfg(unix)]`: its only callers drive shell-script stubs (Unix-only),
+    /// so on Windows it would be dead code under `-D warnings` (the round-9 windows job failed
+    /// exactly here).
+    #[cfg(unix)]
     fn start_acp_process(
         config: &AcpConfig,
         cwd: &std::path::Path,
@@ -7846,6 +7870,12 @@ cat >/dev/null
             );
         }
         sweep_own_settings_temps(&dir).expect("sweep");
+        // (codex round 9) a home that cannot be listed is an error carrying the cause, never `Ok`.
+        let err = sweep_own_settings_temps(&settings).expect_err("a file cannot be listed");
+        assert!(
+            err.to_string().contains("cannot list the worker home"),
+            "{err}"
+        );
         assert!(!ours.exists(), "our leftover is swept");
         assert!(
             theirs.exists(),
@@ -9109,7 +9139,7 @@ transport = "stdio"
         // that can drift. The state-home rule rides each session's `session/new` options.
         assert_eq!(
             deny,
-            crate::execute_wrapped::shared_deny_rules(None),
+            crate::execute_wrapped::shared_deny_rules(None).unwrap(),
             "the shared ACP settings must be the launch-independent fence, not a copy that can drift"
         );
         assert!(

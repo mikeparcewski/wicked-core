@@ -395,7 +395,7 @@ pub(crate) fn inject_isolation_flags(
     // otherwise — Claude's deny beats any allow, so the deny itself must not cover the snapshot,
     // and admission (`fence_check`) already refused a snapshot the fence would cover. ALWAYS
     // injected — hatch or not — UNIONED with whatever the template itself denied.
-    let mut rules = deny_rules(skills_plugin, operational_home);
+    let mut rules = deny_rules(skills_plugin, operational_home)?;
     for extra in lift_disallowed_tools(argv, prompt_ix) {
         if !rules.contains(&extra) {
             rules.push(extra);
@@ -613,23 +613,28 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 /// file both the wrapped and ACP paths write (the ACP bridge forwards settings but has its own flag
 /// surface, so the file is the only carrier that reaches both).
 ///
-/// Nothing is ever dropped silently. Two things can go wrong, and each degrades to the largest
-/// boundary still expressible rather than to none:
+/// Nothing is ever dropped silently, and nothing is ever dropped at all once a directory is known:
 ///
 ///  - **No home directory resolves** (HOME and USERPROFILE both unset — plausible for a daemon under
 ///    launchd/systemd). Only the PATH rules need a home; [`DENIED_BASH`] does not. Returning nothing
 ///    here would have taken `Bash(sudo:*)` and `Bash(find /:*)` down with the path rules, silently,
 ///    in exactly the unattended environment where that matters most. So the path rules are skipped
 ///    with a warning and the verb rules still ship.
-///  - **An individual directory cannot be expressed** — see [`rule_path`]. Skipped with a warning; the
-///    remaining rules still ship. Dropping the other dozen because one path is unrepresentable would
-///    trade a small hole for a total one.
+///  - **A known directory cannot be expressed** — see [`rule_path`]: a comma (the character
+///    `--disallowedTools` joins its rules on), a POSIX backslash, a non-UTF-8 component. This
+///    REFUSES the launch (`Err`, naming the directory and the character; codex round 9). Rounds 1–8
+///    logged and skipped it, reasoning that a small hole beats a total one — but on a launch with no
+///    snapshot the skipped directory can be the whole operational store, and a fence an operator
+///    reads as complete with one directory silently missing is worse than no launch. The fix is on
+///    the operator's side (rename the directory, or point the daemon at one the rule syntax can
+///    spell); the engine never runs a worker beside a protected directory it could not fence.
 ///
-/// This is documented as a deny-list rather than a sandbox (see [`inject_isolation_flags`]), so a
-/// partial list is a real if reduced boundary. What must never happen is a gap being SILENT — an
-/// operator who reads "the worker is fenced off from `~/.ssh`" needs to hear when it isn't.
+/// This is documented as a deny-list rather than a sandbox (see [`inject_isolation_flags`]). What
+/// must never happen is a gap being SILENT — an operator who reads "the worker is fenced off from
+/// `~/.ssh`" needs to hear when it isn't — and, for a directory the engine knows about, a gap at
+/// all.
 ///
-/// The return is a plain `Vec` because it can never be empty: `DENIED_BASH` is unconditional.
+/// `Ok` is never empty: `DENIED_BASH` is unconditional.
 ///
 /// The rule strings themselves are built by [`rule_path`], which is where the platform difference
 /// lives.
@@ -648,8 +653,10 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 /// STATIC rules of the state-home registry (`state_home`, embedded from
 /// `tests/fixtures/state-home-subtrees.json`, mirrored by crew): one Read rule per registered
 /// top-level entry (`core.db*`, `daemon-*`, `evals/**`, …) and one per denied child of the skills
-/// root (`baseline/**`, `effective/**`, `manifest.json`, `current`, `.uv-cache/**`,
-/// `snapshots/.staging-*/**`), so the resolved generation is the ONLY non-denied path under the
+/// root (`baseline/**`, `effective/**`, `manifest.json`, `manifest.json.tmp-*`, `current`,
+/// `.uv-cache/**`, `.staging-*/**`, `refused/**`, `snapshots/.staging-*/**`,
+/// `snapshots/.tmp-current-*/**` — v3.5 §2: every settled AND transient name crew can create
+/// there, each with its declared kind), so the resolved generation is the ONLY non-denied path under the
 /// state home. The default `~/.wicked-crew` keeps its blanket whenever it is not that launch's
 /// state home (v3.4 §2: the state home is derived from the snapshot path alone — the round-4
 /// companion variable `WICKED_CREW_STATE_HOME` is retired and not read; a custom state home is
@@ -675,7 +682,7 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 pub(crate) fn deny_rules(
     skills_root: Option<&Path>,
     operational_home: Option<&Path>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     // The state home whose fence opens around the handed snapshot: DERIVED from the root's own
     // shape (`<state home>/skills/snapshots/<gen>`, `state_home::of_snapshot`), never from a
     // directory name (codex round 3: the `.wicked-crew` basename let a custom state home's
@@ -691,12 +698,9 @@ pub(crate) fn deny_rules(
     }
     let mut rules: Vec<String> = Vec::new();
     for dir in dirs {
-        // Skip what cannot be spelled, but SAY SO — see the doc comment: the hole is acceptable,
-        // hiding it is not.
-        let Some(p) = rule_path(&dir) else {
-            unspellable(&dir);
-            continue;
-        };
+        // A directory the rule syntax cannot spell REFUSES the launch (codex round 9) — the fence
+        // is never partial; see the doc comment.
+        let p = rule_path(&dir).ok_or_else(|| unspellable(&dir))?;
         let is_state_home = state_home
             .as_deref()
             .is_some_and(|sh| crate::state_home::same_dir(&dir, sh));
@@ -750,7 +754,7 @@ pub(crate) fn deny_rules(
         }
     }
     rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
-    rules
+    Ok(rules)
 }
 
 /// The LAUNCH-INDEPENDENT part of the fence: every fenced directory EXCEPT the state-home
@@ -763,7 +767,7 @@ pub(crate) fn deny_rules(
 /// ([`state_home_candidates`]) — the only fenced directory a snapshot's derived state home can be
 /// (v3.4 §2: a custom state home is known only through the snapshot handed from it, so it never
 /// appears in the shared file either).
-pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Vec<String> {
+pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<String>, String> {
     let candidates = state_home_candidates(operational_home);
     let mut rules: Vec<String> = Vec::new();
     for dir in denied_dirs(operational_home) {
@@ -773,16 +777,14 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Vec<String> 
         {
             continue;
         }
-        let Some(p) = rule_path(&dir) else {
-            unspellable(&dir);
-            continue;
-        };
+        // Fail closed (codex round 9): the shared file is never written with a hole in it.
+        let p = rule_path(&dir).ok_or_else(|| unspellable(&dir))?;
         for tool in ["Read", "Edit", "Write"] {
             rules.push(format!("{tool}({p}/**)"));
         }
     }
     rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
-    rules
+    Ok(rules)
 }
 
 /// The admission-time fence check for a snapshot root (canonical), on both carriers, before any
@@ -884,12 +886,28 @@ fn denied_dirs(operational_home: Option<&Path>) -> Vec<PathBuf> {
     unique
 }
 
-fn unspellable(dir: &Path) {
-    eprintln!(
-        "wicked-core: worker isolation cannot express a deny rule for {} (non-UTF8, or it \
-         contains a backslash or a comma); this path is NOT fenced off from workers",
+/// The refusal for a fenced directory [`rule_path`] cannot spell (codex round 9): names the
+/// directory and the offending character, and says what to do. Never a warning-and-skip — a
+/// protected directory left readable because its name was awkward is the hole this fence exists
+/// to close.
+fn unspellable(dir: &Path) -> String {
+    let what = match dir.to_str() {
+        None => "its path is not UTF-8".to_string(),
+        Some(s) if s.contains(',') => {
+            "it contains a comma (`,`), the character `--disallowedTools` \
+                                       joins its rules on"
+                .to_string()
+        }
+        Some(_) => {
+            "it contains a backslash (`\\`), the permission-rule escape character".to_string()
+        }
+    };
+    format!(
+        "worker isolation cannot express a deny rule for {} ({what}); the fence is never partial \
+         — a protected directory that cannot be spelled refuses the launch rather than being left \
+         readable; rename the directory, or point the daemon at one the rule syntax can spell",
         dir.display()
-    );
+    )
 }
 
 /// Append claude's `--output-format stream-json --verbose` flags to an already-built argv, INSERTED
@@ -1206,6 +1224,14 @@ impl WrappedCliStepRunner {
             // `--` guard). opencode's rides the env, set on the command below. Nothing is written
             // into `~/.pi`, `~/.copilot`, `~/.config/opencode` or `~/.codex`; a seat without a
             // lever gets no flags and no skills.
+            //
+            // Documented residual (codex round 9, ADJUDICATED; follow-up core#400): codex has no
+            // lever AND no engine-minted worker home — it runs under the operator's own `~/.codex`,
+            // which v3.2 forbids touching — so "no lever ⇒ no skills" means wicked DELIVERS nothing
+            // to codex and REFUSES a skill-bearing codex unit by name (`SkillsError::NoLever`,
+            // before launch). Whatever codex discovers ambiently under the operator's `~/.codex` is
+            // the operator's configuration, not a wicked delivery; isolating that discovery needs
+            // a `CODEX_HOME` worker home (auth relocation included), tracked in core#400.
             let flags = delivery.argv_flags();
             if !flags.is_empty() {
                 apply_seat_posture(&mut argv, &flags);
@@ -2405,6 +2431,9 @@ fn arm_input_governance(
                 }
             })
         });
+    // (codex round 9) an unspellable fenced directory refuses the launch here too — the settings
+    // file is never written with a hole the argv flag also lacks.
+    let deny = deny_rules(skills_root, operational_home).map_err(std::io::Error::other)?;
     let settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [
@@ -2419,7 +2448,7 @@ fn arm_input_governance(
         // under `acceptEdits`/headless unless allow-listed — a non-interactive session can't answer the
         // approval prompt. Whole-server allow is safe because the server runs `--readonly`
         // (`repo_estate_mcp_parts` / §3.0): there is nothing destructive left to allow.
-        "permissions": { "deny": deny_rules(skills_root, operational_home), "allow": ["mcp__wicked-estate"] }
+        "permissions": { "deny": deny, "allow": ["mcp__wicked-estate"] }
     });
     let dir = decisions_path
         .parent()
@@ -3232,12 +3261,18 @@ mod tests {
     /// round-8 operational-home cases call `super::…` with a home explicitly.
     fn deny_rules(skills_root: Option<&Path>) -> Vec<String> {
         super::deny_rules(skills_root, None)
+            .unwrap_or_else(|why| panic!("every fenced directory here is spellable: {why}"))
     }
     /// `#[cfg(unix)]`: its only caller is the Unix-only fence test (a fixture of symlinks).
     #[cfg(unix)]
     fn shared_deny_rules() -> Vec<String> {
         super::shared_deny_rules(None)
+            .unwrap_or_else(|why| panic!("every fenced directory here is spellable: {why}"))
     }
+    /// `#[cfg(unix)]`: its only callers are the Unix-only fence tests (fixtures of symlinks) — on
+    /// Windows it is dead code under `-D warnings` (the round-8 windows job failed exactly here);
+    /// the round-8 operational-home cases call `super::fence_check` with a home explicitly.
+    #[cfg(unix)]
     fn fence_check(root: &Path) -> Result<(), String> {
         super::fence_check(root, None)
     }
@@ -6180,6 +6215,84 @@ mod tests {
         }
     }
 
+    /// codex round 9 (C1): a protected directory whose path the rule syntax cannot spell — a
+    /// comma (the character `--disallowedTools` joins its rules on), a POSIX backslash, a non-UTF-8
+    /// component — REFUSES the launch, naming the directory and the character. Rounds 1–8 logged
+    /// and skipped it, which on a no-snapshot launch could leave the whole operational store
+    /// readable while the rest of the list read as complete. Fail closed everywhere the fence is
+    /// built: the operational state home, the live config dir (`CLAUDE_CONFIG_DIR`), the argv
+    /// injector (nothing is injected on a refusal), the shared worker-home file — and under the
+    /// inherit hatch too: the hatch withholds the scope/mode flags, never the fence.
+    #[test]
+    fn an_unspellable_protected_directory_refuses_the_launch_even_under_the_hatch() {
+        use crate::skills_snapshot::test_support::scratch;
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_hatch = VarGuard::unset(INHERIT_OPERATOR_CONFIG_ENV);
+        let base = scratch("unspellable");
+        let comma_home = base.join("state,home");
+        std::fs::create_dir_all(&comma_home).unwrap();
+        let names = |why: &str| {
+            why.contains(&comma_home.display().to_string())
+                && why.contains("comma")
+                && why.contains("refuses the launch")
+        };
+        // The operational state home.
+        let why =
+            super::deny_rules(None, Some(&comma_home)).expect_err("a comma cannot be spelled");
+        assert!(names(&why), "{why}");
+        // Through the injector: refused before any flag is written.
+        let inv = "claude -p {PROMPT}";
+        let mut argv = build_argv(inv, "hi", &[]);
+        let before = argv.clone();
+        let why =
+            super::inject_isolation_flags(&mut argv, inv, None, Some("hi"), Some(&comma_home))
+                .expect_err("the launch is refused");
+        assert!(names(&why), "{why}");
+        assert_eq!(argv, before, "nothing is injected on a refusal");
+        // Under the inherit hatch too.
+        {
+            let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
+            let why =
+                super::inject_isolation_flags(&mut argv, inv, None, Some("hi"), Some(&comma_home))
+                    .expect_err("refused under the hatch as well");
+            assert!(names(&why), "{why}");
+            assert_eq!(argv, before);
+        }
+        // The live config dir is fenced in BOTH the per-launch and the shared list: a comma there
+        // refuses both builders.
+        {
+            let comma_config = base.join("claude,config");
+            std::fs::create_dir_all(&comma_config).unwrap();
+            let _cfg = VarGuard::set("CLAUDE_CONFIG_DIR", &comma_config);
+            let spelled = comma_config.display().to_string();
+            let why = super::deny_rules(None, None).expect_err("a comma in CLAUDE_CONFIG_DIR");
+            assert!(why.contains(&spelled) && why.contains("comma"), "{why}");
+            let why = super::shared_deny_rules(None).expect_err("the shared file refuses too");
+            assert!(why.contains(&spelled) && why.contains("comma"), "{why}");
+        }
+        // A backslash in a POSIX path has no spelling either (the rule's escape character).
+        #[cfg(unix)]
+        {
+            let bs_home = base.join("state\\home");
+            std::fs::create_dir_all(&bs_home).unwrap();
+            let why =
+                super::deny_rules(None, Some(&bs_home)).expect_err("a backslash cannot be spelled");
+            assert!(
+                why.contains(&bs_home.display().to_string()) && why.contains("backslash"),
+                "{why}"
+            );
+        }
+        // Spellable ⇒ the same launch proceeds, the home fenced.
+        let plain = base.join("state-home");
+        std::fs::create_dir_all(&plain).unwrap();
+        let rules = super::deny_rules(None, Some(&plain)).expect("spellable");
+        assert!(
+            rules.contains(&format!("Read({}/**)", rule_path(&plain).unwrap())),
+            "{rules:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A PROMPT that looks like a flag must not switch the boundary off.
     ///
     /// Deference used to be decided by scanning the built argv — which contains the prompt. Prompt
@@ -6956,7 +7069,7 @@ mod tests {
             std::fs::write(op_home.join("core.db"), b"sqlite").unwrap();
             let op_rule = rule_path(&op_home).expect("expressible");
             let op = Some(op_home.as_path());
-            let without = super::deny_rules(None, op);
+            let without = super::deny_rules(None, op).unwrap();
             assert!(
                 without.contains(&format!("Read({op_rule}/**)")),
                 "no snapshot ⇒ the operational home is fenced as a blanket: {without:?}"
@@ -6995,7 +7108,7 @@ mod tests {
             std::fs::remove_dir_all(op_home.join("sessions")).unwrap();
             std::fs::remove_dir_all(op_home.join("decisions")).unwrap();
             assert_eq!(super::fence_check(&op_gen, op), Ok(()));
-            let with = super::deny_rules(Some(&op_gen), op);
+            let with = super::deny_rules(Some(&op_gen), op).unwrap();
             assert!(
                 !with.contains(&format!("Read({op_rule}/**)")),
                 "the registry replaces the blanket for the home the snapshot derives: {with:?}"
@@ -7011,11 +7124,12 @@ mod tests {
             };
             assert_eq!(
                 sorted(with.clone()),
-                sorted(super::deny_rules(Some(&op_gen), None)),
+                sorted(super::deny_rules(Some(&op_gen), None).unwrap()),
                 "stating the home the snapshot derives adds nothing: the same set"
             );
             assert!(
                 !super::shared_deny_rules(op)
+                    .unwrap()
                     .iter()
                     .any(|r| r.contains(&op_rule)),
                 "the operational home never reaches the shared file"
@@ -7075,9 +7189,16 @@ mod tests {
     /// naming the skill and never launched, while a codex unit that names none runs with nothing
     /// delivered. Throughout, fake `~/.codex`, `~/.pi`, `~/.copilot`, `~/.config/opencode` and
     /// `~/.claude` trees are byte-identical before and after — no side channel, ever.
+    ///
+    /// What this PROVES for codex (codex round 9): the built argv carries NO delivery flag
+    /// (`--skill`/`--no-skills`/`--add-dir`/`--plugin-dir`), no delivery env, and a skill-naming
+    /// codex unit is refused by name before launch. What it CANNOT prove (documented residual,
+    /// core#400): that codex loads nothing ambient — the recorder here is not codex, and a real
+    /// codex runs under the operator's own `~/.codex`, which v3.2 forbids the engine to touch.
     #[cfg(unix)]
     #[test]
-    fn non_claude_seats_get_skills_only_through_their_lever_and_no_user_cli_dir_is_touched() {
+    fn non_claude_seats_get_skills_only_through_their_lever_and_codex_gets_no_flag_and_is_refused_by_name(
+    ) {
         use crate::skills_snapshot::test_support::{scratch, snapshot_root_with, tree_fingerprint};
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let home = scratch("levers-home");

@@ -232,17 +232,37 @@ impl StepRunner for PersistentStepRunner {
 impl PersistentStepRunner {
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
-        // core#396 (codex round 8, ADJUDICATED): this carrier opens the raw CLI — no snapshot
-        // resolution, no admission, no isolation flags, no delivery lever — so it cannot hand a
-        // skill to the worker. A skill-bearing unit is REFUSED by name here, before any session is
-        // opened or written to, and no invocation directive is ever emitted on this carrier;
-        // skill-free units run exactly as before.
-        if let Some(skill) = input.unit.skill_ref.as_deref().filter(|s| !s.is_empty()) {
+        // core#396 (codex round 8, ADJUDICATED; round 9): this carrier opens the raw CLI — no
+        // snapshot resolution, no admission, no isolation flags, no delivery lever — so it cannot
+        // hand a skill to the worker. A run with ANY skill-bearing unit is REFUSED here at its
+        // FIRST unit, before any session is opened or written to: the actor hands every unit the
+        // run's whole skill set (`StepInput::required_skills`, read off the plan), so a skill-free
+        // first unit does no work ahead of a later unit this carrier could never serve. The current
+        // unit's own `skill_ref` is unioned in (a unit dispatched outside the actor's plan carries
+        // no plan set). No invocation directive is ever emitted on this carrier; a run that names
+        // no skill anywhere runs exactly as before.
+        let mut skills: Vec<String> = input
+            .required_skills
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .chain(
+                input
+                    .unit
+                    .skill_ref
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            )
+            .collect();
+        skills.sort();
+        skills.dedup();
+        if !skills.is_empty() {
             return skills_refusal(
                 input,
                 &crate::skills_snapshot::SkillsError::CarrierWithoutSkills {
                     carrier: PTY_CARRIER.to_string(),
-                    skills: vec![skill.to_string()],
+                    skills,
                 },
             );
         }
@@ -701,6 +721,53 @@ mod tests {
         format!("sh {p}")
     }
 
+    /// RAII pin of `WICKED_MEMORY_EMBEDDER` (codex round 9, L2): hold `test_env::ENV_LOCK` (write)
+    /// first and declare the pin AFTER the lock guard, so it restores before the lock releases —
+    /// the process-global mutation never leaks into a concurrently running test.
+    struct EmbedderPin(Option<std::ffi::OsString>);
+
+    impl EmbedderPin {
+        fn hash() -> Self {
+            let prev = std::env::var_os("WICKED_MEMORY_EMBEDDER");
+            std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+            Self(prev)
+        }
+    }
+
+    impl Drop for EmbedderPin {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("WICKED_MEMORY_EMBEDDER", v),
+                None => std::env::remove_var("WICKED_MEMORY_EMBEDDER"),
+            }
+        }
+    }
+
+    /// A fake interactive CLI like [`fake_cli_invocation`] that, per turn, APPENDS the prompt line
+    /// to `marker` before answering — so a test can prove a session never received a turn (the
+    /// marker is never created).
+    fn fake_cli_with_marker(marker: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "wicked-core-fake-cli-marker-{}-{}.sh",
+            std::process::id(),
+            DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let script = format!(
+            "#!/bin/sh\n\
+             while IFS= read -r line; do\n\
+               printf '%s\\n' \"$line\" >> '{}'\n\
+               printf '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"WKRTURN:%s\"}}]}}}}\\n' \"$line\"\n\
+               printf '{{\"type\":\"result\",\"result\":\"ok\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\\n' \"$line\"\n\
+             done\n",
+            marker.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("sh {}", path.to_string_lossy())
+    }
+
     /// Helper: drain events until `pred` matches or timeout elapses.
     fn wait_for(rx: &std::sync::mpsc::Receiver<CoreEvent>, pred: impl Fn(&CoreEvent) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -720,7 +787,10 @@ mod tests {
     /// 3. Report `StepStatus::Ok` + non-zero usage for each turn.
     #[test]
     fn two_units_same_run_share_one_session() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         let events = core.subscribe();
 
@@ -796,7 +866,10 @@ mod tests {
     /// echoes back carries no `Invoke your skill`.
     #[test]
     fn a_skill_bearing_unit_is_refused_on_the_pty_carrier_and_no_directive_is_written() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         let events = core.subscribe();
         let invocation = fake_cli_invocation();
@@ -832,10 +905,74 @@ mod tests {
         wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
     }
 
+    /// codex round 9 (H3): the refusal is PLAN-WIDE. The actor hands every unit the run's whole
+    /// skill set (`StepInput::required_skills`), so a run whose FIRST unit names no skill but whose
+    /// later unit does is refused AT the first unit — before any session opens and before the fake
+    /// CLI receives a single turn (its marker file is never created) — naming the carrier and the
+    /// later unit's skill. Control: the same first unit in a run whose plan names no skill runs,
+    /// and the marker proves the CLI received that turn.
+    #[test]
+    fn a_run_with_any_skill_bearing_unit_is_refused_at_its_first_unit_on_the_pty_carrier() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let marker = std::env::temp_dir().join(format!(
+            "wicked-core-pty-marker-{}-{}",
+            std::process::id(),
+            DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let invocation = fake_cli_with_marker(&marker);
+        // Unit 0 names no skill; the plan's later unit does.
+        let mut input = make_input(
+            "run-pty-plan",
+            0,
+            make_unit("first, skill-free work", &invocation),
+        );
+        input.required_skills = vec!["wicked-garden-domain".to_string()];
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output
+                .contains("persistent PTY sessions do not load the skills snapshot")
+                && out.output.contains("wicked-garden-domain")
+                && out.output.contains("wrapped or ACP carrier"),
+            "refused at the first unit, naming the later unit's skill: {}",
+            out.output
+        );
+        assert!(!marker.exists(), "the fake CLI never received a turn");
+        let mut opened = 0usize;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, CoreEvent::TerminalOpened { .. }) {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 0, "no session opens for a refused run");
+        // Control: a run whose plan names no skill runs, and the marker records the turn.
+        let plain = make_input(
+            "run-pty-plain",
+            0,
+            make_unit("first, skill-free work", &invocation),
+        );
+        let out = runner.run_unit(&plain);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let turns = std::fs::read_to_string(&marker).expect("the fake CLI recorded the turn");
+        assert!(!turns.trim().is_empty(), "{turns:?}");
+        runner.drop_session("run-pty-plain");
+        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+        let _ = std::fs::remove_file(&marker);
+    }
+
     /// Two runs with DIFFERENT `run_id`s each open their own session.
     #[test]
     fn different_run_ids_open_separate_sessions() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         let events = core.subscribe();
 
@@ -878,7 +1015,10 @@ mod tests {
     /// `drop_session` on an unknown id is a no-op (idempotent).
     #[test]
     fn drop_session_unknown_id_is_noop() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (_, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         runner.drop_session("no-such-run"); // must not panic
     }

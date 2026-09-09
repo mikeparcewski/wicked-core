@@ -267,7 +267,27 @@ Two release tracks share this file, newest entry first regardless of track:
   ISOLATED state (`WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR`, `WICKED_SKILLS_LIVE_WORKER_HOME` —
   refused when they resolve to the operator's real dirs), and the load+invoke proof stays
   adjudicated to the integrated functional test. Windows CI: the plan-admission test's tool
-  command is spelled for `cmd.exe` (no `\\?\` verbatim prefix).
+  command is spelled for `cmd.exe` (no `\\?\` verbatim prefix). **Review pass 10 (windows clippy
+  on pass 9 + crew fixture mirror, v3.5 §2 + codex round 9 REJECT):** the worker fence FAILS
+  CLOSED on a protected directory the rule syntax cannot spell — a comma, a POSIX backslash, a
+  non-UTF-8 component ⇒ the launch is refused naming the directory and the character, on the
+  argv, in the settings file, in the shared worker-home file, and under the inherit hatch (rounds
+  1–8 logged and skipped it). The state-home registry is crew's fixture byte for byte: every
+  settled AND transient name the store can create under `skills/` (`.staging-*`,
+  `manifest.json.tmp-*`, `refused/`, `snapshots/.staging-*`, `snapshots/.tmp-current-*`) with its
+  declared kind (`denied_children_kinds`, required to cover the children exactly); the launch-time
+  listing of the skills root and of the read slot classifies each child by pattern AND lstat kind
+  (a `current` that is a directory, a `.staging-*` that is a file, a `.tmp-current-*` that is not
+  a link, an unknown name ⇒ refused; a parked publish's transients ⇒ admitted and denied). A
+  set-but-empty `WICKED_SKILLS_SNAPSHOT` stays a config error naming the variable (v3.5 §4). The
+  persistent PTY carrier refuses PLAN-WIDE: a run with any skill-bearing unit is refused at its
+  first unit (`StepInput::required_skills`), before any session opens. ACP cleanup never swallows
+  errors (a failed session-dir removal is logged; an unlistable worker home is an error). Documented
+  residual (ADJUDICATED): codex has no lever and no engine-minted worker home — it runs under the
+  operator's own `~/.codex`, which v3.2 forbids touching — so "no lever ⇒ no skills" means wicked
+  delivers nothing and refuses skill-bearing codex units by name; `CODEX_HOME` isolation is
+  core#400. Windows: the two test-module wrappers used only by Unix tests are `#[cfg(unix)]`, and
+  the cfg audit ignores path-qualified and commented mentions (it had missed exactly those two).
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`
