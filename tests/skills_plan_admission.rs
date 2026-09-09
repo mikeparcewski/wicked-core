@@ -122,11 +122,15 @@ mod skills_fixture;
 /// EXECUTED. Absolute path, so the unit's working directory is irrelevant; spelled for the shell
 /// (no Windows `\\?\` verbatim prefix — `cmd.exe` rejects it; review pass 9).
 fn marker_cmd(marker: &std::path::Path) -> Vec<String> {
-    let write = format!("echo ran > \"{}\"", skills_fixture::shell_spelling(marker));
+    let spelled = skills_fixture::shell_spelling(marker);
     if cfg!(windows) {
-        vec!["cmd".into(), "/c".into(), write]
+        // No inner quotes: the whole `/c` argument is quoted by the process spawner because it
+        // holds spaces, and cmd.exe strips only the OUTER pair — inner `\"…\"` would stay in the
+        // redirect target ("The filename, directory name, or volume label syntax is incorrect",
+        // Windows CI on 4ead6aa). The runner's temp path carries no spaces.
+        vec!["cmd".into(), "/c".into(), format!("echo ran > {spelled}")]
     } else {
-        vec!["sh".into(), "-c".into(), write]
+        vec!["sh".into(), "-c".into(), format!("echo ran > \"{spelled}\"")]
     }
 }
 
