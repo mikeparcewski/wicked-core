@@ -42,6 +42,39 @@ export interface CoreEventJson {
   ord?: number
   [k: string]: unknown
 }
+
+/**
+ * The \`unitDistributed\` event — a CLI was assigned to a unit — as delivered to the
+ * {@link Core.subscribe} callback: the shape to read a parsed {@link CoreEventJson} as once
+ * \`type === 'unitDistributed'\`. Every field is emitted unconditionally; the engine's \`Option\`
+ * fields arrive as \`null\`, never absent. Pinned against wicked-core's \`event_to_json\` by the
+ * binding's own tests (\`cargo test\` in this crate) and asserted at compile time by
+ * \`types-test/\` (\`npm run typecheck\`).
+ */
+export interface UnitDistributedEventJson extends CoreEventJson {
+  type: 'unitDistributed'
+  session: string
+  ord: number
+  /** The roster key of the assigned seat. */
+  cli: string
+  /** How the seat was chosen: the council verdict, a degrade to the first candidate, an
+   * evaluator ≠ creator reassignment, or a deterministic tool execution. */
+  routingMethod: 'council' | 'degraded' | 'evaluator_distinct' | 'tool'
+  agreementPct: number | null
+  returned: number | null
+  /** Seats convened for the council that produced this assignment (\`null\` = unknown). */
+  seated: number | null
+  dissent: number | null
+  degradedReason: string | null
+  /**
+   * WHY the candidate seats were narrowed BEFORE the council voted (core#401): the unit's skill
+   * (or a transitive mandate) is \`portable: false\` in the handed skills snapshot — or the root is
+   * the Claude-only live-cache fallback — so only a claude seat could be handed it, and the
+   * council chose among those. \`null\` when every roster seat was a candidate. Additive:
+   * \`routingMethod\` and its fields read exactly as before.
+   */
+  seatConstraint: string | null
+}
 ${END}
 `
 

@@ -217,14 +217,34 @@ pub(crate) fn binary_is_claude(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// [`binary_is_claude`] on an invocation TEMPLATE's first token — the judgement the wrapped runner
-/// makes at launch (`exec`, before argv exists), exposed so seat selection can make the same one
-/// over the roster before the council votes (core#401). Quote-aware like the launch itself
-/// (`tokenize`): a quoted binary path with spaces is one token.
-pub(crate) fn invocation_is_claude(invocation: &str) -> bool {
-    tokenize(invocation)
-        .first()
-        .is_some_and(|bin| binary_is_claude(bin))
+/// The invocation template ONE wrapped launch of `cli_key` runs: the unit's own
+/// `assigned_invocation` — the launch roster's template, an ad-hoc CLI not in the registry
+/// included — else the registry's template for the key, else the key itself
+/// ([`resolve_invocation`]). ONE function for the runner (`exec`) and for seat selection
+/// (`distribute::seat_is_claude`, #402 review pass 2).
+pub(crate) fn launch_invocation(cli_key: &str, assigned_invocation: Option<String>) -> String {
+    assigned_invocation.unwrap_or_else(|| resolve_invocation(cli_key))
+}
+
+/// The binary an invocation template names — its first token, quote-aware like the launch itself
+/// (`tokenize`: a quoted binary path with spaces is one token) — read BEFORE argv exists: what the
+/// wrapped runner selects the directive's form, the output adapter, the isolation and the skills
+/// admission by ([`binary_is_claude`]).
+pub(crate) fn template_binary(invocation: &str) -> String {
+    tokenize(invocation).first().cloned().unwrap_or_default()
+}
+
+/// The seat identity the WRAPPED carrier judges for one launch of `cli_key` carrying
+/// `assigned_invocation`, as the [`WorkerCli`](crate::skills_snapshot::WorkerCli) admission judges
+/// for — the CLI is its own carrier on this path, so its lever (v3.2) is the CLI's own. Composed of
+/// exactly the two resolutions `exec` makes ([`launch_invocation`], [`template_binary`]), so seat
+/// selection reads the identity this carrier will execute (#402 review pass 2).
+pub(crate) fn wrapped_seat_identity(
+    cli_key: &str,
+    assigned_invocation: Option<String>,
+) -> crate::skills_snapshot::WorkerCli {
+    let binary = template_binary(&launch_invocation(cli_key, assigned_invocation));
+    crate::skills_snapshot::WorkerCli::for_binaries(&binary, &binary, cli_key)
 }
 
 /// Set to any value to let workers run under the operator's own CLI configuration again.
@@ -1142,16 +1162,13 @@ impl WrappedCliStepRunner {
             .unwrap_or("claude")
             .to_string();
         // Prefer the unit's own invocation template (an ad-hoc launch CLI not in the registry); else
-        // resolve the key via the council registry.
-        let invocation = input
-            .unit
-            .assigned_invocation
-            .clone()
-            .unwrap_or_else(|| resolve_invocation(&cli_key));
+        // resolve the key via the council registry — `launch_invocation`, the resolution seat
+        // selection also reads (#402 review pass 2).
+        let invocation = launch_invocation(&cli_key, input.unit.assigned_invocation.clone());
         // The binary decides the directive's form (and, below, the output adapter + isolation):
         // read off the TEMPLATE's first token, before argv exists, so the prompt is spelled for
         // the CLI that will run it — and so admission knows WHICH CLI it is admitting for.
-        let binary = tokenize(&invocation).first().cloned().unwrap_or_default();
+        let binary = template_binary(&invocation);
         let is_claude = binary_is_claude(&binary);
         // On the wrapped path the CLI IS the carrier, so its lever (v3.2) is the CLI's own.
         let worker_cli =

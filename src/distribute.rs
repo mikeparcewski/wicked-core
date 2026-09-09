@@ -304,8 +304,11 @@ fn seat_candidates(
             match crate::skills_snapshot::seat_requirement(snapshot, u.skill_ref.as_deref()) {
                 SeatRequirement::Any => Ok(None),
                 SeatRequirement::ClaudeOnly { skills, why } => {
-                    let eligible: Vec<AgenticCli> =
-                        clis.iter().filter(|c| seat_is_claude(c)).cloned().collect();
+                    let eligible: Vec<AgenticCli> = clis
+                        .iter()
+                        .filter(|c| seat_is_claude(clis, &c.key))
+                        .cloned()
+                        .collect();
                     if eligible.is_empty() {
                         return Err(SkillsError::NoEligibleSeat {
                             ord: u.ord,
@@ -322,25 +325,22 @@ fn seat_candidates(
         .collect()
 }
 
-/// Is this roster seat one the delivery can hand a NON-PORTABLE skill to — a claude seat, on both
-/// carriers (design v3.2 §3)? Judged off the same facts the two runners judge at launch, with the
-/// same test (`execute_wrapped::binary_is_claude`): the wrapped runner reads the invocation
-/// template's first token, the ACP runner the seat record's `binary`, and an unregistered key is
-/// its own binary on both. Where both facts are present they must AGREE — a record that says
-/// `claude` under a template that runs something else (or the reverse) is not a seat the routing
-/// can promise the ladder will admit, so it is not a candidate for a Claude-only unit; the roster
-/// is what it is, and a misdescribed seat is refused loudly at plan time rather than seated and
-/// refused mid-run.
-fn seat_is_claude(cli: &AgenticCli) -> bool {
-    let record = (!cli.binary.trim().is_empty())
-        .then(|| crate::execute_wrapped::binary_is_claude(&cli.binary));
-    let template = (!cli.headless_invocation.trim().is_empty())
-        .then(|| crate::execute_wrapped::invocation_is_claude(&cli.headless_invocation));
-    match (record, template) {
-        (Some(record), Some(template)) => record && template,
-        (Some(only), None) | (None, Some(only)) => only,
-        (None, None) => crate::execute_wrapped::binary_is_claude(&cli.key),
-    }
+/// Is the roster seat `key` one the delivery can hand a NON-PORTABLE skill to — a claude seat on
+/// BOTH carriers (design v3.2 §3)? Judged by the SAME resolutions the two runners make at launch
+/// (#402 review pass 2), never by the roster record's own fields: the ACP carrier reloads the
+/// MERGED registry by key and judges that record's `binary` (`acp_runner::acp_seat_identity`);
+/// the wrapped carrier judges the first token of the template the unit will carry — this
+/// roster's template for the key (its `assigned_invocation`), else the registry's, else the key
+/// (`execute_wrapped::wrapped_seat_identity`). Both must say claude: the routing cannot know
+/// which carrier a launch takes (ACP first, the wrapped runner as its fallback), and a seat the
+/// operator's `clis.toml` re-points at another carrier — or a roster record keyed `claude` whose
+/// template runs something else — is exactly the seat the ladder would refuse mid-run. A seat the
+/// two carriers would disagree about is therefore refused loudly at plan time, not seated.
+fn seat_is_claude(clis: &[AgenticCli], key: &str) -> bool {
+    use crate::skills_snapshot::WorkerCli;
+    let acp = crate::acp_runner::acp_seat_identity(key);
+    let wrapped = crate::execute_wrapped::wrapped_seat_identity(key, invocation_of(clis, key));
+    matches!(acp, WorkerCli::Claude) && matches!(wrapped, WorkerCli::Claude)
 }
 
 /// METHODOLOGY: evaluator ≠ creator. A REVIEW/TEST unit must not run on a CLI that produced the work
@@ -1027,6 +1027,63 @@ mod tests {
         (dispatcher, calls)
     }
 
+    /// Pins `HOME` to a directory for the test's lifetime (restored on drop). The merged council
+    /// registry the carriers resolve seats from lives at `$HOME/.config/wicked-council/clis.toml`
+    /// (`registry::default_user_path`), so every eligibility test reads a registry IT wrote — or
+    /// the built-ins, when it wrote none — never the operator's.
+    struct HomePin(Option<std::ffi::OsString>);
+
+    impl HomePin {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self(prev)
+        }
+    }
+
+    impl Drop for HomePin {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(prev) => std::env::set_var("HOME", prev),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// A hermetic registry home for one test: `HOME` pinned to a fresh canonical scratch dir under
+    /// the crate's env write lock (like every other env-pinning test), and that dir. The pin is
+    /// the FIRST element so it restores `HOME` before the lock is released.
+    fn hermetic_home(
+        name: &str,
+    ) -> (
+        HomePin,
+        std::sync::RwLockWriteGuard<'static, ()>,
+        std::path::PathBuf,
+    ) {
+        let env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = scratch(name);
+        let pin = HomePin::set(&dir);
+        (pin, env, dir)
+    }
+
+    /// The operator's `clis.toml` under `home`, re-pointing the registry record for `key` at
+    /// `binary` — a user record replaces its built-in WHOLESALE (`registry::load`), so this is
+    /// what both carriers will resolve for that key from now on.
+    fn override_seat(home: &std::path::Path, key: &str, binary: &str) {
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                "[[cli]]\nkey = \"{key}\"\ndisplay_name = \"{key} (override)\"\nbinary = \
+                 \"{binary}\"\nheadless_invocation = \"{binary} run {{PROMPT}}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
     /// The live defect (core#401): a `capture-learnings` unit carrying `wicked-garden-repo-learn`
     /// (`portable: false`) was council-routed to copilot, which the ladder then refused by name.
     /// Now the unit's candidates are the claude seats — one here, so no ballot is dispatched and
@@ -1037,6 +1094,7 @@ mod tests {
     #[test]
     fn a_nonportable_skill_ref_is_seated_on_claude_while_a_portable_one_convenes_the_whole_roster()
     {
+        let (_home, _env, _) = hermetic_home("route-nonportable-home");
         let snapshot = published("route-nonportable");
         let roster = [
             seat_running("copilot", "copilot"),
@@ -1131,6 +1189,7 @@ mod tests {
     /// escalation gate could only re-dispatch to the same seat or cancel.
     #[test]
     fn a_claude_less_roster_is_refused_at_plan_time_naming_skill_portability_and_seat_kind() {
+        let (_home, _env, _) = hermetic_home("route-refuse-home");
         let snapshot = published("route-refuse");
         let roster = [seat_running("copilot", "copilot"), seat_running("pi", "pi")];
         let mut first = WorkUnit::pending("u1", "s1", 1, "Recon: read the repo");
@@ -1165,7 +1224,7 @@ mod tests {
             "unit 2 requires wicked-garden-repo-learn",
             "only a claude seat can be handed",
             "portable: false",
-            "roster [copilot, pi] holds no claude seat",
+            "roster [copilot, pi] holds no seat that resolves to claude",
             "before any unit ran",
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
@@ -1178,6 +1237,7 @@ mod tests {
     /// and a Claude-less roster is refused saying so.
     #[test]
     fn the_live_cache_fallback_seats_every_skill_bearing_unit_on_claude() {
+        let (_home, _env, _) = hermetic_home("route-live-home");
         let config = scratch("route-live").join("claude-config");
         live_root(
             &config
@@ -1230,7 +1290,9 @@ mod tests {
         .expect_err("Claude-less roster under the fallback");
         assert!(
             err.to_string().contains("live plugin cache")
-                && err.to_string().contains("holds no claude seat"),
+                && err
+                    .to_string()
+                    .contains("holds no seat that resolves to claude"),
             "{err}"
         );
     }
@@ -1287,6 +1349,7 @@ mod tests {
     /// constrained review unit lands on pi — the refusal this change exists to prevent.
     #[test]
     fn evaluator_distinct_never_moves_a_claude_only_review_unit_onto_a_seat_that_cannot_take_it() {
+        let (_home, _env, _) = hermetic_home("route-evaluator-home");
         let snapshot = published("route-evaluator");
         let roster = [seat_running("claude", "claude"), seat_running("pi", "pi")];
         let mut build = WorkUnit::pending("u1", "s1", 1, "Build the thing");
@@ -1328,53 +1391,115 @@ mod tests {
         assert!(dists[2].seat_constraint.is_none());
     }
 
-    /// The seat-kind judgement mirrors BOTH runners and is conservative where they would disagree:
-    /// the wrapped runner reads the template's first token, the ACP runner the record's `binary`
-    /// (an unregistered key is its own binary on both). A quoted path with spaces is one token.
+    /// #402 review pass 2: eligibility is judged by the SAME resolutions the carriers execute —
+    /// the ACP carrier's merged registry record by key (`acp_seat_identity`, the very function
+    /// `exec_turn_inner` calls) and the wrapped carrier's launch template
+    /// (`wrapped_seat_identity`, composed of the two resolutions `exec` makes) — and NEVER by the
+    /// roster record's own fields, so a custom or overridden record cannot pass routing as claude
+    /// and execute as something else (the #401 mid-run refusal, recreated). Hermetic: `HOME` is
+    /// pinned, so the registry is the built-ins plus whatever `clis.toml` THIS test writes.
+    /// Mutation: judge the roster record's `binary` instead and the override case below seats the
+    /// unit on a seat the ACP carrier would refuse.
     #[test]
-    fn seat_is_claude_mirrors_both_runners_and_refuses_a_misdescribed_seat() {
-        assert!(seat_is_claude(&seat_running("claude", "claude")));
-        assert!(seat_is_claude(&seat_running("claude", "/opt/bin/claude")));
-        // A quoted binary path with spaces is ONE token (the launch tokenizes the same way); the
-        // stem test is the runners' (`claude.exe` is claude on the record, too).
-        assert!(seat_is_claude(&AgenticCli {
-            binary: "claude.exe".into(),
-            headless_invocation: r#""/Applications/Claude Tools/claude" -p {PROMPT}"#.into(),
-            ..seat("claude")
-        }));
-        assert!(!seat_is_claude(&seat_running("pi", "pi")));
-        assert!(!seat_is_claude(&seat_running("copilot", "copilot")));
-        // The two facts disagree ⇒ not a candidate (the launch could still refuse it).
-        assert!(!seat_is_claude(&AgenticCli {
+    fn eligibility_follows_the_carriers_seat_resolution_not_the_roster_record() {
+        use crate::acp_runner::acp_seat_identity;
+        use crate::execute_wrapped::wrapped_seat_identity;
+        use crate::skills_snapshot::WorkerCli;
+        let (_home, _env, home) = hermetic_home("route-override");
+        let snapshot = published("route-override");
+        let (dispatcher, _) = spy();
+
+        // Built-in registry: `claude` resolves to claude on both carriers ⇒ eligible, and the ACP
+        // runner's own judgement agrees. A quoted template path with spaces is one token.
+        let claude = seat_running("claude", "claude");
+        assert!(seat_is_claude(std::slice::from_ref(&claude), "claude"));
+        assert!(matches!(acp_seat_identity("claude"), WorkerCli::Claude));
+        assert!(seat_is_claude(
+            &[AgenticCli {
+                headless_invocation: r#""/Applications/Claude Tools/claude" -p {PROMPT}"#.into(),
+                ..seat("claude")
+            }],
+            "claude"
+        ));
+        assert!(!seat_is_claude(&[seat_running("pi", "pi")], "pi"));
+
+        // A roster record keyed `claude` whose TEMPLATE runs codex: the wrapped carrier would run
+        // codex ⇒ not eligible, although the registry (the ACP carrier) says claude. The record's
+        // own `binary` saying `claude` changes nothing — no runner reads it.
+        let codex_template = AgenticCli {
             binary: "claude".into(),
             headless_invocation: "codex exec {PROMPT}".into(),
             ..seat("claude")
-        }));
-        assert!(!seat_is_claude(&AgenticCli {
-            binary: "codex".into(),
-            headless_invocation: "claude -p {PROMPT}".into(),
+        };
+        assert!(matches!(
+            wrapped_seat_identity(
+                "claude",
+                invocation_of(std::slice::from_ref(&codex_template), "claude")
+            ),
+            WorkerCli::Other { .. }
+        ));
+        assert!(!seat_is_claude(
+            std::slice::from_ref(&codex_template),
+            "claude"
+        ));
+
+        // An unregistered key whose template is claude: the ACP carrier judges the key as its own
+        // binary ⇒ the carriers disagree ⇒ not eligible (refused at plan time, never seated).
+        assert!(!seat_is_claude(
+            &[seat_running("my-claude", "claude")],
+            "my-claude"
+        ));
+
+        // THE OVERRIDE, end to end: the operator's clis.toml re-points `claude` at a codex
+        // carrier. The ACP runner's resolution says codex; so does routing; and a Claude-only
+        // unit on [claude, pi] — a roster whose `claude` record LOOKS like claude — is refused at
+        // plan time, before any council convenes, instead of seated and refused mid-run.
+        override_seat(&home, "claude", "codex");
+        assert!(
+            matches!(acp_seat_identity("claude"), WorkerCli::Other { ref key, .. } if key == "claude"),
+            "the ACP carrier would execute the override"
+        );
+        assert!(!seat_is_claude(std::slice::from_ref(&claude), "claude"));
+        let err = distribute_units_against(
+            &[skilled(1, "wicked-garden-repo-learn")],
+            &[claude.clone(), seat_running("pi", "pi")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect_err("no seat resolves to claude on both carriers");
+        assert!(
+            matches!(err.downcast_ref::<SkillsError>(), Some(SkillsError::NoEligibleSeat { roster, .. })
+                if roster == &["claude".to_string(), "pi".into()]),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("not the key's spelling"), "{err}");
+
+        // …and vice versa: the override re-points `codex` at claude. A roster seat keyed `codex`
+        // with an EMPTY template (so the wrapped carrier resolves the registry's) resolves to
+        // claude on both carriers ⇒ eligible ⇒ the unit is seated on it, no refusal.
+        override_seat(&home, "codex", "claude");
+        assert!(matches!(acp_seat_identity("codex"), WorkerCli::Claude));
+        let codex_key = AgenticCli {
+            headless_invocation: String::new(),
             ..seat("codex")
-        }));
-        // One fact only ⇒ that fact decides; none ⇒ the key (an unregistered key is its own binary).
-        assert!(seat_is_claude(&AgenticCli {
-            binary: String::new(),
-            headless_invocation: "claude -p {PROMPT}".into(),
-            ..seat("my-claude")
-        }));
-        assert!(seat_is_claude(&AgenticCli {
-            binary: "claude".into(),
-            headless_invocation: String::new(),
-            ..seat("my-claude")
-        }));
-        assert!(seat_is_claude(&AgenticCli {
-            binary: String::new(),
-            headless_invocation: String::new(),
-            ..seat("claude")
-        }));
-        assert!(!seat_is_claude(&AgenticCli {
-            binary: String::new(),
-            headless_invocation: String::new(),
-            ..seat("pi")
-        }));
+        };
+        assert!(seat_is_claude(std::slice::from_ref(&codex_key), "codex"));
+        let dists = distribute_units_against(
+            &[skilled(1, "wicked-garden-repo-learn")],
+            &[seat_running("pi", "pi"), codex_key],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+            Some(&snapshot),
+        )
+        .expect("the overridden `codex` seat IS a claude seat");
+        assert_eq!(dists[0].assigned_cli, "codex");
+        assert!(dists[0].seat_constraint.is_some());
+        // Its launch resolves the registry template — no roster template was carried.
+        assert_eq!(dists[0].assigned_invocation, None);
     }
 }

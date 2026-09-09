@@ -28,7 +28,13 @@ Two release tracks share this file, newest entry first regardless of track:
   doc. Portable skills, skill-free units, tool units and a run with no resolvable root route
   exactly as before (the launch admission stays the enforcer). Live evidence (2026-09-09): a
   `capture-learnings` run carrying `wicked-garden-repo-learn` (`portable: false`) was routed
-  unit 1 → copilot, refused correctly, escalated, and could only be cancelled.
+  unit 1 → copilot, refused correctly, escalated, and could only be cancelled. Seat eligibility is
+  read off the SAME resolutions the carriers execute — `acp_runner::acp_seat_identity` (the merged
+  registry record by key, `clis.toml` overrides included) and `execute_wrapped::wrapped_seat_identity`
+  (the launch template) — never the roster record's own fields, so a seat that passes routing as
+  claude cannot run as anything else; `wicked-core-ts` declares `UnitDistributedEventJson`
+  (literal `type`, `seatConstraint: string | null`) with compile-time assertions
+  (`types-test/`, `npm run typecheck`) and a cargo lockstep test over `index.d.ts`.
 - **Skills snapshot on both worker paths (#396)** — the engine consumes one skills input,
   `WICKED_SKILLS_SNAPSHOT` (the ABSOLUTE path of a crew-published, immutable garden-shaped plugin
   root; pinned to its canonical real path — relative paths and symlinks at ANY component, the last

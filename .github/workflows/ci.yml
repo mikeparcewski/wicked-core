@@ -77,6 +77,17 @@ jobs:
           cargo clippy --manifest-path crates/wicked-core-ts/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path crates/wicked-core-ts/Cargo.toml
 
+      # The binding's hand-authored TypeScript contract (`CoreEventJson`, `UnitDistributedEventJson`
+      # — `scripts/finalize-dts.mjs`, shipped in `index.d.ts`) is asserted at COMPILE time over the
+      # committed `index.d.ts` (`types-test/`, core#401): a loosened or drifted declaration fails
+      # here, not in a consumer's build. Node is preinstalled on every hosted runner; the cargo test
+      # above already pins the `.d.ts` ↔ script lockstep, this checks what TypeScript sees.
+      - name: core-ts TypeScript contract assertions (tsc --noEmit)
+        working-directory: wicked-core/crates/wicked-core-ts
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run typecheck
+
       # Backend-parity compile check (DES-OUTGOV-001 §5): estate's Postgres backend, wired through
       # the engine's `dyn GraphStore` seam + `AnyStore`, must keep COMPILING under `--features
       # postgres` (it pulls sqlx + tokio). No Postgres SERVICE is needed for the compile — the

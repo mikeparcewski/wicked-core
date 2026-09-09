@@ -4598,30 +4598,15 @@ impl AcpStepRunner {
             .unwrap_or("claude")
             .to_string();
 
-        // The seat's registry record, read ONCE for this turn: its `binary` decides whether this
-        // is a claude seat — the only one the plugin handshake and the Claude directive form apply
-        // to (`binary_is_claude`, the same test the wrapped runner applies to its template), and
-        // the identity the skills admission judges for — and its `[cli.acp]` table decides the
-        // transport and admission below. An unregistered key is its own binary, exactly as
-        // `resolve_invocation` treats it.
+        // The seat's MERGED registry record, read by key ONCE for this turn: its `binary` decides
+        // whether this is a claude seat (the only one the plugin handshake and the Claude directive
+        // form apply to), its `[cli.acp]` bridge is the carrier, and its `[cli.acp]` table decides
+        // the transport and admission below. The identity is judged off THIS record through the
+        // ONE function seat selection also reads (`seat_identity_of` / `acp_seat_identity`; #402
+        // review pass 2), so a unit is never routed to a seat this carrier would then refuse. The
+        // wrapped fallback below judges the CLI on its own terms.
         let seat = registry_record(&cli_key);
-        let seat_binary = seat
-            .as_ref()
-            .map_or(cli_key.as_str(), |c| c.binary.as_str())
-            .to_string();
-        // The CARRIER this path spawns is the seat's ACP bridge (v3.2): a bridge that is a
-        // separate program (`pi-acp`, `codex-acp`) forwards no CLI flags and so has no skills
-        // lever even where the CLI itself does; a bridge that IS the CLI (`copilot --acp`,
-        // `opencode acp`) keeps it. The wrapped fallback below judges the CLI on its own terms.
-        let carrier_binary = seat
-            .as_ref()
-            .and_then(|c| c.acp.as_ref())
-            .map_or(seat_binary.clone(), |a| a.binary.clone());
-        let worker_cli = crate::skills_snapshot::WorkerCli::for_binaries(
-            &seat_binary,
-            &carrier_binary,
-            &cli_key,
-        );
+        let worker_cli = seat_identity_of(seat.as_ref(), &cli_key);
         // core#396 / v3.1 §4 — admission, BEFORE the operator messages below are consumed
         // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST and ONE
         // policy for cached and fresh alike (`admit_turn`, codex round 4): a session this run
@@ -5450,6 +5435,39 @@ fn registry_record(cli_key: &str) -> Option<wicked_council::AgenticCli> {
         .unwrap_or_else(|_| wicked_council::registry::builtin())
         .into_iter()
         .find(|c| c.key == cli_key)
+}
+
+/// The seat identity the ACP carrier judges for ONE launch of `cli_key` (core#396), as the
+/// [`WorkerCli`](crate::skills_snapshot::WorkerCli) the skills admission and the Claude-only
+/// handshake key off: the MERGED registry record read by key — the operator's `clis.toml`
+/// overriding a built-in wholesale — whose `binary` decides whether this is a claude seat
+/// (`binary_is_claude`, the same test the wrapped runner applies to its template) and whose
+/// `[cli.acp]` bridge is the CARRIER this path spawns (v3.2): a bridge that is a separate program
+/// (`pi-acp`, `codex-acp`) forwards no CLI flags and so has no skills lever even where the CLI
+/// itself does; a bridge that IS the CLI (`copilot --acp`, `opencode acp`) keeps it. An
+/// unregistered key is its own binary, exactly as `resolve_invocation` treats it.
+///
+/// ONE function for the runner (`exec_turn_inner`) and for seat selection
+/// (`distribute::seat_is_claude`, #402 review pass 2): routing eligibility is read off the same
+/// resolution this carrier will execute — never off the launch roster's own record, which the
+/// registry may override — so a seat that passes routing as claude cannot execute here as
+/// anything else.
+pub(crate) fn acp_seat_identity(cli_key: &str) -> crate::skills_snapshot::WorkerCli {
+    seat_identity_of(registry_record(cli_key).as_ref(), cli_key)
+}
+
+/// [`acp_seat_identity`] on an already-read registry record (`None` ⇒ unregistered: the key is
+/// its own binary) — the runner reads the record once per turn for the transport too, and judges
+/// the identity off THAT record through this function, so it and the routing cannot diverge.
+pub(crate) fn seat_identity_of(
+    seat: Option<&wicked_council::AgenticCli>,
+    cli_key: &str,
+) -> crate::skills_snapshot::WorkerCli {
+    let seat_binary = seat.map_or(cli_key, |c| c.binary.as_str()).to_string();
+    let carrier_binary = seat
+        .and_then(|c| c.acp.as_ref())
+        .map_or(seat_binary.clone(), |a| a.binary.clone());
+    crate::skills_snapshot::WorkerCli::for_binaries(&seat_binary, &carrier_binary, cli_key)
 }
 
 fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {

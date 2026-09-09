@@ -1441,9 +1441,11 @@ impl std::fmt::Display for SkillsError {
             } => write!(
                 f,
                 "unit {ord} requires {}, which only a {required_seat} seat can be handed ({why}), \
-                 and the roster [{}] holds no {required_seat} seat; add a {required_seat} seat to \
-                 the roster, or publish the skill as portable / drop the unit's skill_ref — refused \
-                 at plan time, before any unit ran",
+                 and the roster [{}] holds no seat that resolves to {required_seat} on both \
+                 carriers (the merged registry record for the key and the launch template decide, \
+                 not the key's spelling); add a {required_seat} seat to the roster, or publish the \
+                 skill as portable / drop the unit's skill_ref — refused at plan time, before any \
+                 unit ran",
                 skills.join(", "),
                 roster.join(", ")
             ),
@@ -6453,7 +6455,8 @@ mod tests {
             "unit 1 requires wicked-garden-repo-learn",
             "only a claude seat can be handed",
             "portable: false",
-            "roster [copilot, pi] holds no claude seat",
+            "roster [copilot, pi] holds no seat that resolves to claude on both carriers",
+            "not the key's spelling",
             "add a claude seat to the roster",
             "refused at plan time, before any unit ran",
         ] {
