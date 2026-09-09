@@ -210,10 +210,15 @@ fn gate_phase_approves_a_satisfying_phase_end_to_end() {
 /// appear. The ACP half — the real `claude-agent-acp` through the real `AcpStepRunner` — lives in
 /// `acp_runner::tests::the_real_acp_bridge_loads_the_snapshot_and_invokes_the_fixture_skill`.
 ///
-/// `#[ignore]`d by default: it needs `claude` on PATH, a logged-in account, and network. Opt in:
-///   WICKED_SKILLS_LIVE_TEST=1 cargo test --test skills_live the_pinned_harness -- --ignored --nocapture
-/// Without the variable (or without `claude`) the body SKIPS with a clear message rather than
-/// failing, so an accidental `--ignored` sweep on a CI box stays green.
+/// `#[ignore]`d by default: it needs `claude` on PATH, an ISOLATED logged-in claude config dir
+/// (`WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR` — never the operator's real `~/.claude`; codex round 8:
+/// live tests use temp/isolated state throughout), and network. Opt in:
+///   WICKED_SKILLS_LIVE_TEST=1 WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR=<dir> \
+///     cargo test --test skills_live the_pinned_harness -- --ignored --nocapture
+/// Without the variables (or without `claude`) the body SKIPS with a clear message rather than
+/// failing, so an accidental `--ignored` sweep on a CI box stays green. The deterministic
+/// load+invoke proof is ADJUDICATED to the integrated functional test on the disposable daemon
+/// with the real CLIs; this is an opt-in extra.
 #[test]
 #[ignore = "launches the real `claude`; opt in with WICKED_SKILLS_LIVE_TEST=1 and run with --ignored"]
 fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
@@ -229,6 +234,36 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
         eprintln!("SKIP: no `claude` binary on PATH");
         return;
     }
+    // ISOLATED state throughout (codex round 8): the live `claude` runs against an operator-prepared
+    // config dir named by `WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR` (logged in there, outside their
+    // real `~/.claude`) — never the operator's own configuration. Refused when it resolves to the
+    // real one; skipped when unset.
+    let Some(live_config) = std::env::var_os("WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir())
+    else {
+        eprintln!(
+            "SKIP: set WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR to an isolated, logged-in claude config \
+             dir (never your real ~/.claude) to launch the live test"
+        );
+        return;
+    };
+    if let Some(real) =
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude"))
+    {
+        let same = match (
+            std::fs::canonicalize(&live_config),
+            std::fs::canonicalize(&real),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => live_config == real,
+        };
+        assert!(
+            !same,
+            "WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR must not be the operator's real ~/.claude"
+        );
+    }
+    let _config = EnvPin::set("CLAUDE_CONFIG_DIR", &live_config);
     const MARKER: &str = "WICKED-PROBE-MARKER-4f9c2e";
     // A fixture snapshot OUTSIDE every default fenced directory, at its CANONICAL path (the OS
     // temp dir is a symlink on macOS; the loader refuses an ancestor symlink and pins the real

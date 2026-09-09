@@ -241,6 +241,33 @@ Two release tracks share this file, newest entry first regardless of track:
   `refused_snapshot_path` in `tests/support/skills_snapshot_fixture.rs`), never by spelling — the
   windows runner's `temp_dir()` (an 8.3 short name) and `canonicalize` (which keeps the `\\?\`
   verbatim prefix) spell one directory differently from the engine's `\\?\`-free canonical form.
+  **Review pass 9 (codex round 8 REJECT + windows CI on pass 8):** worker isolation is MANDATORY
+  — a registry template that states `--setting-sources` or `--permission-mode` (either spelling)
+  is a config error naming the template and the flag (`isolation_refusal`; rounds 1–7 deferred to
+  it), a template's own `--disallowedTools` is UNIONED into the engine's single deny flag, and the
+  deny fence is injected even under the inherit-config hatch (which withholds only the two
+  scope/mode flags) — on both carriers (ACP: `disallowedTools` rides the frame under the hatch;
+  `settingSources: ["project","local"]` is SET on every non-hatch `session/new`, the ACP analog
+  of `--setting-sources`). Every `--plugin-dir` in the BUILT argv (placeholders expanded) is
+  stripped except the prompt token, and exactly one (the snapshot) is asserted, else refused.
+  `.venv` containment: every component of `<state_home>/skills/baseline/<64-hex>/.venv` is
+  lstat-checked (no link but the snapshot-root `.venv` itself), the link's target is resolved
+  lexically (crew's relative spelling) and must END exactly at `<64-hex>/.venv`; the state-home
+  fence refuses any symlink among the skills root's children except `current`, and requires the
+  read slot to be a real directory. The live-cache FALLBACK gets the same fail-closed whole-tree
+  containment as a published generation (any symlink, an unreadable/non-UTF-8/nameless
+  `SKILL.md`, a link under the support tree ⇒ `Ladder::Failed` with the reason; `SkillsError::
+  Fallback` is gone). The engine's OWN operational state home — the canonical parent of the
+  database it was spawned on (crew's `stateHomeOfDb`; no environment input, v3.4 §2 stands) — is
+  fenced on EVERY launch (blanket without a snapshot, registry with one from it) and kept out of
+  the shared worker-home file: `AcpStepRunner::new_for_store` / `WrappedCliStepRunner::
+  with_tx_for_store` carry it; `admit_turn`/`fence_check`/`deny_rules` take it. The persistent
+  PTY carrier REFUSES skill-bearing units by name (`SkillsError::CarrierWithoutSkills`) and never
+  emits a directive (ADJUDICATED: it has no snapshot lever). The two live `#[ignore]` tests use
+  ISOLATED state (`WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR`, `WICKED_SKILLS_LIVE_WORKER_HOME` —
+  refused when they resolve to the operator's real dirs), and the load+invoke proof stays
+  adjudicated to the integrated functional test. Windows CI: the plan-admission test's tool
+  command is spelled for `cmd.exe` (no `\\?\` verbatim prefix).
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`

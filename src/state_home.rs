@@ -67,6 +67,37 @@ use serde_json::Value;
 /// handed snapshot's derived state home is that very directory.
 pub(crate) const DEFAULT_STATE_HOME_DIRNAME: &str = ".wicked-crew";
 
+/// The one child of the skills root that IS a link by design: crew's `current -> snapshots/<gen>`
+/// pointer. Every other child must be a real entry (codex round 8).
+pub(crate) const CURRENT_LINK_NAME: &str = "current";
+
+/// The OPERATIONAL state home of the engine's own database (codex round 8; design v3.4 §2 stands —
+/// no new environment input): crew's `stateHomeOfDb` is `dirname(resolve(dbPath))`, the `--db`
+/// parent, `~/.wicked-crew` without `--db` — so the canonical parent directory of the store the
+/// engine was spawned on IS the daemon's state home, and it is fenced on EVERY launch (registry
+/// rules when a handed snapshot derives it, the blanket otherwise), whether or not a snapshot is
+/// handed. `None` for a store that is not a file (`:memory:`, a `postgres://` URL). A parent that
+/// cannot be canonicalized yet is spelled absolute, unresolved.
+pub(crate) fn operational_home_of_db(db_path: &str) -> Option<PathBuf> {
+    if db_path.is_empty() || db_path == ":memory:" || db_path.contains("://") {
+        return None;
+    }
+    let db = PathBuf::from(db_path);
+    let parent = db.parent()?;
+    let abs = if parent.as_os_str().is_empty() {
+        std::env::current_dir().ok()?
+    } else if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(parent)
+    };
+    Some(
+        std::fs::canonicalize(&abs)
+            .map(crate::skills_snapshot::simplify_verbatim)
+            .unwrap_or(abs),
+    )
+}
+
 /// The registry, embedded so the binary and the fixture crew mirrors cannot drift: the test
 /// suite parses this same text, and `tests/fixtures/state-home-subtrees.json` is the file crew
 /// copies into `packages/crew/tests/fixtures/`.
@@ -371,7 +402,11 @@ pub(crate) fn read_rules_around_snapshot(
         };
         check_entry_kind(state_home, &name, entry)?;
     }
-    // (b) Every child of the skills root must be a denied child or the read slot itself.
+    // (b) Every child of the skills root must be a denied child or the read slot itself — and
+    // (codex round 8) none of them may be a SYMLINK except `current` (crew's own pointer, a link
+    // by design): a linked `baseline` would be walked through by a worker whose `.venv` resolves
+    // into it, a linked read slot would list another tree's generations. The read slot must be a
+    // real directory.
     let skills_dir = state_home.join(skills_name);
     if std::fs::symlink_metadata(&skills_dir).is_ok() {
         let known: Vec<&str> = skills
@@ -384,6 +419,28 @@ pub(crate) fn read_rules_around_snapshot(
         for name in list_names(&skills_dir)? {
             if !known.iter().any(|k| *k == name) {
                 return Err(unclassified(&skills_dir, &name));
+            }
+            let child = skills_dir.join(&name);
+            let meta = std::fs::symlink_metadata(&child).map_err(|e| {
+                format!(
+                    "cannot inspect `{name}` under {} to check the Read fence ({e})",
+                    skills_dir.display()
+                )
+            })?;
+            if meta.file_type().is_symlink() && name != CURRENT_LINK_NAME {
+                return Err(format!(
+                    "`{name}` under {} is a symlink; only `{CURRENT_LINK_NAME}` may be a link in \
+                     the skills root (crew's pointer) — the worker Read fence would be walked \
+                     through, so the launch is refused rather than leaving it readable; remove it",
+                    skills_dir.display()
+                ));
+            }
+            if name == slot && !meta.is_dir() {
+                return Err(format!(
+                    "`{name}` under {} is not a directory where the read slot is expected; the \
+                     worker Read fence cannot classify it — the launch is refused; remove it",
+                    skills_dir.display()
+                ));
             }
         }
     }
@@ -1019,6 +1076,37 @@ mod tests {
         std::fs::remove_file(skills.join("snapshots").join("000004")).unwrap();
         // (codex round 7) a recognised staging/temp NAME must be a real directory too: a FILE
         // named `.staging-file` and (unix) a SYMLINK named `.tmp-link` are refused by name.
+        // (codex round 8) a child of the skills root may not be a symlink — `current` excepted
+        // (crew's pointer) — and the read slot must be a real directory.
+        #[cfg(unix)]
+        {
+            let real_baseline = base.join("real-baseline");
+            std::fs::rename(skills.join("baseline"), &real_baseline).unwrap();
+            std::os::unix::fs::symlink(&real_baseline, skills.join("baseline")).unwrap();
+            let err =
+                read_rules_around_snapshot(&home, "000007", &spell).expect_err("a linked baseline");
+            assert!(
+                err.contains("`baseline`") && err.contains("is a symlink"),
+                "{err}"
+            );
+            std::fs::remove_file(skills.join("baseline")).unwrap();
+            std::fs::rename(&real_baseline, skills.join("baseline")).unwrap();
+            std::os::unix::fs::symlink("snapshots/000007", skills.join("current")).unwrap();
+            assert_eq!(
+                read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
+                rules,
+                "`current` is the one link the skills root may hold"
+            );
+            std::fs::remove_file(skills.join("current")).unwrap();
+        }
+        // The operational home of a database: its canonical parent; none for a non-file store.
+        assert_eq!(
+            operational_home_of_db(&home.join("core.db").display().to_string()),
+            Some(std::fs::canonicalize(&home).unwrap())
+        );
+        assert_eq!(operational_home_of_db(":memory:"), None);
+        assert_eq!(operational_home_of_db("postgres://h/db"), None);
+        assert_eq!(operational_home_of_db(""), None);
         std::fs::write(skills.join("snapshots").join(".staging-file"), "").unwrap();
         let err = read_rules_around_snapshot(&home, "000007", &spell)
             .expect_err("a file where a staging directory is expected");

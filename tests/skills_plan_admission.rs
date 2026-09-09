@@ -119,9 +119,10 @@ fn drain_until_terminal(
 mod skills_fixture;
 
 /// The platform's shell writing `ran` into `marker` — the observable that the tool command
-/// EXECUTED. Absolute path, so the unit's working directory is irrelevant.
+/// EXECUTED. Absolute path, so the unit's working directory is irrelevant; spelled for the shell
+/// (no Windows `\\?\` verbatim prefix — `cmd.exe` rejects it; review pass 9).
 fn marker_cmd(marker: &std::path::Path) -> Vec<String> {
-    let write = format!("echo ran > \"{}\"", marker.display());
+    let write = format!("echo ran > \"{}\"", skills_fixture::shell_spelling(marker));
     if cfg!(windows) {
         vec!["cmd".into(), "/c".into(), write]
     } else {

@@ -511,7 +511,9 @@ impl Core {
         let self_tx = tx.clone();
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
-        let runner = std::sync::Arc::new(AcpStepRunner::new(tx.clone()));
+        // The runner knows the store it serves (codex round 8): the database's canonical parent is
+        // the daemon's operational state home, fenced on every launch — snapshot or not.
+        let runner = std::sync::Arc::new(AcpStepRunner::new_for_store(tx.clone(), &path));
         // Share the maps and write registry already inside the runner so the actor and the
         // ACP execution layer use a single consistent lock.
         let actor_maps = runner.elicitation_maps().clone();

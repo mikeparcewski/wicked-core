@@ -953,47 +953,79 @@ impl SkillsSnapshot {
                     .to_string(),
             );
         };
-        let real = std::fs::canonicalize(link)
-            .map(simplify_verbatim)
-            .map_err(|e| {
-                format!(
-                    ".venv is a symlink that does not resolve ({e}) — crew links it to the \
-                     baseline env `<state home>/skills/baseline/<hash>/.venv`"
-                )
-            })?;
-        let baseline_root = state_home.join(SKILLS_DIR).join("baseline");
-        let baseline = std::fs::canonicalize(&baseline_root)
-            .map(simplify_verbatim)
-            .map_err(|e| {
-                format!(
-                    ".venv is a symlink to `{}` but the state home has no baseline env root at \
-                     `{}` to hold it ({e})",
-                    real.display(),
-                    baseline_root.display()
-                )
-            })?;
+        // (codex round 8) Every component of `<state home>/skills/baseline/<hash>/.venv` is
+        // lstat-checked to be a REAL directory — never `canonicalize` and trust: a linked
+        // `skills/` or `baseline/` would be walked through. The state home itself is canonical
+        // (derived from the canonical root).
+        let real_dir = |p: &Path, rel: &str| -> Result<(), String> {
+            match std::fs::symlink_metadata(p) {
+                Ok(m) if m.file_type().is_symlink() => Err(format!(
+                    ".venv cannot be admitted: `<state home>/{rel}` is a symlink — every \
+                     component of the path to the baseline env must be a real directory"
+                )),
+                Ok(m) if !m.is_dir() => Err(format!(
+                    ".venv cannot be admitted: `<state home>/{rel}` is not a directory"
+                )),
+                Ok(_) => Ok(()),
+                Err(e) => Err(format!(
+                    ".venv is a symlink but the state home has no baseline env root at \
+                     `<state home>/{rel}` ({e})"
+                )),
+            }
+        };
+        let skills = state_home.join(SKILLS_DIR);
+        let baseline = skills.join("baseline");
+        real_dir(&skills, SKILLS_DIR)?;
+        real_dir(&baseline, &format!("{SKILLS_DIR}/baseline"))?;
+        // The link's own target, resolved LEXICALLY against the snapshot root (crew writes
+        // `../../baseline/<hash>/.venv`, or the absolute real path on Windows) — never by
+        // following it — must END exactly at `<baseline>/<64-hex>/.venv`: no component beyond.
+        let target = std::fs::read_link(link)
+            .map_err(|e| format!(".venv is a symlink whose target cannot be read ({e})"))?;
+        let joined = if target.is_absolute() {
+            target.clone()
+        } else {
+            link.parent()
+                .map(|p| p.join(&target))
+                .unwrap_or(target.clone())
+        };
+        let normalized = lexical_normalize(&joined);
         let outside = || {
             format!(
-                ".venv is a symlink to `{}`, which is not inside `{}/<64-hex>/.venv` — the one link \
-                 a generation may carry points into the baseline env crew provisioned for its \
-                 bundle hash",
-                real.display(),
+                ".venv is a symlink to `{}` (`{}`), which is not exactly `{}/<64-hex>/.venv` — the \
+                 one link a generation may carry ends at the baseline env crew provisioned for its \
+                 bundle hash, with no component beyond it",
+                target.display(),
+                normalized.display(),
                 baseline.display()
             )
         };
-        let rest = real.strip_prefix(&baseline).map_err(|_| outside())?;
-        let mut parts = rest.components().filter_map(|c| match c {
-            std::path::Component::Normal(s) => s.to_str(),
-            _ => None,
-        });
-        let hash_ok = parts.next().is_some_and(|h| {
-            h.len() == 64
-                && h.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        });
-        if !hash_ok || parts.next() != Some(".venv") {
+        let rest = normalized.strip_prefix(&baseline).map_err(|_| outside())?;
+        let parts: Vec<&str> = rest
+            .components()
+            .map(|c| match c {
+                std::path::Component::Normal(s) => s.to_str().unwrap_or(""),
+                _ => "",
+            })
+            .collect();
+        let [hash, venv] = parts.as_slice() else {
+            return Err(outside());
+        };
+        let hash_ok = hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+        if !hash_ok || *venv != ".venv" {
             return Err(outside());
         }
+        real_dir(
+            &baseline.join(hash),
+            &format!("{SKILLS_DIR}/baseline/{hash}"),
+        )?;
+        real_dir(
+            &baseline.join(hash).join(".venv"),
+            &format!("{SKILLS_DIR}/baseline/{hash}/.venv"),
+        )?;
         Ok(())
     }
 
@@ -1001,6 +1033,30 @@ impl SkillsSnapshot {
     pub(crate) fn skills(&self) -> &[SkillEntry] {
         &self.skills
     }
+}
+
+/// Lexical normalization of a path: `.` dropped, `..` pops the previous normal component (a `..`
+/// with nothing to pop is kept, so the result cannot pretend to be under a prefix it left),
+/// prefixes and the root kept. Never touches the filesystem — the containment checks that use it
+/// (`check_venv_link`) lstat the components themselves.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let popped = matches!(
+                    out.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) && out.pop();
+                if !popped {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Does `skill_ref` carry this plugin's name prefix? Only used to WORD a refusal: a ref from
@@ -1074,11 +1130,6 @@ pub(crate) enum SkillsError {
         skills: Vec<String>,
         why: String,
     },
-    /// The live-cache FALLBACK root (no explicit input) is not a tree the engine can index: a
-    /// linked `skills/` (or an entry that resolves outside the root), an unlistable directory.
-    /// Refused rather than indexed — the fallback is the ladder's last rung, not a place where
-    /// containment stops mattering (codex round 5).
-    Fallback { root: PathBuf, why: String },
     /// A CACHED ACP session that was opened WITHOUT a snapshot (nothing pinned — no root on the
     /// ladder at the time) was asked, on a later turn, for skills. The plugin is handed at
     /// `session/new` and never afterwards, so the session cannot be given what a NOW-available
@@ -1101,6 +1152,15 @@ pub(crate) enum SkillsError {
     /// the no-root rung like an absence but is never silent: this refusal carries the reason for a
     /// run that names a skill.
     FallbackFailed { why: String, missing: Vec<String> },
+    /// A unit that invokes a skill was routed to a CARRIER that does not load the skills snapshot
+    /// (codex round 8; ADJUDICATED): the persistent PTY session runner opens the raw CLI with no
+    /// snapshot resolution, admission, isolation or delivery lever, so a skill directive there
+    /// would tell the worker to invoke a skill nothing loaded. Refused by name; no directive is
+    /// ever emitted on that carrier.
+    CarrierWithoutSkills {
+        carrier: String,
+        skills: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for SkillsError {
@@ -1212,13 +1272,13 @@ impl std::fmt::Display for SkillsError {
                  copilot with a published copilot view, opencode) or drop its skill_ref",
                 skills.join(", ")
             ),
-            SkillsError::Fallback { root, why } => write!(
+            SkillsError::CarrierWithoutSkills { carrier, skills } => write!(
                 f,
-                "the {} at {} cannot be used as the skills fallback ({why}); {SKILLS_SNAPSHOT_ENV} \
-                 is unset, so the installed {PLUGIN_NAME} is the only candidate root and it must be \
-                 a contained tree — repair the installation, or publish a snapshot and pass it",
-                SnapshotSource::LiveCache,
-                root.display()
+                "{carrier} sessions do not load the skills snapshot, but this unit requires {}; \
+                 run skill-bearing units on the wrapped or ACP carrier (which resolve, admit and \
+                 hand the snapshot) — no invocation directive is emitted on a carrier that cannot \
+                 load the skill",
+                skills.join(", ")
             ),
             SkillsError::NotDelivered { cli, skills } => write!(
                 f,
@@ -1380,11 +1440,25 @@ pub(crate) fn resolve_ladder_in(
         }
         Candidate::Found(root) => root,
     };
-    // A candidate that is not a CONTAINED tree (a linked `skills/`, an entry resolving outside
-    // it, an unlistable directory) is REFUSED, not indexed and not skipped: the operator did not
-    // choose it, but the worker would be handed its paths (codex round 5).
-    let snapshot = load_live(root.clone(), SnapshotSource::LiveCache, log)
-        .map_err(|why| SkillsError::Fallback { root, why })?;
+    // A candidate that is not a CONTAINED, fully indexable tree (a link anywhere in it, an entry
+    // resolving outside it, an unlistable directory, a `SKILL.md` that cannot be read or indexed)
+    // is a FAILURE of the fallback (codex rounds 5, 7 and 8): the no-root rung with the reason —
+    // never indexed, never silently skipped, never "no installed garden".
+    let snapshot = match load_live(root.clone(), SnapshotSource::LiveCache) {
+        Ok(snapshot) => snapshot,
+        Err(why) => {
+            let why = format!(
+                "the installed {PLUGIN_NAME} at {} is not a contained, fully indexable tree: {why}",
+                root.display()
+            );
+            log(format!(
+                "[wicked-core] skills.fallback FAILED: {why}; {SKILLS_SNAPSHOT_ENV} is unset and \
+                 the installed plugin could not be used as the fallback — workers run WITHOUT \
+                 {PLUGIN_NAME} skills, and a run that names one is refused with this reason"
+            ));
+            return Ok(Ladder::Failed(why));
+        }
+    };
     log(format!(
         "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset; using the {} at {} ({} \
          skills) — Claude-only: the installed plugin carries no publish-time portability verdict, \
@@ -2071,29 +2145,24 @@ fn verify_skill_file(root: &Path, dir: &str) -> Result<Frontmatter, String> {
 }
 
 /// Index an INSTALLED plugin root (no `snapshot.json`): every directory under `skills/` holding a
-/// `SKILL.md`, nested ones included, keyed by frontmatter `name`. A `SKILL.md` without a
-/// parseable frontmatter `name` is SKIPPED and named in a `skills.notice` — never given a derived
-/// identity the harness would not agree with. `portable` is approximated from the text (the index
-/// is authoritative for a published snapshot; the fallback has none).
+/// `SKILL.md`, nested ones included, keyed by frontmatter `name`. `portable` is approximated from
+/// the text — advisory only: a live root is Claude-only ([`SkillsError::FallbackClaudeOnly`]).
 ///
-/// CONTAINED before it is traversed (codex round 5): `root` and `root/skills` are lstat-checked
-/// — neither may be a symlink, both must be directories — BEFORE `skills/` is read, so a
-/// `skills -> /outside` link is refused at `skills` and nothing under it is ever indexed (round 4
-/// checked only the children, so a linked `skills/` root indexed an external tree and handed its
-/// paths to pi/opencode); every indexed entry — its directory and its `SKILL.md` — must ALSO
-/// canonicalize INSIDE `root` ([`contained_under`], v3.3 §3), which is canonical by construction
-/// at resolution. A plugin with NO `skills/` at all is an empty index (there is no component to
-/// follow — the same "no skills" the walk always yielded), while a `skills` that exists but is not
-/// a real directory, or cannot be stat'ed, is a defect. Inside the walk, a linked child is
-/// SKIPPED (a link is not a skill of this root; the walk never follows it), and a directory that
-/// cannot be listed or an entry that cannot be inspected is an ERROR — enumeration errors are
-/// never flattened into "nothing here". `Err(why)` ⇒ the root is refused as a fallback
-/// ([`SkillsError::Fallback`]); `rel` spellings in the error are `/`-joined from the root.
-fn load_live(
-    root: PathBuf,
-    source: SnapshotSource,
-    log: &mut dyn FnMut(String),
-) -> Result<SkillsSnapshot, String> {
+/// FAIL-CLOSED whole-tree containment, the same standard as a published generation (codex rounds
+/// 5, 7 and 8): `root` and `root/skills` are lstat-checked BEFORE `skills/` is read (a
+/// `skills -> /outside` link is refused at `skills`); inside the walk a SYMLINK anywhere — a linked
+/// skill directory, a linked file — is refused by path (round 5 skipped it; round 8: a delivered
+/// tree may hold no link the worker would read through); a `SKILL.md` that cannot be read, is not
+/// UTF-8, has no frontmatter block, malformed frontmatter or no `name` is refused with the error
+/// (round 5 skipped it with a notice — a live root must be FULLY indexable, or it is not a root);
+/// every indexed entry must canonicalize inside `root` ([`contained_under`]); a directory that
+/// cannot be listed or an entry that cannot be inspected is an error. After indexing, the whole
+/// delivered closure — support files included — is walked by
+/// [`SkillsSnapshot::verify_delivered_tree`], exactly as for a published generation (with no state
+/// home, even a `.venv` link is refused). A plugin with NO `skills/` at all is an empty index.
+/// `Err(why)` ⇒ the ladder takes the no-root rung WITH the reason ([`Ladder::Failed`]); `rel`
+/// spellings in the error are `/`-joined from the root.
+fn load_live(root: PathBuf, source: SnapshotSource) -> Result<SkillsSnapshot, String> {
     contained(&root, "the root", false)?;
     let skills_dir = root.join(SKILLS_DIR);
     let mut skills = Vec::new();
@@ -2103,18 +2172,26 @@ fn load_live(
         Ok(_) => {
             contained(&skills_dir, SKILLS_DIR, false)?;
             contained_under(&root, &skills_dir, SKILLS_DIR)?;
-            walk_skills(&root, &skills_dir, &[], &mut skills, log)?;
+            walk_skills(&root, &skills_dir, &[], &mut skills)?;
         }
     }
     skills.sort_by(|a, b| a.dir.cmp(&b.dir));
-    Ok(SkillsSnapshot {
+    let snapshot = SkillsSnapshot {
         root,
         source,
         gen: None,
         content_hash: None,
         state_home: None,
         skills,
-    })
+    };
+    // The same whole-tree containment a published generation gets: no link anywhere in the
+    // delivered closure (support tree included), every SKILL.md indexed (the walk above already
+    // refused any it could not index), only the copilot view under `views/`.
+    snapshot.verify_delivered_tree().map_err(|e| match e {
+        SkillsError::Config { why, .. } => why,
+        other => other.to_string(),
+    })?;
+    Ok(snapshot)
 }
 
 fn walk_skills(
@@ -2122,7 +2199,6 @@ fn walk_skills(
     dir: &Path,
     rel: &[String],
     out: &mut Vec<SkillEntry>,
-    log: &mut dyn FnMut(String),
 ) -> Result<(), String> {
     let here = || {
         if rel.is_empty() {
@@ -2140,46 +2216,71 @@ fn walk_skills(
         let child_rel_str = format!("{}/{file_name}", here());
         let meta = std::fs::symlink_metadata(&path)
             .map_err(|e| format!("{child_rel_str} cannot be inspected ({e})"))?;
-        // A link is never followed — not into a skill, not into a subtree. It is skipped, not a
-        // defect: the live cache is the operator's installed plugin, and a stray link in it is
-        // simply not one of this root's skills. (A published snapshot refuses links at load.)
-        if meta.file_type().is_symlink() || !meta.is_dir() {
+        // A link is never followed — and (codex round 8) never tolerated either: the whole root
+        // is handed to Claude's plugin loader, which WOULD follow it.
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "{child_rel_str} is a symlink — the installed plugin must be a contained tree to \
+                 serve as the skills fallback (no link anywhere in it)"
+            ));
+        }
+        if !meta.is_dir() {
             continue;
         }
         contained_under(root, &path, &child_rel_str)?;
         let mut child_rel = rel.to_vec();
         child_rel.push(file_name);
         let skill_md = path.join(SKILL_FILE);
-        if std::fs::symlink_metadata(&skill_md).is_ok_and(|m| m.is_file()) {
-            let dir = child_rel.join("/");
-            contained_under(root, &skill_md, &format!("{child_rel_str}/{SKILL_FILE}"))?;
-            let text = read_no_follow(&skill_md)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok());
-            match text.as_deref().map(parse_frontmatter) {
-                Some(Ok(Frontmatter {
-                    name: Some(name),
-                    mandates,
-                })) => out.push(SkillEntry {
+        match std::fs::symlink_metadata(&skill_md) {
+            Err(_) => {}
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!(
+                    "{child_rel_str}/{SKILL_FILE} is a symlink — the installed plugin must be a \
+                     contained tree to serve as the skills fallback"
+                ))
+            }
+            Ok(m) if !m.is_file() => {
+                return Err(format!(
+                    "{child_rel_str}/{SKILL_FILE} is not a regular file"
+                ))
+            }
+            Ok(_) => {
+                let dir = child_rel.join("/");
+                let rel_file = format!("{child_rel_str}/{SKILL_FILE}");
+                contained_under(root, &skill_md, &rel_file)?;
+                // Every SKILL.md the fallback holds must be INDEXABLE, or the root is not a
+                // fallback: an unreadable or non-UTF-8 file, a missing or malformed frontmatter
+                // block, or no `name` is refused with the error (round 5 skipped it with a notice,
+                // leaving Claude to load a skill the engine could not name).
+                let bytes = read_no_follow(&skill_md)
+                    .map_err(|e| format!("{rel_file} cannot be read ({e})"))?;
+                let text = String::from_utf8(bytes)
+                    .map_err(|e| format!("{rel_file} is not UTF-8 ({e})"))?;
+                let fm = parse_frontmatter(&text).map_err(|e| match e {
+                    FrontmatterError::NoBlock => {
+                        format!(
+                            "{rel_file} has no `---` frontmatter block, so it cannot be indexed"
+                        )
+                    }
+                    FrontmatterError::Malformed(why) => {
+                        format!("{rel_file} has malformed frontmatter ({why})")
+                    }
+                })?;
+                let Some(name) = fm.name else {
+                    return Err(format!(
+                        "{rel_file} has no frontmatter `name`, so it cannot be indexed (the \
+                         harness would not know it by a derived name either)"
+                    ));
+                };
+                out.push(SkillEntry {
                     name,
                     dir,
-                    portable: !has_nonportable_markers(text.as_deref().unwrap_or_default()),
-                    mandates,
-                }),
-                Some(Err(FrontmatterError::Malformed(why))) => log(format!(
-                    "[wicked-core] skills.notice {}/{SKILLS_DIR}/{dir}/{SKILL_FILE} has malformed \
-                     frontmatter ({why}); the skill is not indexed",
-                    root.display()
-                )),
-                _ => log(format!(
-                    "[wicked-core] skills.notice {}/{SKILLS_DIR}/{dir}/{SKILL_FILE} has no \
-                     parseable frontmatter `name`; the skill is not indexed (the harness would \
-                     not know it by a derived name either)",
-                    root.display()
-                )),
+                    portable: !has_nonportable_markers(&text),
+                    mandates: fm.mandates,
+                });
             }
         }
-        walk_skills(root, &path, &child_rel, out, log)?;
+        walk_skills(root, &path, &child_rel, out)?;
     }
     Ok(())
 }
@@ -2594,8 +2695,9 @@ fn require_existence(snapshot: Option<&SkillsSnapshot>, plan: &[&str]) -> Result
 pub(crate) fn admit_unit(
     input: &StepInput,
     cli: &WorkerCli,
+    operational_home: Option<&Path>,
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
-    admit_turn(Turn::Fresh, input, cli)
+    admit_turn(Turn::Fresh, input, cli, operational_home)
 }
 
 /// The run-wide EXISTENCE admission for a unit that spawns NO worker — a TOOL COMMAND
@@ -2698,12 +2800,15 @@ pub(crate) fn admit_turn(
     turn: Turn,
     input: &StepInput,
     cli: &WorkerCli,
+    // The engine's OPERATIONAL state home (the canonical parent of its own database, codex round
+    // 8) — fenced on every launch, so the fence check must know it (`fence_admit`).
+    operational_home: Option<&Path>,
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
     let refs = RequiredRefs::of(input);
     let snapshot = match turn {
         Turn::Fresh => match resolve_ladder()? {
             Ladder::Root(s) => {
-                fence_admit(&s)?;
+                fence_admit(&s, operational_home)?;
                 Some(s)
             }
             Ladder::Absent => None,
@@ -2749,8 +2854,11 @@ pub(crate) fn admit_turn(
 /// one is published is the fail-open ladder's opposite mistake), but it is said out loud — the
 /// plugin loads, its support files stay unreadable to the worker's file tools, and the fix is to
 /// publish a snapshot.
-fn fence_admit(snapshot: &SkillsSnapshot) -> Result<(), SkillsError> {
-    match crate::execute_wrapped::fence_check(&snapshot.root) {
+fn fence_admit(
+    snapshot: &SkillsSnapshot,
+    operational_home: Option<&Path>,
+) -> Result<(), SkillsError> {
+    match crate::execute_wrapped::fence_check(&snapshot.root, operational_home) {
         Ok(()) => Ok(()),
         Err(why) if snapshot.source == SnapshotSource::Published => Err(SkillsError::Config {
             var: SKILLS_SNAPSHOT_ENV,
@@ -2956,6 +3064,16 @@ mod tests {
 
     fn published(root: &Path) -> Result<Option<SkillsSnapshot>, SkillsError> {
         resolve_in(Some(root.to_path_buf()), None, None, &mut |_| {})
+    }
+
+    /// The admission entry points with NO operational state home (the tests here fence nothing
+    /// but the defaults); shadows the glob import.
+    fn admit_turn(
+        turn: Turn,
+        input: &StepInput,
+        cli: &WorkerCli,
+    ) -> Result<Option<SkillsSnapshot>, SkillsError> {
+        super::admit_turn(turn, input, cli, None)
     }
 
     /// The explicit path is loaded from its index: gen, hash, and the skills keyed by their
@@ -3763,7 +3881,6 @@ mod tests {
         let live = load_live(
             live_root(&base.join("live"), "1.0.0", &[]),
             SnapshotSource::LiveCache,
-            &mut |_| {},
         )
         .unwrap();
         let json = live
@@ -4570,12 +4687,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The live walk indexes nested skills, SKIPS (with a `skills.notice` naming it) a `SKILL.md`
-    /// without a frontmatter name rather than inventing one, never follows a symlink out of the
-    /// root, and approximates `portable` from the text.
+    /// The live walk indexes nested skills and approximates `portable` from the text — and is
+    /// FAIL-CLOSED like a published generation (codex round 8): a `SKILL.md` without a frontmatter
+    /// name (or block, or unreadable, or non-UTF-8) is REFUSED with the error, not skipped with a
+    /// notice; a symlink ANYWHERE in the root — a linked skill directory, a link under `scripts/`,
+    /// a linked `skills/` root — is refused by path; a plugin with no `skills/` at all is an empty
+    /// index. Through the ladder every such defect is `Ladder::Failed` with the reason (the
+    /// `skills.fallback FAILED` log), never a silent skip and never "no installed garden".
     #[cfg(unix)]
     #[test]
-    fn the_live_walk_indexes_nested_skills_skips_nameless_ones_and_does_not_follow_links() {
+    fn the_live_walk_indexes_nested_skills_and_refuses_nameless_skills_and_links() {
         let base = scratch("walk");
         let root = live_root(
             &base.join("plugin"),
@@ -4592,24 +4713,7 @@ mod tests {
             "",
             "Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/x.py`\n",
         );
-        std::fs::create_dir_all(root.join("skills").join("bare")).unwrap();
-        std::fs::write(
-            root.join("skills").join("bare").join("SKILL.md"),
-            "# no frontmatter\n",
-        )
-        .unwrap();
-        let outside = base.join("outside");
-        write_skill(&outside, "leak", "wicked-garden-leak");
-        std::os::unix::fs::symlink(outside.join("skills"), root.join("skills").join("linked"))
-            .unwrap();
-
-        let mut lines = Vec::new();
-        let s = load_live(
-            root.clone(),
-            SnapshotSource::LiveCache,
-            &mut collect(&mut lines),
-        )
-        .unwrap();
+        let s = load_live(root.clone(), SnapshotSource::LiveCache).unwrap();
         let names: Vec<&str> = s.skills().iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
@@ -4618,14 +4722,7 @@ mod tests {
                 "wicked-garden-qe",
                 "wicked-garden-qe-a11y"
             ],
-            "sorted by dir; the nameless one is skipped, the linked tree is not walked"
-        );
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            lines[0].contains("skills.notice")
-                && lines[0].contains("skills/bare/SKILL.md")
-                && lines[0].contains("not indexed"),
-            "{lines:?}"
+            "sorted by dir, nested included"
         );
         assert_eq!(s.skill("wicked-garden-qe-a11y").unwrap().dir, "qe/a11y");
         assert!(s.skill("wicked-garden-qe").unwrap().portable);
@@ -4633,35 +4730,70 @@ mod tests {
             !s.skill("wicked-garden-domain-extractor").unwrap().portable,
             "a ${{CLAUDE_PLUGIN_ROOT}} reference marks the skill Claude-only"
         );
+        let refused = |needle: &str| {
+            let err = load_live(root.clone(), SnapshotSource::LiveCache).expect_err(needle);
+            assert!(err.contains(needle), "{needle}: {err}");
+            err
+        };
+        // A nameless SKILL.md (no frontmatter block) ⇒ refused naming it, not skipped.
+        std::fs::create_dir_all(root.join("skills").join("bare")).unwrap();
+        std::fs::write(
+            root.join("skills").join("bare").join("SKILL.md"),
+            "# no frontmatter\n",
+        )
+        .unwrap();
+        refused("skills/bare/SKILL.md has no `---` frontmatter block");
+        // Non-UTF-8 ⇒ refused with the error.
+        std::fs::write(
+            root.join("skills").join("bare").join("SKILL.md"),
+            [b"---\nname: x\n---\n".as_slice(), &[0xff, 0xfe, 0xfd]].concat(),
+        )
+        .unwrap();
+        refused("skills/bare/SKILL.md is not UTF-8");
+        std::fs::remove_dir_all(root.join("skills").join("bare")).unwrap();
+        // A linked skill DIRECTORY ⇒ refused (round 5 skipped it).
+        let outside = base.join("outside");
+        write_skill(&outside, "leak", "wicked-garden-leak");
+        std::os::unix::fs::symlink(outside.join("skills"), root.join("skills").join("linked"))
+            .unwrap();
+        refused("skills/linked is a symlink");
+        std::fs::remove_file(root.join("skills").join("linked")).unwrap();
+        // A link under the support tree (`scripts/`) ⇒ refused by the whole-tree walk.
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("scripts").join("vendored")).unwrap();
+        refused("scripts/vendored is a symlink");
+        std::fs::remove_file(root.join("scripts").join("vendored")).unwrap();
+        // A linked SKILL.md file ⇒ refused.
+        std::fs::create_dir_all(root.join("skills").join("lf")).unwrap();
+        std::os::unix::fs::symlink(
+            skill_dir(&outside, "leak").join(SKILL_FILE),
+            root.join("skills").join("lf").join(SKILL_FILE),
+        )
+        .unwrap();
+        refused("skills/lf/SKILL.md is a symlink");
+        std::fs::remove_dir_all(root.join("skills").join("lf")).unwrap();
+        assert!(
+            load_live(root.clone(), SnapshotSource::LiveCache).is_ok(),
+            "well-formed again"
+        );
 
         // codex round 5: a linked `skills/` ROOT is refused AT `skills`, before anything under it
-        // is looked at — round 4 lstat-checked only the children, so `skills -> /outside` indexed
-        // the external tree and handed its paths to pi/opencode. Directly: an error naming the
-        // component. Through the ladder: the fallback candidate is a `Fallback` config error
-        // naming the root — never indexed, never silently skipped for "no root".
-        // (A skill-less `live_root` writes no `skills/` — a plugin without one is an EMPTY index,
-        // not a defect: nothing to follow — so the link is planted where the directory would be.)
+        // is looked at. (A skill-less `live_root` writes no `skills/` — a plugin without one is an
+        // EMPTY index, not a defect — so the link is planted where the directory would be.)
         let linked_root = live_root(&base.join("linked-root"), "1.0.0", &[]);
         assert!(
-            load_live(linked_root.clone(), SnapshotSource::LiveCache, &mut |_| {})
+            load_live(linked_root.clone(), SnapshotSource::LiveCache)
                 .unwrap()
                 .skills()
                 .is_empty(),
             "no skills/ at all is an empty index, not a containment defect"
         );
         std::os::unix::fs::symlink(outside.join("skills"), linked_root.join("skills")).unwrap();
-        let mut lines = Vec::new();
-        let err = load_live(
-            linked_root.clone(),
-            SnapshotSource::LiveCache,
-            &mut collect(&mut lines),
-        )
-        .expect_err("a linked skills/ root is not a contained tree");
+        let err = load_live(linked_root.clone(), SnapshotSource::LiveCache)
+            .expect_err("a linked skills/ root is not a contained tree");
         assert!(err.contains("skills is a symlink"), "{err}");
-        assert!(
-            lines.is_empty(),
-            "nothing under the link was walked: {lines:?}"
-        );
+        // Through the ladder (codex round 8): a FAILURE with the reason and a `FAILED` log — the
+        // no-root rung, so a skill-naming run is refused with it and a skill-free one proceeds.
         let config = base.join("claude-config");
         let cache = config
             .join("plugins")
@@ -4672,25 +4804,20 @@ mod tests {
         live_root(&cache, "2.0.0", &[]);
         std::os::unix::fs::symlink(outside.join("skills"), cache.join("skills")).unwrap();
         let mut lines = Vec::new();
-        let err = resolve_in(None, Some(config.clone()), None, &mut collect(&mut lines))
-            .expect_err("the ladder refuses a linked fallback root");
-        let SkillsError::Fallback { root: r, why } = &err else {
-            panic!("expected Fallback, got {err:?}");
+        let ladder =
+            resolve_ladder_in(None, Some(config.clone()), None, &mut collect(&mut lines)).unwrap();
+        let Ladder::Failed(why) = &ladder else {
+            panic!("expected Failed, got {ladder:?}");
         };
-        assert_eq!(r, &cache);
-        assert!(why.contains("skills is a symlink"), "{why}");
         assert!(
-            err.to_string()
-                .contains("cannot be used as the skills fallback")
-                && err.to_string().contains(&cache.display().to_string()),
-            "{err}"
+            why.contains("skills is a symlink") && why.contains(&cache.display().to_string()),
+            "{why}"
         );
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines.is_empty(),
-            "a refused fallback is not logged as taken: {lines:?}"
+            lines[0].contains("skills.fallback FAILED") && !lines[0].contains("using the"),
+            "a refused fallback is logged as FAILED, never as taken: {lines:?}"
         );
-        // A linked skill DIRECTORY inside a real `skills/` is still merely skipped (above); the
-        // root's own containment is what round 5 adds.
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4792,20 +4919,19 @@ mod tests {
             why.contains("skills/domain/SKILL.md has malformed frontmatter"),
             "{why}"
         );
-        // …and the live walk skips it with a notice naming the file and the reason.
+        // …and the live walk REFUSES it with the error naming the file (codex round 8 — round 5
+        // skipped it with a notice, leaving Claude to load a skill the engine could not index).
         let live = live_root(&base.join("live"), "1.0.0", &[("qe", "wicked-garden-qe")]);
         std::fs::write(
             skill_dir(&live, "qe").join(SKILL_FILE),
             "---\nname: wicked-garden-qe\nmandates:\n\t- x\n---\n",
         )
         .unwrap();
-        let mut lines = Vec::new();
-        let s = load_live(live, SnapshotSource::LiveCache, &mut collect(&mut lines)).unwrap();
-        assert!(s.skills().is_empty(), "{:?}", s.skills());
-        assert_eq!(lines.len(), 1, "{lines:?}");
+        let err = load_live(live, SnapshotSource::LiveCache)
+            .expect_err("a live root with a malformed SKILL.md is not a fallback");
         assert!(
-            lines[0].contains("malformed frontmatter") && lines[0].contains("skills/qe/SKILL.md"),
-            "{lines:?}"
+            err.contains("skills/qe/SKILL.md has malformed frontmatter"),
+            "{err}"
         );
         assert_eq!(derived_name("qe/a11y"), "wicked-garden-qe-a11y");
         assert!(is_garden_name("wicked-garden-qe") && !is_garden_name("wicked-testing-qe"));
@@ -5434,9 +5560,11 @@ mod tests {
             refused("views/copilot is a symlink");
             std::fs::remove_dir_all(root.join("views")).unwrap();
             // .venv: with NO baseline env root in the state home, any link is refused naming the
-            // missing root; with one, a link elsewhere ⇒ refused ("not inside"); into
-            // `<state home>/skills/baseline/<64-hex>/.venv` ⇒ fine; a non-hex baseline name ⇒
-            // refused; dangling ⇒ refused.
+            // missing root; with one, a link elsewhere ⇒ refused ("not exactly"); crew's link into
+            // `<state home>/skills/baseline/<64-hex>/.venv` — RELATIVE as crew writes it, or
+            // absolute — ⇒ fine; a non-hex baseline name ⇒ refused; dangling ⇒ refused; (codex
+            // round 8) a target with a component BEYOND `.venv` (`<hash>/.venv/bin`), one that
+            // climbs back out (`<hash>/.venv/../x`), and a SYMLINKED `baseline` are refused.
             let venv = root.join(".venv");
             std::os::unix::fs::symlink(&outside, &venv).unwrap();
             refused("has no baseline env root");
@@ -5447,7 +5575,7 @@ mod tests {
                 .join(&hash)
                 .join(".venv");
             std::fs::create_dir_all(env.join("bin")).unwrap();
-            refused("not inside");
+            refused("not exactly");
             std::fs::remove_file(&venv).unwrap();
             std::os::unix::fs::symlink(&env, &venv).unwrap();
             assert!(
@@ -5456,6 +5584,19 @@ mod tests {
                 published(&root).err()
             );
             std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(format!("../../baseline/{hash}/.venv"), &venv).unwrap();
+            assert!(
+                published(&root).is_ok(),
+                "the RELATIVE spelling crew writes is accepted: {:?}",
+                published(&root).err()
+            );
+            std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(env.join("bin"), &venv).unwrap();
+            refused("not exactly");
+            std::fs::remove_file(&venv).unwrap();
+            std::os::unix::fs::symlink(format!("../../baseline/{hash}/.venv/../x"), &venv).unwrap();
+            refused("not exactly");
+            std::fs::remove_file(&venv).unwrap();
             let bad_env = base
                 .join(SKILLS_DIR)
                 .join("baseline")
@@ -5463,11 +5604,21 @@ mod tests {
                 .join(".venv");
             std::fs::create_dir_all(&bad_env).unwrap();
             std::os::unix::fs::symlink(&bad_env, &venv).unwrap();
-            refused("not inside");
+            refused("not exactly");
             std::fs::remove_file(&venv).unwrap();
             std::os::unix::fs::symlink(base.join("nowhere").join(".venv"), &venv).unwrap();
-            refused("does not resolve");
+            refused("not exactly");
             std::fs::remove_file(&venv).unwrap();
+            // A symlinked `baseline` ⇒ refused even for a target that spells the right path.
+            let real_baseline = base.join("real-baseline");
+            std::fs::rename(base.join(SKILLS_DIR).join("baseline"), &real_baseline).unwrap();
+            std::os::unix::fs::symlink(&real_baseline, base.join(SKILLS_DIR).join("baseline"))
+                .unwrap();
+            std::os::unix::fs::symlink(&env, &venv).unwrap();
+            refused("skills/baseline` is a symlink");
+            std::fs::remove_file(&venv).unwrap();
+            std::fs::remove_file(base.join(SKILLS_DIR).join("baseline")).unwrap();
+            std::fs::rename(&real_baseline, base.join(SKILLS_DIR).join("baseline")).unwrap();
             // A .venv link that is NOT at the root is an ordinary (refused) link.
             std::os::unix::fs::symlink(&env, skill_dir(&root, "domain").join(".venv")).unwrap();
             refused("skills/domain/.venv is a symlink");
@@ -5492,7 +5643,6 @@ mod tests {
                 &[("core", "wicked-garden-core"), ("mem", "wicked-garden-mem")],
             ),
             SnapshotSource::LiveCache,
-            &mut |_| {},
         )
         .unwrap();
         let claude = WorkerCli::Claude;
@@ -5768,7 +5918,6 @@ mod tests {
         let live = load_live(
             live_root(&base.join("live"), "1.0.0", &[]),
             SnapshotSource::LiveCache,
-            &mut |_| {},
         )
         .unwrap();
         assert_eq!(live.state_home, None);

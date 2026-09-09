@@ -36,6 +36,21 @@ pub fn names_generation(reported: &str, snapshot: &Path) -> bool {
     }
 }
 
+/// A path spelled for a SHELL command line: the Windows `\\?\` verbatim prefix that `canonicalize`
+/// adds is dropped (`\\?\C:\x` → `C:\x`, `\\?\UNC\srv\share` → `\\srv\share`) — `cmd.exe` answers
+/// "The specified path is invalid" to a verbatim path (review pass 9: the windows job's tool
+/// command could not create its marker file). A no-op for every other spelling and OS.
+pub fn shell_spelling(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.into_owned()
+    }
+}
+
 /// The path a skills refusal names as the generation it judged the run against — the text
 /// between `the skills snapshot at ` and ` does not hold` in `SkillsError::Missing`'s wording — or
 /// `None` when the message names no snapshot (a refusal with no root at all).

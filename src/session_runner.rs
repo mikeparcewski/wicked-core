@@ -38,7 +38,7 @@ use crate::command::Command;
 use crate::event::CoreEvent;
 use crate::execute_wrapped::{
     binary_is_claude, build_argv, inject_claude_stream_flags, pty_unit_prompt, resolve_invocation,
-    AdapterOut, ClaudeStreamJson, OutputAdapter, SkillForm,
+    skills_refusal, AdapterOut, ClaudeStreamJson, OutputAdapter, SkillForm,
 };
 use crate::terminal;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
@@ -62,6 +62,9 @@ pub struct PersistentStepRunner {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     timeout: Duration,
 }
+
+/// The carrier's name in a skills refusal (`SkillsError::CarrierWithoutSkills`).
+const PTY_CARRIER: &str = "persistent PTY";
 
 impl PersistentStepRunner {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<Command>, pty: terminal::PtyMap) -> Self {
@@ -229,6 +232,20 @@ impl StepRunner for PersistentStepRunner {
 impl PersistentStepRunner {
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
+        // core#396 (codex round 8, ADJUDICATED): this carrier opens the raw CLI — no snapshot
+        // resolution, no admission, no isolation flags, no delivery lever — so it cannot hand a
+        // skill to the worker. A skill-bearing unit is REFUSED by name here, before any session is
+        // opened or written to, and no invocation directive is ever emitted on this carrier;
+        // skill-free units run exactly as before.
+        if let Some(skill) = input.unit.skill_ref.as_deref().filter(|s| !s.is_empty()) {
+            return skills_refusal(
+                input,
+                &crate::skills_snapshot::SkillsError::CarrierWithoutSkills {
+                    carrier: PTY_CARRIER.to_string(),
+                    skills: vec![skill.to_string()],
+                },
+            );
+        }
         // ONE resolution of the invocation template for this turn: the session argv (when a
         // session is opened) and the prompt's skill form both read THIS value, so they cannot name
         // different binaries even if the registry is reloaded between the two uses.
@@ -769,6 +786,49 @@ mod tests {
 
         // Explicit teardown — closes the PTY cleanly.
         runner.drop_session("run-shared-session");
+        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+    }
+
+    /// core#396 (codex round 8, ADJUDICATED): the persistent PTY carrier does not load the skills
+    /// snapshot, so a skill-bearing unit is REFUSED by name — naming the carrier and the skill —
+    /// before any session is opened (no `TerminalOpened`), and no invocation directive is ever
+    /// written to a PTY: a skill-free unit on the same run still runs, and the prompt the fake CLI
+    /// echoes back carries no `Invoke your skill`.
+    #[test]
+    fn a_skill_bearing_unit_is_refused_on_the_pty_carrier_and_no_directive_is_written() {
+        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let invocation = fake_cli_invocation();
+        let mut skilled = make_unit("extract the rules", &invocation);
+        skilled.skill_ref = Some("wicked-garden-domain".to_string());
+        let out = runner.run_unit(&make_input("run-pty-skills", 0, skilled));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output
+                .contains("persistent PTY sessions do not load the skills snapshot")
+                && out.output.contains("wicked-garden-domain")
+                && out.output.contains("wrapped or ACP carrier"),
+            "refused by name, naming the carrier: {}",
+            out.output
+        );
+        let mut opened = 0usize;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, CoreEvent::TerminalOpened { .. }) {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 0, "a refused unit opens no session");
+        // Skill-free: unchanged — the session opens, the turn runs, and no directive is written.
+        let plain = make_unit("second work", &invocation);
+        let out = runner.run_unit(&make_input("run-pty-skills", 1, plain));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(
+            out.output.contains("WKRTURN:") && !out.output.contains("Invoke your skill"),
+            "the PTY prompt carries no skill directive: {}",
+            out.output
+        );
+        runner.drop_session("run-pty-skills");
         wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
     }
 

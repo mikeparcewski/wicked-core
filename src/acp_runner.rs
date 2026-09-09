@@ -1172,11 +1172,14 @@ pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// branches are testable without mutating the test process's environment. The home is
 /// launch-independent (v3.1 §3): the settings a particular launch needs — its fence, its
 /// snapshot — ride that session's own configuration ([`SessionOptions`]), never this shared dir.
-fn worker_claude_config_dir(inherit_operator: bool) -> Option<anyhow::Result<std::path::PathBuf>> {
+fn worker_claude_config_dir(
+    inherit_operator: bool,
+    operational_home: Option<&std::path::Path>,
+) -> Option<anyhow::Result<std::path::PathBuf>> {
     if inherit_operator {
         return None;
     }
-    Some(ensure_worker_config_home())
+    Some(ensure_worker_config_home(operational_home))
 }
 
 /// Mint a fresh, engine-owned config directory for ONE ACP spawn.
@@ -1248,7 +1251,11 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 /// whatever its own settings say; it rides each session's `session/new` options and per-session
 /// settings file instead ([`write_session_settings`]). Written atomically (tmp + rename) so a
 /// concurrent spawn's CLI never reads a torn file.
-fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
+fn ensure_worker_config_home(
+    // The engine's operational state home (codex round 8): kept OUT of the shared file's blanket
+    // like every state-home candidate (its fence rides each session's own configuration).
+    operational_home: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
     static ENSURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = ENSURE.lock().unwrap_or_else(|p| p.into_inner());
     let dir = worker_config_home()?;
@@ -1307,7 +1314,7 @@ fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
     }
     sweep_own_settings_temps(&dir)?;
     let settings = json!({
-        "permissions": { "deny": crate::execute_wrapped::shared_deny_rules() }
+        "permissions": { "deny": crate::execute_wrapped::shared_deny_rules(operational_home) }
     });
     write_atomic(&dir, &settings_path, &serde_json::to_vec(&settings)?)?;
     Ok(dir)
@@ -1656,6 +1663,8 @@ fn start_acp_process(
     // denies in the system temp. UNIT sessions pass `<cwd>/tmp`; CHAT sessions pass `None` —
     // dropping a `tmp/` dir into a user's own working directory would be intrusive.
     scratch_tmp: Option<&std::path::Path>,
+    // The engine's own operational state home (codex round 8), fenced on chat sessions too.
+    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
     // No skills delivery and no per-session settings dir: CHAT sessions (and the tests that use
     // this shape) are not run units — the skills handoff belongs to the unit path, which calls
@@ -1669,6 +1678,7 @@ fn start_acp_process(
         &[],
         &crate::skills_snapshot::SkillsDelivery::None,
         None,
+        operational_home,
     )
 }
 
@@ -1704,7 +1714,15 @@ pub(crate) struct SessionOptions<'a> {
     pub skills_plugin: Option<&'a std::path::Path>,
     pub deny: &'a [String],
     pub settings: Option<&'a std::path::Path>,
+    /// `settingSources` — the ACP analog of the wrapped path's `--setting-sources project,local`
+    /// (codex round 8): the engine OWNS the scope selection, so this is SET (not merged — a list
+    /// that kept an existing `user` would defeat the isolation) when present; `None` under the
+    /// inherit-config hatch, where the bridge's own default (`user,project,local`) applies.
+    pub setting_sources: Option<&'a [&'a str]>,
 }
+
+/// The scopes a worker session reads its settings from — never the operator's `user` scope.
+pub(crate) const ENGINE_SETTING_SOURCES: &[&str] = &["project", "local"];
 
 #[cfg(test)]
 impl SessionOptions<'_> {
@@ -1712,6 +1730,7 @@ impl SessionOptions<'_> {
         skills_plugin: None,
         deny: &[],
         settings: None,
+        setting_sources: None,
     };
 }
 
@@ -1760,6 +1779,9 @@ fn attach_session_options(params: &mut Value, options: &SessionOptions<'_>) {
     }
     if let Some(path) = options.settings {
         claude_code_options(params)["settings"] = json!(path.to_string_lossy().as_ref());
+    }
+    if let Some(sources) = options.setting_sources {
+        claude_code_options(params)["settingSources"] = json!(sources);
     }
 }
 
@@ -1853,6 +1875,8 @@ fn start_acp_process_with_write_roots(
     // `Some((run_id, cli_key))` for a UNIT session: names its per-session settings directory
     // (v3.1 §3). `None` for chat sessions.
     session: Option<(&str, &str)>,
+    // The engine's OWN operational state home (codex round 8) — fenced on every launch.
+    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
     use crate::skills_snapshot::SkillsDelivery;
     // FINDING-061: decided BEFORE the spawn closure so both spawn attempts (the bare binary and
@@ -1860,33 +1884,35 @@ fn start_acp_process_with_write_roots(
     // that proceeded without the override would run under the operator's own configuration,
     // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
     // carries its own isolation.
-    let worker_config_dir =
-        match worker_claude_config_dir(crate::execute_wrapped::inherits_operator_config()) {
-            None => None,
-            Some(Ok(dir)) => Some(dir),
-            Some(Err(e)) => {
-                return Err(anyhow::anyhow!(
-                    "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+    let worker_config_dir = match worker_claude_config_dir(
+        crate::execute_wrapped::inherits_operator_config(),
+        operational_home,
+    ) {
+        None => None,
+        Some(Ok(dir)) => Some(dir),
+        Some(Err(e)) => {
+            return Err(anyhow::anyhow!(
+                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
                      under the operator's own CLI configuration (FINDING-061)"
-                ))
-            }
-        };
+            ))
+        }
+    };
     let skills_plugin: Option<&std::path::Path> = match delivery {
         SkillsDelivery::ClaudePlugin(root) => Some(root.as_path()),
         _ => None,
     };
     // v3.1 §3: THIS launch's fence — the state-home registry when the snapshot sits in the read
-    // slot, the blanket otherwise (`execute_wrapped::deny_rules`) — computed once here and
-    // carried on this session's own configuration only: the `session/new` options and, for a
-    // unit session, its per-session settings file under the worker home. Nothing
-    // launch-dependent touches the shared worker home. Under the inherit escape hatch (no worker
-    // home minted) there is no fence, exactly as on the wrapped path. Attached for every bridge:
-    // only the Claude bridge reads `_meta.claudeCode.options`, and the others ignore the
-    // extension — one code path, exercised by every stub the tests drive.
-    let deny: Vec<String> = match &worker_config_dir {
-        Some(_) => crate::execute_wrapped::deny_rules(skills_plugin),
-        None => Vec::new(),
-    };
+    // slot, the blanket otherwise (`execute_wrapped::deny_rules`), the engine's own operational
+    // home included (codex round 8) — computed once here and carried on this session's own
+    // configuration only: the `session/new` options and, for a unit session, its per-session
+    // settings file under the worker home. Nothing launch-dependent touches the shared worker
+    // home. ALWAYS injected — the inherit escape hatch inherits the operator's scopes (no
+    // engine-minted worker home, no `settingSources` override), never the fence (codex round 8;
+    // the wrapped path does the same). Attached for every bridge: only the Claude bridge reads
+    // `_meta.claudeCode.options`, and the others ignore the extension — one code path, exercised
+    // by every stub the tests drive.
+    let inherit = crate::execute_wrapped::inherits_operator_config();
+    let deny: Vec<String> = crate::execute_wrapped::deny_rules(skills_plugin, operational_home);
     let session_settings: Option<std::path::PathBuf> = match (session, &worker_config_dir) {
         (Some((run_id, cli_key)), Some(home)) => {
             Some(write_session_settings(home, run_id, cli_key, &deny)?)
@@ -1897,6 +1923,11 @@ fn start_acp_process_with_write_roots(
         skills_plugin,
         deny: &deny,
         settings: session_settings.as_deref(),
+        setting_sources: if inherit {
+            None
+        } else {
+            Some(ENGINE_SETTING_SOURCES)
+        },
     };
     // v3.2: opencode's lever rides the SAME variable its governance content does — composed,
     // never replaced. The seat's registry value is the base when it names that variable; else
@@ -3900,6 +3931,10 @@ pub struct AcpStepRunner {
     chat_activity: Arc<Mutex<HashMap<String, Instant>>>,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
+    /// The engine's OWN operational state home — the canonical parent of the database it was
+    /// spawned on (codex round 8) — fenced on every launch, snapshot or not. `None` outside an
+    /// engine spawn (`new`, the tests).
+    operational_home: Option<std::path::PathBuf>,
     /// Shared elicitation coordination state (DES-002). One Arc per Core instance; also held
     /// by the actor for `Command::ResolveElicitation` dispatch.
     pub elicitation_maps: Arc<Mutex<ElicitationMaps>>,
@@ -3950,6 +3985,17 @@ impl AcpStepRunner {
         Self::new_with_maps(tx, maps, write_reg)
     }
 
+    /// [`new`](Self::new) for the runner the engine spawns on a STORE (codex round 8): `db_path`
+    /// is the database `Core::spawn` was given; its canonical parent is the daemon's operational
+    /// state home (`state_home::operational_home_of_db`), fenced on every launch this runner and
+    /// its wrapped fallback make — snapshot or not.
+    pub(crate) fn new_for_store(tx: std::sync::mpsc::Sender<Command>, db_path: &str) -> Self {
+        let mut runner = Self::new(tx.clone());
+        runner.operational_home = crate::state_home::operational_home_of_db(db_path);
+        runner.fallback = WrappedCliStepRunner::with_tx_for_store(tx, db_path);
+        runner
+    }
+
     /// Construct with explicitly-provided `ElicitationMaps` and `WriteReg` Arcs.
     ///
     /// Used by `spawn_with_acp_sessions` so the actor and the runner share the same
@@ -3972,6 +4018,7 @@ impl AcpStepRunner {
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             timeout: Duration::from_secs(secs),
+            operational_home: None,
             elicitation_maps,
             write_reg,
         }
@@ -4187,7 +4234,8 @@ impl AcpStepRunner {
             ));
         }
         // Chat is repo-less exploration → no estate MCP server (FINDING-122).
-        let proc = start_acp_process(&config, cwd, None, None).map_err(|e| e.to_string())?;
+        let proc = start_acp_process(&config, cwd, None, None, self.operational_home.as_deref())
+            .map_err(|e| e.to_string())?;
         let arc = Arc::new(Mutex::new(proc));
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         // A racing ensure may have inserted first — reuse theirs, drop ours.
@@ -4579,7 +4627,12 @@ impl AcpStepRunner {
                 crate::skills_snapshot::Turn::Fresh
             }
         };
-        let skills = match crate::skills_snapshot::admit_turn(turn, input, &worker_cli) {
+        let skills = match crate::skills_snapshot::admit_turn(
+            turn,
+            input,
+            &worker_cli,
+            self.operational_home.as_deref(),
+        ) {
             Ok(s) => s,
             Err(e) => return crate::execute_wrapped::skills_refusal(input, &e),
         };
@@ -4895,6 +4948,7 @@ impl AcpStepRunner {
                     &estate_provenance,
                     &delivery,
                     Some((run_id.as_str(), cli_key.as_str())),
+                    self.operational_home.as_deref(),
                 ) {
                     Ok(mut proc) => {
                         // core#396: BIND the admitted snapshot to the process it was handed to.
@@ -5021,6 +5075,7 @@ impl AcpStepRunner {
                 crate::skills_snapshot::Turn::Cached(bound.clone()),
                 input,
                 &worker_cli,
+                self.operational_home.as_deref(),
             ) {
                 drop(proc);
                 return crate::execute_wrapped::skills_refusal(input, &e);
@@ -5435,6 +5490,51 @@ mod tests {
     // fixture, in the flake that motivated this (core#285) — and trips the FINDING-061 guard.
     // Lock order everywhere: ENV_LOCK before REAL_STARTS.
     use crate::test_env::ENV_LOCK;
+
+    /// The spawn and worker-home entry points with NO operational state home (codex round 8 —
+    /// these tests fence nothing but the defaults and the handed snapshot's home); shadow the glob
+    /// imports. The operational-home cases live in `execute_wrapped::tests` against the fence
+    /// builders themselves.
+    fn start_acp_process(
+        config: &AcpConfig,
+        cwd: &std::path::Path,
+        code_graph_db: Option<&str>,
+        scratch_tmp: Option<&std::path::Path>,
+    ) -> anyhow::Result<AcpProcess> {
+        super::start_acp_process(config, cwd, code_graph_db, scratch_tmp, None)
+    }
+    /// `#[cfg(unix)]`: its only callers drive shell-script stubs (Unix-only), so on Windows it
+    /// would be dead code under `-D warnings`.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    fn start_acp_process_with_write_roots(
+        config: &AcpConfig,
+        cwd: &std::path::Path,
+        code_graph_db: Option<&str>,
+        scratch_tmp: Option<&std::path::Path>,
+        extra_write_roots: &[String],
+        estate_provenance: &[(String, String)],
+        delivery: &crate::skills_snapshot::SkillsDelivery,
+        session: Option<(&str, &str)>,
+    ) -> anyhow::Result<AcpProcess> {
+        super::start_acp_process_with_write_roots(
+            config,
+            cwd,
+            code_graph_db,
+            scratch_tmp,
+            extra_write_roots,
+            estate_provenance,
+            delivery,
+            session,
+            None,
+        )
+    }
+    fn ensure_worker_config_home() -> anyhow::Result<std::path::PathBuf> {
+        super::ensure_worker_config_home(None)
+    }
+    fn worker_claude_config_dir(inherit: bool) -> Option<anyhow::Result<std::path::PathBuf>> {
+        super::worker_claude_config_dir(inherit, None)
+    }
 
     /// A fresh base dir for a worker-home fixture. Keyed by test name + pid + a process-wide
     /// counter — NEVER by `ThreadId` (core#285): the harness pools test threads, so a
@@ -7331,6 +7431,7 @@ sleep 30
             skills_plugin: Some(root),
             deny: &[],
             settings: None,
+            setting_sources: None,
         };
         let handed = session_new_params(cwd, servers.clone(), &with_plugin(gen7));
         assert_eq!(
@@ -7370,15 +7471,24 @@ sleep 30
                 skills_plugin: None,
                 deny: &deny,
                 settings: Some(std::path::Path::new("/wh/sessions/r-claude/settings.json")),
+                setting_sources: Some(ENGINE_SETTING_SOURCES),
             },
         );
         let options = &fenced["_meta"]["claudeCode"]["options"];
         assert_eq!(options["disallowedTools"], serde_json::json!(deny));
         assert_eq!(options["settings"], "/wh/sessions/r-claude/settings.json");
+        // codex round 8 (M2): the production frame carries the engine's scope selection — the
+        // ACP analog of `--setting-sources project,local` — and SETS it (an existing `user`
+        // kept by a merge would defeat the isolation); `None` (the hatch) leaves it absent.
+        assert_eq!(
+            options["settingSources"],
+            serde_json::json!(["project", "local"]),
+            "{fenced}"
+        );
         assert!(options.get("plugins").is_none(), "{fenced}");
         let mut params = serde_json::json!({
             "cwd": "/wt", "mcpServers": [],
-            "_meta": {"claudeCode": {"options": {"disallowedTools": ["AskUserQuestion", "Bash(sudo:*)"]}}}
+            "_meta": {"claudeCode": {"options": {"disallowedTools": ["AskUserQuestion", "Bash(sudo:*)"], "settingSources": ["user", "project", "local"]}}}
         });
         attach_session_options(
             &mut params,
@@ -7386,7 +7496,29 @@ sleep 30
                 skills_plugin: None,
                 deny: &deny,
                 settings: None,
+                setting_sources: Some(ENGINE_SETTING_SOURCES),
             },
+        );
+        assert_eq!(
+            params["_meta"]["claudeCode"]["options"]["settingSources"],
+            serde_json::json!(["project", "local"]),
+            "an existing `user` scope is REPLACED, not merged: {params}"
+        );
+        let mut hatch = serde_json::json!({"cwd": "/wt", "mcpServers": []});
+        attach_session_options(
+            &mut hatch,
+            &SessionOptions {
+                skills_plugin: None,
+                deny: &deny,
+                settings: None,
+                setting_sources: None,
+            },
+        );
+        assert!(
+            hatch["_meta"]["claudeCode"]["options"]
+                .get("settingSources")
+                .is_none(),
+            "under the hatch no scope selection is attached: {hatch}"
         );
         assert_eq!(
             params["_meta"]["claudeCode"]["options"]["disallowedTools"],
@@ -8110,19 +8242,41 @@ transport = "stdio"
             );
             return;
         };
-        let real_home = std::env::var_os("HOME")
+        // ISOLATED worker home (codex round 8): an operator-prepared, logged-in worker home named
+        // by `WICKED_SKILLS_LIVE_WORKER_HOME` — NEVER the operator's real `~/.wicked-worker`,
+        // which this test used to re-aim the engine at. Refused when it resolves there; skipped
+        // when unset. The pre-main arming stays the fallback value restored afterwards (never
+        // `remove_var` — see `hermetic_test_worker_home`).
+        let Some(live_worker_home) = std::env::var_os("WICKED_SKILLS_LIVE_WORKER_HOME")
             .map(std::path::PathBuf::from)
-            .expect("HOME");
+            .filter(|p| p.is_dir())
+        else {
+            eprintln!(
+                "SKIP: set WICKED_SKILLS_LIVE_WORKER_HOME to an isolated, logged-in worker home \
+                 (never your real ~/.wicked-worker) to launch the live ACP test"
+            );
+            return;
+        };
+        if let Some(real) =
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".wicked-worker"))
+        {
+            let same = match (
+                std::fs::canonicalize(&live_worker_home),
+                std::fs::canonicalize(&real),
+            ) {
+                (Ok(a), Ok(b)) => a == b || a.starts_with(&b),
+                _ => live_worker_home == real,
+            };
+            assert!(
+                !same,
+                "WICKED_SKILLS_LIVE_WORKER_HOME must not be (or lie under) the operator's real \
+                 ~/.wicked-worker"
+            );
+        }
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
-        // The engine's own logged-in worker home: the pre-main arming points WICKED_WORKER_HOME at
-        // a scratch dir (no login there); this one launch uses the real one and restores the
-        // armed value afterwards (never `remove_var` — see `hermetic_test_worker_home`).
         let armed = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
-        std::env::set_var(
-            wicked_apps_core::spawn::WORKER_HOME_ENV,
-            real_home.join(".wicked-worker"),
-        );
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &live_worker_home);
         // The bridge's directory FIRST on PATH, so the registry seat's bare `claude-agent-acp`
         // resolves to it exactly as the daemon's would.
         let prev_path = std::env::var_os("PATH");
@@ -8746,10 +8900,18 @@ transport = "stdio"
                     "under the hatch the snapshot is still handed at session/new: {}",
                     entries[2]
                 );
+                // codex round 8: the hatch inherits the operator's SCOPES (no engine
+                // `settingSources` override) — never the fence, which rides the frame under it.
                 assert!(
                     entries[2]["new"]["_meta"]["claudeCode"]["options"]["disallowedTools"]
-                        .is_null(),
-                    "the hatch inherits the operator's configuration — no engine fence: {}",
+                        .as_array()
+                        .is_some_and(|d| !d.is_empty()),
+                    "the deny fence rides the frame even under the hatch: {}",
+                    entries[2]
+                );
+                assert!(
+                    entries[2]["new"]["_meta"]["claudeCode"]["options"]["settingSources"].is_null(),
+                    "under the hatch the operator's scopes are inherited (no engine override): {}",
                     entries[2]
                 );
                 assert!(
@@ -8947,7 +9109,7 @@ transport = "stdio"
         // that can drift. The state-home rule rides each session's `session/new` options.
         assert_eq!(
             deny,
-            crate::execute_wrapped::shared_deny_rules(),
+            crate::execute_wrapped::shared_deny_rules(None),
             "the shared ACP settings must be the launch-independent fence, not a copy that can drift"
         );
         assert!(
