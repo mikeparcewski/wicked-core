@@ -27,13 +27,15 @@
 //! - both governance carriers read-widen to the snapshot (`execute_wrapped::assemble_read_roots`);
 //!   the worker Read fence over crew's state home is an EXPLICIT denylist (`state_home`,
 //!   `execute_wrapped::deny_rules`) under which the resolved `skills/snapshots/<gen>/` is the one
-//!   non-denied path. The state home is the ACTUAL one — DERIVED from the snapshot's own path
-//!   (`<state home>/skills/snapshots/<gen>`, three components up: `state_home::of_snapshot`), and
-//!   required to agree with `WICKED_CREW_STATE_HOME` when the daemon states one — never a
-//!   `.wicked-crew` basename: a scratch daemon on a custom state home is fenced exactly like the
-//!   default one. A snapshot without that shape is a config error at load, and one anywhere else
-//!   inside the fence FAILS the launch (`execute_wrapped::fence_check`, v3.1 §1); writes under
-//!   it stay denied — a snapshot is immutable by contract, and this module never writes into one;
+//!   non-denied path. The state home is the ACTUAL one — DERIVED from the snapshot's own path and
+//!   from nothing else (`<state home>/skills/snapshots/<gen>`: the parent literally `snapshots`,
+//!   the grandparent literally `skills`, the state home three components up —
+//!   `state_home::of_snapshot`; design v3.4 §2 retired the round-4 companion variable
+//!   `WICKED_CREW_STATE_HOME`, which is not read anywhere) — never a `.wicked-crew` basename: a
+//!   scratch daemon on a custom state home is fenced exactly like the default one. A snapshot
+//!   without that shape is a config error at load naming the path, and one anywhere else inside
+//!   the fence FAILS the launch (`execute_wrapped::fence_check`, v3.1 §1); writes under it stay
+//!   denied — a snapshot is immutable by contract, and this module never writes into one;
 //! - the skill directive is CLI-aware (`execute_wrapped::plugin_skill_invocation`): the plugin
 //!   form for Claude, the mirrored directory name for every other CLI.
 //!
@@ -43,14 +45,18 @@
 //! withdrawn: crew resolves its `current` pointer and passes the concrete generation path.)
 //!
 //! 1. [`SKILLS_SNAPSHOT_ENV`] set ⇒ that path, strictly ([`load_published`]): it must be absolute,
-//!    no ancestor may be a symlink (a link above a pinned generation could re-aim it later), it
-//!    is pinned to its canonical real path (a FINAL-component link such as crew's `current` is
-//!    followed once, at load; a DANGLING one is a config error naming the missing target), and
-//!    its index must describe files that actually exist — every component from the root down
-//!    (`.claude-plugin/`, `plugin.json`, `snapshot.json`, `skills/`, each skill directory, each
-//!    `SKILL.md`) is lstat-verified NOT to be a symlink and read without following one. Any
-//!    shortfall is a config error — a deliberately chosen snapshot is never silently swapped.
-//!    Set but EMPTY is invalid explicit configuration, not "unset".
+//!    EVERY component including the LAST must be a real directory — no ancestor may be a symlink
+//!    (a link above a pinned generation could re-aim it later) and neither may the final component
+//!    (crew's `current -> snapshots/<gen>` is resolved by CREW before the handoff, v3.4 §2; a
+//!    handed `current` is a config error naming the link and its target, so a fresh launch can
+//!    never change generation between two units of one run) — its identity must hold
+//!    (`snapshot.json.gen` equals the generation directory's name; `contentHash` and `gardenSource`
+//!    present; every skill keyed by its frontmatter `name`, which must equal the path-derived
+//!    name), and its index must describe files that actually exist — every component from the
+//!    root down (`.claude-plugin/`, `plugin.json`, `snapshot.json`, `skills/`, each skill
+//!    directory, each `SKILL.md`) is lstat-verified NOT to be a symlink and read without following
+//!    one. Any shortfall is a config error — a deliberately chosen snapshot is never silently
+//!    swapped. Set but EMPTY is invalid explicit configuration, not "unset".
 //! 2. Unset ⇒ the LIVE installed garden: the marketplace cache's highest version under the
 //!    daemon's `CLAUDE_CONFIG_DIR` (else `~/.claude`), logged as `skills.fallback`. NOT the hand
 //!    copy at `<config>/plugins/wicked-garden` — that stale copy is the defect being fixed, never
@@ -76,8 +82,18 @@
 //! On the ACP path a CACHED session is admitted against ITS pinned snapshot before any ambient
 //! resolution happens (v3.1 §4) — `acp_runner::exec_turn_inner` consults the session cache first
 //! and hands what it pinned to [`admit_turn`], ONE policy for fresh and cached turns alike: the
-//! inherit-config escape hatch first, then the pinned generation if there is one, else the
-//! ambient root through the ladder and the fence check (codex round 4).
+//! pinned generation if there is one, else the ambient root through the ladder and the fence
+//! check (codex round 4). The inherit-config escape hatch
+//! (`execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`) bypasses NONE of this (codex round 6): it
+//! decides only whether the operator's ambient configuration is inherited IN ADDITION to the
+//! snapshot — an invalid explicit snapshot is a launch error, a missing required skill a refusal
+//! by name, and a template `--plugin-dir` is stripped, hatch or not.
+//!
+//! A TOOL-COMMAND unit spawns no worker, but the run-wide EXISTENCE admission still runs before
+//! it ([`admit_plan`], codex round 6): a plan whose later agent unit names a skill the root lacks
+//! is refused at its first unit whatever kind that unit is — a tool command that mutates state
+//! before the missing skill is discovered is exactly the "work before refusal" the plan-wide set
+//! exists to prevent.
 //!
 //! The generation in use is reported at every launch — the `skills.snapshot gen=…` log line
 //! ([`SkillsSnapshot::report`]) and the [`CoreEvent::SkillsSnapshotHanded`] event
@@ -396,15 +412,17 @@ pub(crate) struct SkillsSnapshot {
     /// cannot re-aim a pinned generation.
     pub root: PathBuf,
     pub source: SnapshotSource,
-    /// `snapshot.json`'s `gen` — `None` for a fallback root, which has no index.
+    /// The VERIFIED generation: the generation directory's name (`000007`, as crew publishes it
+    /// and reaps by), which `snapshot.json.gen` was checked to equal at load. `None` for a
+    /// fallback root, which has no index.
     pub gen: Option<String>,
-    /// `snapshot.json`'s `contentHash`, when the index carries one.
+    /// `snapshot.json`'s `contentHash` — required for a published snapshot; `None` for a
+    /// fallback root.
     pub content_hash: Option<String>,
     /// The crew state home this generation was published under — DERIVED from the root's own
-    /// shape (`<state home>/skills/snapshots/<gen>`, `state_home::derive`) and, when the daemon
-    /// states `WICKED_CREW_STATE_HOME`, checked to agree with it. The worker Read fence over that
-    /// directory is the registry (`execute_wrapped::deny_rules`). `None` for a fallback root,
-    /// which has no state home (it sits in the claude config dir).
+    /// shape (`<state home>/skills/snapshots/<gen>`, `state_home::derive`) and from nothing else.
+    /// The worker Read fence over that directory is the registry (`execute_wrapped::deny_rules`).
+    /// `None` for a fallback root, which has no state home (it sits in the claude config dir).
     pub state_home: Option<PathBuf>,
     skills: Vec<SkillEntry>,
 }
@@ -418,19 +436,12 @@ pub(crate) struct Closure<'a> {
 }
 
 impl SkillsSnapshot {
-    /// The entry a `skill_ref` names: by frontmatter `name` first, else by the dir-derived name
-    /// (`wicked-garden-` + the dir path joined by `-`), which garden's convention makes equal to
-    /// the frontmatter name for every shipped skill — the fallback matters for a user-added skill
-    /// whose frontmatter diverged from its directory.
+    /// The entry a `skill_ref` names — by frontmatter `name` ONLY (design v3 §5; codex round 6).
+    /// A published index whose `name` diverges from the path-derived name (`wicked-garden-` + the
+    /// dir path joined by `-`, [`derived_name`]) is a config error at load, never an alias here:
+    /// rounds 1–5 fell back to the derived name, which gave one skill two identities.
     pub(crate) fn skill(&self, skill_ref: &str) -> Option<&SkillEntry> {
-        self.skills
-            .iter()
-            .find(|s| s.name == skill_ref)
-            .or_else(|| {
-                self.skills
-                    .iter()
-                    .find(|s| derived_name(&s.dir) == skill_ref)
-            })
+        self.skills.iter().find(|s| s.name == skill_ref)
     }
 
     /// The Claude-side identity of a `skill_ref`'s skill — the `<skill-dir>` half of
@@ -814,7 +825,9 @@ fn is_garden_name(skill_ref: &str) -> bool {
         .is_some_and(|rest| !rest.is_empty())
 }
 
-/// `engineering/frontend` → `wicked-garden-engineering-frontend`.
+/// `engineering/frontend` → `wicked-garden-engineering-frontend`: the name a skill at
+/// `skills/<dir>` MUST declare (crew's `derivedSkillName`, checked at every publish); the loader
+/// re-checks it at load ([`load_published`]) so a skill is keyed by exactly one identity.
 fn derived_name(dir: &str) -> String {
     format!("{PLUGIN_NAME}-{}", dir.replace('/', "-"))
 }
@@ -889,15 +902,6 @@ pub(crate) enum SkillsError {
 impl std::fmt::Display for SkillsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SkillsError::Config { var, path, why } if *var == crate::state_home::STATE_HOME_ENV => {
-                write!(
-                    f,
-                    "{var}={} is not a usable crew state home ({why}); pass the daemon's actual \
-                     state home — the directory whose skills/snapshots/<gen> holds the published \
-                     generation — or unset it to derive the state home from the snapshot path",
-                    path.display()
-                )
-            }
             SkillsError::Config { var, path, why } => write!(
                 f,
                 "{var}={} is not a usable skills snapshot ({why}); point it at a published \
@@ -924,8 +928,11 @@ impl std::fmt::Display for SkillsError {
                     write!(
                         f,
                         " — {} {} not a {PLUGIN_NAME} name: the snapshot is the worker's only \
-                         skills source, so a skill of another family must be added to the \
-                         effective root and published before a run can name it",
+                         skills source and every skill it holds is keyed `{PLUGIN_NAME}-<dir>` \
+                         (its frontmatter name, which crew requires to equal the path-derived \
+                         name at publish), so a ref of another family can never resolve in it — \
+                         fix the workflow's skill_ref, or add the skill to the effective root \
+                         under the catalog's naming convention and publish before a run names it",
                         foreign.join(", "),
                         if foreign.len() == 1 { "is" } else { "are" }
                     )?;
@@ -1046,21 +1053,11 @@ fn env_path(var: &'static str) -> Result<Option<PathBuf>, SkillsError> {
 /// Resolve the skills root from the process environment, logging the ladder step taken.
 /// `Ok(None)` ⇒ no root anywhere (already logged). `Err` ⇒ an explicit input is misconfigured.
 pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
+    // Exactly ONE skills input (v3.1 §2, v3.4 §2): the snapshot path. The state home is derived
+    // from it; no companion variable is read.
     let explicit = env_path(SKILLS_SNAPSHOT_ENV)?;
-    // The daemon's explicit state home (crew#480), when stated: resolved here so a malformed
-    // value — set but empty, relative, unresolvable — refuses the launch as a config error
-    // naming it, whether or not a snapshot is handed (the fence over it depends on it).
-    let state_home =
-        crate::state_home::explicit_state_home().map_err(|why| SkillsError::Config {
-            var: crate::state_home::STATE_HOME_ENV,
-            path: std::env::var_os(crate::state_home::STATE_HOME_ENV)
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            why,
-        })?;
     resolve_in(
         explicit,
-        state_home.as_deref(),
         std::env::var_os(crate::acp_runner::CLAUDE_CONFIG_DIR_ENV).map(PathBuf::from),
         home_dir(),
         &mut |line| eprintln!("{line}"),
@@ -1069,17 +1066,14 @@ pub(crate) fn resolve() -> Result<Option<SkillsSnapshot>, SkillsError> {
 
 /// [`resolve`] with its inputs and its log sink explicit, so the ladder is testable without
 /// touching the process environment and the "logged" half of each step is asserted, not assumed.
-/// `explicit_state_home` is the daemon's resolved `WICKED_CREW_STATE_HOME`, if any — a published
-/// snapshot's derived state home must agree with it ([`crate::state_home::derive`]).
 pub(crate) fn resolve_in(
     explicit: Option<PathBuf>,
-    explicit_state_home: Option<&Path>,
     claude_config_dir: Option<PathBuf>,
     home: Option<PathBuf>,
     log: &mut dyn FnMut(String),
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
     if let Some(path) = explicit {
-        return load_published(SKILLS_SNAPSHOT_ENV, &path, explicit_state_home).map(Some);
+        return load_published(SKILLS_SNAPSHOT_ENV, &path).map(Some);
     }
     let Some(config) = claude_config_dir.or_else(|| home.map(|h| h.join(".claude"))) else {
         log(format!(
@@ -1143,11 +1137,12 @@ pub(crate) fn resolve_in(
 /// - An ancestor that is a symlink ⇒ refused: canonicalizing would pin the generation, but a
 ///   link ABOVE it is a lever anyone who can flip it holds over every later resolution of the
 ///   same spelling; the operator is told the real path to pass instead.
-/// - The final component MAY be a link (crew's `current -> snapshots/<gen>`): `canonicalize`
-///   follows it once, here, so the session keeps the generation it was handed even if the link is
-///   flipped under it. A DANGLING final link (`lstat` succeeds, `canonicalize` fails — crew's
-///   `current` aimed at a reaped or not-yet-published generation) is a config error that names
-///   the target it points at; a loop is what the OS reports.
+/// - The FINAL component that is a symlink ⇒ refused too (design v3.4 §2; codex round 6). Rounds
+///   1–5 followed crew's `current -> snapshots/<gen>` once, at load — which made the generation a
+///   FRESH launch gets depend on when it resolved the link: two wrapped units of one run could
+///   land on two generations across a publish. Crew resolves `current` BEFORE the handoff and
+///   passes the concrete generation path; a handed link is a config error naming the link and
+///   its target (a dangling one included — there is no generation to follow either way).
 /// - On Windows the `\\?\` verbatim prefix `canonicalize` adds is dropped
 ///   ([`simplify_verbatim`]): a worker CLI is handed a spelling it can open.
 fn canonical_root(named: &Path) -> Result<PathBuf, String> {
@@ -1178,25 +1173,26 @@ fn canonical_root(named: &Path) -> Result<PathBuf, String> {
             }
         }
     }
-    match std::fs::canonicalize(named) {
-        Ok(real) => Ok(simplify_verbatim(real)),
-        Err(e) => {
-            // Both halves of the dangling case are handled explicitly: the lstat SUCCEEDS (the
-            // link exists) while canonicalize FAILS (its target does not) — so the error names
-            // the target, which is the generation the operator must publish or stop pointing at.
-            if std::fs::symlink_metadata(named).is_ok_and(|m| m.file_type().is_symlink()) {
-                let target = std::fs::read_link(named)
-                    .map(|t| t.display().to_string())
-                    .unwrap_or_else(|_| "<unreadable>".to_string());
-                return Err(format!(
-                    "it is a symlink to `{target}`, which cannot resolve to a real path ({e}) — a \
-                     dangling link is not a snapshot; publish the generation it names or pass a \
-                     concrete generation path"
-                ));
-            }
-            Err(format!("cannot resolve it to a real path: {e}"))
-        }
+    // The LAST component, lstat'ed: a link here is never followed (v3.4 §2). The target is named
+    // so an operator who passed `current` sees which generation it pointed at.
+    if std::fs::symlink_metadata(named).is_ok_and(|m| m.file_type().is_symlink()) {
+        let target = std::fs::read_link(named)
+            .map(|t| t.display().to_string())
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        let real = match std::fs::canonicalize(named) {
+            Ok(p) => format!("pass the real path `{}`", simplify_verbatim(p).display()),
+            Err(e) => format!("and it dangles ({e}) — publish the generation it names"),
+        };
+        return Err(format!(
+            "it is a symlink to `{target}`; every component of the snapshot path, the last \
+             included, must be a real directory — crew resolves `current` before the handoff and \
+             passes the concrete generation, so a fresh launch cannot change generation between \
+             units — {real}"
+        ));
     }
+    std::fs::canonicalize(named)
+        .map(simplify_verbatim)
+        .map_err(|e| format!("cannot resolve it to a real path: {e}"))
 }
 
 /// `path` must exist, must NOT be a symlink, and must be a regular file (`want_file`) or a
@@ -1397,13 +1393,19 @@ fn simplify_verbatim_str(s: &str) -> String {
 
 /// Load the snapshot `var` names. Strict: every shortfall is a config error naming the variable,
 /// the path and the reason — this path was chosen deliberately, so nothing here degrades. The
-/// generation's STATE HOME is derived from the canonical root's shape and must agree with
-/// `explicit_state_home` when the daemon stated one ([`crate::state_home::derive`]).
-fn load_published(
-    var: &'static str,
-    named: &Path,
-    explicit_state_home: Option<&Path>,
-) -> Result<SkillsSnapshot, SkillsError> {
+/// generation's STATE HOME is derived from the canonical root's shape and from nothing else
+/// ([`crate::state_home::derive`]).
+///
+/// IDENTITY (codex round 6): the snapshot must be the generation its directory says it is —
+/// `snapshot.json.gen` (a number, or a string of digits) must equal the directory's name
+/// numerically (crew zero-pads the directory, `000007`, and writes `gen: 7`), the directory's name
+/// must be a generation name (decimal digits), and the `contentHash` and `gardenSource` crew
+/// writes must be present — a `snapshot.json` without them was not published by crew. The
+/// generation REPORTED (`gen`, the reaping token) is the verified directory name, never the
+/// index's unverified claim. Each skill is keyed by its frontmatter `name` ONLY, which must equal
+/// the path-derived name (`wicked-garden-<dir joined by ->`): a divergence is a defect, not an
+/// alias.
+fn load_published(var: &'static str, named: &Path) -> Result<SkillsSnapshot, SkillsError> {
     let config_err = |why: String| SkillsError::Config {
         var,
         path: named.to_path_buf(),
@@ -1437,7 +1439,7 @@ fn load_published(
         .map_err(|e| config_err(format!("cannot read {SNAPSHOT_INDEX}: {e}")))?;
     let index: Value = serde_json::from_slice(&bytes)
         .map_err(|e| config_err(format!("{SNAPSHOT_INDEX} is not valid JSON: {e}")))?;
-    let gen = match index.get("gen") {
+    let claimed = match index.get("gen") {
         Some(Value::String(s)) if !s.is_empty() => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
         _ => {
@@ -1446,10 +1448,88 @@ fn load_published(
             )))
         }
     };
-    let content_hash = index
-        .get("contentHash")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // The generation IS the directory: its name must be a generation name, and the index's
+    // claim must be the same generation. The verified directory name is what is reported.
+    let gen = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| crate::state_home::is_generation_name(n))
+        .ok_or_else(|| {
+            config_err(format!(
+                "its directory `{}` is not a generation name (decimal digits, as crew publishes \
+                 them: `000007`); a snapshot is `<state home>/skills/snapshots/<gen>`",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ))
+        })?
+        .to_string();
+    let same_generation = match (claimed.parse::<u64>(), gen.parse::<u64>()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if !same_generation {
+        return Err(config_err(format!(
+            "{SNAPSHOT_INDEX} says gen `{claimed}` but the directory is `{gen}`; the snapshot is \
+             not the generation its path says it is (a copied or edited index) — the generation \
+             directory and its index must agree, so the reported generation is the verified one"
+        )));
+    }
+    let content_hash = match index.get("contentHash") {
+        Some(Value::String(s)) if !s.is_empty() => s.clone(),
+        Some(other) => {
+            return Err(config_err(format!(
+                "{SNAPSHOT_INDEX} `contentHash` is a JSON {}, not a non-empty string — crew \
+                 records the tree's content hash in every published generation",
+                json_kind(other)
+            )))
+        }
+        None => {
+            return Err(config_err(format!(
+                "{SNAPSHOT_INDEX} has no `contentHash` — crew records the tree's content hash in \
+                 every published generation; an index without one was not published by crew"
+            )))
+        }
+    };
+    // `gardenSource` — where the bundle came from: `{kind, path, plugin_version, baseline}`, the
+    // field names crew's `SnapshotManifest` writes. Required as an object with a non-empty
+    // `baseline` (the content-hash identity of the bundle) and string `kind`, `path`,
+    // `plugin_version` (the latter two may be empty for a source that has none).
+    let source = index.get("gardenSource").ok_or_else(|| {
+        config_err(format!(
+            "{SNAPSHOT_INDEX} has no `gardenSource` — crew records the bundle's source \
+             ({{kind, path, plugin_version, baseline}}) in every published generation"
+        ))
+    })?;
+    let Some(source_obj) = source.as_object() else {
+        return Err(config_err(format!(
+            "{SNAPSHOT_INDEX} `gardenSource` is a JSON {}, not an object",
+            json_kind(source)
+        )));
+    };
+    for key in ["kind", "path", "plugin_version", "baseline"] {
+        let must_be_non_empty = matches!(key, "kind" | "baseline");
+        match source_obj.get(key) {
+            Some(Value::String(s)) if !(must_be_non_empty && s.is_empty()) => {}
+            Some(Value::String(_)) => {
+                return Err(config_err(format!(
+                    "{SNAPSHOT_INDEX} `gardenSource.{key}` is empty; crew records the bundle's \
+                     {key} in every published generation"
+                )))
+            }
+            Some(other) => {
+                return Err(config_err(format!(
+                    "{SNAPSHOT_INDEX} `gardenSource.{key}` is a JSON {}, not a string",
+                    json_kind(other)
+                )))
+            }
+            None => {
+                return Err(config_err(format!(
+                    "{SNAPSHOT_INDEX} `gardenSource` has no `{key}`"
+                )))
+            }
+        }
+    }
     let entries = index
         .get("skills")
         .and_then(Value::as_array)
@@ -1504,6 +1584,17 @@ fn load_published(
         if let Err(why) = safe_segments(&name, false, "name") {
             defects.push(format!("skills[{i}]: {why}"));
         }
+        // ONE identity per skill (v3 §5; codex round 6): the frontmatter/index `name` must be the
+        // name its directory derives — crew refuses to publish anything else, and the loader no
+        // longer aliases a divergent pair (a ref could otherwise reach one skill by two names).
+        let derived = derived_name(&dir);
+        if safe_segments(&dir, true, "dir").is_ok() && derived != name {
+            defects.push(format!(
+                "skills[{i}]: `{name}` at skills/{dir} is not the path-derived name `{derived}` — \
+                 a skill is keyed by its frontmatter name, which must equal the name its \
+                 directory derives (no alias is made for the divergence)"
+            ));
+        }
         match verify_skill_file(path, &dir) {
             Ok(fm) => {
                 match &fm.name {
@@ -1537,15 +1628,15 @@ fn load_published(
         )));
     }
     // A valid plugin root, indexed and contained — now WHERE it is: the state home whose fence
-    // is opened around it is derived from the root's own shape (three components up), and must
-    // be the one the daemon states when it states one. Checked last so an operator pointing at
-    // something that is not a snapshot at all is told that first.
-    let state_home = crate::state_home::derive(path, explicit_state_home).map_err(config_err)?;
+    // is opened around it is derived from the root's own shape (three components up) and from
+    // nothing else. Checked last so an operator pointing at something that is not a snapshot at
+    // all is told that first.
+    let state_home = crate::state_home::derive(path).map_err(config_err)?;
     Ok(SkillsSnapshot {
         root,
         source: SnapshotSource::Published,
         gen: Some(gen),
-        content_hash,
+        content_hash: Some(content_hash),
         state_home: Some(state_home),
         skills,
     })
@@ -1987,25 +2078,10 @@ pub(crate) fn admit_refs(
         .copied()
         .filter(|r| !r.is_empty())
         .collect();
+    require_existence(snapshot.as_ref(), &plan)?;
     let Some(snapshot) = snapshot else {
-        let mut missing: Vec<String> = plan.into_iter().map(str::to_string).collect();
-        missing.sort();
-        missing.dedup();
-        if missing.is_empty() {
-            return Ok(None);
-        }
-        return Err(SkillsError::Missing {
-            root: None,
-            missing,
-        });
+        return Ok(None);
     };
-    let existence = snapshot.closure(plan);
-    if !existence.missing.is_empty() {
-        return Err(SkillsError::Missing {
-            root: Some(snapshot.root.clone()),
-            missing: existence.missing,
-        });
-    }
     let invoked = snapshot.closure(refs.seat.iter().copied());
     match cli {
         WorkerCli::Claude => {
@@ -2101,6 +2177,32 @@ pub(crate) fn admit_refs(
     Ok(Some(snapshot))
 }
 
+/// EXISTENCE, plan-wide: every ref in `plan` — of ANY family — and everything it transitively
+/// `mandates` must resolve in `snapshot`, or the launch is refused naming the missing ones (sorted,
+/// deduplicated); with no root at all every ref is missing, and an empty plan needs nothing.
+fn require_existence(snapshot: Option<&SkillsSnapshot>, plan: &[&str]) -> Result<(), SkillsError> {
+    let Some(snapshot) = snapshot else {
+        let mut missing: Vec<String> = plan.iter().map(|r| r.to_string()).collect();
+        missing.sort();
+        missing.dedup();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        return Err(SkillsError::Missing {
+            root: None,
+            missing,
+        });
+    };
+    let existence = snapshot.closure(plan.iter().copied());
+    if !existence.missing.is_empty() {
+        return Err(SkillsError::Missing {
+            root: Some(snapshot.root.clone()),
+            missing: existence.missing,
+        });
+    }
+    Ok(())
+}
+
 /// The launch admission for one FRESH launch, on either spawn path — [`admit_turn`] for a
 /// [`Turn::Fresh`]: resolve the root (the ladder), refuse a root the worker Read fence would deny
 /// ([`fence_admit`]), then require every skill the run names — see [`admit_refs`]. `Ok(None)` ⇒
@@ -2110,6 +2212,30 @@ pub(crate) fn admit_unit(
     cli: &WorkerCli,
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
     admit_turn(Turn::Fresh, input, cli)
+}
+
+/// The run-wide EXISTENCE admission for a unit that spawns NO worker — a TOOL COMMAND
+/// (`actor::dispatch_unit`; codex round 6). The plan-wide set ([`StepInput::required_skills`])
+/// exists so a run whose snapshot lacks a skill is refused before its FIRST unit does work; a
+/// tool-command first unit bypasses both worker runners, so without this it executed — and could
+/// mutate state — before a later agent unit discovered the missing skill. Judged like a fresh
+/// launch's existence half: the ladder is resolved (an explicit path that is not a snapshot is the
+/// same config error every launch gets) and every ref the RUN names must exist, transitive
+/// mandates included; nothing seat-specific applies (no CLI runs) and no fence is opened (no
+/// worker reads the root). A run that names NO skill has nothing to admit and resolves nothing.
+pub(crate) fn admit_plan(input: &StepInput) -> Result<(), SkillsError> {
+    let refs = RequiredRefs::of(input);
+    let plan: Vec<&str> = refs
+        .plan
+        .iter()
+        .copied()
+        .filter(|r| !r.is_empty())
+        .collect();
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let snapshot = resolve()?;
+    require_existence(snapshot.as_ref(), &plan)
 }
 
 /// What a turn is judged against (codex round 5): a FRESH launch resolves the ambient root; a
@@ -2132,10 +2258,14 @@ pub(crate) enum Turn {
 /// admitted a skill-bearing turn against a plugin the bridge never loaded and generated a
 /// directive for a skill the session could not invoke.
 ///
-/// - The inherit-config escape hatch (`execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`) comes first,
-///   fresh or cached: the worker runs with the operator's OWN plugins, so no snapshot is handed and
-///   none is required — said out loud, since a set-but-ignored `WICKED_SKILLS_SNAPSHOT` would
-///   otherwise read as a silent no-op.
+/// - The inherit-config escape hatch (`execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV`) bypasses
+///   NOTHING here (codex round 6; rounds 2–5 returned `Ok(None)` before resolving anything, so
+///   under the hatch an invalid explicit snapshot loaded nothing and said nothing, a missing
+///   required skill proceeded on the operator's plugins, and the template's stale `--plugin-dir`
+///   survived). The hatch decides ONLY whether the operator's ambient configuration is inherited
+///   IN ADDITION to the snapshot (`execute_wrapped::inject_isolation_flags`,
+///   `acp_runner::worker_claude_config_dir`); the snapshot is resolved, admitted and handed
+///   exactly as without it.
 /// - [`Turn::Fresh`] resolves the ambient root (the ladder), passes it through the fence check,
 ///   and is admitted against it.
 /// - [`Turn::Cached`]`(Some(pinned))` — the generation the session was opened with (v3.1 §4) — is
@@ -2150,16 +2280,6 @@ pub(crate) fn admit_turn(
     input: &StepInput,
     cli: &WorkerCli,
 ) -> Result<Option<SkillsSnapshot>, SkillsError> {
-    if crate::execute_wrapped::inherits_operator_config() {
-        eprintln!(
-            "[wicked-core] skills.snapshot bypassed for {}:{}: {} is set, so the worker runs under \
-             the operator's own configuration and plugins",
-            input.run_id,
-            input.unit.ord,
-            crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV
-        );
-        return Ok(None);
-    }
     let refs = RequiredRefs::of(input);
     let snapshot = match turn {
         Turn::Fresh => {
@@ -2310,6 +2430,30 @@ pub(crate) mod test_support {
         snapshot_root_with(root, gen, &entries)
     }
 
+    /// The `gardenSource` crew writes into every `snapshot.json` (`SnapshotManifest`), as a
+    /// fixture value — required at load (codex round 6).
+    pub(crate) fn garden_source() -> serde_json::Value {
+        serde_json::json!({
+            "kind": "directory",
+            "path": "/fixture/garden",
+            "plugin_version": "0.0.0",
+            "baseline": "fixture-baseline"
+        })
+    }
+
+    /// A complete `snapshot.json` for `gen` over `skills` (JSON rows) — the required identity
+    /// fields (`gen`, `contentHash`, `gardenSource`) plus the rows — for tests that hand-write an
+    /// index to say exactly what is wrong with ITS rows.
+    pub(crate) fn index_json(gen: &str, skills: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "gen": gen,
+            "contentHash": format!("sha256:{gen}"),
+            "gardenSource": garden_source(),
+            "skills": skills
+        }))
+        .unwrap()
+    }
+
     /// [`snapshot_root`] with per-skill `portable` and `mandates` (declared in the frontmatter,
     /// as garden will spell them).
     pub(crate) fn snapshot_root_with(root: &Path, gen: &str, skills: &[Entry<'_>]) -> PathBuf {
@@ -2339,12 +2483,7 @@ pub(crate) mod test_support {
             .collect();
         std::fs::write(
             root.join(super::SNAPSHOT_INDEX),
-            serde_json::to_vec(&serde_json::json!({
-                "gen": gen,
-                "contentHash": format!("sha256:{gen}"),
-                "skills": entries
-            }))
-            .unwrap(),
+            index_json(gen, serde_json::Value::Array(entries)),
         )
         .unwrap();
         root.to_path_buf()
@@ -2352,7 +2491,7 @@ pub(crate) mod test_support {
 
     /// The loaded snapshot for a fixture written by [`snapshot_root`].
     pub(crate) fn load(root: &Path) -> super::SkillsSnapshot {
-        super::resolve_in(Some(root.to_path_buf()), None, None, None, &mut |_| {})
+        super::resolve_in(Some(root.to_path_buf()), None, None, &mut |_| {})
             .expect("the fixture is a snapshot")
             .expect("an explicit path always yields a snapshot")
     }
@@ -2392,15 +2531,18 @@ mod tests {
     }
 
     fn published(root: &Path) -> Result<Option<SkillsSnapshot>, SkillsError> {
-        resolve_in(Some(root.to_path_buf()), None, None, None, &mut |_| {})
+        resolve_in(Some(root.to_path_buf()), None, None, &mut |_| {})
     }
 
-    /// The explicit path is loaded from its index: gen, hash, and the skills keyed by name; a ref
-    /// resolves by frontmatter name first and by the dir-derived name second; the Claude identity
-    /// is the top-level DIRECTORY (what Claude Code's plugin loader exposes), and a nested skill
-    /// has none — its identity is not invented.
+    /// The explicit path is loaded from its index: gen, hash, and the skills keyed by their
+    /// frontmatter `name` ONLY (codex round 6 — rounds 1–5 also resolved a ref by the dir-derived
+    /// name, giving a divergent skill two identities; now a `name` that is not what its directory
+    /// derives is a config error at load naming both). The Claude identity is the top-level
+    /// DIRECTORY (what Claude Code's plugin loader exposes), and a nested skill has none — its
+    /// identity is not invented. The reported generation is the DIRECTORY's name, verified equal
+    /// to the index's claim (a zero-padded directory reports its padded name).
     #[test]
-    fn an_explicit_snapshot_is_indexed_and_refs_resolve_by_name_then_by_dir() {
+    fn an_explicit_snapshot_is_indexed_and_refs_resolve_by_frontmatter_name_only() {
         let base = scratch("published");
         let root = snapshot_root(
             &gen_dir(&base, "7"),
@@ -2408,19 +2550,13 @@ mod tests {
             &[
                 ("domain", "wicked-garden-domain"),
                 ("engineering/frontend", "wicked-garden-engineering-frontend"),
-                ("qe-oracle", "wicked-garden-test-oracle"),
+                ("qe-oracle", "wicked-garden-qe-oracle"),
             ],
         );
         let mut lines = Vec::new();
-        let s = resolve_in(
-            Some(root.clone()),
-            None,
-            None,
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap()
-        .unwrap();
+        let s = resolve_in(Some(root.clone()), None, None, &mut collect(&mut lines))
+            .unwrap()
+            .unwrap();
         assert!(
             lines.is_empty(),
             "an explicit path logs no fallback: {lines:?}"
@@ -2438,19 +2574,18 @@ mod tests {
         assert_eq!(s.skill("wicked-garden-domain").unwrap().dir, "domain");
         assert!(s.skill("wicked-garden-domain").unwrap().portable);
         assert_eq!(
-            s.skill("wicked-garden-test-oracle").unwrap().dir,
+            s.skill("wicked-garden-qe-oracle").unwrap().dir,
             "qe-oracle",
             "by frontmatter name"
         );
-        assert_eq!(
-            s.skill("wicked-garden-qe-oracle").unwrap().name,
-            "wicked-garden-test-oracle",
-            "by the dir-derived name when the frontmatter diverged"
+        assert!(
+            s.skill("wicked-garden-test-oracle").is_none(),
+            "no second identity: a name the index does not carry resolves to nothing"
         );
         assert_eq!(
-            s.claude_skill_dir("wicked-garden-test-oracle").as_deref(),
+            s.claude_skill_dir("wicked-garden-qe-oracle").as_deref(),
             Some("qe-oracle"),
-            "Claude's id is the directory, not the frontmatter name"
+            "Claude's id is the directory"
         );
         assert_eq!(
             s.claude_skill_dir("wicked-garden-engineering-frontend"),
@@ -2466,6 +2601,34 @@ mod tests {
         assert!(s
             .launch_line("run=r1 unit=2")
             .starts_with("[wicked-core] skills.snapshot gen=7 root="));
+
+        // The reported generation is the verified DIRECTORY name — crew zero-pads it and writes
+        // the number in the index; the two are the same generation.
+        let padded = snapshot_root(&gen_dir(&base, "000009"), "9", &[]);
+        let s = published(&padded).unwrap().unwrap();
+        assert_eq!(s.gen.as_deref(), Some("000009"));
+        assert_eq!(s.gen_label(), "gen=000009");
+
+        // A DIVERGENT frontmatter/index name (the round-5 alias case) is a defect at load, naming
+        // the skill, its directory and the name the directory derives — never an alias.
+        let divergent = snapshot_root(
+            &gen_dir(&base.join("divergent"), "8"),
+            "8",
+            &[
+                ("domain", "wicked-garden-domain"),
+                ("qe-oracle", "wicked-garden-test-oracle"),
+            ],
+        );
+        let err = published(&divergent).expect_err("a divergent name is not an alias");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(
+            why.contains("`wicked-garden-test-oracle` at skills/qe-oracle")
+                && why.contains("path-derived name `wicked-garden-qe-oracle`")
+                && !why.contains("wicked-garden-domain"),
+            "{why}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2478,7 +2641,6 @@ mod tests {
             let mut lines = Vec::new();
             let err = resolve_in(
                 Some(path.to_path_buf()),
-                None,
                 None,
                 None,
                 &mut collect(&mut lines),
@@ -2535,13 +2697,16 @@ mod tests {
         );
         std::fs::write(
             bad.join(SNAPSHOT_INDEX),
-            "{\"gen\":\"3\",\"skills\":[{\"name\":\"x\"}]}",
+            index_json("3", serde_json::json!([{"name": "x"}])),
         )
         .unwrap();
         expect_err(&bad, "skills[0] has no string `dir`");
         std::fs::write(
             bad.join(SNAPSHOT_INDEX),
-            "{\"gen\":\"3\",\"skills\":[{\"name\":\"wicked-garden-core\",\"dir\":\"core\"}]}",
+            index_json(
+                "3",
+                serde_json::json!([{"name": "wicked-garden-core", "dir": "core"}]),
+            ),
         )
         .unwrap();
         expect_err(&bad, "no boolean `portable`");
@@ -2549,6 +2714,75 @@ mod tests {
         expect_err(&bad, "`gen`");
         std::fs::write(bad.join(SNAPSHOT_INDEX), "not json").unwrap();
         expect_err(&bad, "not valid JSON");
+        // IDENTITY (codex round 6): the index's `gen` must be the generation the directory says
+        // (a copied or edited index is refused naming both); `contentHash` and `gardenSource` —
+        // with every field crew writes — are required; the directory itself must be a generation
+        // name.
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            index_json("4", serde_json::json!([])),
+        )
+        .unwrap();
+        expect_err(&bad, "says gen `4` but the directory is `3`");
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            format!(
+                r#"{{"gen":"3","gardenSource":{},"skills":[]}}"#,
+                garden_source()
+            ),
+        )
+        .unwrap();
+        expect_err(&bad, "has no `contentHash`");
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            r#"{"gen":"3","contentHash":"","gardenSource":{},"skills":[]}"#,
+        )
+        .unwrap();
+        expect_err(
+            &bad,
+            "`contentHash` is a JSON string, not a non-empty string",
+        );
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            r#"{"gen":"3","contentHash":"sha256:3","skills":[]}"#,
+        )
+        .unwrap();
+        expect_err(&bad, "has no `gardenSource`");
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            r#"{"gen":"3","contentHash":"sha256:3","gardenSource":"garden","skills":[]}"#,
+        )
+        .unwrap();
+        expect_err(&bad, "`gardenSource` is a JSON string, not an object");
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            r#"{"gen":"3","contentHash":"sha256:3","gardenSource":{"kind":"directory","path":"","plugin_version":""},"skills":[]}"#,
+        )
+        .unwrap();
+        expect_err(&bad, "`gardenSource` has no `baseline`");
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            r#"{"gen":"3","contentHash":"sha256:3","gardenSource":{"kind":"directory","path":"","plugin_version":"","baseline":""},"skills":[]}"#,
+        )
+        .unwrap();
+        expect_err(&bad, "`gardenSource.baseline` is empty");
+        // Empty `path` / `plugin_version` are what crew writes for a source without them: fine.
+        std::fs::write(
+            bad.join(SNAPSHOT_INDEX),
+            r#"{"gen":3,"contentHash":"sha256:3","gardenSource":{"kind":"directory","path":"","plugin_version":"","baseline":"b"},"skills":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(published(&bad).unwrap().unwrap().gen.as_deref(), Some("3"));
+        let not_a_gen = snapshot_root(
+            &base
+                .join("named")
+                .join(SKILLS_DIR)
+                .join("snapshots")
+                .join("gen-7"),
+            "7",
+            &[],
+        );
+        expect_err(&not_a_gen, "directory `gen-7` is not a generation name");
         // Relative paths are refused outright: they mean something else in the worker's cwd.
         let rel = Path::new("snapshots/7");
         let err = published(rel).expect_err("relative");
@@ -2617,10 +2851,14 @@ mod tests {
         );
         std::fs::write(
             dup.join(SNAPSHOT_INDEX),
-            r#"{"gen":"6","skills":[
-                {"name":"wicked-garden-a","dir":"a","portable":true},
-                {"name":"wicked-garden-a","dir":"b","portable":true},
-                {"name":"wicked-garden-c","dir":"../escape","portable":true}]}"#,
+            index_json(
+                "6",
+                serde_json::json!([
+                    {"name": "wicked-garden-a", "dir": "a", "portable": true},
+                    {"name": "wicked-garden-a", "dir": "b", "portable": true},
+                    {"name": "wicked-garden-c", "dir": "../escape", "portable": true}
+                ]),
+            ),
         )
         .unwrap();
         let err = published(&dup).expect_err("duplicate + unclean");
@@ -2629,6 +2867,12 @@ mod tests {
         };
         assert!(why.contains("duplicate name `wicked-garden-a`"), "{why}");
         assert!(why.contains("not a clean relative"), "{why}");
+        assert!(
+            why.contains(
+                "`wicked-garden-a` at skills/b is not the path-derived name `wicked-garden-b`"
+            ),
+            "the duplicate is also a divergent identity: {why}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2755,15 +2999,9 @@ mod tests {
             &[("core", "wicked-garden-core")],
         );
         let mut lines = Vec::new();
-        let picked = resolve_in(
-            None,
-            None,
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap()
-        .expect("the live cache is a root");
+        let picked = resolve_in(None, Some(config.clone()), None, &mut collect(&mut lines))
+            .unwrap()
+            .expect("the live cache is a root");
         assert_eq!(picked.source, SnapshotSource::LiveCache);
         assert_eq!(picked.state_home, None, "a fallback root has no state home");
         assert_eq!(
@@ -2793,14 +3031,7 @@ mod tests {
         // Cache gone, hand copy still there ⇒ NO root: the hand copy is not on the ladder.
         std::fs::remove_dir_all(config.join("plugins").join("cache")).unwrap();
         let mut lines = Vec::new();
-        let none = resolve_in(
-            None,
-            None,
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .unwrap();
+        let none = resolve_in(None, Some(config.clone()), None, &mut collect(&mut lines)).unwrap();
         assert!(
             none.is_none(),
             "the hand copy at <config>/plugins/wicked-garden must never be a fallback: {none:?}"
@@ -2821,37 +3052,55 @@ mod tests {
             .join("wicked-garden")
             .join("1.0.0");
         live_root(&home_cache, "1.0.0", &[("core", "wicked-garden-core")]);
-        let picked = resolve_in(None, None, None, Some(home.clone()), &mut |_| {})
+        let picked = resolve_in(None, None, Some(home.clone()), &mut |_| {})
             .unwrap()
             .unwrap();
         assert_eq!(picked.root, home_cache);
 
-        // Numeric `gen` in a published index.
+        // Numeric `gen` in a published index (what crew writes): the same generation as the
+        // directory loads and reports the directory's name; another generation is refused (codex
+        // round 6 — the reported generation is the verified one, never the index's claim).
         let numeric = snapshot_root(&gen_dir(&base.join("num"), "9"), "9", &[]);
-        std::fs::write(numeric.join(SNAPSHOT_INDEX), "{\"gen\":12,\"skills\":[]}").unwrap();
+        let with_gen = |gen: u64| {
+            format!(
+                r#"{{"gen":{gen},"contentHash":"sha256:9","gardenSource":{},"skills":[]}}"#,
+                garden_source()
+            )
+        };
+        std::fs::write(numeric.join(SNAPSHOT_INDEX), with_gen(9)).unwrap();
         let s = published(&numeric).unwrap().unwrap();
-        assert_eq!(s.gen.as_deref(), Some("12"));
+        assert_eq!(s.gen.as_deref(), Some("9"));
+        std::fs::write(numeric.join(SNAPSHOT_INDEX), with_gen(12)).unwrap();
+        let err = published(&numeric).expect_err("the index claims another generation");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(
+            why.contains("says gen `12` but the directory is `9`"),
+            "{why}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The ONE input (v3.1 §2): a variable that is SET BUT EMPTY is invalid explicit
-    /// configuration — a config error, not "unset" — and the withdrawn second input
-    /// (`WICKED_SKILLS_CURRENT`) is not read at all: set to anything, empty included, it neither
-    /// steers the ladder nor breaks it.
+    /// The ONE input (v3.1 §2, v3.4 §2): a variable that is SET BUT EMPTY is invalid explicit
+    /// configuration — a config error, not "unset" — and neither withdrawn companion is read at
+    /// all: `WICKED_SKILLS_CURRENT` (pass 1's second rung) and `WICKED_CREW_STATE_HOME` (round 4's
+    /// "passed alongside" state home, retired by v3.4 §2) set to anything, empty included, neither
+    /// steer the ladder nor break it — the state home is derived from the snapshot path alone.
     #[test]
     fn an_empty_explicit_value_is_a_config_error_not_unset_and_there_is_no_second_input() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
         const WITHDRAWN: &str = "WICKED_SKILLS_CURRENT";
-        const STATE_HOME: &str = crate::state_home::STATE_HOME_ENV;
+        const RETIRED_STATE_HOME: &str = "WICKED_CREW_STATE_HOME";
         let saved: Vec<(&str, Option<std::ffi::OsString>)> =
-            [SKILLS_SNAPSHOT_ENV, WITHDRAWN, STATE_HOME]
+            [SKILLS_SNAPSHOT_ENV, WITHDRAWN, RETIRED_STATE_HOME]
                 .iter()
                 .map(|k| (*k, std::env::var_os(k)))
                 .collect();
         std::env::remove_var(SKILLS_SNAPSHOT_ENV);
-        std::env::remove_var(STATE_HOME);
+        std::env::remove_var(RETIRED_STATE_HOME);
         std::env::set_var(SKILLS_SNAPSHOT_ENV, "");
         let err = env_path(SKILLS_SNAPSHOT_ENV).expect_err("empty is not unset");
         let SkillsError::Config { var: v, why, .. } = &err else {
@@ -2880,46 +3129,37 @@ mod tests {
         std::env::set_var(WITHDRAWN, base.join("nowhere"));
         assert_eq!(resolve().unwrap().unwrap().root, root);
 
-        // The daemon's explicit state home (codex round 3): set but EMPTY, relative, or not a
-        // real directory ⇒ a config error naming the variable — the fence depends on it;
-        // agreeing with the snapshot's derived state home ⇒ loads; another directory ⇒ a config
-        // error naming both.
-        let expect_state_home_err = |value: &str, needle: &str| {
-            std::env::set_var(STATE_HOME, value);
-            let err = resolve().expect_err(needle);
-            let SkillsError::Config { var, why, .. } = &err else {
-                panic!("expected Config, got {err:?}");
-            };
-            assert_eq!(*var, STATE_HOME, "{err}");
-            assert!(why.contains(needle), "{why}");
-            assert!(
-                err.to_string().contains(STATE_HOME) && err.to_string().contains("crew state home"),
-                "{err}"
-            );
-        };
-        expect_state_home_err("", "set but empty");
-        expect_state_home_err("relative/state", "relative");
-        expect_state_home_err(
-            &base.join("does-not-exist").display().to_string(),
-            "cannot be resolved",
-        );
-        std::env::set_var(STATE_HOME, &base);
-        assert_eq!(
-            resolve().unwrap().unwrap().state_home.as_deref(),
-            Some(base.as_path())
-        );
+        // The RETIRED state-home variable (v3.4 §2; codex round 6 — round 3 made a set-but-empty,
+        // relative, unresolvable or DISAGREEING value a config error): it is not read. Set to
+        // nothing, to a relative spelling, to a directory that is not the snapshot's state home,
+        // the snapshot still loads and its state home is still the one DERIVED from its path.
         let other = base.join("other-state");
         std::fs::create_dir_all(&other).unwrap();
-        std::env::set_var(STATE_HOME, &other);
-        let err = resolve().expect_err("a different state home");
-        let SkillsError::Config { var, why, .. } = &err else {
-            panic!("expected Config, got {err:?}");
-        };
-        assert_eq!(*var, SKILLS_SNAPSHOT_ENV);
-        assert!(
-            why.contains(&base.display().to_string()) && why.contains(&other.display().to_string()),
-            "names both directories: {why}"
-        );
+        for value in ["", "relative/state", &other.display().to_string()] {
+            std::env::set_var(RETIRED_STATE_HOME, value);
+            let s = resolve()
+                .unwrap_or_else(|e| panic!("{RETIRED_STATE_HOME}={value:?} must not be read: {e}"))
+                .expect("a root");
+            assert_eq!(s.root, root);
+            assert_eq!(
+                s.state_home.as_deref(),
+                Some(base.as_path()),
+                "the state home is derived from the snapshot path alone"
+            );
+        }
+        // And with no snapshot handed it steers nothing either: the fallback rung is unchanged.
+        std::env::remove_var(SKILLS_SNAPSHOT_ENV);
+        std::env::set_var(RETIRED_STATE_HOME, &other);
+        let mut lines = Vec::new();
+        let none = resolve_in(
+            None,
+            Some(base.join("no-config")),
+            None,
+            &mut collect(&mut lines),
+        )
+        .unwrap();
+        assert!(none.is_none(), "{none:?}");
+        assert_eq!(lines.len(), 1, "{lines:?}");
         for (k, v) in saved {
             match v {
                 Some(val) => std::env::set_var(k, val),
@@ -2929,14 +3169,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// An explicit path whose FINAL component is a symlink (crew's `current -> snapshots/<gen>`)
-    /// is PINNED to the real generation it points at when loaded, so a session keeps the
-    /// generation it was handed while a later resolve — after crew flips the link — gets the next
-    /// one. An ANCESTOR symlink is refused with the real path to pass instead; a loop is a config
-    /// error, not a hang.
+    /// An explicit path whose FINAL component is a symlink — crew's `current -> snapshots/<gen>` —
+    /// is REFUSED (design v3.4 §2; codex round 6): every component including the last must be a
+    /// real directory, and crew resolves `current` before the handoff. Rounds 1–5 followed the
+    /// link once at load, which let two fresh launches of one run land on two generations across
+    /// a publish. The refusal names the link's target and the real path to pass; the CONCRETE
+    /// generation path loads, and after crew publishes the next generation and re-exports the
+    /// concrete path, that one loads while the earlier snapshot still names its own generation.
+    /// An ANCESTOR symlink is refused with the real path to pass instead; a loop and a dangling
+    /// link are refused as links too (config errors, never a hang, never a follow).
     #[cfg(unix)]
     #[test]
-    fn a_current_link_is_pinned_to_its_concrete_generation_at_load() {
+    fn a_current_link_is_refused_and_the_concrete_generation_path_is_what_loads() {
         let base = scratch("pin");
         let gen7 = snapshot_root(
             &gen_dir(&base, "7"),
@@ -2953,23 +3197,34 @@ mod tests {
         let current = skills.join("current");
         std::os::unix::fs::symlink("snapshots/7", &current).unwrap();
 
-        let first = published(&current).unwrap().unwrap();
-        assert_eq!(
-            first.root, gen7,
-            "the link is resolved to the real generation it names"
+        let err = published(&current).expect_err("a handed `current` link is refused");
+        let SkillsError::Config { path, why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert_eq!(path, &current, "the error names the path as given");
+        assert!(
+            why.contains("it is a symlink to `snapshots/7`")
+                && why.contains("the last included")
+                && why.contains("crew resolves `current` before the handoff")
+                && why.contains(&format!("pass the real path `{}`", gen7.display())),
+            "names the link, its target and the concrete path to pass: {why}"
         );
-        assert_eq!(first.gen.as_deref(), Some("7"));
 
-        // crew publishes gen 8 and flips `current` — the session already handed gen 7 is unaffected.
+        // The concrete generation loads; after crew publishes gen 8 and re-exports the concrete
+        // path, THAT loads — the snapshot loaded earlier still names its own generation.
+        let first = published(&gen7).unwrap().unwrap();
+        assert_eq!(first.root, gen7);
+        assert_eq!(first.gen.as_deref(), Some("7"));
         std::fs::remove_file(&current).unwrap();
         std::os::unix::fs::symlink(&gen8, &current).unwrap();
-        let second = published(&current).unwrap().unwrap();
-        assert_eq!(second.root, gen8, "an absolute link target resolves too");
-        assert_eq!(second.gen.as_deref(), Some("8"));
-        assert_eq!(
-            first.root, gen7,
-            "the earlier snapshot still names its own generation"
+        assert!(
+            published(&current).is_err(),
+            "an absolute link target is refused all the same"
         );
+        let second = published(&gen8).unwrap().unwrap();
+        assert_eq!(second.root, gen8);
+        assert_eq!(second.gen.as_deref(), Some("8"));
+        assert_eq!(first.root, gen7);
         assert_ne!(first.root, second.root);
 
         // An ancestor link: `<skills>/linked-snapshots -> snapshots`, then `.../linked-snapshots/7`.
@@ -2985,7 +3240,8 @@ mod tests {
             "names the link and the real path to pass: {why}"
         );
 
-        // A loop is what the OS reports, as a config error for the path the operator set.
+        // A loop: the final component is a link, so it is refused as one (never followed, never
+        // a hang) — the config error names the path the operator set.
         let a = base.join("loop-a");
         let b = base.join("loop-b");
         std::os::unix::fs::symlink(&b, &a).unwrap();
@@ -2998,11 +3254,13 @@ mod tests {
             path, a,
             "the error names the path the operator set, not a hop"
         );
-        assert!(why.contains("cannot resolve"), "{why}");
+        assert!(
+            why.contains("it is a symlink to") && why.contains("dangles"),
+            "{why}"
+        );
 
-        // A DANGLING link — crew's `current` aimed at a reaped or unpublished generation: lstat
-        // succeeds (the link exists), canonicalize fails (its target does not). Both halves are
-        // handled: a config error naming the path as given AND the target it points at.
+        // A DANGLING link — crew's `current` aimed at a reaped or unpublished generation: refused
+        // as a link, naming the target it points at and that there is no generation behind it.
         let dangling = base.join("current-dangling");
         std::os::unix::fs::symlink("snapshots/99", &dangling).unwrap();
         assert!(std::fs::symlink_metadata(&dangling).is_ok());
@@ -3012,7 +3270,7 @@ mod tests {
         };
         assert_eq!(path, &dangling);
         assert!(
-            why.contains("snapshots/99") && why.contains("dangling"),
+            why.contains("snapshots/99") && why.contains("dangles"),
             "names the missing target: {why}"
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -3081,14 +3339,18 @@ mod tests {
 
     /// A run naming skills the snapshot does not hold is REFUSED with exactly those names (sorted,
     /// deduplicated); a ref of ANOTHER FAMILY is judged the same way — refused when absent, with
-    /// the message saying why the snapshot could not hold it by default, admitted when present;
-    /// with no root at all every ref is missing while a skill-less run is admitted.
+    /// the message saying why no snapshot can hold it (every published skill is keyed
+    /// `wicked-garden-<dir>`, codex round 6 — a foreign-named entry is a load-time defect, as it
+    /// is at crew's publish); with no root at all every ref is missing while a skill-less run is
+    /// admitted.
     #[test]
     fn missing_required_skills_are_refused_by_name_whatever_their_family() {
         let base = scratch("admit");
-        let root = snapshot_root(
-            &gen_dir(&base, "4"),
-            "4",
+        // A foreign-family entry cannot be published: crew requires `name == wicked-garden-<dir>`
+        // and so does the loader — a user-added skill of another family is a defect naming it.
+        let foreign = snapshot_root(
+            &gen_dir(&base.join("foreign"), "3"),
+            "3",
             &[
                 ("domain", "wicked-garden-domain"),
                 (
@@ -3097,22 +3359,45 @@ mod tests {
                 ),
             ],
         );
+        let err = published(&foreign).expect_err("a foreign-named entry is not an identity");
+        let SkillsError::Config { why, .. } = &err else {
+            panic!("expected Config, got {err:?}");
+        };
+        assert!(
+            why.contains(
+                "`wicked-testing-acceptance-test-writer` at skills/acceptance-test-writer is not \
+                 the path-derived name `wicked-garden-acceptance-test-writer`"
+            ),
+            "{why}"
+        );
+        let root = snapshot_root(
+            &gen_dir(&base, "4"),
+            "4",
+            &[
+                ("domain", "wicked-garden-domain"),
+                (
+                    "acceptance-test-writer",
+                    "wicked-garden-acceptance-test-writer",
+                ),
+            ],
+        );
         let snapshot = load(&root);
         let claude = WorkerCli::Claude;
 
-        // A foreign-family skill that IS in the snapshot (a user-added skill) is admitted.
+        // Both present ⇒ admitted.
         let ok = admit_refs(
             Some(snapshot.clone()),
             &RequiredRefs::seat([
                 "wicked-garden-domain",
-                "wicked-testing-acceptance-test-writer",
+                "wicked-garden-acceptance-test-writer",
             ]),
             &claude,
         )
         .expect("both are present");
         assert_eq!(ok.as_ref().map(|s| &s.root), Some(&root));
 
-        // A foreign-family skill that is NOT is refused — there is no exemption by family.
+        // A foreign-family ref is refused — there is no exemption by family — and the message
+        // says why no snapshot can hold it under that name.
         let err = admit_refs(
             Some(snapshot.clone()),
             &RequiredRefs::seat(["wicked-garden-domain", "wicked-testing-plan"]),
@@ -3129,8 +3414,9 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("wicked-testing-plan is not a wicked-garden name")
-                && msg.contains("added to the effective root"),
-            "the refusal says why the snapshot could not hold it by default: {msg}"
+                && msg.contains("can never resolve in it")
+                && msg.contains("fix the workflow's skill_ref"),
+            "the refusal says why no snapshot holds it by that name: {msg}"
         );
 
         // Plan-wide: a skill only ANOTHER seat invokes must still exist (the seat here names one
@@ -3283,9 +3569,14 @@ mod tests {
         );
         std::fs::write(
             idx.join(SNAPSHOT_INDEX),
-            r#"{"gen":"11","skills":[
-                {"name":"wicked-garden-a","dir":"a","portable":true,"mandates":["wicked-garden-b"]},
-                {"name":"wicked-garden-b","dir":"b","portable":true}]}"#,
+            index_json(
+                "11",
+                serde_json::json!([
+                    {"name": "wicked-garden-a", "dir": "a", "portable": true,
+                     "mandates": ["wicked-garden-b"]},
+                    {"name": "wicked-garden-b", "dir": "b", "portable": true}
+                ]),
+            ),
         )
         .unwrap();
         let s = load(&idx);
@@ -3942,14 +4233,8 @@ mod tests {
         live_root(&cache, "2.0.0", &[]);
         std::os::unix::fs::symlink(outside.join("skills"), cache.join("skills")).unwrap();
         let mut lines = Vec::new();
-        let err = resolve_in(
-            None,
-            None,
-            Some(config.clone()),
-            None,
-            &mut collect(&mut lines),
-        )
-        .expect_err("the ladder refuses a linked fallback root");
+        let err = resolve_in(None, Some(config.clone()), None, &mut collect(&mut lines))
+            .expect_err("the ladder refuses a linked fallback root");
         let SkillsError::Fallback { root: r, why } = &err else {
             panic!("expected Fallback, got {err:?}");
         };
@@ -4274,6 +4559,8 @@ mod tests {
         // Overwrite the index with hostile spellings; the valid `domain` entry stays.
         let index = serde_json::json!({
             "gen": "31",
+            "contentHash": "sha256:31",
+            "gardenSource": garden_source(),
             "skills": [
                 {"name": "wicked-garden-domain", "dir": "domain", "portable": true},
                 {"name": "/etc", "dir": "domain", "portable": true},
@@ -4381,10 +4668,8 @@ mod tests {
         }
         let base = scratch("turn");
         // The fence over the fixture's state home (`base`) must classify it: HOME is pinned to the
-        // base so no default fenced directory can contain the scratch, and no explicit state home
-        // can disagree with the derived one.
+        // base so no default fenced directory can contain the scratch.
         let _home = Pin::set("HOME", Some(base.as_os_str()));
-        let _state = Pin::set(crate::state_home::STATE_HOME_ENV, None);
         let ambient = snapshot_root(
             &gen_dir(&base, "2"),
             "2",
@@ -4482,33 +4767,150 @@ mod tests {
                 skills: vec!["wicked-garden-domain".to_string()],
             })
         );
-        // The escape hatch: bypassed whatever the turn, even with a snapshot handed and a skill
-        // the run names nowhere — the worker runs on the operator's own plugins.
+        // The inherit-config escape hatch bypasses NOTHING (codex round 6): under it a fresh
+        // launch still resolves, fences and is handed the ambient generation; a missing required
+        // skill is still refused by name against it; a pinned session is still judged against its
+        // generation; a session that never received a plugin still refuses a skill turn; and an
+        // explicit path that is not a snapshot is still a launch error naming it. Rounds 2–5
+        // returned `Ok(None)` for every one of these.
         {
             let _hatch = Pin::set(
                 crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
                 Some(std::ffi::OsStr::new("1")),
             );
-            for turn in [
-                Turn::Fresh,
+            let handed = admit_turn(Turn::Fresh, &input("wicked-garden-search"), &claude)
+                .unwrap()
+                .expect("the snapshot is handed under the hatch too");
+            assert_eq!(handed.root, ambient);
+            let err = admit_turn(Turn::Fresh, &input("wicked-garden-absent"), &claude)
+                .expect_err("a missing skill is refused under the hatch");
+            assert_eq!(
+                err,
+                SkillsError::Missing {
+                    root: Some(ambient.clone()),
+                    missing: vec!["wicked-garden-absent".to_string()],
+                }
+            );
+            let err = admit_turn(
                 Turn::Cached(Some(pinned.clone())),
-                Turn::Cached(None),
-            ] {
-                assert_eq!(
-                    admit_turn(turn, &input("wicked-garden-absent"), &claude),
-                    Ok(None)
-                );
-            }
+                &input("wicked-garden-search"),
+                &claude,
+            )
+            .expect_err("the pinned generation is still the judge");
+            assert!(
+                matches!(&err, SkillsError::Missing { root: Some(r), .. } if r == &pinned_root),
+                "{err:?}"
+            );
+            assert_eq!(
+                admit_turn(Turn::Cached(None), &input("wicked-garden-search"), &claude),
+                Err(SkillsError::NotDelivered {
+                    cli: "claude".to_string(),
+                    skills: vec!["wicked-garden-search".to_string()],
+                })
+            );
+            let bad = base.join("no-such-snapshot");
+            let _bad = Pin::set(SKILLS_SNAPSHOT_ENV, Some(bad.as_os_str()));
+            let err = admit_turn(Turn::Fresh, &none, &claude)
+                .expect_err("an invalid explicit snapshot is a launch error under the hatch");
+            assert!(
+                matches!(&err, SkillsError::Config { var, path, .. }
+                    if *var == SKILLS_SNAPSHOT_ENV && path == &bad),
+                "{err:?}"
+            );
         }
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The snapshot's STATE HOME is derived from its own shape at load (codex round 3): a root in
-    /// a custom state home derives THAT directory — never a `.wicked-crew` basename — and agrees
-    /// with an explicit statement of the same directory; a different explicit state home is a
-    /// config error naming both; the live cache has none.
+    /// The run-wide EXISTENCE admission a TOOL-COMMAND unit gets (`admit_plan`, codex round 6):
+    /// a plan that names a skill the ambient root lacks is refused naming it — before the command
+    /// runs, whatever unit invokes the skill; a plan whose skills all exist is admitted; an
+    /// explicit path that is not a snapshot is the same config error every launch gets; and a
+    /// run that names NO skill has nothing to admit — nothing is resolved, so an invalid path is
+    /// not even looked at for it.
     #[test]
-    fn the_state_home_is_derived_from_the_snapshot_and_must_agree_with_an_explicit_one() {
+    fn a_tool_command_unit_is_admitted_for_plan_wide_existence_before_it_runs() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Pin(&'static str, Option<std::ffi::OsString>);
+        impl Pin {
+            fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+                let prev = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Pin(key, prev)
+            }
+        }
+        impl Drop for Pin {
+            fn drop(&mut self) {
+                match &self.1 {
+                    Some(v) => std::env::set_var(self.0, v),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let base = scratch("plan");
+        let root = snapshot_root(
+            &gen_dir(&base, "1"),
+            "1",
+            &[("domain", "wicked-garden-domain")],
+        );
+        let tool = |plan: &[&str]| {
+            let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "index the repo");
+            u.tool_cmd = Some(vec!["true".to_string()]);
+            StepInput {
+                run_id: "r".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: None,
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: plan.iter().map(|s| s.to_string()).collect(),
+            }
+        };
+        {
+            let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, root.as_os_str());
+            assert_eq!(admit_plan(&tool(&["wicked-garden-domain"])), Ok(()));
+            assert_eq!(admit_plan(&tool(&[])), Ok(()));
+            assert_eq!(
+                admit_plan(&tool(&["wicked-garden-domain", "wicked-garden-mem"])),
+                Err(SkillsError::Missing {
+                    root: Some(root.clone()),
+                    missing: vec!["wicked-garden-mem".to_string()],
+                }),
+                "a later agent unit's skill is judged before the tool command runs"
+            );
+        }
+        {
+            let bad = base.join("no-such-snapshot");
+            let _snap = Pin::set(SKILLS_SNAPSHOT_ENV, bad.as_os_str());
+            assert!(
+                matches!(admit_plan(&tool(&["wicked-garden-domain"])),
+                    Err(SkillsError::Config { var, path, .. })
+                        if var == SKILLS_SNAPSHOT_ENV && path == bad),
+                "an invalid explicit snapshot is the same launch error"
+            );
+            assert_eq!(
+                admit_plan(&tool(&[])),
+                Ok(()),
+                "a skill-free run has nothing to admit and resolves nothing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The snapshot's STATE HOME is derived from its own shape at load (codex round 3; v3.4 §2):
+    /// a root in a custom state home derives THAT directory — never a `.wicked-crew` basename,
+    /// never a companion variable — and a root whose parent is not literally `snapshots` or whose
+    /// grandparent is not literally `skills` is a config error naming the path; the live cache
+    /// has no state home.
+    #[test]
+    fn the_state_home_is_derived_from_the_snapshot_shape_alone() {
         let base = scratch("state-home");
         let crew_state = base.join("crew-state");
         let root = snapshot_root(
@@ -4522,31 +4924,25 @@ mod tests {
             Some(crew_state.as_path()),
             "a custom state home is derived from the shape, not from a directory name"
         );
-        let same = resolve_in(
-            Some(root.clone()),
-            Some(&crew_state),
-            None,
-            None,
-            &mut |_| {},
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(same.state_home.as_deref(), Some(crew_state.as_path()));
-        let other = base.join("other-state");
-        std::fs::create_dir_all(&other).unwrap();
-        let err = resolve_in(Some(root.clone()), Some(&other), None, None, &mut |_| {})
-            .expect_err("the two must agree");
-        let SkillsError::Config { var, path, why } = &err else {
-            panic!("expected Config, got {err:?}");
-        };
-        assert_eq!(*var, SKILLS_SNAPSHOT_ENV);
-        assert_eq!(path, &root);
-        assert!(
-            why.contains(&crew_state.display().to_string())
-                && why.contains(&other.display().to_string())
-                && why.contains(crate::state_home::STATE_HOME_ENV),
-            "names both: {why}"
-        );
+        for (parent, grandparent) in [("generations", SKILLS_DIR), ("snapshots", "plugins")] {
+            let misshapen = snapshot_root(
+                &base.join(grandparent).join(parent).join("2"),
+                "2",
+                &[("domain", "wicked-garden-domain")],
+            );
+            let err = published(&misshapen).expect_err("the shape is fixed");
+            let SkillsError::Config { var, path, why } = &err else {
+                panic!("expected Config, got {err:?}");
+            };
+            assert_eq!(*var, SKILLS_SNAPSHOT_ENV);
+            assert_eq!(path, &misshapen);
+            assert!(
+                why.contains(&misshapen.display().to_string())
+                    && why.contains("parent must be `snapshots`")
+                    && why.contains("grandparent `skills`"),
+                "{why}"
+            );
+        }
         let live = load_live(
             live_root(&base.join("live"), "1.0.0", &[]),
             SnapshotSource::LiveCache,

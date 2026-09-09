@@ -5442,10 +5442,12 @@ fn dispatch_unit(
         elicitation_epoch,
         process_gen: Some(process_gen),
         launch_seq,
-        // core#396: the RUN's whole skill set, so the runner refuses a launch whose snapshot lacks
-        // any of them before the FIRST unit does work — not at the unit that needed it. Read off the
-        // units already fetched above (the plan copied each phase's `skill_ref` onto its unit);
-        // the worker holds no store handle, so the set has to ride the input.
+        // core#396: the RUN's whole skill set, so the launch is refused when the snapshot lacks
+        // any of them before the FIRST unit does work — of ANY kind (the worker runners admit an
+        // agent unit; `skills_snapshot::admit_plan` admits a tool command below, codex round 6) —
+        // not at the unit that needed it. Read off the units already fetched above (the plan
+        // copied each phase's `skill_ref` onto its unit); the worker holds no store handle, so
+        // the set has to ride the input.
         required_skills: run_required_skills(&units),
     };
 
@@ -5455,7 +5457,9 @@ fn dispatch_unit(
     if let Some(cmd) = unit.tool_cmd.clone() {
         // (EVT-011) ToolExecutorDispatched — fires just before the tool command spawns so the
         // studio can distinguish a tool-path unit from an agent-path unit in the event stream
-        // (both emit UnitExecuting, but only this event carries the actual command).
+        // (both emit UnitExecuting, but only this event carries the actual command). A plan-wide
+        // skills refusal (below, off-thread) then comes back as the dispatched unit's Failed
+        // result, exactly as a worker refusal does on the agent path.
         emit(
             subscribers,
             CoreEvent::ToolExecutorDispatched {
@@ -5472,7 +5476,18 @@ fn dispatch_unit(
         let attempt = session.attempt;
         let workdir = session.workdir.clone();
         std::thread::spawn(move || {
-            let (output_str, status) = run_tool_cmd(&cmd, workdir.as_deref());
+            // core#396 (codex round 6): the run-wide EXISTENCE admission runs before the FIRST
+            // unit of ANY kind. A tool command spawns no worker, so neither runner would ever
+            // judge this run's skill set — the command executed, and could mutate state, before
+            // a later agent unit discovered the missing skill. Same ladder, same refusal shape
+            // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
+            let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
+                Ok(()) => run_tool_cmd(&cmd, workdir.as_deref()),
+                Err(e) => {
+                    let refused = crate::execute_wrapped::skills_refusal(&input, &e);
+                    (refused.output, refused.status)
+                }
+            };
             // Stream the whole output as one delta so the transcript panel shows something.
             let _ = tx.send(crate::command::Command::CliOutputDelta {
                 run_id: run_id2.clone(),

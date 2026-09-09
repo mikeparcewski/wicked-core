@@ -201,9 +201,8 @@ fn gate_phase_approves_a_satisfying_phase_end_to_end() {
 /// <snapshot>` reaches the binary); this is the positive proof that the pinned harness LOADS it
 /// AND INVOKES the skill: the REAL `claude` on PATH is launched through the real
 /// `WrappedCliStepRunner` with `WICKED_SKILLS_SNAPSHOT` pointing at a fixture snapshot — in the
-/// `<state home>/skills/snapshots/<gen>` shape the fence derives the state home from, with
-/// `WICKED_CREW_STATE_HOME` stating the same directory — holding one skill whose `SKILL.md`
-/// instructs printing a unique marker. The unit's `skill_ref` names that skill (so the directive
+/// `<state home>/skills/snapshots/<gen>` shape the fence derives the state home from (the one
+/// input, v3.4 §2) — holding one skill whose `SKILL.md` instructs printing a unique marker. The unit's `skill_ref` names that skill (so the directive
 /// is the real `Invoke your skill "wicked-garden:wicked-probe" (via the Skill tool)…`), and the
 /// turn must end `Ok` WITH the marker in the output. Round 2 only asked for the roster and
 /// grepped the skill's name; a listed skill is not an invoked one. If the harness ignored
@@ -259,11 +258,10 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
     .unwrap();
     std::fs::write(
         snapshot.join("snapshot.json"),
-        "{\"gen\":\"000001\",\"contentHash\":\"sha256:live-fixture\",\"skills\":[{\"name\":\"wicked-garden-wicked-probe\",\"dir\":\"wicked-probe\",\"kind\":\"module\",\"core\":false,\"portable\":true}]}",
+        "{\"gen\":1,\"contentHash\":\"sha256:live-fixture\",\"gardenSource\":{\"kind\":\"directory\",\"path\":\"/fixture\",\"plugin_version\":\"0.0.0\",\"baseline\":\"live-fixture\"},\"skills\":[{\"name\":\"wicked-garden-wicked-probe\",\"dir\":\"wicked-probe\",\"kind\":\"module\",\"core\":false,\"portable\":true}]}",
     )
     .unwrap();
     std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
-    std::env::set_var("WICKED_CREW_STATE_HOME", &state_home);
     std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
 
     // A real work unit WITH the skill_ref: the engine's directive tells the worker to invoke the
@@ -298,7 +296,6 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
         "--- live claude reply (status {:?}) ---\n{}\n---",
         out.status, out.output
     );
-    std::env::remove_var("WICKED_CREW_STATE_HOME");
     std::env::remove_var("WICKED_SKILLS_SNAPSHOT");
     assert_eq!(
         out.status,

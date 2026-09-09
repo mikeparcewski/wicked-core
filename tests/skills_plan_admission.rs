@@ -1,0 +1,312 @@
+//! core#396 / codex round 6 (item 6): the run-wide skills EXISTENCE admission runs before the
+//! FIRST unit of ANY kind — a TOOL-COMMAND first unit must not execute when a later agent unit's
+//! required skill is missing from the snapshot.
+//!
+//! Driven through a REAL `Core` and a REAL actor (`dispatch_unit` is where the tool-command path
+//! bypasses both worker runners): a two-phase workflow whose first phase is a Tool executor that
+//! writes a marker file and whose second phase is an agent unit with a `skill_ref`. With
+//! `WICKED_SKILLS_SNAPSHOT` pointing at a fixture generation that LACKS that skill, the run must
+//! fail at unit 1 with the skills refusal, the marker must never appear (the command never ran),
+//! and the agent runner must never be called. With a generation that HOLDS it, the same workflow's
+//! tool command runs (marker present) and the run completes — the admission is a gate, not a wall.
+//!
+//! One test in its own binary: it sets a process-global variable, and integration tests run one
+//! process per file.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use wicked_core::{
+    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, StepInput, StepOutput, StepRunner,
+    StepStatus,
+};
+use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+use wicked_council::{AgenticCli, CouncilTask};
+
+fn cli(key: &str) -> AgenticCli {
+    AgenticCli {
+        key: key.into(),
+        display_name: key.into(),
+        binary: "unused".into(),
+        headless_invocation: "unused {PROMPT}".into(),
+        category: Category::default(),
+        input_mode: InputMode::default(),
+        version_probe: vec![],
+        trust_flags: vec![],
+        alt_binaries: vec![],
+        confidence: Confidence::default(),
+        enabled_for_council: true,
+        acp: None,
+        capabilities: None,
+        login_invocation: None,
+    }
+}
+
+struct NumericDispatcher;
+impl Dispatcher for NumericDispatcher {
+    fn dispatch(&self, c: &AgenticCli, _: &CouncilTask) -> Option<Vote> {
+        Some(Vote {
+            cli: c.key.clone(),
+            recommendation: "1".into(),
+            top_risk: "none".into(),
+            change_my_mind: "no".into(),
+            disqualifier: None,
+            confidence: Confidence::default(),
+            provenance: "numeric".into(),
+        })
+    }
+}
+
+/// Completes every AGENT unit with Ok — and records that it was asked to. A tool-command unit
+/// never reaches a runner, so this being called means the run advanced PAST the tool phase.
+struct RecordingOkRunner(Arc<AtomicBool>);
+impl StepRunner for RecordingOkRunner {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        self.0.store(true, Ordering::SeqCst);
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output: "ok".into(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: vec![],
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// Drain events until a terminal event for `session` is observed or the deadline expires.
+fn drain_until_terminal(
+    events: &std::sync::mpsc::Receiver<CoreEvent>,
+    session: &str,
+) -> Vec<CoreEvent> {
+    let mut collected = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            break;
+        }
+        match events.recv_timeout(remaining.min(Duration::from_millis(500))) {
+            Ok(ev) => {
+                let terminal = matches!(&ev,
+                    CoreEvent::SessionCompleted { session: s } if s == session)
+                    || matches!(&ev,
+                    CoreEvent::SessionFailed { session: s, .. } if s == session)
+                    || matches!(&ev,
+                    CoreEvent::RunCancelled { session: s } if s == session)
+                    || matches!(&ev,
+                    CoreEvent::AwaitingHuman { session: s, .. } if s == session);
+                collected.push(ev);
+                if terminal {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+        }
+    }
+    collected
+}
+
+/// A published-snapshot fixture in the ONE shape a generation has —
+/// `<state home>/skills/snapshots/<gen>` — under a CANONICAL base (the OS temp dir is a symlink on
+/// macOS; the loader refuses an ancestor symlink), holding `skills` (dir, frontmatter name) and
+/// the identity fields crew writes (`gen`, `contentHash`, `gardenSource`).
+fn snapshot_fixture(
+    base: &std::path::Path,
+    gen: &str,
+    skills: &[(&str, &str)],
+) -> std::path::PathBuf {
+    let root = base
+        .join("crew-state")
+        .join("skills")
+        .join("snapshots")
+        .join(gen);
+    std::fs::create_dir_all(root.join(".claude-plugin")).unwrap();
+    std::fs::write(
+        root.join(".claude-plugin").join("plugin.json"),
+        "{\"name\":\"wicked-garden\",\"version\":\"0.0.0\"}",
+    )
+    .unwrap();
+    let mut rows = Vec::new();
+    for (dir, name) in skills {
+        let skill = root.join("skills").join(dir);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: fixture\n---\n\n# {name}\n"),
+        )
+        .unwrap();
+        rows.push(serde_json::json!({
+            "name": name, "dir": dir, "kind": "fork-worker", "core": false, "portable": true
+        }));
+    }
+    std::fs::write(
+        root.join("snapshot.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "gen": gen.parse::<u64>().unwrap(),
+            "contentHash": format!("sha256:{gen}"),
+            "gardenSource": {
+                "kind": "directory", "path": "/fixture/garden",
+                "plugin_version": "0.0.0", "baseline": "fixture-baseline"
+            },
+            "skills": rows
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    root
+}
+
+/// The platform's shell writing `ran` into `marker` — the observable that the tool command
+/// EXECUTED. Absolute path, so the unit's working directory is irrelevant.
+fn marker_cmd(marker: &std::path::Path) -> Vec<String> {
+    let write = format!("echo ran > \"{}\"", marker.display());
+    if cfg!(windows) {
+        vec!["cmd".into(), "/c".into(), write]
+    } else {
+        vec!["sh".into(), "-c".into(), write]
+    }
+}
+
+fn spec(session_id: &str, workflow: &str) -> LaunchSpec {
+    LaunchSpec {
+        project_id: None,
+        problem: "Index, then extract.".into(),
+        clis: vec![cli("stub")],
+        entity_mode: EntityMode::Shared,
+        session_id: session_id.into(),
+        human_confirm: HumanConfirm::None,
+        repo_ref: None,
+        workflow: Some(workflow.into()),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+    }
+}
+
+#[test]
+fn a_tool_command_first_unit_does_not_execute_when_a_later_unit_s_skill_is_missing() {
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("wicked-core-planadm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    // The handed generation holds `domain` only; the run below also names `mem`.
+    let snapshot = snapshot_fixture(&base, "000001", &[("domain", "wicked-garden-domain")]);
+    std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
+    std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
+
+    let db = base.join("core.db").to_str().unwrap().to_string();
+    let agent_ran = Arc::new(AtomicBool::new(false));
+    let core = Core::spawn_with_engine(
+        db,
+        Arc::new(NumericDispatcher),
+        Arc::new(RecordingOkRunner(agent_ran.clone())),
+    );
+    let ev = core.subscribe();
+
+    // ── Refused: the tool command must NOT run when a later unit's skill is missing. ──
+    let marker = base.join("ran-missing.txt");
+    core.register_workflow(
+        serde_json::json!({
+            "id": "tool-then-missing-skill",
+            "phases": [
+                {"id": "index", "kind": "build",
+                 "executor": {"type": "tool", "cmd": marker_cmd(&marker)}},
+                {"id": "extract", "kind": "build", "skill_ref": "wicked-garden-mem"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("register workflow");
+    core.launch_run(spec("plan-missing", "tool-then-missing-skill"))
+        .expect("launch");
+    let events = drain_until_terminal(&ev, "plan-missing");
+    assert!(
+        events.iter().any(
+            |e| matches!(e, CoreEvent::SessionFailed { session, .. } if session == "plan-missing")
+        ),
+        "the run fails at its first unit: {events:?}"
+    );
+    let refusal = events
+        .iter()
+        .find_map(|e| match e {
+            CoreEvent::StepFailed {
+                session, detail, ..
+            } if session == "plan-missing" => Some(detail.clone()),
+            _ => None,
+        })
+        .expect("a StepFailed carries the refusal");
+    assert!(
+        refusal.contains("skills snapshot refused the launch")
+            && refusal.contains("wicked-garden-mem")
+            && refusal.contains(&snapshot.display().to_string()),
+        "the refusal names the missing skill and the snapshot judged against: {refusal}"
+    );
+    assert!(
+        !marker.exists(),
+        "the tool command executed before the missing skill was discovered: {}",
+        marker.display()
+    );
+    assert!(
+        !agent_ran.load(Ordering::SeqCst),
+        "no agent unit ran — the run was refused at unit 1"
+    );
+
+    // ── Admitted: the same shape with a skill the generation HOLDS runs the command. ──
+    let marker_ok = base.join("ran-present.txt");
+    core.register_workflow(
+        serde_json::json!({
+            "id": "tool-then-present-skill",
+            "phases": [
+                {"id": "index", "kind": "build",
+                 "executor": {"type": "tool", "cmd": marker_cmd(&marker_ok)}},
+                {"id": "extract", "kind": "build", "skill_ref": "wicked-garden-domain"}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("register workflow");
+    core.launch_run(spec("plan-present", "tool-then-present-skill"))
+        .expect("launch");
+    let events = drain_until_terminal(&ev, "plan-present");
+    assert!(
+        events.iter().any(
+            |e| matches!(e, CoreEvent::SessionCompleted { session } if session == "plan-present")
+        ),
+        "a run whose skills all exist completes: {events:?}"
+    );
+    assert!(
+        marker_ok.exists(),
+        "the admitted tool command ran: {}",
+        marker_ok.display()
+    );
+    assert!(
+        agent_ran.load(Ordering::SeqCst),
+        "the agent unit ran after the admitted tool command"
+    );
+
+    std::env::remove_var("WICKED_SKILLS_SNAPSHOT");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+// ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
+/// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
+/// race it): engine paths under test fire coarse fire-and-forget `wicked.*` emissions, and with
+/// no shared store configured those spool — which must land in a per-process temp file, never in
+/// the operator's real `~/.something-wicked/wicked-apps/emit-outbox.ndjson` replay queue. Every
+/// binary in this suite carries this block; `harness_hygiene.rs` fails the suite if one is missing.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}

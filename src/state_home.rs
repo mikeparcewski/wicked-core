@@ -18,19 +18,30 @@
 //! classify fails the launch by name ([`read_rules_around_snapshot`]). Fail closed, never widen;
 //! no runtime enumeration builds a rule.
 //!
-//! # Which directory IS the state home (pass 3)
+//! # Which directory IS the state home (pass 3; design v3.4 §2)
 //!
 //! Pass 2 recognized the state home by its default basename, `~/.wicked-crew` — so a daemon
 //! running on a custom state home (`crewStateHome()` is the `--db` parent: a scratch daemon on
 //! `/private/tmp/crew-state`, say) handed a snapshot from `/private/tmp/crew-state/skills/
 //! snapshots/1` that passed the fence without that daemon's sibling stores ever being classified
-//! or denied. The state home is now DERIVED from the snapshot itself: a published generation is
-//! `<state home>/skills/snapshots/<gen>` by contract, so the state home is three components up
-//! from the resolved (canonical) root ([`of_snapshot`]) — and a snapshot whose ancestors do not
-//! have that shape is a config error, never "not under the fence". When the daemon also passes
-//! [`STATE_HOME_ENV`] (crew#480), the two must AGREE or the launch fails naming both
-//! ([`derive`]); the explicit value is fenced on its own even when no snapshot is handed. The
-//! default `~/.wicked-crew` keeps its blanket rule whenever it is not the state home in play.
+//! or denied. The state home is DERIVED from the snapshot itself, and from NOTHING else: a
+//! published generation is `<state home>/skills/snapshots/<gen>` by contract (the parent literally
+//! `snapshots`, the grandparent literally `skills`), so the state home is three components up from
+//! the resolved (canonical) root ([`of_snapshot`]) — and a snapshot whose ancestors do not have
+//! that shape is a config error naming the path, never "not under the fence". The engine reads
+//! exactly ONE skills input, `WICKED_SKILLS_SNAPSHOT`; the round-4 companion variable
+//! (`WICKED_CREW_STATE_HOME`, "passed alongside") is RETIRED as an engine input (v3.4 §2) and is
+//! not read anywhere — crew's engine-env stops exporting it. The default `~/.wicked-crew` keeps
+//! its blanket rule whenever it is not the state home in play. Residual, stated: a CUSTOM state
+//! home is fenced only through a snapshot handed from it — with no snapshot handed (the live-cache
+//! rung) nothing derives it, and only the default directory is fenced.
+//!
+//! Every classified top-level entry is also checked for its ACTUAL kind (codex round 6): the
+//! registry declares each entry `file`, `dir` or `file-with-sidecars`, and the launch-time listing
+//! `lstat`s each entry it classified — a symlink of any name, a directory named `audit.log`, a
+//! file named `daemon-x` — refuses the launch naming the entry. The rule emitted for an entry
+//! follows its DECLARED kind (`/**` for anything that can have children), so an entry whose kind
+//! on disk disagrees would otherwise pass admission and receive a rule that does not cover it.
 //!
 //! The only non-denied path under the state home is the HANDED `skills/snapshots/<gen>/` — and
 //! only that one (design v3.3 §1; codex round 4). `skills/snapshots/` is the ONE directory listed
@@ -55,11 +66,6 @@ use serde_json::Value;
 /// (`execute_wrapped::DENIED_HOME_SUBDIRS` lists it), and the state home in play only when the
 /// handed snapshot's derived state home is that very directory.
 pub(crate) const DEFAULT_STATE_HOME_DIRNAME: &str = ".wicked-crew";
-
-/// The daemon's EXPLICIT statement of its state home (crew#480 passes `crewStateHome()` here).
-/// Optional: the engine derives the state home from the snapshot path regardless; when both are
-/// present they must agree ([`derive`]). Set, it is fenced even for a launch handed no snapshot.
-pub(crate) const STATE_HOME_ENV: &str = "WICKED_CREW_STATE_HOME";
 
 /// The registry, embedded so the binary and the fixture crew mirrors cannot drift: the test
 /// suite parses this same text, and `tests/fixtures/state-home-subtrees.json` is the file crew
@@ -253,68 +259,26 @@ pub(crate) fn of_snapshot(root: &Path) -> Option<PathBuf> {
     Some(home.to_path_buf())
 }
 
-/// The state home the daemon states through [`STATE_HOME_ENV`]: `Ok(None)` when unset;
-/// `Ok(Some(real path))` when set to an absolute path that resolves (the `\\?\` prefix dropped on
-/// Windows, as for the snapshot itself); `Err` when set but empty, relative, or unresolvable — a
-/// daemon that configures its fence configures something, and a value the fence cannot spell or
-/// find is a launch refusal, never a silent gap.
-pub(crate) fn explicit_state_home() -> Result<Option<PathBuf>, String> {
-    let Some(raw) = std::env::var_os(STATE_HOME_ENV) else {
-        return Ok(None);
-    };
-    if raw.is_empty() {
-        return Err(format!(
-            "{STATE_HOME_ENV} is set but empty — an explicit value must name the daemon's state \
-             home; unset it to derive the state home from the snapshot path alone"
-        ));
-    }
-    let named = PathBuf::from(raw);
-    if !named.is_absolute() {
-        return Err(format!(
-            "{STATE_HOME_ENV}=`{}` is a relative path; the worker Read fence must spell it \
-             absolutely — pass the daemon's absolute state home",
-            named.display()
-        ));
-    }
-    std::fs::canonicalize(&named)
-        .map(|p| Some(crate::skills_snapshot::simplify_verbatim(p)))
-        .map_err(|e| {
-            format!(
-                "{STATE_HOME_ENV}=`{}` cannot be resolved to a real directory ({e}); the fence \
-                 cannot classify a state home it cannot list",
-                named.display()
-            )
-        })
-}
-
-/// The state home of a published snapshot at `root` (canonical): derived from its shape
-/// ([`of_snapshot`]) and, when the daemon also stated one (`explicit`, already resolved), checked
-/// to be the SAME directory — the two must agree or the launch fails naming both, so a daemon that
-/// hands a snapshot from another daemon's storage root (or mis-states its own) is caught before
-/// any process starts.
-pub(crate) fn derive(root: &Path, explicit: Option<&Path>) -> Result<PathBuf, String> {
-    let derived = of_snapshot(root).ok_or_else(|| {
+/// The state home of a published snapshot at `root` (canonical), derived from its shape alone
+/// ([`of_snapshot`]; design v3.4 §2): `<state home>/skills/snapshots/<gen>` — the parent literally
+/// the registry's read slot (`snapshots`), the grandparent literally the skills root (`skills`).
+/// Any other spelling is a config error naming the path. Nothing else is consulted — the engine
+/// reads one skills input and no companion variable.
+pub(crate) fn derive(root: &Path) -> Result<PathBuf, String> {
+    of_snapshot(root).ok_or_else(|| {
         format!(
-            "its path does not have the shape `<state home>/{}/{}/<gen>` that crew publishes \
-             generations in — the worker Read fence over the daemon's state home is derived from \
-             that shape, so a snapshot anywhere else cannot be fenced around; publish it under \
-             the state home's skills root and pass that concrete generation path",
+            "its path `{}` does not have the shape `<state home>/{}/{}/<gen>` that crew publishes \
+             generations in (the parent must be `{}`, the grandparent `{}`) — the worker Read \
+             fence over the daemon's state home is derived from that shape and from nothing else, \
+             so a snapshot anywhere else cannot be fenced around; publish it under the state \
+             home's skills root and pass that concrete generation path",
+            root.display(),
             skills_name_or_default(),
-            slot_or_default()
+            slot_or_default(),
+            slot_or_default(),
+            skills_name_or_default()
         )
-    })?;
-    if let Some(explicit) = explicit {
-        if !same_dir(&derived, explicit) {
-            return Err(format!(
-                "it sits in the state home `{}` (three components above the generation) but \
-                 {STATE_HOME_ENV}=`{}` names a different directory; the daemon must pass the \
-                 state home the snapshot was published under, or unset the variable",
-                derived.display(),
-                explicit.display()
-            ));
-        }
-    }
-    Ok(derived)
+    })
 }
 
 fn skills_name_or_default() -> String {
@@ -391,11 +355,15 @@ pub(crate) fn read_rules_around_snapshot(
         .as_deref()
         .ok_or("the skills root has no `read_slot`")?;
 
-    // (a) Every top-level entry must be classified — fail closed on anything else.
+    // (a) Every top-level entry must be classified — fail closed on anything else — AND must be
+    // on disk what the registry declares it to be (codex round 6): the rule emitted below follows
+    // the DECLARED kind, so a directory named like a registered file (or a symlink of any name)
+    // would pass admission and receive a rule that does not cover it.
     for name in list_names(state_home)? {
-        if registry.classify(&name).is_none() {
+        let Some(entry) = registry.classify(&name) else {
             return Err(unclassified(state_home, &name));
-        }
+        };
+        check_entry_kind(state_home, &name, entry)?;
     }
     // (b) Every child of the skills root must be a denied child or the read slot itself.
     let skills_dir = state_home.join(skills_name);
@@ -505,11 +473,58 @@ pub(crate) fn read_rules_around_snapshot(
     Ok(rules)
 }
 
+/// The ACTUAL kind of a classified top-level entry must be the registry's DECLARED kind (codex
+/// round 6), judged by `lstat` — never a following stat: `file` ⇒ a regular file; `dir` ⇒ a
+/// directory; `file-with-sidecars` ⇒ a regular file or a directory (`core.db` is a file, its
+/// `core.db.events/` sidecar a directory — both covered by the `/**` rule such an entry gets); a
+/// SYMLINK of any classified name is refused whatever it points at — the rule would name the
+/// link, and the worker would read through it. Fail closed, naming the entry.
+fn check_entry_kind(state_home: &Path, name: &str, entry: &Entry) -> Result<(), String> {
+    let path = state_home.join(name);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+        format!(
+            "cannot inspect `{name}` under {} to check the Read fence ({e})",
+            state_home.display()
+        )
+    })?;
+    let ft = meta.file_type();
+    let refuse = |actual: &str| {
+        format!(
+            "`{name}` under {} is {actual} where the state-home registry declares a `{}` \
+             (tests/fixtures/state-home-subtrees.json); the worker Read fence would emit a rule \
+             for the declared kind and leave the actual entry uncovered, so the launch is refused \
+             rather than fenced wrongly — remove the entry, or fix what wrote it",
+            state_home.display(),
+            entry.kind
+        )
+    };
+    if ft.is_symlink() {
+        return Err(refuse("a symlink"));
+    }
+    let ok = match entry.kind.as_str() {
+        "file" => ft.is_file(),
+        "dir" => ft.is_dir(),
+        // `file-with-sidecars`: the prefix covers a file and its sidecars, one of which is a
+        // directory (`core.db.events/`).
+        _ => ft.is_file() || ft.is_dir(),
+    };
+    if ok {
+        Ok(())
+    } else if ft.is_dir() {
+        Err(refuse("a directory"))
+    } else if ft.is_file() {
+        Err(refuse("a regular file"))
+    } else {
+        Err(refuse("neither a regular file nor a directory"))
+    }
+}
+
 /// A generation directory's name as crew publishes it — decimal digits (`000007`, zero-padded so a
 /// lexical listing is the generation order; core accepts any non-empty run of ASCII digits). The
 /// read-slot listing denies such an entry as a sibling generation and refuses anything else it
-/// cannot recognise ([`read_rules_around_snapshot`]).
-fn is_generation_name(name: &str) -> bool {
+/// cannot recognise ([`read_rules_around_snapshot`]); the snapshot loader requires the handed
+/// generation's directory to be one (`skills_snapshot::load_published`).
+pub(crate) fn is_generation_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
 }
 
@@ -732,23 +747,25 @@ mod tests {
             None,
             "the live cache has no state home"
         );
-        // Agreement with an explicit statement: the same directory (by spelling) agrees, a
-        // different one fails naming BOTH, and a shapeless root fails naming the shape.
+        // Derivation is by shape ALONE (v3.4 §2): the shaped root derives its state home, and a
+        // shapeless root fails naming the path and the shape — including a parent that is not
+        // literally `snapshots` and a grandparent that is not literally `skills`.
         let root = Path::new("/h/.wicked-crew/skills/snapshots/000007");
-        assert_eq!(derive(root, None), Ok(PathBuf::from("/h/.wicked-crew")));
-        assert_eq!(
-            derive(root, Some(Path::new("/h/.wicked-crew"))),
-            Ok(PathBuf::from("/h/.wicked-crew"))
-        );
-        let err = derive(root, Some(Path::new("/private/tmp/crew-state"))).expect_err("disagree");
-        assert!(
-            err.contains("/h/.wicked-crew")
-                && err.contains("/private/tmp/crew-state")
-                && err.contains(STATE_HOME_ENV),
-            "{err}"
-        );
-        let err = derive(Path::new("/h/elsewhere/7"), None).expect_err("shapeless");
-        assert!(err.contains("skills/snapshots/<gen>"), "{err}");
+        assert_eq!(derive(root), Ok(PathBuf::from("/h/.wicked-crew")));
+        for shapeless in [
+            "/h/elsewhere/7",
+            "/h/.wicked-crew/skills/generations/000007",
+            "/h/.wicked-crew/plugins/snapshots/000007",
+        ] {
+            let err = derive(Path::new(shapeless)).expect_err("shapeless");
+            assert!(
+                err.contains(shapeless)
+                    && err.contains("skills/snapshots/<gen>")
+                    && err.contains("parent must be `snapshots`")
+                    && err.contains("grandparent `skills`"),
+                "{shapeless}: {err}"
+            );
+        }
     }
 
     /// Fail closed: an unclassified top-level entry (or an unclassified child of the skills
@@ -860,6 +877,71 @@ mod tests {
             "{err}"
         );
         std::fs::remove_file(home.join("stray.txt")).unwrap();
+        // (codex round 6) A CLASSIFIED entry whose kind on disk is not the declared one refuses
+        // by name too: a DIRECTORY named `audit.log` (declared `file`) or `daemon-x` (declared
+        // `file`, the `daemon-` prefix), a FILE named `evals` (declared `dir`). The rule emitted
+        // for a `file` has no `/**`, so a directory of that name would pass admission unfenced.
+        // A regular file named `daemon-x` is exactly what the registry declares and is admitted.
+        let kind_err = |what: &str| {
+            let err = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect_err("a kind mismatch refuses");
+            assert!(
+                err.contains(&format!("`{what}`"))
+                    && err.contains("state-home registry declares")
+                    && err.contains("refused"),
+                "{what}: {err}"
+            );
+        };
+        std::fs::create_dir_all(home.join("audit.log")).unwrap();
+        kind_err("audit.log");
+        std::fs::remove_dir_all(home.join("audit.log")).unwrap();
+        std::fs::create_dir_all(home.join("daemon-x")).unwrap();
+        kind_err("daemon-x");
+        std::fs::remove_dir_all(home.join("daemon-x")).unwrap();
+        std::fs::write(home.join("daemon-x"), "log").unwrap();
+        assert_eq!(
+            read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
+            rules,
+            "a regular file named daemon-x is what the registry declares"
+        );
+        std::fs::remove_file(home.join("daemon-x")).unwrap();
+        std::fs::remove_dir_all(home.join("evals")).unwrap();
+        std::fs::write(home.join("evals"), "not a dir").unwrap();
+        kind_err("evals");
+        std::fs::remove_file(home.join("evals")).unwrap();
+        std::fs::create_dir_all(home.join("evals")).unwrap();
+        // A SYMLINK of a classified name — `skills` (declared `dir`) aimed at a real directory,
+        // `audit.log` (declared `file`) aimed at a real file — is refused whatever it points at:
+        // the worker would read through the link.
+        #[cfg(unix)]
+        {
+            let real_skills = base.join("real-skills");
+            std::fs::rename(&skills, &real_skills).unwrap();
+            std::os::unix::fs::symlink(&real_skills, &skills).unwrap();
+            let err = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect_err("a linked skills root");
+            assert!(
+                err.contains("`skills`") && err.contains("a symlink"),
+                "{err}"
+            );
+            std::fs::remove_file(&skills).unwrap();
+            std::fs::rename(&real_skills, &skills).unwrap();
+            let real_log = base.join("real-audit.log");
+            std::fs::write(&real_log, "").unwrap();
+            std::os::unix::fs::symlink(&real_log, home.join("audit.log")).unwrap();
+            let err = read_rules_around_snapshot(&home, "000007", &spell)
+                .expect_err("a linked audit.log");
+            assert!(
+                err.contains("`audit.log`") && err.contains("a symlink"),
+                "{err}"
+            );
+            std::fs::remove_file(home.join("audit.log")).unwrap();
+        }
+        assert_eq!(
+            read_rules_around_snapshot(&home, "000007", &spell).unwrap(),
+            rules,
+            "the classified tree yields the same rules once the mismatches are gone"
+        );
         // …and so does an unclassified child of the skills root.
         std::fs::create_dir_all(skills.join("scratch")).unwrap();
         let err =

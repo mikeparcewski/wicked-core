@@ -225,9 +225,12 @@ pub(crate) fn binary_is_claude(bin: &str) -> bool {
 pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPERATOR_CONFIG";
 
 /// Has the operator pulled the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch? Read in ONE place so
-/// the argv isolation, the ACP config-dir override, and the skills-snapshot handoff
-/// (`skills_snapshot::admit_unit`) cannot disagree about it: a worker that inherits the operator's
-/// configuration inherits their plugins too, and must be handed no snapshot.
+/// the argv isolation and the ACP config-dir override cannot disagree about it. The hatch decides
+/// ONLY whether the operator's ambient configuration (user-scope settings, hooks, plugins) is
+/// inherited IN ADDITION to the skills snapshot (codex round 6; design v3.4): the snapshot is
+/// resolved, admitted and handed exactly as without it — `skills_snapshot::admit_turn` does not
+/// consult the hatch, an invalid explicit snapshot is a launch error and a missing required skill
+/// a refusal under it, and the template's `--plugin-dir` is stripped under it.
 pub(crate) fn inherits_operator_config() -> bool {
     std::env::var_os(INHERIT_OPERATOR_CONFIG_ENV).is_some()
 }
@@ -312,14 +315,18 @@ const DENIED_BASH: &[&str] = &[
 /// created the gap. Nothing is copied and no permission is widened for it: writes under the
 /// snapshot stay denied by the governance boundary, and reads pass through the read roots
 /// ([`assemble_read_roots`]).
+///
+/// Under the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch the three ISOLATION flags are withheld
+/// — that is what the hatch means: the worker inherits the operator's own scopes, mode and (no)
+/// fence — but the skills half is unchanged (codex round 6): the template's `--plugin-dir` is
+/// stripped and the snapshot rides its one `--plugin-dir` exactly as without the hatch. Rounds
+/// 2–5 returned before either, so under the hatch the stale hand copy survived in the argv and the
+/// admitted snapshot was never handed.
 pub(crate) fn inject_isolation_flags(
     argv: &mut Vec<String>,
     invocation: &str,
     skills_plugin: Option<&Path>,
 ) {
-    if inherits_operator_config() {
-        return;
-    }
     // Deference is decided against the TEMPLATE, not against the built argv. The argv also holds
     // the prompt, which is workflow- and model-authored, and `build_argv` may place it as a bare
     // token (`-p {PROMPT}` puts it before any `--` guard). Scanning the argv therefore let a prompt
@@ -329,49 +336,53 @@ pub(crate) fn inject_isolation_flags(
     // placeholder, so prompt content cannot appear here at all.
     let stated = tokenize(invocation);
     let mut flags: Vec<String> = Vec::new();
-    // An operator template that already pins its own scopes wins — the same deference
-    // `inject_claude_stream_flags` shows `--output-format`.
-    if !argv_states(&stated, &["--setting-sources"]) {
-        flags.push("--setting-sources".into());
-        flags.push("project,local".into());
-    }
-    // Dropping user scope also drops whatever permission mode lived there, and a `-p` session with
-    // no mode denies its own Write calls — verified: the same probe that wrote `probe.txt` under
-    // `acceptEdits` got "Claude requested permissions to write to …" with the mode left unset. So
-    // the mode has to be stated, not inherited.
-    //
-    // `acceptEdits` and not `bypassPermissions`/`auto`: both of those make the deny rules below
-    // inert. Measured on the live CLI with an identical probe — under `acceptEdits` the read of the
-    // operator's config was refused by the rule, under `auto` it went straight through, and under
-    // `--dangerously-skip-permissions` likewise. `acceptEdits` is the only mode where a worker can
-    // do its job AND stay inside the boundary.
-    if !argv_states(&stated, &["--permission-mode"]) {
-        flags.push("--permission-mode".into());
-        flags.push("acceptEdits".into());
-    }
-    if !argv_states(&stated, &["--disallowedTools", "--disallowed-tools"]) {
-        // The fence for THIS launch (`deny_rules`, core#396 / v3.1 §1): over the state home it is
-        // the explicit registry when the snapshot sits in the read slot, the blanket otherwise —
-        // Claude's deny beats any allow, so the deny itself must not cover the snapshot, and
-        // admission (`fence_check`) already refused a snapshot the fence would cover.
-        let rules = deny_rules(skills_plugin);
-        if !rules.is_empty() {
-            flags.push("--disallowedTools".into());
-            // Comma-joined into a SINGLE argv entry rather than spread across several: the flag is
-            // variadic, and a bare sequence of values invites a parser to keep swallowing until the
-            // next `-`-prefixed token — which is exactly where `--settings` lands.
-            flags.push(rules.join(","));
+    if !inherits_operator_config() {
+        // An operator template that already pins its own scopes wins — the same deference
+        // `inject_claude_stream_flags` shows `--output-format`.
+        if !argv_states(&stated, &["--setting-sources"]) {
+            flags.push("--setting-sources".into());
+            flags.push("project,local".into());
+        }
+        // Dropping user scope also drops whatever permission mode lived there, and a `-p` session
+        // with no mode denies its own Write calls — verified: the same probe that wrote `probe.txt`
+        // under `acceptEdits` got "Claude requested permissions to write to …" with the mode left
+        // unset. So the mode has to be stated, not inherited.
+        //
+        // `acceptEdits` and not `bypassPermissions`/`auto`: both of those make the deny rules
+        // below inert. Measured on the live CLI with an identical probe — under `acceptEdits` the
+        // read of the operator's config was refused by the rule, under `auto` it went straight
+        // through, and under `--dangerously-skip-permissions` likewise. `acceptEdits` is the only
+        // mode where a worker can do its job AND stay inside the boundary.
+        if !argv_states(&stated, &["--permission-mode"]) {
+            flags.push("--permission-mode".into());
+            flags.push("acceptEdits".into());
+        }
+        if !argv_states(&stated, &["--disallowedTools", "--disallowed-tools"]) {
+            // The fence for THIS launch (`deny_rules`, core#396 / v3.1 §1): over the state home
+            // it is the explicit registry when the snapshot sits in the read slot, the blanket
+            // otherwise — Claude's deny beats any allow, so the deny itself must not cover the
+            // snapshot, and admission (`fence_check`) already refused a snapshot the fence would
+            // cover.
+            let rules = deny_rules(skills_plugin);
+            if !rules.is_empty() {
+                flags.push("--disallowedTools".into());
+                // Comma-joined into a SINGLE argv entry rather than spread across several: the
+                // flag is variadic, and a bare sequence of values invites a parser to keep
+                // swallowing until the next `-`-prefixed token — which is exactly where
+                // `--settings` lands.
+                flags.push(rules.join(","));
+            }
         }
     }
     // An operator template that carries its OWN `--plugin-dir` — the `clis.toml` stop-gap that
     // pointed workers at a stale hand copy of the plugin — is a RETIRED input (v3 §2): stripped
-    // from the argv ALWAYS, snapshot in hand or not, and said so. Two `--plugin-dir`s naming the
-    // same plugin load it twice and the stale one is the very defect; and WITHOUT a snapshot the
-    // template's flag is not "the worker's only source of skills" — it is the stale hand copy the
-    // ladder exists to keep out. The ladder decides what a worker gets: a unit that needs a skill
-    // when the ladder yields no root is refused before launch, never handed the hand copy. No
-    // deference here, unlike the flags above: the template's choice was a workaround for the gap
-    // this closes.
+    // from the argv ALWAYS, snapshot in hand or not, hatch or not, and said so. Two
+    // `--plugin-dir`s naming the same plugin load it twice and the stale one is the very defect;
+    // and WITHOUT a snapshot the template's flag is not "the worker's only source of skills" — it
+    // is the stale hand copy the ladder exists to keep out. The ladder decides what a worker gets:
+    // a unit that needs a skill when the ladder yields no root is refused before launch, never
+    // handed the hand copy. No deference here, unlike the flags above: the template's choice was
+    // a workaround for the gap this closes.
     for retired in strip_plugin_dir(argv, &stated) {
         match skills_plugin {
             Some(root) => eprintln!(
@@ -538,8 +549,10 @@ fn rule_path_sep(p: &str, os_sep: char) -> Option<String> {
 /// top-level entry (`core.db*`, `daemon-*`, `evals/**`, …) and one per denied child of the skills
 /// root (`baseline/**`, `effective/**`, `manifest.json`, `current`, `.uv-cache/**`,
 /// `snapshots/.staging-*/**`), so the resolved generation is the ONLY non-denied path under the
-/// state home. The default `~/.wicked-crew` and an explicit `WICKED_CREW_STATE_HOME` keep their
-/// blanket whenever they are not that launch's state home. `Edit`/`Write` keep the blanket
+/// state home. The default `~/.wicked-crew` keeps its blanket whenever it is not that launch's
+/// state home (v3.4 §2: the state home is derived from the snapshot path alone — the round-4
+/// companion variable `WICKED_CREW_STATE_HOME` is retired and not read; a custom state home is
+/// fenced only through a snapshot handed from it). `Edit`/`Write` keep the blanket
 /// `<dir>/**` everywhere: the snapshot is immutable by contract and a worker never writes under
 /// it. Both carriers use this (the `--disallowedTools` argv and the wrapped settings file; the
 /// ACP `session/new` options and per-session settings file), so the fence cannot differ by path.
@@ -640,9 +653,10 @@ pub(crate) fn deny_rules(skills_root: Option<&Path>) -> Vec<String> {
 /// a blanket rule there over a directory that IS some launch's state home would deny that
 /// launch's snapshot whatever its own settings say. The state-home rule — blanket or registry —
 /// rides each session's own configuration (`acp_runner::SessionOptions`), never a file two
-/// launches share (v3.1 §3). The candidates are the default `~/.wicked-crew` and the daemon's
-/// explicit `WICKED_CREW_STATE_HOME` ([`state_home_candidates`]) — the only directories a
-/// snapshot's derived state home can be while the daemon is the publisher.
+/// launches share (v3.1 §3). The one candidate is the default `~/.wicked-crew`
+/// ([`state_home_candidates`]) — the only fenced directory a snapshot's derived state home can be
+/// (v3.4 §2: a custom state home is known only through the snapshot handed from it, so it never
+/// appears in the shared file either).
 pub(crate) fn shared_deny_rules() -> Vec<String> {
     let candidates = state_home_candidates();
     let mut rules: Vec<String> = Vec::new();
@@ -669,9 +683,9 @@ pub(crate) fn shared_deny_rules() -> Vec<String> {
 /// process starts. The root's state home is DERIVED from its shape (`state_home::of_snapshot`);
 /// `Err(why)` when the worker Read fence would cover the root or cannot be built around it — it
 /// lies under a fenced directory that is not its own state home (`~/.claude`, the default
-/// `~/.wicked-crew` when the state home is elsewhere, an explicit `WICKED_CREW_STATE_HOME` that
-/// is not its own); its path has no state home to derive (no `skills/snapshots/<gen>` shape); or
-/// its state home holds an entry the registry does not classify (named in `why`). `Ok(())` when
+/// `~/.wicked-crew` when the state home is elsewhere); its path has no state home to derive (no
+/// `skills/snapshots/<gen>` shape); or its state home holds an entry the registry does not
+/// classify, or one whose kind on disk is not the declared one (named in `why`). `Ok(())` when
 /// the root sits in the read slot of a fully classified state home — its own, wherever that is.
 pub(crate) fn fence_check(root: &Path) -> Result<(), String> {
     let state_home = crate::state_home::of_snapshot(root);
@@ -707,35 +721,26 @@ pub(crate) fn fence_check(root: &Path) -> Result<(), String> {
     crate::state_home::read_rules_around_snapshot(&state_home, gen, &rule_path).map(|_| ())
 }
 
-/// The directories that can be a launch's state home while the daemon publishes the snapshots:
-/// the default `~/.wicked-crew` and the daemon's explicit `WICKED_CREW_STATE_HOME`, when stated
-/// and resolvable (an unresolvable statement refuses every launch at admission,
-/// `skills_snapshot::resolve`, so nothing is lost by skipping it here).
+/// The fenced directory that can be a launch's state home while the daemon publishes the
+/// snapshots: the default `~/.wicked-crew`. A custom state home (a scratch daemon's `--db` parent)
+/// is known to the engine only through the snapshot handed from it — v3.4 §2 retired the companion
+/// variable that used to state it — so it is fenced by the registry when such a snapshot is handed
+/// and is never a shared-file candidate.
 fn state_home_candidates() -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = std::env::var_os("HOME")
+    std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| PathBuf::from(h).join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME))
         .into_iter()
-        .collect();
-    if let Ok(Some(explicit)) = crate::state_home::explicit_state_home() {
-        if !out
-            .iter()
-            .any(|c| crate::state_home::same_dir(c, &explicit))
-        {
-            out.push(explicit);
-        }
-    }
-    out
+        .collect()
 }
 
 /// The directories the file tools are fenced off from, in rule order: `$CLAUDE_CONFIG_DIR` first
 /// — when the daemon inherits one it is the live config dir, frequently NOT `~/.claude` (that
 /// redirection is how the operator's own tooling stays separate), and home-independent, so it
-/// still contributes when no home resolves — then the daemon's explicit `WICKED_CREW_STATE_HOME`
-/// (a custom state home is fenced whether or not a snapshot is handed; when a snapshot is, its
-/// derived state home must agree with it), then every [`DENIED_HOME_SUBDIRS`] entry under the
-/// home. Deduplicated by identity (an explicit state home that IS `~/.wicked-crew`, spelled either
-/// way, appears once). Says so when no home resolves (the Bash verb rules do not need one).
+/// still contributes when no home resolves — then every [`DENIED_HOME_SUBDIRS`] entry under the
+/// home. Deduplicated by identity. Says so when no home resolves (the Bash verb rules do not need
+/// one). The handed snapshot's DERIVED state home is added by [`deny_rules`] when it is not among
+/// these (v3.4 §2: no variable states a state home; the snapshot path is the one input).
 fn denied_dirs() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -747,12 +752,10 @@ fn denied_dirs() -> Vec<PathBuf> {
              from workers (the Bash verb rules still apply)"
         );
     }
-    let explicit_state_home = crate::state_home::explicit_state_home().ok().flatten();
     let mut unique: Vec<PathBuf> = Vec::new();
     for dir in std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .into_iter()
-        .chain(explicit_state_home)
         .chain(
             home.iter()
                 .flat_map(|h| DENIED_HOME_SUBDIRS.iter().map(|d| h.join(d))),
@@ -4962,10 +4965,11 @@ mod tests {
     /// the Skill-tool clause; every other CLI gets the bare mirrored name — the frontmatter `name`
     /// its skills directory carries — and NO Skill-tool clause (it has no such tool). With a
     /// snapshot in hand the identity is DISCOVERED from its index (ref → entry → top-level dir),
-    /// so a skill whose directory diverged from its frontmatter name still resolves on both sides,
-    /// and a NESTED skill — which Claude Code's plugin loader does not expose — gets no invented
-    /// plugin form; without a snapshot, the convention garden's top-level layout guarantees is
-    /// applied for Claude and the ref passes through untouched for the rest.
+    /// keyed by frontmatter name ONLY (codex round 6: a divergent name is a load-time defect, not
+    /// an alias, so a ref that is not an indexed name resolves to nothing in the index), and a
+    /// NESTED skill — which Claude Code's plugin loader does not expose — gets no invented plugin
+    /// form; without a snapshot, the convention garden's top-level layout guarantees is applied
+    /// for Claude and the ref passes through untouched for the rest.
     #[test]
     fn the_skill_directive_is_cli_aware() {
         use crate::skills_snapshot::test_support::{load, scratch, snapshot_root};
@@ -4976,7 +4980,7 @@ mod tests {
             &[
                 ("domain", "wicked-garden-domain"),
                 ("engineering/frontend", "wicked-garden-engineering-frontend"),
-                ("qe-oracle", "wicked-garden-test-oracle"),
+                ("qe-oracle", "wicked-garden-qe-oracle"),
             ],
         );
         let snap = load(&root);
@@ -5007,14 +5011,18 @@ mod tests {
             "the nested skill is refused for a Claude seat, not prompted for"
         );
         assert_eq!(
-            plugin_skill_invocation("wicked-garden-test-oracle", claude, Some(&snap)),
+            plugin_skill_invocation("wicked-garden-qe-oracle", claude, Some(&snap)),
             "wicked-garden:qe-oracle",
-            "the index wins over the naming convention when the dir diverged from the name"
+            "discovered from the index by frontmatter name"
         );
         assert_eq!(
             plugin_skill_invocation("wicked-garden-qe-oracle", mirrored, Some(&snap)),
-            "wicked-garden-test-oracle",
-            "a dir-derived ref is spelled by its frontmatter name for the mirrors"
+            "wicked-garden-qe-oracle",
+            "the mirrors invoke the frontmatter name"
+        );
+        assert!(
+            snap.skill("wicked-garden-test-oracle").is_none(),
+            "no alias: a name the index does not carry is not a skill of this snapshot"
         );
         assert_eq!(
             plugin_skill_invocation("wicked-garden-domain", mirrored, Some(&snap)),
@@ -6030,15 +6038,11 @@ mod tests {
     #[test]
     fn no_home_still_denies_the_verbs_that_never_needed_one() {
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
-        let saved: Vec<(&str, Option<std::ffi::OsString>)> = [
-            "HOME",
-            "USERPROFILE",
-            "CLAUDE_CONFIG_DIR",
-            crate::state_home::STATE_HOME_ENV,
-        ]
-        .iter()
-        .map(|k| (*k, std::env::var_os(k)))
-        .collect();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR"]
+                .iter()
+                .map(|k| (*k, std::env::var_os(k)))
+                .collect();
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
@@ -6064,22 +6068,28 @@ mod tests {
 
     // ── core#396: the skills snapshot on the wrapped path ────────────────────────────────────────
 
-    /// RAII restore of one process-global variable — the skills-snapshot input — with the same
-    /// discipline as [`HomeGuard`]: hold [`ENV_LOCK`] and declare the guard after the lock guard.
-    #[cfg(unix)]
+    /// RAII restore of one process-global variable — the skills-snapshot input, the escape hatch —
+    /// with the same discipline as [`HomeGuard`]: hold [`ENV_LOCK`] (write) and declare the guard
+    /// after the lock guard. Platform-independent: the hatch sub-case of the plugin-flag test runs
+    /// on every CI OS.
     struct VarGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
     }
-    #[cfg(unix)]
     impl VarGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let prev = std::env::var_os(key);
             std::env::set_var(key, value);
             Self { key, prev }
         }
+        /// Pin the variable UNSET (restored on drop) — a scenario that needs "no hatch" cannot rely
+        /// on the developer's or CI's environment not carrying one.
+        fn unset(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
     }
-    #[cfg(unix)]
     impl Drop for VarGuard {
         fn drop(&mut self) {
             match &self.prev {
@@ -6148,14 +6158,15 @@ mod tests {
     /// template that states none loses nothing even when the PROMPT is the flag's literal text;
     /// and with NO snapshot the template's flag is stripped all the same — a template is not a
     /// skills input, and the ladder (not the operator's hand copy) decides what a worker gets.
+    /// Under the inherit-config escape hatch (codex round 6) the ISOLATION flags are withheld but
+    /// the skills half is identical: one `--plugin-dir`, the snapshot, the template's stripped.
     #[test]
     fn the_snapshot_rides_plugin_dir_exactly_once_and_supersedes_the_template_hand_copy() {
         // `inject_isolation_flags` reads the inherit-config escape hatch (and HOME, for the deny
-        // rules): a concurrent test pinning `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` would make it
-        // return with the argv untouched — the stale hand copy still there — and fail this
-        // assertion for a reason that is not this code's (codex round 5). Read side, held for the
-        // whole body.
-        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        // rules): this test PINS the hatch both ways, so it holds the write side for the whole
+        // body (codex round 5 held the read side against a concurrent pin).
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_hatch = VarGuard::unset(INHERIT_OPERATOR_CONFIG_ENV);
         let snapshot = std::path::Path::new("/snapshots/5");
         let stale = "/home/op/.claude/plugins/wicked-garden";
 
@@ -6206,6 +6217,40 @@ mod tests {
         let mut argv = build_argv(&inv, "hi", &[]);
         inject_isolation_flags(&mut argv, &inv, None);
         assert!(!argv.iter().any(|a| a.contains(stale)), "{argv:?}");
+
+        // The escape hatch: the operator's scopes, mode and fence are inherited (no isolation
+        // flag is injected), but the snapshot still rides its ONE `--plugin-dir` and the
+        // template's stale copy is still stripped — in either spelling, and with no snapshot too.
+        // Rounds 2–5 returned before both, leaving the stale copy in the argv.
+        {
+            let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
+            let inv = format!("claude --plugin-dir {stale} -p {{PROMPT}}");
+            let mut argv = build_argv(&inv, "hi", &[]);
+            inject_isolation_flags(&mut argv, &inv, Some(snapshot));
+            assert_eq!(
+                plugin_dirs(&argv),
+                vec!["/snapshots/5"],
+                "under the hatch: one --plugin-dir, the snapshot: {argv:?}"
+            );
+            assert!(!argv.iter().any(|a| a.contains(stale)), "{argv:?}");
+            for isolation in [
+                "--setting-sources",
+                "--permission-mode",
+                "--disallowedTools",
+            ] {
+                assert!(
+                    !argv.iter().any(|a| a == isolation),
+                    "the hatch withholds {isolation}: {argv:?}"
+                );
+            }
+            let inv = format!("claude --plugin-dir={stale} -p {{PROMPT}}");
+            let mut argv = build_argv(&inv, "hi", &[]);
+            inject_isolation_flags(&mut argv, &inv, None);
+            assert!(
+                plugin_dirs(&argv).is_empty() && !argv.iter().any(|a| a.contains(stale)),
+                "no snapshot under the hatch: the template's flag is still not a skills input: {argv:?}"
+            );
+        }
     }
 
     /// The read boundary widens to the snapshot on the wrapped carrier — through the ONE shared
@@ -6347,9 +6392,10 @@ mod tests {
     /// daemon's `<x>/crew-state/skills/snapshots/1` — derives that directory, whose siblings are
     /// then classified and fenced by the same registry (and refused when unclassified), while the
     /// default `~/.wicked-crew` keeps its blanket; a root with no `skills/snapshots/<gen>` shape
-    /// has no state home and fails `fence_check`. An explicit `WICKED_CREW_STATE_HOME` is fenced
-    /// on its own even with no snapshot, and stays out of the shared (launch-independent) subset.
-    /// Documented residual: a sibling immutable generation stays readable until crew reaps it.
+    /// has no state home and fails `fence_check`. The retired companion variable (v3.4 §2) states
+    /// nothing: a custom state home is fenced only through a snapshot handed from it and never
+    /// reaches the shared (launch-independent) subset. Documented residual: a generation published
+    /// while a session runs stays readable by it until its next launch.
     #[cfg(unix)]
     #[test]
     fn the_state_home_fence_is_the_static_registry_and_fails_closed_on_the_unclassified() {
@@ -6622,37 +6668,30 @@ mod tests {
         std::fs::remove_dir_all(custom.join("wt")).unwrap();
         assert_eq!(fence_check(&custom_gen), Ok(()));
 
-        // The daemon's EXPLICIT state home: fenced (blanket) even with no snapshot; out of the
-        // shared subset; the registry when it IS the handed snapshot's state home — and when it
-        // names the default state home in another spelling, the rules are not duplicated.
+        // v3.4 §2 (codex round 6): the state home is known through the handed snapshot ALONE.
+        // The retired companion variable, set to the custom state home, changes nothing — with no
+        // snapshot handed the custom directory is not fenced (documented residual: only a
+        // snapshot from it fences it), the shared subset never names it, and the rules built
+        // around the custom generation are the same whatever the variable says.
         {
-            let _explicit = VarGuard::set(crate::state_home::STATE_HOME_ENV, &custom);
-            let with_explicit = deny_rules(None);
+            let _retired = VarGuard::set("WICKED_CREW_STATE_HOME", &custom);
+            let without_snapshot = deny_rules(None);
             assert!(
-                with_explicit.contains(&format!("Read({custom_rule}/**)"))
-                    && with_explicit.contains(&format!("Read({crew_rule}/**)")),
-                "{with_explicit:?}"
+                !without_snapshot.contains(&format!("Read({custom_rule}/**)"))
+                    && without_snapshot.contains(&format!("Read({crew_rule}/**)")),
+                "the retired variable states nothing; only the default is fenced without a \
+                 snapshot: {without_snapshot:?}"
             );
             assert!(
                 !shared_deny_rules().iter().any(|r| r.contains(&custom_rule)),
-                "the explicit state home rides each session, never the shared file"
+                "a custom state home never reaches the shared file"
             );
-            // Same rules, whatever position the explicit statement puts the directory at.
-            let sorted = |mut v: Vec<String>| {
-                v.sort();
-                v
-            };
             assert_eq!(
-                sorted(deny_rules(Some(&custom_gen))),
-                sorted(custom_fenced.clone()),
-                "stating the state home the snapshot derives changes nothing"
+                deny_rules(Some(&custom_gen)),
+                custom_fenced,
+                "the variable changes nothing about the fence a handed snapshot opens"
             );
-            let _explicit = VarGuard::set(crate::state_home::STATE_HOME_ENV, &crew);
-            assert_eq!(
-                sorted(deny_rules(Some(&gen7))),
-                sorted(fenced.clone()),
-                "the default, restated explicitly, is not fenced twice"
-            );
+            assert_eq!(deny_rules(Some(&gen7)), fenced);
         }
 
         // The shared (launch-independent) subset carries no state-home rule at all.
@@ -6981,9 +7020,10 @@ mod tests {
     /// Two sessions on two generations, CONCURRENTLY: two threads released by one barrier each
     /// build their admission, directive, argv and read roots against THEIR generation while the
     /// other does the same; the roots differ, nothing crosses over (the same `skill_ref` resolves
-    /// to a different directory in each generation), and neither tree is written into — the
-    /// snapshot is a shared-nothing input, so reaping one generation cannot touch a session on
-    /// the other. The ACP runner's session-bound variant lives in `acp_runner::tests`.
+    /// in each generation's own root, and a skill only one generation holds is admitted in that
+    /// one alone), and neither tree is written into — the snapshot is a shared-nothing input, so
+    /// reaping one generation cannot touch a session on the other. The ACP runner's session-bound
+    /// variant lives in `acp_runner::tests`.
     #[test]
     fn two_sessions_on_two_generations_carry_their_own_roots_concurrently_and_write_nothing() {
         use crate::skills_snapshot::test_support::{
@@ -7003,7 +7043,7 @@ mod tests {
             &crate::skills_snapshot::test_support::gen_dir(&base, "2"),
             "2",
             &[
-                ("mem-v2", "wicked-garden-mem"),
+                ("mem", "wicked-garden-mem"),
                 ("search", "wicked-garden-search"),
             ],
         );
@@ -7045,12 +7085,12 @@ mod tests {
         assert_eq!(b.0, root2);
         assert!(
             a.1.contains("\"wicked-garden:mem\""),
-            "gen 1 spells the skill by ITS directory: {}",
+            "gen 1 spells the skill by its directory: {}",
             a.1
         );
         assert!(
-            b.1.contains("\"wicked-garden:mem-v2\""),
-            "gen 2 spells the same skill by ITS directory: {}",
+            b.1.contains("\"wicked-garden:mem\""),
+            "gen 2 spells it by its own index's directory: {}",
             b.1
         );
         assert_eq!(plugin_dirs(&a.2), vec![root1.to_string_lossy().as_ref()]);
@@ -7064,99 +7104,173 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// END TO END through `run_unit`, the positive half and the negative exclusion: a claude unit
-    /// is launched with the snapshot as its ONE `--plugin-dir`, the stale hand copy the operator's
-    /// template pinned is stripped from the real argv, the directive names the skill in Claude's
-    /// plugin form BY DISCOVERY — the skill lives at `skills/domain-v5/` and is found through the
-    /// index by its frontmatter name, so the directive says `wicked-garden:domain-v5`, which no
-    /// string rewrite of the ref could produce — and the snapshot tree is byte-identical
-    /// afterwards. HOME is pinned so the deny rules and the ladder resolve deterministically.
+    /// END TO END through `run_unit` — the deterministic wrapped-carrier coverage (codex round 6,
+    /// item 7; no network, no auth, part of the normal suite): a fake `claude` FIRST ON PATH (a
+    /// shell script that records its argv), a REGISTRY seat (`~/.config/wicked-council/clis.toml`
+    /// under the pinned HOME) whose `headless_invocation` carries the operator's stop-gap
+    /// `--plugin-dir <stale hand copy>`, and a unit assigned to that seat with no ad-hoc
+    /// invocation — the path a governed run's unit takes. The argv the binary RECEIVES carries
+    /// EXACTLY ONE `--plugin-dir`, the snapshot, with the registry's stripped; the isolation flags
+    /// ride beside it; the directive names the skill in Claude's plugin form by the directory
+    /// DISCOVERED through the index; the snapshot tree is byte-identical afterwards. Then the SAME
+    /// launch under the inherit-config escape hatch: the isolation flags are gone (the operator's
+    /// configuration is inherited) but the snapshot still rides its one `--plugin-dir` and the
+    /// registry's stale copy is still stripped — the hatch decides what is inherited IN ADDITION
+    /// to the snapshot, never whether it is handed. HOME is pinned so the registry, the deny rules
+    /// and the ladder resolve deterministically.
     #[cfg(unix)]
     #[test]
-    fn a_wrapped_claude_unit_is_handed_the_snapshot_and_not_the_stale_hand_copy() {
+    fn a_wrapped_claude_unit_on_path_is_handed_the_snapshot_and_not_the_registry_hand_copy() {
         use crate::skills_snapshot::test_support::{scratch, snapshot_root, tree_fingerprint};
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let home = scratch("wrapped-home");
         let _home = HomeGuard::pin(&home);
+        let _no_hatch = VarGuard::unset(INHERIT_OPERATOR_CONFIG_ENV);
         let snapshot = snapshot_root(
             &crate::skills_snapshot::test_support::gen_dir(&home.join(".wicked-crew"), "5"),
             "5",
             &[
-                ("domain-v5", "wicked-garden-domain"),
+                ("domain", "wicked-garden-domain"),
                 ("mem", "wicked-garden-mem"),
             ],
         );
         let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
         let before = tree_fingerprint(&snapshot);
-        // The operator's stop-gap: a hand copy pinned by the template's own --plugin-dir.
+        // The operator's stop-gap: a hand copy pinned by the REGISTRY template's own --plugin-dir
+        // (the `clis.toml` under the pinned HOME is the user overlay `resolve_invocation` reads).
         let stale = home.join(".claude/plugins/wicked-garden");
         std::fs::create_dir_all(stale.join("skills/domain")).unwrap();
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "skills-seat"
+display_name = "Skills seat"
+binary = "claude"
+headless_invocation = "claude --plugin-dir {stale} -p {{PROMPT}}"
+"#,
+                stale = stale.display()
+            ),
+        )
+        .unwrap();
         let dir = home.join("wt");
         std::fs::create_dir_all(&dir).unwrap();
         // Captured INSIDE the worktree — the one root a worker may write under any sandbox floor.
         let argv_file = dir.join("argv.txt");
-        let claude = fake_claude(&home.join("bin"), &argv_file);
+        // The fake `claude` resolves through PATH — the registry's bare `claude` does exactly
+        // that for the daemon.
+        let bin = home.join("bin");
+        fake_claude(&bin, &argv_file);
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let _path = VarGuard::set("PATH", std::path::Path::new(&path));
 
-        let mut u = WorkUnit::pending("s:u1", "s", 1, "extract the rules");
-        u.skill_ref = Some("wicked-garden-domain".to_string());
-        u.assigned_invocation = Some(format!(
-            "{} --plugin-dir {} -p {{PROMPT}}",
-            claude.display(),
-            stale.display()
-        ));
-        let input = StepInput {
-            run_id: "run-skills".to_string(),
-            unit_ix: 0,
-            attempt: 0,
-            unit: u,
-            workflow_id: "wf-x".to_string(),
-            entity_mode: crate::scope::EntityMode::Isolated,
-            workdir: Some(dir),
-            governance: None,
-            prior_outputs: vec![],
-            elicitation_epoch: 0,
-            process_gen: None,
-            launch_seq: 0,
-            required_skills: vec![
-                "wicked-garden-domain".to_string(),
-                "wicked-garden-mem".to_string(),
-            ],
+        let input = || {
+            let mut u = WorkUnit::pending("s:u1", "s", 1, "extract the rules");
+            u.skill_ref = Some("wicked-garden-domain".to_string());
+            u.assigned_cli = Some("skills-seat".to_string());
+            StepInput {
+                run_id: "run-skills".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: vec![
+                    "wicked-garden-domain".to_string(),
+                    "wicked-garden-mem".to_string(),
+                ],
+            }
         };
-        let out = WrappedCliStepRunner::default().run_unit(&input);
-        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
-        let argv: Vec<String> = std::fs::read_to_string(&argv_file)
-            .expect("the fake claude ran and recorded its argv")
-            .lines()
-            .map(str::to_string)
-            .collect();
+        let launched = |label: &str| -> Vec<String> {
+            let _ = std::fs::remove_file(&argv_file);
+            let out = WrappedCliStepRunner::default().run_unit(&input());
+            assert_eq!(out.status, StepStatus::Ok, "{label}: {}", out.output);
+            std::fs::read_to_string(&argv_file)
+                .unwrap_or_else(|e| {
+                    panic!("{label}: the fake claude on PATH ran and recorded its argv: {e}")
+                })
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let stale_str = stale.to_string_lossy();
+        const DIRECTIVE: &str = "Invoke your skill \"wicked-garden:domain\" (via the Skill tool) and complete this task under its instructions: extract the rules";
+
+        let argv = launched("isolated");
         assert_eq!(
             plugin_dirs(&argv),
             vec![snapshot.to_string_lossy().as_ref()],
             "the real argv carries the snapshot as its ONE --plugin-dir: {argv:?}"
         );
-        let stale_str = stale.to_string_lossy();
         assert!(
             !argv.iter().any(|a| a.contains(stale_str.as_ref())),
-            "the template's stale hand copy must not reach the worker: {argv:?}"
+            "the registry template's stale hand copy must not reach the worker: {argv:?}"
         );
         assert!(
-            argv.iter().any(|a| a.starts_with(
-                "Invoke your skill \"wicked-garden:domain-v5\" (via the Skill tool) and complete this task under its instructions: extract the rules"
-            )),
+            argv.iter().any(|a| a.starts_with(DIRECTIVE)),
             "the directive names the skill by the directory DISCOVERED through the index: {argv:?}"
+        );
+        assert!(
+            states_pair(&argv, "--setting-sources", "project,local")
+                && states_pair(&argv, "--permission-mode", "acceptEdits")
+                && argv.iter().any(|a| a == "--disallowedTools"),
+            "the isolation rides beside the snapshot: {argv:?}"
         );
         assert_eq!(
             tree_fingerprint(&snapshot),
             before,
             "the snapshot is immutable: the launch wrote nothing into it"
         );
+
+        // The escape hatch (codex round 6): the operator's configuration is inherited — no
+        // isolation flag — and the skills half is unchanged: one --plugin-dir, the snapshot, the
+        // registry's stale copy stripped, the same directive.
+        {
+            let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
+            let argv = launched("hatch");
+            assert_eq!(
+                plugin_dirs(&argv),
+                vec![snapshot.to_string_lossy().as_ref()],
+                "under the hatch the snapshot still rides its ONE --plugin-dir: {argv:?}"
+            );
+            assert!(
+                !argv.iter().any(|a| a.contains(stale_str.as_ref())),
+                "under the hatch the registry's stale hand copy is still stripped: {argv:?}"
+            );
+            for isolation in [
+                "--setting-sources",
+                "--permission-mode",
+                "--disallowedTools",
+            ] {
+                assert!(
+                    !argv.iter().any(|a| a == isolation),
+                    "the hatch withholds {isolation}: {argv:?}"
+                );
+            }
+            assert!(argv.iter().any(|a| a.starts_with(DIRECTIVE)), "{argv:?}");
+        }
+        assert_eq!(tree_fingerprint(&snapshot), before);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     /// END TO END through `run_unit`, the refusals: a run whose skill set is not fully held by the
     /// snapshot is refused BY NAME before any process starts, and an explicit snapshot path that
     /// is not a snapshot fails the launch as a config error naming the variable and the path —
-    /// never a silent fallback, never a worker told to invoke a skill it cannot have.
+    /// never a silent fallback, never a worker told to invoke a skill it cannot have. Both stand
+    /// under the inherit-config escape hatch too (codex round 6): the hatch never bypasses
+    /// admission.
     #[cfg(unix)]
     #[test]
     fn a_wrapped_launch_is_refused_by_name_for_a_missing_skill_and_fails_on_a_bad_path() {
@@ -7164,6 +7278,7 @@ mod tests {
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let home = scratch("refuse-home");
         let _home = HomeGuard::pin(&home);
+        let _no_hatch = VarGuard::unset(INHERIT_OPERATOR_CONFIG_ENV);
         let snapshot = snapshot_root(
             &crate::skills_snapshot::test_support::gen_dir(&home.join(".wicked-crew"), "1"),
             "1",
@@ -7229,6 +7344,37 @@ mod tests {
                     && out.output.contains(&bad.to_string_lossy().to_string())
                     && out.output.contains("not a usable skills snapshot"),
                 "a bad explicit path is a named config error, not a fallback: {}",
+                out.output
+            );
+            assert!(!argv_file.exists(), "failed BEFORE any process was spawned");
+        }
+        // Under the escape hatch (codex round 6): the same two refusals, unchanged — rounds 2–5
+        // launched the worker on the operator's plugins for the first and ignored the second.
+        {
+            let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
+            let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            assert_eq!(out.status, StepStatus::Failed, "hatch: {}", out.output);
+            assert!(
+                out.output
+                    .contains("requires: wicked-garden-domain-extractor, wicked-garden-mem;"),
+                "under the hatch a missing skill is still refused by name: {}",
+                out.output
+            );
+            assert!(
+                !argv_file.exists(),
+                "refused BEFORE any process was spawned"
+            );
+            let bad = home.join("no-such-snapshot");
+            let _bad = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &bad);
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            assert_eq!(out.status, StepStatus::Failed, "hatch: {}", out.output);
+            assert!(
+                out.output
+                    .contains(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV)
+                    && out.output.contains(&bad.to_string_lossy().to_string())
+                    && out.output.contains("not a usable skills snapshot"),
+                "under the hatch an invalid explicit snapshot is still a launch error: {}",
                 out.output
             );
             assert!(!argv_file.exists(), "failed BEFORE any process was spawned");

@@ -7412,6 +7412,12 @@ cat >/dev/null
             "the spec params still ride the same frame: {seen}"
         );
         assert!(
+            frame["params"]["_meta"]["claudeCode"]["options"]["disallowedTools"]
+                .as_array()
+                .is_some_and(|d| !d.is_empty()),
+            "the plugin is MERGED beside the session's own options (the fence): {seen}"
+        );
+        assert!(
             std::fs::symlink_metadata(home.join("plugins")).is_err(),
             "the worker home's plugins/ (the stale hand copy) must be sanitized away before the \
              bridge starts — the handshake is the only skills input"
@@ -8061,7 +8067,6 @@ transport = "stdio"
         )
         .unwrap();
         let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &root);
-        let _state = EnvPin::set(crate::state_home::STATE_HOME_ENV, &state);
         let wt = base.join("wt");
         std::fs::create_dir_all(&wt).unwrap();
 
@@ -8166,19 +8171,22 @@ while True:
     }
 
     /// core#396, the ACP session BINDING — end to end through `run_unit` against the recording
-    /// bridge, with `WICKED_SKILLS_SNAPSHOT` pointing at crew's `current` link:
+    /// bridge (the deterministic ACP-carrier coverage: a stdio JSON-RPC server that echoes the
+    /// `session/new` params it received — no network, no auth, part of the normal suite), with
+    /// `WICKED_SKILLS_SNAPSHOT` pointing at the CONCRETE generation path crew exports after
+    /// resolving `current` (v3.4 §2 — a handed `current` link is refused at load):
     ///
     /// 1. turn 1 of run A opens the session on generation 1 — the `session/new` frame names gen 1's
-    ///    root, and the directive is DISCOVERED from gen 1's index;
-    /// 2. crew publishes generation 2 and flips `current`;
-    /// 3. turn 2 of run A — the SAME cached session — still prompts from gen 1's index (the skill
-    ///    `wicked-garden-mem` lives at `mem` in gen 1 and at `mem-v2` in gen 2, so the directive
-    ///    says `wicked-garden:mem`), still ADMITS against gen 1 (turn 3 names a skill only gen 2
-    ///    holds and is refused naming gen 1's root — never reaching the bridge), and reports gen 1
-    ///    only;
-    /// 4. a NEW run B, spawned after the flip, gets gen 2 — and its first turn runs CONCURRENTLY
-    ///    with run A's next turn (barrier-released threads on the shared runner): two live
-    ///    sessions on two generations, each prompting from its own index, one bridge each.
+    ///    root as `_meta.claudeCode.options.plugins == [{type: local, path}]`, MERGED beside the
+    ///    session's own `disallowedTools` and `settings`, and the directive is DISCOVERED from gen
+    ///    1's index;
+    /// 2. crew publishes generation 2, flips `current`, and re-exports the concrete path of gen 2;
+    /// 3. turn 2 of run A — the SAME cached session — still prompts from gen 1's index, still
+    ///    ADMITS against gen 1 (turn 3 names a skill only gen 2 holds and is refused naming gen 1's
+    ///    root — never reaching the bridge), and reports gen 1 only;
+    /// 4. a NEW run B, spawned after the re-export, gets gen 2 — and its first turn runs
+    ///    CONCURRENTLY with run A's next turn (barrier-released threads on the shared runner): two
+    ///    live sessions on two generations, each prompting from its own index, one bridge each.
     ///
     /// Generation reporting: exactly one `SkillsSnapshotHanded` per session — (A, gen 1) and
     /// (B, gen 2) — and no event ever names (A, gen 2). The read-boundary surface of the binding
@@ -8215,9 +8223,11 @@ while True:
                 ("search", "wicked-garden-search"),
             ],
         );
+        // crew's `current` link exists beside `snapshots/` — and is NOT what the engine is handed:
+        // crew resolves it and exports the concrete generation (v3.4 §2).
         let current = skills.join("current");
         std::os::unix::fs::symlink("snapshots/1", &current).unwrap();
-        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &current);
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen1);
 
         // A claude-binary seat over the recording bridge, through the real user-overlay seam.
         let ledger = home.join("ledger.ndjson");
@@ -8291,9 +8301,11 @@ transport = "stdio"
             entries[1]
         );
 
-        // 2. crew publishes generation 2 and flips `current`.
+        // 2. crew publishes generation 2, flips `current` and re-exports the CONCRETE path of gen 2
+        //    to the engine (the link itself is never handed).
         std::fs::remove_file(&current).unwrap();
         std::os::unix::fs::symlink("snapshots/2", &current).unwrap();
+        let _snap2 = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen2);
 
         // 3a. Turn 2 of run A, the SAME session, names `mem` — which `current` (gen 2) no longer
         //     holds. v3.1 §4: the cached session is admitted against ITS pinned generation BEFORE
@@ -8495,10 +8507,13 @@ transport = "stdio"
     /// one by resolving the ambient configuration. A session's FIRST turn names no skill; its
     /// second names one:
     ///
-    /// 1. under the inherit-config escape hatch the session opens with nothing pinned
-    ///    (`proc.skills = None` — the worker runs on the operator's own plugins, no snapshot is
-    ///    handed) and turn 2 is admitted (the bypass applies to cached and fresh alike) with its
-    ///    directive in the plugin form — the operator's own plugins are what the worker runs on;
+    /// 1. the inherit-config escape hatch bypasses NOTHING (codex round 6): (a) with NO root on the
+    ///    ladder a skill-free session opens with nothing pinned and its skill-bearing turn 2 is
+    ///    REFUSED (`NotDelivered`) exactly as without the hatch — rounds 2–5 admitted it onto the
+    ///    operator's plugins and generated a directive; (b) with a snapshot handed, a hatch session
+    ///    is OPENED ON IT (`plugins` in the handshake — the hatch inherits the operator's
+    ///    configuration IN ADDITION to the snapshot), its skill turn carries the directive, and a
+    ///    skill the generation lacks is refused by name;
     /// 2. with NO root on the ladder (no snapshot variable, no plugin cache under the pinned HOME
     ///    or the pinned, empty claude config dir) a skill-free session opens with nothing pinned;
     ///    then a snapshot APPEARS (`WICKED_SKILLS_SNAPSHOT` set) and the same session's
@@ -8523,13 +8538,12 @@ transport = "stdio"
         let home = canonical_scratch("acp-turns");
         let _home = EnvPin::set("HOME", &home);
         // The ladder, pinned hermetic: no snapshot variable (yet), an EMPTY claude config dir (the
-        // live-cache rung looks under it, never under the developer's real one), no explicit
-        // state home (the fixture's derives from its shape).
+        // live-cache rung looks under it, never under the developer's real one); the fixture's
+        // state home derives from its shape (the one input, v3.4 §2).
         let _no_snap = EnvPin::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let config = home.join("claude-config");
         std::fs::create_dir_all(&config).unwrap();
         let _config = EnvPin::set(CLAUDE_CONFIG_DIR_ENV, &config);
-        let _no_state = EnvPin::unset(crate::state_home::STATE_HOME_ENV);
         let skills = home.join(".wicked-crew").join("skills");
         let gen = snapshot_root(
             &skills.join("snapshots").join("000001"),
@@ -8588,39 +8602,84 @@ transport = "stdio"
             }
         };
 
-        // 1. The inherit-config escape hatch, pinned for the whole of run I (both turns).
+        // 1. The inherit-config escape hatch, pinned for runs I and H — it bypasses NOTHING
+        //    (codex round 6).
         {
             let _hatch = EnvPin::set(
                 crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV,
                 std::path::Path::new("1"),
             );
+            // (a) No root on the ladder: the skill-free session opens with nothing pinned, and
+            //     its skill-bearing turn is REFUSED like any session that never received a
+            //     plugin — never admitted onto the operator's plugins, no directive generated.
             let out = runner.run_unit(&unit("run-I", 1, None));
             assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
             let entries = ledger_entries(&ledger);
             assert_eq!(entries.len(), 2, "session/new + one prompt: {entries:?}");
             assert!(
                 entries[0]["new"]["_meta"]["claudeCode"]["options"]["plugins"].is_null(),
-                "under the hatch no snapshot is handed: {}",
+                "no root on the ladder ⇒ nothing handed, hatch or not: {}",
                 entries[0]
             );
             let out = runner.run_unit(&unit("run-I", 2, Some("wicked-garden-domain")));
             assert_eq!(
                 out.status,
-                StepStatus::Ok,
-                "turn 2 of a session opened with nothing pinned is admitted under the same \
-                 configuration a fresh launch is: {}",
+                StepStatus::Failed,
+                "under the hatch a session opened without a snapshot still refuses a skill it \
+                 never loaded: {}",
                 out.output
             );
-            let entries = ledger_entries(&ledger);
-            assert_eq!(entries.len(), 3, "the turn reached the bridge: {entries:?}");
             assert!(
-                entries[2]["prompt"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Invoke your skill \"wicked-garden:domain\""),
+                out.output.contains("wicked-garden-domain")
+                    && out.output.contains("opened without a skills snapshot"),
                 "{}",
-                entries[2]
+                out.output
             );
+            assert_eq!(
+                ledger_entries(&ledger).len(),
+                2,
+                "the refusal never reached the bridge"
+            );
+            // (b) A snapshot handed: the hatch session is OPENED ON IT — the plugin handshake —
+            //     and admitted against it; the operator's configuration is inherited IN
+            //     ADDITION (no per-session fence rides the frame under the hatch).
+            {
+                let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &gen);
+                let out = runner.run_unit(&unit("run-H", 1, Some("wicked-garden-domain")));
+                assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+                let entries = ledger_entries(&ledger);
+                assert_eq!(entries.len(), 4, "{entries:?}");
+                assert_eq!(
+                    entries[2]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
+                    serde_json::json!([{"type": "local", "path": gen.to_string_lossy()}]),
+                    "under the hatch the snapshot is still handed at session/new: {}",
+                    entries[2]
+                );
+                assert!(
+                    entries[2]["new"]["_meta"]["claudeCode"]["options"]["disallowedTools"]
+                        .is_null(),
+                    "the hatch inherits the operator's configuration — no engine fence: {}",
+                    entries[2]
+                );
+                assert!(
+                    entries[3]["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Invoke your skill \"wicked-garden:domain\""),
+                    "{}",
+                    entries[3]
+                );
+                let out = runner.run_unit(&unit("run-H", 2, Some("wicked-garden-search")));
+                assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+                assert!(
+                    out.output.contains("wicked-garden-search")
+                        && out.output.contains(&gen.display().to_string()),
+                    "under the hatch a missing skill is refused by name against the pinned \
+                     generation: {}",
+                    out.output
+                );
+                assert_eq!(ledger_entries(&ledger).len(), 4);
+            }
         }
 
         // 2. NO root on the ladder: run N opens skill-free with nothing pinned — no plugin in the
@@ -8628,11 +8687,11 @@ transport = "stdio"
         let out = runner.run_unit(&unit("run-N", 1, None));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
         let entries = ledger_entries(&ledger);
-        assert_eq!(entries.len(), 5, "session/new + one prompt: {entries:?}");
+        assert_eq!(entries.len(), 6, "session/new + one prompt: {entries:?}");
         assert!(
-            entries[3]["new"]["_meta"]["claudeCode"]["options"]["plugins"].is_null(),
+            entries[4]["new"]["_meta"]["claudeCode"]["options"]["plugins"].is_null(),
             "no root on the ladder ⇒ no plugin handed at session/new: {}",
-            entries[3]
+            entries[4]
         );
         // The snapshot APPEARS. The cached session for run N never received it and cannot now:
         // its skill-bearing turn is refused naming the skill, advising a fresh session — never
@@ -8656,21 +8715,21 @@ transport = "stdio"
         );
         assert_eq!(
             ledger_entries(&ledger).len(),
-            5,
+            6,
             "the refusal never reached the bridge — no prompt, no directive"
         );
         // A skill-free turn on that same session still runs — nothing handed, no directive.
         let out = runner.run_unit(&unit("run-N", 3, None));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
         let entries = ledger_entries(&ledger);
-        assert_eq!(entries.len(), 6, "{entries:?}");
+        assert_eq!(entries.len(), 7, "{entries:?}");
         assert!(
-            !entries[5]["prompt"]
+            !entries[6]["prompt"]
                 .as_str()
                 .unwrap()
                 .contains("Invoke your skill"),
             "a skill-free turn carries no directive: {}",
-            entries[5]
+            entries[6]
         );
 
         // 3. A FRESH session under the same snapshot: run S opens PINNED to the generation — the
@@ -8678,24 +8737,24 @@ transport = "stdio"
         let out = runner.run_unit(&unit("run-S", 1, None));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
         let entries = ledger_entries(&ledger);
-        assert_eq!(entries.len(), 8, "{entries:?}");
+        assert_eq!(entries.len(), 9, "{entries:?}");
         assert_eq!(
-            entries[6]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
+            entries[7]["new"]["_meta"]["claudeCode"]["options"]["plugins"],
             serde_json::json!([{"type": "local", "path": gen.to_string_lossy()}]),
             "the fresh session is opened on the generation even though turn 1 invokes nothing: {}",
-            entries[6]
+            entries[7]
         );
         let out = runner.run_unit(&unit("run-S", 2, Some("wicked-garden-domain")));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
         let entries = ledger_entries(&ledger);
-        assert_eq!(entries.len(), 9, "{entries:?}");
+        assert_eq!(entries.len(), 10, "{entries:?}");
         assert!(
-            entries[8]["prompt"]
+            entries[9]["prompt"]
                 .as_str()
                 .unwrap()
                 .contains("\"wicked-garden:domain\""),
             "the directive is discovered from the pinned generation's index: {}",
-            entries[8]
+            entries[9]
         );
         let out = runner.run_unit(&unit("run-S", 3, Some("wicked-garden-search")));
         assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
@@ -8707,10 +8766,11 @@ transport = "stdio"
         );
         assert_eq!(
             ledger_entries(&ledger).len(),
-            9,
+            10,
             "the refusal never reached the bridge"
         );
         runner.on_run_complete("run-I");
+        runner.on_run_complete("run-H");
         runner.on_run_complete("run-N");
         runner.on_run_complete("run-S");
         let _ = std::fs::remove_dir_all(&home);
