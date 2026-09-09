@@ -17,8 +17,13 @@ use wicked_governance::{
 const TESTING_MD: &str = include_str!("../TESTING.md");
 
 /// The ONE ```markdown fenced block in TESTING.md that carries the `git-hygiene` example.
+///
+/// Line endings are normalized first: a Windows checkout with `core.autocrlf` hands
+/// `include_str!` a CRLF file, and the fence literals below would otherwise never match
+/// (CI on windows-latest found 0 examples while macOS/ubuntu found 1).
 fn doc_example() -> String {
-    let blocks: Vec<&str> = TESTING_MD
+    let normalized = TESTING_MD.replace("\r\n", "\n");
+    let blocks: Vec<&str> = normalized
         .split("```markdown\n")
         .skip(1)
         .map(|chunk| {
