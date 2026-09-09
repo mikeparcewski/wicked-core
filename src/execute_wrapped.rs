@@ -4084,6 +4084,10 @@ mod tests {
 
     #[test]
     fn arm_input_governance_writes_a_pretool_settings_file_and_returns_env() {
+        // Arming builds the deny fence from the process-global `CLAUDE_CONFIG_DIR`/HOME; hold the
+        // env lock (read side) so a concurrent writer — the unspellable-path test pins a comma
+        // config dir under the write lock — cannot be observed mid-flight (Windows CI on a212fa5).
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         // Governance now refuses to arm against a CLI speaking another protocol (core#167).
         // This test is about what arming WRITES, so give it a matching CLI.
         seed_probe_for_test(
@@ -4928,6 +4932,9 @@ mod tests {
     /// in the happy path — so the `None` case asserts on the whole serialized file, not just the args.
     #[test]
     fn the_worker_mcp_never_receives_the_operational_store() {
+        // Arming reads the process-global `CLAUDE_CONFIG_DIR`/HOME for the deny fence — hold the env
+        // lock (read side) against concurrent writers (see the unspellable-path test).
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
         // Governance now refuses to arm against a CLI speaking another protocol (core#167).
         // This test is about what arming WRITES, so give it a matching CLI.
         seed_probe_for_test(
