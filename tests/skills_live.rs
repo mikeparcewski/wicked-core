@@ -196,13 +196,20 @@ fn gate_phase_approves_a_satisfying_phase_end_to_end() {
     let _ = std::fs::remove_dir_all(&bad);
 }
 
-/// core#396 — PINNED-HARNESS INVOCABILITY EVIDENCE (codex round 2, finding 7). The argv/frame
-/// tests prove the snapshot is DELIVERED (`--plugin-dir <snapshot>` reaches the binary; the ACP
-/// frame carries `plugins:[{type:local,path}]`); this is the positive proof that the harness LOADS
-/// it: the REAL `claude` on PATH is launched through the real `WrappedCliStepRunner` with
-/// `WICKED_SKILLS_SNAPSHOT` pointing at a fixture snapshot holding one skill, in print mode, asked
-/// to list its skills — and the fixture skill's name must appear in the model's reply. If the
-/// harness ignored `--plugin-dir`, or could not load the plugin, the name cannot appear.
+/// core#396 — POSITIVE INVOCATION EVIDENCE ON THE WRAPPED CARRIER (codex round 2 finding 7,
+/// tightened in round 3). The argv/frame tests prove the snapshot is DELIVERED (`--plugin-dir
+/// <snapshot>` reaches the binary); this is the positive proof that the pinned harness LOADS it
+/// AND INVOKES the skill: the REAL `claude` on PATH is launched through the real
+/// `WrappedCliStepRunner` with `WICKED_SKILLS_SNAPSHOT` pointing at a fixture snapshot — in the
+/// `<state home>/skills/snapshots/<gen>` shape the fence derives the state home from, with
+/// `WICKED_CREW_STATE_HOME` stating the same directory — holding one skill whose `SKILL.md`
+/// instructs printing a unique marker. The unit's `skill_ref` names that skill (so the directive
+/// is the real `Invoke your skill "wicked-garden:wicked-probe" (via the Skill tool)…`), and the
+/// turn must end `Ok` WITH the marker in the output. Round 2 only asked for the roster and
+/// grepped the skill's name; a listed skill is not an invoked one. If the harness ignored
+/// `--plugin-dir`, could not load the plugin, or did not invoke the skill, the marker cannot
+/// appear. The ACP half — the real `claude-agent-acp` through the real `AcpStepRunner` — lives in
+/// `acp_runner::tests::the_real_acp_bridge_loads_the_snapshot_and_invokes_the_fixture_skill`.
 ///
 /// `#[ignore]`d by default: it needs `claude` on PATH, a logged-in account, and network. Opt in:
 ///   WICKED_SKILLS_LIVE_TEST=1 cargo test --test skills_live the_pinned_harness -- --ignored --nocapture
@@ -210,7 +217,7 @@ fn gate_phase_approves_a_satisfying_phase_end_to_end() {
 /// failing, so an accidental `--ignored` sweep on a CI box stays green.
 #[test]
 #[ignore = "launches the real `claude`; opt in with WICKED_SKILLS_LIVE_TEST=1 and run with --ignored"]
-fn the_pinned_harness_loads_the_snapshot_and_lists_the_fixture_skill() {
+fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
     if std::env::var_os("WICKED_SKILLS_LIVE_TEST").is_none() {
         eprintln!("SKIP: set WICKED_SKILLS_LIVE_TEST=1 to launch the real `claude` against a fixture snapshot");
         return;
@@ -223,13 +230,21 @@ fn the_pinned_harness_loads_the_snapshot_and_lists_the_fixture_skill() {
         eprintln!("SKIP: no `claude` binary on PATH");
         return;
     }
-    // A fixture snapshot OUTSIDE every fenced directory, at its CANONICAL path (the OS temp dir is
-    // a symlink on macOS; the loader refuses an ancestor symlink and pins the real path).
+    const MARKER: &str = "WICKED-PROBE-MARKER-4f9c2e";
+    // A fixture snapshot OUTSIDE every default fenced directory, at its CANONICAL path (the OS
+    // temp dir is a symlink on macOS; the loader refuses an ancestor symlink and pins the real
+    // path), in the one shape a published generation has: `<state home>/skills/snapshots/<gen>`.
+    // The state home (`crew-state`) holds ONLY `skills/` — the worktree sits beside it, not in it,
+    // since an unclassified entry in the state home refuses the launch by name.
     let base = std::fs::canonicalize(std::env::temp_dir())
         .unwrap()
         .join(format!("wicked-skills-live-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
-    let snapshot = base.join("snapshots").join("000001");
+    let state_home = base.join("crew-state");
+    let snapshot = state_home
+        .join("skills")
+        .join("snapshots")
+        .join("000001");
     let skill = snapshot.join("skills").join("wicked-probe");
     std::fs::create_dir_all(snapshot.join(".claude-plugin")).unwrap();
     std::fs::create_dir_all(&skill).unwrap();
@@ -240,7 +255,9 @@ fn the_pinned_harness_loads_the_snapshot_and_lists_the_fixture_skill() {
     .unwrap();
     std::fs::write(
         skill.join("SKILL.md"),
-        "---\nname: wicked-garden-wicked-probe\ndescription: A probe skill that exists only to be listed by the harness under test.\n---\n\n# wicked-probe\n\nWhen invoked, reply with the single word PROBE.\n",
+        format!(
+            "---\nname: wicked-garden-wicked-probe\ndescription: A probe skill that exists only to prove the harness under test loaded and invoked it.\n---\n\n# wicked-probe\n\nWhen this skill is invoked, reply with exactly this marker on its own line and nothing else:\n\n{MARKER}\n"
+        ),
     )
     .unwrap();
     std::fs::write(
@@ -249,18 +266,21 @@ fn the_pinned_harness_loads_the_snapshot_and_lists_the_fixture_skill() {
     )
     .unwrap();
     std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
+    std::env::set_var("WICKED_CREW_STATE_HOME", &state_home);
     std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
 
-    // A real work unit with NO skill_ref: the snapshot is handed to every real unit, and the
-    // prompt asks for the roster rather than an invocation, so the assertion is about LOADING.
+    // A real work unit WITH the skill_ref: the engine's directive tells the worker to invoke the
+    // skill, and the skill tells it what to print — the assertion is about INVOCATION.
     let mut unit = WorkUnit::pending(
-        "live-skills:list",
+        "live-skills:invoke",
         "live-skills",
         1,
-        "List the names of every skill available to you in this session, one per line, exactly as \
-         you would invoke them, and nothing else.",
+        "Invoke the skill and print its marker. Output only what the skill tells you to output.",
     );
+    unit.skill_ref = Some("wicked-garden-wicked-probe".to_string());
     unit.assigned_invocation = Some("claude -p {PROMPT}".to_string());
+    let wt = base.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
     let input = StepInput {
         run_id: "live-skills".to_string(),
         unit_ix: 0,
@@ -268,7 +288,7 @@ fn the_pinned_harness_loads_the_snapshot_and_lists_the_fixture_skill() {
         unit,
         workflow_id: "wf-live-skills".to_string(),
         entity_mode: EntityMode::Shared,
-        workdir: Some(base.join("wt")),
+        workdir: Some(wt),
         governance: None,
         prior_outputs: vec![],
         elicitation_epoch: 0,
@@ -276,17 +296,23 @@ fn the_pinned_harness_loads_the_snapshot_and_lists_the_fixture_skill() {
         launch_seq: 0,
         required_skills: Vec::new(),
     };
-    std::fs::create_dir_all(base.join("wt")).unwrap();
     let out = WrappedCliStepRunner::default().run_unit(&input);
     eprintln!(
         "--- live claude reply (status {:?}) ---\n{}\n---",
         out.status, out.output
     );
+    std::env::remove_var("WICKED_CREW_STATE_HOME");
+    std::env::remove_var("WICKED_SKILLS_SNAPSHOT");
+    assert_eq!(
+        out.status,
+        wicked_core::StepStatus::Ok,
+        "the invocation must succeed: {:?}",
+        out.output
+    );
     assert!(
-        out.output.contains("wicked-probe"),
-        "the pinned harness must list the fixture skill it was handed via --plugin-dir; got: {:?} (status {:?})",
-        out.output,
-        out.status
+        out.output.contains(MARKER),
+        "the pinned harness must load the snapshot handed via --plugin-dir AND invoke the skill; got: {:?}",
+        out.output
     );
     let _ = std::fs::remove_dir_all(&base);
 }

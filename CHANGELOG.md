@@ -87,9 +87,40 @@ Two release tracks share this file, newest entry first regardless of track:
   generations safely. Tests: env mutation across the crate serializes on one crate-wide lock; the
   ladder's tests compare paths as `Path`s (the Windows separator-spelling failure); two-generation
   concurrency is exercised with barrier-released threads on both carriers, reading the per-session
-  settings files the fake bridge received; the pinned-harness LOADING evidence is an `#[ignore]`d
-  live test (`tests/skills_live.rs`, opt-in `WICKED_SKILLS_LIVE_TEST=1`) that launches the real
-  `claude --plugin-dir <fixture>` and asserts the fixture skill is listed.
+  settings files the fake bridge received. **Review pass 3 (codex round 3 on #399):** the fence
+  follows the ACTUAL state home — derived from the snapshot's own path
+  (`<state home>/skills/snapshots/<gen>`, three components up; `state_home::of_snapshot`) and
+  required to agree with an explicit `WICKED_CREW_STATE_HOME` when the daemon passes one (crew#480;
+  set-but-empty / relative / unresolvable is a config error) — never from a `.wicked-crew`
+  basename, so a scratch daemon's `/private/tmp/crew-state` has ITS sibling stores classified and
+  fenced by the registry (unclassified ⇒ refused by name) while the default `~/.wicked-crew` keeps
+  its blanket; a snapshot without that shape is a config error at load. The copilot view is
+  VERIFIED at admission: `views`, `views/copilot`, `.github`, `.github/skills`, each required
+  skill's dir and `SKILL.md` are lstat-walked (a symlink anywhere ⇒ config error, even for a unit
+  invoking nothing — the launch would still `--add-dir` it), and every skill the seat invokes must
+  be present in the view with a matching frontmatter `name` — an empty or partial view ⇒
+  `SkillsError::Missing` naming the skills. Per-session ACP settings are collision-free: each
+  launch gets `<worker home>/sessions/<run>-<cli>-<pid>-<seq>/` via an exclusive `create_dir`
+  (EEXIST ⇒ a fresh suffix; never removing another launch's directory), the owning `AcpProcess`
+  reaps only its own directory on drop, and ids that sanitize alike (`campaign:one` /
+  `campaign_one`) cannot collide. A malformed `OPENCODE_CONFIG_CONTENT` (not a JSON object, or a
+  `skills`/`skills.paths` that cannot take the paths) FAILS the launch on both carriers
+  (`SkillsError::LeverConfig`, the unit refused by name — never composed onto a bare document);
+  the ACP carrier refuses before spawning rather than falling back. Directory levers (pi
+  `--skill`, opencode `skills.paths`, scanned recursively) never deliver a portable parent whose
+  directory nests a non-portable skill — its portable descendants are delivered on their own paths
+  and a non-Claude unit invoking the parent is refused (`SkillsError::NestsNonPortable`, parent and
+  child named). Frontmatter is parsed with YAML semantics (`serde_yaml`): `name: x # comment` is
+  `x`, `mandates: [a, b] # comment` is two mandates, quoted scalars/block lists/flow lists all
+  read; an unterminated flow list, a tab in indentation, an unterminated block or a non-string
+  `name` is a config error naming the file (the live walk skips it with a notice). The Windows
+  clippy `unused_mut` in `private_dir` is gone (`private_dir_builder` has one body per `cfg`).
+  Live evidence is now POSITIVE INVOCATION on both carriers, `#[ignore]`d and opt-in
+  (`WICKED_SKILLS_LIVE_TEST=1`): `tests/skills_live.rs` launches the real `claude --plugin-dir
+  <fixture>` with the unit's `skill_ref` set and asserts exit `Ok` plus the fixture skill's unique
+  marker in the output; `acp_runner::tests::the_real_acp_bridge_…` drives the real
+  `claude-agent-acp` through the real `AcpStepRunner` (`session/new` with the plugins option, then
+  the prompt) and asserts the same marker in the streamed output.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`
