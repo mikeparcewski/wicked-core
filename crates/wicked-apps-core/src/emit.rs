@@ -24,18 +24,27 @@
 //! `std::path::Path` segments (never a hardcoded `~`), overridable via [`DEADLETTER_ENV`].
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use wicked_estate_core::SymbolQuery;
+
 use crate::{
-    open_store, synthetic_symbol, GraphStore, Language, Location, Node, NodeKind, Span,
+    open_store, synthetic_symbol, GraphRead, GraphStore, Language, Location, Node, NodeKind, Span,
     ESTATE_DB_ENV, EVENT, SYMBOL_SCHEME,
 };
 
 /// Overrides the outbox / dead-letter spool file path. When unset, the spool defaults to
 /// `<home>/.something-wicked/wicked-apps/emit-outbox.ndjson`.
 pub const DEADLETTER_ENV: &str = "WICKED_APPS_EMIT_DEADLETTER";
+
+/// Optional origin stamp for spooled records (wicked-crew#495): the launcher that owns this
+/// process sets it to a human-readable "who am I" (wicked-crew `serve` writes
+/// `wicked-crew@<version> serve pid=<pid> port=<port> db=<core db>`), and every dead letter carries
+/// it as `origin` beside the engine's own `ts` and `pid` — so a record read months later, in a
+/// drained outbox, still says WHICH daemon could not store it. Unset → no `origin` key.
+pub const ORIGIN_ENV: &str = "WICKED_APPS_EMIT_ORIGIN";
 
 /// Loud, greppable marker written to stderr whenever an event is spooled instead of stored.
 pub const DEADLETTER_MARKER: &str = "EMIT-DEADLETTER:";
@@ -77,16 +86,35 @@ impl EmitEvent {
         }
     }
 
-    /// The outbox record: the envelope plus the reason it was spooled. Serialized as one NDJSON line.
+    /// The outbox record: the envelope plus the reason it was spooled, stamped with WHEN (`ts`,
+    /// epoch milliseconds — the CoreEvent convention) and BY WHOM (`pid`, and `origin` when the
+    /// launcher set [`ORIGIN_ENV`]). Serialized as one NDJSON line. Before the stamps (crew#495 /
+    /// F-022) a 3,400-entry outbox had no recoverable order and no way to tell two daemons' entries
+    /// apart; [`replay_outbox`] restores `ts` onto the replayed node so an id-ordered scan of the
+    /// store is still chronological.
     fn spool_record(&self, reason: &str) -> serde_json::Value {
-        serde_json::json!({
+        let mut record = serde_json::json!({
             "type": self.event_type,
             "domain": self.domain,
             "subdomain": self.subdomain,
             "payload": self.payload,
             "deadletter_reason": reason,
-        })
+            "ts": now_millis(),
+            "pid": std::process::id(),
+        });
+        if let Some(origin) = std::env::var_os(ORIGIN_ENV).filter(|o| !o.is_empty()) {
+            record["origin"] = serde_json::Value::String(origin.to_string_lossy().into_owned());
+        }
+        record
     }
+}
+
+/// Milliseconds since the Unix epoch as a `u64`; `0` if the clock predates the epoch.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Nanoseconds since the Unix epoch as a `u64` (fits until year ~2262); `0` if the clock predates
@@ -281,9 +309,150 @@ fn append_spool(event: &EmitEvent, reason: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The read side and the drain (wicked-crew#495 / F-022): count what landed, replay what did not.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// EVENT nodes on `store` — the read side of this seam. wicked-crew's `/diagnostics` reports this
+/// at boot and live (`records.total` / `records.sinceBoot`) so an operator can see governance
+/// evidence LANDING rather than infer it from the absence of dead letters. `GraphRead` has no
+/// count primitive, so this loads the event nodes; the governance store is small (thousands, not
+/// millions) and the caller caches.
+pub fn count_events(store: &dyn GraphRead) -> anyhow::Result<usize> {
+    let nodes = store.find_symbols(&SymbolQuery {
+        kinds: vec![NodeKind::Other(EVENT.to_string())],
+        ..Default::default()
+    })?;
+    Ok(nodes.len())
+}
+
+/// One entry of an outbox that did not land on replay — the ORIGINAL line verbatim (so the caller
+/// can keep it dead-lettered without re-serializing) and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplayFailure {
+    pub line: String,
+    pub reason: String,
+}
+
+/// The outcome of [`replay_outbox`]: non-empty lines read, entries written as EVENT nodes, and the
+/// entries that did not land (torn lines, records that are not spool records, store write errors).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplayReport {
+    pub read: usize,
+    pub replayed: usize,
+    pub failed: Vec<ReplayFailure>,
+}
+
+/// A spool line parsed back: the envelope, the original spool stamp (`ts` in millis) if the
+/// record carried one, and the provenance fields the replayed node keeps.
+struct SpoolLine {
+    event: EmitEvent,
+    ts_millis: Option<u64>,
+    reason: Option<String>,
+    origin: Option<String>,
+}
+
+/// Parse one NDJSON spool line (the shape [`EmitEvent::spool_record`] writes — with or without
+/// the `ts`/`pid`/`origin` stamps older engines did not write). Strict on the envelope: a record
+/// missing `type`/`domain`/`subdomain` strings or a `payload` object is not an event and is
+/// refused with the reason, never guessed at.
+fn parse_spool_line(line: &str) -> Result<SpoolLine, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("not a JSON spool record: {e}"))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "spool record is not a JSON object".to_string())?;
+    let str_field = |k: &str| -> Result<String, String> {
+        obj.get(k)
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("spool record has no `{k}` string"))
+    };
+    let event_type = str_field("type")?;
+    let domain = str_field("domain")?;
+    let subdomain = str_field("subdomain")?;
+    let payload = obj
+        .get("payload")
+        .filter(|p| p.is_object())
+        .cloned()
+        .ok_or_else(|| "spool record has no `payload` object".to_string())?;
+    Ok(SpoolLine {
+        event: EmitEvent::new(event_type, domain, subdomain, payload),
+        ts_millis: obj.get("ts").and_then(|t| t.as_u64()),
+        reason: obj
+            .get("deadletter_reason")
+            .and_then(|r| r.as_str())
+            .map(str::to_owned),
+        origin: obj
+            .get("origin")
+            .and_then(|o| o.as_str())
+            .map(str::to_owned),
+    })
+}
+
+/// Replay every record in the outbox at `path` onto `store` as the EVENT node it should have
+/// been. A record's original `ts` (millis) — when it carries one — becomes the node's `ts_nanos`
+/// and therefore its id prefix, so the store's id-ordered scan stays chronological; a record
+/// without a stamp lands at replay time. Every replayed node also keeps its provenance:
+/// `replayed: true`, the `deadletter_reason` it was spooled with, and `spooled_by` (the origin)
+/// when present. Failures are REPORTED, never re-spooled here (the caller owns the live outbox and
+/// decides what to append back); one bad line never stops the rest. Reads the file in one pass;
+/// the caller is expected to have moved the live outbox aside first so a concurrent emitter's
+/// appends are not read half-written.
+pub fn replay_outbox(path: &Path, store: &mut dyn GraphStore) -> std::io::Result<ReplayReport> {
+    let body = std::fs::read_to_string(path)?;
+    let mut report = ReplayReport::default();
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        report.read += 1;
+        let parsed = match parse_spool_line(line) {
+            Ok(p) => p,
+            Err(reason) => {
+                report.failed.push(ReplayFailure {
+                    line: line.to_string(),
+                    reason,
+                });
+                continue;
+            }
+        };
+        let ts = parsed
+            .ts_millis
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .unwrap_or_else(now_nanos);
+        let seq = EMIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut node = event_to_node(&parsed.event, ts, seq);
+        node.metadata
+            .insert("replayed".to_string(), serde_json::Value::Bool(true));
+        if let Some(reason) = parsed.reason {
+            node.metadata.insert(
+                "deadletter_reason".to_string(),
+                serde_json::Value::String(reason),
+            );
+        }
+        if let Some(origin) = parsed.origin {
+            node.metadata
+                .insert("spooled_by".to_string(), serde_json::Value::String(origin));
+        }
+        match write_event_node(store, node) {
+            Ok(()) => report.replayed += 1,
+            Err(e) => report.failed.push(ReplayFailure {
+                line: line.to_string(),
+                reason: format!("store write failed: {e}"),
+            }),
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{deadletter_path, emit_event, emit_event_to, EmitEvent, DEADLETTER_ENV};
+    use super::{
+        count_events, deadletter_path, emit_event, emit_event_to, replay_outbox, EmitEvent,
+        DEADLETTER_ENV, ORIGIN_ENV,
+    };
     use crate::{GraphRead, NodeKind, SqliteStore, ESTATE_DB_ENV, EVENT, EV_POLICY_EVALUATED};
     use std::sync::{Mutex, MutexGuard};
     use wicked_estate_core::SymbolQuery;
@@ -393,5 +562,159 @@ mod tests {
             );
             assert!(!s.contains('~'), "path must be expanded, not literal ~");
         }
+    }
+
+    /// Every spooled record is stamped with WHEN and BY WHOM (crew#495 / F-022): `ts` (epoch
+    /// millis), `pid`, and `origin` exactly as the launcher exported it — absent when it did not.
+    /// Falsifier: an unstamped record (the pre-fix shape, whose replay order was unrecoverable).
+    #[test]
+    fn spooled_records_carry_ts_pid_and_origin() {
+        let _guard = lock_env();
+        let dir = std::env::temp_dir().join(format!("wicked-apps-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spool = dir.join("emit-outbox.ndjson");
+        let _ = std::fs::remove_file(&spool);
+        unsafe {
+            std::env::set_var(DEADLETTER_ENV, &spool);
+            std::env::remove_var(ESTATE_DB_ENV);
+            std::env::set_var(
+                ORIGIN_ENV,
+                "wicked-crew@0.7.28 serve pid=4242 port=7701 db=/s/core.db",
+            );
+        }
+        let ev = EmitEvent::new(
+            EV_POLICY_EVALUATED,
+            "wicked-governance",
+            "governance.evaluation",
+            serde_json::json!({ "claim_id": "c1" }),
+        );
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(!emit_event(&ev), "no store ⇒ spooled");
+        unsafe {
+            std::env::remove_var(ORIGIN_ENV);
+        }
+        assert!(
+            !emit_event(&ev),
+            "no store ⇒ spooled (second record, no origin)"
+        );
+        let lines = read_lines(&spool);
+        unsafe {
+            std::env::remove_var(DEADLETTER_ENV);
+        }
+        let _ = std::fs::remove_file(&spool);
+
+        assert_eq!(lines.len(), 2);
+        let ts = lines[0]["ts"].as_u64().expect("ts is a u64 (epoch millis)");
+        assert!(
+            ts >= before && ts < before + 60_000,
+            "ts {ts} is not 'now' ({before})"
+        );
+        assert_eq!(
+            lines[0]["pid"].as_u64(),
+            Some(u64::from(std::process::id()))
+        );
+        assert_eq!(
+            lines[0]["origin"],
+            "wicked-crew@0.7.28 serve pid=4242 port=7701 db=/s/core.db"
+        );
+        assert!(
+            lines[1].get("origin").is_none(),
+            "no launcher origin ⇒ no `origin` key, never an invented one"
+        );
+        assert!(lines[1]["ts"].is_u64());
+    }
+
+    /// The drain (crew#495): replaying an outbox lands each valid record as an EVENT node with its
+    /// ORIGINAL `ts` restored (chronological id order survives), keeps its dead-letter provenance,
+    /// counts through `count_events`, and reports torn / non-record lines VERBATIM instead of
+    /// stopping. Falsifier: a torn line that aborts the replay, or a replayed node stamped at
+    /// replay time when the record carried its own time.
+    #[test]
+    fn replay_outbox_lands_records_and_reports_torn_lines() {
+        let dir = std::env::temp_dir().join(format!("wicked-apps-replay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outbox = dir.join("emit-outbox.ndjson");
+        let stamped = serde_json::json!({
+            "type": "wicked.crew.phase.transitioned",
+            "domain": "wicked-crew",
+            "subdomain": "crew.phase",
+            "payload": { "run": "r1" },
+            "deadletter_reason": "no shared store (WICKED_ESTATE_DB unset)",
+            "ts": 1_757_500_000_000u64,
+            "pid": 4242,
+            "origin": "wicked-crew@0.7.28 serve pid=4242 db=/s/core.db"
+        });
+        let unstamped = serde_json::json!({
+            "type": EV_POLICY_EVALUATED,
+            "domain": "wicked-governance",
+            "subdomain": "governance.evaluation",
+            "payload": { "claim_id": "c1" },
+            "deadletter_reason": "store write failed: locked"
+        });
+        let torn = r#"{"type":"wicked.crew.phase.transitioned","domain":"wicked-c"#;
+        let not_a_record = r#"{"hello":"world"}"#;
+        std::fs::write(
+            &outbox,
+            format!("{stamped}\n{unstamped}\n\n{torn}\n{not_a_record}\n"),
+        )
+        .unwrap();
+
+        let mut store = SqliteStore::in_memory().expect("open in-memory estate store");
+        assert_eq!(count_events(&store).unwrap(), 0);
+        let report = replay_outbox(&outbox, &mut store).expect("outbox readable");
+        let _ = std::fs::remove_file(&outbox);
+
+        assert_eq!(report.read, 4, "blank lines are not entries");
+        assert_eq!(report.replayed, 2);
+        assert_eq!(report.failed.len(), 2);
+        assert_eq!(report.failed[0].line, torn);
+        assert!(report.failed[0].reason.contains("not a JSON spool record"));
+        assert_eq!(report.failed[1].line, not_a_record);
+        assert!(report.failed[1].reason.contains("`type`"));
+        assert_eq!(count_events(&store).unwrap(), 2);
+
+        let nodes = store
+            .find_symbols(&SymbolQuery {
+                kinds: vec![NodeKind::Other(EVENT.to_string())],
+                ..Default::default()
+            })
+            .unwrap();
+        let phase = nodes
+            .iter()
+            .find(|n| n.metadata["event_type"] == "wicked.crew.phase.transitioned")
+            .expect("the stamped record landed");
+        assert_eq!(
+            phase.metadata["ts_nanos"].as_u64(),
+            Some(1_757_500_000_000u64 * 1_000_000),
+            "the ORIGINAL spool time is restored, not the replay time"
+        );
+        assert_eq!(phase.metadata["replayed"], true);
+        assert_eq!(
+            phase.metadata["deadletter_reason"],
+            "no shared store (WICKED_ESTATE_DB unset)"
+        );
+        assert_eq!(
+            phase.metadata["spooled_by"],
+            "wicked-crew@0.7.28 serve pid=4242 db=/s/core.db"
+        );
+        assert_eq!(phase.metadata["payload"]["run"], "r1");
+        let policy = nodes
+            .iter()
+            .find(|n| n.metadata["event_type"] == EV_POLICY_EVALUATED)
+            .expect("the unstamped record landed");
+        assert!(
+            policy.metadata["ts_nanos"].as_u64().unwrap() > 1_700_000_000_000_000_000,
+            "an unstamped record lands at replay time"
+        );
+        assert!(policy.metadata.get("spooled_by").is_none());
+        // The serde shape crew parses: `{ read, replayed, failed: [{ line, reason }] }`.
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["read"], 4);
+        assert_eq!(json["replayed"], 2);
+        assert_eq!(json["failed"][0]["line"], torn);
+        assert!(json["failed"][0]["reason"].is_string());
     }
 }

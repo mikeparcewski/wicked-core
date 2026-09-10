@@ -104,6 +104,24 @@ export declare class Core {
    */
   static registryRoster(): string
   /**
+   * EVENT nodes on the estate store at `dbPath` — the shared store the emit seam writes
+   * governance events to (`WICKED_ESTATE_DB`; wicked-crew#495) — as a JSON number string, over
+   * a READ-ONLY connection (never the single-writer actor's handle; the store must already
+   * exist). crew's `GET /diagnostics` reports it as `governance.records.total` and derives
+   * `sinceBoot` from a boot baseline; an addon without this static answers `null` there.
+   */
+  static eventStoreCount(dbPath: string): Promise<string>
+  /**
+   * Replay a dead-letter outbox — the emit seam's NDJSON spool (`WICKED_APPS_EMIT_DEADLETTER`)
+   * of governance events it could not store — into the estate store at `dbPath`, writing each
+   * record as the EVENT node it should have been with its original `ts` restored
+   * (`wicked_apps_core::emit::replay_outbox`). Opens the store read-write (creating it if
+   * missing — the caller creates the parent directory). Resolves to the JSON report
+   * `{ read, replayed, failed: [{ line, reason }] }`; a failed entry carries its ORIGINAL line so
+   * the caller can keep it dead-lettered. Behind `wicked-crew governance replay`.
+   */
+  static replayEmitOutbox(outboxPath: string, dbPath: string): Promise<string>
+  /**
    * Subscribe to the live [`CoreEvent`] stream. `callback` follows the Node error-first
    * convention — `(err, eventJson)` — and is invoked once per event with the event serialized as
    * a JSON string (`{ type, ...fields }`); parse it in JS. Events arrive in emission order. Call
