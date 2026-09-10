@@ -4183,27 +4183,15 @@ pub struct ChatScope {
     pub read_roots: Vec<String>,
 }
 
-/// Create a chat's scratch root for its seats — PRIVATE (0700 on unix) and never through a
-/// planted link (Copilot, #426): the default root sits under the system temp directory, where
-/// another local user can pre-place a symlink under a predictable name, and `create_dir_all`
-/// alone would follow it and hand the seats that target as their cwd. `refuse_symlinked_home`
-/// is the same no-follow walk the worker config homes get (root-owned system links such as
-/// macOS's `/var -> /private/var` are followed; anything plantable is refused by name).
+/// Create a chat's scratch root for its seats — ABSOLUTE, PRIVATE (0700 on unix, enforced on an
+/// existing directory too) and never through a planted link (Copilot, #426): the default root sits
+/// under the system temp directory, where another local user can pre-place a symlink under a
+/// predictable name, and `create_dir_all` alone would follow it and hand the seats that target as
+/// their cwd; a relative root would resolve against the daemon's cwd — the F-067 leak by another
+/// spelling. One shared helper with the seat config roots (`ensure_private_dir`).
 fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
-    wicked_apps_core::spawn::refuse_symlinked_home(cwd)
-        .map_err(|e| format!("refusing scratch root {} ({e})", cwd.display()))?;
-    if cwd.is_dir() {
-        return Ok(());
-    }
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    b.create(cwd)
-        .map_err(|e| format!("cannot create scratch root {} ({e})", cwd.display()))
+    wicked_apps_core::spawn::ensure_private_dir(cwd)
+        .map_err(|e| format!("refusing scratch root {} ({e})", cwd.display()))
 }
 
 impl ChatScope {
@@ -10398,7 +10386,11 @@ transport = "stdio"
         std::os::unix::fs::symlink(&operator_like, &linked).unwrap();
         let err = ensure_chat_scratch_root(&linked).expect_err("a planted link is refused");
         assert!(err.contains("symlink"), "{err}");
-        // A real (or not-yet-existing) directory is created private.
+        // A relative root would resolve against the daemon's cwd — refused (Copilot, #426).
+        let err = ensure_chat_scratch_root(std::path::Path::new("chats/c1")).expect_err("relative");
+        assert!(err.contains("relative"), "{err}");
+        // A real (or not-yet-existing) directory is created private; an existing too-open one is
+        // made private rather than left as found.
         let fresh = dir.join("fresh").join("nested");
         ensure_chat_scratch_root(&fresh).expect("creates");
         use std::os::unix::fs::PermissionsExt;
@@ -10406,7 +10398,13 @@ transport = "stdio"
             std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        std::fs::set_permissions(&fresh, std::fs::Permissions::from_mode(0o755)).unwrap();
         ensure_chat_scratch_root(&fresh).expect("idempotent");
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "privacy is enforced, not merely granted at creation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

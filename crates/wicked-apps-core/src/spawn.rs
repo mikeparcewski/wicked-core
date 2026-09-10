@@ -537,31 +537,55 @@ impl SeatConfig {
     /// Create every directory this seat is pointed at (the root and each `set` target), PRIVATE
     /// (0700 on unix) and no-follow checked at every component first — a CLI handed a variable
     /// naming a missing directory may refuse to start (codex) or fall back to its default home
-    /// (the very leak this closes). Idempotent; `Inherit` and a rootless seat are no-ops. Claude's
-    /// home is ALSO re-sanitized on every ACP spawn (`wicked-core::acp_runner`); that stays there
-    /// — this only guarantees existence and privacy.
+    /// (the very leak this closes). Privacy is ENFORCED on an existing directory too, not only
+    /// granted at creation (Copilot, #426): a root that pre-existed at 0755 is made 0700.
+    /// Idempotent; `Inherit` and a rootless seat are no-ops. Claude's home is ALSO re-sanitized on
+    /// every ACP spawn (`wicked-core::acp_runner`); that stays there — this guarantees existence
+    /// and privacy.
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
         let SeatConfig::Isolated { root, set, .. } = self else {
             return Ok(());
         };
         for dir in root.iter().chain(set.iter().map(|(_, d)| d)) {
-            refuse_symlinked_home(dir)?;
-            if dir.is_dir() {
-                continue;
-            }
-            let mut b = std::fs::DirBuilder::new();
-            b.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                b.mode(0o700);
-            }
-            use anyhow::Context;
-            b.create(dir)
-                .with_context(|| format!("could not create seat config root {}", dir.display()))?;
+            ensure_private_dir(dir)
+                .map_err(|e| anyhow::anyhow!("seat config root {}: {e}", dir.display()))?;
         }
         Ok(())
     }
+}
+
+/// Create `dir` private (0700 on unix) if absent — and MAKE it private if it exists — never through
+/// a plantable symlink at any component ([`refuse_symlinked_home`]). Refuses a relative path: every
+/// consumer would resolve it against its own working directory (the rule the worker home has).
+/// Shared by the seat roots and by wicked-core's chat scratch roots, so "a private engine-owned
+/// directory" is spelled once.
+pub fn ensure_private_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if !dir.is_absolute() {
+        anyhow::bail!(
+            "{} is a relative path; an engine-owned directory must be absolute",
+            dir.display()
+        );
+    }
+    refuse_symlinked_home(dir)?;
+    if !dir.is_dir() {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("could not make {} private", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// The configuration decision for ONE seat spawn of `cli` (core#410): `Inherit` under the
@@ -1232,6 +1256,9 @@ mod tests {
             ],
             strip: SEAT_CONFIG_ENV.to_vec(),
         };
+        // A pre-existing, too-open root is made private, not left as found (Copilot, #426).
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         decision.ensure_dirs().expect("creates the tree");
         decision.ensure_dirs().expect("idempotent");
         for dir in [
@@ -1265,6 +1292,9 @@ mod tests {
             .expect_err("a planted link is refused");
         assert!(err.to_string().contains("symlink"), "{err}");
         assert_eq!(SeatConfig::Inherit.ensure_dirs().ok(), Some(()));
+        // A relative directory is refused outright — never resolved against a working directory.
+        let err = ensure_private_dir(std::path::Path::new("relative/dir")).expect_err("relative");
+        assert!(err.to_string().contains("relative"), "{err}");
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }
