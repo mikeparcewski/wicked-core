@@ -4148,8 +4148,11 @@ pub struct AcpStepRunner {
     chat_activity: Arc<Mutex<HashMap<String, Instant>>>,
     /// Each open chat's [`ChatScope`] (core#410 / crew#502) — the cwd, graph and read roots its
     /// seats run against, recorded at `chat_open` so a seat re-warmed after an eviction lands in
-    /// the same scope. Removed with the chat.
-    chat_scopes: Arc<Mutex<HashMap<String, ChatScope>>>,
+    /// the same scope — stamped with the OPEN GENERATION that recorded it, so an older open still
+    /// finishing cannot drop a newer open's record (Copilot, #426). Removed with the chat.
+    chat_scopes: Arc<Mutex<HashMap<String, RecordedScope>>>,
+    /// Monotonic open counter behind [`RecordedScope::gen`].
+    chat_open_seq: Arc<std::sync::atomic::AtomicU64>,
     fallback: WrappedCliStepRunner,
     timeout: Duration,
     /// The engine's OWN operational state home — the canonical parent of the database it was
@@ -4285,6 +4288,42 @@ fn same_file_as_a_top_level_entry_of(file: &std::path::Path, dir: &std::path::Pa
     }
 }
 
+/// A recorded chat scope and the open generation that recorded it (see `AcpStepRunner::chat_scopes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecordedScope {
+    gen: u64,
+    scope: ChatScope,
+}
+
+/// May `cli_key` join a chat in `scope` (Copilot, #426)? An UNSCOPED chat (no roots, no graph)
+/// promises nothing beyond its scratch root and admits every seat. A SCOPED chat promises that
+/// its roots are read-only and that the seats see nothing else — a promise this engine can keep
+/// only through a channel the seat actually passes through: the chat boundary on
+/// `session/request_permission` (an adapter admitted to input governance asks for every tool
+/// call — claude, opencode, copilot) or the kernel write floor (`os_sandbox` armed on the seat's
+/// record). An adapter that asks no permissions and runs under no floor (pi-acp, codex-acp as
+/// registered) would run unbounded behind a read-only statement, so it is refused BY NAME for
+/// scoped chats — the open still succeeds for the seats that can be held, and the per-seat
+/// outcome says why this one cannot. Read containment for such adapters needs a read jail this
+/// platform does not have; the residual is stated rather than hidden.
+fn scoped_seat_admission(
+    cli_key: &str,
+    scope: &ChatScope,
+    config: &AcpConfig,
+) -> Result<(), String> {
+    let scoped = scope.code_graph_db.is_some() || !scope.read_roots.is_empty();
+    if !scoped || config.acp_input_governance || config.os_sandbox {
+        return Ok(());
+    }
+    Err(format!(
+        "seat '{cli_key}' cannot join a SCOPED chat: its ACP adapter '{}' asks no permissions (the \
+         chat's read-only boundary never sees its tool calls) and its record arms no OS sandbox, so \
+         the scoped repositories could not be held read-only; open the chat unscoped for this seat, \
+         or set `os_sandbox = true` on its [cli.acp] record",
+        config.binary
+    ))
+}
+
 /// The boundary a chat's seats are judged against (core#410, review): the scratch root is the ONE
 /// write root (and the cwd), the scoped repository roots are read-only, `HOME` and — for a claude
 /// seat — its worker config dir get the same carve-outs the governed boundary applies. No phase
@@ -4387,6 +4426,7 @@ impl AcpStepRunner {
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             chat_scopes: Arc::new(Mutex::new(HashMap::new())),
+            chat_open_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             timeout: Duration::from_secs(secs),
             operational_home: None,
             elicitation_maps,
@@ -4490,11 +4530,13 @@ impl AcpStepRunner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let scopes = self
+        let scopes: HashMap<String, ChatScope> = self
             .chat_scopes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone();
+            .iter()
+            .map(|(id, r)| (id.clone(), r.scope.clone()))
+            .collect();
         let mut out: Vec<ChatInfo> = by_chat
             .into_iter()
             .map(|(chat_id, mut seats)| {
@@ -4613,8 +4655,12 @@ impl AcpStepRunner {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(chat_id)
-            .cloned()
+            .map(|r| r.scope.clone())
             .ok_or_else(|| format!("chat '{chat_id}' has no scope recorded — open it first"))?;
+        // A SCOPED chat promises read-only roots: only a seat this engine can actually hold to
+        // that — its ACP adapter asks permissions (the chat boundary sees every tool call) or it
+        // runs under the kernel write floor — may join one (Copilot, #426).
+        scoped_seat_admission(cli_key, &scope, &config)?;
         ensure_chat_scratch_root(&scope.cwd).map_err(|e| format!("chat '{chat_id}': {e}"))?;
         // Grounded on the scope's graph — the READ-ONLY estate MCP, the same seam governed
         // workers get (DES-GROUNDING-001; formerly "chat is repo-less exploration → no estate
@@ -4644,7 +4690,7 @@ impl AcpStepRunner {
         // re-open with a new scope while this seat was warming would otherwise land an old-scope
         // process under a key the new scope now owns); a stale process is dropped, not inserted.
         let scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
-        if scopes.get(chat_id) != Some(&scope) {
+        if scopes.get(chat_id).map(|r| &r.scope) != Some(&scope) {
             drop(arc);
             return Err(format!(
                 "chat '{chat_id}': its scope changed while seat '{cli_key}' was warming — retry"
@@ -4678,11 +4724,15 @@ impl AcpStepRunner {
         scope: ChatScope,
     ) -> Result<ChatOpenOutcomes, String> {
         self.validate_chat_scope(&scope)?;
+        let gen = self
+            .chat_open_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         {
             let mut scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
             let changed = scopes
                 .get(chat_id)
-                .is_some_and(|recorded| *recorded != scope);
+                .is_some_and(|recorded| recorded.scope != scope);
             if changed {
                 let prefix = Self::chat_pool_key(chat_id);
                 self.sessions
@@ -4690,7 +4740,7 @@ impl AcpStepRunner {
                     .unwrap_or_else(|p| p.into_inner())
                     .retain(|(rid, _), _| rid != &prefix);
             }
-            scopes.insert(chat_id.to_string(), scope);
+            scopes.insert(chat_id.to_string(), RecordedScope { gen, scope });
         }
         let opened: ChatOpenOutcomes = clis
             .iter()
@@ -4712,15 +4762,9 @@ impl AcpStepRunner {
             .collect();
         if self.chat_seats(chat_id).is_empty() {
             // Nothing warmed: hold no scope (and no activity stamp) for a chat the pool does not
-            // know — see the doc above.
-            self.chat_scopes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(chat_id);
-            self.chat_activity
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(chat_id);
+            // know — see the doc above. Only THIS open's record, though (Copilot, #426): a newer
+            // open may have recorded its own scope meanwhile, and that one is its to keep.
+            self.drop_scope_if_gen(chat_id, gen);
         }
         // Enforce the cap only AFTER the new chat is warm and touched, so it is the freshest entry
         // and therefore the last possible victim. Doing it first would let a full pool evict a
@@ -4732,6 +4776,20 @@ impl AcpStepRunner {
         // that goes stale.
         self.chat_enforce_cap(Self::chat_pool_cap());
         Ok(opened)
+    }
+
+    /// Drop `chat_id`'s recorded scope and activity stamp — only if the record is still the one
+    /// open generation `gen` made (Copilot, #426: an older open's cleanup must never remove a
+    /// newer open's record).
+    fn drop_scope_if_gen(&self, chat_id: &str, gen: u64) {
+        let mut scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
+        if scopes.get(chat_id).is_some_and(|r| r.gen == gen) {
+            scopes.remove(chat_id);
+            self.chat_activity
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(chat_id);
+        }
     }
 
     /// Refuse a scope this engine must not run a chat in (core#410, review) — judged BEFORE it is
@@ -8324,6 +8382,7 @@ headless_invocation = "claude -p \"{{PROMPT}}\""
 [cli.acp]
 binary = "{}"
 transport = "stdio"
+acp_input_governance = true
 "#,
                 script.display()
             ),
@@ -10612,20 +10671,26 @@ transport = "stdio"
         // A recorded scope A with a pool entry (None slot: constructing a live child is not the
         // point here). Re-open with the SAME scope and no seats to warm: the entry is untouched.
         r.sessions.lock().unwrap().insert(key.clone(), None);
-        r.chat_scopes
-            .lock()
-            .unwrap()
-            .insert("c1".to_string(), scope_a.clone());
+        r.chat_scopes.lock().unwrap().insert(
+            "c1".to_string(),
+            RecordedScope {
+                gen: 0,
+                scope: scope_a.clone(),
+            },
+        );
         let _ = r.chat_open("c1", &[], scope_a.clone());
         assert!(
             r.sessions.lock().unwrap().contains_key(&key),
             "a same-scope re-open evicts nothing"
         );
         // Re-open with a DIFFERENT scope: the stale entry is evicted...
-        r.chat_scopes
-            .lock()
-            .unwrap()
-            .insert("c1".to_string(), scope_a.clone());
+        r.chat_scopes.lock().unwrap().insert(
+            "c1".to_string(),
+            RecordedScope {
+                gen: 0,
+                scope: scope_a.clone(),
+            },
+        );
         let _ = r.chat_open("c1", &[], scope_b);
         assert!(
             !r.sessions.lock().unwrap().contains_key(&key),
@@ -10637,11 +10702,76 @@ transport = "stdio"
         // Every seat failing to start (an unknown cli) ends the same way: outcome reported,
         // nothing held.
         let opened = r
-            .chat_open("c2", &["no-such-cli-xyz".to_string()], scope_a)
+            .chat_open("c2", &["no-such-cli-xyz".to_string()], scope_a.clone())
             .expect("a valid scope is accepted");
         assert!(opened[0].1.is_err());
         assert!(r.chat_scopes.lock().unwrap().get("c2").is_none());
         assert!(r.chat_list().is_empty());
+        // Copilot, #426: the seatless cleanup drops only ITS OWN open's record — a newer open's
+        // record (a higher generation) survives an older open finishing with no seats.
+        r.chat_scopes.lock().unwrap().insert(
+            "c3".to_string(),
+            RecordedScope {
+                gen: 7,
+                scope: scope_a.clone(),
+            },
+        );
+        r.drop_scope_if_gen("c3", 6);
+        assert!(
+            r.chat_scopes.lock().unwrap().get("c3").is_some(),
+            "an older generation's cleanup leaves a newer record alone"
+        );
+        r.drop_scope_if_gen("c3", 7);
+        assert!(r.chat_scopes.lock().unwrap().get("c3").is_none());
+    }
+
+    /// Copilot, #426: a seat whose adapter asks no permissions and runs under no kernel floor
+    /// cannot be held to a scoped chat's read-only roots — refused by name for SCOPED chats,
+    /// admitted to unscoped ones; an admitted or sandboxed adapter joins either.
+    #[test]
+    fn a_permission_less_unsandboxed_seat_is_refused_for_a_scoped_chat_only() {
+        let scoped = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-adm"),
+            code_graph_db: None,
+            read_roots: vec![std::env::temp_dir()
+                .join("repo")
+                .to_string_lossy()
+                .into_owned()],
+        };
+        let unscoped = ChatScope {
+            read_roots: vec![],
+            ..scoped.clone()
+        };
+        let mut cfg = AcpConfig {
+            binary: "pi-acp".into(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: false,
+            os_sandbox: false,
+            acp_governance_env: None,
+            verified_version: None,
+        };
+        let err = scoped_seat_admission("pi", &scoped, &cfg).expect_err("refused");
+        assert!(
+            err.contains("pi") && err.contains("SCOPED") && err.contains("pi-acp"),
+            "{err}"
+        );
+        assert!(
+            scoped_seat_admission("pi", &unscoped, &cfg).is_ok(),
+            "unscoped admits everyone"
+        );
+        cfg.os_sandbox = true;
+        assert!(
+            scoped_seat_admission("pi", &scoped, &cfg).is_ok(),
+            "the kernel floor holds it"
+        );
+        cfg.os_sandbox = false;
+        cfg.acp_input_governance = true;
+        assert!(
+            scoped_seat_admission("claude", &scoped, &cfg).is_ok(),
+            "the boundary holds it"
+        );
     }
 
     /// Copilot, #426: a scope is validated BEFORE it is recorded — relative roots, a missing graph
