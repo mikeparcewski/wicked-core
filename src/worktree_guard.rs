@@ -234,7 +234,7 @@ pub fn pinned_git_dir(worktree: &Path, repo_root: &Path) -> anyhow::Result<PathB
         );
     }
     if wt == root {
-        return Ok(main_git);
+        return Ok(plain_path(main_git));
     }
     let worktrees = main_git.join("worktrees");
     let entries = std::fs::read_dir(&worktrees).map_err(|e| {
@@ -261,7 +261,7 @@ pub fn pinned_git_dir(worktree: &Path, repo_root: &Path) -> anyhow::Result<PathB
             continue;
         };
         if std::fs::canonicalize(parent).ok().as_deref() == Some(wt.as_path()) {
-            return Ok(dir);
+            return Ok(plain_path(dir));
         }
     }
     anyhow::bail!(
@@ -270,6 +270,22 @@ pub fn pinned_git_dir(worktree: &Path, repo_root: &Path) -> anyhow::Result<PathB
         root.display(),
         worktrees.display()
     )
+}
+
+/// `std::fs::canonicalize` on Windows yields a verbatim (`\\?\`) path, which git refuses as a
+/// `GIT_DIR` ("not a git repository"); hand git the plain spelling. A no-op elsewhere.
+fn plain_path(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
 
 /// Take the worktree's content snapshot THROUGH `git_dir` (see [`pinned_git_dir`]). Never modifies

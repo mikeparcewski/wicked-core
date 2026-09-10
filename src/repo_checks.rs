@@ -1439,8 +1439,17 @@ mod tests {
             std::fs::read_dir(&outside).unwrap().next().is_none(),
             "nothing was created through the link"
         );
-        // The floor reports the refusal as a detection error, fail-closed.
-        let report = run_with_sandbox(&wt, sandbox_for(&wt));
+        // The floor reports the refusal as a detection error, fail-closed — with a boundary
+        // injected so the scratch step is reached on every host (no tool ⇒ the earlier
+        // fail-closed branch would answer first).
+        let report = run_with_sandbox(
+            &wt,
+            WorkerSandbox {
+                wrapper: vec!["true".to_string()],
+                level: SandboxLevel::Sandboxed,
+                downgrade_reason: None,
+            },
+        );
         assert!(!report.passed);
         assert!(
             report
