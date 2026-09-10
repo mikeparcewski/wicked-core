@@ -462,11 +462,13 @@ fn seq_stays_monotonic_across_a_real_process_restart() {
         .env(RESTART_CHILD_DB, &db)
         .output()
         .expect("re-execute this test binary");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Exit status only — libtest's human-readable summary is not a stable API (Copilot on #420).
+    // Whether the child actually did the work is asserted below on the history it left behind.
     assert!(
-        out.status.success() && stdout.contains("1 passed"),
-        "the restarted process must approve the gate and finish the run\n--- stdout\n{stdout}\n\
+        out.status.success(),
+        "the restarted process must approve the gate and finish the run\n--- stdout\n{}\n\
          --- stderr\n{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -475,7 +477,8 @@ fn seq_stays_monotonic_across_a_real_process_restart() {
     let after = core.run_events(RESTART_RUN);
     assert!(
         after.len() > before.len(),
-        "the resumed run recorded more history: {after:#?}"
+        "the resumed run recorded more history — if it did not, the child ran no test (did the \
+         `--exact` filter still name `{RESTART_CHILD_TEST}`?): {after:#?}"
     );
 
     // The pre-restart history is untouched and still comes first.
