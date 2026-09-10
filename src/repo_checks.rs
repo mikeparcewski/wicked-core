@@ -747,23 +747,28 @@ pub(crate) fn run_one(
     let err_h = child.stderr.take().map(drain_tail);
     let timeout = check.timeout();
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(st)) => break Some(st),
-            Ok(None) if started.elapsed() >= timeout => {
+        match crate::validator::has_exited_unreaped(&mut child) {
+            Ok(true) => {
+                // Quiesce: nothing the check backgrounded may keep running (or writing) into the
+                // next stage. The exit was observed WITHOUT reaping (Copilot on #414), so the
+                // leader's pid — the group id — is still reserved by the zombie when the group is
+                // killed; only then is the status collected (immediate on a zombie).
+                crate::validator::kill_child_tree(&mut child);
+                break child.wait().ok();
+            }
+            Ok(false) if started.elapsed() >= timeout => {
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
                 result.timed_out = true;
                 break None;
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(false) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => {
                 result.spawn_error = Some(format!("wait failed: {e}"));
                 break None;
             }
         }
     };
-    // Quiesce: nothing the check backgrounded may keep running (or writing) into the next stage.
-    crate::validator::kill_child_tree(&mut child);
     result.exit_code = status.and_then(|st| st.code());
     result.stdout_tail = out_h
         .and_then(|h| h.join().ok())
