@@ -153,8 +153,16 @@ pub enum CoreEvent {
         exit_code: Option<i32>,
         /// Captured stderr, truncated. The artifact `run_in_isolation` used to discard.
         stderr: String,
+        /// The TAIL of captured stdout, truncated (F-031). claude prints `Not logged in · Please
+        /// run /login` on STDOUT and exits 1 with stderr EMPTY, so an event carrying stderr alone
+        /// said nothing about why the seat failed.
+        stdout: String,
         /// The OS/IO error text, where the branch has one.
         detail: String,
+        /// The classified cause when the seat's own words matched a known signature
+        /// (`not_logged_in`), `None` (wire `null`) otherwise — emitted unconditionally, the same
+        /// "unknown" rule as every other `Option` on this stream.
+        reason: Option<String>,
         /// How long the seat ran before failing. A spawn error costs ~0 ms; a timeout costs the
         /// whole budget. Without this the two are indistinguishable in the event stream.
         latency_ms: u64,
@@ -892,7 +900,9 @@ impl CoreEvent {
                 kind,
                 exit_code,
                 stderr,
+                stdout,
                 detail,
+                reason,
                 latency_ms,
             } => json!({
                 "type": "councilSeatFailed",
@@ -903,7 +913,9 @@ impl CoreEvent {
                 "kind": kind,
                 "exitCode": exit_code,
                 "stderr": stderr,
+                "stdout": stdout,
                 "detail": detail,
+                "reason": reason,
                 "latencyMs": latency_ms,
             }),
             CoreEvent::CouncilVoted {
@@ -1591,6 +1603,40 @@ mod tests {
             "emitted unconditionally: {j}"
         );
         assert!(j["seatConstraint"].is_null(), "{j}");
+    }
+
+    /// F-031: `councilSeatFailed` carries the seat's stdout TAIL and the classified `reason`
+    /// (`not_logged_in`) beside the stderr/detail it already carried, both emitted unconditionally
+    /// (`reason` is `null` when unclassified). Mutation: drop either key from the to_json arm and
+    /// the corresponding assertion fails.
+    #[test]
+    fn council_seat_failed_to_json_carries_stdout_and_the_classified_reason() {
+        let ev = |reason: Option<&str>| CoreEvent::CouncilSeatFailed {
+            session: "run-1".into(),
+            ord: 2,
+            round: 1,
+            cli: "claude".into(),
+            kind: "non_zero_exit".into(),
+            exit_code: Some(1),
+            stderr: String::new(),
+            stdout: "Not logged in · Please run /login".into(),
+            detail: String::new(),
+            reason: reason.map(str::to_string),
+            latency_ms: 2100,
+        };
+        let j = ev(Some("not_logged_in")).to_json();
+        assert_eq!(j["type"], "councilSeatFailed");
+        assert_eq!(j["cli"], "claude");
+        assert_eq!(j["kind"], "non_zero_exit");
+        assert_eq!(j["exitCode"], 1);
+        assert_eq!(j["stdout"], "Not logged in · Please run /login");
+        assert_eq!(j["reason"], "not_logged_in");
+        let j = ev(None).to_json();
+        assert!(
+            j.as_object().unwrap().contains_key("reason"),
+            "emitted unconditionally: {j}"
+        );
+        assert!(j["reason"].is_null(), "{j}");
     }
 
     /// FINDING-012: the `cliUsage` wire frame must expose the cache breakdown, so the studio Burn

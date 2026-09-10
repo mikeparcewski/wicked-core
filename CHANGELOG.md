@@ -511,6 +511,47 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Council ballots run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (F-030;
+  F-031, F-013).** `wicked-council`'s ballot spawn inherited whatever `CLAUDE_CONFIG_DIR` the daemon
+  was started with (`hardened()` strips only `WICKED_*`): on a fresh install that is the
+  never-signed-in dir garden is registered in, so every claude ballot exited 1 `Not logged in` and
+  the seat was benched on every council (4-of-5 verdicts) while the ACP worker path — which sets the
+  variable from the worker home — ran the same CLI fine; on a laptop with no such variable the
+  ballots ran on the OPERATOR's `~/.claude` login by accident. ONE resolver now
+  (`wicked_apps_core::spawn::{worker_home_base, worker_claude_config_dir, seat_claude_config_dir,
+  claude_config_for_carrier}`: `$WICKED_WORKER_HOME` else `~/.wicked-worker`, joined `/claude` —
+  ALWAYS absolute: an empty or relative override/home is refused as a config error, since three
+  consumers would each resolve it against a different cwd; VALIDATED no-follow via the shared
+  `refuse_symlinked_home`, so a planted `<worker home>/claude -> ~/.claude` link is refused for
+  ballots exactly as for ACP workers; and CARRIER-AWARE via the shared `binary_is_claude` file-stem
+  test — only a claude carrier gets a claude config dir, a codex/pi/copilot/opencode seat or bridge
+  gets the variable STRIPPED, never an ambient claude config path). Used by the ACP worker spawn
+  (`acp_runner::worker_config_home` delegates to it; `start_acp_process*` take `seat_is_claude`),
+  the ballot spawn (sets `CLAUDE_CONFIG_DIR` on claude seats after `hardened()`, honours the same
+  `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` hatch — the const moved below the root too — and fails
+  CLOSED when the dir cannot be resolved or validated) and the roster's claude `login_invocation`,
+  which is now DERIVED from the resolved dir (`CLAUDE_CONFIG_DIR="<resolved>/claude" claude`; plain
+  `claude` under the hatch; NO command at all when the dir is unresolvable — fail closed, no
+  `$HOME/...` fallback) instead of the hard-coded `$HOME/.wicked-worker/claude` that sent an operator
+  under `WICKED_WORKER_HOME` to sign in the wrong directory (`default_login_invocation` returns
+  `Option<String>`). Seat-failure diagnostics (F-031): `SeatFailure` keeps the stdout TAIL (claude
+  prints its refusal on stdout with stderr empty), stderr as HEAD+TAIL around an elision marker, and
+  a classified `reason` (`SeatFailureReason::NotLoggedIn` ⇢ `not_logged_in`) judged over the
+  UNTRUNCATED streams (`with_output`), so a signature past the 4 KiB cap still classifies;
+  `SeatFailure::reason()` is renamed `summary()` and includes the class. Review round 2 hardening:
+  the resolver also refuses `.`/`..` segments and walks EVERY component from the filesystem root
+  to the leaf refusing planted (non-root-owned) symlinks — applied inside `worker_claude_config_dir`
+  so every consumer gets the same validated path; the WRAPPED worker applies the same carrier
+  decision (`execute_wrapped::exec` sets the worker home for a claude carrier, strips the variable
+  for any other — wrapped claude no longer runs on the operator's login by accident); and an ACP
+  launch reads its `[cli.acp]` transport and its seat identity off ONE registry record
+  (`acp_launch_facts`; the unit path reuses its single `seat` read). The shared `binary_is_claude`
+  carrier test follows the OS's executable lookup: case-insensitive on Windows (`CLAUDE.EXE`,
+  `Claude.cmd` are claude there), exact elsewhere.
+  `councilSeatFailed` gains ADDITIVE `stdout` and `reason` (`null` when unclassified) beside
+  `stderr`/`detail` — wire shape change (additive) — crew/studio consume it via the next core-ts
+  release; the crew roster consumer of `login_invocation` sees the resolved path. Persisted
+  `seat_failures` written before this read with the new fields defaulted.
 - **ACP input-governance admission is evidence-gated (#364).** ACP permission requests now enter
   the shared policy, boundary, marker, and conformance-claim evaluator only for an ACP adapter
   explicitly marked `acp_input_governance = true`; the capability defaults off and only the

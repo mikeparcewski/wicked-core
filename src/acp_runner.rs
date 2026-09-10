@@ -1161,8 +1161,9 @@ fn death_context_with(proc: &AcpProcess, status: Option<std::process::ExitStatus
 /// SDK it drives in-process (`CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? homedir()`),
 /// so this variable decides WHOSE configuration a worker runs under. It is the carrier the
 /// bridge honours where argv is not: flags the bridge does not parse are discarded, which is how
-/// FINDING-060 happened.
-pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+/// FINDING-060 happened. Spelled once, below this crate, so the council ballot spawn sets the
+/// SAME variable from the SAME resolver (F-030).
+pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV;
 
 /// Decide the [`CLAUDE_CONFIG_DIR_ENV`] override for an ACP worker spawn — `None` means inherit
 /// the operator's own configuration (the explicit escape hatch only).
@@ -1220,16 +1221,13 @@ fn worker_claude_config_dir(
 /// pre-main at a per-process temp base (via `emit::hermetic_test_spool`, core#311-class): a real
 /// start reached by a test re-sanitizes the resolved home, which must never be the operator's
 /// real `~/.wicked-worker`.
+///
+/// The PATH is the shared resolver's (`wicked_apps_core::spawn::worker_claude_config_dir`) — the
+/// same one the council ballot spawn sets and the roster's claude sign-in command names (F-030 /
+/// F-013). This crate owns only what happens AT that path: creation, permissions, symlink refusal
+/// and per-spawn re-sanitization ([`ensure_worker_config_home`]).
 fn worker_config_home() -> anyhow::Result<std::path::PathBuf> {
-    if let Some(base) = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV) {
-        return Ok(std::path::PathBuf::from(base).join("claude"));
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".wicked-worker")
-        .join("claude"))
+    wicked_apps_core::spawn::worker_claude_config_dir()
 }
 
 /// Filesystem entries re-sanitized out of the worker home at EVERY spawn — the exact
@@ -1575,27 +1573,9 @@ fn write_atomic(dir: &std::path::Path, path: &std::path::Path, bytes: &[u8]) -> 
 /// write the worker's CLI makes at a path the operator never chose. FAIL CLOSED on any stat
 /// error other than not-found (a PermissionDenied probe must not read as "not a symlink").
 fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
-    for probe in [dir.parent(), Some(dir)].into_iter().flatten() {
-        match std::fs::symlink_metadata(probe) {
-            Ok(m) if m.file_type().is_symlink() => {
-                anyhow::bail!(
-                    "refusing worker config home {}: {} is a symlink",
-                    dir.display(),
-                    probe.display()
-                );
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                anyhow::bail!(
-                    "refusing worker config home {}: cannot stat {} ({e})",
-                    dir.display(),
-                    probe.display()
-                );
-            }
-        }
-    }
-    Ok(())
+    // The ONE no-follow check, shared with the council ballot spawn (PR#413): a link at the home
+    // or its parent re-aims every write AND every credential read.
+    wicked_apps_core::spawn::refuse_symlinked_home(dir)
 }
 
 /// Remove a worker-home entry WITHOUT following symlinks: a link is deleted as a link
@@ -1681,6 +1661,9 @@ fn start_acp_process(
     // denies in the system temp. UNIT sessions pass `<cwd>/tmp`; CHAT sessions pass `None` —
     // dropping a `tmp/` dir into a user's own working directory would be intrusive.
     scratch_tmp: Option<&std::path::Path>,
+    // Whether the seat this bridge carries IS claude (`acp_seat_identity`): only a claude carrier
+    // gets the engine-owned claude config dir; every other bridge gets the variable STRIPPED.
+    seat_is_claude: bool,
     // The engine's own operational state home (codex round 8), fenced on chat sessions too.
     operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<AcpProcess> {
@@ -1695,6 +1678,7 @@ fn start_acp_process(
         &[],
         &[],
         &crate::skills_snapshot::SkillsDelivery::None,
+        seat_is_claude,
         None,
         operational_home,
     )
@@ -1870,7 +1854,7 @@ fn same_plugin_path(existing: &str, root: &std::path::Path) -> bool {
 /// governance context used to arm `WICKED_WRITE_ROOTS`; Boundary 1 is WRITE containment only,
 /// not exfiltration protection, a read jail, or a replacement for ACP governance.
 ///
-/// Eight parameters, each a distinct launch fact documented inline below; bundling them into a
+/// Nine parameters, each a distinct launch fact documented inline below; bundling them into a
 /// struct would touch every test spawn in this file for no gain in clarity.
 #[allow(clippy::too_many_arguments)]
 fn start_acp_process_with_write_roots(
@@ -1890,6 +1874,13 @@ fn start_acp_process_with_write_roots(
     // `--add-dir …` appended to the bridge argv when the bridge IS pi / copilot; opencode's
     // `skills.paths` composed into `OPENCODE_CONFIG_CONTENT`; or nothing.
     delivery: &crate::skills_snapshot::SkillsDelivery,
+    // Whether the seat this bridge carries IS claude, as `acp_seat_identity` judges it (the merged
+    // registry record's `binary`). Decides the CLAUDE_CONFIG_DIR handling below: a claude carrier
+    // gets the engine-owned worker home (or inherits under the hatch); a codex/pi/copilot/opencode
+    // bridge never reads the variable and gets it STRIPPED — no ambient claude configuration path
+    // in a foreign process, and no ensuring (creating, re-sanitizing) claude's home on its account
+    // (codex review, PR#413).
+    seat_is_claude: bool,
     // `Some((run_id, cli_key))` for a UNIT session: names its per-session settings directory
     // (v3.1 §3). `None` for chat sessions.
     session: Option<(&str, &str)>,
@@ -1902,17 +1893,22 @@ fn start_acp_process_with_write_roots(
     // that proceeded without the override would run under the operator's own configuration,
     // which is the exact leak being fixed — and the caller's fallback is the wrapped path, which
     // carries its own isolation.
-    let worker_config_dir = match worker_claude_config_dir(
-        crate::execute_wrapped::inherits_operator_config(),
-        operational_home,
-    ) {
-        None => None,
-        Some(Ok(dir)) => Some(dir),
-        Some(Err(e)) => {
-            return Err(anyhow::anyhow!(
-                "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
+    let worker_config_dir = if !seat_is_claude {
+        // Carrier-aware: a non-claude bridge gets no claude config dir (stripped below).
+        None
+    } else {
+        match worker_claude_config_dir(
+            crate::execute_wrapped::inherits_operator_config(),
+            operational_home,
+        ) {
+            None => None,
+            Some(Ok(dir)) => Some(dir),
+            Some(Err(e)) => {
+                return Err(anyhow::anyhow!(
+                    "ACP worker config isolation failed ({e}); refusing to start an ACP worker \
                      under the operator's own CLI configuration (FINDING-061)"
-            ))
+                ))
+            }
         }
     };
     let skills_plugin: Option<&std::path::Path> = match delivery {
@@ -2022,6 +2018,12 @@ fn start_acp_process_with_write_roots(
         // frequently exactly that variable.
         if let Some(dir) = &worker_config_dir {
             cmd.env(CLAUDE_CONFIG_DIR_ENV, dir);
+        } else if !seat_is_claude {
+            // No ambient claude configuration path for a non-claude carrier: the daemon's own
+            // CLAUDE_CONFIG_DIR would otherwise ride into a codex/pi/copilot/opencode bridge for
+            // nothing (PR#413). The claude-under-the-hatch case is the remaining `None`, which
+            // inherits on purpose.
+            cmd.env_remove(CLAUDE_CONFIG_DIR_ENV);
         }
         // UNCONDITIONAL — never gated on whether THIS unit is governed (DES-INPUT-GOV-006 §3.3).
         // A session is spawned once and cached/reused across turns (`probe_cached_session`); a
@@ -4247,16 +4249,25 @@ impl AcpStepRunner {
                 return Ok(arc.clone());
             }
         }
-        let config =
-            acp_config_for(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
+        // ONE registry read for this launch: the transport config AND the seat identity come off
+        // the same record (codex r2, PR#413).
+        let (config, seat_is_claude) =
+            acp_launch_facts(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
         if config.transport == AcpTransport::Http {
             return Err(format!(
                 "ACP HTTP transport not supported for chat ('{cli_key}')"
             ));
         }
         // Chat is repo-less exploration → no estate MCP server (FINDING-122).
-        let proc = start_acp_process(&config, cwd, None, None, self.operational_home.as_deref())
-            .map_err(|e| e.to_string())?;
+        let proc = start_acp_process(
+            &config,
+            cwd,
+            None,
+            None,
+            seat_is_claude,
+            self.operational_home.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         let arc = Arc::new(Mutex::new(proc));
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         // A racing ensure may have inserted first — reuse theirs, drop ours.
@@ -4607,6 +4618,10 @@ impl AcpStepRunner {
         // wrapped fallback below judges the CLI on its own terms.
         let seat = registry_record(&cli_key);
         let worker_cli = seat_identity_of(seat.as_ref(), &cli_key);
+        // Judged off THIS record — the same one whose `[cli.acp]` decides the transport below
+        // (`acp_cfg_probe`) — never a second registry read (codex r2, PR#413: a clis.toml edit
+        // between two reads would pair one record's bridge with another's identity).
+        let seat_is_claude = matches!(worker_cli, crate::skills_snapshot::WorkerCli::Claude);
         // core#396 / v3.1 §4 — admission, BEFORE the operator messages below are consumed
         // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST and ONE
         // policy for cached and fresh alike (`admit_turn`, codex round 4): a session this run
@@ -4953,6 +4968,7 @@ impl AcpStepRunner {
                     extra_write_roots,
                     &estate_provenance,
                     &delivery,
+                    seat_is_claude,
                     Some((run_id.as_str(), cli_key.as_str())),
                     self.operational_home.as_deref(),
                 ) {
@@ -5283,8 +5299,8 @@ impl AcpStepRunner {
                             "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
                              (crew#267). One-time fix: run \
                              `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude login` yourself, then \
-                             every worker stays logged in. Using single-shot fallback meanwhile, \
-                             which runs under the operator's own auth"
+                             every worker stays logged in. Using single-shot fallback meanwhile — \
+                             it runs under the SAME worker home, so it needs the same sign-in"
                         ),
                         fallback_kind::AUTH_REQUIRED,
                     )
@@ -5470,11 +5486,20 @@ pub(crate) fn seat_identity_of(
     crate::skills_snapshot::WorkerCli::for_binaries(&seat_binary, &carrier_binary, cli_key)
 }
 
-fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
-    // The MERGED registry, not builtin(): a user record replaces its built-in wholesale,
-    // so its [cli.acp] table (or its absence) must decide the transport here exactly as
-    // it does everywhere else.
-    registry_record(cli_key).and_then(|c| c.acp)
+/// ONE registry read for ONE ACP launch: the seat's `[cli.acp]` transport config AND whether the
+/// seat is claude (`seat_identity_of` on the SAME record), or `None` when the seat has no ACP
+/// config. The MERGED registry, not `builtin()`: a user record replaces its built-in wholesale,
+/// so its `[cli.acp]` table (or its absence) must decide the transport here exactly as it does
+/// everywhere else — and its `binary` decides the identity off that same record, never a second,
+/// independent read that a concurrent `clis.toml` edit could make disagree (codex r2, PR#413).
+fn acp_launch_facts(cli_key: &str) -> Option<(AcpConfig, bool)> {
+    let record = registry_record(cli_key);
+    let config = record.as_ref().and_then(|c| c.acp.clone())?;
+    let seat_is_claude = matches!(
+        seat_identity_of(record.as_ref(), cli_key),
+        crate::skills_snapshot::WorkerCli::Claude
+    );
+    Some((config, seat_is_claude))
 }
 
 /// Make the wire-visible disclosure for a governed unit using an ACP adapter that has not passed
@@ -5543,7 +5568,16 @@ mod tests {
         code_graph_db: Option<&str>,
         scratch_tmp: Option<&std::path::Path>,
     ) -> anyhow::Result<AcpProcess> {
-        super::start_acp_process(config, cwd, code_graph_db, scratch_tmp, None)
+        // The stubs below stand in for the CLAUDE bridge unless a test says otherwise.
+        super::start_acp_process(config, cwd, code_graph_db, scratch_tmp, true, None)
+    }
+    /// [`start_acp_process`] for a stub standing in for a NON-claude bridge (codex, pi, …).
+    #[cfg(unix)]
+    fn start_non_claude_acp_process(
+        config: &AcpConfig,
+        cwd: &std::path::Path,
+    ) -> anyhow::Result<AcpProcess> {
+        super::start_acp_process(config, cwd, None, None, false, None)
     }
     /// `#[cfg(unix)]`: its only callers drive shell-script stubs (Unix-only), so on Windows it
     /// would be dead code under `-D warnings`.
@@ -5567,6 +5601,7 @@ mod tests {
             extra_write_roots,
             estate_provenance,
             delivery,
+            true,
             session,
             None,
         )
@@ -5879,6 +5914,234 @@ mod tests {
         std::env::set_var("WICKED_WORKER_HOME", &base);
         let err = ensure_worker_config_home().expect_err("symlinked home must be refused");
         assert!(err.to_string().contains("symlink"), "{err}");
+        restore_hermetic_worker_home();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A RELATIVE `WICKED_WORKER_HOME` is refused by the ACP path before any spawn — at the shared
+    /// resolver, so the ballot path and the sign-in command refuse the same value the same way
+    /// (codex, PR#413: a relative dir would otherwise be resolved against three different working
+    /// directories). The empty spelling is covered at the pure resolver
+    /// (`wicked_apps_core::spawn::tests`): Windows deletes a variable set to "" so it cannot be
+    /// pinned through the environment.
+    #[test]
+    fn a_relative_worker_home_is_refused_before_any_spawn() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        for bad in ["relative/worker", "worker", "./worker"] {
+            std::env::set_var("WICKED_WORKER_HOME", bad);
+            let err = ensure_worker_config_home().expect_err(bad);
+            assert!(err.to_string().contains("absolute"), "{bad}: {err}");
+            // The spawn's own decision (no hatch) is the same refusal, so `start_acp_process`
+            // fails closed before spawning — never a worker on `relative/worker/claude`.
+            let decision = worker_claude_config_dir(false).expect("not the hatch");
+            assert!(decision.is_err(), "{bad}: the ACP spawn must refuse too");
+            assert!(
+                wicked_apps_core::spawn::seat_claude_config_dir()
+                    .expect("not the hatch")
+                    .is_err(),
+                "{bad}: the ballot spawn must refuse too"
+            );
+        }
+        restore_hermetic_worker_home();
+    }
+
+    /// codex r2, PR#413: the ACP launch's transport config and its seat identity are read off ONE
+    /// registry record (`acp_launch_facts`), so an operator override that changes a seat's `binary`
+    /// changes its identity in the SAME resolution that hands out its bridge — never one record's
+    /// bridge paired with another's identity. Pins HOME so the override is the only `clis.toml`.
+    #[test]
+    fn acp_launch_facts_couple_the_bridge_and_the_identity_from_one_record() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = worker_home_base("launch-facts-home");
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            r#"
+[[cli]]
+key = "claude"
+display_name = "Not actually claude"
+binary = "some-other-cli"
+headless_invocation = "some-other-cli -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/overridden/bridge-a"
+transport = "stdio"
+
+[[cli]]
+key = "skills-seat"
+display_name = "Claude under another key"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/overridden/bridge-b"
+transport = "stdio"
+"#,
+        )
+        .unwrap();
+        let prior_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let a = acp_launch_facts("claude");
+        let b = acp_launch_facts("skills-seat");
+        let none = acp_launch_facts("no-such-seat");
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let (cfg_a, claude_a) = a.expect("the override has an ACP table");
+        assert_eq!(
+            cfg_a.binary, "/opt/overridden/bridge-a",
+            "the bridge off THAT record"
+        );
+        assert!(
+            !claude_a,
+            "the key says claude but THAT record's binary does not — identity follows the record"
+        );
+        let (cfg_b, claude_b) = b.expect("the override has an ACP table");
+        assert_eq!(cfg_b.binary, "/opt/overridden/bridge-b");
+        assert!(
+            claude_b,
+            "a claude binary under another key IS a claude seat"
+        );
+        assert!(none.is_none(), "no record, no launch facts");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// codex r3, PR#413: the ACP seat identity — judged off the record's `binary` through the same
+    /// carrier test as the ballot and the wrapped runner — follows the OS's executable lookup: a
+    /// record spelling its binary `CLAUDE.EXE` / `Claude.cmd` is a claude seat on Windows (so the
+    /// bridge gets the worker home, never a stripped variable), and not one on a case-sensitive
+    /// filesystem.
+    #[test]
+    fn a_case_variant_claude_binary_is_a_claude_seat_exactly_where_the_os_launches_it_as_one() {
+        use crate::skills_snapshot::WorkerCli;
+        for spelled in ["CLAUDE.EXE", "Claude.cmd", r"C:\Tools\CLAUDE.exe"] {
+            let identity = WorkerCli::for_binaries(spelled, "claude-agent-acp", "claude");
+            assert_eq!(
+                matches!(identity, WorkerCli::Claude),
+                cfg!(windows),
+                "{spelled}: {identity:?}"
+            );
+        }
+        assert!(matches!(
+            WorkerCli::for_binaries("claude", "claude-agent-acp", "claude"),
+            WorkerCli::Claude
+        ));
+    }
+
+    /// A NON-claude bridge (codex, pi, copilot, opencode) gets no ambient claude configuration
+    /// path: the daemon's own `CLAUDE_CONFIG_DIR` is stripped, not forwarded, and the engine-owned
+    /// claude home is neither handed to it nor ensured on its account (codex, PR#413).
+    #[test]
+    #[cfg(unix)]
+    fn a_non_claude_acp_worker_gets_no_ambient_claude_config_dir() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("non-claude-config");
+        std::env::set_var("WICKED_WORKER_HOME", &dir);
+        // The daemon's own claude config dir — what a non-claude bridge must NOT see.
+        let decoy = dir.join("daemon-config-dir");
+        std::fs::create_dir_all(&decoy).unwrap();
+        let _decoy = EnvPin::set(CLAUDE_CONFIG_DIR_ENV, &decoy);
+        let ledger = dir.join("seen-config-dir.txt");
+        let script = write_stub(
+            &dir,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "${{CLAUDE_CONFIG_DIR:-UNSET}}" > "{ledger}"
+read _init
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"nc"}}}}'
+sleep 30
+"#,
+                ledger = ledger.display()
+            ),
+        );
+        let proc = start_non_claude_acp_process(&stub_config(&script, None), &dir).expect("start");
+        let seen = std::fs::read_to_string(&ledger).unwrap().trim().to_string();
+        assert_eq!(
+            seen, "UNSET",
+            "a non-claude bridge must see NO claude config dir — neither the daemon's nor the \
+             worker home's"
+        );
+        assert!(
+            !dir.join("claude").exists(),
+            "claude's worker home must not be ensured on a non-claude bridge's account"
+        );
+        drop(proc);
+        restore_hermetic_worker_home();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-030 / F-013: ONE resolver for "the claude seat's config dir". Compared through the two
+    /// spawn-facing APIs EXACTLY as the spawns call them — the ACP worker path's
+    /// `worker_claude_config_dir(inherits_operator_config(), ..)` (what `start_acp_process` sets
+    /// `CLAUDE_CONFIG_DIR` to) and the council ballot path's
+    /// `wicked_apps_core::spawn::seat_claude_config_dir()` (what `run_in_isolation` sets), hatch
+    /// included — plus the roster's claude `login_invocation` (what the studio tells the operator
+    /// to sign in). All three must agree under `WICKED_WORKER_HOME`: the finding was three
+    /// spellings that agreed only on the default laptop layout. (Copilot, PR#413: comparing the
+    /// hatch-unaware `worker_claude_config_dir()` resolver instead would not catch the ballot API
+    /// diverging from it.)
+    #[test]
+    fn the_worker_home_the_ballots_and_the_sign_in_command_resolve_to_one_dir() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("one-resolver");
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        // Pin HOME so `registry_roster` reads NO developer `~/.config/wicked-council/clis.toml`
+        // (which could override or disable the claude seat) — the built-in roster is under test.
+        let prior_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &base);
+
+        let inherit = crate::execute_wrapped::inherits_operator_config();
+        // The ACP spawn's decision, as `start_acp_process_with_write_roots` makes it.
+        let worker = worker_claude_config_dir(inherit).map(|r| r.expect("worker home resolves"));
+        // The ballot spawn's decision, as `run_in_isolation` makes it.
+        let ballot = wicked_apps_core::spawn::seat_claude_config_dir()
+            .map(|r| r.expect("seat dir resolves"));
+        let claude = crate::registry_roster()
+            .into_iter()
+            .find(|c| c.key == "claude")
+            .expect("the built-in roster seats claude");
+        let login = claude
+            .login_invocation
+            .expect("claude has a sign-in command");
+        match (&worker, &ballot) {
+            (None, None) => {
+                // The operator's inherit hatch: BOTH spawns run on the operator's own config
+                // (one hatch, not two), so that is where the sign-in goes.
+                assert!(inherit, "only the hatch may make a spawn inherit");
+                assert_eq!(login, "claude");
+            }
+            (Some(worker), Some(ballot)) => {
+                assert!(!inherit, "without the hatch every spawn sets the dir");
+                assert_eq!(*worker, base.join("claude"));
+                assert_eq!(
+                    worker, ballot,
+                    "the ACP worker and the ballot spawn disagree on the seat dir"
+                );
+                assert_eq!(
+                    login,
+                    format!("CLAUDE_CONFIG_DIR=\"{}\" claude", ballot.display()),
+                    "the sign-in command must name the dir the seats actually run under"
+                );
+                assert!(
+                    !login.contains("$HOME"),
+                    "resolved, never the hard-coded default spelling (F-013): {login}"
+                );
+            }
+            (w, b) => panic!(
+                "the two spawn paths disagree on WHETHER to set the seat dir (worker={w:?}, \
+                 ballot={b:?}) — the hatch is read in two places"
+            ),
+        }
+
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
         restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -225,10 +225,11 @@ pub fn registry_roster() -> Vec<AgenticCli> {
         .map(|mut c| {
             // Fill the seat's sign-in command from the built-in table when the registry entry
             // does not override it — consumers (the studio's sign-in terminal) read it off the
-            // roster and never hardcode per-provider flows.
+            // roster and never hardcode per-provider flows. The claude command names the RESOLVED
+            // worker config dir (the one the ballots and the ACP workers run under), so it is
+            // derived here per call, never a literal (F-013).
             if c.login_invocation.is_none() {
-                c.login_invocation =
-                    wicked_council::types::default_login_invocation(&c.key).map(str::to_string);
+                c.login_invocation = wicked_council::types::default_login_invocation(&c.key);
             }
             c
         })

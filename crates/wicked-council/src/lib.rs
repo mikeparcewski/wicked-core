@@ -36,6 +36,22 @@ pub mod synthesis;
 pub mod types;
 pub mod worker;
 
+/// The ONE lock every test in this binary takes before touching process-global environment
+/// (`WICKED_WORKER_HOME`, `CLAUDE_CONFIG_DIR`, `PATH`, `WICKED_WORKER_INHERIT_OPERATOR_CONFIG`).
+///
+/// `cargo test` runs a crate's tests on many threads in one process and environment variables are
+/// process-global, so two modules each guarding their own mutations with their OWN mutex serialize
+/// against themselves and against nothing else (Copilot, PR#413): a `dispatch` test pinning a
+/// relative `WICKED_WORKER_HOME` could land mid-way through a `types` test resolving the sign-in
+/// command. Same shape as the root crate's `test_env::ENV_LOCK`: tests that MUTATE hold `write()`;
+/// tests that only READ a variable a mutator might change (a resolver call, a real spawn of a
+/// claude-carrier seat) hold `read()`. Poison-tolerant on purpose: one panicking test must not
+/// cascade.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+}
+
 // Re-export the seam-bearing surface at the crate root for ergonomic callers.
 pub use bus::EmitSink;
 pub use store::{EstateHandle, EstateRankStore, Ledger, TaskRecord};
