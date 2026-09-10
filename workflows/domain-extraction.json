@@ -54,7 +54,7 @@
       "gate": {
         "human_confirm_if": "verdict_not_pass"
       },
-      "executes_code": false,
+      "executes_code": true,
       "verified_evidence": true,
       "required_deliverables": [
         "coverage-report.json"

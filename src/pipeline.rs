@@ -768,11 +768,10 @@ pub(crate) fn apply_and_finish_unit(
     // ── (layer-0) WORKTREE GUARD (F-036) — evaluator ≠ creator held structurally. For a unit
     // whose phase declared `executes_code: false`, the worker thread compared the tree it left
     // against the baseline the actor snapshotted at dispatch (`worktree_guard`). Any non-exempt
-    // change DENIES: the change under review is no longer the creator's, so no verdict this unit
-    // produced can certify it. Judged FIRST — the pinned diff floor below would PASS a rewritten
-    // tree (a diff exists), and the agent judge would be grading the evaluator's own edit. The
-    // event fires for every observed change, exempt-only ones included, so an operator always
-    // sees what an evaluator wrote. Fail-closed: a guarded unit whose outcome is missing or
+    // change DENIES — there are no exemptions: the change under review is no longer the
+    // creator's, so no verdict this unit produced can certify it. Judged FIRST — the pinned diff
+    // floor below would PASS a rewritten tree (a diff exists), and the agent judge would be
+    // grading the evaluator's own edit. Fail-closed: a guarded unit whose outcome is missing or
     // unverifiable is denied — a guard whose absence reads as a pass is not a guard.
     let guard_denial: Option<String> =
         if crate::worktree_guard::applies_to(unit) && workdir.is_some() {
@@ -791,7 +790,6 @@ pub(crate) fn apply_and_finish_unit(
                     after_tree: m.after.tree.clone(),
                     head_moved: m.head_moved,
                     changed: m.changed.clone(),
-                    exempted: m.exempted.clone(),
                 });
                 m.denies()
                     .then(|| crate::worktree_guard::denial_reason(unit, m))

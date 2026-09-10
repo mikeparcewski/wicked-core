@@ -172,10 +172,11 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
              \"REPO CHECK BOOM\");\n    }\n}\n"
         };
         std::fs::write(repo.join("src/lib.rs"), body).unwrap();
-        // `cargo test` writes `target/` AND generates `Cargo.lock` in a fixture that ships none.
-        // Both are ignored, as a library crate's `.gitignore` would — anything else the check
-        // wrote would (correctly) trip the worktree guard's FINAL comparison.
-        std::fs::write(repo.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+        // `cargo test` generates `Cargo.lock` in a fixture that ships none — ignored, as a library
+        // crate's `.gitignore` would. Build artifacts go to the floor's scratch (`CARGO_TARGET_DIR`),
+        // so `target/` needs no ignore; anything else the check wrote would (correctly) trip the
+        // worktree guard's FINAL comparison.
+        std::fs::write(repo.join(".gitignore"), "Cargo.lock\n").unwrap();
     }
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
@@ -354,15 +355,9 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
                 ord,
                 phase,
                 changed,
-                exempted,
                 head_moved,
                 ..
-            } if *ord == 4 => Some((
-                phase.clone(),
-                changed.clone(),
-                exempted.clone(),
-                *head_moved,
-            )),
+            } if *ord == 4 => Some((phase.clone(), changed.clone(), *head_moved)),
             _ => None,
         })
         .expect("evaluatorMutatedWorktree emitted for the verify unit");
@@ -374,7 +369,7 @@ fn an_evaluator_that_rewrites_the_fix_is_denied_with_the_path_named() {
         .collect();
     paths.sort();
     assert_eq!(paths, vec!["D src/fix.ts", "M src/app.ts"]);
-    assert!(mutation.2.is_empty() && !mutation.3);
+    assert!(!mutation.2, "HEAD did not move");
 
     // The repo checks did NOT run over the rewritten tree — certifying the wrong code is worse
     // than running nothing, and the guard's denial is the honest record.

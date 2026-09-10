@@ -40,18 +40,26 @@
 //! confined to the worktree, the curated secret directories unreadable, network open because
 //! installs need it), with an ISOLATED `HOME` and package caches under the worktree's engine
 //! scratch (`<worktree>/tmp/wicked-checks/…` — `HOME`, `npm_config_cache`, `CARGO_HOME`,
-//! `XDG_*`), so no check reads the operator's `~/.npmrc`, `~/.cargo/config.toml` or credentials,
-//! and nothing it writes lands outside the tree. `RUSTUP_HOME` is preserved so the toolchain
-//! proxies still resolve. When no sandbox tool is on the host (Windows), the floor runs with the
-//! env isolation alone and SAYS SO on the report (`sandbox_level: "best-effort"`) — the same
-//! disclose-and-continue posture the worker sandbox takes (DES-GOV-008 A1), never a silent claim
-//! of containment.
+//! `CARGO_TARGET_DIR`, `XDG_*`), so no check reads the operator's `~/.npmrc`,
+//! `~/.cargo/config.toml` or credentials, nothing it writes lands outside the tree, and its build
+//! artifacts (`target/`, a generated `package-lock.json` — `--no-package-lock` when the repo ships
+//! none) never land in the reviewed tree either, where the worktree guard would deny them. `RUSTUP_HOME` is preserved so the toolchain
+//! proxies still resolve. When NO write boundary can be armed — no `sandbox-exec`/`bwrap` on the
+//! host (all of Windows), or the worktree root failing to canonicalize — the floor does NOT run
+//! the checks: repo-controlled scripts never execute unsandboxed (codex review on #414). The
+//! report FAILS with the probe's reason (`sandbox_error`, `sandbox_level: "best-effort"`), which
+//! the gate turns into a denial an operator can read and act on (install the sandbox tool, or run
+//! the verify phase where one exists).
 //!
 //! ## Detection is fail-closed
 //!
 //! A `package.json` that cannot be read or parsed, or a manifest/lockfile/`node_modules` that is a
-//! SYMLINK (probed with `lstat`, never followed), fails the floor with the reason: an unverifiable
-//! manifest is not "no checks", it is "cannot tell what the checks are". Only a repository with NO
+//! SYMLINK, fails the floor with the reason: an unverifiable manifest is not "no checks", it is
+//! "cannot tell what the checks are". Probes never follow links and leave no lstat-then-open
+//! window: each entry is `lstat`ed, then opened `O_NOFOLLOW` and the opened descriptor `fstat`ed
+//! (a regular file, same device + inode as the lstat) before a single byte is read (codex review
+//! on #414). On a host without `O_NOFOLLOW` (Windows) the probe is `lstat` + open + re-`lstat`,
+//! documented as the weaker of the two. Only a repository with NO
 //! manifest at all yields a report with no runs and `passed: true` — disclosed as such on the
 //! event (`checks: []`), never silently.
 //!
@@ -183,11 +191,21 @@ pub struct RepoChecksReport {
     /// Why the level is below `sandboxed`, when it is — verbatim from the worker-sandbox probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_note: Option<String>,
+    /// Set when the checks did NOT run because no OS write boundary could be armed: the floor
+    /// fails closed rather than run repo-controlled scripts unsandboxed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_error: Option<String>,
 }
 
 impl RepoChecksReport {
     /// The operator-facing denial when `!passed`.
     pub fn denial_reason(&self) -> String {
+        if let Some(e) = &self.sandbox_error {
+            return format!(
+                "repo checks floor failed: {CRITERION}. The checks were NOT run: {e} — the floor \
+                 never runs repo-controlled scripts without an OS write boundary (fail-closed)."
+            );
+        }
         if let Some(e) = &self.detect_error {
             return format!(
                 "repo checks floor failed: {CRITERION}. The repository's checks could not be \
@@ -232,6 +250,9 @@ impl RepoChecksReport {
 
     /// A one-line account for `GateEvaluated`/logs: `install: exit 0 (31.2s), test: exit 1 (…)`.
     pub fn summary(&self) -> String {
+        if let Some(e) = &self.sandbox_error {
+            return format!("checks not run: {e}");
+        }
         if let Some(e) = &self.detect_error {
             return format!("checks could not be determined: {e}");
         }
@@ -267,19 +288,103 @@ fn last_lines(tail: &str) -> String {
     }
 }
 
-/// `lstat` a probe path WITHOUT following links. `Ok(None)` = absent; `Ok(Some(meta))` = present
-/// and not a symlink; `Err` = a symlink (refused — a manifest that points elsewhere is not the
-/// repository's) or an unreadable entry.
-fn probe(worktree: &Path, rel: &str) -> Result<Option<std::fs::Metadata>, String> {
-    let p = worktree.join(rel);
-    match std::fs::symlink_metadata(&p) {
-        Ok(m) if m.file_type().is_symlink() => Err(format!(
-            "`{rel}` is a symlink (the floor never follows links out of the worktree)"
-        )),
-        Ok(m) => Ok(Some(m)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("`{rel}` could not be inspected: {e}")),
+/// A probed worktree entry: present, not a symlink, and opened without following links.
+struct Probed {
+    meta: std::fs::Metadata,
+    file: std::fs::File,
+}
+
+impl Probed {
+    fn is_file(&self) -> bool {
+        self.meta.is_file()
     }
+}
+
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(unix, not(target_os = "macos")))]
+const O_NOFOLLOW: i32 = 0o400000;
+
+/// Open `path` WITHOUT following a final symlink. On unix this is `O_NOFOLLOW` (a link fails with
+/// `ELOOP`/`EMLINK`, which is reported as "is a symlink"); elsewhere the plain open, which the
+/// caller's lstat-before / lstat-after bracket covers.
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new().read(true).open(path)
+    }
+}
+
+/// Probe `rel` under the worktree without ever following a link, and without an lstat-then-open
+/// window: `lstat` (a symlink is refused by name), open `O_NOFOLLOW`, `fstat` the OPENED descriptor
+/// and require a regular-file/directory that is the same device + inode the lstat saw. `Ok(None)`
+/// = absent; `Ok(Some(probed))` = the entry, with the descriptor the caller reads from (never the
+/// path again); `Err` = a symlink, an identity mismatch (something swapped the entry between the
+/// two syscalls), or an unreadable entry.
+fn probe(worktree: &Path, rel: &str) -> Result<Option<Probed>, String> {
+    let p = worktree.join(rel);
+    let lstat = match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err(format!(
+                "`{rel}` is a symlink (the floor never follows links out of the worktree)"
+            ))
+        }
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("`{rel}` could not be inspected: {e}")),
+    };
+    let file = match open_nofollow(&p) {
+        Ok(f) => f,
+        Err(e) => {
+            // `O_NOFOLLOW` on a link: ELOOP (Linux) / EMLINK (macOS, "Too many links").
+            let raw = e.raw_os_error();
+            if raw == Some(40) || raw == Some(31) || raw == Some(62) {
+                return Err(format!(
+                    "`{rel}` became a symlink between inspection and open (refused)"
+                ));
+            }
+            return Err(format!("`{rel}` could not be opened: {e}"));
+        }
+    };
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("`{rel}` could not be fstat'ed after open: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.dev() != lstat.dev() || meta.ino() != lstat.ino() {
+            return Err(format!(
+                "`{rel}` changed identity between inspection and open (refused — something \\
+                 swapped the entry)"
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No O_NOFOLLOW: re-lstat after the open and require the entry is still not a link.
+        match std::fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!(
+                    "`{rel}` became a symlink between inspection and open (refused)"
+                ))
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("`{rel}` vanished after open: {e}")),
+        }
+        let _ = &lstat;
+    }
+    if meta.file_type().is_symlink() {
+        return Err(format!("`{rel}` is a symlink (refused)"));
+    }
+    Ok(Some(Probed { meta, file }))
 }
 
 /// Which package manager a Node repo uses, read off its lockfile (npm when none says otherwise).
@@ -301,11 +406,15 @@ fn s(v: &[&str]) -> Vec<String> {
 /// `Err` when a manifest exists but cannot be trusted (unreadable, malformed, a symlink).
 pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
     let mut out = Vec::new();
-    if let Some(meta) = probe(worktree, "package.json")? {
-        if !meta.is_file() {
+    if let Some(mut probed) = probe(worktree, "package.json")? {
+        if !probed.is_file() {
             return Err("`package.json` is not a regular file".to_string());
         }
-        let raw = std::fs::read_to_string(worktree.join("package.json"))
+        // Read from the descriptor the probe opened — never the path again.
+        let mut raw = String::new();
+        probed
+            .file
+            .read_to_string(&mut raw)
             .map_err(|e| format!("`package.json` could not be read: {e}"))?;
         let json: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("`package.json` is not valid JSON: {e}"))?;
@@ -336,11 +445,15 @@ pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
                         s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
                         "package-lock.json (node_modules absent)",
                     ),
+                    // No lockfile: `--no-package-lock`, or npm would write one into the reviewed
+                    // tree and the worktree guard's final comparison would (correctly) deny it
+                    // (Copilot on #414).
                     _ => (
                         s(&[
                             "npm",
                             "install",
                             "--ignore-scripts",
+                            "--no-package-lock",
                             "--no-audit",
                             "--no-fund",
                         ]),
@@ -362,8 +475,8 @@ pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
             }
         }
     }
-    if let Some(meta) = probe(worktree, "Cargo.toml")? {
-        if !meta.is_file() {
+    if let Some(probed) = probe(worktree, "Cargo.toml")? {
+        if !probed.is_file() {
             return Err("`Cargo.toml` is not a regular file".to_string());
         }
         out.push(RepoCheck {
@@ -390,6 +503,7 @@ impl CheckScratch {
             "home",
             "npm-cache",
             "cargo-home",
+            "cargo-target",
             "xdg-config",
             "xdg-cache",
             "tmp",
@@ -420,6 +534,10 @@ impl CheckScratch {
             .env("npm_config_fund", "false")
             .env("npm_config_audit", "false")
             .env("CARGO_HOME", self.root.join("cargo-home"))
+            // Build artifacts go under the scratch, not `./target`: a repo that does not ignore
+            // `target/` would otherwise fail the worktree guard's final comparison on a PASSING
+            // `cargo test` (Copilot on #414).
+            .env("CARGO_TARGET_DIR", self.root.join("cargo-target"))
             .env("CI", "1")
             .env("NO_COLOR", "1")
             .env("FORCE_COLOR", "0");
@@ -438,11 +556,35 @@ impl CheckScratch {
 }
 
 /// Detect and run the checks in `worktree`, stopping at the first failure. Fail-closed on a
-/// detection error (see the module doc).
+/// detection error and when no OS write boundary can be armed (see the module doc).
 pub fn run(worktree: &Path) -> RepoChecksReport {
     let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+    run_with_sandbox(worktree, sandbox)
+}
+
+/// [`run`] against an explicit sandbox probe — the injectable seam, so the fail-closed branch is
+/// testable on a host that HAS a sandbox tool by handing it a best-effort probe.
+pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoChecksReport {
     let sandbox_level = sandbox.level.as_wire().to_string();
     let sandbox_note = sandbox.downgrade_reason.clone();
+    if sandbox.level != crate::validator::SandboxLevel::Sandboxed || sandbox.wrapper.is_empty() {
+        // NEVER run repo-controlled scripts unsandboxed (codex review on #414): the floor fails
+        // with the probe's own reason, and the gate turns that into a denial the operator can act
+        // on. Detection is still reported so the record says what WOULD have run.
+        return RepoChecksReport {
+            detected: detect(worktree).unwrap_or_default(),
+            checks: Vec::new(),
+            skipped: Vec::new(),
+            passed: false,
+            detect_error: None,
+            sandbox_level,
+            sandbox_note: sandbox_note.clone(),
+            sandbox_error: Some(format!(
+                "no OS write boundary could be armed for the checks ({})",
+                sandbox_note.unwrap_or_else(|| "no OS-sandbox tool on PATH".to_string())
+            )),
+        };
+    }
     let detected = match detect(worktree) {
         Ok(d) => d,
         Err(e) => {
@@ -454,6 +596,7 @@ pub fn run(worktree: &Path) -> RepoChecksReport {
                 detect_error: Some(e),
                 sandbox_level,
                 sandbox_note,
+                sandbox_error: None,
             }
         }
     };
@@ -472,6 +615,7 @@ pub fn run(worktree: &Path) -> RepoChecksReport {
                 )),
                 sandbox_level,
                 sandbox_note,
+                sandbox_error: None,
             }
         }
     };
@@ -495,6 +639,7 @@ pub fn run(worktree: &Path) -> RepoChecksReport {
         detect_error: None,
         sandbox_level,
         sandbox_note,
+        sandbox_error: None,
     }
 }
 
@@ -623,6 +768,7 @@ pub(crate) fn run_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::validator::SandboxLevel;
 
     fn scratch(name: &str) -> PathBuf {
@@ -667,6 +813,19 @@ mod tests {
             "install first (lockfile ⇒ ci, lifecycle scripts NEVER run), then typecheck/lint/test \
              in that order, only those present"
         );
+        // No lockfile ⇒ an `npm install` that writes NO lockfile into the reviewed tree.
+        std::fs::remove_file(wt.join("package-lock.json")).unwrap();
+        assert_eq!(
+            detect(&wt).unwrap()[0].argv,
+            s(&[
+                "npm",
+                "install",
+                "--ignore-scripts",
+                "--no-package-lock",
+                "--no-audit",
+                "--no-fund"
+            ])
+        );
         // node_modules present ⇒ no install step.
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
         assert_eq!(
@@ -698,8 +857,15 @@ mod tests {
         let empty = scratch("detect-empty");
         assert!(detect(&empty).unwrap().is_empty());
         let report = run(&empty);
-        assert!(report.passed && report.checks.is_empty() && report.detect_error.is_none());
-        assert!(report.summary().contains("no repository checks detected"));
+        if report.sandbox_error.is_none() {
+            assert!(report.passed && report.checks.is_empty() && report.detect_error.is_none());
+            assert!(report.summary().contains("no repository checks detected"));
+        } else {
+            assert!(
+                !report.passed,
+                "no boundary ⇒ fail-closed even with nothing to run"
+            );
+        }
         assert!(
             !report.sandbox_level.is_empty(),
             "the containment level is always disclosed"
@@ -715,7 +881,14 @@ mod tests {
         std::fs::write(wt.join("package.json"), "not a manifest").unwrap();
         let err = detect(&wt).expect_err("malformed package.json must not read as no checks");
         assert!(err.contains("not valid JSON"), "{err}");
-        let report = run(&wt);
+        let report = run_with_sandbox(
+            &wt,
+            WorkerSandbox {
+                wrapper: vec!["true".to_string()],
+                level: SandboxLevel::Sandboxed,
+                downgrade_reason: None,
+            },
+        );
         assert!(!report.passed && report.checks.is_empty());
         assert!(
             report.denial_reason().contains("not valid JSON")
@@ -782,6 +955,12 @@ mod tests {
             !report.passed,
             "a failing test must fail the floor: {report:?}"
         );
+        if report.sandbox_error.is_some() {
+            eprintln!(
+                "repo_checks: no sandbox tool here — the floor failed closed instead of running"
+            );
+            return;
+        }
         let c = &report.checks[0];
         assert_eq!(c.name, "cargo-test");
         assert!(
@@ -802,12 +981,20 @@ mod tests {
             denial.contains("cargo-test: exit") && denial.contains(CRITERION),
             "the denial names the check and the criterion: {denial}"
         );
-        // The isolated homes exist under the engine scratch, never elsewhere.
-        assert!(wt
+        // The isolated homes AND the build artifacts live under the engine scratch, never in the
+        // reviewed tree (Copilot on #414: `./target` would trip the worktree guard).
+        let scratch = wt
             .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-            .join(SCRATCH_SUBDIR)
-            .join("cargo-home")
-            .is_dir());
+            .join(SCRATCH_SUBDIR);
+        assert!(scratch.join("cargo-home").is_dir());
+        assert!(
+            scratch.join("cargo-target").join("debug").is_dir(),
+            "cargo built into the scratch target dir"
+        );
+        assert!(
+            !wt.join("target").exists(),
+            "no ./target in the reviewed tree"
+        );
     }
 
     /// The brief's literal case — a failing `npm test`. Runs where npm is on PATH (every hosted
@@ -829,6 +1016,12 @@ mod tests {
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
         let report = run(&wt);
         assert!(!report.passed, "{report:?}");
+        if report.sandbox_error.is_some() {
+            eprintln!(
+                "repo_checks: no sandbox tool here — the floor failed closed instead of running"
+            );
+            return;
+        }
         let c = &report.checks[0];
         assert_eq!(c.name, "test");
         assert_eq!(c.argv, s(&["npm", "run", "test"]));
@@ -842,10 +1035,56 @@ mod tests {
         assert!(c.stdout_tail.contains("NPM BOOM"), "{}", c.stdout_tail);
     }
 
-    /// Codex review on #414: a check is repo-controlled code and runs INSIDE the OS write boundary —
-    /// a script that writes outside the worktree fails, and the write never lands. Exercised
-    /// wherever the host has a write-containing sandbox tool (`sandbox-exec` / `bwrap`); a host
-    /// without one is the disclosed best-effort floor and is not a kernel claim to test.
+    /// Codex review on #414: a check is repo-controlled code and NEVER runs without an OS write
+    /// boundary. Deterministic by injection: a best-effort probe (what a host with no
+    /// `sandbox-exec`/`bwrap` yields) makes the floor FAIL with the reason, and nothing runs —
+    /// even a check that would have passed.
+    #[test]
+    fn without_a_write_boundary_the_floor_fails_closed_and_runs_nothing() {
+        let wt = scratch("no-boundary");
+        std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        let probe_marker = wt.join("ran.txt");
+        let no_boundary = WorkerSandbox {
+            wrapper: Vec::new(),
+            level: SandboxLevel::BestEffort,
+            downgrade_reason: Some("no OS-sandbox tool on PATH".to_string()),
+        };
+        let report = run_with_sandbox(&wt, no_boundary);
+        assert!(!report.passed, "{report:?}");
+        assert!(
+            report.checks.is_empty(),
+            "nothing may run unsandboxed: {report:?}"
+        );
+        assert_eq!(report.sandbox_level, "best-effort");
+        assert!(
+            report.sandbox_error.as_deref().is_some_and(
+                |e| e.contains("no OS write boundary") && e.contains("no OS-sandbox tool")
+            ),
+            "{report:?}"
+        );
+        assert_eq!(
+            report
+                .detected
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cargo-test"],
+            "what WOULD have run is still on the record"
+        );
+        let denial = report.denial_reason();
+        assert!(
+            denial.contains("NOT run")
+                && denial.contains("fail-closed")
+                && denial.contains(CRITERION),
+            "{denial}"
+        );
+        assert!(!probe_marker.exists());
+    }
+
+    /// The boundary itself, where the host has one: a check script that writes outside the
+    /// worktree fails the floor and the write never lands; the operator's real HOME is not the
+    /// check's HOME. On a host without a sandbox tool this asserts the fail-closed path instead
+    /// (never a skip that reads as a pass).
     #[cfg(unix)]
     #[test]
     fn a_check_that_writes_outside_the_worktree_fails_the_floor() {
@@ -856,16 +1095,17 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let sandbox = sandbox_for(&wt);
         if sandbox.level != SandboxLevel::Sandboxed {
-            eprintln!(
-                "repo_checks: no write-containing sandbox on this host ({}) — containment cannot \
-                 be exercised here",
-                sandbox.downgrade_reason.as_deref().unwrap_or("?")
+            // No tool here: the floor must FAIL, not run. Assert that and stop.
+            let report = run(&wt);
+            assert!(
+                !report.passed && report.sandbox_error.is_some(),
+                "{report:?}"
             );
             return;
         }
         let scratch = CheckScratch::prepare(&wt).unwrap();
         // Premise: an INSIDE write under the same wrapper works (bwrap present but unusable — no
-        // user namespaces — is an environmental skip, never a false kernel claim).
+        // user namespaces — is an environmental skip of the KERNEL claim only).
         let inside = RepoCheck {
             name: "test".into(),
             argv: s(&[
@@ -878,7 +1118,7 @@ mod tests {
             source: "fixture".into(),
         };
         if !run_one(&wt, &inside, &sandbox, &scratch).passed() {
-            eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping");
+            eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping the kernel claim");
             return;
         }
         let pwned = outside.join("pwned");
@@ -962,6 +1202,7 @@ mod tests {
             detect_error: None,
             sandbox_level: sandbox.level.as_wire().to_string(),
             sandbox_note: None,
+            sandbox_error: None,
         };
         let denial = report.denial_reason();
         assert!(

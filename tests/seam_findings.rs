@@ -114,6 +114,7 @@ const CONDGATE_WORKFLOW: &str = r#"{
             "kind": "test",
             "gate": {"human_confirm_if": "verdict_not_pass"},
             "verified_evidence": true,
+            "validator_pin": "e2e7af1db9e48454",
             "role": "evaluator",
             "depends_on": ["fix"]
         }

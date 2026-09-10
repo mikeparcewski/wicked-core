@@ -613,12 +613,9 @@ pub enum CoreEvent {
     /// (F-036) An `executes_code: false` phase — an evaluator, a recon rung, a review — CHANGED
     /// the worktree it was working in. Emitted at the gate fold when the engine's own before/after
     /// tree snapshots differ (`worktree_guard`), for EVERY seat and carrier, independent of the
-    /// CLI's governance adapter. `changed` are the paths that DENY the unit (source
-    /// `worktree_guard` on the same unit's `gateEvaluated.denial`); `exempted` are differing paths
-    /// an exemption covers (documentation, the phase's declared deliverables, engine scratch) —
-    /// disclosed, not denied. `headMoved` means the run branch was committed/amended/reset. Also
-    /// emitted when ONLY exempt paths changed (then `changed: []` and the gate is not denied on
-    /// this account), so an operator always sees what an evaluator wrote.
+    /// CLI's governance adapter. `changed` names EVERY differing path — each one denies (source
+    /// `worktree_guard` on the same unit's `gateEvaluated.denial`); there are no exemptions.
+    /// `headMoved` means the run branch was committed/amended/reset, which denies on its own.
     EvaluatorMutatedWorktree {
         session: String,
         ord: u32,
@@ -632,7 +629,6 @@ pub enum CoreEvent {
         after_tree: String,
         head_moved: bool,
         changed: Vec<crate::worktree_guard::ChangedPath>,
-        exempted: Vec<crate::worktree_guard::ChangedPath>,
     },
     /// (F-039) The engine ran the repository's OWN checks in the run's worktree for the def's
     /// code-verifying unit (`verified_evidence` with an `executes_code` Creator upstream) and
@@ -1513,7 +1509,6 @@ impl CoreEvent {
                 after_tree,
                 head_moved,
                 changed,
-                exempted,
             } => json!({
                 "type": "evaluatorMutatedWorktree",
                 "session": session,
@@ -1525,7 +1520,6 @@ impl CoreEvent {
                 "afterTree": after_tree,
                 "headMoved": head_moved,
                 "changed": changed.iter().map(changed_path_json).collect::<Vec<_>>(),
-                "exempted": exempted.iter().map(changed_path_json).collect::<Vec<_>>(),
             }),
             CoreEvent::RepoChecksEvaluated {
                 session,

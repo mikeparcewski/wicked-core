@@ -31,14 +31,16 @@ Two release tracks share this file, newest entry first regardless of track:
     on exit (the wrapped runner now spawns the seat in its own group and `killpg`s it when it
     exits, is cancelled or times out), the agent judge rendered, the repo checks run — immediately
     before the result is posted to the gate fold, so a delayed write from a backgrounded process or
-    a "passing" check script that edits a tracked file is caught too. Any non-exempt path that
-    differs, or a moved `HEAD`, DENIES the unit (deny-dominates, source `worktree_guard`, judged
-    BEFORE the pinned diff floor that would otherwise pass a rewritten tree) and emits the new
+    a "passing" check script that edits a tracked file is caught too. ANY path that differs, or
+    a moved `HEAD`, DENIES the unit (deny-dominates, source `worktree_guard`, judged BEFORE the
+    pinned diff floor that would otherwise pass a rewritten tree) and emits the new
     `evaluatorMutatedWorktree` event (`session, ord, attempt, cli, phase, beforeTree, afterTree,
-    headMoved, changed[{status,path}], exempted[…]`). The ONE exemption is the phase's own declared
-    `required_deliverables` (`domain-extraction/coverage` writes `coverage-report.json` at the
-    worktree root and its pinned validator reads it there) — disclosed on the event, never denied;
-    there is no documentation and no in-tree-graph exemption. Fail-closed: a guarded unit whose
+    headMoved, changed[{status,path}]`). There are NO exemptions — not documentation, not a
+    declared deliverable, not tool state: an evaluator's write-up belongs in its output, a phase
+    whose deliverable must live in the tree is a code phase (`domain-extraction/coverage` now
+    declares `executes_code: true` — it writes `coverage-report.json` for its pinned validator —
+    and is therefore never guarded), and an in-tree code graph moving under a recon phase is a
+    defect to surface (core#406). Fail-closed: a guarded unit whose
     outcome is missing or unverifiable is denied, never assumed clean. The guard denies; it does not
     revert — the denial names the paths, both tree ids and the one-line `git read-tree --reset -u
     <before>` restore. A human APPROVING a mutation-denied gate re-baselines the re-dispatch; a
@@ -47,8 +49,11 @@ Two release tracks share this file, newest entry first regardless of track:
   - **Read-only posture for no-code phases on non-claude seats** — ONE launch boundary for every
     argv-building carrier (`execute_wrapped::apply_no_code_posture`: the wrapped one-shot runner
     AND the persistent PTY session runner), applied to the template's own tokens and the seat's
-    resolved posture. Seats are recognised by registry key OR by the binary's normalised file stem
-    (`/opt/homebrew/bin/codex`, `codex.exe`, an alias key): codex runs `--sandbox read-only`
+    resolved posture. Seats are recognised SOLELY by the normalised file stem of the RESOLVED
+    binary — the template's argv[0] as an absolute path or looked up on `PATH`
+    (`/opt/homebrew/bin/codex`, `codex.exe`) — never by the seat's registry key, so a seat NAMED
+    `codex` that runs some other binary is unknown and its write grants are refused rather than
+    rewritten: codex runs `--sandbox read-only`
     (every sandbox spelling rewritten, the bypass and `--full-auto` dropped, one appended when none
     was declared); pi gets `--exclude-tools edit,write` (merged into an existing denylist). A
     lever-less seat whose template or posture carries ANY recognised write grant
@@ -59,21 +64,29 @@ Two release tracks share this file, newest entry first regardless of track:
     posture refused the launch: …`, naming the token, seat and clis.toml remedy); a lever-less seat
     with a bare posture runs, and the existing `governanceUnenforced` reason says the worktree
     guard — not the posture — is what holds the line. The governed carriers gain the matching
-    **NO-CODE phase scope**: `WICKED_NO_CODE_SCOPE` (+ `WICKED_NO_CODE_DELIVERABLES`) on the hook
-    subprocess, `BoundaryCtx::{no_code_scope, no_code_deliverables}` on the ACP carrier —
-    `Write`/`Edit`/`NotebookEdit` to anything but a declared deliverable is refused up front for
-    ANY `executes_code: false` phase (the pre-build scope keeps its documentation allowance; the
-    no-code scope has none, matching the guard).
+    **NO-CODE phase scope**: `WICKED_NO_CODE_SCOPE` on the hook subprocess,
+    `BoundaryCtx::no_code_scope` on the ACP carrier — `Write`/`Edit`/`NotebookEdit` to ANYTHING in
+    the worktree is refused up front for ANY `executes_code: false` phase (the pre-build scope
+    keeps its documentation allowance; the no-code scope permits nothing, matching the guard). The
+    persistent PTY session carrier never reuses a session across postures: an `executes_code:
+    false` phase reaching a creator-opened (write-posture) session closes it and opens a fresh
+    read-only one (and a code phase never inherits a read-only session), and a no-code phase's
+    session is closed — its whole process group `killpg`ed — the moment its turn ends, before the
+    guard's final snapshot, so a writer the seat backgrounded cannot land after the comparison.
   - **The code-writing Creator's gate evaluates something** (`bug/fix`, `feature/build`,
     `migration/execute` — compiled defs and the shipped `workflows/*.json`): each now pins the
     built-in evidence floor, so layer 1 re-derives the diff and layer 2 has a seat DISTINCT from
     the creator judge it. Registration REFUSES an `executes_code` agent phase with no
     `validator_pin` and no `human_confirm` gate — `WorkflowDefError::GateEvaluatesNothing`, "gate
     evaluates nothing: fix — … pin the built-in evidence floor (…), a phase-specific validator, or
-    gate the phase with human_confirm" — after `carry_shadowed_pins` and `enforce_verified_evidence`
-    have run, so a stale same-id overlay copy that dropped a shipped pin is repaired by the shadow
-    rule, and only a def that never had a gate is refused. `workflow::ungated_code_phases(&def)`
-    is the pure lint a consumer runs first. Tool phases are exempt (their exit code is their gate).
+    gate the phase with human_confirm" — and judges the def AS AUTHORED: `carry_shadowed_pins` and
+    `enforce_verified_evidence` are gone from the load path (nothing is injected or restored at
+    registration), so a same-id overlay copy that dropped a shipped pin is refused exactly like a
+    def that never had one and the registered built-in stands, and a `verified_evidence` phase
+    with no `validator_pin` is refused by name too (`WorkflowDefError::UnverifiedEvidence`,
+    "verified_evidence declared but nothing pinned: <phase>"). The shipped defs pin every gate
+    explicitly, in code and in `workflows/*.json`. `workflow::ungated_code_phases(&def)` is the
+    pure lint a consumer runs first. Tool phases are exempt (their exit code is their gate).
     **Coupling to note:** wicked-crew composes per-run defs (`feature-pr`, …) from a mirror of the
     shipped defs — a mirror without these pins is refused at registration until the crew release
     that carries them (wicked-crew#507) is deployed alongside this engine.
@@ -87,11 +100,16 @@ Two release tracks share this file, newest entry first regardless of track:
     repo-controlled code and run CONTAINED: inside the worker OS write boundary
     (`validator::detect_worker_sandbox` — macOS `sandbox-exec` / Linux `bwrap`, writes confined to
     the worktree, secret dirs unreadable, network open) with an isolated `HOME`, `npm_config_cache`,
-    `CARGO_HOME` and `XDG_*` under `<worktree>/tmp/wicked-checks/` (`RUSTUP_HOME` preserved); a
-    host without a sandbox tool runs with the env isolation alone and SAYS SO (`sandbox_level:
-    "best-effort"` + the reason on the report). Detection is fail-closed: an unreadable or malformed
-    `package.json`, or a symlinked manifest/lockfile/`node_modules` (probed with `lstat`, never
-    followed), FAILS the floor with the reason — only a repo with no manifest at all is a disclosed
+    `CARGO_HOME`, `CARGO_TARGET_DIR` and `XDG_*` under `<worktree>/tmp/wicked-checks/`
+    (`RUSTUP_HOME` preserved; `npm install --no-package-lock` when the repo ships no lockfile, so no
+    build artifact lands in the reviewed tree). A host where NO write boundary can be armed (no
+    `sandbox-exec`/`bwrap` — all of Windows) does NOT run the checks: the floor FAILS with
+    `sandbox_error` (+ `sandbox_level: "best-effort"` and the probe's reason) and the gate denies —
+    repo-controlled scripts never run unsandboxed. Detection is fail-closed: an unreadable or
+    malformed `package.json`, or a symlinked manifest/lockfile/`node_modules`, FAILS the floor with
+    the reason — every probe `lstat`s the entry, opens it `O_NOFOLLOW`, and `fstat`s the OPENED
+    descriptor (regular file, same device + inode) before a byte is read, so there is no
+    lstat-then-open window — only a repo with no manifest at all is a disclosed
     vacuous pass (`checks: []`, `passed: true`). Exit code, duration and 4 KiB stdout/stderr TAILS
     ride the new `repoChecksEvaluated` event (`session, ord, attempt, passed, criterion,
     checks[{name, argv, source, exitCode, timedOut, spawnError, durationMs, stdoutTail,
@@ -105,12 +123,18 @@ Two release tracks share this file, newest entry first regardless of track:
   Tests: an evaluator whose fake seat edits a file is denied with the path listed and the event
   emitted (real repo + worktree, through the actor); a PASSING `npm test` that appends to a tracked
   file is caught by the final comparison; a backgrounded writer dies with the seat's process group;
-  a code phase with no pin is refused at registration ("gate evaluates nothing: fix"); the floor
-  captures a failing `cargo test` (exit 101 + the assertion text in the tail) and a failing `npm
-  test` (exit 3); a check that writes outside the worktree fails the floor and never lands (where
-  the host has a sandbox tool); a malformed or symlinked manifest fails the floor by name; the
-  codex argv for a no-code phase is `--sandbox read-only` by key, alias and absolute path, on both
-  carriers; a write-capable lever-less seat is refused before launch on both carriers.
+  nothing is exempt — a documentation file, a declared deliverable and tool state all deny; a
+  code phase with no pin is refused at registration ("gate evaluates nothing: fix"), a same-id
+  drop-in that drops a shipped pin is refused and the built-in stands, `verified_evidence` without
+  a pin is refused; the floor captures a failing `cargo test` (exit 101 + the assertion text in
+  the tail) and a failing `npm test` (exit 3); a check that writes outside the worktree fails the
+  floor and never lands (where the host has a sandbox tool), and an injected best-effort probe
+  makes the floor fail closed and run NOTHING; a malformed or symlinked manifest fails the floor by
+  name; the codex argv for a no-code phase is `--sandbox read-only` by the RESOLVED binary's stem
+  (bare name on `PATH`, absolute path) — never by key, a `codex`-keyed seat on another binary is
+  refused — on both carriers; a write-capable lever-less seat is refused before launch on both
+  carriers; a creator's PTY session is never reused by the evaluator that follows (fresh read-only
+  session, closed with its process group when its turn ends — a backgrounded writer never lands).
   `wicked-core-ts` pins both new wire shapes and documents them in `CoreEventJson`; its
   `package-lock.json` now pins the five platform packages to the published 0.7.17 artifacts
   (`npm ci` on current npm refuses lock entries without a version — the types-test step).

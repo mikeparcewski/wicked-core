@@ -2724,7 +2724,6 @@ mod tests {
                 after_tree: s(),
                 head_moved: false,
                 changed: vec![],
-                exempted: vec![],
             },
             "evaluatorMutatedWorktree",
             &[
@@ -2738,7 +2737,6 @@ mod tests {
                 "afterTree",
                 "headMoved",
                 "changed",
-                "exempted",
             ],
         );
         check(

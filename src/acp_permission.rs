@@ -354,7 +354,6 @@ mod tests {
                 claude_config_dir: None,
                 pre_build_scope: false, // a build-phase unit: the FILESYSTEM boundary is what is on trial here
                 no_code_scope: false,
-                no_code_deliverables: Vec::new(),
             })
         };
 
@@ -459,7 +458,6 @@ mod tests {
                 claude_config_dir: None,
                 pre_build_scope,
                 no_code_scope: false,
-                no_code_deliverables: Vec::new(),
             })
         };
         // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.
