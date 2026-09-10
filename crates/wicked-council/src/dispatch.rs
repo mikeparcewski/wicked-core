@@ -1364,7 +1364,9 @@ mod failure_diagnostics_tests {
     }
 
     /// A fresh scratch dir for one env-mutating test (pid + nanos, so parallel binaries and a
-    /// crashed earlier run cannot collide).
+    /// crashed earlier run cannot collide). `#[cfg(unix)]` with its only users (the fake-CLI-on-PATH
+    /// tests), or the Windows clippy job fails on dead code.
+    #[cfg(unix)]
     fn f030_scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "wicked-council-f030-{tag}-{}-{}",
@@ -1406,7 +1408,8 @@ mod failure_diagnostics_tests {
         EnvPin::set("PATH", &path)
     }
 
-    /// The production registry seat for `key`, not a fixture.
+    /// The production registry seat for `key`, not a fixture. Unix-only users (see above).
+    #[cfg(unix)]
     fn registry_seat(key: &str) -> AgenticCli {
         crate::registry::builtin()
             .into_iter()

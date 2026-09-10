@@ -641,10 +641,12 @@ impl SeatFailureReason {
         }
     }
 
-    /// Classify a failed seat's output. Case-insensitive substring match over BOTH streams —
+    /// Classify a failed seat's output. ASCII-case-insensitive substring match over BOTH streams —
     /// claude prints its refusal on STDOUT (`Not logged in · Please run /login`, exit 1, stderr
     /// empty), other CLIs on stderr. Deliberately narrow: an unrecognised failure stays
-    /// unclassified rather than mislabelled.
+    /// unclassified rather than mislabelled. Scans each stream in place — no combined or
+    /// lowercased copy — because it runs over the UNTRUNCATED output of `wait_with_output`, which
+    /// a pathological seat can make large (Copilot, PR#413).
     pub fn classify(stdout: &str, stderr: &str) -> Option<Self> {
         const NOT_LOGGED_IN: &[&str] = &[
             "not logged in",
@@ -659,12 +661,30 @@ impl SeatFailureReason {
             "login required",
             "not signed in",
         ];
-        let haystack = format!("{stdout}\n{stderr}").to_lowercase();
-        NOT_LOGGED_IN
+        [stdout, stderr]
             .iter()
-            .any(|sig| haystack.contains(sig))
+            .any(|stream| {
+                NOT_LOGGED_IN
+                    .iter()
+                    .any(|sig| contains_ignore_ascii_case(stream, sig))
+            })
             .then_some(SeatFailureReason::NotLoggedIn)
     }
+}
+
+/// `haystack.to_lowercase().contains(needle)` for an ASCII-lowercase `needle`, without the copy:
+/// a byte-window scan with `eq_ignore_ascii_case`. Non-ASCII bytes in the haystack never equal an
+/// ASCII needle byte, so UTF-8 multi-byte sequences simply fail to match — no boundary handling
+/// needed.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// The captured diagnostics for one seat that failed to vote.
