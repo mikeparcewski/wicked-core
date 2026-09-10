@@ -1105,8 +1105,15 @@ impl Core {
     }
 
     /// A run's recorded event history, oldest first, as a JSON array. Each entry is the SAME tagged
-    /// object the `/ws` stream carries ([`CoreEvent::to_json`]) plus a capture-time `ts` (epoch millis)
-    /// and an ordering `seq`.
+    /// object the `/ws` stream carries ([`CoreEvent::to_json`]) plus the durable log's envelope — a
+    /// capture-time `ts` (epoch millis) and an ordering `seq`; `RecordedEventJson` is the shape.
+    ///
+    /// Ordering contract (wicked-core#408): `seq` is strictly increasing within a run for the run's
+    /// whole life, ACROSS daemon restarts — the engine continues a run's `seq` from its persisted
+    /// log rather than from 0 — so the array is in emission order and its last entry is the run's
+    /// latest event. The first entry a restarted engine records for a run carries
+    /// `daemonRestarted: true` (absent everywhere else). `ts` may repeat within a burst; never order
+    /// by it.
     ///
     /// The read half of FINDING-014: an evidence bundle assembled after a run must read what actually
     /// happened rather than re-derive pseudo-events from unit records, which cannot recover what it

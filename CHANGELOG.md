@@ -678,6 +678,25 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Event `seq` stays monotonic across daemon restarts (core#408, F-035).** The durable per-run
+  event log stamped `seq` from a process-wide counter that started at 0 with every daemon, so a run
+  resumed after a restart recorded its new events with `seq` 0, 1, … while its history already held
+  0–294 — and `GET /runs/:id/events`, which sorted by `seq`, returned the new events BEFORE the old
+  ones. Every consumer taking the tail as "latest" (the studio now-bar, crew's relays, the
+  acceptance poller) read the pre-restart `awaitingHuman` as current while the run had moved on.
+  The first record a process writes for a run now continues from the largest `seq` already in that
+  run's log (raised into the counter with `fetch_max` so other in-flight runs stay monotonic too),
+  with the first-touch check, the seed, the stamp and the enqueue under one lock so concurrent
+  callers cannot slip below the history; `seq` is therefore strictly increasing within a run for the
+  run's whole life. That first post-restart record also carries `daemonRestarted: true`
+  (envelope-only, like `ts`/`seq`; absent everywhere else) so a consumer can see the boundary
+  instead of inferring it. The reader no longer sorts: for the append-only single-writer log, file
+  order IS emission order, so a log a pre-fix engine wrote across a restart — a repeated or a gapped
+  second `seq` run — reads back exactly as emitted instead of interleaved. Proven across a REAL
+  process boundary: the e2e re-executes the test binary as the "restarted daemon", which approves
+  the gate and finishes the run. core-ts: `runEvents` states the contract and the hand-authored
+  `index.d.ts` gains `RecordedEventJson` (`ts`, `seq`, `daemonRestarted?: true`) with compile-time
+  assertions in `types-test/`.
 - **Council ballots run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (F-030;
   F-031, F-013).** `wicked-council`'s ballot spawn inherited whatever `CLAUDE_CONFIG_DIR` the daemon
   was started with (`hardened()` strips only `WICKED_*`): on a fresh install that is the

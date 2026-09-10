@@ -240,8 +240,15 @@ export declare class Core {
   unitTranscript(unitId: string): Promise<string>
   /**
    * A run's recorded event history, oldest first, as a JSON array. Each entry is the SAME tagged
-   * object the `/ws` stream carries ([`CoreEvent::to_json`]) plus a capture-time `ts` (epoch millis)
-   * and an ordering `seq`.
+   * object the `/ws` stream carries ([`CoreEvent::to_json`]) plus the durable log's envelope — a
+   * capture-time `ts` (epoch millis) and an ordering `seq`; `RecordedEventJson` is the shape.
+   *
+   * Ordering contract (wicked-core#408): `seq` is strictly increasing within a run for the run's
+   * whole life, ACROSS daemon restarts — the engine continues a run's `seq` from its persisted
+   * log rather than from 0 — so the array is in emission order and its last entry is the run's
+   * latest event. The first entry a restarted engine records for a run carries
+   * `daemonRestarted: true` (absent everywhere else). `ts` may repeat within a burst; never order
+   * by it.
    *
    * The read half of FINDING-014: an evidence bundle assembled after a run must read what actually
    * happened rather than re-derive pseudo-events from unit records, which cannot recover what it
@@ -654,5 +661,27 @@ export interface UnitDistributedEventJson extends CoreEventJson {
    * `routingMethod` and its fields read exactly as before.
    */
   seatConstraint: string | null
+}
+
+/**
+ * One entry of the JSON array {@link Core.runEvents} resolves: the `/ws` frame ({@link CoreEventJson})
+ * plus the durable log's envelope. Ordering contract (wicked-core#408): `seq` is strictly increasing
+ * within a run for the run's WHOLE life — across daemon restarts, not just within one process — so
+ * the array is in emission order and its last entry is the run's latest event. `ts` is capture time
+ * (epoch millis) and may repeat within a burst; never order by it. The first entry a restarted
+ * engine records for a run carries `daemonRestarted: true` (absent everywhere else), marking the
+ * boundary for consumers that keep per-run state across the gap. All three are envelope-only: the
+ * live `/ws` frame carries none of them.
+ */
+export interface RecordedEventJson extends CoreEventJson {
+  /** Capture-time epoch millis. May repeat within a burst — not an order. */
+  ts: number
+  /**
+   * Strictly increasing within the run, across daemon restarts. NOT the per-terminal `seq` of
+   * `terminalOutput` frames — those are streaming chunks and are never recorded.
+   */
+  seq: number
+  /** Present, and `true`, only on the first entry a restarted engine recorded for this run. */
+  daemonRestarted?: true
 }
 // ─── end hand-authored ───
