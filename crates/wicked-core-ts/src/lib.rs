@@ -1953,6 +1953,127 @@ mod tests {
         assert_eq!(got, want, "key set drift for {expected_type}");
     }
 
+    /// The hand-authored TypeScript contract lives in `scripts/finalize-dts.mjs` and is what
+    /// `index.d.ts` ships (the script re-appends it between sentinels after `napi build`): the two
+    /// must hold the SAME block, and the `UnitDistributedEventJson` declaration must name EVERY
+    /// key `event_to_json` emits for `unitDistributed` — `seatConstraint: string | null` included
+    /// (core#401, #402 review pass 2). The compile-time assertions over the declaration live in
+    /// `types-test/` (`npm run typecheck`); this pins the lockstep on cargo alone, which CI runs.
+    #[test]
+    fn hand_authored_dts_is_in_lockstep_and_declares_every_unit_distributed_key() {
+        let (from_mjs, from_dts) = hand_authored_blocks(
+            include_str!("../scripts/finalize-dts.mjs"),
+            include_str!("../index.d.ts"),
+        );
+        assert_eq!(
+            from_mjs.trim(),
+            from_dts.trim(),
+            "index.d.ts drifted from finalize-dts.mjs — rerun `node scripts/finalize-dts.mjs`"
+        );
+        assert_unit_distributed_declared(&from_dts);
+    }
+
+    /// A checkout with `core.autocrlf` (the Windows CI runner, #402 review pass 3) hands
+    /// `include_str!` CRLF content: the line-anchored extraction must read it exactly as LF —
+    /// same blocks, no `\r` left to defeat a `\n`-anchored match — and the declaration checks
+    /// must still pass over it. (`.gitattributes` pins these files to LF as well; this makes the
+    /// test independent of that.)
+    #[test]
+    fn the_lockstep_check_reads_a_crlf_checkout_the_same_as_lf() {
+        let mjs = include_str!("../scripts/finalize-dts.mjs");
+        let dts = include_str!("../index.d.ts");
+        let (lf_mjs, lf_dts) = hand_authored_blocks(mjs, dts);
+        let crlf = |s: &str| s.replace("\r\n", "\n").replace('\n', "\r\n");
+        let (crlf_mjs, crlf_dts) = hand_authored_blocks(&crlf(mjs), &crlf(dts));
+        assert!(
+            crlf(mjs).contains("${BEGIN}\r\n"),
+            "the CRLF copy really does break the LF-anchored opener"
+        );
+        assert_eq!(crlf_mjs, lf_mjs, "CRLF script reads as LF");
+        assert_eq!(crlf_dts, lf_dts, "CRLF index.d.ts reads as LF");
+        assert!(!crlf_dts.contains('\r') && !crlf_mjs.contains('\r'));
+        assert_unit_distributed_declared(&crlf_dts);
+    }
+
+    /// The hand-authored block as the script declares it (`HAND_AUTHORED`, a template literal
+    /// opened with `${BEGIN}` and closed with `${END}`, backticks escaped as \`) and as
+    /// `index.d.ts` ships it (between the two sentinel lines) — both normalized to LF first, so a
+    /// CRLF checkout compares equal to an LF one.
+    fn hand_authored_blocks(mjs: &str, dts: &str) -> (String, String) {
+        let mjs = mjs.replace("\r\n", "\n");
+        let dts = dts.replace("\r\n", "\n");
+        const BEGIN: &str =
+            "// ─── hand-authored (not napi-generated): see scripts/finalize-dts.mjs ───";
+        const END: &str = "// ─── end hand-authored ───";
+        let mjs_open = "const HAND_AUTHORED = `${BEGIN}\n";
+        let start = mjs
+            .find(mjs_open)
+            .expect("finalize-dts.mjs declares HAND_AUTHORED")
+            + mjs_open.len();
+        let end = mjs[start..]
+            .find("${END}")
+            .expect("HAND_AUTHORED closes with ${END}")
+            + start;
+        let from_mjs = mjs[start..end].replace("\\`", "`");
+        let dts_start = dts
+            .find(BEGIN)
+            .expect("index.d.ts carries the hand-authored block")
+            + BEGIN.len();
+        let dts_end = dts[dts_start..]
+            .find(END)
+            .expect("index.d.ts closes the block")
+            + dts_start;
+        (from_mjs, dts[dts_start..dts_end].to_string())
+    }
+
+    /// `UnitDistributedEventJson` in the shipped block names EVERY key `event_to_json` emits for
+    /// `unitDistributed`, with the literal tag, `seatConstraint: string | null` and the four
+    /// routing methods `pipeline::apply_distributions` emits.
+    fn assert_unit_distributed_declared(from_dts: &str) {
+        let iface_start = from_dts
+            .find("export interface UnitDistributedEventJson extends CoreEventJson {")
+            .expect("unitDistributed is declared as a named, discriminated shape");
+        let iface_end = from_dts[iface_start..]
+            .find("\n}")
+            .expect("interface closes")
+            + iface_start;
+        // Inclusive of the newline before `}`, so the LAST declared line is `\n  key: type\n`
+        // like every other and the line-anchored checks below cannot miss it.
+        let iface = &from_dts[iface_start..=iface_end];
+        let emitted = event_to_json(&CoreEvent::UnitDistributed {
+            session: "s".into(),
+            ord: 1,
+            cli: "claude".into(),
+            routing_method: "council".into(),
+            agreement_pct: None,
+            returned: None,
+            seated: None,
+            dissent: None,
+            degraded_reason: None,
+            seat_constraint: None,
+        });
+        for key in emitted.as_object().expect("object").keys() {
+            assert!(
+                iface.contains(&format!("\n  {key}:")),
+                "`{key}` is emitted on the wire but not declared on UnitDistributedEventJson"
+            );
+        }
+        assert!(
+            iface.contains("\n  type: 'unitDistributed'\n"),
+            "literal tag: {iface}"
+        );
+        assert!(
+            iface.contains("\n  seatConstraint: string | null\n"),
+            "seatConstraint is a real `string | null` property: {iface}"
+        );
+        for method in ["'council'", "'degraded'", "'evaluator_distinct'", "'tool'"] {
+            assert!(
+                iface.contains(method),
+                "routingMethod names {method} (pipeline::apply_distributions emits it)"
+            );
+        }
+    }
+
     /// Pin EVERY mapped `CoreEvent` variant's tag (camelCase) + exact key set. Because `CoreEvent` is
     /// `#[non_exhaustive]`, a NEW variant no longer breaks the build (the defensive `_` arm catches
     /// it) — so this test is the tripwire: a new variant with no explicit arm falls through to
@@ -2062,6 +2183,7 @@ mod tests {
                 seated: None,
                 dissent: None,
                 degraded_reason: None,
+                seat_constraint: None,
             },
             "unitDistributed",
             &[
@@ -2078,6 +2200,10 @@ mod tests {
                 "seated",
                 "dissent",
                 "degradedReason",
+                // WHY the candidate seats were narrowed before the council voted (core#401) —
+                // the unit's skill is Claude-only in the handed snapshot. Additive; emitted
+                // unconditionally (null when unconstrained), the `degradedReason` rule.
+                "seatConstraint",
             ],
         );
         check(

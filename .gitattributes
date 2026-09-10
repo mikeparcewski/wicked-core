@@ -1,0 +1,7 @@
+# The wicked-core-ts binding's hand-authored TypeScript contract is compared byte-for-byte on every
+# CI OS (`scripts/finalize-dts.mjs` ↔ the block it appends to `index.d.ts`, pinned by the crate's
+# lockstep test) and type-checked over the committed `index.d.ts`. A CRLF checkout (Windows
+# `core.autocrlf`) must not change what those files contain, so they are LF everywhere.
+crates/wicked-core-ts/*.d.ts text eol=lf
+crates/wicked-core-ts/scripts/*.mjs text eol=lf
+crates/wicked-core-ts/types-test/** text eol=lf

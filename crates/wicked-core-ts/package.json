@@ -39,7 +39,8 @@
     "smoke:lifecycle": "node smoke-lifecycle.mjs",
     "smoke:terminal": "node smoke-terminal.mjs",
     "smoke:evals": "node smoke-evals.mjs",
-    "smoke:all": "node smoke.mjs && node smoke-lifecycle.mjs && node smoke-terminal.mjs && node smoke-evals.mjs"
+    "smoke:all": "node smoke.mjs && node smoke-lifecycle.mjs && node smoke-terminal.mjs && node smoke-evals.mjs",
+    "typecheck": "tsc --noEmit -p types-test/tsconfig.json"
   },
   "optionalDependencies": {
     "wicked-core-ts-darwin-x64": "0.7.16",
@@ -49,6 +50,7 @@
     "wicked-core-ts-win32-x64-msvc": "0.7.16"
   },
   "devDependencies": {
-    "@napi-rs/cli": "^2.18.4"
+    "@napi-rs/cli": "^2.18.4",
+    "typescript": "~6.0.2"
   }
 }
