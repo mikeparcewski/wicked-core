@@ -254,15 +254,28 @@ fn parse_name_status_z(raw: &[u8]) -> Vec<ChangedPath> {
 
 /// Re-snapshot `worktree` and compare it with `before`. `Ok(None)` when nothing changed;
 /// `Ok(Some(mutation))` otherwise — and a mutation always denies: every differing path is named,
-/// none is exempt.
-pub fn compare(
+/// none is exempt. The production path is [`compare_with_after`] (via `outcome_for_unit`), which
+/// also keeps the after snapshot; this is the tests' view of the same comparison.
+#[cfg(test)]
+pub(crate) fn compare(
     worktree: &Path,
     before: &WorktreeSnapshot,
 ) -> anyhow::Result<Option<WorktreeMutation>> {
+    compare_with_after(worktree, before).map(|(_, m)| m)
+}
+
+/// [`compare`], also handing back the AFTER snapshot the comparison was made against — so a clean
+/// outcome carries the snapshot that was actually taken (its own tree id and `taken_at_ms`), not a
+/// copy of the baseline (Copilot on #414: an "after" stamped with the baseline's time misreads on
+/// the bus and in the logs).
+fn compare_with_after(
+    worktree: &Path,
+    before: &WorktreeSnapshot,
+) -> anyhow::Result<(WorktreeSnapshot, Option<WorktreeMutation>)> {
     let after = snapshot(worktree)?;
     let head_moved = after.head != before.head;
     if after.tree == before.tree && !head_moved {
-        return Ok(None);
+        return Ok((after, None));
     }
     let changed = if after.tree == before.tree {
         Vec::new()
@@ -281,12 +294,15 @@ pub fn compare(
             &[],
         )?)
     };
-    Ok(Some(WorktreeMutation {
-        before: before.clone(),
-        after,
-        changed,
-        head_moved,
-    }))
+    Ok((
+        after.clone(),
+        Some(WorktreeMutation {
+            before: before.clone(),
+            after,
+            changed,
+            head_moved,
+        }),
+    ))
 }
 
 /// Run the guard for one finished unit: the worker-thread half. `None` when the unit is not
@@ -308,11 +324,11 @@ pub(crate) fn outcome_for_unit(
                 .to_string(),
         ));
     };
-    match compare(wd, before) {
-        Ok(Some(m)) => Some(WorktreeGuardOutcome::Mutated(m)),
-        Ok(None) => Some(WorktreeGuardOutcome::Clean {
+    match compare_with_after(wd, before) {
+        Ok((_, Some(m))) => Some(WorktreeGuardOutcome::Mutated(m)),
+        Ok((after, None)) => Some(WorktreeGuardOutcome::Clean {
             before: before.clone(),
-            after: before.clone(),
+            after,
         }),
         Err(e) => Some(WorktreeGuardOutcome::Unverifiable(e.to_string())),
     }
@@ -515,6 +531,35 @@ mod tests {
             compare(&wt, &before).unwrap().is_none(),
             "gitignored artifacts and the engine scratch are not a mutation"
         );
+    }
+
+    /// Copilot on #414: a CLEAN outcome's `after` is the snapshot that was actually taken at the
+    /// comparison — same tree and HEAD as the baseline, but its own `taken_at_ms` — never a copy of
+    /// the baseline dressed up as an after.
+    #[test]
+    fn a_clean_outcome_carries_the_real_after_snapshot_not_a_copy_of_the_baseline() {
+        let wt = creator_worktree("clean-after");
+        let before = snapshot(&wt).unwrap();
+        let mut unit = guarded_unit();
+        unit.worktree_baseline = Some(before.clone());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        match outcome_for_unit(&unit, Some(&wt)) {
+            Some(WorktreeGuardOutcome::Clean {
+                before: b,
+                after: a,
+            }) => {
+                assert_eq!(b, before);
+                assert_eq!(a.tree, before.tree);
+                assert_eq!(a.head, before.head);
+                assert!(
+                    a.taken_at_ms > before.taken_at_ms,
+                    "the after snapshot was taken later: {} vs {}",
+                    a.taken_at_ms,
+                    before.taken_at_ms
+                );
+            }
+            other => panic!("expected Clean, got {other:?}"),
+        }
     }
 
     #[test]

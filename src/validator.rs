@@ -807,6 +807,44 @@ pub(crate) fn reap_bounded(child: &mut std::process::Child) {
     }
 }
 
+/// Has `child` exited — observed WITHOUT reaping it (Copilot on #414)? A reaped pid is free for
+/// reuse, and the process group id we `killpg` is that same pid, so "reap, then kill the group"
+/// could land the kill on a stranger. On unix this is `waitid(P_PID, …, WEXITED | WNOHANG |
+/// WNOWAIT)`: the exited child stays a zombie — its pid and therefore its group id stay reserved —
+/// until the caller `wait()`s, which is what makes a group kill between the two calls safe.
+/// `Ok(true)` = exited (the status is collected by the caller's `wait()`, immediate on a zombie),
+/// `Ok(false)` = still running. Non-unix has no WNOWAIT and no process groups: `try_wait` there
+/// (the status is cached, so the caller's `wait()` still returns it).
+pub(crate) fn has_exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        // Safe: a zeroed siginfo_t is a valid out-parameter for waitid; we read only si_pid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // With WNOHANG and no state change, waitid returns 0 and leaves si_pid == 0.
+        #[cfg(target_os = "linux")]
+        let exited_pid = unsafe { info.si_pid() };
+        #[cfg(not(target_os = "linux"))]
+        let exited_pid = info.si_pid;
+        Ok(exited_pid == pid)
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|s| s.is_some())
+    }
+}
+
 /// Spawn `cmd` and wait up to `timeout`; kill the whole tree + BOUNDED-reap on timeout. `Ok(Some(status))`
 /// on natural exit, `Ok(None)` on timeout (fail-closed by the caller), `Err` when the OS refused —
 /// the spawn failing, or (rarer) a `try_wait` on a child that had started. On unix the child is spawned
@@ -1807,6 +1845,41 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Copilot on #414: exit is observed WITHOUT reaping, so the group kill that follows targets a
+    /// pid the zombie still reserves; the status is collected afterwards, intact.
+    #[cfg(unix)]
+    #[test]
+    fn exit_is_observed_unreaped_and_the_status_survives_the_group_kill() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 3"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match has_exited_unreaped(&mut child) {
+                Ok(true) => break,
+                Ok(false) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                other => panic!("exit not observed: {other:?}"),
+            }
+        }
+        // Idempotent until reaped — the zombie is still ours.
+        assert!(has_exited_unreaped(&mut child).unwrap());
+        kill_child_tree(&mut child); // the group kill lands on the still-reserved pid, harmlessly
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(3),
+            "the status was not lost"
+        );
+        // A running child is `false`, then observed once it exits.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 0.2; exit 0"]).process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        assert!(!has_exited_unreaped(&mut child).unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+    }
 
     /// FINDING-064. The judge prompt asks for the verdict alone on line 1 and "a brief reason on the
     /// next line"; the parser recorded only line 1. A COMPLIANT model therefore produced the bare

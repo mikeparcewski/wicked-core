@@ -3226,29 +3226,35 @@ fn run_bounded(
         // cancel included) vs the engine's own deadline. Kept apart so the caller can report
         // `Cancelled` vs `TimedOut` instead of conflating both into one status (616c8661).
         let (code, killed_by) = loop {
-            match child_ref.try_wait() {
-                Ok(Some(status)) => {
-                    // QUIESCE (F-036): the seat exited; reap anything it backgrounded in its
-                    // group so no phase-owned process outlives the phase. The group is the
-                    // child's own (see the spawn), so this can never signal the launcher.
+            match crate::validator::has_exited_unreaped(child_ref) {
+                Ok(true) => {
+                    // QUIESCE (F-036): the seat exited but is NOT yet reaped — its pid, which is
+                    // also its process group id (see the spawn), stays reserved by the zombie, so
+                    // the group kill cannot land on a reused pid (Copilot on #414). Kill the group
+                    // FIRST — anything the seat backgrounded dies with the phase — THEN collect
+                    // the status (immediate on a zombie). The group is the child's own, so this
+                    // can never signal the launcher.
                     crate::validator::kill_child_tree(child_ref);
-                    break (status.code().unwrap_or(-1), None);
+                    let code = child_ref.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                    break (code, None);
                 }
-                Ok(None) => {
+                Ok(false) => {
                     if cancel
                         .as_ref()
                         .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                     {
-                        // Run-terminal cancellation: kill + reap NOW (the late StepOutput is
-                        // discarded by the actor's stale-result guard; the kill is the part
-                        // that matters — crew#277's orphaned worker).
+                        // Run-terminal cancellation: kill + BOUNDED reap NOW (the late StepOutput
+                        // is discarded by the actor's stale-result guard; the kill is the part
+                        // that matters — crew#277's orphaned worker). Bounded, never a bare
+                        // `wait()`: an unkillable child must not wedge the runner (Copilot on
+                        // #414; the same failure `reap_bounded` exists for).
                         crate::validator::kill_child_tree(child_ref);
-                        let _ = child_ref.wait();
+                        crate::validator::reap_bounded(child_ref);
                         break (-1, Some(CANCELLED));
                     }
                     if start.elapsed() > timeout {
                         crate::validator::kill_child_tree(child_ref);
-                        let _ = child_ref.wait();
+                        crate::validator::reap_bounded(child_ref);
                         break (-1, Some(TIMED_OUT));
                     }
                     std::thread::sleep(Duration::from_millis(20));

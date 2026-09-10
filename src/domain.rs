@@ -374,8 +374,9 @@ pub struct WorkUnit {
     /// AGENT-executed plan (F-036) — the WORKTREE GUARD marker, set at plan time from def data
     /// exactly like [`Self::pre_build_scope`]. Three consumers, one marker: the actor snapshots
     /// the worktree at dispatch ([`Self::worktree_baseline`]); the worker thread re-snapshots and
-    /// compares when the seat's work ends ([`crate::worktree_guard`]); the gate fold DENIES a
-    /// non-exempt change (source `worktree_guard`, `evaluatorMutatedWorktree`). The carriers also
+    /// compares when the seat's work ends ([`crate::worktree_guard`]); the gate fold DENIES ANY
+    /// change — there are no exemptions: documentation, declared deliverables and tool state all
+    /// deny (source `worktree_guard`, `evaluatorMutatedWorktree`). The carriers also
     /// read it as the NO-CODE phase scope (`WICKED_NO_CODE_SCOPE` / `BoundaryCtx::no_code_scope`)
     /// so a governed seat is refused the path-bearing write tools up front. FALSE for every
     /// `executes_code` phase, every Tool phase and every prose-planned unit — a guard that scoped
