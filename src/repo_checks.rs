@@ -684,13 +684,18 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
     if sandbox.level != crate::validator::SandboxLevel::Sandboxed || sandbox.wrapper.is_empty() {
         // NEVER run repo-controlled scripts unsandboxed (codex review on #414): the floor fails
         // with the probe's own reason, and the gate turns that into a denial the operator can act
-        // on. Detection is still reported so the record says what WOULD have run.
+        // on. Detection is still reported so the record says what WOULD have run — and a
+        // detection FAILURE is reported as such, never as "no checks" (Copilot on #414).
+        let (detected, detect_error) = match detect(worktree) {
+            Ok(d) => (d, None),
+            Err(e) => (Vec::new(), Some(e)),
+        };
         return RepoChecksReport {
-            detected: detect(worktree).unwrap_or_default(),
+            detected,
             checks: Vec::new(),
             skipped: Vec::new(),
             passed: false,
-            detect_error: None,
+            detect_error,
             sandbox_level,
             sandbox_note: sandbox_note.clone(),
             sandbox_error: Some(format!(
@@ -909,6 +914,11 @@ pub(crate) fn run_one(
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(50)),
             Err(e) => {
+                // The wait itself failed: the child may still be running — never leave a
+                // repo-controlled process alive in the worktree after the floor gave up on it
+                // (Copilot on #414). Kill the group, reap bounded, then report the failure.
+                crate::validator::kill_child_tree(&mut child);
+                crate::validator::reap_bounded(&mut child);
                 result.spawn_error = Some(format!("wait failed: {e}"));
                 break None;
             }

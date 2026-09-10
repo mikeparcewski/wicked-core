@@ -3263,7 +3263,13 @@ fn run_bounded(
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(_) => break (-1, None),
+                Err(_) => {
+                    // A failed wait is not an exited seat: kill the group and reap bounded rather
+                    // than leave the seat's tree alive past the phase (Copilot on #414).
+                    crate::validator::kill_child_tree(child_ref);
+                    crate::validator::reap_bounded(child_ref);
+                    break (-1, None);
+                }
             }
         };
         let (out, usage, files, tools) = out_h.join().unwrap_or_default();

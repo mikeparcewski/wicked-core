@@ -2023,11 +2023,13 @@ mod tests {
     use super::*;
 
     /// F-036: the NO-CODE phase scope — an `executes_code: false` phase (an evaluator reviewing a
-    /// build, not only a pre-build rung) is refused the path-bearing write tools on production
-    /// code, keeps documentation, and is inert for a code phase (neither flag set). The pre-build
-    /// wording wins when both flags are on, so that gate's established message is unchanged.
+    /// build, not only a pre-build rung) is refused the path-bearing write tools on EVERYTHING in
+    /// the tree, documentation included (no exemptions — matching the worktree guard); only the
+    /// PRE-BUILD scope keeps its documentation allowance (core#296); and both are inert for a code
+    /// phase (neither flag set). The pre-build wording wins when both flags are on, so that gate's
+    /// established message is unchanged.
     #[test]
-    fn no_code_scope_refuses_production_code_writes_and_keeps_documentation() {
+    fn no_code_scope_refuses_every_write_and_only_the_pre_build_scope_keeps_documentation() {
         let ctx = |p: &str| serde_json::json!({ "path": p });
         let wt = std::path::Path::new("/wt");
         for tool in WRITE_TOOLS {

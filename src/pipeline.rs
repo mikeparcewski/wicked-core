@@ -1010,7 +1010,15 @@ pub(crate) fn apply_and_finish_unit(
     // F-039: the repo-checks floor is a deterministic instrument too — when it ran, the gate HAD a
     // floor and the criterion names both (pinned validator's, then the checks'), so a consumer
     // reading `criterion` sees exactly what was re-derived.
-    let checks_ran = evidence.repo_checks.is_some();
+    // The checks floor counts whenever it APPLIES to the unit — a report that exists (ran, or
+    // refused to run without a boundary) OR a floor-marked unit whose report never arrived, which
+    // `checks_denial` above denies fail-closed. Deriving it from the report alone made that
+    // denial read as "no floor, criterion None" (Copilot on #414).
+    let checks_ran = evidence.repo_checks.is_some()
+        || (unit.repo_checks_floor
+            && unit.tool_cmd.is_none()
+            && workdir.is_some()
+            && guard_denial.is_none());
     let has_deterministic_floor = unit.validator.is_some() || checks_ran;
     let criterion = match (
         unit.validator.as_ref().map(|v| v.criterion.clone()),
