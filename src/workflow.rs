@@ -82,6 +82,13 @@ pub struct StepInput {
     /// Per-run monotonic launch sequence number. Incremented at every `begin_launch` call.
     /// Used together with `process_gen` as the bus dedup key and stale-completion guard.
     pub launch_seq: u64,
+    /// Every `skill_ref` the RUN's plan names (deduplicated), computed by the actor from the
+    /// session's units before dispatch (core#396). The runner refuses the launch when any is
+    /// missing from the skills snapshot — before the FIRST unit runs, not at the unit that needed
+    /// it — so a run never does three phases of work to fail at the fourth's missing method
+    /// (`skills_snapshot::admit_unit`). Empty for a directly-constructed input (engine-internal
+    /// judge/validator sessions, tests): the runner then admits the unit on its own `skill_ref`.
+    pub required_skills: Vec<String>,
 }
 
 /// The governance context threaded to a GOVERNED wrapped-CLI unit (DES-OUTGOV-003 §4). Carries the

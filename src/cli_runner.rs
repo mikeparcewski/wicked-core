@@ -174,6 +174,11 @@ struct DispatchedTask {
     /// whether the consumer calls `try_next_epoch_bus` to allocate an ACP epoch.
     #[serde(default)]
     is_acp: bool,
+    /// The run's whole skill set ([`StepInput::required_skills`], core#396), so the off-actor
+    /// runner refuses a launch whose snapshot lacks any of them exactly as the in-process worker
+    /// would. Empty on older payloads — the runner then admits the unit on its own `skill_ref`.
+    #[serde(default)]
+    required_skills: Vec<String>,
 }
 
 /// Wire representation of a cross-CLI prior-unit output (Serialize/Deserialize for the event bus).
@@ -819,6 +824,7 @@ pub(crate) fn try_publish_dispatched(
             process_gen: input.process_gen,
             launch_seq: input.launch_seq,
             is_acp,
+            required_skills: input.required_skills.clone(),
         };
         let payload = match serde_json::to_value(&task) {
             Ok(v) => v,
@@ -1455,6 +1461,7 @@ fn run_cli_runner(
                     elicitation_epoch,
                     process_gen: task.process_gen,
                     launch_seq: task.launch_seq,
+                    required_skills: task.required_skills.clone(),
                 };
                 // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does.
@@ -1877,6 +1884,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
 
         // Arm the publisher on THIS thread, publish, then disarm (thread-local is per-thread).
@@ -1949,6 +1957,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
 
         assert!(arm_exec_publisher(&bus_path), "arm publisher");
@@ -2060,6 +2069,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         let noop: &DeltaSink = &|_: &str| {};
 
@@ -2272,7 +2282,8 @@ mod tests {
             prior_outputs: vec![],
             elicitation_epoch: 0,
             process_gen: Some(uuid::Uuid::new_v4()), // will be stripped below
-            launch_seq: 5,                           // will be stripped below
+            launch_seq: 5,                           // will be stripped below,
+            required_skills: Vec::new(),
         };
         // Publish a dispatched task to a real bus db so we can round-trip through serde.
         let bus_path = tmp_bus("t7a");
@@ -2672,6 +2683,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: Some(actor_gen_a),
             launch_seq: 1,
+            required_skills: Vec::new(),
         };
         assert!(arm_exec_publisher(&bus_path_a), "arm publisher t38a");
         assert!(
@@ -2772,6 +2784,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: Some(actor_gen_b),
             launch_seq: 1,
+            required_skills: Vec::new(),
         };
         assert!(arm_exec_publisher(&bus_path_b), "arm publisher t38b");
         assert!(

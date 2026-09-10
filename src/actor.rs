@@ -647,12 +647,10 @@ mod wal_checkpoint_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Serializes the knob-mutating test against anything else in this binary that touches
-    /// process-global env — the same rule as `execute_wrapped::tests::ENV_LOCK` (env vars are
-    /// process-global and cargo runs tests on many threads; an unsynchronized `set_var` is a
-    /// flake generator at best and UB on POSIX at worst). Poison-tolerant on purpose: one
-    /// panicking test must not cascade.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Serializes the knob-mutating test against anything else in this BINARY that touches
+    // process-global env — the crate-wide lock (`crate::test_env`), not a module-local one: env
+    // vars are process-global and cargo runs every module's tests on many threads.
+    use crate::test_env::ENV_LOCK;
 
     /// RAII restore of the process-global knob: captures the current value up front and restores
     /// the original (or unsets it) on drop — INCLUDING a panic unwind. Declared AFTER the lock
@@ -685,7 +683,7 @@ mod wal_checkpoint_tests {
     /// and restored by the [`KnobGuard`] RAII even on a panicking assertion.
     #[test]
     fn wal_checkpoint_min_interval_honors_the_env_knob() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _lock = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _restore = KnobGuard::capture();
         KnobGuard::unset();
         assert_eq!(
@@ -5444,6 +5442,13 @@ fn dispatch_unit(
         elicitation_epoch,
         process_gen: Some(process_gen),
         launch_seq,
+        // core#396: the RUN's whole skill set, so the launch is refused when the snapshot lacks
+        // any of them before the FIRST unit does work — of ANY kind (the worker runners admit an
+        // agent unit; `skills_snapshot::admit_plan` admits a tool command below, codex round 6) —
+        // not at the unit that needed it. Read off the units already fetched above (the plan
+        // copied each phase's `skill_ref` onto its unit); the worker holds no store handle, so
+        // the set has to ride the input.
+        required_skills: run_required_skills(&units),
     };
 
     // TOOL EXECUTOR: if the unit carries a tool_cmd, bypass the CLI runner entirely.
@@ -5452,7 +5457,9 @@ fn dispatch_unit(
     if let Some(cmd) = unit.tool_cmd.clone() {
         // (EVT-011) ToolExecutorDispatched — fires just before the tool command spawns so the
         // studio can distinguish a tool-path unit from an agent-path unit in the event stream
-        // (both emit UnitExecuting, but only this event carries the actual command).
+        // (both emit UnitExecuting, but only this event carries the actual command). A plan-wide
+        // skills refusal (below, off-thread) then comes back as the dispatched unit's Failed
+        // result, exactly as a worker refusal does on the agent path.
         emit(
             subscribers,
             CoreEvent::ToolExecutorDispatched {
@@ -5469,7 +5476,37 @@ fn dispatch_unit(
         let attempt = session.attempt;
         let workdir = session.workdir.clone();
         std::thread::spawn(move || {
-            let (output_str, status) = run_tool_cmd(&cmd, workdir.as_deref());
+            // core#396 (codex round 6): the run-wide EXISTENCE admission runs before the FIRST
+            // unit of ANY kind. A tool command spawns no worker, so neither runner would ever
+            // judge this run's skill set — the command executed, and could mutate state, before
+            // a later agent unit discovered the missing skill. Same ladder, same refusal shape
+            // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
+            let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
+                Ok(admitted) => {
+                    // The generation the RUN was judged against, reported like a handoff
+                    // (`path: "tool_cmd"`): the log line for the operator and the event crew's
+                    // ledger pins the generation on for this session from its first unit —
+                    // the same record the worker runners emit when they hand the root over.
+                    if let Some(s) = &admitted {
+                        s.report(&format!(
+                            "path=tool_cmd run={} unit={ord} cli=tool",
+                            input.run_id
+                        ));
+                        let _ = tx.send(crate::command::Command::EmitEvent(s.handed_event(
+                            &input.run_id,
+                            ord,
+                            attempt,
+                            "tool_cmd",
+                            "tool",
+                        )));
+                    }
+                    run_tool_cmd(&cmd, workdir.as_deref())
+                }
+                Err(e) => {
+                    let refused = crate::execute_wrapped::skills_refusal(&input, &e);
+                    (refused.output, refused.status)
+                }
+            };
             // Stream the whole output as one delta so the transcript panel shows something.
             let _ = tx.send(crate::command::Command::CliOutputDelta {
                 run_id: run_id2.clone(),
@@ -5562,6 +5599,27 @@ fn dispatch_unit(
         });
     });
     Ok(true)
+}
+
+/// Every `skill_ref` the run's units name — sorted, deduplicated, empties dropped, of EVERY
+/// family — for [`StepInput::required_skills`] (core#396). Pure over the plan the actor already
+/// holds: `units` are the run's planned units, so refs from a crew-generated workflow def are
+/// here exactly like refs from a shipped one (they are units of this run either way). The
+/// transitive `mandates` closure is NOT expanded here — the actor holds no skills snapshot, and
+/// mandates are declared in each skill's frontmatter inside it — but at admission
+/// (`skills_snapshot::admit_refs`, which has the snapshot in hand), where a missing mandate is
+/// refused by its own name. No family is filtered out: the snapshot is the worker's only skills
+/// source, so a ref it does not hold is a refusal whatever its prefix, not a notice.
+fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
+    let mut refs: Vec<String> = units
+        .iter()
+        .filter_map(|u| u.skill_ref.as_deref())
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
 }
 
 /// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
@@ -7691,6 +7749,7 @@ mod deliverable_floor_tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         };
         assert_eq!(
             crate::execute_wrapped::sandbox_for(&probe),

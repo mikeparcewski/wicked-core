@@ -2586,6 +2586,32 @@ mod tests {
                 "type", "session", "ord", "attempt", "cli", "level", "reason",
             ],
         );
+        check(
+            CoreEvent::SkillsSnapshotHanded {
+                session: s(),
+                ord: 2,
+                attempt: 0,
+                path: "acp".to_string(),
+                cli: s(),
+                gen: Some("7".to_string()),
+                content_hash: Some("sha256:abc".to_string()),
+                root: s(),
+                source: "published".to_string(),
+            },
+            "skillsSnapshotHanded",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "path",
+                "cli",
+                "gen",
+                "contentHash",
+                "root",
+                "source",
+            ],
+        );
         // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
         check(
             CoreEvent::WorkflowSelected {

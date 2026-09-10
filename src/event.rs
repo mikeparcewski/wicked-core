@@ -564,6 +564,33 @@ pub enum CoreEvent {
         /// containment for a worker)", or "…worktree root <p> failed to canonicalize; arming skipped".
         reason: String,
     },
+    /// (core#396) A worker launch was handed a skills root — the immutable snapshot crew published
+    /// (`WICKED_SKILLS_SNAPSHOT`), or the live installed plugin when none was published. Fires once
+    /// per handoff: per unit on the wrapped path (`path: "wrapped_cli"`, the `--plugin-dir` flag),
+    /// once per spawned session on the ACP path (`path: "acp"`, the `session/new` plugins
+    /// handshake — the session is reused across the run's turns), and once per TOOL-COMMAND unit
+    /// of a run that names skills (`path: "tool_cmd"`, `cli: "tool"` — the plan-wide admission
+    /// before the command runs; no process is handed the root, but the run was judged against
+    /// this generation, so the session pins it from its first unit). This is the record crew
+    /// consults before reaping a snapshot generation: a `gen` still named by a live session is in
+    /// use.
+    /// `gen`/`content_hash` are `snapshot.json`'s for a published snapshot and `None` for the
+    /// installed-plugin fallback (`source: "live-cache"`), which has nothing to reap.
+    SkillsSnapshotHanded {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        /// The carrier: `"wrapped_cli"` or `"acp"` — the same vocabulary as `GovernanceContextArmed`.
+        path: String,
+        /// The seat it was handed to (the wrapped path's CLI key / the ACP registry seat key).
+        cli: String,
+        gen: Option<String>,
+        content_hash: Option<String>,
+        /// The plugin root the worker was pointed at — the concrete generation directory.
+        root: String,
+        /// `"published"` (a crew snapshot) or `"live-cache"` (the installed plugin fallback).
+        source: String,
+    },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
     /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
@@ -1363,6 +1390,28 @@ impl CoreEvent {
                 "cli": cli,
                 "level": level,
                 "reason": reason,
+            }),
+            CoreEvent::SkillsSnapshotHanded {
+                session,
+                ord,
+                attempt,
+                path,
+                cli,
+                gen,
+                content_hash,
+                root,
+                source,
+            } => json!({
+                "type": "skillsSnapshotHanded",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "path": path,
+                "cli": cli,
+                "gen": gen,
+                "contentHash": content_hash,
+                "root": root,
+                "source": source,
             }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {

@@ -2791,12 +2791,14 @@ mod boundary_tests {
     use super::*;
     use serde_json::json;
 
-    /// Env is process-global and Rust runs tests in threads, so these serialize on one mutex.
-    /// Without it, two tests setting WICKED_WRITE_ROOTS race and the failure looks like a logic bug.
-    static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Env is process-global and Rust runs tests in threads, so these serialize on the CRATE-WIDE
+    // lock (`crate::test_env`). Without it, two tests setting WICKED_WRITE_ROOTS race and the
+    // failure looks like a logic bug — and a module-local lock would leave the race open against
+    // every other module's env-mutating tests.
+    use crate::test_env::ENV_LOCK as ENV;
 
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV.write().unwrap_or_else(|e| e.into_inner());
         match write {
             Some(w) => std::env::set_var(WRITE_ROOTS_ENV, w),
             None => std::env::remove_var(WRITE_ROOTS_ENV),
@@ -3232,8 +3234,11 @@ mod boundary_tests {
     fn the_governance_pin_is_outside_the_boundary() {
         let wt = std::env::temp_dir().join("wicked-boundary-wt");
         std::fs::create_dir_all(&wt).unwrap();
-        let pin = dirs_config_workflow();
         with_roots(Some(wt.to_str().unwrap()), || {
+            // Resolved INSIDE the env lock: the pin path derives from HOME, and a concurrent
+            // HOME-pinning test (the skills fixtures pin HOME to a temp scratch) would otherwise
+            // hand this test a pin under the system temp, where the core#264 carve-out applies.
+            let pin = dirs_config_workflow();
             let (denial, is_write) = boundary_denial(&ctx(&pin), "Write")
                 .expect("writing the gate's own pin must be refused");
             assert!(is_write, "writing the pin is a WRITE escape (unit-fatal)");
@@ -3501,12 +3506,19 @@ mod boundary_tests {
     fn the_launcher_arms_the_launch_declared_read_roots() {
         // The wrapped carrier: extras enter WICKED_READ_ROOTS through `assemble_read_roots` —
         // never through `armed_write_roots`, whose exact argument list the test above pins.
-        let launcher = include_str!("execute_wrapped.rs");
+        // Whitespace-collapsed so the audit pins the CALL, not rustfmt's line breaks — and only
+        // its STABLE prefix, through the third argument, so rustfmt's choice of a trailing comma
+        // before `)` cannot fail the audit either (Copilot, review pass 11). The third argument
+        // is the skills snapshot (core#396): the same one assembly read-widens to it.
+        let launcher: String = include_str!("execute_wrapped.rs")
+            .split_whitespace()
+            .collect();
         assert!(
-            launcher
-                .contains("assemble_read_roots(g.code_graph_db.as_deref(), &g.extra_read_roots)"),
-            "the wrapped launcher no longer joins the launch-declared extra_read_roots into \
-             WICKED_READ_ROOTS (core#294)"
+            launcher.contains(
+                "assemble_read_roots(g.code_graph_db.as_deref(),&g.extra_read_roots,g.skills_root.as_deref()"
+            ),
+            "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
+             skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"
         );
         // The ACP carrier builds its BoundaryCtx from the same assembly (core#260's one-assembly
         // rule): dropping the extras there would make the read grant depend on which seat the run
@@ -3538,7 +3550,7 @@ mod boundary_tests {
     fn a_non_utf8_worktree_still_has_a_boundary() {
         use std::os::unix::ffi::OsStrExt;
         let raw = std::ffi::OsStr::from_bytes(b"/tmp/wicked-\xff-wt");
-        let _g = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = ENV.write().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(WRITE_ROOTS_ENV, raw);
         std::env::remove_var(READ_ROOTS_ENV);
         let roots = allowed_roots_from_env();

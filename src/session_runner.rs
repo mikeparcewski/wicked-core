@@ -38,7 +38,7 @@ use crate::command::Command;
 use crate::event::CoreEvent;
 use crate::execute_wrapped::{
     binary_is_claude, build_argv, inject_claude_stream_flags, pty_unit_prompt, resolve_invocation,
-    AdapterOut, ClaudeStreamJson, OutputAdapter,
+    skills_refusal, AdapterOut, ClaudeStreamJson, OutputAdapter, SkillForm,
 };
 use crate::terminal;
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, Usage};
@@ -62,6 +62,9 @@ pub struct PersistentStepRunner {
     sessions: Arc<Mutex<HashMap<String, PtySession>>>,
     timeout: Duration,
 }
+
+/// The carrier's name in a skills refusal (`SkillsError::CarrierWithoutSkills`).
+const PTY_CARRIER: &str = "persistent PTY";
 
 impl PersistentStepRunner {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<Command>, pty: terminal::PtyMap) -> Self {
@@ -139,19 +142,28 @@ impl PersistentStepRunner {
 
     // ── session argv ──────────────────────────────────────────────────────────
 
-    /// Build the argv for an **interactive** (multi-turn) CLI session. Like the wrapped-CLI argv
-    /// but without `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
-    /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
-    fn session_argv(input: &StepInput) -> Vec<String> {
+    /// The invocation template a unit's session runs: the unit's own (an ad-hoc launch CLI not in
+    /// the registry), else the registry's for its CLI key. ONE resolution for both the session
+    /// argv and the prompt's skill form (core#396), so the two cannot name different binaries.
+    fn session_invocation(input: &StepInput) -> String {
         let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
-        let invocation = input
+        input
             .unit
             .assigned_invocation
             .clone()
-            .unwrap_or_else(|| resolve_invocation(cli_key));
+            .unwrap_or_else(|| resolve_invocation(cli_key))
+    }
+
+    /// Build the argv for an **interactive** (multi-turn) CLI session from the ONE resolved
+    /// `invocation` template (`session_invocation`, resolved once per turn by `exec_turn` and shared
+    /// with the prompt's skill form — Copilot, review pass 7: a second resolution could see a
+    /// reloaded registry and name another binary). Like the wrapped-CLI argv but without
+    /// `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
+    /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
+    fn session_argv(invocation: &str, input: &StepInput) -> Vec<String> {
         // Build argv without a real prompt — the placeholder expands to an empty string and the
         // trailing `--` + empty arg are stripped below.
-        let mut argv = build_argv(&invocation, "", &input.unit.allowed_skills);
+        let mut argv = build_argv(invocation, "", &input.unit.allowed_skills);
         let is_claude = argv.first().map(|a| binary_is_claude(a)).unwrap_or(false);
         // Drop the end-of-options guard and the empty prompt arg emitted by the template.
         argv.retain(|a| a != "--" && !a.is_empty());
@@ -220,6 +232,44 @@ impl StepRunner for PersistentStepRunner {
 impl PersistentStepRunner {
     fn exec_turn(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
         let run_id = input.run_id.clone();
+        // core#396 (codex round 8, ADJUDICATED; round 9): this carrier opens the raw CLI — no
+        // snapshot resolution, no admission, no isolation flags, no delivery lever — so it cannot
+        // hand a skill to the worker. A run with ANY skill-bearing unit is REFUSED here at its
+        // FIRST unit, before any session is opened or written to: the actor hands every unit the
+        // run's whole skill set (`StepInput::required_skills`, read off the plan), so a skill-free
+        // first unit does no work ahead of a later unit this carrier could never serve. The current
+        // unit's own `skill_ref` is unioned in (a unit dispatched outside the actor's plan carries
+        // no plan set). No invocation directive is ever emitted on this carrier; a run that names
+        // no skill anywhere runs exactly as before.
+        let mut skills: Vec<String> = input
+            .required_skills
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .chain(
+                input
+                    .unit
+                    .skill_ref
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            )
+            .collect();
+        skills.sort();
+        skills.dedup();
+        if !skills.is_empty() {
+            return skills_refusal(
+                input,
+                &crate::skills_snapshot::SkillsError::CarrierWithoutSkills {
+                    carrier: PTY_CARRIER.to_string(),
+                    skills,
+                },
+            );
+        }
+        // ONE resolution of the invocation template for this turn: the session argv (when a
+        // session is opened) and the prompt's skill form both read THIS value, so they cannot name
+        // different binaries even if the registry is reloaded between the two uses.
+        let invocation = Self::session_invocation(input);
 
         // Lazily open a session for this run_id. The lock covers only the map read/write — not
         // the blocking open_terminal / wait_for_opened calls — so unrelated runs are never
@@ -247,7 +297,7 @@ impl PersistentStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let cmd = Self::session_argv(input);
+                let cmd = Self::session_argv(&invocation, input);
                 // Subscribe BEFORE open so we catch the TerminalOpened event.
                 let pre = self.subscribe();
                 let tid = match self.open_terminal(cwd, cmd) {
@@ -293,7 +343,10 @@ impl PersistentStepRunner {
         // Line-length is a correctness constraint here, not a nicety: an over-long line is dropped by
         // the terminal with no error, so the alternative to failing now is a turn that waits out its
         // full timeout for output the CLI was never given the chance to produce.
-        let prompt = match pty_unit_prompt(input) {
+        // The directive is spelled for the binary this session runs (core#396) — the SAME resolved
+        // template `session_argv` opened it with (one `session_invocation` call per turn, above).
+        let form = SkillForm::for_invocation(&invocation);
+        let prompt = match pty_unit_prompt(input, form) {
             Ok(p) => format!("{p}\n"),
             Err(e) => return failed_output(input, e),
         };
@@ -640,6 +693,7 @@ mod tests {
             elicitation_epoch: 0,
             process_gen: None,
             launch_seq: 0,
+            required_skills: Vec::new(),
         }
     }
 
@@ -667,6 +721,53 @@ mod tests {
         format!("sh {p}")
     }
 
+    /// RAII pin of `WICKED_MEMORY_EMBEDDER` (codex round 9, L2): hold `test_env::ENV_LOCK` (write)
+    /// first and declare the pin AFTER the lock guard, so it restores before the lock releases —
+    /// the process-global mutation never leaks into a concurrently running test.
+    struct EmbedderPin(Option<std::ffi::OsString>);
+
+    impl EmbedderPin {
+        fn hash() -> Self {
+            let prev = std::env::var_os("WICKED_MEMORY_EMBEDDER");
+            std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+            Self(prev)
+        }
+    }
+
+    impl Drop for EmbedderPin {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("WICKED_MEMORY_EMBEDDER", v),
+                None => std::env::remove_var("WICKED_MEMORY_EMBEDDER"),
+            }
+        }
+    }
+
+    /// A fake interactive CLI like [`fake_cli_invocation`] that, per turn, APPENDS the prompt line
+    /// to `marker` before answering — so a test can prove a session never received a turn (the
+    /// marker is never created).
+    fn fake_cli_with_marker(marker: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "wicked-core-fake-cli-marker-{}-{}.sh",
+            std::process::id(),
+            DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let script = format!(
+            "#!/bin/sh\n\
+             while IFS= read -r line; do\n\
+               printf '%s\\n' \"$line\" >> '{}'\n\
+               printf '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"WKRTURN:%s\"}}]}}}}\\n' \"$line\"\n\
+               printf '{{\"type\":\"result\",\"result\":\"ok\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\\n' \"$line\"\n\
+             done\n",
+            marker.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        format!("sh {}", path.to_string_lossy())
+    }
+
     /// Helper: drain events until `pred` matches or timeout elapses.
     fn wait_for(rx: &std::sync::mpsc::Receiver<CoreEvent>, pred: impl Fn(&CoreEvent) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -686,7 +787,10 @@ mod tests {
     /// 3. Report `StepStatus::Ok` + non-zero usage for each turn.
     #[test]
     fn two_units_same_run_share_one_session() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         let events = core.subscribe();
 
@@ -755,10 +859,120 @@ mod tests {
         wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
     }
 
+    /// core#396 (codex round 8, ADJUDICATED): the persistent PTY carrier does not load the skills
+    /// snapshot, so a skill-bearing unit is REFUSED by name — naming the carrier and the skill —
+    /// before any session is opened (no `TerminalOpened`), and no invocation directive is ever
+    /// written to a PTY: a skill-free unit on the same run still runs, and the prompt the fake CLI
+    /// echoes back carries no `Invoke your skill`.
+    #[test]
+    fn a_skill_bearing_unit_is_refused_on_the_pty_carrier_and_no_directive_is_written() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let invocation = fake_cli_invocation();
+        let mut skilled = make_unit("extract the rules", &invocation);
+        skilled.skill_ref = Some("wicked-garden-domain".to_string());
+        let out = runner.run_unit(&make_input("run-pty-skills", 0, skilled));
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output
+                .contains("persistent PTY sessions do not load the skills snapshot")
+                && out.output.contains("wicked-garden-domain")
+                && out.output.contains("wrapped or ACP carrier"),
+            "refused by name, naming the carrier: {}",
+            out.output
+        );
+        let mut opened = 0usize;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, CoreEvent::TerminalOpened { .. }) {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 0, "a refused unit opens no session");
+        // Skill-free: unchanged — the session opens, the turn runs, and no directive is written.
+        let plain = make_unit("second work", &invocation);
+        let out = runner.run_unit(&make_input("run-pty-skills", 1, plain));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(
+            out.output.contains("WKRTURN:") && !out.output.contains("Invoke your skill"),
+            "the PTY prompt carries no skill directive: {}",
+            out.output
+        );
+        runner.drop_session("run-pty-skills");
+        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+    }
+
+    /// codex round 9 (H3): the refusal is PLAN-WIDE. The actor hands every unit the run's whole
+    /// skill set (`StepInput::required_skills`), so a run whose FIRST unit names no skill but whose
+    /// later unit does is refused AT the first unit — before any session opens and before the fake
+    /// CLI receives a single turn (its marker file is never created) — naming the carrier and the
+    /// later unit's skill. Control: the same first unit in a run whose plan names no skill runs,
+    /// and the marker proves the CLI received that turn.
+    #[test]
+    fn a_run_with_any_skill_bearing_unit_is_refused_at_its_first_unit_on_the_pty_carrier() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let marker = std::env::temp_dir().join(format!(
+            "wicked-core-pty-marker-{}-{}",
+            std::process::id(),
+            DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let invocation = fake_cli_with_marker(&marker);
+        // Unit 0 names no skill; the plan's later unit does.
+        let mut input = make_input(
+            "run-pty-plan",
+            0,
+            make_unit("first, skill-free work", &invocation),
+        );
+        input.required_skills = vec!["wicked-garden-domain".to_string()];
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output
+                .contains("persistent PTY sessions do not load the skills snapshot")
+                && out.output.contains("wicked-garden-domain")
+                && out.output.contains("wrapped or ACP carrier"),
+            "refused at the first unit, naming the later unit's skill: {}",
+            out.output
+        );
+        assert!(!marker.exists(), "the fake CLI never received a turn");
+        let mut opened = 0usize;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, CoreEvent::TerminalOpened { .. }) {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 0, "no session opens for a refused run");
+        // Control: a run whose plan names no skill runs, and the marker records the turn.
+        let plain = make_input(
+            "run-pty-plain",
+            0,
+            make_unit("first, skill-free work", &invocation),
+        );
+        let out = runner.run_unit(&plain);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let turns = std::fs::read_to_string(&marker).expect("the fake CLI recorded the turn");
+        assert!(!turns.trim().is_empty(), "{turns:?}");
+        runner.drop_session("run-pty-plain");
+        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+        let _ = std::fs::remove_file(&marker);
+    }
+
     /// Two runs with DIFFERENT `run_id`s each open their own session.
     #[test]
     fn different_run_ids_open_separate_sessions() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         let events = core.subscribe();
 
@@ -801,7 +1015,10 @@ mod tests {
     /// `drop_session` on an unknown id is a no-op (idempotent).
     #[test]
     fn drop_session_unknown_id_is_noop() {
-        std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
         let (_, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
         runner.drop_session("no-such-run"); // must not panic
     }

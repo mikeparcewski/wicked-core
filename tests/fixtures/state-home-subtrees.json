@@ -1,0 +1,143 @@
+{
+  "$comment": "Design v3.1 §1 — the registry of every TOP-LEVEL entry that appears under the daemon state home (crewStateHome(): the --db parent, ~/.wicked-crew by default). wicked-core embeds this file (src/state_home.rs, include_str!) to build the worker Read fence: one deny rule per entry, with the resolved skills/snapshots/<gen>/ the ONLY non-denied path. At every launch that opens the fence, core LISTS the state home's top-level entries (and skills/'s) and REFUSES the launch, naming the entry, if one is not classified here — fail closed, never widen. No runtime enumeration ever BUILDS a rule; this list is static. crew mirrors this file at packages/crew/tests/fixtures/state-home-subtrees.json, and its tests/state-home-subtrees.test.ts asserts (a) every join(<state home>, …) in crew's src/ names an entry here and (b) a booted daemon creates nothing outside it. `name` is an exact top-level name; `prefix` covers a file and its sidecars (core.db, core.db-wal, core.db.events, …). `worker_read` is prose for the reader; the skills entry's `read_slot` and `denied_children` are the machine-readable half core enforces. Design v3.3 §1: skills/snapshots/ is the ONE directory core lists at launch to BUILD rules — one deny per sibling entry (every generation but the handed one; every .staging-*/.tmp-current-* entry), failing closed on an unlistable slot or an entry that is neither a generation directory (decimal digits, as crew publishes them) nor a recognised staging name. Design v3.5 §2: the skills entry lists EVERY name the store can ever create under skills/ — settled AND transient (.staging-* park-and-place directories, manifest.json.tmp-* commit files, snapshots/.staging-* generations being written, snapshots/.tmp-current-* links before their rename, the refused/ sentinel that is named but never created) — because a launch admitted while a mutation is parked must classify every child it sees; `denied_children_kinds` records each pattern's kind and whether it is transient (src/skills/root-names.ts is crew's source of truth; tests/skills-fence-names.test.ts asserts equality and observes the transient names mid-mutation). Residuals (documented): a top-level entry created under the state home WHILE a session is running is fenced at the next launch, not mid-session — crew is the only writer of that directory; a generation published while a session runs is readable by that session until its next launch (generations are immutable and hold only the enabled skills of a newer publish).",
+  "version": 1,
+  "entries": [
+    {
+      "name": "skills",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/skills/store.ts resolveSkillsRoot — join(crewStateHome(), SKILLS_DIRNAME); every child name: src/skills/root-names.ts SKILLS_ROOT_NAMES",
+      "worker_read": "snapshots/<gen>/ (the resolved WICKED_SKILLS_SNAPSHOT) only; baseline/, effective/, manifest.json, manifest.json.tmp-*, current, .uv-cache/, .staging-*, refused/, snapshots/.staging-*, snapshots/.tmp-current-* denied",
+      "read_slot": "snapshots",
+      "denied_children": [
+        "baseline",
+        "effective",
+        "manifest.json",
+        "manifest.json.tmp-*",
+        "current",
+        ".uv-cache",
+        ".staging-*",
+        "refused",
+        "snapshots/.staging-*",
+        "snapshots/.tmp-current-*"
+      ],
+      "denied_children_kinds": {
+        "baseline": { "kind": "dir", "transient": false },
+        "effective": { "kind": "dir", "transient": false },
+        "manifest.json": { "kind": "file", "transient": false },
+        "manifest.json.tmp-*": { "kind": "file", "transient": true },
+        "current": { "kind": "link", "transient": false },
+        ".uv-cache": { "kind": "dir", "transient": false },
+        ".staging-*": { "kind": "dir", "transient": true },
+        "refused": { "kind": "dir", "transient": false },
+        "snapshots/.staging-*": { "kind": "dir", "transient": true },
+        "snapshots/.tmp-current-*": { "kind": "link", "transient": true }
+      }
+    },
+    {
+      "name": "audit.log",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/api/audit.ts defaultAuditPath — join(crewStateHome(), 'audit.log')",
+      "worker_read": "none"
+    },
+    {
+      "name": "evals",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/api/eval-store.ts — join(crewStateHome(), 'evals')",
+      "worker_read": "none"
+    },
+    {
+      "name": "project-graphs",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/projects/graph-paths.ts projectGraphRoot — join(crewStateHome(), 'project-graphs')",
+      "worker_read": "none (a run's project graph is handed to the engine by explicit dbPath, not read through the state home)"
+    },
+    {
+      "name": "project-settings.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/projects/settings.ts — join(crewStateHome(), 'project-settings.json')",
+      "worker_read": "none"
+    },
+    {
+      "name": "interactive-chat-ledger.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/interactive/chat-events.ts — join(defaultStateDir(), 'interactive-chat-ledger.json'); swept via src/api/server.ts crewStateDir",
+      "worker_read": "none"
+    },
+    {
+      "name": "interactive-chats",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/interactive/chat-events.ts — join(defaultStateDir(), 'interactive-chats')",
+      "worker_read": "none (a run's inbox is handed to the engine as an explicit extra write root)"
+    },
+    {
+      "name": "interactive-demo-ledger.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/interactive/demo-events.ts — join(defaultStateDir(), 'interactive-demo-ledger.json'); swept via src/api/server.ts crewStateDir",
+      "worker_read": "none"
+    },
+    {
+      "name": "interactive-demos",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/interactive/demo-events.ts — join(defaultStateDir(), 'interactive-demos')",
+      "worker_read": "none (explicit extra write root per run)"
+    },
+    {
+      "name": "interactive-draft-ledger.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/interactive/draft-events.ts — join(defaultStateDir(), 'interactive-draft-ledger.json'); swept via src/api/server.ts crewStateDir",
+      "worker_read": "none"
+    },
+    {
+      "name": "interactive-drafts",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/interactive/draft-events.ts — join(defaultStateDir(), 'interactive-drafts')",
+      "worker_read": "none (explicit extra write root per run)"
+    },
+    {
+      "name": "interactive-edit-ledger.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/interactive/edit-events.ts — join(defaultStateDir(), 'interactive-edit-ledger.json'); swept via src/api/server.ts crewStateDir",
+      "worker_read": "none"
+    },
+    {
+      "name": "interactive-edits",
+      "kind": "dir",
+      "owner": "crew",
+      "source": "src/interactive/edit-events.ts — join(defaultStateDir(), 'interactive-edits')",
+      "worker_read": "none (explicit extra write root per run)"
+    },
+    {
+      "prefix": "bus.db",
+      "kind": "file-with-sidecars",
+      "owner": "crew",
+      "source": "src/cli/index.ts — join(stateHomeOfDb(dbPath), 'bus.db') (wicked-bus SQLite: bus.db, bus.db-wal, bus.db-shm)",
+      "worker_read": "none"
+    },
+    {
+      "prefix": "core.db",
+      "kind": "file-with-sidecars",
+      "owner": "engine",
+      "source": "src/cli/index.ts — join(stateHome(), 'core.db') is the default --db; wicked-core writes the file and its sidecars: SQLite -wal/-shm, `<db>.events/` (event_log.rs), `<db>.mem*` and `<db>.knowledge*` (actor.rs SIDECAR_SUFFIXES)",
+      "worker_read": "none"
+    },
+    {
+      "prefix": "daemon-",
+      "kind": "file",
+      "owner": "operator",
+      "source": "the sanctioned launch redirects the daemon's stdout to <state home>/daemon-stdout.log (operating playbook; src/api/diagnostics.ts names it) — crew itself never writes it",
+      "worker_read": "none"
+    }
+  ]
+}

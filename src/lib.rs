@@ -49,12 +49,30 @@ mod repo;
 mod repo_intel;
 mod scope;
 mod session_runner;
+mod skills_snapshot;
 mod sources;
 mod spawn_audit;
+mod state_home;
 mod terminal;
 mod validator;
 mod validator_vault;
 mod workflow;
+
+/// The ONE lock every test in this binary takes before touching process-global environment.
+///
+/// `cargo test` runs a crate's tests on many threads in one process, and environment variables
+/// are process-global: an unsynchronized `set_var` is a flake generator at best and UB on POSIX
+/// at worst. Each module used to keep its OWN lock, which serialized its tests against each
+/// other and against nothing else — `execute_wrapped` pinning `HOME` or `WICKED_SKILLS_SNAPSHOT`
+/// could still race an `acp_runner` test resolving the same variables mid-spawn. A crate-wide
+/// lock closes that: tests that MUTATE hold `write()`; tests that only READ a variable a
+/// mutator might change (a real spawn resolving `HOME`/`WICKED_WORKER_HOME`) hold `read()`.
+/// Poison-tolerant on purpose (`unwrap_or_else(|p| p.into_inner())`): one panicking test must not
+/// cascade.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+}
 
 pub use acp_runner::AcpStepRunner;
 pub use actor::{RunBusy, RunExists};
@@ -493,7 +511,9 @@ impl Core {
         let self_tx = tx.clone();
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
-        let runner = std::sync::Arc::new(AcpStepRunner::new(tx.clone()));
+        // The runner knows the store it serves (codex round 8): the database's canonical parent is
+        // the daemon's operational state home, fenced on every launch — snapshot or not.
+        let runner = std::sync::Arc::new(AcpStepRunner::new_for_store(tx.clone(), &path));
         // Share the maps and write registry already inside the runner so the actor and the
         // ACP execution layer use a single consistent lock.
         let actor_maps = runner.elicitation_maps().clone();

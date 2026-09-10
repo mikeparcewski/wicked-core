@@ -15,6 +15,295 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Skills snapshot on both worker paths (#396)** — the engine consumes one skills input,
+  `WICKED_SKILLS_SNAPSHOT` (the ABSOLUTE path of a crew-published, immutable garden-shaped plugin
+  root; pinned to its canonical real path — relative paths and symlinks at ANY component, the last
+  included, are config errors: crew resolves `current` before the handoff, see review pass 6), and hands it to each
+  worker through the mechanism its CLI has, copying nothing: Claude over ACP gets it in
+  `session/new` as `_meta.claudeCode.options.plugins = [{type:"local", path}]` (merged into the
+  existing options) and the snapshot is BOUND to the cached session — every later turn of that
+  session prompts, admits, read-widens and reports against the generation it was opened with, never
+  a re-resolved `current`; wrapped Claude gets exactly one `--plugin-dir <snapshot>`, and any
+  `--plugin-dir` a `clis.toml` template carries is stripped ALWAYS (snapshot or not) with a logged
+  notice — a template is not a skills input. The snapshot joins the READ roots on both governance
+  carriers (never a write root). **The worker Read fence over crew's state home is an explicit,
+  tested denylist (design v3.1 §1)**: the snapshot lives under crew's one storage root
+  (`~/.wicked-crew/skills/snapshots/<gen>/`), which the fence denies and whose deny would beat any
+  allow, so when the handed snapshot sits exactly in that read slot the state home's blanket
+  `Read(…/**)` is replaced by the STATIC rules of the state-home registry
+  (`tests/fixtures/state-home-subtrees.json`, embedded via `include_str!` in `state_home.rs` and
+  mirrored by crew) — one rule per registered top-level entry (`core.db*`, `bus.db*`, `daemon-*`,
+  `audit.log`, `evals/**`, `project-graphs/**`, `interactive-*` …) and one per denied child of the
+  skills root (`baseline/**`, `effective/**`, `manifest.json`, `current`, `.uv-cache/**`,
+  `snapshots/.staging-*/**`, `snapshots/.tmp-*/**`); `Edit`/`Write` keep the blanket. Fail closed,
+  never widen: no runtime listing builds a rule; the launch-time listing only REFUSES — a top-level
+  entry (or a child of `skills/` other than the read slot) the registry does not classify fails
+  admission by name (`fence_check`), and a snapshot under the state home outside the slot or under
+  any other fenced directory is a config error naming both paths. Documented residuals: an entry
+  created under the state home while a session runs is fenced at the next launch (crew is that
+  directory's only writer); a generation published while a session runs is readable by that
+  session until its next launch (v3.3 — see review pass 4 below; sibling generations are DENIED). The
+  published index is VERIFIED at load (every component from the root down — `.claude-plugin/`,
+  `plugin.json`, `snapshot.json`, `skills/`, each skill directory, each `SKILL.md` — is lstat-checked
+  not to be a symlink and read without following one (`O_NOFOLLOW` on unix); a `skills -> /outside`
+  link is refused at `skills`; `portable` is required; all defects are listed in one error); the
+  live-cache fallback skips a nameless `SKILL.md` with a `skills.notice` instead of deriving an
+  identity. Admission judges EXISTENCE plan-wide (the run's `skill_ref`s via
+  `StepInput.required_skills`, expanded through transitive frontmatter/index `mandates`; a missing
+  skill of ANY family is refused by name — no family is exempt, the snapshot is the worker's only
+  skills source) and INVOCABILITY per seat (v3.1 §5: only the skills THIS unit's seat invokes are
+  judged — a NESTED skill is refused for a Claude seat, since Claude Code discovers plugin skills one
+  directory deep and names them by directory (verified against the live roster: 92/92 top-level
+  garden dirs, 0/50 nested), a `portable: false` skill for every non-Claude seat — so a Codex unit
+  is not refused because a Claude unit elsewhere needs a non-portable skill, nor a Claude unit
+  because a mirror seat uses a nested one). **Design v3.2: skills reach a non-Claude seat ONLY
+  through a per-launch, wicked-owned lever, decided off the binary the launch actually runs** —
+  pi: `--no-skills` + one `--skill <snapshot>/skills/<dir>` per portable skill; copilot:
+  `--add-dir <snapshot>/views/copilot` (crew publishes that view; a generation without one has no
+  copilot lever); opencode 1.17: `OPENCODE_CONFIG_CONTENT.skills.paths` composed WITH the seat's
+  governance content (verified in the installed binary); codex 0.153 and any ACP bridge that is a
+  separate program (`pi-acp`, `codex-acp`): no lever. No lever ⇒ no skills, never a side channel: a
+  unit that invokes a skill on such a seat is REFUSED naming the skill and the reason
+  (`SkillsError::NoLever`), and nothing wicked does writes into `~/.codex`, `~/.pi`, `~/.copilot`,
+  `~/.config/opencode` or `~/.claude` (pinned by a test that launches every seat against fake copies
+  of those trees). The skill directive is CLI-aware (`wicked-garden:<top-level dir>` + the Skill-tool
+  clause for Claude; the mirrored frontmatter name, no Skill-tool clause, for a seat with a lever;
+  a "NOT loaded" form for a seat without one). **Exactly one input (v3.1 §2)**: `WICKED_SKILLS_SNAPSHOT`
+  unset → the live installed plugin cache with a `skills.fallback` log (never the hand copy; the
+  fallback sits inside the `~/.claude` fence and says so with a notice); set-but-EMPTY or invalid →
+  config error; a final-component link (`current`, dangling or not) is a config error naming its
+  target. `WICKED_SKILLS_CURRENT` is withdrawn — crew resolves `current` and passes the
+  concrete generation. **Session-specific ACP configuration (v3.1 §3)**: the shared worker-home
+  `settings.json` carries only the launch-independent fence (every fenced directory except the
+  state home), written atomically; each session's fence rides its own `session/new`
+  `_meta.claudeCode.options` (`disallowedTools`, merged by the bridge; `settings` = a per-session
+  file at `<worker home>/sessions/<run_id>-<cli_key>/settings.json`, created fresh per launch,
+  tmp+rename, reaped with the run) — never a shared mutable file two launches can race on.
+  **Cached session first (v3.1 §4)**: a cached ACP session is admitted against the snapshot it was
+  opened with (`proc.skills`) BEFORE any ambient resolution; only a fresh session resolves
+  `current` — so a `current` that moves to a generation dropping a skill the pinned one has does
+  not refuse the cached session's next turn. New `CoreEvent::SkillsSnapshotHanded`
+  (`skillsSnapshotHanded`: session/ord/attempt/path/cli/gen/contentHash/root/source) reports the
+  generation each launch used (every seat with a delivery, not only Claude) so crew can reap old
+  generations safely. Tests: env mutation across the crate serializes on one crate-wide lock; the
+  ladder's tests compare paths as `Path`s (the Windows separator-spelling failure); two-generation
+  concurrency is exercised with barrier-released threads on both carriers, reading the per-session
+  settings files the fake bridge received. **Review pass 3 (codex round 3 on #399):** the fence
+  follows the ACTUAL state home — derived from the snapshot's own path
+  (`<state home>/skills/snapshots/<gen>`, three components up; `state_home::of_snapshot`) — in
+  round 3 also required to agree with an explicit `WICKED_CREW_STATE_HOME` when the daemon passed
+  one (crew#480); that companion variable is RETIRED in review pass 6 (design v3.4 §2) — never from a `.wicked-crew`
+  basename, so a scratch daemon's `/private/tmp/crew-state` has ITS sibling stores classified and
+  fenced by the registry (unclassified ⇒ refused by name) while the default `~/.wicked-crew` keeps
+  its blanket; a snapshot without that shape is a config error at load. The copilot view is
+  VERIFIED at admission: `views`, `views/copilot`, `.github`, `.github/skills`, each required
+  skill's dir and `SKILL.md` are lstat-walked (a symlink anywhere ⇒ config error, even for a unit
+  invoking nothing — the launch would still `--add-dir` it), and every skill the seat invokes must
+  be present in the view with a matching frontmatter `name` — an empty or partial view ⇒
+  `SkillsError::Missing` naming the skills. Per-session ACP settings are collision-free: each
+  launch gets `<worker home>/sessions/<run>-<cli>-<pid>-<seq>/` via an exclusive `create_dir`
+  (EEXIST ⇒ a fresh suffix; never removing another launch's directory), the owning `AcpProcess`
+  reaps only its own directory on drop, and ids that sanitize alike (`campaign:one` /
+  `campaign_one`) cannot collide. A malformed `OPENCODE_CONFIG_CONTENT` (not a JSON object, or a
+  `skills`/`skills.paths` that cannot take the paths) FAILS the launch on both carriers
+  (`SkillsError::LeverConfig`, the unit refused by name — never composed onto a bare document);
+  the ACP carrier refuses before spawning rather than falling back. Directory levers (pi
+  `--skill`, opencode `skills.paths`, scanned recursively) never deliver a portable parent whose
+  directory nests a non-portable skill — its portable descendants are delivered on their own paths
+  and a non-Claude unit invoking the parent is refused (`SkillsError::NestsNonPortable`, parent and
+  child named). Frontmatter is parsed with YAML semantics (`serde_yaml`): `name: x # comment` is
+  `x`, `mandates: [a, b] # comment` is two mandates, quoted scalars/block lists/flow lists all
+  read; an unterminated flow list, a tab in indentation, an unterminated block or a non-string
+  `name` is a config error naming the file (the live walk skips it with a notice). The Windows
+  clippy `unused_mut` in `private_dir` is gone (`private_dir_builder` has one body per `cfg`).
+  Live evidence is now POSITIVE INVOCATION on both carriers, `#[ignore]`d and opt-in
+  (`WICKED_SKILLS_LIVE_TEST=1`): `tests/skills_live.rs` launches the real `claude --plugin-dir
+  <fixture>` with the unit's `skill_ref` set and asserts exit `Ok` plus the fixture skill's unique
+  marker in the output; `acp_runner::tests::the_real_acp_bridge_…` drives the real
+  `claude-agent-acp` through the real `AcpStepRunner` (`session/new` with the plugins option, then
+  the prompt) and asserts the same marker in the streamed output. **Review pass 4 (codex round 4
+  on #399; design amendment v3.3):** the handed generation is the ONLY readable path under the state
+  home — `skills/snapshots/` is the one directory listed at launch to BUILD rules, one deny per
+  sibling entry (every other generation, every `.staging-*`/`.tmp-*` entry; in addition to the
+  static registry rules), failing closed on an unlistable slot or an entry that is neither a
+  generation directory (a real directory named by decimal digits, as crew publishes them) nor a
+  recognised staging name — round 3 left every sibling generation readable, which the fence test
+  now asserts the opposite of; residual: a generation published while a session runs is readable by
+  that session until its next launch. Path hygiene everywhere a persisted spelling is joined (v3.3
+  §3): an index entry's `name` (joined onto the copilot view) and `dir` (onto `skills/`) and every
+  view entry must be safe relative segments — no absolute, drive (`C:/x`), verbatim/UNC (`\\?\…`,
+  any backslash), `.`/`..` or extra separators — refused at index verification, all defects listed;
+  after every join the lstat-walked path must also canonicalize INSIDE its root before it is read.
+  The copilot view is validated as a WHOLE tree (v3.3 §2): every entry of `views/copilot/.github/skills/`
+  must be an indexed PORTABLE skill whose `SKILL.md` name matches, no symlink anywhere below the
+  view, no stray file, no unindexed or non-portable entry, no Claude-only child nested inside a
+  copy — each refuses the launch by name as a config error, whether or not the unit invokes a skill
+  (the launch `--add-dir`s the whole view). The recursive-nesting restriction
+  (`SkillsError::NestsNonPortable`) applies only to the levers that hand over ORIGINAL directories
+  (pi `--skill`, opencode `skills.paths`); copilot is judged on its published view (a copy that
+  excludes the non-portable child admits the parent), and a lever-less seat gets `NoLever`. ONE
+  admission policy for fresh and cached ACP sessions (`skills_snapshot::admit_turn`): a cached
+  session is judged against its pinned generation (the round-4 rule that the inherit-config escape
+  hatch bypassed admission is reversed in review pass 6 — the hatch bypasses nothing). The shared
+  worker-home settings writer's temp files are `settings.json.<pid>.<seq>.tmp`
+  and the sweep removes only THIS process's leftovers — never another engine process's in-flight
+  temp, whose rename it would otherwise race. Windows CI: the acp_runner test scratch helper is
+  platform-independent (a non-`cfg(unix)` test used a `cfg(unix)` helper and the lib tests did not
+  compile). **Review pass 5 (codex round 5 on #399):** the live-cache FALLBACK root is contained
+  before it is traversed — `root` and `root/skills` are lstat-checked (no symlink component) and
+  every indexed entry must canonicalize inside the root — so a `skills -> /outside` link in the
+  installed plugin is REFUSED as a fallback (`SkillsError::Fallback`, naming the root), never
+  indexed (round 4 lstat-checked only the children and handed an external tree's paths to
+  pi/opencode); enumeration errors in the live walk propagate instead of reading as "no skills".
+  The copilot view is enumerated from `views/copilot` ITSELF: it may hold exactly `.github`, which
+  may hold exactly `skills`; any other file, directory or symlink at either level
+  (`views/copilot/leak`, `.github/copilot-instructions.md`, `.github/workflows`) refuses the launch
+  by name, since the whole directory is what `--add-dir` delivers (round 4 started at
+  `.github/skills`). A cached ACP session that was opened WITHOUT a snapshot (`proc.skills =
+  None`, no root on the ladder then) is told apart from a fresh launch (`skills_snapshot::Turn::
+  {Fresh, Cached(Option<_>)}`): a skill-bearing turn on it is REFUSED (`SkillsError::NotDelivered`,
+  naming the skills and advising a fresh session) instead of admitted off the ambient configuration
+  — the plugin reaches a session only at `session/new`, so round 4 admitted such a turn, sent no
+  handshake and still generated the invocation directive; a skill-free turn on it still runs, and a
+  fresh session under the now-available snapshot is handed it. The shared worker-home
+  `settings.json` is REPLACED, never unlinked first: the pid/seq temp is `rename`d over the target
+  (atomic; a planted link is replaced as a link), so a concurrent reader in another engine process
+  or a running CLI sees the previous or the new file and never none, and a failed write leaves the
+  previous content — only a planted non-file, non-link entry (a directory) is cleared beforehand.
+  Test hygiene: every test reading the inherit-config escape hatch or HOME through
+  `inject_isolation_flags`/`deny_rules` now holds the crate-wide env lock (read side) — the
+  round-4 plugin-flag regression raced the ACP test pinning `WICKED_WORKER_INHERIT_OPERATOR_CONFIG`
+  — and the Unix-only recording-bridge helpers (`EnvPin`, `ledger_entries`) are `#[cfg(unix)]`, which
+  is what failed the round-4 Windows clippy job (`dead_code` under `-D warnings`). **Review pass 6
+  (codex round 6 on #399; design amendment v3.4 §2):** the engine input is EXACTLY ONE variable —
+  `WICKED_CREW_STATE_HOME` (round 4's "passed alongside" state home) is RETIRED and not read
+  anywhere; the state home is derived from `WICKED_SKILLS_SNAPSHOT`'s fixed layout alone
+  (`<state home>/skills/snapshots/<gen>`: parent literally `snapshots`, grandparent literally
+  `skills`, else a config error naming the path; the subtree registry fixture is unchanged;
+  documented residual: a custom state home is fenced only through a snapshot handed from it —
+  crew#480's `engine-env.ts` stops exporting the variable). The inherit-config escape hatch
+  bypasses NOTHING of the skills contract: admission runs under it unchanged (an invalid explicit
+  snapshot is a launch error, a missing required skill a refusal by name, a cached session that
+  never received a plugin still refuses a skill turn), the snapshot is still handed
+  (`--plugin-dir` / `session/new` plugins) and a template `--plugin-dir` is still stripped with a
+  notice — the hatch decides only whether the operator's ambient configuration is inherited IN
+  ADDITION (the isolation flags / the engine-minted worker home are what it withholds). EVERY
+  component of the snapshot path, the LAST included, must be a real directory: a handed `current`
+  link (dangling or not) is a config error naming the link, its target and the real path to pass
+  — crew resolves `current` before the handoff, so a fresh launch can never change generation
+  between two units of one run. Snapshot IDENTITY is verified: `snapshot.json.gen` must equal the
+  generation directory's name (numerically — crew zero-pads the directory), the directory must be
+  a generation name, `contentHash` and `gardenSource` (`{kind, path, plugin_version, baseline}`,
+  crew's field names) are REQUIRED, and the generation the engine REPORTS (`skills.snapshot gen=`,
+  `SkillsSnapshotHanded.gen`) is the verified directory name, never the index's unverified claim;
+  a skill is keyed by its frontmatter `name` ONLY — an index `name` that is not the path-derived
+  name (`wicked-garden-<dir joined by ->`) is a load-time defect naming both, never an alias
+  (rounds 1–5 resolved a ref by the derived name too). The state-home fence checks each
+  classified top-level entry's ACTUAL kind (lstat) against the registry's declared kind — a
+  directory named `audit.log` or `daemon-x`, a file named `evals`, a symlink of any classified
+  name (`skills`, `audit.log`) — and refuses the launch naming the entry, since the rule emitted
+  follows the declared kind and would otherwise leave the entry uncovered. The run-wide skills
+  EXISTENCE admission runs before the FIRST unit of ANY kind: a TOOL-COMMAND unit is admitted
+  (`skills_snapshot::admit_plan`, off the actor thread, same ladder and refusal shape) before its
+  command executes, so a run whose later agent unit names a missing skill fails at unit 1 without
+  the command mutating anything (`tests/skills_plan_admission.rs` drives a real `Core`). Both
+  carriers have DETERMINISTIC, normally-executed, no-network integration coverage: wrapped — a
+  fake `claude` first on PATH recording its argv, a REGISTRY seat whose template carries the
+  stop-gap `--plugin-dir`, exactly one `--plugin-dir` (the snapshot) with the registry's stripped,
+  with and without the hatch; ACP — the recording bridge (stdio JSON-RPC echoing `session/new`)
+  through the real `AcpStepRunner`, `_meta.claudeCode.options.plugins == [{type: local, path}]`
+  merged beside `disallowedTools` and `settings`; the live `#[ignore]` tests remain opt-in extras.
+  **Review pass 7 (CI on pass 6 + Copilot):** the loader reads a snapshot row's `dir` as crew
+  writes it — PLUGIN-relative, `skills/<dir>` (crew's row validator requires the prefix) — and
+  strips the prefix for the engine's under-`skills/` key; a row without it is a config error
+  naming crew's spelling (rounds 1–6 read the field as already relative to `skills/`, so a real
+  generation would have failed to load at its first skill — found while building the hermetic
+  e2e fixture). `tests/domain_extraction_e2e.rs` is hermetic: `setup` publishes a crew-shaped
+  fixture generation (`tests/support/skills_snapshot_fixture.rs`: gen == directory, 64-hex
+  `contentHash`, `gardenSource`, `venv`, rows with `dir: skills/<…>`/`portable`/`nested`, the
+  `views` block, `skills/<dir>/SKILL.md` per referenced name) under a canonical per-process
+  temp state home and hands it via `WICKED_SKILLS_SNAPSHOT` in its set-once block — the runs
+  passed locally only because the ladder's fallback found the developer's installed garden, an
+  ambient dependency a hermetic CI runner does not have — and both governed-run tests assert from
+  the run's events that generation `000001` was the one admitted: a TOOL-COMMAND unit's
+  plan-wide admission now reports the verified generation it judged the plan by as
+  `SkillsSnapshotHanded { path: "tool_cmd", cli: "tool" }` (crew's ledger pins the generation
+  for the session from its first unit; `admit_plan` returns the admitted root). Copilot:
+  `attach_skills_plugin` de-duplicates by canonical path (the same snapshot already in
+  `plugins` — identical or another spelling of the same real directory — gains no second entry;
+  the ACP twin of the single `--plugin-dir`); `parse_registry` refuses a non-string
+  `denied_children` entry or a non-array `denied_children` (never a silently narrower fence);
+  `tests/skills_live.rs` pins its variables with an RAII guard restored on panic;
+  `PersistentStepRunner::exec_turn` resolves the session invocation ONCE and passes it to both
+  the argv and the skill form (the docstring's single-resolution guarantee now holds by
+  construction). **Review pass 8 (windows CI on pass 7):** the integration tests compare the
+  generation an engine refusal/event names by canonical IDENTITY (`names_generation`,
+  `refused_snapshot_path` in `tests/support/skills_snapshot_fixture.rs`), never by spelling — the
+  windows runner's `temp_dir()` (an 8.3 short name) and `canonicalize` (which keeps the `\\?\`
+  verbatim prefix) spell one directory differently from the engine's `\\?\`-free canonical form.
+  **Review pass 9 (codex round 8 REJECT + windows CI on pass 8):** worker isolation is MANDATORY
+  — a registry template that states `--setting-sources` or `--permission-mode` (either spelling)
+  is a config error naming the template and the flag (`isolation_refusal`; rounds 1–7 deferred to
+  it), a template's own `--disallowedTools` is UNIONED into the engine's single deny flag, and the
+  deny fence is injected even under the inherit-config hatch (which withholds only the two
+  scope/mode flags) — on both carriers (ACP: `disallowedTools` rides the frame under the hatch;
+  `settingSources: ["project","local"]` is SET on every non-hatch `session/new`, the ACP analog
+  of `--setting-sources`). Every `--plugin-dir` in the BUILT argv (placeholders expanded) is
+  stripped except the prompt token, and exactly one (the snapshot) is asserted, else refused.
+  `.venv` containment: every component of `<state_home>/skills/baseline/<64-hex>/.venv` is
+  lstat-checked (no link but the snapshot-root `.venv` itself), the link's target is resolved
+  lexically (crew's relative spelling) and must END exactly at `<64-hex>/.venv`; the state-home
+  fence refuses any symlink among the skills root's children except `current`, and requires the
+  read slot to be a real directory. The live-cache FALLBACK gets the same fail-closed whole-tree
+  containment as a published generation (any symlink, an unreadable/non-UTF-8/nameless
+  `SKILL.md`, a link under the support tree ⇒ `Ladder::Failed` with the reason; `SkillsError::
+  Fallback` is gone). The engine's OWN operational state home — the canonical parent of the
+  database it was spawned on (crew's `stateHomeOfDb`; no environment input, v3.4 §2 stands) — is
+  fenced on EVERY launch (blanket without a snapshot, registry with one from it) and kept out of
+  the shared worker-home file: `AcpStepRunner::new_for_store` / `WrappedCliStepRunner::
+  with_tx_for_store` carry it; `admit_turn`/`fence_check`/`deny_rules` take it. The persistent
+  PTY carrier REFUSES skill-bearing units by name (`SkillsError::CarrierWithoutSkills`) and never
+  emits a directive (ADJUDICATED: it has no snapshot lever). The two live `#[ignore]` tests use
+  ISOLATED state (`WICKED_SKILLS_LIVE_CLAUDE_CONFIG_DIR`, `WICKED_SKILLS_LIVE_WORKER_HOME` —
+  refused when they resolve to the operator's real dirs), and the load+invoke proof stays
+  adjudicated to the integrated functional test. Windows CI: the plan-admission test's tool
+  command is spelled for `cmd.exe` (no `\\?\` verbatim prefix). **Review pass 10 (windows clippy
+  on pass 9 + crew fixture mirror, v3.5 §2 + codex round 9 REJECT):** the worker fence FAILS
+  CLOSED on a protected directory the rule syntax cannot spell — a comma, a POSIX backslash, a
+  non-UTF-8 component ⇒ the launch is refused naming the directory and the character, on the
+  argv, in the settings file, in the shared worker-home file, and under the inherit hatch (rounds
+  1–8 logged and skipped it). The state-home registry is crew's fixture byte for byte: every
+  settled AND transient name the store can create under `skills/` (`.staging-*`,
+  `manifest.json.tmp-*`, `refused/`, `snapshots/.staging-*`, `snapshots/.tmp-current-*`) with its
+  declared kind (`denied_children_kinds`, required to cover the children exactly); the launch-time
+  listing of the skills root and of the read slot classifies each child by pattern AND lstat kind
+  (a `current` that is a directory, a `.staging-*` that is a file, a `.tmp-current-*` that is not
+  a link, an unknown name ⇒ refused; a parked publish's transients ⇒ admitted and denied). A
+  set-but-empty `WICKED_SKILLS_SNAPSHOT` stays a config error naming the variable (v3.5 §4). The
+  persistent PTY carrier refuses PLAN-WIDE: a run with any skill-bearing unit is refused at its
+  first unit (`StepInput::required_skills`), before any session opens. ACP cleanup never swallows
+  errors (a failed session-dir removal is logged; an unlistable worker home is an error). Documented
+  residual (ADJUDICATED): codex has no lever and no engine-minted worker home — it runs under the
+  operator's own `~/.codex`, which v3.2 forbids touching — so "no lever ⇒ no skills" means wicked
+  delivers nothing and refuses skill-bearing codex units by name; `CODEX_HOME` isolation is
+  core#400. Windows: the two test-module wrappers used only by Unix tests are `#[cfg(unix)]`, and
+  the cfg audit ignores path-qualified and commented mentions (it had missed exactly those two).
+  **Review pass 11 (confirmation review, one wire mismatch + one Copilot thread):** the snapshot's
+  `.venv` link is BOUND to its metadata as crew's `verifyCurrent` binds it — the link's `<64-hex>`
+  must equal `snapshot.json.gardenSource.baseline` (a link into another, equally valid baseline
+  env is refused naming both hashes), the link may exist only when `snapshot.json.venv` is
+  `synced` (present while `skipped`/`pending`/`failed` ⇒ refused), and a `synced` generation
+  without the link is refused too; `gardenSource.baseline` must be a sha256 content hash and
+  `venv` one of crew's four states, both required at load (`SkillsSnapshot::{baseline, venv}`).
+  The gate-hook wiring audit matches the stable prefix of the `assemble_read_roots` call, not
+  rustfmt's trailing comma. **Review pass 12 (one Copilot thread):** every containment and
+  identity comparison in the worker fence goes through ONE canonical spelling
+  (`state_home::canonical_spelling`: canonicalize + the Windows `\\?\` verbatim prefix dropped)
+  and a whole-component prefix check (`under_spelled`) — `base_under` compared a simplified
+  snapshot root against an UNSIMPLIFIED canonical denied directory, so on Windows a root under a
+  denied directory could escape and `fence_check` failed to refuse (fail-open on that OS only);
+  the `.venv` link's absolute target is simplified before its lexical check too. Unit-tested with
+  Windows-shaped spellings on every OS.
 - **Operator-authored `effect` in markdown steering rules + eval rule coverage (#395, #394).**
   The markdown doc lane gains the enforcement half of a steering rule: a frontmatter
   `effect: deny|warn|allow` key (rides onto every rule the doc mints) plus per-rule `effect:`
