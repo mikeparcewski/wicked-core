@@ -215,6 +215,10 @@ pub(crate) enum Command {
     ApplyStepResult {
         output: StepOutput,
         agent_verdict: Option<(bool, String)>,
+        /// Engine-derived evidence gathered on the worker thread after the seat's work (F-036
+        /// worktree guard outcome, F-039 repo-checks report) — folded into the gate beside the
+        /// output. `Default` (nothing gathered) for Tool units and pre-evidence payloads.
+        evidence: crate::workflow::UnitEvidence,
         /// Process-generation token from the dispatching Core instance (DES-002 stale-result guard).
         #[allow(dead_code)] // used by bus consumer path added in T6/T7
         process_gen: Option<uuid::Uuid>,

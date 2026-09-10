@@ -353,6 +353,7 @@ mod tests {
                 home: None, // no `~` paths in this test; the carve-out is out of scope here
                 claude_config_dir: None,
                 pre_build_scope: false, // a build-phase unit: the FILESYSTEM boundary is what is on trial here
+                no_code_scope: false,
             })
         };
 
@@ -456,6 +457,7 @@ mod tests {
                 home: None,
                 claude_config_dir: None,
                 pre_build_scope,
+                no_code_scope: false,
             })
         };
         // 1. THE REPORTED BUG: a recon phase writing production code into its own worktree.

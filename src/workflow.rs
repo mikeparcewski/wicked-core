@@ -237,6 +237,27 @@ pub struct StepOutput {
     pub governed: bool,
 }
 
+/// Engine-derived EVIDENCE about a finished unit, gathered on the WORKER thread after the seat's
+/// work and carried to the gate fold beside the [`StepOutput`] (`Command::ApplyStepResult`, the
+/// bus `task.completed` payload). Two instruments today:
+///
+/// * [`worktree_guard`](Self::worktree_guard) — F-036: for an `executes_code: false` unit of a
+///   bound run, whether the tree it worked in is byte-identical to the one it was handed. `None`
+///   for an unguarded unit; for a GUARDED one the fold treats `None` as fail-closed (the guard
+///   never ran), never as clean.
+/// * [`repo_checks`](Self::repo_checks) — F-039: for the def's code-verifying unit, the
+///   repository's own checks the engine ran in the worktree, with exit codes and output tails.
+///
+/// `Default` = nothing gathered — the shape a Tool unit, a failed unit, or a pre-evidence bus
+/// payload arrives with. Serde-`default` on every field so older payloads parse.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_guard: Option<crate::worktree_guard::WorktreeGuardOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_checks: Option<crate::repo_checks::RepoChecksReport>,
+}
+
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`
 /// can carry an `amend` that is appended to the next unit's instruction (redirect the work).
 #[derive(Debug, Clone)]
@@ -498,9 +519,9 @@ pub struct PhaseDef {
     /// [`validator_pin`](PhaseDef::validator_pin) — `attach_pinned_validators` loads it and the
     /// gate re-runs it (layers 1+2). This field has no other reader, so a phase declaring the flag
     /// with no pin was a control that looked armed and gated nothing (`feature`'s `test` phase
-    /// shipped exactly that way). [`WorkflowRegistry::register`] therefore pins the built-in
-    /// evidence floor onto any `verified_evidence` phase that names no validator of its own —
-    /// see [`enforce_verified_evidence`].
+    /// shipped exactly that way). [`WorkflowRegistry::register`] therefore REFUSES a
+    /// `verified_evidence` phase that names no validator (the def is judged as authored — codex
+    /// review on #414); the author pins the built-in evidence floor or a validator of their own.
     #[serde(default)]
     pub verified_evidence: bool,
     /// Deliverables that MUST be present for the structural gate check (fail-closed if missing).
@@ -640,6 +661,20 @@ pub enum WorkflowDefError {
         phase: String,
         dep: String,
     },
+    /// An `executes_code` agent phase whose gate would evaluate NOTHING (F-039): no
+    /// `validator_pin` (so neither the deterministic floor nor the agent judge can run) and no
+    /// human gate. Its gate would fold `combined: true` over an empty evaluation — the exact
+    /// record a governed `bug/fix` produced (`agentVerdict: None, hasDeterministicFloor: false,
+    /// evaluatorPolicies: []`). Refused at registration; the message names the phase and every
+    /// remedy. `workflow::ungated_code_phases` is the pure lint a consumer can run first.
+    GateEvaluatesNothing {
+        phase: String,
+    },
+    /// A phase declares `verified_evidence` but pins no validator — the declaration has no other
+    /// reader, so as authored it would gate nothing (FINDING-055). Refused at registration.
+    UnverifiedEvidence {
+        phase: String,
+    },
 }
 
 impl std::fmt::Display for WorkflowDefError {
@@ -654,6 +689,23 @@ impl std::fmt::Display for WorkflowDefError {
                 f,
                 "phase {phase} depends on {dep}, which is not declared before it \
                  (declaration order must be execution order — dependencies point backward)"
+            ),
+            WorkflowDefError::GateEvaluatesNothing { phase } => write!(
+                f,
+                "gate evaluates nothing: {phase} — the phase declares executes_code but pins no \
+                 validator and has no human gate, so its gate would approve with nothing \
+                 checked. Pin the built-in evidence floor (validator_pin \"{}\" — the run left \
+                 a change in its worktree, judged by a seat distinct from the creator), pin a \
+                 phase-specific validator, or gate the phase with human_confirm",
+                crate::builtin_floors::EVIDENCE_FLOOR_PIN
+            ),
+            WorkflowDefError::UnverifiedEvidence { phase } => write!(
+                f,
+                "verified_evidence declared but nothing pinned: {phase} — the flag's only reader \
+                 is validator_pin, so as authored the phase would be re-verified by nothing. Pin the \
+                 built-in evidence floor (validator_pin \"{}\"), pin a phase-specific validator, or \
+                 drop the flag",
+                crate::builtin_floors::EVIDENCE_FLOOR_PIN
             ),
         }
     }
@@ -731,66 +783,22 @@ impl WorkflowRegistry {
         }
         r
     }
-    /// Register (or replace) a workflow. Validates before inserting.
-    ///
-    /// A replacement may change anything about a workflow EXCEPT quietly ungating it — see
-    /// [`carry_shadowed_pins`](WorkflowRegistry::carry_shadowed_pins) — and a phase that declares
-    /// `verified_evidence` is armed with a real verifier — see [`enforce_verified_evidence`].
-    /// Order matters between the two: shadowed pins are carried forward FIRST, so a replacement
-    /// that dropped a phase-specific pin gets that pin back rather than the generic floor.
+    /// Register (or replace) a workflow. Validates before inserting — and judges the def exactly
+    /// as authored: an `executes_code` phase whose gate evaluates nothing, or a `verified_evidence`
+    /// phase with no pin, is refused (see [`refuse_ungated_code_phases`] and
+    /// [`refuse_unpinned_verified_evidence`]); nothing is injected or restored on the way in.
     pub fn register(&mut self, def: WorkflowDef) -> Result<(), WorkflowDefError> {
         def.validate()?;
-        let def = self.carry_shadowed_pins(def);
-        let def = enforce_verified_evidence(def);
+        // A def is judged AS AUTHORED (codex review on #414): nothing is injected or restored
+        // at load. A same-id replacement that drops a shipped pin, or a `verified_evidence` phase
+        // with no pin, is REFUSED with the phase named — never silently repaired into a gate
+        // nobody chose. The shipped defs pin their gates explicitly.
+        refuse_ungated_code_phases(&def)?;
+        refuse_unpinned_verified_evidence(&def)?;
         self.defs.insert(def.id.clone(), def);
         Ok(())
     }
 
-    /// A replacement may not silently REMOVE a `validator_pin` the definition it shadows carried.
-    /// Where the incoming phase has no pin and the shadowed one did, the pin is carried forward and
-    /// the substitution is announced.
-    ///
-    /// This exists because replacement is silent and the loss is invisible. `register` overwrites by
-    /// id, `load_dir` runs AFTER `with_defaults`, and both the drop-in dir and the runtime
-    /// `RegisterWorkflow` path funnel through here — so anything re-registering a built-in id
-    /// replaces the shipped def wholesale, and a mirror of that def written before the floors existed
-    /// takes the gates back out with no error, no warning, and a workflow that still reports the
-    /// right id and phases. Observed exactly that way: `~/.config/wicked-core/workflows/feature.json`
-    /// written by a consumer's hand-transcribed copy, `adversarial-review` role `evaluator`,
-    /// `validator_pin: null` — the evidence floor shipped in the built-in and never engaged for the
-    /// one caller that matters.
-    ///
-    /// A gate is a floor, so the safe direction is unambiguous: keep it. Everything else in the
-    /// replacement still applies, which is what a legitimate shadow is actually for (the onboarding
-    /// drop-in, for instance, exists to bake runtime-resolved executor paths). Deliberately dropping
-    /// a gate is still available — under a NEW id, which is what `gate-phase` already does and what
-    /// the warning points at. Changing a pin is untouched: only a phase with NO pin inherits one.
-    fn carry_shadowed_pins(&self, mut def: WorkflowDef) -> WorkflowDef {
-        let Some(shadowed) = self.defs.get(&def.id) else {
-            return def;
-        };
-        for phase in def.phases.iter_mut() {
-            if phase.validator_pin.is_some() {
-                continue;
-            }
-            let Some(pin) = shadowed
-                .phases
-                .iter()
-                .find(|p| p.id == phase.id)
-                .and_then(|p| p.validator_pin.as_deref())
-            else {
-                continue;
-            };
-            eprintln!(
-                "wicked-core: workflow `{}` was re-registered without the validator pin that phase \
-                 `{}` carried ({}); KEEPING the pin — a replacement may change a gate but not \
-                 silently remove one. To run this phase ungated, register under a different id.",
-                def.id, phase.id, pin
-            );
-            phase.validator_pin = Some(pin.to_string());
-        }
-        def
-    }
     /// Overwrite one phase's `validator_pin` on a registered def. Returns false when the workflow or
     /// phase is absent.
     ///
@@ -883,55 +891,66 @@ impl WorkflowRegistry {
     }
 }
 
-/// A `verified_evidence` phase must be able to DELIVER the re-verification it declares
-/// (FINDING-055).
+/// An `executes_code` AGENT phase must have a gate that evaluates SOMETHING (F-039).
 ///
-/// The flag's contract — "the phase verdict requires re-verified evidence" — is delivered by
-/// exactly one mechanism: a [`validator_pin`](PhaseDef::validator_pin), which
-/// `attach_pinned_validators` loads and the gate re-runs (layers 1 + 2). The flag itself has no
-/// other reader anywhere in the engine, so a phase declaring it with no pin was a control that
-/// looked armed and gated nothing — `feature`'s `test` phase shipped exactly that way, while its
-/// siblings (`bug`/`verify`, `migration`/`verify`, `domain-extraction`/`coverage`) all pair the
-/// flag with a pin.
+/// The gate layers keyed off `validator_pin` (the deterministic floor and the agent judge) are
+/// both inert without one, and the evaluator≠creator policy pass default-allows on an empty
+/// selection — so an auto-gated code phase with no pin folds `combined: true` over nothing
+/// evaluated. That is what a governed `bug/fix` recorded: `agentVerdict: None,
+/// hasDeterministicFloor: false, evaluatorPolicies: [], combined: true`. The phase whose entire
+/// job is to change the code was the one phase nothing judged.
 ///
-/// Enforced here because [`WorkflowRegistry::register`] is the choke point every def crosses on
-/// its way to the engine: `with_defaults` (built-ins), `load_dir` (drop-ins), and the runtime
-/// RegisterWorkflow path all funnel through it — the same property `carry_shadowed_pins` leans on.
-/// Only `def_from_file` (the explicit lint read) sees a def before this runs.
-///
-/// The fail-closed direction is to make the declaration TRUE rather than delete it: a flagged
-/// phase with no pin of its own gains the built-in evidence floor
-/// ([`crate::builtin_floors::EVIDENCE_FLOOR_PIN`] — seeded on the plan path by `pre_distribute`,
-/// so the pin always resolves and `attach_pinned_validators` engages). Loudly, like every other
-/// registration-time substitution. An author who wants a phase-specific criterion pins their own
-/// validator — never overridden here (and `carry_shadowed_pins` runs first, so a shadowed
-/// phase-specific pin is restored before this could floor it).
-///
-/// Opting OUT of re-verification is scoped: dropping the flag runs the phase unverified only on a
-/// FRESH id — one with no already-registered def to shadow it. Once a phase has been floored, a
-/// SAME-id re-registration that drops the flag does NOT ungate it: `carry_shadowed_pins` runs first
-/// and carries the floor forward, because a replacement may change a gate but never silently remove
-/// one (the same rule that keeps a hand-transcribed mirror from stripping a shipped gate). The floor
-/// is a pin like any other by the time this runs, so it is indistinguishable from an author's pin
-/// and inherits that protection. The escape hatch is therefore a new id — exactly the one
-/// `carry_shadowed_pins` already documents — not a re-registration.
-/// Guarded by `dropping_verified_evidence_keeps_the_floor_on_reregistration_but_a_fresh_id_runs_unverified`.
-fn enforce_verified_evidence(mut def: WorkflowDef) -> WorkflowDef {
-    for phase in def.phases.iter_mut() {
-        if !phase.verified_evidence || phase.validator_pin.is_some() {
-            continue;
-        }
-        eprintln!(
-            "wicked-core: workflow `{}` phase `{}` declares verified_evidence but pins no \
-             validator; PINNING the built-in evidence floor so the declaration is enforced rather \
-             than silently inert (FINDING-055). Pin a phase-specific validator to replace it; to \
-             run the phase unverified, drop `verified_evidence` on a FRESH workflow id — a same-id \
-             re-registration keeps this floor (carry_shadowed_pins will not silently ungate it).",
-            def.id, phase.id
-        );
-        phase.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
+/// Satisfied by: a `validator_pin` (the shipped defs pin the built-in evidence floor onto
+/// `feature/build`, `bug/fix`, `migration/execute` — layer 1 re-derives the diff, layer 2 has a
+/// seat DISTINCT from the creator judge it), or a `human_confirm` gate (a human evaluates —
+/// `migration/cutover`). Tool phases are exempt: their exit code is their gate. Pure query — the
+/// ids of the phases that fail the rule, in declaration order — so a consumer can lint a def
+/// before registering it.
+pub fn ungated_code_phases(def: &WorkflowDef) -> Vec<String> {
+    def.phases
+        .iter()
+        .filter(|phase| {
+            let is_tool = matches!(phase.executor, PhaseExecutor::Tool { .. });
+            let human_gate = matches!(phase.gate, GateSpec::HumanConfirm { .. });
+            phase.executes_code && !is_tool && phase.validator_pin.is_none() && !human_gate
+        })
+        .map(|phase| phase.id.clone())
+        .collect()
+}
+
+/// Registration REFUSES a def with any phase [`ungated_code_phases`] names — the contract is
+/// that a workflow whose code phase would fold `combined: true` over nothing evaluated does not
+/// load. The shipped defs pin their code phases explicitly (`bug/fix`, `feature/build`,
+/// `migration/execute`); an author's def is told exactly which phase and the three remedies.
+/// Refusal rather than repair (codex review on #414): a gate silently injected at load is a gate
+/// nobody chose, and the cost of a refused def is a legible error at load — the same failure
+/// shape every other `WorkflowDefError` has. The def is judged AS AUTHORED: a same-id overlay
+/// copy that dropped a shipped pin is refused exactly like a def that never had one — nothing is
+/// carried forward or injected on the way in.
+fn refuse_ungated_code_phases(def: &WorkflowDef) -> Result<(), WorkflowDefError> {
+    match ungated_code_phases(def).into_iter().next() {
+        Some(phase) => Err(WorkflowDefError::GateEvaluatesNothing { phase }),
+        None => Ok(()),
     }
-    def
+}
+
+/// A `verified_evidence` phase must be able to DELIVER the re-verification it declares
+/// (FINDING-055): the flag's only reader is [`validator_pin`](PhaseDef::validator_pin), which
+/// `attach_pinned_validators` loads and the gate re-runs. A flagged phase with no pin used to be
+/// ARMED here with the built-in floor; a def is now judged as authored (codex review on #414) and
+/// such a phase is REFUSED by name — the author pins the floor (`validator_pin:
+/// "e2e7af1db9e48454"`) or a validator of their own, or drops the flag.
+fn refuse_unpinned_verified_evidence(def: &WorkflowDef) -> Result<(), WorkflowDefError> {
+    match def
+        .phases
+        .iter()
+        .find(|p| p.verified_evidence && p.validator_pin.is_none())
+    {
+        Some(p) => Err(WorkflowDefError::UnverifiedEvidence {
+            phase: p.id.clone(),
+        }),
+        None => Ok(()),
+    }
 }
 
 /// `feature` — clarify(value) → design(strategy) → build(execution) → adversarial-review → test → review.
@@ -986,6 +1005,7 @@ pub fn feature_def() -> WorkflowDef {
                 .gate(GateType::Execution, GateSpec::Auto)
                 .codes()
                 .role(PhaseRole::Creator)
+                .evidence_floor()
                 .after("design"),
             PhaseDef::new("adversarial-review", StageKind::Review)
                 .gate(
@@ -1026,6 +1046,7 @@ pub fn bug_def() -> WorkflowDef {
                 .gate(GateType::Execution, GateSpec::Auto)
                 .codes()
                 .role(PhaseRole::Creator)
+                .evidence_floor()
                 .after("reproduce"),
             PhaseDef::new("verify", StageKind::Test)
                 .gate(
@@ -1056,6 +1077,7 @@ pub fn migration_def() -> WorkflowDef {
                 .gate(GateType::Execution, GateSpec::Auto)
                 .codes()
                 .role(PhaseRole::Creator)
+                .evidence_floor()
                 .after("plan"),
             PhaseDef::new("cutover", StageKind::Build)
                 .gate(
@@ -1518,91 +1540,87 @@ mod workflow_def_tests {
         assert_eq!(feature.phases[0].id, "ship-it");
     }
 
-    /// FINDING-049. A drop-in that shadows a built-in must not take its gates out.
+    /// FINDING-049 → codex review on #414. A drop-in that shadows a built-in and drops its gate is
+    /// REFUSED as authored — the mirror does not replace the built-in, and `load_dir` says why.
     ///
     /// This is how the evidence floor was nullified in practice: a consumer wrote a hand-transcribed
-    /// mirror of the shipped `feature` def into the overlay dir, every phase `validator_pin: null`.
-    /// `load_dir` runs after `with_defaults` and `register` overwrites, so the mirror replaced the
-    /// gated built-in — same id, same phases, no gate, no error. The floor shipped and never engaged
-    /// for the one caller that mattered.
-    ///
-    /// The shadow still applies (that is what a drop-in is for); only the REMOVAL of a gate is
-    /// refused. Note the phase list here is the mirror's, not the built-in's.
+    /// mirror of the shipped `feature` def into the overlay dir, every phase `validator_pin: null`,
+    /// and `register` overwrote the gated built-in. The first fix carried the shadowed pin forward;
+    /// that was still a gate nobody chose. Now the mirror is rejected and the built-in stands.
     #[test]
-    fn a_drop_in_cannot_silently_ungate_the_builtin_it_shadows() {
+    fn a_drop_in_that_ungates_the_builtin_it_shadows_is_refused_and_the_builtin_stands() {
         let dir = ScratchDir::new("ungate");
         let base = feature_def();
-        let gated = base
-            .phases
-            .iter()
-            .find(|p| p.validator_pin.is_some())
-            .expect("a shipped feature phase pins the evidence floor");
-        let floor = gated.validator_pin.clone().unwrap();
-        let gated_id = gated.id.clone();
-
-        // The mirror: the shadowed phase, plus a phase of its own so the shadow is observably applied
-        // and not just ignored. Every pin null, exactly as transcribed.
+        // The mirror: the code phase with its pin stripped (exactly as transcribed), plus a phase
+        // of its own so a silent acceptance would be observable.
         dir.write(
             "feature.json",
-            &format!(
-                r#"{{ "id": "feature", "phases": [
-                    {{ "id": "{gated_id}", "kind": "review", "role": "evaluator" }},
-                    {{ "id": "mirror-only", "kind": "build" }}
-                ] }}"#
-            ),
+            r#"{ "id": "feature", "phases": [
+                { "id": "build", "kind": "build", "role": "creator", "executes_code": true },
+                { "id": "mirror-only", "kind": "build" }
+            ] }"#,
         );
         let mut reg = WorkflowRegistry::with_defaults();
-        reg.load_dir(&dir.0).unwrap();
-        let feature = reg.get("feature").unwrap();
-
-        let ids: Vec<&str> = feature.phases.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec![gated_id.as_str(), "mirror-only"],
-            "the drop-in still replaces the def — only the gate is protected"
-        );
-        assert_eq!(
-            feature.phases[0].validator_pin.as_deref(),
-            Some(floor.as_str()),
-            "the shadowed phase keeps the floor the built-in carried"
-        );
+        let loaded = reg.load_dir(&dir.0).unwrap();
         assert!(
-            feature.phases[1].validator_pin.is_none(),
-            "a phase the built-in never had gains nothing — this carries pins forward, it does not invent them"
+            !loaded.iter().any(|id| id == "feature"),
+            "the ungating mirror must not register: {loaded:?}"
+        );
+        let feature = reg.get("feature").unwrap();
+        assert_eq!(
+            feature.phases.len(),
+            base.phases.len(),
+            "the shipped built-in stands untouched"
+        );
+        assert_eq!(
+            feature
+                .phases
+                .iter()
+                .find(|p| p.id == "build")
+                .unwrap()
+                .validator_pin,
+            base.phases
+                .iter()
+                .find(|p| p.id == "build")
+                .unwrap()
+                .validator_pin
+        );
+        // The same def through the runtime registration path names the phase.
+        let err = reg
+            .register(WorkflowDef {
+                id: "feature".to_string(),
+                phases: vec![PhaseDef::new("build", StageKind::Build)
+                    .codes()
+                    .role(PhaseRole::Creator)],
+            })
+            .expect_err("refused");
+        assert_eq!(
+            err,
+            WorkflowDefError::GateEvaluatesNothing {
+                phase: "build".to_string()
+            }
         );
     }
 
-    /// The other direction: a shadow that states its OWN pin is honoured, and a fresh id inherits
-    /// nothing. Without this, "keep the gate" could have been implemented as "gates are immutable",
-    /// which would break `gate-phase` and lock operators out of their own criteria.
+    /// A shadow that states its OWN pin is honoured as authored, and a fresh id inherits nothing —
+    /// a def is taken exactly as written, gates included.
     #[test]
-    fn carrying_a_pin_forward_never_overrides_one_the_drop_in_states() {
+    fn a_drop_in_with_its_own_pin_is_taken_as_authored() {
         let dir = ScratchDir::new("ungate-own");
-        let gated_id = feature_def()
-            .phases
-            .iter()
-            .find(|p| p.validator_pin.is_some())
-            .expect("a pinned phase")
-            .id
-            .clone();
         dir.write(
             "feature.json",
-            &format!(
-                r#"{{ "id": "feature", "phases": [
-                    {{ "id": "{gated_id}", "kind": "review", "validator_pin": "operators-own-pin" }}
-                ] }}"#
-            ),
+            r#"{ "id": "feature", "phases": [
+                { "id": "build", "kind": "build", "role": "creator", "executes_code": true,
+                  "validator_pin": "operators-own-pin" }
+            ] }"#,
         );
-        // A brand-new id shadows nothing, so it stays exactly as authored.
+        // A brand-new id with a non-code phase and no pin is fine as authored: nothing to gate.
         dir.write(
             "fresh.json",
-            &format!(
-                r#"{{ "id": "fresh", "phases": [ {{ "id": "{gated_id}", "kind": "review" }} ] }}"#
-            ),
+            r#"{ "id": "fresh", "phases": [ { "id": "review", "kind": "review" } ] }"#,
         );
         let mut reg = WorkflowRegistry::with_defaults();
         reg.load_dir(&dir.0).unwrap();
-
         assert_eq!(
             reg.get("feature").unwrap().phases[0]
                 .validator_pin
@@ -1612,7 +1630,7 @@ mod workflow_def_tests {
         );
         assert!(
             reg.get("fresh").unwrap().phases[0].validator_pin.is_none(),
-            "a new id shadows nothing and inherits nothing"
+            "a fresh id carries exactly what it authored"
         );
     }
 
@@ -1684,19 +1702,179 @@ mod workflow_def_tests {
         );
     }
 
-    /// FINDING-055, the mechanism: a phase declaring `verified_evidence` with no pin of its own is
-    /// armed with the built-in evidence floor AT REGISTRATION; a phase-specific pin is never
-    /// overridden; an unflagged phase gains nothing (this is enforcement of a declaration, not a
-    /// blanket floor).
+    /// F-039: an `executes_code` agent phase with an `auto` gate and no pin would fold `combined:
+    /// true` over nothing evaluated — registration REFUSES it by name ("gate evaluates nothing:
+    /// <phase>"), the pure lint names it, and a pin / a human gate / a Tool executor each satisfy
+    /// the rule so the shipped built-ins load untouched.
     #[test]
-    fn verified_evidence_without_a_pin_is_floored_at_registration() {
+    fn a_code_phase_whose_gate_evaluates_nothing_is_refused_at_registration() {
+        let ungated = WorkflowDef {
+            id: "ungated".to_string(),
+            phases: vec![
+                PhaseDef::new("triage", StageKind::Recon),
+                PhaseDef::new("fix", StageKind::Build)
+                    .gate(GateType::Execution, GateSpec::Auto)
+                    .codes()
+                    .role(PhaseRole::Creator)
+                    .after("triage"),
+            ],
+        };
+        assert_eq!(
+            ungated_code_phases(&ungated),
+            vec!["fix".to_string()],
+            "the lint names exactly the code phase whose gate evaluates nothing"
+        );
         let mut reg = WorkflowRegistry::default();
+        let err = reg
+            .register(ungated)
+            .expect_err("a code phase with no pin and no human gate must be refused");
+        assert_eq!(
+            err,
+            WorkflowDefError::GateEvaluatesNothing {
+                phase: "fix".to_string()
+            }
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("gate evaluates nothing: fix")
+                && msg.contains(crate::builtin_floors::EVIDENCE_FLOOR_PIN)
+                && msg.contains("human_confirm"),
+            "the error names the phase and every remedy: {msg}"
+        );
+        assert!(
+            reg.get("ungated").is_none(),
+            "a refused def is not registered"
+        );
+
+        // The three ways an author satisfies the rule — each registers and is left as authored.
+        let with = |id: &str, fix: PhaseDef| WorkflowDef {
+            id: id.to_string(),
+            phases: vec![fix],
+        };
+        let own_pin = PhaseDef {
+            validator_pin: Some("authors-own-pin".to_string()),
+            ..PhaseDef::new("fix", StageKind::Build).codes()
+        };
+        let human = PhaseDef::new("cutover", StageKind::Build)
+            .gate(
+                GateType::Execution,
+                GateSpec::HumanConfirm {
+                    unconditional: true,
+                },
+            )
+            .codes();
+        let tool = PhaseDef {
+            executes_code: true,
+            ..PhaseDef::new("apply", StageKind::Build).executor(PhaseExecutor::Tool {
+                cmd: vec!["true".to_string()],
+            })
+        };
+        for (id, phase) in [("pinned", own_pin), ("human", human), ("tool", tool)] {
+            assert!(
+                ungated_code_phases(&with(id, phase.clone())).is_empty(),
+                "{id}"
+            );
+            reg.register(with(id, phase.clone())).unwrap();
+            assert_eq!(
+                reg.get(id).unwrap().phases[0].validator_pin,
+                phase.validator_pin,
+                "`{id}` satisfies the rule on its own terms and is left exactly as authored"
+            );
+        }
+        // `verified_evidence` on its own arms nothing (codex review on #414: no injection at
+        // load) — a flagged, unpinned CODE phase is still a code phase whose gate evaluates
+        // nothing, and is refused by this rule (the evidence rule would refuse it next).
+        assert_eq!(
+            reg.register(with(
+                "verified",
+                PhaseDef::new("fix", StageKind::Build).codes().verified(),
+            ))
+            .expect_err("a flag is not a gate"),
+            WorkflowDefError::GateEvaluatesNothing {
+                phase: "fix".to_string()
+            }
+        );
+        // A same-id re-registration that DROPPED a shipped pin is refused AS AUTHORED — nothing
+        // is restored behind the author's back, and the registered def stands untouched.
+        reg.register(bug_def()).unwrap();
+        let mut stripped = bug_def();
+        for p in stripped.phases.iter_mut() {
+            p.validator_pin = None;
+        }
+        assert_eq!(
+            reg.register(stripped).expect_err("refused as authored"),
+            WorkflowDefError::GateEvaluatesNothing {
+                phase: "fix".to_string()
+            }
+        );
+        assert_eq!(
+            reg.get("bug")
+                .unwrap()
+                .phases
+                .iter()
+                .find(|p| p.id == "fix")
+                .unwrap()
+                .validator_pin,
+            bug_def()
+                .phases
+                .iter()
+                .find(|p| p.id == "fix")
+                .unwrap()
+                .validator_pin,
+            "the shipped def stands"
+        );
+        // Every shipped built-in already carries its pins: the lint is silent on them.
+        for id in WorkflowRegistry::with_defaults().ids() {
+            let def = WorkflowRegistry::with_defaults();
+            assert!(
+                ungated_code_phases(def.get(&id).unwrap()).is_empty(),
+                "built-in `{id}` ships a code phase with no gate"
+            );
+        }
+    }
+
+    /// FINDING-055 → codex review on #414: a phase declaring `verified_evidence` with no pin of its
+    /// own is REFUSED at registration, naming the phase; a phase-specific pin is taken as authored;
+    /// an unflagged phase is not touched. Enforcement of a declaration by refusal, not by injection.
+    #[test]
+    fn verified_evidence_without_a_pin_is_refused_at_registration() {
+        let mut reg = WorkflowRegistry::default();
+        let err = reg
+            .register(WorkflowDef {
+                id: "declares".to_string(),
+                phases: vec![
+                    PhaseDef::new("work", StageKind::Build)
+                        .codes()
+                        .evidence_floor(),
+                    PhaseDef::new("check", StageKind::Test)
+                        .verified()
+                        .after("work"),
+                ],
+            })
+            .expect_err("a flagged, unpinned phase is refused");
+        assert_eq!(
+            err,
+            WorkflowDefError::UnverifiedEvidence {
+                phase: "check".to_string()
+            }
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("verified_evidence declared but nothing pinned: check")
+                && msg.contains(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
+            "{msg}"
+        );
+        assert!(reg.get("declares").is_none());
+        // As authored with its own pin (or the floor) it registers, and nothing else is touched.
         reg.register(WorkflowDef {
             id: "declares".to_string(),
             phases: vec![
-                PhaseDef::new("work", StageKind::Build).codes(),
+                PhaseDef::new("work", StageKind::Build)
+                    .codes()
+                    .evidence_floor(),
                 PhaseDef::new("check", StageKind::Test)
                     .verified()
+                    .evidence_floor()
                     .after("work"),
                 PhaseDef::new("unflagged", StageKind::Test).after("work"),
                 PhaseDef {
@@ -1719,20 +1897,10 @@ mod workflow_def_tests {
         };
         assert_eq!(
             pin("check").as_deref(),
-            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
-            "a verified_evidence phase with no pin must gain the floor — without one the flag \
-             gates nothing (it has no other reader)"
+            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN)
         );
-        assert_eq!(
-            pin("custom").as_deref(),
-            Some("authors-own-pin"),
-            "an author's own pin is never overridden — the floor is a default, not a cap"
-        );
-        assert_eq!(
-            pin("unflagged"),
-            None,
-            "a phase that never declared the flag gains nothing"
-        );
+        assert_eq!(pin("custom").as_deref(), Some("authors-own-pin"));
+        assert_eq!(pin("unflagged"), None, "an unflagged phase gains nothing");
     }
 
     /// FINDING-055, the shipped subject and the closed class.
@@ -1762,12 +1930,13 @@ mod workflow_def_tests {
             .expect("feature has a test phase");
         assert!(
             test_phase.verified_evidence,
-            "the declaration is still authored — enforcement arms it, it does not erase it"
+            "the declaration is authored explicitly"
         );
         assert_eq!(
             test_phase.validator_pin.as_deref(),
             Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
-            "feature/test declares verified_evidence — registration must arm it with the floor"
+            "feature/test declares verified_evidence AND pins the floor as authored — registration \
+             refuses the flag without a pin"
         );
 
         // The class.
@@ -1792,22 +1961,11 @@ mod workflow_def_tests {
         );
     }
 
-    /// FINDING-055 (remediation): the "drop the flag to run unverified" escape hatch is scoped to a
-    /// FRESH id, and this pins exactly that so the doc on `enforce_verified_evidence` cannot drift
-    /// from the code.
-    ///
-    /// Once a phase is floored, `carry_shadowed_pins` runs BEFORE `enforce_verified_evidence` on the
-    /// next `register`, so a same-id re-registration that drops the flag has the floor carried
-    /// forward — a replacement may change a gate but never silently remove one. Dropping the flag
-    /// therefore runs the phase unverified only under a NEW id, which has no shadow to inherit.
-    ///
-    /// Falsifiers (both compiling): teach `carry_shadowed_pins` to skip the floor
-    /// (`if pin == EVIDENCE_FLOOR_PIN { continue; }`) and the re-registration assert fails — that
-    /// mutation is precisely the silent-ungating hole the pin exists to close; or make
-    /// `enforce_verified_evidence` floor unflagged phases and the fresh-id assert fails.
+    /// Codex review on #414: a def is taken AS AUTHORED on every registration — a same-id
+    /// re-registration that drops a pin is refused exactly like a fresh one, and a fresh id with a
+    /// non-code, unflagged phase registers exactly as written (nothing invented, nothing restored).
     #[test]
-    fn dropping_verified_evidence_keeps_the_floor_on_reregistration_but_a_fresh_id_runs_unverified()
-    {
+    fn reregistration_is_judged_as_authored_too() {
         let pin_of = |reg: &WorkflowRegistry, id: &str, phase: &str| {
             reg.get(id)
                 .unwrap()
@@ -1818,50 +1976,59 @@ mod workflow_def_tests {
                 .validator_pin
                 .clone()
         };
-        let flagged = |id: &str| WorkflowDef {
+        let pinned = |id: &str| WorkflowDef {
             id: id.to_string(),
             phases: vec![
-                PhaseDef::new("work", StageKind::Build).codes(),
+                PhaseDef::new("work", StageKind::Build)
+                    .codes()
+                    .evidence_floor(),
                 PhaseDef::new("check", StageKind::Test)
                     .verified()
+                    .evidence_floor()
                     .after("work"),
             ],
         };
-        let unflagged = |id: &str| WorkflowDef {
-            id: id.to_string(),
+        let mut reg = WorkflowRegistry::default();
+        reg.register(pinned("wf")).unwrap();
+        assert_eq!(
+            pin_of(&reg, "wf", "check").as_deref(),
+            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN)
+        );
+        // Same id, the check's pin dropped (flag kept): refused — nothing is restored.
+        let mut dropped = pinned("wf");
+        dropped.phases[1].validator_pin = None;
+        assert_eq!(
+            reg.register(dropped).expect_err("refused as authored"),
+            WorkflowDefError::UnverifiedEvidence {
+                phase: "check".to_string()
+            }
+        );
+        // Same id, the CODE phase's pin dropped: refused — nothing is carried forward.
+        let mut ungated = pinned("wf");
+        ungated.phases[0].validator_pin = None;
+        assert_eq!(
+            reg.register(ungated).expect_err("refused as authored"),
+            WorkflowDefError::GateEvaluatesNothing {
+                phase: "work".to_string()
+            }
+        );
+        assert_eq!(
+            pin_of(&reg, "wf", "check").as_deref(),
+            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
+            "the registered def is untouched by a refused replacement"
+        );
+        // A fresh id whose check is neither flagged nor pinned registers exactly as written.
+        reg.register(WorkflowDef {
+            id: "wf-unverified".to_string(),
             phases: vec![
-                PhaseDef::new("work", StageKind::Build).codes(),
+                PhaseDef::new("work", StageKind::Build)
+                    .codes()
+                    .evidence_floor(),
                 PhaseDef::new("check", StageKind::Test).after("work"),
             ],
-        };
-
-        let mut reg = WorkflowRegistry::default();
-        // First registration arms the floor (no shadow to carry).
-        reg.register(flagged("wf")).unwrap();
-        assert_eq!(
-            pin_of(&reg, "wf", "check").as_deref(),
-            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
-            "first registration of a flagged, unpinned phase must arm it with the floor"
-        );
-
-        // Same-id re-registration that DROPS the flag does NOT run the phase unverified: the floor
-        // is a gate, so `carry_shadowed_pins` keeps it. The "drop the flag" remedy is inert here —
-        // by design, not by accident, which is the narrowed claim under test.
-        reg.register(unflagged("wf")).unwrap();
-        assert_eq!(
-            pin_of(&reg, "wf", "check").as_deref(),
-            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
-            "dropping the flag on the SAME id must keep the floor — carry_shadowed_pins forbids \
-             silently ungating a replacement (FINDING-055 remedy is scoped to a fresh id)"
-        );
-
-        // A FRESH id with no flag and no pin is the actual escape hatch — no shadow, nothing carried.
-        reg.register(unflagged("wf-unverified")).unwrap();
-        assert_eq!(
-            pin_of(&reg, "wf-unverified", "check"),
-            None,
-            "a fresh unflagged id runs unverified — the documented way to opt out of re-verification"
-        );
+        })
+        .unwrap();
+        assert_eq!(pin_of(&reg, "wf-unverified", "check"), None);
     }
 
     /// FINDING-011, asserted against the SHIPPED `survey-repo` drop-in (the workflow the finding

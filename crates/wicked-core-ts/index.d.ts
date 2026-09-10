@@ -612,6 +612,9 @@ export declare class Subscription {
  * `sessionCompleted` `{session}`, `sessionFailed` `{session, ord}`, `error` `{session, message}`.
  * PTY terminal sessions emit `terminalOpened` `{id, cwd}`, `terminalOutput` `{id, seq, bytesB64}`
  * (raw output base64-encoded in `bytesB64`), and `terminalExited` `{id, status}`.
+ * Gate evidence (wicked-core F-036/F-039): evaluatorMutatedWorktree {session, ord, attempt, cli,
+ * phase, beforeTree, afterTree, headMoved, changed} and repoChecksEvaluated {session,
+ * ord, attempt, passed, criterion, checks, skipped}.
  */
 export interface CoreEventJson {
   type: string

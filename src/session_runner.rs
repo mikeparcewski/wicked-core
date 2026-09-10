@@ -47,6 +47,11 @@ use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, 
 
 struct PtySession {
     terminal_id: String,
+    /// Whether the session was opened for a NO-CODE phase (read-only posture, F-036). A session
+    /// serves only turns of its own posture: a creator's write-posture session is never reused by
+    /// an `executes_code: false` phase — it could background a write past the guard's final
+    /// snapshot — and a read-only session is never handed to a code phase that must write.
+    no_code: bool,
 }
 
 // ── PersistentStepRunner ──────────────────────────────────────────────────────
@@ -160,7 +165,11 @@ impl PersistentStepRunner {
     /// reloaded registry and name another binary). Like the wrapped-CLI argv but without
     /// `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
     /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
-    fn session_argv(invocation: &str, input: &StepInput) -> Vec<String> {
+    /// `Err` is a refused launch (F-036): a NO-CODE unit on a lever-less non-claude seat whose
+    /// template grants writes — the same boundary the wrapped runner applies
+    /// (`execute_wrapped::apply_no_code_posture`), so no carrier can launch an evaluator with a
+    /// write-capable posture.
+    fn session_argv(invocation: &str, input: &StepInput) -> Result<Vec<String>, String> {
         // Build argv without a real prompt — the placeholder expands to an empty string and the
         // trailing `--` + empty arg are stripped below.
         let mut argv = build_argv(invocation, "", &input.unit.allowed_skills);
@@ -173,8 +182,24 @@ impl PersistentStepRunner {
             argv.retain(|a| a != "-p" && a != "--print");
             // Inject stream-json (skipped when the template already carries --output-format).
             inject_claude_stream_flags(&mut argv);
+        } else if crate::worktree_guard::applies_to(&input.unit) {
+            // F-036: a NO-CODE phase on a non-claude seat crosses the shared launch boundary —
+            // the template's tokens are rewritten to the seat's read-only lever (codex
+            // `--sandbox read-only`, pi `--exclude-tools edit,write`), a write grant on a
+            // lever-less seat refuses the launch. This carrier resolves no `trust_flags`, so the
+            // template is the whole posture here.
+            // Recognition is by the RESOLVED binary's stem (argv[0]), never the seat's key.
+            let lever = crate::execute_wrapped::apply_no_code_posture(&mut argv, Vec::new())?;
+            eprintln!(
+                "wicked-core: unit {} (phase `{}`, executes_code:false) opens a persistent \
+                 session on '{}' with the read-only posture {} (F-036)",
+                input.unit.ord,
+                input.unit.phase_id().unwrap_or("?"),
+                argv.first().map(String::as_str).unwrap_or("?"),
+                lever.describe()
+            );
         }
-        argv
+        Ok(argv)
     }
 }
 
@@ -274,9 +299,30 @@ impl PersistentStepRunner {
         // Lazily open a session for this run_id. The lock covers only the map read/write — not
         // the blocking open_terminal / wait_for_opened calls — so unrelated runs are never
         // serialised by one run's slow PTY startup.
+        // F-036 (codex review on #414): a session is reused ONLY when its posture matches this
+        // phase's. A no-code phase reaching a creator-opened (write-posture) session closes it and
+        // opens a fresh read-only one; a code phase reaching a read-only session likewise.
+        let wants_no_code = crate::worktree_guard::applies_to(&input.unit);
         let existing_id = {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-            guard.get(&run_id).map(|s| s.terminal_id.clone())
+            guard
+                .get(&run_id)
+                .map(|s| (s.terminal_id.clone(), s.no_code))
+        };
+        let existing_id = match existing_id {
+            Some((tid, no_code)) if no_code == wants_no_code => Some(tid),
+            Some((tid, _)) => {
+                eprintln!(
+                    "wicked-core: run {run_id} unit {} needs a {} session but the open PTY session \
+                     {tid} was opened {} — closing it and opening a fresh one (F-036)",
+                    input.unit.ord,
+                    if wants_no_code { "read-only" } else { "write-posture" },
+                    if wants_no_code { "with write posture" } else { "read-only" }
+                );
+                self.drop_session(&run_id);
+                None
+            }
+            None => None,
         };
 
         let terminal_id = match existing_id {
@@ -297,7 +343,15 @@ impl PersistentStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let cmd = Self::session_argv(&invocation, input);
+                let cmd = match Self::session_argv(&invocation, input) {
+                    Ok(cmd) => cmd,
+                    Err(why) => {
+                        return failed_output(
+                            input,
+                            format!("read-only posture refused the launch: {why}"),
+                        )
+                    }
+                };
                 // Subscribe BEFORE open so we catch the TerminalOpened event.
                 let pre = self.subscribe();
                 let tid = match self.open_terminal(cwd, cmd) {
@@ -311,6 +365,7 @@ impl PersistentStepRunner {
                     let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                     let entry = guard.entry(run_id.clone()).or_insert(PtySession {
                         terminal_id: tid.clone(),
+                        no_code: wants_no_code,
                     });
                     entry.terminal_id.clone()
                 };
@@ -376,6 +431,14 @@ impl PersistentStepRunner {
         if result.status != StepStatus::Ok {
             // On any non-Ok outcome the terminal may be broken/hung. Drop the session so
             // the next unit for this run_id opens a fresh PTY instead of reusing a stale one.
+            self.drop_session(&run_id);
+        } else if wants_no_code {
+            // F-036 QUIESCE (codex review on #414): a NO-CODE phase's session is closed as soon as
+            // its turn is over — the PTY teardown `killpg`s the whole process group (terminal.rs),
+            // so a writer the seat backgrounded cannot land after the worktree guard's FINAL
+            // snapshot, which the worker thread takes when this returns. Such a session is never
+            // reused anyway (the next phase either writes, or is another no-code phase that opens
+            // its own).
             self.drop_session(&run_id);
         }
         result
@@ -675,6 +738,11 @@ mod tests {
             depends_on: Vec::new(),
             pre_build_scope: false,
             scope_warnings: Vec::new(),
+            worktree_guarded: false,
+            worktree_baseline: None,
+            worktree_mutation: None,
+            repo_checks_floor: false,
+            repo_checks: None,
             status: UnitStatus::Pending,
         }
     }
@@ -857,6 +925,266 @@ mod tests {
         // Explicit teardown — closes the PTY cleanly.
         runner.drop_session("run-shared-session");
         wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+    }
+
+    /// F-036 (codex review on #414): the persistent PTY carrier crosses the SAME no-code launch
+    /// boundary as the wrapped runner — recognition by the RESOLVED binary's stem, so a fake CLI
+    /// NAMED `codex` gets `--sandbox read-only` appended (the template's own tokens rewritten), a
+    /// code phase on the same binary is untouched, and an unknown binary whose template grants
+    /// writes is refused before any PTY opens.
+    #[test]
+    fn a_no_code_unit_opens_its_pty_session_read_only_and_a_write_grant_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-sess-posture-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let codex = dir.join("codex");
+        std::fs::write(&codex, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let codex = codex.to_string_lossy().into_owned();
+
+        // A NO-CODE unit on a binary named codex: the template's workspace-write is rewritten.
+        let mut unit = make_unit(
+            "verify the fix",
+            &format!("{codex} --sandbox workspace-write"),
+        );
+        unit.assigned_cli = Some("reviewer".to_string()); // the key is irrelevant to recognition
+        unit.worktree_guarded = true;
+        let input = make_input("run-ro", 0, unit);
+        let argv = PersistentStepRunner::session_argv(
+            &format!("{codex} --sandbox workspace-write"),
+            &input,
+        )
+        .expect("codex has a lever");
+        assert_eq!(argv, s(&[&codex, "--sandbox", "read-only"]));
+        // No sandbox in the template: the lever is appended.
+        let mut unit = make_unit("verify the fix", &format!("{codex} exec"));
+        unit.worktree_guarded = true;
+        let input = make_input("run-ro-append", 0, unit);
+        assert_eq!(
+            PersistentStepRunner::session_argv(&format!("{codex} exec"), &input).unwrap(),
+            s(&[&codex, "exec", "--sandbox", "read-only"])
+        );
+        // `--yolo` (codex's alias of the bypass, which beats a later read-only sandbox) is dropped
+        // on this carrier too — adversarial review on #414.
+        assert_eq!(
+            PersistentStepRunner::session_argv(&format!("{codex} --yolo exec"), &input).unwrap(),
+            s(&[&codex, "exec", "--sandbox", "read-only"])
+        );
+        // A CODE phase is untouched — the guard reads the def, never guesses.
+        let unit = make_unit("build it", &format!("{codex} --sandbox workspace-write"));
+        let input = make_input("run-code", 0, unit);
+        assert_eq!(
+            PersistentStepRunner::session_argv(
+                &format!("{codex} --sandbox workspace-write"),
+                &input
+            )
+            .unwrap(),
+            s(&[&codex, "--sandbox", "workspace-write"])
+        );
+        // A seat NAMED codex that runs some other binary is unknown: its write-capable sandbox is
+        // refused, never rewritten.
+        let mut unit = make_unit(
+            "verify the fix",
+            "/opt/other/tool --sandbox workspace-write",
+        );
+        unit.assigned_cli = Some("codex".to_string());
+        unit.worktree_guarded = true;
+        let input = make_input("run-alias-refused", 0, unit);
+        assert!(PersistentStepRunner::session_argv(
+            "/opt/other/tool --sandbox workspace-write",
+            &input
+        )
+        .is_err());
+        // An unknown binary whose TEMPLATE grants writes: refused before any PTY opens.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let mut unit = make_unit("verify the fix", "copilot --allow-all-tools -p");
+        unit.assigned_cli = Some("copilot".to_string());
+        unit.worktree_guarded = true;
+        let input = make_input("run-refused", 0, unit);
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("read-only posture refused the launch")
+                && out.output.contains("--allow-all-tools"),
+            "{}",
+            out.output
+        );
+        while let Ok(ev) = events.try_recv() {
+            assert!(
+                !matches!(ev, CoreEvent::TerminalOpened { .. }),
+                "a refused launch must open no PTY"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-036 (codex review on #414): a creator phase opens a write-posture session; the evaluator
+    /// phase that follows must NOT reuse it — it gets a FRESH session (and the fake CLI sees the
+    /// read-only argv), and when its turn is over the session is CLOSED, so a writer the seat
+    /// backgrounded dies with the process group before the worktree guard's final snapshot.
+    #[test]
+    fn an_evaluator_phase_never_reuses_a_creators_session_and_its_own_is_quiesced_after_the_turn() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-sess-reopen-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let late = dir.join("late.txt");
+        // A fake CLI NAMED codex: echoes its argv in every turn's text, and on every turn
+        // backgrounds a delayed writer — the shape a quiesce must defeat.
+        let codex = dir.join("codex");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nARGS=\"$*\"\nwhile IFS= read -r line; do\n  (sleep 1; echo late >> \"{}\") &\n  printf '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"WKRTURN:%s|ARGV:%s\"}}]}}}}\\n' \"$line\" \"$ARGS\"\n  printf '{{\"type\":\"result\",\"result\":\"ok\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\\n'\ndone\n",
+                late.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = format!("{} --sandbox workspace-write", codex.display());
+
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+
+        // Turn 1 — the CREATOR (a code phase): opens a write-posture session.
+        let mut creator = make_unit("build the fix", &invocation);
+        creator.executes_code = true;
+        let out1 = runner.run_unit(&make_input("run-reopen", 0, creator));
+        assert_eq!(out1.status, StepStatus::Ok, "{}", out1.output);
+        assert!(
+            out1.output.contains("ARGV:--sandbox workspace-write"),
+            "the creator's session keeps its write posture: {}",
+            out1.output
+        );
+        let mut opened = 0usize;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, CoreEvent::TerminalOpened { .. }) {
+                opened += 1;
+            }
+        }
+        assert_eq!(opened, 1, "one session so far");
+
+        // Turn 2 — the EVALUATOR (executes_code: false): must not reuse the creator's session.
+        let mut evaluator = make_unit("verify the fix", &invocation);
+        evaluator.worktree_guarded = true;
+        let out2 = runner.run_unit(&make_input("run-reopen", 1, evaluator));
+        assert_eq!(out2.status, StepStatus::Ok, "{}", out2.output);
+        assert!(
+            out2.output.contains("ARGV:--sandbox read-only")
+                && !out2.output.contains("workspace-write"),
+            "the evaluator got a FRESH read-only session: {}",
+            out2.output
+        );
+        let (mut reopened, mut exited) = (0usize, 0usize);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(CoreEvent::TerminalOpened { .. }) => reopened += 1,
+                Ok(CoreEvent::TerminalExited { .. }) => exited += 1,
+                Ok(_) => {}
+                Err(_) => {
+                    if exited >= 2 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        assert_eq!(reopened, 1, "the evaluator opened its own session");
+        assert!(
+            exited >= 2,
+            "the creator's session was closed on the posture change AND the evaluator's own \\
+             session was closed when its turn ended (quiesce); saw {exited} exits"
+        );
+        // The backgrounded writers died with their process groups: nothing lands late.
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(
+            !late.exists(),
+            "a writer the seat backgrounded must die with the quiesced session"
+        );
+        runner.drop_session("run-reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Adversarial review on #414: the PTY teardown SIGKILLs the process group UNCONDITIONALLY
+    /// after the TERM grace. A descendant that traps TERM and detaches its stdio lets the PTY
+    /// reader EOF — the old "SIGKILL only if the reader has not exited" left it alive to write
+    /// into the worktree after the guard's final snapshot.
+    #[test]
+    fn a_term_trapping_detached_descendant_dies_with_the_quiesced_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-sess-trap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let late = dir.join("late.txt");
+        let pidfile = dir.join("writer.pid");
+        // A fake CLI NAMED codex: on every turn it backgrounds a TERM-immune, stdio-detached
+        // writer that lands 3 s later, records its pid, then answers the turn.
+        let codex = dir.join("codex");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  nohup sh -c 'trap \"\" TERM; sleep 3; echo x >> \"{late}\"' </dev/null >/dev/null 2>&1 &\n  echo $! > \"{pid}\"\n  printf '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"WKRTURN:%s\"}}]}}}}\\n' \"$line\"\n  printf '{{\"type\":\"result\",\"result\":\"ok\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\\n'\ndone\n",
+                late = late.display(),
+                pid = pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = format!("{} --sandbox workspace-write", codex.display());
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        // A NO-CODE unit: its session is quiesced the moment the turn ends.
+        let mut evaluator = make_unit("verify the fix", &invocation);
+        evaluator.worktree_guarded = true;
+        let out = runner.run_unit(&make_input("run-trap", 0, evaluator));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the fixture recorded its writer's pid")
+            .trim()
+            .parse()
+            .unwrap();
+        // The writer is TERM-immune, so only the unconditional SIGKILL of the group explains its
+        // death; give the kernel a moment to reap and the would-be write its full window.
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !alive,
+            "the TERM-trapping writer (pid {pid}) survived the quiesce"
+        );
+        assert!(
+            !late.exists(),
+            "the detached writer must never land after the quiesce"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// core#396 (codex round 8, ADJUDICATED): the persistent PTY carrier does not load the skills

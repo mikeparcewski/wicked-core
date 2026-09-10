@@ -781,7 +781,7 @@ mod sig {
 /// child AND every backgrounded/orphaned descendant still in that group — none of which a bare
 /// `Child::kill` (direct child only) would reach. We ALSO call `Child::kill` (harmless on unix, and the
 /// only mechanism on non-unix). Because the group is the child's own, we can never signal the launcher.
-fn kill_child_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;
@@ -794,7 +794,7 @@ fn kill_child_tree(child: &mut std::process::Child) {
 /// Reap a just-killed child WITHOUT blocking forever (C5): poll `try_wait` up to a short cap instead of a
 /// bare `child.wait()` that could hang if the process is unkillable (uninterruptible sleep / zombie-parent
 /// races). A killed child normally reaps within a few ms; the cap is a backstop, not the expected path.
-fn reap_bounded(child: &mut std::process::Child) {
+pub(crate) fn reap_bounded(child: &mut std::process::Child) {
     const REAP_CAP: Duration = Duration::from_secs(2);
     let start = Instant::now();
     loop {
@@ -804,6 +804,44 @@ fn reap_bounded(child: &mut std::process::Child) {
             Ok(None) => std::thread::sleep(Duration::from_millis(20)),
             Err(_) => return,
         }
+    }
+}
+
+/// Has `child` exited — observed WITHOUT reaping it (Copilot on #414)? A reaped pid is free for
+/// reuse, and the process group id we `killpg` is that same pid, so "reap, then kill the group"
+/// could land the kill on a stranger. On unix this is `waitid(P_PID, …, WEXITED | WNOHANG |
+/// WNOWAIT)`: the exited child stays a zombie — its pid and therefore its group id stay reserved —
+/// until the caller `wait()`s, which is what makes a group kill between the two calls safe.
+/// `Ok(true)` = exited (the status is collected by the caller's `wait()`, immediate on a zombie),
+/// `Ok(false)` = still running. Non-unix has no WNOWAIT and no process groups: `try_wait` there
+/// (the status is cached, so the caller's `wait()` still returns it).
+pub(crate) fn has_exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        // Safe: a zeroed siginfo_t is a valid out-parameter for waitid; we read only si_pid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // With WNOHANG and no state change, waitid returns 0 and leaves si_pid == 0.
+        #[cfg(target_os = "linux")]
+        let exited_pid = unsafe { info.si_pid() };
+        #[cfg(not(target_os = "linux"))]
+        let exited_pid = info.si_pid;
+        Ok(exited_pid == pid)
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|s| s.is_some())
     }
 }
 
@@ -1807,6 +1845,43 @@ mod tests {
         );
     }
     use super::*;
+
+    /// Copilot on #414: exit is observed WITHOUT reaping, so the group kill that follows targets a
+    /// pid the zombie still reserves; the status is collected afterwards, intact.
+    #[cfg(unix)]
+    #[test]
+    fn exit_is_observed_unreaped_and_the_status_survives_the_group_kill() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 3"]).process_group(0);
+        cmd.hardened();
+        let mut child = cmd.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match has_exited_unreaped(&mut child) {
+                Ok(true) => break,
+                Ok(false) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                other => panic!("exit not observed: {other:?}"),
+            }
+        }
+        // Idempotent until reaped — the zombie is still ours.
+        assert!(has_exited_unreaped(&mut child).unwrap());
+        kill_child_tree(&mut child); // the group kill lands on the still-reserved pid, harmlessly
+        assert_eq!(
+            child.wait().unwrap().code(),
+            Some(3),
+            "the status was not lost"
+        );
+        // A running child is `false`, then observed once it exits.
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 0.2; exit 0"]).process_group(0);
+        cmd.hardened();
+        let mut child = cmd.spawn().unwrap();
+        assert!(!has_exited_unreaped(&mut child).unwrap());
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+    }
 
     /// FINDING-064. The judge prompt asks for the verdict alone on line 1 and "a brief reason on the
     /// next line"; the parser recorded only line 1. A COMPLIANT model therefore produced the bare

@@ -15,6 +15,155 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Evaluator phases cannot mutate the worktree; `verify` runs the repo's own checks as a
+  deterministic floor (F-036 / F-039).** The acceptance run's `bug/verify` evaluator (codex,
+  unchecked — governance is claude-only) REWROTE the fix it was reviewing and passed its own gate
+  on the one criterion "the run left a change in its worktree", after a `fix` gate that had
+  evaluated nothing (`agentVerdict: None, hasDeterministicFloor: false, evaluatorPolicies: []`).
+  Four changes close it, for EVERY seat and carrier, independent of the CLI's governance adapter:
+  - **Worktree guard** (`worktree_guard`): for a def-driven, agent-executed unit whose phase declared
+    `executes_code: false` (`WorkUnit.worktree_guarded`, plan-derived like `pre_build_scope`), the
+    actor snapshots the worktree at dispatch — git TREE HASH over tracked + untracked-not-ignored
+    content via a scratch index seeded from `HEAD`'s tree (`read-tree HEAD`, then `add -A`
+    re-hashes every path — never copied from the real index, so no `assume-unchanged` bit can hide
+    a rewrite, and never empty, so a committed path that an ignore rule matches stays tracked and
+    its rewrite is seen; the real index, refs and worktree are never touched; the engine's own
+    `tmp/` scratch is excluded by construction through `core.excludesFile`) plus `HEAD`, taken
+    THROUGH the git directory PINNED from the
+    REGISTERED repository (`<repo>/.git/worktrees/<id>`, found from the repo side — never through
+    the worktree's own `.git` file, which an evaluator can redirect to a repository it controls;
+    both escapes were reproduced by the independent review) — and persists it ON the unit
+    (`worktree_baseline` with its `git_dir`, restart-durable); the final comparison reuses exactly
+    that directory, and a baseline without the pin is unverifiable, never clean. The FINAL
+    comparison is taken after everything the phase owned has run — the seat's process group killed
+    on exit (the wrapped runner now spawns the seat in its own group and `killpg`s it when it
+    exits, is cancelled or times out), the agent judge rendered, the repo checks run — immediately
+    before the result is posted to the gate fold, so a delayed write from a backgrounded process or
+    a "passing" check script that edits a tracked file is caught too. ANY path that differs, or
+    a moved `HEAD`, DENIES the unit (deny-dominates, source `worktree_guard`, judged BEFORE the
+    pinned diff floor that would otherwise pass a rewritten tree) and emits the new
+    `evaluatorMutatedWorktree` event (`session, ord, attempt, cli, phase, beforeTree, afterTree,
+    headMoved, changed[{status,path}]`). There are NO exemptions — not documentation, not a
+    declared deliverable, not tool state: an evaluator's write-up belongs in its output, a phase
+    whose deliverable must live in the tree is a code phase (`domain-extraction/coverage` now
+    declares `executes_code: true` — it writes `coverage-report.json` for its pinned validator —
+    and is therefore never guarded), and an in-tree code graph moving under a recon phase is a
+    defect to surface (core#406). Fail-closed: a guarded unit whose
+    outcome is missing or unverifiable is denied, never assumed clean. The guard denies; it does not
+    revert — the denial names the paths, both tree ids and the one-line `git read-tree --reset -u
+    <before>` restore. A human APPROVING a mutation-denied gate re-baselines the re-dispatch; a
+    restart-driven redrive keeps the persisted baseline. Tool units and prose-planned runs are never
+    guarded.
+  - **Read-only posture for no-code phases on non-claude seats** — ONE launch boundary for every
+    argv-building carrier (`execute_wrapped::apply_no_code_posture`: the wrapped one-shot runner
+    AND the persistent PTY session runner), applied to the template's own tokens and the seat's
+    resolved posture. Seats are recognised SOLELY by the normalised file stem of the RESOLVED
+    binary — the template's argv[0] as an absolute path or looked up on `PATH`
+    (`/opt/homebrew/bin/codex`, `codex.exe`) — never by the seat's registry key, so a seat NAMED
+    `codex` that runs some other binary is unknown and its write grants are refused rather than
+    rewritten: codex runs `--sandbox read-only` with EVERY write-capable token dropped (`--yolo`
+    included — codex's alias of the bypass, which beats a later read-only sandbox)
+    (every sandbox spelling rewritten, the bypass and `--full-auto` dropped, one appended when none
+    was declared); pi gets `--exclude-tools edit,write` (merged into an existing denylist). A
+    lever-less seat whose template or posture carries ANY recognised write grant
+    (`--allow-all-tools`, `--allow-all`, `--dangerously-skip-permissions`,
+    `--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, `--yolo`, `--auto`,
+    `--approve-all`, or codex's `--sandbox workspace-write`/`danger-full-access` spellings on an
+    unrecognised seat) has the launch REFUSED before any process spawns or PTY opens (`read-only
+    posture refused the launch: …`, naming the token, seat and clis.toml remedy); a lever-less seat
+    with a bare posture runs, and the existing `governanceUnenforced` reason says the worktree
+    guard — not the posture — is what holds the line. The governed carriers gain the matching
+    **NO-CODE phase scope**: `WICKED_NO_CODE_SCOPE` on the hook subprocess,
+    `BoundaryCtx::no_code_scope` on the ACP carrier — `Write`/`Edit`/`NotebookEdit` to ANYTHING in
+    the worktree is refused up front for ANY `executes_code: false` phase (the pre-build scope
+    keeps its documentation allowance; the no-code scope permits nothing, matching the guard). The
+    persistent PTY session carrier never reuses a session across postures: an `executes_code:
+    false` phase reaching a creator-opened (write-posture) session closes it and opens a fresh
+    read-only one (and a code phase never inherits a read-only session), and a no-code phase's
+    session is closed — its whole process group `killpg`ed, SIGTERM then an UNCONDITIONAL SIGKILL
+    (a TERM-trapping, stdio-detached descendant no longer survives a teardown whose reader
+    already saw EOF) — the moment its turn ends, before the guard's final snapshot, so a writer
+    the seat backgrounded cannot land after the comparison. The ACP carrier, persistent per run
+    too, follows the same rule: an `executes_code: false` unit never reuses the process that
+    served a write turn (a fresh bridge is started), that process is killed — group and all, the
+    bridge's kill handle now `killpg`s — the moment the unit ends and BEFORE `run_unit` returns,
+    and every bridge teardown reaps bounded.
+  - **The code-writing Creator's gate evaluates something** (`bug/fix`, `feature/build`,
+    `migration/execute` — compiled defs and the shipped `workflows/*.json`): each now pins the
+    built-in evidence floor, so layer 1 re-derives the diff and layer 2 has a seat DISTINCT from
+    the creator judge it. Registration REFUSES an `executes_code` agent phase with no
+    `validator_pin` and no `human_confirm` gate — `WorkflowDefError::GateEvaluatesNothing`, "gate
+    evaluates nothing: fix — … pin the built-in evidence floor (…), a phase-specific validator, or
+    gate the phase with human_confirm" — and judges the def AS AUTHORED: `carry_shadowed_pins` and
+    `enforce_verified_evidence` are gone from the load path (nothing is injected or restored at
+    registration), so a same-id overlay copy that dropped a shipped pin is refused exactly like a
+    def that never had one and the registered built-in stands, and a `verified_evidence` phase
+    with no `validator_pin` is refused by name too (`WorkflowDefError::UnverifiedEvidence`,
+    "verified_evidence declared but nothing pinned: <phase>"). The shipped defs pin every gate
+    explicitly, in code and in `workflows/*.json`. `workflow::ungated_code_phases(&def)` is the
+    pure lint a consumer runs first. Tool phases are exempt (their exit code is their gate).
+    **Coupling to note:** wicked-crew composes per-run defs (`feature-pr`, …) from a mirror of the
+    shipped defs — a mirror without these pins is refused at registration until the crew release
+    that carries them (wicked-crew#507) is deployed alongside this engine.
+  - **Repo checks floor** (`repo_checks`): for the def's code-VERIFYING unit (`verified_evidence`
+    with an `executes_code` Creator upstream — `bug/verify`, `feature/test`, `migration/verify`;
+    `WorkUnit.repo_checks_floor`), the engine runs the repository's OWN checks in the worktree
+    after the seat's work, off the actor thread: `package.json` `typecheck`/`lint`/`test` scripts
+    (those present, in that order, via the lockfile's package manager; `npm ci`/`install` first
+    when `node_modules/` is absent — ALWAYS `--ignore-scripts`) and `Cargo.toml` → `cargo test`;
+    each under a 20-minute bound (15 for install), own process group, killed on exit. The checks are
+    repo-controlled code and run CONTAINED: inside the worker OS write boundary
+    (`validator::detect_worker_sandbox` — macOS `sandbox-exec` / Linux `bwrap`, writes confined to
+    the worktree, secret dirs unreadable, network open) with an isolated `HOME`, `npm_config_cache`,
+    `CARGO_HOME`, `CARGO_TARGET_DIR` and `XDG_*` under `<worktree>/tmp/wicked-checks/`
+    (`RUSTUP_HOME` preserved; `npm install --no-package-lock` when the repo ships no lockfile, so no
+    build artifact lands in the reviewed tree) — and a MINIMAL environment: the daemon's env is
+    cleared and only `PATH`, locale, `TERM`, `USER`, the Windows shell essentials, `RUSTUP_HOME`
+    and those overrides are passed, so no token, API key or `WICKED_*` variable reaches a check
+    (a repo-controlled script with the network open could otherwise read them). The stdout/stderr
+    drains are BOUNDED after the group kill (a `setsid`-detached descendant holding the pipe
+    cannot wedge the verify unit; the tail read so far is reported); a checkout that ships `tmp`
+    as a symlink is refused, never followed, when the scratch is prepared; `cargo test` runs
+    `--locked` when the repo ships a `Cargo.lock`, and when it ships none the `Cargo.lock` cargo
+    writes — provably the engine's own (absent at detection, after the seat was quiesced) — is
+    removed after the checks and disclosed on the report (`engine_writes_removed`), so the guard
+    never denies the engine's side effect. A host where NO
+    write boundary can be armed (no
+    `sandbox-exec`/`bwrap` — all of Windows) does NOT run the checks: the floor FAILS with
+    `sandbox_error` (+ `sandbox_level: "best-effort"` and the probe's reason) and the gate denies —
+    repo-controlled scripts never run unsandboxed. Detection is fail-closed: an unreadable or
+    malformed `package.json`, or a symlinked manifest/lockfile/`node_modules`, FAILS the floor with
+    the reason — every probe `lstat`s the entry, opens it `O_NOFOLLOW`, and `fstat`s the OPENED
+    descriptor (regular file, same device + inode) before a byte is read, so there is no
+    lstat-then-open window — only a repo with no manifest at all is a disclosed
+    vacuous pass (`checks: []`, `passed: true`). Exit code, duration and 4 KiB stdout/stderr TAILS
+    ride the new `repoChecksEvaluated` event (`session, ord, attempt, passed, criterion,
+    checks[{name, argv, source, exitCode, timedOut, spawnError, durationMs, stdoutTail,
+    stderrTail}], skipped`) and the unit record (`repo_checks`); a non-zero exit, timeout or
+    unspawnable command DENIES (source `repo_checks`), stopping at the first failure.
+    `gateEvaluated.hasDeterministicFloor` is now true when EITHER instrument ran and `criterion`
+    names both (`; `-joined); `deterministicPass` covers both. Checks are not run over a tree the
+    guard's first look already caught being rewritten. `Command::ApplyStepResult` and the bus
+    `task.completed` payload carry the new `UnitEvidence {worktree_guard, repo_checks}`
+    (serde-default; a pre-evidence payload folds a GUARDED unit closed).
+  Tests: an evaluator whose fake seat edits a file is denied with the path listed and the event
+  emitted (real repo + worktree, through the actor); a PASSING `npm test` that appends to a tracked
+  file is caught by the final comparison; a backgrounded writer dies with the seat's process group;
+  nothing is exempt — a documentation file, a declared deliverable and tool state all deny; a
+  code phase with no pin is refused at registration ("gate evaluates nothing: fix"), a same-id
+  drop-in that drops a shipped pin is refused and the built-in stands, `verified_evidence` without
+  a pin is refused; the floor captures a failing `cargo test` (exit 101 + the assertion text in
+  the tail) and a failing `npm test` (exit 3); a check that writes outside the worktree fails the
+  floor and never lands (where the host has a sandbox tool), and an injected best-effort probe
+  makes the floor fail closed and run NOTHING; a malformed or symlinked manifest fails the floor by
+  name; the codex argv for a no-code phase is `--sandbox read-only` by the RESOLVED binary's stem
+  (bare name on `PATH`, absolute path) — never by key, a `codex`-keyed seat on another binary is
+  refused — on both carriers; a write-capable lever-less seat is refused before launch on both
+  carriers; a creator's PTY session is never reused by the evaluator that follows (fresh read-only
+  session, closed with its process group when its turn ends — a backgrounded writer never lands).
+  `wicked-core-ts` pins both new wire shapes and documents them in `CoreEventJson`; its
+  `package-lock.json` now pins the five platform packages to the published 0.7.17 artifacts
+  (`npm ci` on current npm refuses lock entries without a version — the types-test step).
 - **Seat selection honours skill portability (#401)** — distribution narrows a unit's candidate
   seats to what its skills admit BEFORE the council votes: a unit whose `skill_ref` (or a
   transitive mandate) is `portable: false` in the handed snapshot — or whose root is the

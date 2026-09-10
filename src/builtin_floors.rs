@@ -340,10 +340,25 @@ mod tests {
     fn the_floor_is_pinned_exactly_where_a_diff_is_the_evidence() {
         let reg = WorkflowRegistry::with_defaults();
         let (mut gated, mut exempt) = (Vec::new(), Vec::new());
+        let mut code_creators = Vec::new();
 
         for id in reg.ids() {
             let def = reg.get(&id).unwrap();
             for (i, phase) in def.phases.iter().enumerate() {
+                // F-039: the code-writing Creator's OWN gate must evaluate something too — the
+                // same floor, at the phase that was supposed to make the change, so its gate
+                // never folds `combined: true` over nothing (registration refuses otherwise).
+                if phase.role == PhaseRole::Creator && phase.executes_code {
+                    assert_eq!(
+                        phase.validator_pin.as_deref(),
+                        Some(EVIDENCE_FLOOR_PIN),
+                        "`{id}/{}` writes code but carries no floor of its own — its gate would \
+                         evaluate nothing (F-039)",
+                        phase.id
+                    );
+                    code_creators.push(format!("{id}/{}", phase.id));
+                    continue;
+                }
                 if phase.role != PhaseRole::Evaluator {
                     continue;
                 }
@@ -386,6 +401,11 @@ mod tests {
             "collab is the only built-in whose Evaluators judge prose rather than a diff; if this \
              list grows, those workflows are shipping ungated and need their own floor"
         );
+        assert_eq!(
+            code_creators,
+            vec!["bug/fix", "feature/build", "migration/execute"],
+            "the code-writing Creators of the built-ins, each carrying its own floor (F-039)"
+        );
     }
 
     /// The same invariant, for the workflows shipped as DROP-IN JSON rather than compiled in.
@@ -416,6 +436,7 @@ mod tests {
     fn no_shipped_drop_in_ships_an_evaluator_nobody_checked() {
         let workflows_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
         let (mut diff_floored, mut own_floored, mut ungated) = (Vec::new(), Vec::new(), Vec::new());
+        let mut code_creators = Vec::new();
         let mut files = 0;
 
         for entry in std::fs::read_dir(&workflows_dir).expect("workflows/ is readable") {
@@ -427,6 +448,20 @@ mod tests {
             let def = WorkflowRegistry::def_from_file(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             for (i, phase) in def.phases.iter().enumerate() {
+                // F-039: the shipped JSON copies must pin the code-writing Creators exactly as the
+                // compiled defs do — a JSON that lost this pin would be REFUSED at registration
+                // (`GateEvaluatesNothing`), so this check is what keeps the shipped files loadable.
+                if phase.role == PhaseRole::Creator && phase.executes_code {
+                    assert_eq!(
+                        phase.validator_pin.as_deref(),
+                        Some(EVIDENCE_FLOOR_PIN),
+                        "`{}/{}` writes code but its shipped JSON carries no floor (F-039)",
+                        def.id,
+                        phase.id
+                    );
+                    code_creators.push(format!("{}/{}", def.id, phase.id));
+                    continue;
+                }
                 if phase.role != PhaseRole::Evaluator {
                     continue;
                 }
@@ -457,6 +492,12 @@ mod tests {
         diff_floored.sort();
         own_floored.sort();
         ungated.sort();
+        code_creators.sort();
+        assert_eq!(
+            code_creators,
+            vec!["bug/fix", "feature/build", "migration/execute"],
+            "the shipped JSON copies of the code-writing workflows must pin their Creator phases"
+        );
 
         assert_eq!(
             diff_floored,

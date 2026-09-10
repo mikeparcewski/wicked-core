@@ -217,11 +217,15 @@ pub enum CoreEvent {
     /// (deny-dominance over ALL layers). Emitted just before `GateDecided`; `GateDecided{allow}` is
     /// retained for back-compat and carries the same bool as `combined`.
     ///
-    /// HONESTY (M5): `has_deterministic_floor` is `true` iff a pinned validator gated this unit. When
-    /// `false` the phase is UNGATED — nothing deterministic ran — so `criterion` is `None` (the unit
-    /// description is NEVER relabeled a "criterion") and `deterministic_pass` is vacuous (there was no
-    /// floor to pass). `criterion` is `Some` only when `has_deterministic_floor` (the pinned validator's
-    /// criterion).
+    /// HONESTY (M5): `has_deterministic_floor` is `true` iff a deterministic instrument gated this
+    /// unit — a pinned validator, the engine-run repo checks (F-039, `RepoChecksEvaluated`), or
+    /// both. When `false` the phase is UNGATED — nothing deterministic ran — so `criterion` is
+    /// `None` (the unit description is NEVER relabeled a "criterion") and `deterministic_pass` is
+    /// vacuous (there was no floor to pass). `criterion` is `Some` only when
+    /// `has_deterministic_floor`, and names every instrument that ran (pinned validator's criterion,
+    /// then the repo-checks criterion, `; `-joined). The worktree guard (F-036) is a BOUNDARY, not a
+    /// floor: it never sets this flag and surfaces only as a denial (`denial.source ==
+    /// "worktree_guard"`) plus its own `EvaluatorMutatedWorktree` event.
     ///
     /// HONESTY (S2): `evaluator_pass` surfaces the evaluator≠creator second pass — `Some(false)` when
     /// that layer denied (even though `deterministic_pass == true` and no agent judge ran), `Some(true)`
@@ -606,6 +610,43 @@ pub enum CoreEvent {
         /// `"published"` (a crew snapshot) or `"live-cache"` (the installed plugin fallback).
         source: String,
     },
+    /// (F-036) An `executes_code: false` phase — an evaluator, a recon rung, a review — CHANGED
+    /// the worktree it was working in. Emitted at the gate fold when the engine's own before/after
+    /// tree snapshots differ (`worktree_guard`), for EVERY seat and carrier, independent of the
+    /// CLI's governance adapter. `changed` names EVERY differing path — each one denies (source
+    /// `worktree_guard` on the same unit's `gateEvaluated.denial`); there are no exemptions.
+    /// `headMoved` means the run branch was committed/amended/reset, which denies on its own.
+    EvaluatorMutatedWorktree {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        /// The seat that ran the unit (`assigned_cli`; empty when unassigned).
+        cli: String,
+        /// The workflow phase id (`verify`, `adversarial-review`, …); empty for a unit with no
+        /// phase suffix.
+        phase: String,
+        before_tree: String,
+        after_tree: String,
+        head_moved: bool,
+        changed: Vec<crate::worktree_guard::ChangedPath>,
+    },
+    /// (F-039) The engine ran the repository's OWN checks in the run's worktree for the def's
+    /// code-verifying unit (`verified_evidence` with an `executes_code` Creator upstream) and
+    /// folded them into the gate as a deterministic floor. One event per fold, emitted just before
+    /// `gateEvaluated` (whose `hasDeterministicFloor`/`criterion` include this floor). `checks` is
+    /// what actually ran, in order, with exit code, duration and stdout/stderr TAILS; `skipped`
+    /// names detected checks not run because an earlier one failed. `passed: false` ⇒ the unit is
+    /// denied (source `repo_checks`). An empty `checks` with `passed: true` means no checks were
+    /// detected (no package.json typecheck/lint/test script, no Cargo.toml) — disclosed as such.
+    RepoChecksEvaluated {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        passed: bool,
+        criterion: String,
+        checks: Vec<crate::repo_checks::CheckRun>,
+        skipped: Vec<String>,
+    },
     /// (EVT-001) A structured workflow def was selected for this session — the authoritative
     /// decomposition signal. Fires once per session, after `SessionStarted` and before the first
     /// `UnitPlanned`. Only emitted when a `--workflow` id was resolved (not for free-text runs).
@@ -760,6 +801,27 @@ pub enum CoreEvent {
 /// Render a [`crate::domain::UnitDenial`] in the events wire's camelCase convention (the persisted
 /// unit record keeps serde's snake_case; the event stream is camelCase throughout, so the same
 /// structure is spelled per-surface rather than leaking one convention into the other).
+/// The wire form of one changed path on `evaluatorMutatedWorktree`.
+fn changed_path_json(c: &crate::worktree_guard::ChangedPath) -> serde_json::Value {
+    serde_json::json!({ "status": c.status, "path": c.path })
+}
+
+/// The wire form of one check run on `repoChecksEvaluated` — camelCase like every other event
+/// field, tails included verbatim (already bounded by `repo_checks::TAIL_BYTES`).
+fn check_run_json(c: &crate::repo_checks::CheckRun) -> serde_json::Value {
+    serde_json::json!({
+        "name": c.name,
+        "argv": c.argv,
+        "source": c.source,
+        "exitCode": c.exit_code,
+        "timedOut": c.timed_out,
+        "spawnError": c.spawn_error,
+        "durationMs": c.duration_ms,
+        "stdoutTail": c.stdout_tail,
+        "stderrTail": c.stderr_tail,
+    })
+}
+
 fn denial_json(d: &crate::domain::UnitDenial) -> serde_json::Value {
     serde_json::json!({
         "source": d.source,
@@ -1436,6 +1498,46 @@ impl CoreEvent {
                 "contentHash": content_hash,
                 "root": root,
                 "source": source,
+            }),
+            CoreEvent::EvaluatorMutatedWorktree {
+                session,
+                ord,
+                attempt,
+                cli,
+                phase,
+                before_tree,
+                after_tree,
+                head_moved,
+                changed,
+            } => json!({
+                "type": "evaluatorMutatedWorktree",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "phase": phase,
+                "beforeTree": before_tree,
+                "afterTree": after_tree,
+                "headMoved": head_moved,
+                "changed": changed.iter().map(changed_path_json).collect::<Vec<_>>(),
+            }),
+            CoreEvent::RepoChecksEvaluated {
+                session,
+                ord,
+                attempt,
+                passed,
+                criterion,
+                checks,
+                skipped,
+            } => json!({
+                "type": "repoChecksEvaluated",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "passed": passed,
+                "criterion": criterion,
+                "checks": checks.iter().map(check_run_json).collect::<Vec<_>>(),
+                "skipped": skipped,
             }),
             // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).
             CoreEvent::WorkflowSelected {

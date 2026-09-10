@@ -46,6 +46,7 @@ mod pipeline;
 mod plan;
 mod project;
 mod repo;
+mod repo_checks;
 mod repo_intel;
 mod scope;
 mod session_runner;
@@ -57,6 +58,7 @@ mod terminal;
 mod validator;
 mod validator_vault;
 mod workflow;
+mod worktree_guard;
 
 /// The ONE lock every test in this binary takes before touching process-global environment.
 ///
@@ -138,6 +140,7 @@ pub use project::{
     MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
 pub use repo::{coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoSpec};
+pub use repo_checks::{CheckRun, RepoCheck, RepoChecksReport};
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,
 };
@@ -155,9 +158,10 @@ pub use validator_vault::{
 pub use wicked_council::AgenticCli;
 pub use workflow::{
     bug_def, feature_def, migration_def, GateCond, GateSpec, GateType, HumanDecision, PhaseDef,
-    PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner, Usage, WorkflowDef,
-    WorkflowDefError, WorkflowRegistry,
+    PhaseRole, StepInput, StepOutput, StepRunner, StepStatus, StubStepRunner, UnitEvidence, Usage,
+    WorkflowDef, WorkflowDefError, WorkflowRegistry,
 };
+pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 
 /// What to run: the problem to decompose, the council roster (`AgenticCli` seats), the scope toggle,
 /// and a stable session id. The roster is passed explicitly so callers (tests, UI) control it; the

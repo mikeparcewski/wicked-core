@@ -301,14 +301,15 @@ mod tests {
     }
 
     /// The sibling case — a replacement that DROPS the pin — turns out to be unreachable through
-    /// the registry: `carry_shadowed_pins` carries a shadowed pin forward and announces the
-    /// substitution, precisely so a hand-copied def cannot take a gate back out silently.
+    /// the registry: registration judges a def AS AUTHORED (codex review on #414) and REFUSES a
+    /// code phase whose gate evaluates nothing, so a hand-copied def cannot take a gate back out —
+    /// silently or otherwise; the registered def stands.
     ///
     /// So this asserts that EXISTING protection rather than the mismatch reporter. `PinMismatch`
     /// still models `installed: None` defensively, but nothing in the registry can produce it, and
     /// a test asserting otherwise would be asserting an impossible state.
     #[test]
-    fn a_replacement_that_drops_the_pin_has_it_carried_forward_not_reported_as_stale() {
+    fn a_replacement_that_drops_the_pin_is_refused_and_the_installed_def_stands() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("workflows");
         let mut reg = crate::workflow::WorkflowRegistry::with_defaults();
         reg.load_dir(&dir).expect("overlay loads");
@@ -319,7 +320,15 @@ mod tests {
             .find(|p| p.id == "coverage")
             .expect("coverage phase")
             .validator_pin = None;
-        reg.register(def).expect("replace");
+        // `coverage` executes code (it writes `coverage-report.json` into the worktree) under a
+        // conditional gate: with its pin gone its gate evaluates nothing, and the def is refused
+        // exactly as authored — the registry never repairs it.
+        assert_eq!(
+            reg.register(def).expect_err("refused as authored"),
+            crate::workflow::WorkflowDefError::GateEvaluatesNothing {
+                phase: "coverage".to_string()
+            }
+        );
 
         let after = reg
             .get("domain-extraction")
@@ -328,11 +337,11 @@ mod tests {
         assert_eq!(
             after.as_deref(),
             Some(COVERAGE_VALIDATOR_PIN),
-            "a replacement dropping the pin must have it carried forward, not lost"
+            "the installed def stands untouched by a refused replacement"
         );
         assert!(
             installed_pin_mismatches(&reg).is_empty(),
-            "the carried-forward pin still matches the binary, so nothing is stale"
+            "the installed pin still matches the binary, so nothing is stale"
         );
     }
 

@@ -146,6 +146,18 @@ fn pre_build_scope_from_env() -> bool {
     parse_pre_build_scope(std::env::var_os(PRE_BUILD_SCOPE_ENV).as_deref())
 }
 
+/// Set to `1` by the launcher when the governed unit's backing phase declared `executes_code:
+/// false` ([`crate::domain::WorkUnit::worktree_guarded`], F-036) — an evaluator, a recon rung, a
+/// review. Same carrier, same strict parse and same UNSET-is-honest rule as
+/// [`PRE_BUILD_SCOPE_ENV`]; the two differ only in which phases they cover: the pre-build ladder
+/// versus every phase that said it would not write code, post-build evaluators included.
+pub const NO_CODE_SCOPE_ENV: &str = "WICKED_NO_CODE_SCOPE";
+
+/// Read [`NO_CODE_SCOPE_ENV`] off the hook subprocess's own environment.
+fn no_code_scope_from_env() -> bool {
+    parse_pre_build_scope(std::env::var_os(NO_CODE_SCOPE_ENV).as_deref())
+}
+
 /// The unit's filesystem boundary, or `None` when the launcher armed no roots.
 ///
 /// `None` is NOT "allow everything" — it is "no boundary was configured", which is the honest state
@@ -241,6 +253,10 @@ pub(crate) struct BoundaryCtx {
     /// boundary that scoped the creator away from creating would be a worse bug than the one the
     /// scope exists to stop.
     pub pre_build_scope: bool,
+    /// The unit's NO-CODE scope (F-036): TRUE when its backing phase declared `executes_code:
+    /// false`, carried from [`crate::domain::WorkUnit::worktree_guarded`]. Rides here for the
+    /// same reason `pre_build_scope` does; the subprocess carrier reads [`NO_CODE_SCOPE_ENV`].
+    pub no_code_scope: bool,
 }
 
 /// Is `resolved` inside a SYSTEM temp dir? The advisory carve-out set for scratch writes
@@ -426,19 +442,40 @@ fn scope_relative(path: &str, cwd: &std::path::Path) -> String {
 
 pub(crate) fn phase_scope_denial(
     pre_build_scope: bool,
+    no_code_scope: bool,
     context: &serde_json::Value,
     tool: &str,
     cwd: &std::path::Path,
 ) -> Option<String> {
-    if !pre_build_scope || !WRITE_TOOLS.contains(&tool) {
+    if !(pre_build_scope || no_code_scope) || !WRITE_TOOLS.contains(&tool) {
         return None;
     }
     let path = context
         .get("path")
         .and_then(serde_json::Value::as_str)
         .filter(|p| !p.trim().is_empty())?;
-    if crate::actor::is_documentation_change(&scope_relative(path, cwd)) {
+    let rel = scope_relative(path, cwd);
+    // The PRE-BUILD scope keeps its documentation allowance (core#296: a design/plan rung writes
+    // its deliverable as docs). The NO-CODE scope permits NOTHING (codex review on #414): an
+    // `executes_code: false` phase's outputs belong outside the tree it is judging — and the
+    // worktree guard, which has no exemption of any kind, would deny the write at the gate anyway;
+    // a tool call the hook allows and the gate then denies is a contradiction, not a policy.
+    if pre_build_scope && crate::actor::is_documentation_change(&rel) {
         return None;
+    }
+    // F-036: the NO-CODE scope — a phase that declared it would not write code (an evaluator
+    // reviewing the build, a recon rung, a review) is refused the path-bearing write tools on
+    // production code. Named as its own rule: the remedy differs (report, don't edit; a phase
+    // that must change code declares `executes_code: true`). Pre-build wins the wording when both
+    // apply (a pre-build phase is also a no-code one) so its established message is unchanged.
+    if !pre_build_scope {
+        return Some(format!(
+            "phase scope: this phase declares `executes_code: false` (an evaluation/recon/review \
+             phase) — `{tool}` to `{path}` would change the tree under review, so it is refused. \
+             Nothing in the worktree may be written here: report findings in this phase's output, \
+             and leave any change to the tree — code, docs or a report file — to a phase that \
+             declares `executes_code: true`."
+        ));
     }
     // A refusal the worker cannot act on is not a refusal, it is a wall (FINDING-066): name the
     // rule, the file, and the two ways forward — write the deliverable as documentation, or leave
@@ -903,13 +940,19 @@ pub(crate) fn evaluate_tool_call(
         Some(b) => b.pre_build_scope,
         None => pre_build_scope_from_env(),
     };
+    let no_code_scope = match boundary {
+        Some(b) => b.no_code_scope,
+        None => no_code_scope_from_env(),
+    };
     // The worktree the path must be judged against: explicit on the in-process carrier, the
     // process cwd on the subprocess one — the same split the roots use just above.
     let scope_cwd = match boundary {
         Some(b) => b.cwd.clone(),
         None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     };
-    if let Some(reason) = phase_scope_denial(pre_build_scope, context, tool, &scope_cwd) {
+    if let Some(reason) =
+        phase_scope_denial(pre_build_scope, no_code_scope, context, tool, &scope_cwd)
+    {
         append_phase_scope_deny(decisions_path, scope, phase, &reason);
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
@@ -1978,6 +2021,63 @@ fn output_rule_query() -> RuleQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-036: the NO-CODE phase scope — an `executes_code: false` phase (an evaluator reviewing a
+    /// build, not only a pre-build rung) is refused the path-bearing write tools on EVERYTHING in
+    /// the tree, documentation included (no exemptions — matching the worktree guard); only the
+    /// PRE-BUILD scope keeps its documentation allowance (core#296); and both are inert for a code
+    /// phase (neither flag set). The pre-build wording wins when both flags are on, so that gate's
+    /// established message is unchanged.
+    #[test]
+    fn no_code_scope_refuses_every_write_and_only_the_pre_build_scope_keeps_documentation() {
+        let ctx = |p: &str| serde_json::json!({ "path": p });
+        let wt = std::path::Path::new("/wt");
+        for tool in WRITE_TOOLS {
+            let denied = phase_scope_denial(false, true, &ctx("/wt/src/app.ts"), tool, wt)
+                .expect("a no-code phase may not write production code");
+            assert!(
+                denied.contains("executes_code: false") && denied.contains("tree under review"),
+                "the refusal names its own rule: {denied}"
+            );
+            assert!(
+                !denied.contains("PRE-BUILD"),
+                "a post-build evaluator is not a pre-build phase: {denied}"
+            );
+        }
+        assert!(
+            phase_scope_denial(false, true, &ctx("/wt/docs/review.md"), "Write", wt).is_some(),
+            "a no-code phase's write-up belongs in its output, not in the tree — documentation is \
+             NOT exempt here (codex review on #414), matching the worktree guard"
+        );
+        assert!(
+            phase_scope_denial(true, false, &ctx("/wt/docs/design.md"), "Write", wt).is_none(),
+            "the PRE-BUILD scope keeps its documentation allowance (core#296)"
+        );
+        assert!(
+            phase_scope_denial(false, false, &ctx("/wt/src/app.ts"), "Write", wt).is_none(),
+            "a code phase (neither flag) is free to write code"
+        );
+        assert!(
+            phase_scope_denial(false, true, &ctx("/wt/src/app.ts"), "Read", wt).is_none(),
+            "reads are never in scope"
+        );
+        let both = phase_scope_denial(true, true, &ctx("/wt/src/app.ts"), "Write", wt).unwrap();
+        assert!(
+            both.contains("PRE-BUILD"),
+            "pre-build keeps its wording: {both}"
+        );
+        // Codex review on #414: NOTHING is exempt from the no-code scope — not a report, not a
+        // declared deliverable (a phase that must write one declares `executes_code: true`).
+        assert!(
+            phase_scope_denial(false, true, &ctx("/wt/coverage-report.json"), "Write", wt)
+                .is_some(),
+            "a report file in the tree is refused for a no-code phase"
+        );
+        assert!(
+            phase_scope_denial(false, true, &ctx("/wt/out/report.json"), "Write", wt).is_some(),
+            "so is anything under an output directory inside the tree"
+        );
+    }
     use wicked_apps_core::open_store;
 
     #[test]
@@ -3596,7 +3696,8 @@ mod phase_scope_tests {
             ("Write", "docs.ts"), // a FILE named docs is code; only a docs/ DIRECTORY is not
         ] {
             assert!(
-                phase_scope_denial(true, &ctx(path), tool, std::path::Path::new("/wt")).is_some(),
+                phase_scope_denial(true, false, &ctx(path), tool, std::path::Path::new("/wt"))
+                    .is_some(),
                 "a pre-build phase must not `{tool}` `{path}`"
             );
         }
@@ -3610,7 +3711,7 @@ mod phase_scope_tests {
             ("Write", "spec.rst"),
         ] {
             assert_eq!(
-                phase_scope_denial(true, &ctx(path), tool, std::path::Path::new("/wt")),
+                phase_scope_denial(true, false, &ctx(path), tool, std::path::Path::new("/wt")),
                 None,
                 "a pre-build phase MUST be able to `{tool}` its deliverable `{path}`"
             );
@@ -3636,7 +3737,7 @@ mod phase_scope_tests {
             "/Users/me/docs/projects/studio/src/lib.rs",
         ] {
             assert!(
-                phase_scope_denial(true, &ctx(path), "Write", wt).is_some(),
+                phase_scope_denial(true, false, &ctx(path), "Write", wt).is_some(),
                 "`{path}` is production code; the `docs` ANCESTOR must not exempt it"
             );
         }
@@ -3645,6 +3746,7 @@ mod phase_scope_tests {
         assert!(
             phase_scope_denial(
                 true,
+                false,
                 &ctx("/home/ci/.product/checkout/src/lib.rs"),
                 "Write",
                 ci
@@ -3661,7 +3763,7 @@ mod phase_scope_tests {
             "/Users/me/docs/projects/studio/DESIGN.md",
         ] {
             assert_eq!(
-                phase_scope_denial(true, &ctx(path), "Write", wt),
+                phase_scope_denial(true, false, &ctx(path), "Write", wt),
                 None,
                 "`{path}` IS the phase's deliverable and must stay writable"
             );
@@ -3670,8 +3772,14 @@ mod phase_scope_tests {
         // own cannot lend it documentation status. (The filesystem boundary refuses these first;
         // this is defence in depth, not the primary control.)
         assert!(
-            phase_scope_denial(true, &ctx("/somewhere/docs/evil/src/main.rs"), "Write", wt)
-                .is_some(),
+            phase_scope_denial(
+                true,
+                false,
+                &ctx("/somewhere/docs/evil/src/main.rs"),
+                "Write",
+                wt
+            )
+            .is_some(),
             "a path outside the worktree must not borrow `docs` from an ancestor"
         );
     }
@@ -3682,7 +3790,13 @@ mod phase_scope_tests {
     fn a_phase_that_is_not_pre_build_is_never_scope_denied() {
         for path in ["src/lib.rs", "package.json", "tests/x.test.ts"] {
             assert_eq!(
-                phase_scope_denial(false, &ctx(path), "Write", std::path::Path::new("/wt")),
+                phase_scope_denial(
+                    false,
+                    false,
+                    &ctx(path),
+                    "Write",
+                    std::path::Path::new("/wt")
+                ),
                 None
             );
         }
@@ -3697,6 +3811,7 @@ mod phase_scope_tests {
         assert_eq!(
             phase_scope_denial(
                 true,
+                false,
                 &ctx("src/lib.rs"),
                 "Read",
                 std::path::Path::new("/wt")
@@ -3706,6 +3821,7 @@ mod phase_scope_tests {
         assert_eq!(
             phase_scope_denial(
                 true,
+                false,
                 &ctx("src/lib.rs"),
                 "Grep",
                 std::path::Path::new("/wt")
@@ -3715,6 +3831,7 @@ mod phase_scope_tests {
         assert_eq!(
             phase_scope_denial(
                 true,
+                false,
                 &json!({"command": "cat > src/lib.rs <<'EOF'\nx\nEOF", "path": null}),
                 "Bash",
                 std::path::Path::new("/wt")
@@ -3726,6 +3843,7 @@ mod phase_scope_tests {
         assert_eq!(
             phase_scope_denial(
                 true,
+                false,
                 &json!({"path": null}),
                 "Write",
                 std::path::Path::new("/wt")
@@ -3733,7 +3851,13 @@ mod phase_scope_tests {
             None
         );
         assert_eq!(
-            phase_scope_denial(true, &ctx("   "), "Write", std::path::Path::new("/wt")),
+            phase_scope_denial(
+                true,
+                false,
+                &ctx("   "),
+                "Write",
+                std::path::Path::new("/wt")
+            ),
             None
         );
     }
@@ -3744,6 +3868,7 @@ mod phase_scope_tests {
     fn the_refusal_names_the_file_the_rule_and_the_way_forward() {
         let reason = phase_scope_denial(
             true,
+            false,
             &ctx("src/board/attentionReason.ts"),
             "Write",
             std::path::Path::new("/wt"),
