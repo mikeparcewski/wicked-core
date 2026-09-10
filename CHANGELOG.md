@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Fixed
+- **Event `seq` stays monotonic across daemon restarts (core#408, F-035).** The durable per-run
+  event log stamped `seq` from a process-wide counter that started at 0 with every daemon, so a run
+  resumed after a restart recorded its new events with `seq` 0, 1, … while its history already held
+  0–294 — and `GET /runs/:id/events`, which orders by `seq`, returned the new events BEFORE the old
+  ones. Every consumer taking the tail as "latest" (the studio now-bar, crew's relays, the
+  acceptance poller) read the pre-restart `awaitingHuman` as current while the run had moved on.
+  The first record an engine writes for a run now continues from the largest `seq` already in that
+  run's log (`persisted_max_seq`, raised into the counter with `fetch_max` so other in-flight runs
+  stay monotonic too), so `seq` is strictly increasing within a run for the run's whole life; that
+  first post-restart record also carries `daemonRestarted: true` (envelope-only, like `ts`/`seq`;
+  absent everywhere else) so a consumer can see the boundary instead of inferring it. The reader
+  hands a log a pre-fix engine wrote across a restart back in FILE order (a repeated `seq` is proof
+  the counter restarted, and append order is emission order for the single-writer log) rather than
+  interleaving it. Proven across a REAL process boundary: the e2e re-executes the test binary as
+  the "restarted daemon", which approves the gate and finishes the run. core-ts: `runEvents` states
+  the contract and the hand-authored `index.d.ts` gains `RecordedEventJson` (`ts`, `seq`,
+  `daemonRestarted?: true`) with compile-time assertions in `types-test/`.
+
 ### Added
 - **Evaluator phases cannot mutate the worktree; `verify` runs the repo's own checks as a
   deterministic floor (F-036 / F-039).** The acceptance run's `bug/verify` evaluator (codex,
