@@ -372,12 +372,14 @@ jobs:
         run: |
           set -euo pipefail
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefer-online
-          # Lockfile-only by construction — refuse to open a PR that carries anything else.
+          # Lockfile-only by construction — refuse to open a PR that carries anything else. Counted
+          # rather than compared against a path, so the check does not depend on how `git status`
+          # spells the path from this working directory (Copilot on #427).
           changed="$(git status --porcelain)"
           if [ -z "$changed" ]; then
             echo "  package-lock.json already describes the published ${VERSION}; nothing to open"
             echo "changed=false" >> "$GITHUB_OUTPUT"
-          elif [ "$changed" = " M crates/wicked-core-ts/package-lock.json" ]; then
+          elif [ "$(printf '%s\n' "$changed" | wc -l)" -eq 1 ] && ! git diff --quiet -- package-lock.json; then
             git --no-pager diff --stat -- package-lock.json
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -395,9 +397,14 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="chore/core-ts-${VERSION}-lockfile"
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            echo "::notice::branch ${BRANCH} already exists on origin (an earlier run of this job pushed it) — leaving it and its PR alone."
-            gh pr list --head "$BRANCH" --state all --json number,state,url --jq '.[] | "  PR #\(.number) \(.state) \(.url)"'
+          # Idempotent across re-runs (Copilot on #427): stop only when a PR for the branch already
+          # exists (open, merged or closed — never nag). A branch WITHOUT a PR means an earlier run
+          # pushed it and `gh pr create` then failed (the repo-setting case, or a transient API
+          # error); the branch is this job's own, so replace it with this run's re-stamp and retry.
+          existing="$(gh pr list --head "$BRANCH" --state all --json number,state,url --jq '.[] | "  PR #\(.number) \(.state) \(.url)"')"
+          if [ -n "$existing" ]; then
+            echo "::notice::a PR for ${BRANCH} already exists — leaving it alone."
+            echo "$existing"
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -416,7 +423,13 @@ jobs:
 
           Refs #422
           MSG
-          git push origin "HEAD:refs/heads/${BRANCH}"
+          remote_sha="$(git ls-remote --heads origin "$BRANCH" | cut -f1)"
+          if [ -n "$remote_sha" ]; then
+            echo "  ${BRANCH} exists at ${remote_sha} without a PR — replacing it with this run's re-stamp"
+            git push --force-with-lease="refs/heads/${BRANCH}:${remote_sha}" origin "HEAD:refs/heads/${BRANCH}"
+          else
+            git push origin "HEAD:refs/heads/${BRANCH}"
+          fi
           sed "s/__VERSION__/${VERSION}/g; s#__RUN_URL__#${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#g" <<'BODY' > "$RUNNER_TEMP/pr-body.md"
           Opened automatically by `napi-release.yml`'s `lockfile` job for tag `core-ts-v__VERSION__` (run: __RUN_URL__).
 
