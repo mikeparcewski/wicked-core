@@ -1201,6 +1201,10 @@ impl WrappedCliStepRunner {
             .unwrap_or(crate::skills_snapshot::SkillsDelivery::None);
         let prompt = unit_prompt(input, form, handed);
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
+        // F-036: set below when a NO-CODE phase lands on a non-claude seat that exposes no
+        // read-only lever — folded into the governance disclosure so the record says which
+        // control is actually holding the line (the post-hoc worktree guard, not the posture).
+        let mut no_lever_note: Option<String> = None;
 
         // Per-binary output adapter (B-runner). claude → stream-json (+ the two flags, injected before the
         // `--` guard); every other binary → passthrough (byte-identical to the pre-adapter raw-line stream).
@@ -1246,7 +1250,42 @@ impl WrappedCliStepRunner {
             // without the claude-only gate-hook. This is deliberately NOT the claude branch: claude
             // gets `--permission-mode acceptEdits` + the gate-hook, and its `--dangerously-skip-
             // permissions` trust flag would make those deny rules inert.
-            apply_seat_posture(&mut argv, &resolve_seat_posture(&cli_key));
+            let posture = resolve_seat_posture(&cli_key);
+            // F-036: a unit whose phase declared `executes_code: false` (an evaluator, a recon
+            // rung, a review) runs with a READ-ONLY tool posture where this seat has a lever —
+            // codex `--sandbox read-only`, pi `--exclude-tools edit,write` — and is REFUSED when
+            // the seat has no lever AND its resolved posture explicitly grants writes. A seat with
+            // no lever and no write grant runs, disclosed: the worktree guard catches its writes
+            // after the fact (`worktree_guard`), and the record says so.
+            let posture = if crate::worktree_guard::applies_to(&input.unit) {
+                match no_code_posture(&cli_key, &binary, posture) {
+                    Ok((flags, ReadOnlyLever::None)) => {
+                        let note = format!(
+                            "phase `{}` declares executes_code:false but seat '{cli_key}' exposes \
+                             no read-only posture lever, so writes are not prevented at the tool \
+                             boundary — the worktree guard denies them after the fact (F-036)",
+                            input.unit.phase_id().unwrap_or("?")
+                        );
+                        eprintln!("wicked-core: {note}");
+                        no_lever_note = Some(note);
+                        flags
+                    }
+                    Ok((flags, lever)) => {
+                        eprintln!(
+                            "wicked-core: unit {} (phase `{}`, executes_code:false) runs on \
+                             '{cli_key}' with the read-only posture {} (F-036)",
+                            input.unit.ord,
+                            input.unit.phase_id().unwrap_or("?"),
+                            lever.describe()
+                        );
+                        flags
+                    }
+                    Err(why) => return posture_refusal(input, &why),
+                }
+            } else {
+                posture
+            };
+            apply_seat_posture(&mut argv, &posture);
             // v3.2 §2: the seat's PER-LAUNCH skills delivery — pi's `--no-skills --skill <dir>…`,
             // copilot's `--add-dir <view>` — rides the argv exactly like its posture (before any
             // `--` guard). opencode's rides the env, set on the command below. Nothing is written
@@ -1342,10 +1381,17 @@ impl WrappedCliStepRunner {
                         ord: input.unit.ord,
                         attempt: input.attempt,
                         cli: cli.clone(),
-                        reason: format!(
-                            "unit is governed but '{cli}' has no input-governance adapter \
-                             (gate-hook injection is claude-only); its tool calls are unchecked"
-                        ),
+                        reason: match &no_lever_note {
+                            Some(note) => format!(
+                                "unit is governed but '{cli}' has no input-governance adapter \
+                                 (gate-hook injection is claude-only); its tool calls are \
+                                 unchecked; {note}"
+                            ),
+                            None => format!(
+                                "unit is governed but '{cli}' has no input-governance adapter \
+                                 (gate-hook injection is claude-only); its tool calls are unchecked"
+                            ),
+                        },
                     });
                 }
                 None
@@ -1547,6 +1593,13 @@ impl WrappedCliStepRunner {
                 // free to write code.
                 if input.unit.pre_build_scope {
                     cmd.env(crate::gate_hook::PRE_BUILD_SCOPE_ENV, "1");
+                }
+                // F-036: the NO-CODE scope — the same gate, for any `executes_code: false` phase
+                // (an evaluator reviewing a build, not only the pre-build ladder). The hook refuses
+                // the path-bearing write tools up front; the worktree guard is the post-hoc floor
+                // for what a hook cannot see (`Bash` heredocs). Set ONLY when the flag is on.
+                if crate::worktree_guard::applies_to(&input.unit) {
+                    cmd.env(crate::gate_hook::NO_CODE_SCOPE_ENV, "1");
                 }
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
@@ -2768,6 +2821,171 @@ pub(crate) fn apply_seat_posture(argv: &mut Vec<String>, posture: &[String]) {
             }
         }
         None => argv.extend(posture.iter().cloned()),
+    }
+}
+
+/// Which read-only lever [`no_code_posture`] applied to a non-claude seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadOnlyLever {
+    /// codex: `--sandbox read-only` (codex-cli `exec -s/--sandbox`; verified 0.148+).
+    CodexSandbox,
+    /// pi: `--exclude-tools edit,write` (pi's built-in tools are read/bash/edit/write; the
+    /// denylist flag is documented on `pi --help`).
+    PiExcludeTools,
+    /// The seat exposes no lever the engine knows how to apply per launch (copilot's tool
+    /// grants are allow-lists with no verified write-class deny; opencode/agy run over ACP).
+    None,
+}
+
+impl ReadOnlyLever {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            ReadOnlyLever::CodexSandbox => "`--sandbox read-only`",
+            ReadOnlyLever::PiExcludeTools => "`--exclude-tools edit,write`",
+            ReadOnlyLever::None => "(no lever)",
+        }
+    }
+}
+
+/// Tokens that GRANT writes/approvals outright on some seat. A NO-CODE phase may not launch on a
+/// lever-less seat whose posture carries one of these — there is nothing to downgrade it with.
+/// (codex's are handled by rewriting, not refusing: it has a lever.)
+pub(crate) const WRITE_CAPABLE_TOKENS: [&str; 6] = [
+    "--allow-all-tools",
+    "--allow-all",
+    "--dangerously-skip-permissions",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--yolo",
+    "--auto",
+];
+
+/// The posture a NON-claude seat runs a NO-CODE phase under (F-036 — `executes_code: false`, the
+/// evaluator/recon/review rungs): the seat's resolved `posture`, downgraded to read-only where the
+/// seat has a lever; otherwise passed through unless it explicitly grants writes, which is refused.
+///
+/// * codex (`binary`/`cli_key` `codex`): every `-s/--sandbox` value becomes `read-only`
+///   (`--sandbox=<mode>` too), the blanket bypass and any stray mode token are dropped, and a
+///   `--sandbox read-only` is appended when the posture named no sandbox at all. This is exactly
+///   codex's own read-only mode — the one crew#427 moved review seats OFF so they could run the
+///   suite; a no-code phase does not need to write to run it (`npm test` writes only ignored
+///   artifacts and the in-boundary scratch).
+/// * pi: `--exclude-tools edit,write` is appended (merged into an existing `--exclude-tools`/`-xt`
+///   value). `bash` stays — the phase must be able to run tests — so this is a posture, not a
+///   guarantee; the worktree guard holds the rest.
+/// * anything else: `Err` naming the write-capable token when the posture carries one (the launch
+///   is refused with that reason); else `Ok((posture, None))` and the caller discloses.
+pub(crate) fn no_code_posture(
+    cli_key: &str,
+    binary: &str,
+    posture: Vec<String>,
+) -> Result<(Vec<String>, ReadOnlyLever), String> {
+    const READ_ONLY: &str = "read-only";
+    const SANDBOX_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
+    let is = |name: &str| cli_key == name || binary == name;
+    if is("codex") {
+        let mut out: Vec<String> = Vec::with_capacity(posture.len() + 2);
+        let mut has_sandbox = false;
+        let mut i = 0;
+        while i < posture.len() {
+            let flag = posture[i].as_str();
+            if flag == "--dangerously-bypass-approvals-and-sandbox" {
+                i += 1;
+                continue;
+            }
+            if let Some(mode) = flag
+                .strip_prefix("--sandbox=")
+                .or_else(|| flag.strip_prefix("-s="))
+            {
+                let _ = mode;
+                has_sandbox = true;
+                out.push(format!("--sandbox={READ_ONLY}"));
+                i += 1;
+                continue;
+            }
+            if flag == "--sandbox" || flag == "-s" {
+                has_sandbox = true;
+                out.push("--sandbox".to_string());
+                out.push(READ_ONLY.to_string());
+                // Consume the value token only when it IS a mode; a following flag stays.
+                if posture
+                    .get(i + 1)
+                    .is_some_and(|v| SANDBOX_MODES.contains(&v.as_str()))
+                {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if SANDBOX_MODES.contains(&flag) {
+                // A stray mode token not owned by a `--sandbox`: drop it rather than leak it.
+                i += 1;
+                continue;
+            }
+            out.push(flag.to_string());
+            i += 1;
+        }
+        if !has_sandbox {
+            out.push("--sandbox".to_string());
+            out.push(READ_ONLY.to_string());
+        }
+        return Ok((out, ReadOnlyLever::CodexSandbox));
+    }
+    if is("pi") {
+        let mut out = posture;
+        let pos = out
+            .iter()
+            .position(|f| f == "--exclude-tools" || f == "-xt");
+        match pos {
+            Some(p) if p + 1 < out.len() && !out[p + 1].starts_with('-') => {
+                let mut tools: Vec<String> = out[p + 1]
+                    .split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                for t in ["edit", "write"] {
+                    if !tools.iter().any(|x| x == t) {
+                        tools.push(t.to_string());
+                    }
+                }
+                out[p + 1] = tools.join(",");
+            }
+            _ => {
+                out.push("--exclude-tools".to_string());
+                out.push("edit,write".to_string());
+            }
+        }
+        return Ok((out, ReadOnlyLever::PiExcludeTools));
+    }
+    if let Some(tok) = posture
+        .iter()
+        .find(|f| WRITE_CAPABLE_TOKENS.contains(&f.as_str()))
+    {
+        return Err(format!(
+            "seat '{cli_key}' ({binary}) resolved a WRITE-CAPABLE posture {posture:?} for a phase \
+             that declares executes_code:false, and this seat exposes no read-only lever the engine \
+             can apply — refusing the launch rather than letting an evaluator/recon phase run with \
+             `{tok}` (F-036). Declare `trust_flags` without `{tok}` for '{cli_key}' in your \
+             wicked-council clis.toml, or route the phase to a seat with a lever (codex: `--sandbox \
+             read-only`; pi: `--exclude-tools edit,write`) or to the governed claude seat."
+        ));
+    }
+    Ok((posture, ReadOnlyLever::None))
+}
+
+/// The [`StepOutput`] for a unit whose launch [`no_code_posture`] REFUSED: nothing ran, nothing was
+/// governed, and the reason is the whole output — the same shape as [`skills_refusal`].
+pub(crate) fn posture_refusal(input: &StepInput, why: &str) -> StepOutput {
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!("(read-only posture refused the launch: {why})"),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
     }
 }
 
@@ -4935,6 +5153,228 @@ mod tests {
             !out.output.contains("dangerously-bypass"),
             "the applied posture must be BOUNDED, never the full-bypass; got: {}",
             out.output
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// F-036, the posture half: a NO-CODE phase (`executes_code: false`) on a codex seat runs under
+    /// codex's own READ-ONLY sandbox — every sandbox spelling is rewritten, the blanket bypass is
+    /// dropped, and a posture with no sandbox at all gains one. A code phase is untouched.
+    #[test]
+    fn no_code_posture_puts_codex_in_its_read_only_sandbox() {
+        let ro = || vec!["--sandbox".to_string(), "read-only".to_string()];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // The shipped bounded posture (workspace-write) → read-only.
+        assert_eq!(
+            no_code_posture("codex", "codex", s(&["--sandbox", "workspace-write"])).unwrap(),
+            (ro(), ReadOnlyLever::CodexSandbox)
+        );
+        // The blanket bypass (a stale clis.toml) → dropped, read-only appended.
+        assert_eq!(
+            no_code_posture(
+                "codex",
+                "codex",
+                s(&["--dangerously-bypass-approvals-and-sandbox"])
+            )
+            .unwrap()
+            .0,
+            ro()
+        );
+        // `=`-attached and short spellings, other flags preserved in place.
+        assert_eq!(
+            no_code_posture(
+                "codex",
+                "codex",
+                s(&["--model", "o3", "--sandbox=danger-full-access"])
+            )
+            .unwrap()
+            .0,
+            s(&["--model", "o3", "--sandbox=read-only"])
+        );
+        assert_eq!(
+            no_code_posture("codex", "codex", s(&["-s", "workspace-write", "--json"]))
+                .unwrap()
+                .0,
+            s(&["--sandbox", "read-only", "--json"])
+        );
+        // No sandbox declared at all → one is added.
+        assert_eq!(no_code_posture("codex", "codex", vec![]).unwrap().0, ro());
+        // A bare `--sandbox` followed by a NON-mode flag: bounded, and the flag is kept.
+        assert_eq!(
+            no_code_posture("codex", "codex", s(&["--sandbox", "--json"]))
+                .unwrap()
+                .0,
+            s(&["--sandbox", "read-only", "--json"])
+        );
+    }
+
+    /// pi's lever is its tool denylist: `edit,write` are excluded (merged into an existing
+    /// `--exclude-tools`), `bash` stays so the phase can still run the suite.
+    #[test]
+    fn no_code_posture_excludes_pis_write_tools() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            no_code_posture("pi", "pi", vec![]).unwrap(),
+            (
+                s(&["--exclude-tools", "edit,write"]),
+                ReadOnlyLever::PiExcludeTools
+            )
+        );
+        assert_eq!(
+            no_code_posture("pi", "pi", s(&["--exclude-tools", "web,edit", "-a"]))
+                .unwrap()
+                .0,
+            s(&["--exclude-tools", "web,edit,write", "-a"]),
+            "an existing denylist is merged, never duplicated or clobbered"
+        );
+    }
+
+    /// A seat with NO lever: passes through when its posture grants nothing (the caller discloses
+    /// and the worktree guard holds the line), and is REFUSED when the posture explicitly grants
+    /// writes — there is nothing to downgrade `--allow-all-tools` with.
+    #[test]
+    fn no_code_posture_refuses_a_write_capable_leverless_seat_and_passes_a_bare_one() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            no_code_posture("copilot", "copilot", vec![]).unwrap(),
+            (vec![], ReadOnlyLever::None)
+        );
+        assert_eq!(
+            no_code_posture("copilot", "copilot", s(&["--add-dir", "/x"]))
+                .unwrap()
+                .1,
+            ReadOnlyLever::None
+        );
+        let err = no_code_posture("copilot", "copilot", s(&["--allow-all-tools"]))
+            .expect_err("a write grant with no lever must refuse the launch");
+        assert!(
+            err.contains("--allow-all-tools")
+                && err.contains("executes_code:false")
+                && err.contains("copilot")
+                && err.contains("clis.toml"),
+            "the refusal names the token, the rule, the seat and the remedy: {err}"
+        );
+        for tok in WRITE_CAPABLE_TOKENS {
+            assert!(
+                no_code_posture("opencode", "opencode", s(&[tok])).is_err(),
+                "`{tok}` is write-capable on a lever-less seat"
+            );
+        }
+    }
+
+    /// END-TO-END through `run_unit`: the same codex-key seat as the bounded-posture test above,
+    /// but the unit's phase declared `executes_code: false` — the argv must carry `--sandbox
+    /// read-only` and NOT the workspace-write posture the code phases get.
+    #[cfg(unix)]
+    #[test]
+    fn governed_worker_argv_for_a_codex_seat_on_a_no_code_phase_is_read_only() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "wicked-ro-posture-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"ARGV=[$*]\"\n").unwrap();
+
+        let mut u = WorkUnit::pending("s:verify", "s", 4, "verify the fix");
+        u.assigned_cli = Some("codex".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        u.worktree_guarded = true; // the def said `executes_code: false`
+        let input = StepInput {
+            run_id: "run-ro-posture".to_string(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        assert!(
+            out.output.contains("--sandbox") && out.output.contains("read-only"),
+            "a no-code phase on codex must run in codex's read-only sandbox; got: {}",
+            out.output
+        );
+        assert!(
+            !out.output.contains("workspace-write") && !out.output.contains("dangerously-bypass"),
+            "no write-capable sandbox may survive on a no-code phase; got: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The refusal path END-TO-END: a lever-less seat whose posture grants all tools may not run a
+    /// no-code phase — the unit FAILS before any process is spawned, and the output says why.
+    #[cfg(unix)]
+    #[test]
+    fn a_no_code_phase_on_a_write_capable_leverless_seat_is_refused_before_launch() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "wicked-ro-refuse-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let cfg = home.join(".config/wicked-council");
+        std::fs::create_dir_all(&cfg).unwrap();
+        // An operator override granting copilot every tool — the shape that must be refused.
+        std::fs::write(
+            cfg.join("clis.toml"),
+            "[[cli]]\nkey = \"copilot\"\ndisplay_name = \"copilot\"\nbinary = \"copilot\"\n\
+             headless_invocation = \"copilot -p \\\"{PROMPT}\\\"\"\ntrust_flags = [\"--allow-all-tools\"]\n",
+        )
+        .unwrap();
+        let _home = HomeGuard::pin(&home);
+
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo RAN > ran.txt\n").unwrap();
+
+        let mut u = WorkUnit::pending("s:verify", "s", 4, "verify the fix");
+        u.assigned_cli = Some("copilot".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        u.worktree_guarded = true;
+        let input = StepInput {
+            run_id: "run-ro-refuse".to_string(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("read-only posture refused the launch")
+                && out.output.contains("--allow-all-tools"),
+            "{}",
+            out.output
+        );
+        assert!(
+            !dir.join("ran.txt").exists(),
+            "nothing may run when the posture is refused"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

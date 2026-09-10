@@ -310,6 +310,31 @@ fn wait_status(core: &Core, run_id: &str, want: SessionStatus) -> bool {
 }
 
 /// A deny policy scoped EXACTLY to one phase (governance matches the phase name exactly).
+/// A `bug`-SHAPED def for the conditional-gate tests: the same four phase ids in the same order, the
+/// same `HumanConfirmIf(VerdictNotPass)` + `verified_evidence` gate on `verify` (registration arms it
+/// with the shipped evidence floor, exactly as `bug/verify` carries), but a `fix` phase that is a
+/// NON-code Creator. Since wicked-core F-039 the shipped `bug/fix` is a PINNED code phase — its
+/// `auto` gate re-derives the worktree diff and a distinct seat judges it — so on an UNBOUND run
+/// with a stub seat it fails closed at unit 3 before `verify` ever runs. That is the pinned-phase
+/// doctrine ("a repo-less run cannot satisfy a pinned phase"), not the conditional-gate mechanics
+/// these tests pin; this def keeps the `unit-4` deny policy and the `units.len() == 4` reads exact.
+const CONDGATE_WORKFLOW: &str = r#"{
+    "id": "condgate",
+    "phases": [
+        { "id": "triage", "kind": "recon", "gate": "auto" },
+        { "id": "reproduce", "kind": "test", "gate": "auto", "depends_on": ["triage"] },
+        { "id": "fix", "kind": "build", "gate": "auto", "role": "creator", "depends_on": ["reproduce"] },
+        {
+            "id": "verify",
+            "kind": "test",
+            "gate": {"human_confirm_if": "verdict_not_pass"},
+            "verified_evidence": true,
+            "role": "evaluator",
+            "depends_on": ["fix"]
+        }
+    ]
+}"#;
+
 fn deny_policy(phase: &str, pattern: &str) -> Policy {
     Policy {
         id: format!("deny-{phase}"),
@@ -477,7 +502,7 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
     let dir = tmp_dir("condgate");
     let estate_db = dir.join("estate.db").to_str().unwrap().to_string();
     let bus_db = dir.join("bus.db").to_str().unwrap().to_string();
-    // Deny the bug workflow's terminal `verify` phase (unit-4) so its verdict is not-pass → the
+    // Deny the bug-shaped def's terminal `verify` phase (unit-4) so its verdict is not-pass → the
     // HumanConfirmIf(VerdictNotPass) gate escalates to a human.
     {
         let mut store = open_store(Some(&estate_db)).unwrap();
@@ -489,6 +514,8 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         Arc::new(OkRunner),
         bus_db.clone(),
     );
+    core.register_workflow(CONDGATE_WORKFLOW)
+        .expect("register the bug-shaped conditional-gate def");
     core.launch_run(LaunchSpec {
         project_id: None,
         problem: "fix the bug".into(),
@@ -497,12 +524,12 @@ fn a_conditional_gate_approve_re_runs_the_unit_under_exec_mediation() {
         session_id: "cg".into(),
         human_confirm: HumanConfirm::None,
         repo_ref: None,
-        workflow: Some("bug".into()),
+        workflow: Some("condgate".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
     })
-    .expect("launch bug workflow");
+    .expect("launch the bug-shaped workflow");
 
     assert!(
         wait_status(&core, "cg", SessionStatus::AwaitingHuman),

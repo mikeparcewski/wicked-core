@@ -205,6 +205,25 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // Write/Edit before it lands. One field, so the prompt, the gate and the warning can
             // never disagree about which phases are pre-build.
             unit.pre_build_scope = pre_build_scope;
+            // F-036 — the WORKTREE GUARD marker. A def-driven, AGENT-executed phase that declared
+            // `executes_code: false` (an evaluator, a recon rung, a review) may not change the
+            // tree it works in: the actor snapshots the worktree at dispatch and the gate denies
+            // any non-exempt change when the work ends (`worktree_guard`). Read off the def, not
+            // guessed — a prose-planned unit carries no declaration and is never guarded; a Tool
+            // phase is the engine's own command (a `deliver` push MOVES HEAD on purpose).
+            let is_tool = matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
+            unit.worktree_guarded = !phase.executes_code && !is_tool;
+            // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a
+            // `verified_evidence` agent phase with an `executes_code` Creator before it. The engine
+            // runs the repository's own checks in the worktree after the seat's work and folds the
+            // exit codes into the gate (`repo_checks`). Same selection rule as the evidence floor's
+            // "a diff is the evidence" test, so the two floors always agree on which phase
+            // verifies code.
+            unit.repo_checks_floor = phase.verified_evidence
+                && !is_tool
+                && def.phases[..i]
+                    .iter()
+                    .any(|p| p.executes_code && p.role == crate::workflow::PhaseRole::Creator);
             unit
         })
         .collect()

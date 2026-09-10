@@ -52,9 +52,10 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         "store returns the content pin"
     );
 
-    // 2. The `build` phase ships with no validator_pin (the shipped floor sits on the Evaluator,
-    //    `adversarial-review`, not here). Prove that, so the pinning below is a genuine change of
-    //    state for THIS phase (inert → engaged) rather than an overwrite of something already there.
+    // 2. The `build` phase ships with the GENERIC evidence floor (wicked-core F-039: a code-writing
+    //    Creator's gate must evaluate something). Prove that, so the pinning below is a genuine
+    //    change of state for THIS phase — the generic floor REPLACED by a phase-specific validator,
+    //    which `gate-phase` exists to do — rather than an overwrite of the same value.
     let base = feature_def();
     const PHASE: &str = "build";
     let base_build = base
@@ -62,9 +63,23 @@ fn gate_phase_drop_in_makes_a_shipped_style_workflow_actually_gate() {
         .iter()
         .find(|p| p.id == PHASE)
         .expect("feature def has a build phase");
-    assert!(
-        base_build.validator_pin.is_none(),
-        "the shipped feature `build` phase carries no pin of its own — the gap this seam closes"
+    // The generic floor's pin, read off the shipped Evaluator that has always carried it rather
+    // than transcribed — so this premise cannot drift from the constant it names.
+    let generic_floor = base
+        .phases
+        .iter()
+        .find(|p| p.id == "adversarial-review")
+        .and_then(|p| p.validator_pin.clone())
+        .expect("the shipped adversarial-review phase carries the generic evidence floor");
+    assert_eq!(
+        base_build.validator_pin.as_deref(),
+        Some(generic_floor.as_str()),
+        "the shipped feature `build` phase carries the generic evidence floor (F-039); this seam \
+         replaces it with a phase-specific pin"
+    );
+    assert_ne!(
+        approved_pin, generic_floor,
+        "premise: the phase-specific validator must not collide with the generic floor"
     );
 
     // 3. Pin the approved validator onto that phase and RE-ID the def (what `gate-phase` does), then

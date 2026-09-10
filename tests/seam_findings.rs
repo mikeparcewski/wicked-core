@@ -95,6 +95,31 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
+/// A `bug`-SHAPED def for the conditional-gate tests: the same four phase ids in the same order, the
+/// same `HumanConfirmIf(VerdictNotPass)` + `verified_evidence` gate on `verify` (registration arms it
+/// with the shipped evidence floor, exactly as `bug/verify` carries), but a `fix` phase that is a
+/// NON-code Creator. Since wicked-core F-039 the shipped `bug/fix` is a PINNED code phase — its
+/// `auto` gate re-derives the worktree diff and a distinct seat judges it — so on an UNBOUND run
+/// with a stub seat it fails closed at unit 3 before `verify` ever runs. That is the pinned-phase
+/// doctrine ("a repo-less run cannot satisfy a pinned phase"), not the conditional-gate mechanics
+/// these tests pin; this def keeps the `unit-4` deny policy and the `units.len() == 4` reads exact.
+const CONDGATE_WORKFLOW: &str = r#"{
+    "id": "condgate",
+    "phases": [
+        { "id": "triage", "kind": "recon", "gate": "auto" },
+        { "id": "reproduce", "kind": "test", "gate": "auto", "depends_on": ["triage"] },
+        { "id": "fix", "kind": "build", "gate": "auto", "role": "creator", "depends_on": ["reproduce"] },
+        {
+            "id": "verify",
+            "kind": "test",
+            "gate": {"human_confirm_if": "verdict_not_pass"},
+            "verified_evidence": true,
+            "role": "evaluator",
+            "depends_on": ["fix"]
+        }
+    ]
+}"#;
+
 fn db_path(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("wicked-core-seam-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -207,8 +232,9 @@ fn sync_launch_halts_as_failed_on_a_governance_deny() {
 }
 
 /// Finding #3: a `HumanConfirmIf(VerdictNotPass)` phase whose OWN verdict is not-pass ESCALATES to a
-/// human (`AwaitingHuman`) instead of the gate being dead. The built-in `bug` workflow's terminal
-/// `verify` phase (unit-4) carries exactly this gate; a deny on it drives a not-pass verdict.
+/// human (`AwaitingHuman`) instead of the gate being dead. The `bug`-shaped [`CONDGATE_WORKFLOW`]'s
+/// terminal `verify` phase (unit-4) carries exactly the shipped `bug/verify` gate; a deny on it
+/// drives a not-pass verdict.
 #[test]
 fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
     let db = db_path("cond-gate");
@@ -218,6 +244,8 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         register_policy(&mut store, &deny_policy("unit-4", "verify")).unwrap();
     }
     let core = Core::spawn_with_engine(db, Arc::new(StubDispatcher), Arc::new(OkRunner));
+    core.register_workflow(CONDGATE_WORKFLOW)
+        .expect("register the bug-shaped conditional-gate def");
     core.launch_run(LaunchSpec {
         project_id: None,
         problem: "fix the bug".into(),
@@ -226,12 +254,12 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
         session_id: "r".into(),
         human_confirm: HumanConfirm::None,
         repo_ref: None,
-        workflow: Some("bug".into()),
+        workflow: Some("condgate".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
     })
-    .expect("launch bug workflow");
+    .expect("launch the bug-shaped workflow");
 
     assert!(
         wait_status(&core, "r", SessionStatus::AwaitingHuman),
@@ -239,7 +267,7 @@ fn a_conditional_gate_pauses_on_a_not_pass_verdict() {
     );
     let views = core.sessions_detail().unwrap();
     let v = views.iter().find(|v| v.session.id == "r").unwrap();
-    assert_eq!(v.units.len(), 4, "bug workflow plans 4 phases");
+    assert_eq!(v.units.len(), 4, "the bug-shaped def plans 4 phases");
     assert_eq!(
         v.units[3].status,
         UnitStatus::Rejected,
@@ -275,6 +303,8 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         register_policy(&mut store, &deny_policy("unit-4", "verify")).unwrap();
     }
     let core = Core::spawn_with_engine(db, Arc::new(StubDispatcher), Arc::new(OkRunner));
+    core.register_workflow(CONDGATE_WORKFLOW)
+        .expect("register the bug-shaped conditional-gate def");
     let events = core.subscribe();
     core.launch_run(LaunchSpec {
         project_id: None,
@@ -284,12 +314,12 @@ fn t_d4b_conditional_gate_retry_bumps_attempt() {
         session_id: "r".into(),
         human_confirm: HumanConfirm::None,
         repo_ref: None,
-        workflow: Some("bug".into()),
+        workflow: Some("condgate".into()),
         extra_write_roots: Vec::new(),
         extra_read_roots: Vec::new(),
         project_graph: None,
     })
-    .expect("launch bug workflow");
+    .expect("launch the bug-shaped workflow");
     assert!(
         wait_status(&core, "r", SessionStatus::AwaitingHuman),
         "the verify phase's not-pass verdict escalates to a human (first run, attempt 0)"

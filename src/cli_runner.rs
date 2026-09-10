@@ -231,6 +231,12 @@ struct CompletedTask {
     /// actor-side fold applies evidence-integrity fail-closure identically for the bus delivery mode.
     #[serde(default)]
     governed: bool,
+    /// Engine-derived evidence gathered by the off-actor runner after the seat's work (F-036
+    /// worktree guard outcome, F-039 repo-checks report), so the exec-mediated path folds the
+    /// SAME evidence the in-process path does. `#[serde(default)]` keeps pre-evidence payloads
+    /// parseable — absent ⇒ nothing gathered (the fold then fails a GUARDED unit closed).
+    #[serde(default)]
+    evidence: crate::workflow::UnitEvidence,
     /// Actor-lifetime UUID echoed from `DispatchedTask` — lets the `task.completed` poller pass the
     /// stale-completion guard token to `Command::ApplyStepResult`. `None` on pre-DES-002 payloads.
     #[serde(default)]
@@ -639,7 +645,11 @@ pub(crate) fn run_unit_and_judge(
     input: &StepInput,
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
-) -> (StepOutput, Option<(bool, String)>) {
+) -> (
+    StepOutput,
+    Option<(bool, String)>,
+    crate::workflow::UnitEvidence,
+) {
     run_unit_and_judge_with_roster(
         runner,
         input,
@@ -658,8 +668,21 @@ fn run_unit_and_judge_with_roster(
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
     roster: &[crate::AgenticCli],
-) -> (StepOutput, Option<(bool, String)>) {
+) -> (
+    StepOutput,
+    Option<(bool, String)>,
+    crate::workflow::UnitEvidence,
+) {
     let output = runner.run_unit_streaming(input, emit_delta);
+    // F-036 WORKTREE GUARD — compared IMMEDIATELY after the seat's own work and before anything
+    // else touches the tree (the judge seat below, the repo checks after it), so every path the
+    // comparison names is the seat's doing and nothing else's. Only for a unit that folded Ok:
+    // a failed unit fails on its own account and never reaches the gate this feeds.
+    let worktree_guard = if output.status == StepStatus::Ok {
+        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
+    } else {
+        None
+    };
     let work_owned = select_work_for_agent(
         input.unit.role,
         &input.unit.required_deliverables,
@@ -734,7 +757,47 @@ fn run_unit_and_judge_with_roster(
     } else {
         None
     };
-    (output, agent_verdict)
+    // F-039 REPO CHECKS FLOOR — the engine runs the repository's own checks LAST (slowest, and
+    // its build artifacts must not colour the guard's comparison or the judge's evidence above),
+    // only for the def's code-verifying unit, only when the unit folded Ok, and not when the
+    // guard already caught the seat rewriting the tree (checks over a rewritten tree would
+    // certify the wrong code, and the gate denies on the mutation regardless).
+    let guard_denies = matches!(
+        &worktree_guard,
+        Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(m)) if m.denies()
+    ) || matches!(
+        &worktree_guard,
+        Some(crate::worktree_guard::WorktreeGuardOutcome::Unverifiable(_))
+    );
+    let repo_checks = match input.workdir.as_deref() {
+        Some(wd)
+            if input.unit.repo_checks_floor
+                && input.unit.tool_cmd.is_none()
+                && output.status == StepStatus::Ok
+                && !guard_denies =>
+        {
+            eprintln!(
+                "wicked-core: repo checks floor — running the repository's own checks in {} for \
+                 unit {} (F-039)",
+                wd.display(),
+                input.unit.ord
+            );
+            let report = crate::repo_checks::run(wd);
+            eprintln!(
+                "wicked-core: repo checks floor for unit {}: {} — {}",
+                input.unit.ord,
+                if report.passed { "PASS" } else { "FAIL" },
+                report.summary()
+            );
+            Some(report)
+        }
+        _ => None,
+    };
+    let evidence = crate::workflow::UnitEvidence {
+        worktree_guard,
+        repo_checks,
+    };
+    (output, agent_verdict, evidence)
 }
 
 // ── The actor-thread publish seam (thread-local — dispatch_unit consults it) ─────────────────────────
@@ -1298,6 +1361,7 @@ fn run_cli_runner(
                                 tools: completed.tools.clone(),
                                 governed: completed.governed,
                             };
+                            let evidence = completed.evidence.clone();
                             let agent_verdict =
                                 completed.agent_verdict.map(|v| (v.pass, v.reasoning));
                             let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(0);
@@ -1305,6 +1369,7 @@ fn run_cli_runner(
                                 .send(Command::ApplyStepResult {
                                     output,
                                     agent_verdict,
+                                    evidence,
                                     process_gen: task.process_gen,
                                     launch_seq: task.launch_seq,
                                     ack: Some(ack_tx),
@@ -1341,6 +1406,7 @@ fn run_cli_runner(
                             .send(Command::ApplyStepResult {
                                 output: failed_output,
                                 agent_verdict: None,
+                                evidence: Default::default(),
                                 process_gen: task.process_gen,
                                 launch_seq: task.launch_seq,
                                 ack: Some(ack_tx),
@@ -1410,6 +1476,7 @@ fn run_cli_runner(
                             .send(Command::ApplyStepResult {
                                 output: failed_output,
                                 agent_verdict: None,
+                                evidence: Default::default(),
                                 process_gen: task.process_gen,
                                 launch_seq: task.launch_seq,
                                 ack: Some(ack_tx),
@@ -1483,7 +1550,7 @@ fn run_cli_runner(
                         });
                     }
                 };
-                let (output, agent_verdict) = run_unit_and_judge(
+                let (output, agent_verdict, evidence) = run_unit_and_judge(
                     &runner,
                     &input,
                     task.agent_review_target.as_deref(),
@@ -1501,6 +1568,7 @@ fn run_cli_runner(
                     files: output.files.clone(),
                     tools: output.tools.clone(),
                     governed: output.governed,
+                    evidence,
                     process_gen: task.process_gen,
                     launch_seq: task.launch_seq,
                 };
@@ -1629,6 +1697,7 @@ fn run_task_completed_poller(
                     governed: task.governed,
                 };
                 let agent_verdict = task.agent_verdict.map(|v| (v.pass, v.reasoning));
+                let evidence = task.evidence.clone();
                 // Reach the actor via the command channel (self_tx write-back). Gate cursor advance
                 // on the ack so a crash between dequeue and commit leaves the cursor behind for
                 // redelivery (T7-g invariant). A closed channel ⇒ actor is gone → exit.
@@ -1637,6 +1706,7 @@ fn run_task_completed_poller(
                     .send(Command::ApplyStepResult {
                         output,
                         agent_verdict,
+                        evidence,
                         process_gen: task.process_gen,
                         launch_seq: task.launch_seq,
                         ack: Some(ack_tx),
@@ -2082,7 +2152,8 @@ mod tests {
             seat("agy", "agy run {PROMPT}"),
             seat("pi", "pi ask {PROMPT}"),
         ];
-        let (_out, verdict) = run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3);
+        let (_out, verdict, _evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3);
         assert!(
             verdict.is_some(),
             "an approved validator + workdir ⇒ a layer-2 verdict runs"

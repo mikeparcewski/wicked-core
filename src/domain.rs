@@ -184,7 +184,9 @@ pub struct UnitDenial {
     /// `input_governance` (the tool-call hook / boundary), `pinned_validator` (deterministic
     /// re-verify), `agent_validator` (LLM judge), `evaluator` (evaluator≠creator second pass),
     /// `worker_failure` (the CLI process failed), `substance` (no reviewable substance),
-    /// `deliverables` (declared deliverables missing), `elicitation` (ACP elicitation ended).
+    /// `deliverables` (declared deliverables missing), `elicitation` (ACP elicitation ended),
+    /// `worktree_guard` (an `executes_code: false` phase changed the worktree it was reviewing,
+    /// F-036), `repo_checks` (the repository's own checks failed in the worktree, F-039).
     pub source: String,
     /// The operator-facing prose — byte-identical to the `denial_reason` the record carries.
     pub reason: String,
@@ -368,6 +370,38 @@ pub struct WorkUnit {
     /// persisted unit; it never drives the unit `Rejected` (that is [`Self::denial_reason`]'s job).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope_warnings: Vec<String>,
+    /// TRUE when this unit's backing phase declared `executes_code: false` in a def-driven,
+    /// AGENT-executed plan (F-036) — the WORKTREE GUARD marker, set at plan time from def data
+    /// exactly like [`Self::pre_build_scope`]. Three consumers, one marker: the actor snapshots
+    /// the worktree at dispatch ([`Self::worktree_baseline`]); the worker thread re-snapshots and
+    /// compares when the seat's work ends ([`crate::worktree_guard`]); the gate fold DENIES a
+    /// non-exempt change (source `worktree_guard`, `evaluatorMutatedWorktree`). The carriers also
+    /// read it as the NO-CODE phase scope (`WICKED_NO_CODE_SCOPE` / `BoundaryCtx::no_code_scope`)
+    /// so a governed seat is refused the path-bearing write tools up front. FALSE for every
+    /// `executes_code` phase, every Tool phase and every prose-planned unit — a guard that scoped
+    /// a creator away from creating would be the worse bug.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktree_guarded: bool,
+    /// The worktree's content snapshot (tree hash + `HEAD`) taken at this unit's FIRST dispatch
+    /// when [`Self::worktree_guarded`] — persisted ON the unit so a daemon restart mid-unit keeps
+    /// the creator's tree as the baseline. Cleared when a human APPROVES a gate on the already-run
+    /// unit (accepting the tree as it stands), so the re-dispatch re-baselines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_baseline: Option<crate::worktree_guard::WorktreeSnapshot>,
+    /// What the guard recorded at the gate fold when the tree differed — denying or exempt-only
+    /// (see [`crate::worktree_guard::WorktreeMutation::denies`]). Evidence on the unit record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_mutation: Option<crate::worktree_guard::WorktreeMutation>,
+    /// TRUE when this unit's backing phase is the def's code-VERIFYING step (F-039): it declares
+    /// `verified_evidence` and an `executes_code` Creator runs before it. The engine then runs the
+    /// repository's own checks in the worktree after the seat's work and folds their exit codes
+    /// into the gate as a deterministic floor ([`crate::repo_checks`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repo_checks_floor: bool,
+    /// The repo-checks evidence the fold attached: every check the engine ran, its exit code and
+    /// output tails. `None` until the unit's gate folds (or when the floor does not apply).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_checks: Option<crate::repo_checks::RepoChecksReport>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
 }
@@ -526,6 +560,11 @@ impl WorkUnit {
             depends_on: Vec::new(),
             pre_build_scope: false,
             scope_warnings: Vec::new(),
+            worktree_guarded: false,
+            worktree_baseline: None,
+            worktree_mutation: None,
+            repo_checks_floor: false,
+            repo_checks: None,
             status: UnitStatus::Pending,
         }
     }

@@ -2712,6 +2712,57 @@ mod tests {
                 "type", "session", "ord", "attempt", "cli", "level", "reason",
             ],
         );
+        // F-036 / F-039 gate-evidence events.
+        check(
+            CoreEvent::EvaluatorMutatedWorktree {
+                session: s(),
+                ord: 4,
+                attempt: 0,
+                cli: s(),
+                phase: s(),
+                before_tree: s(),
+                after_tree: s(),
+                head_moved: false,
+                changed: vec![],
+                exempted: vec![],
+            },
+            "evaluatorMutatedWorktree",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "cli",
+                "phase",
+                "beforeTree",
+                "afterTree",
+                "headMoved",
+                "changed",
+                "exempted",
+            ],
+        );
+        check(
+            CoreEvent::RepoChecksEvaluated {
+                session: s(),
+                ord: 4,
+                attempt: 0,
+                passed: true,
+                criterion: s(),
+                checks: vec![],
+                skipped: vec![],
+            },
+            "repoChecksEvaluated",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "passed",
+                "criterion",
+                "checks",
+                "skipped",
+            ],
+        );
         check(
             CoreEvent::SkillsSnapshotHanded {
                 session: s(),

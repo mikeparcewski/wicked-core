@@ -4841,6 +4841,9 @@ impl AcpStepRunner {
                     // carrier reads the same fact from `PRE_BUILD_SCOPE_ENV`, which this carrier
                     // has no access to (the daemon's env is the daemon's, core#260).
                     pre_build_scope: input.unit.pre_build_scope,
+                    // F-036: the NO-CODE scope, same route — the ACP carrier answers the
+                    // seat's permission requests in-process, so the flag rides the boundary.
+                    no_code_scope: crate::worktree_guard::applies_to(&input.unit),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -5166,6 +5169,7 @@ impl AcpStepRunner {
                         home: boundary.home.clone(),
                         claude_config_dir: boundary.claude_config_dir.clone(),
                         pre_build_scope: boundary.pre_build_scope,
+                        no_code_scope: boundary.no_code_scope,
                     }),
                 }
             },
@@ -9922,6 +9926,11 @@ transport = "stdio"
             executes_code: false,
             pre_build_scope: false,
             scope_warnings: Vec::new(),
+            worktree_guarded: false,
+            worktree_baseline: None,
+            worktree_mutation: None,
+            repo_checks_floor: false,
+            repo_checks: None,
             status: crate::domain::UnitStatus::Pending,
         }
     }

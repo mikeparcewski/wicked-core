@@ -1688,6 +1688,7 @@ pub(crate) fn run(
             Command::ApplyStepResult {
                 output,
                 agent_verdict,
+                evidence,
                 process_gen: _, // stale-result guard — consumed by bus consumer; ignored here
                 launch_seq: _,
                 ack,
@@ -1716,6 +1717,7 @@ pub(crate) fn run(
                     &self_tx,
                     output,
                     agent_verdict,
+                    evidence,
                     &path,
                     &lifecycle_maps,
                     &actor_maps,
@@ -2588,7 +2590,7 @@ pub(crate) fn run(
                         );
                         // Re-dispatch the cursor unit.
                         match dispatch_unit(
-                            &store,
+                            &mut store,
                             &mut subscribers,
                             &runner,
                             &self_tx,
@@ -2749,7 +2751,7 @@ pub(crate) fn run(
                     }
                 }
                 match dispatch_unit(
-                    &store,
+                    &mut store,
                     &mut subscribers,
                     &runner,
                     &self_tx,
@@ -2890,7 +2892,7 @@ pub(crate) fn run(
                                     continue;
                                 }
                                 if let Err(e) = dispatch_unit(
-                                    &store,
+                                    &mut store,
                                     &mut subscribers,
                                     &runner,
                                     &self_tx,
@@ -2945,7 +2947,7 @@ pub(crate) fn run(
                             continue;
                         }
                         if let Err(e) = dispatch_unit(
-                            &store,
+                            &mut store,
                             &mut subscribers,
                             &runner,
                             &self_tx,
@@ -3996,6 +3998,7 @@ fn apply_step_result(
     self_tx: &Sender<Command>,
     output: crate::workflow::StepOutput,
     agent_verdict: Option<(bool, String)>,
+    evidence: crate::workflow::UnitEvidence,
     _db_path: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
@@ -4743,6 +4746,9 @@ fn apply_step_result(
         output.governed,
         &cli_keys,
         agent_verdict.as_ref(),
+        // The worker-thread evidence (F-036 guard outcome, F-039 repo checks) — folded as
+        // deny-dominant layers beside the pinned validator.
+        &evidence,
         &mut |ev| emit(subscribers, ev),
         coverage_db.as_deref(),
     )?;
@@ -5291,7 +5297,7 @@ fn unsuppressed_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'stati
 /// `unit_ix` is past the last unit (nothing to dispatch — the run is done).
 #[allow(clippy::too_many_arguments)]
 fn dispatch_unit(
-    store: &dyn GraphStore,
+    store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
     runner: &Arc<dyn StepRunner>,
     self_tx: &Sender<Command>,
@@ -5305,9 +5311,32 @@ fn dispatch_unit(
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     let units = crate::domain::session_units(store, run_id)?;
-    let Some(unit) = units.get(unit_ix) else {
+    let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
+    // F-036 WORKTREE GUARD baseline. For a unit whose phase declared `executes_code: false`
+    // (`worktree_guarded`, def-derived at plan time), snapshot the worktree's content NOW — before
+    // the seat runs — and persist it ON the unit, so the comparison at the end of the unit's work
+    // is against the tree the creator left and survives a daemon restart mid-unit (a redrive
+    // finds the baseline already there and keeps it). Keep-first: only a human APPROVING a gate on
+    // this unit clears it (`confirm_gate`), accepting the tree as it stands. A snapshot failure is
+    // logged and left unset — the fold then fails the unit CLOSED (`Unverifiable`), never clean.
+    if crate::worktree_guard::applies_to(&unit) && unit.worktree_baseline.is_none() {
+        if let Some(wd) = session.workdir.as_deref() {
+            match crate::worktree_guard::snapshot(std::path::Path::new(wd)) {
+                Ok(snap) => {
+                    unit.worktree_baseline = Some(snap);
+                    put_node(store, unit.to_node())?;
+                }
+                Err(e) => eprintln!(
+                    "wicked-core: worktree guard could not snapshot {wd} before unit {} of run \
+                     {run_id}: {e} — the unit's gate will fail closed (F-036)",
+                    unit.ord
+                ),
+            }
+        }
+    }
+    let unit = &unit;
     // (DES-STUDIO-COCKPIT-001 §3 B2) UnitDispatched — the durable-rework signal. `dispatch_unit` is the
     // SINGLE funnel every dispatch site reaches (initial advance, `confirm_gate` Approve re-dispatch,
     // `resume_run_inner`, `redrive_executing_sessions`); each of those bumps `session.attempt` in the store
@@ -5531,6 +5560,8 @@ fn dispatch_unit(
                     governed: false,
                 },
                 agent_verdict: None,
+                // A Tool unit is the engine's own command: no seat, no guard, no repo checks.
+                evidence: Default::default(),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
                 ack: None,
@@ -5584,7 +5615,7 @@ fn dispatch_unit(
         // The WORK the agent judges is the creator's COLD output for an Evaluator-role unit
         // (`agent_review_target`, seam finding #8), else the unit's own output. The verdict rides back on the
         // `ApplyStepResult` command; the actor folds it into the gate via `combine_verdict`.
-        let (output, agent_verdict) = crate::cli_runner::run_unit_and_judge(
+        let (output, agent_verdict, evidence) = crate::cli_runner::run_unit_and_judge(
             &runner,
             &input,
             agent_review_target.as_deref(),
@@ -5593,6 +5624,7 @@ fn dispatch_unit(
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,
+            evidence,
             process_gen: None, // local-path worker; bus consumer sets these in T7
             launch_seq: 0,
             ack: None,
@@ -6183,6 +6215,21 @@ pub(crate) fn confirm_gate(
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
+            // F-036: a human APPROVING a gate on an ALREADY-RUN guarded unit (a `HumanConfirmIf`
+            // escalation — e.g. the guard denied the evaluator for rewriting the fix) has seen the
+            // denial name every path and chosen to continue: the re-dispatch re-baselines on the
+            // tree as it stands. Only here — a restart-driven redrive keeps the persisted baseline,
+            // because no human accepted anything there.
+            if cursor_ran {
+                if let Some(u) = units
+                    .get(s.unit_ix)
+                    .filter(|u| u.worktree_baseline.is_some())
+                {
+                    let mut u = u.clone();
+                    u.worktree_baseline = None;
+                    put_node(store, u.to_node())?;
+                }
+            }
             emit(
                 subscribers,
                 CoreEvent::Resumed {
@@ -6996,6 +7043,7 @@ mod substance_gate_tests {
             &tx,
             out,
             None,
+            crate::workflow::UnitEvidence::default(),
             "",
             &None,
             &None,
@@ -7276,6 +7324,7 @@ mod code_evidence_floor_tests {
             &tx,
             out,
             None,
+            crate::workflow::UnitEvidence::default(),
             "",
             &None,
             &None,
@@ -7636,6 +7685,7 @@ mod deliverable_floor_tests {
             &tx,
             out,
             None,
+            crate::workflow::UnitEvidence::default(),
             "",
             &None,
             &None,
@@ -8044,6 +8094,7 @@ mod seat_failover_tests {
             &tx,
             out,
             None,
+            crate::workflow::UnitEvidence::default(),
             "",
             &None,
             &None,
@@ -8482,6 +8533,7 @@ mod live_output_stream_tests {
                     governed: false,
                 },
                 agent_verdict: None,
+                evidence: Default::default(),
                 process_gen: None,
                 launch_seq: 0,
                 ack: None,
@@ -10965,6 +11017,7 @@ mod turn_timeout_vs_cancel_tests {
             &tx,
             out,
             None,
+            crate::workflow::UnitEvidence::default(),
             "",
             &None,
             &None,

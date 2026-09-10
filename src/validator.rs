@@ -781,7 +781,7 @@ mod sig {
 /// child AND every backgrounded/orphaned descendant still in that group — none of which a bare
 /// `Child::kill` (direct child only) would reach. We ALSO call `Child::kill` (harmless on unix, and the
 /// only mechanism on non-unix). Because the group is the child's own, we can never signal the launcher.
-fn kill_child_tree(child: &mut std::process::Child) {
+pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;
@@ -794,7 +794,7 @@ fn kill_child_tree(child: &mut std::process::Child) {
 /// Reap a just-killed child WITHOUT blocking forever (C5): poll `try_wait` up to a short cap instead of a
 /// bare `child.wait()` that could hang if the process is unkillable (uninterruptible sleep / zombie-parent
 /// races). A killed child normally reaps within a few ms; the cap is a backstop, not the expected path.
-fn reap_bounded(child: &mut std::process::Child) {
+pub(crate) fn reap_bounded(child: &mut std::process::Child) {
     const REAP_CAP: Duration = Duration::from_secs(2);
     let start = Instant::now();
     loop {

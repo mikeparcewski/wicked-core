@@ -96,6 +96,9 @@ pub fn run_session(
             false, // the stub sync path never arms governance
             &cli_keys,
             None, // sync straight-through path runs no off-thread agent judge (stub work, no LLM)
+            // The sync path is UNBOUND (no repo ⇒ no worktree): neither the worktree guard nor
+            // the repo-checks floor applies, so there is honestly nothing to carry.
+            &crate::workflow::UnitEvidence::default(),
             emit,
             None, // sync stub path has no estate db path to inject
         )?;
@@ -728,6 +731,7 @@ pub(crate) fn apply_and_finish_unit(
     governed: bool,
     cli_keys: &[String],
     agent_verdict: Option<&(bool, String)>,
+    evidence: &crate::workflow::UnitEvidence,
     emit: &mut dyn FnMut(CoreEvent),
     db_path: Option<&str>,
 ) -> anyhow::Result<UnitOutcome> {
@@ -761,11 +765,94 @@ pub(crate) fn apply_and_finish_unit(
         }
     }
 
+    // ── (layer-0) WORKTREE GUARD (F-036) — evaluator ≠ creator held structurally. For a unit
+    // whose phase declared `executes_code: false`, the worker thread compared the tree it left
+    // against the baseline the actor snapshotted at dispatch (`worktree_guard`). Any non-exempt
+    // change DENIES: the change under review is no longer the creator's, so no verdict this unit
+    // produced can certify it. Judged FIRST — the pinned diff floor below would PASS a rewritten
+    // tree (a diff exists), and the agent judge would be grading the evaluator's own edit. The
+    // event fires for every observed change, exempt-only ones included, so an operator always
+    // sees what an evaluator wrote. Fail-closed: a guarded unit whose outcome is missing or
+    // unverifiable is denied — a guard whose absence reads as a pass is not a guard.
+    let guard_denial: Option<String> =
+        if crate::worktree_guard::applies_to(unit) && workdir.is_some() {
+            use crate::worktree_guard::WorktreeGuardOutcome as G;
+            match &evidence.worktree_guard {
+            Some(G::Clean { .. }) => None,
+            Some(G::Mutated(m)) => {
+                unit.worktree_mutation = Some(m.clone());
+                emit(CoreEvent::EvaluatorMutatedWorktree {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    cli: unit.assigned_cli.clone().unwrap_or_default(),
+                    phase: unit.phase_id().unwrap_or_default().to_string(),
+                    before_tree: m.before.tree.clone(),
+                    after_tree: m.after.tree.clone(),
+                    head_moved: m.head_moved,
+                    changed: m.changed.clone(),
+                    exempted: m.exempted.clone(),
+                });
+                m.denies()
+                    .then(|| crate::worktree_guard::denial_reason(unit, m))
+            }
+            Some(G::Unverifiable(why)) => Some(format!(
+                "worktree guard could not re-verify that this `executes_code: false` phase left \
+                 the tree unchanged: {why} (fail-closed — an unverifiable guard is treated as a \
+                 mutation, never as clean)"
+            )),
+            None => Some(
+                "worktree guard did not run for this `executes_code: false` phase — the result \
+                 reached the gate without the guard's outcome (fail-closed: a guarded unit is \
+                 never assumed to have left the tree alone)"
+                    .to_string(),
+            ),
+        }
+        } else {
+            None
+        };
+
     let det_denial =
         pinned_validator_denial(unit, workdir.as_deref().map(std::path::Path::new), db_path);
-    // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before `det_denial` is
-    // moved into the deny-dominance fold below, so `GateEvaluated` can carry the depth.
-    let deterministic_pass = det_denial.is_none();
+
+    // ── (layer-1b) REPO CHECKS FLOOR (F-039) — for the def's code-verifying unit the worker
+    // thread ran the repository's OWN checks in the worktree (`repo_checks`); their exit codes are
+    // the deterministic evidence this gate rests on, not the seat's account of having run them.
+    // The report is persisted on the unit and emitted whole (tails included) before the gate's
+    // depth event. A failing check denies (source `repo_checks`). Fail-closed on a missing report
+    // for a unit the floor governs — unless the guard already denied, in which case the checks
+    // were deliberately not run over a rewritten tree and the guard's denial is the honest one.
+    let checks_denial: Option<String> = match &evidence.repo_checks {
+        Some(report) => {
+            unit.repo_checks = Some(report.clone());
+            emit(CoreEvent::RepoChecksEvaluated {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                passed: report.passed,
+                criterion: crate::repo_checks::CRITERION.to_string(),
+                checks: report.checks.clone(),
+                skipped: report.skipped.clone(),
+            });
+            (!report.passed).then(|| report.denial_reason())
+        }
+        None if unit.repo_checks_floor
+            && unit.tool_cmd.is_none()
+            && workdir.is_some()
+            && guard_denial.is_none() =>
+        {
+            Some(format!(
+                "repo checks floor did not run for this verified_evidence phase: {} — the result \
+                 reached the gate without the engine's own check evidence (fail-closed)",
+                crate::repo_checks::CRITERION
+            ))
+        }
+        None => None,
+    };
+    // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before the
+    // denials are moved into the deny-dominance fold below, so `GateEvaluated` can carry the
+    // depth. Both deterministic instruments count: the pinned validator and the repo checks.
+    let deterministic_pass = det_denial.is_none() && checks_denial.is_none();
 
     // (layer-2) AGENT VALIDATOR — fold the OFF-THREAD semantic verdict (actor::dispatch_unit's closure
     // ran `claude -p`; here we only interpret its `(pass, reasoning)` via `combine_verdict`). An agent
@@ -869,8 +956,11 @@ pub(crate) fn apply_and_finish_unit(
     // DENY-DOMINATES ordering: deterministic re-verify, agent judge, evaluator pass, input governance.
     // Each layer is wrapped as a STRUCTURED denial naming its source (usability review #1); the
     // hook layer already carries claim id / rule ids / denied tool from the decisions log.
-    let validator_denial = det_denial
-        .map(|r| crate::domain::UnitDenial::new("pinned_validator", r))
+    // The worktree guard leads: a rewritten tree invalidates every verdict rendered over it.
+    let validator_denial = guard_denial
+        .map(|r| crate::domain::UnitDenial::new("worktree_guard", r))
+        .or(det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)))
+        .or(checks_denial.map(|r| crate::domain::UnitDenial::new("repo_checks", r)))
         .or(agent_denial.map(|r| crate::domain::UnitDenial::new("agent_validator", r)))
         .or(evaluator_denial)
         .or(hook_denial);
@@ -919,8 +1009,20 @@ pub(crate) fn apply_and_finish_unit(
     // (M5) HONEST criterion: `Some` ONLY when a pinned validator gated this unit (its criterion); `None`
     // for an ungated phase — the unit description is never relabeled a "criterion". `has_deterministic_floor`
     // makes the ungated case explicit so `deterministic_pass` (vacuously true with no floor) isn't misread.
-    let has_deterministic_floor = unit.validator.is_some();
-    let criterion = unit.validator.as_ref().map(|v| v.criterion.clone());
+    // F-039: the repo-checks floor is a deterministic instrument too — when it ran, the gate HAD a
+    // floor and the criterion names both (pinned validator's, then the checks'), so a consumer
+    // reading `criterion` sees exactly what was re-derived.
+    let checks_ran = evidence.repo_checks.is_some();
+    let has_deterministic_floor = unit.validator.is_some() || checks_ran;
+    let criterion = match (
+        unit.validator.as_ref().map(|v| v.criterion.clone()),
+        checks_ran,
+    ) {
+        (Some(c), true) => Some(format!("{c}; {}", crate::repo_checks::CRITERION)),
+        (Some(c), false) => Some(c),
+        (None, true) => Some(crate::repo_checks::CRITERION.to_string()),
+        (None, false) => None,
+    };
     // (S2) Surface the WINNING denial reason whenever the combined gate denied, so the record is never
     // self-contradictory ("det pass + agent none + combined false" with no visible denying layer).
     let denial_reason = if outcome.approved {

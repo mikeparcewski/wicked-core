@@ -675,6 +675,11 @@ mod tests {
             depends_on: Vec::new(),
             pre_build_scope: false,
             scope_warnings: Vec::new(),
+            worktree_guarded: false,
+            worktree_baseline: None,
+            worktree_mutation: None,
+            repo_checks_floor: false,
+            repo_checks: None,
             status: UnitStatus::Pending,
         }
     }
