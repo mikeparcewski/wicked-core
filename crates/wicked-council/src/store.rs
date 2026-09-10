@@ -577,7 +577,9 @@ mod tests {
                     kind: SeatFailureKind::NonZeroExit,
                     exit_code: Some(2),
                     stderr: String::new(),
+                    stdout: String::new(),
                     detail: String::new(),
+                    reason: None,
                 }
                 .with_stderr("agy: unknown flag --headless"),
             }],

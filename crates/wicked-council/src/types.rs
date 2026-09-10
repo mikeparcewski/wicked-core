@@ -276,19 +276,62 @@ pub struct AgenticCli {
 /// Built-in sign-in commands for the known seat keys — used when a registry entry does not
 /// override `login_invocation`. Each is the seat's OWN documented interactive flow (device-code
 /// or URL+paste), so it works inside a PTY with no localhost-callback assumptions.
+///
+/// The claude command is DERIVED, not a literal: it names the RESOLVED worker config dir
+/// (`wicked_apps_core::spawn::seat_claude_config_dir` — the same resolver the ballot spawn and the
+/// ACP worker spawn set `CLAUDE_CONFIG_DIR` from), so what the studio tells an operator to sign in
+/// is exactly the directory the seats run under. F-013: this used to hard-code
+/// `$HOME/.wicked-worker/claude`; with `WICKED_WORKER_HOME` pointing elsewhere the operator signed
+/// in the wrong directory, the UI said "signed in" and every ballot still exited "Not logged in".
+/// Under the operator's inherit hatch the seats run on the operator's own configuration, so the
+/// sign-in is plain `claude`. Resolved on every call — a roster read after the environment changed
+/// reads the environment, not a cached spelling.
 #[must_use]
-pub fn default_login_invocation(key: &str) -> Option<&'static str> {
+pub fn default_login_invocation(key: &str) -> Option<String> {
     match key {
         // The worker home (crew#267 option 3): sign in the ENGINE-owned config dir, not the
         // operator's — inside the REPL, `/login` runs the URL+paste flow.
-        "claude" => Some(r#"CLAUDE_CONFIG_DIR="$HOME/.wicked-worker/claude" claude"#),
-        "codex" => Some("codex login --device-auth"),
-        "copilot" => Some("copilot login"),
-        "opencode" => Some("opencode auth login"),
-        "pi" => Some("pi"),
-        "agy" => Some("agy"),
+        "claude" => Some(match wicked_apps_core::spawn::seat_claude_config_dir() {
+            None => "claude".to_string(),
+            Some(Ok(dir)) => format!(
+                "CLAUDE_CONFIG_DIR={} claude",
+                shell_double_quote(&dir.display().to_string())
+            ),
+            // No home directory resolves at all — the seats cannot resolve one either. Fall back
+            // to the shell-expanded default spelling rather than invent a path.
+            Some(Err(_)) => r#"CLAUDE_CONFIG_DIR="$HOME/.wicked-worker/claude" claude"#.to_string(),
+        }),
+        "codex" => Some("codex login --device-auth".to_string()),
+        "copilot" => Some("copilot login".to_string()),
+        "opencode" => Some("opencode auth login".to_string()),
+        "pi" => Some("pi".to_string()),
+        "agy" => Some("agy".to_string()),
         _ => None,
     }
+}
+
+/// Wrap `s` in POSIX double quotes so a path with a space or a `$` survives the studio's sign-in
+/// terminal verbatim. Inside double quotes `"`, `$` and `` ` `` are always special; a backslash is
+/// special ONLY before one of those, another backslash, or the closing quote — so a Windows path
+/// (`C:\Users\op\...`) passes through unchanged rather than doubled. The sign-in commands are
+/// POSIX-shell spellings already (`$HOME` in the old literal) — this keeps that contract.
+fn shell_double_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escape = match c {
+            '"' | '$' | '`' => true,
+            '\\' => matches!(chars.peek(), Some('"' | '$' | '`' | '\\') | None),
+            _ => false,
+        };
+        if escape {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 fn default_true() -> bool {
@@ -571,6 +614,57 @@ impl SeatFailureKind {
     }
 }
 
+/// WHY a seat failed, read off the CLI's own words — the classification an operator acts on.
+///
+/// [`SeatFailureKind`] names the dispatch BRANCH (the process exited non-zero); this names the
+/// CAUSE when the output matches a signature the engine knows the fix for. `None` on the record
+/// means nothing recognisable was said, not that nothing went wrong. Serialized snake_case; rides
+/// the `councilSeatFailed` event as `reason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatFailureReason {
+    /// The seat's configuration directory holds no login, so the CLI refused before doing any
+    /// work (`Not logged in · Please run /login`, `Authentication required`, `not
+    /// authenticated`, …). The fix is a sign-in of THAT directory — the roster's
+    /// `login_invocation` names it. F-030/F-031: this was every claude ballot on a fresh install,
+    /// recorded as a bare `non_zero_exit` with an empty stderr.
+    NotLoggedIn,
+}
+
+impl SeatFailureReason {
+    /// Stable snake_case token for events and degrade strings.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SeatFailureReason::NotLoggedIn => "not_logged_in",
+        }
+    }
+
+    /// Classify a failed seat's output. Case-insensitive substring match over BOTH streams —
+    /// claude prints its refusal on STDOUT (`Not logged in · Please run /login`, exit 1, stderr
+    /// empty), other CLIs on stderr. Deliberately narrow: an unrecognised failure stays
+    /// unclassified rather than mislabelled.
+    pub fn classify(stdout: &str, stderr: &str) -> Option<Self> {
+        const NOT_LOGGED_IN: &[&str] = &[
+            "not logged in",
+            "run /login",
+            "authentication required",
+            "authentication_error",
+            "not authenticated",
+            "unauthenticated",
+            "please log in",
+            "please login",
+            "please sign in",
+            "login required",
+            "not signed in",
+        ];
+        let haystack = format!("{stdout}\n{stderr}").to_lowercase();
+        NOT_LOGGED_IN
+            .iter()
+            .any(|sig| haystack.contains(sig))
+            .then_some(SeatFailureReason::NotLoggedIn)
+    }
+}
+
 /// The captured diagnostics for one seat that failed to vote.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeatFailure {
@@ -581,8 +675,20 @@ pub struct SeatFailure {
     /// Captured stderr, truncated to [`STDERR_CAPTURE_LIMIT`]. `run_in_isolation` already
     /// piped stderr and then dropped it on the floor; this is that artifact, kept.
     pub stderr: String,
+    /// The TAIL of captured stdout, truncated to [`STDERR_CAPTURE_LIMIT`] — kept only when the seat
+    /// FAILED (a vote is parsed from stdout, never stored here). F-031: claude prints `Not logged
+    /// in · Please run /login` on STDOUT and exits 1 with stderr EMPTY, so a record keeping stderr
+    /// alone said nothing about why. The tail rather than the head: a CLI states its final error
+    /// last. `#[serde(default)]`: records persisted before this field read as empty.
+    #[serde(default)]
+    pub stdout: String,
     /// The OS/IO error text, where the branch has one.
     pub detail: String,
+    /// The classified cause, when the seat's own words match a known signature. Derived from
+    /// `stdout`/`stderr` by [`Self::with_stdout`] / [`Self::with_stderr`] (recomputed on each, so
+    /// it reflects both streams however they were attached) — never set by hand.
+    #[serde(default)]
+    pub reason: Option<SeatFailureReason>,
 }
 
 /// Cap on retained stderr per seat. Enough to carry a usage message or a stack trace's head,
@@ -596,7 +702,9 @@ impl SeatFailure {
             kind,
             exit_code: None,
             stderr: String::new(),
+            stdout: String::new(),
             detail: detail.into(),
+            reason: None,
         }
     }
 
@@ -613,19 +721,45 @@ impl SeatFailure {
             i
         };
         self.stderr = stderr[..end].to_string();
+        self.reason = SeatFailureReason::classify(&self.stdout, &self.stderr);
         self
     }
 
-    /// One-line reason suitable for a degrade string: the branch, plus the most specific
-    /// evidence available for it.
-    pub fn reason(&self) -> String {
+    /// Attach the TAIL of captured stdout (the last [`STDERR_CAPTURE_LIMIT`] bytes, cut on a char
+    /// boundary so the result stays valid UTF-8) and re-classify the failure over both streams.
+    pub fn with_stdout(mut self, stdout: &str) -> Self {
+        let start = if stdout.len() <= STDERR_CAPTURE_LIMIT {
+            0
+        } else {
+            // Walk FORWARD to the nearest boundary: the tail keeps whole characters, dropping at
+            // most one partial one from the front.
+            let mut i = stdout.len() - STDERR_CAPTURE_LIMIT;
+            while i < stdout.len() && !stdout.is_char_boundary(i) {
+                i += 1;
+            }
+            i
+        };
+        self.stdout = stdout[start..].to_string();
+        self.reason = SeatFailureReason::classify(&self.stdout, &self.stderr);
+        self
+    }
+
+    /// One-line summary suitable for a degrade string: the branch, the exit code, the classified
+    /// cause when there is one, plus the most specific evidence available.
+    pub fn summary(&self) -> String {
         let mut s = self.kind.as_str().to_string();
         if let Some(code) = self.exit_code {
             s.push_str(&format!(" (exit {code})"));
         }
-        // stderr is the more specific artifact when both are present — it is the CLI's own words.
+        if let Some(reason) = self.reason {
+            s.push_str(&format!(" [{}]", reason.as_str()));
+        }
+        // stderr is the more specific artifact when both are present — it is the CLI's own words;
+        // stdout is next (F-031: claude's refusal lives there); the OS error text is last.
         let evidence = if !self.stderr.is_empty() {
             self.stderr.trim()
+        } else if !self.stdout.is_empty() {
+            self.stdout.trim()
         } else {
             self.detail.trim()
         };
@@ -817,9 +951,140 @@ mod login_tests {
             );
         }
         assert_eq!(default_login_invocation("unknown-seat"), None);
-        // The claude entry signs in the WORKER home, never the operator's own config.
-        assert!(default_login_invocation("claude")
-            .unwrap()
-            .contains(".wicked-worker"));
+        // The claude entry signs in the WORKER home — the resolved seat dir, never the operator's
+        // own config. (Under the operator's inherit hatch the seats DO run on the operator's
+        // config, and the sign-in is plain `claude`; a host with the hatch set is a supported
+        // configuration, not a failure of this test.)
+        let claude = default_login_invocation("claude").unwrap();
+        match wicked_apps_core::spawn::seat_claude_config_dir() {
+            None => assert_eq!(claude, "claude"),
+            Some(dir) => {
+                let dir = dir.expect("this process has a home directory");
+                assert_eq!(
+                    claude,
+                    format!(
+                        "CLAUDE_CONFIG_DIR={} claude",
+                        shell_double_quote(&dir.display().to_string())
+                    ),
+                    "the sign-in names EXACTLY the directory the seats run under (F-013)"
+                );
+                assert!(claude.starts_with("CLAUDE_CONFIG_DIR=\""), "{claude}");
+                assert!(claude.ends_with("claude\" claude"), "{claude}");
+                assert!(
+                    !claude.contains("$HOME"),
+                    "resolved, not the default spelling"
+                );
+            }
+        }
+    }
+
+    /// A path with shell-special characters survives the sign-in terminal verbatim; a Windows
+    /// path's backslashes (not special before an ordinary character) pass through unchanged.
+    #[test]
+    fn the_sign_in_path_is_double_quoted_with_the_specials_escaped() {
+        assert_eq!(shell_double_quote("/plain/path"), r#""/plain/path""#);
+        assert_eq!(
+            shell_double_quote(r#"/with space/$var/"q"/`tick`"#),
+            r#""/with space/\$var/\"q\"/\`tick\`""#
+        );
+        assert_eq!(
+            shell_double_quote(r"C:\Users\op\.wicked-worker\claude"),
+            r#""C:\Users\op\.wicked-worker\claude""#,
+            "a lone backslash before an ordinary char is literal inside double quotes"
+        );
+        // A RUN of backslashes before an ordinary char: only the ones followed by another backslash
+        // are escaped — the shell collapses `\\` to `\` and keeps the final `\b` verbatim, so
+        // `"a\\\b"` evaluates to `a\\b` (the minimal correct form, not `\\\\`).
+        assert_eq!(shell_double_quote(r"a\\b"), r#""a\\\b""#);
+        assert_eq!(shell_double_quote(r"a\$b"), r#""a\\\$b""#);
+        assert_eq!(shell_double_quote(r"trailing\"), r#""trailing\\""#);
+    }
+}
+
+#[cfg(test)]
+mod failure_reason_tests {
+    use super::*;
+
+    /// F-031: claude's refusal is on STDOUT with stderr empty — the classification must read both
+    /// streams, and the record must keep the stdout tail so the event says WHY.
+    #[test]
+    fn a_not_logged_in_refusal_on_stdout_is_classified_and_kept() {
+        let f = SeatFailure {
+            kind: SeatFailureKind::NonZeroExit,
+            exit_code: Some(1),
+            stderr: String::new(),
+            stdout: String::new(),
+            detail: String::new(),
+            reason: None,
+        }
+        .with_stderr("")
+        .with_stdout("Not logged in · Please run /login\n");
+        assert_eq!(f.reason, Some(SeatFailureReason::NotLoggedIn));
+        assert_eq!(f.reason.unwrap().as_str(), "not_logged_in");
+        assert!(f.stdout.contains("Not logged in"), "{f:?}");
+        let summary = f.summary();
+        assert!(
+            summary.contains("non_zero_exit (exit 1) [not_logged_in]"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("Not logged in · Please run /login"),
+            "{summary}"
+        );
+    }
+
+    /// The same refusal on stderr (other CLIs) classifies too; the order the streams are attached
+    /// in does not matter, because each attach re-classifies over both.
+    #[test]
+    fn classification_reads_either_stream_in_either_order() {
+        let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "")
+            .with_stdout("")
+            .with_stderr("error: Authentication required — run `codex login`");
+        assert_eq!(f.reason, Some(SeatFailureReason::NotLoggedIn));
+        assert_eq!(
+            SeatFailureReason::classify("NOT LOGGED IN", ""),
+            Some(SeatFailureReason::NotLoggedIn),
+            "case-insensitive"
+        );
+    }
+
+    /// An unrecognised failure stays UNCLASSIFIED — never mislabelled as a login problem.
+    #[test]
+    fn an_unrelated_failure_is_not_classified() {
+        let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "")
+            .with_stderr("agy: unknown flag --headless")
+            .with_stdout("usage: agy [options]");
+        assert_eq!(f.reason, None);
+        assert!(!f.summary().contains('['), "{}", f.summary());
+        assert_eq!(SeatFailureReason::classify("", ""), None);
+    }
+
+    /// stdout keeps the TAIL (a CLI states its final error last), cut on a char boundary.
+    #[test]
+    fn stdout_keeps_the_tail_within_the_cap_on_a_char_boundary() {
+        let head = "x".repeat(STDERR_CAPTURE_LIMIT * 2);
+        let out = format!("{head}éé Not logged in");
+        let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stdout(&out);
+        assert!(f.stdout.len() <= STDERR_CAPTURE_LIMIT, "{}", f.stdout.len());
+        assert!(f.stdout.ends_with("éé Not logged in"), "the tail survives");
+        assert_eq!(f.reason, Some(SeatFailureReason::NotLoggedIn));
+        // A multi-byte char straddling the cut is dropped whole, never split.
+        let straddle = format!("{}é{}", "a".repeat(STDERR_CAPTURE_LIMIT + 1), "b");
+        let cut = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stdout(&straddle);
+        assert!(std::str::from_utf8(cut.stdout.as_bytes()).is_ok());
+        assert!(cut.stdout.len() <= STDERR_CAPTURE_LIMIT);
+    }
+
+    /// Records persisted before `stdout`/`reason` existed still read (both default).
+    #[test]
+    fn a_record_without_the_new_fields_deserializes() {
+        let legacy = r#"{"kind":"non_zero_exit","exit_code":1,"stderr":"","detail":""}"#;
+        let f: SeatFailure = serde_json::from_str(legacy).unwrap();
+        assert_eq!(f.stdout, "");
+        assert_eq!(f.reason, None);
+        let round: SeatFailure =
+            serde_json::from_str(&serde_json::to_string(&f.with_stdout("Not logged in")).unwrap())
+                .unwrap();
+        assert_eq!(round.reason, Some(SeatFailureReason::NotLoggedIn));
     }
 }

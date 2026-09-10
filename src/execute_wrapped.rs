@@ -251,8 +251,10 @@ pub(crate) fn wrapped_seat_identity(
 ///
 /// The escape hatch for the one legitimate case: an operator deliberately testing their own hooks
 /// or skills through a run. It is opt-IN because the safe default has to be the one you get by not
-/// knowing this exists.
-pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPERATOR_CONFIG";
+/// knowing this exists. Spelled once, below this crate, so the council ballot spawn honours the
+/// SAME hatch (F-030).
+pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str =
+    wicked_apps_core::spawn::INHERIT_OPERATOR_CONFIG_ENV;
 
 /// Has the operator pulled the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch? Read in ONE place so
 /// the argv isolation and the ACP config-dir override cannot disagree about it. The hatch decides
@@ -262,7 +264,7 @@ pub(crate) const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPER
 /// consult the hatch, an invalid explicit snapshot is a launch error and a missing required skill
 /// a refusal under it, and the template's `--plugin-dir` is stripped under it.
 pub(crate) fn inherits_operator_config() -> bool {
-    std::env::var_os(INHERIT_OPERATOR_CONFIG_ENV).is_some()
+    wicked_apps_core::spawn::inherits_operator_config()
 }
 
 /// Directories a worker has no business reading: the operator's agent-tooling state and their

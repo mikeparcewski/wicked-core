@@ -422,6 +422,12 @@ fn run_council(
                             "kind": failure.kind.as_str(),
                             "exit_code": failure.exit_code,
                             "stderr": failure.stderr,
+                            // F-031: the stdout tail and the classified cause — claude's
+                            // `Not logged in` refusal is on stdout with stderr empty, so a
+                            // record of stderr alone said nothing about why. `reason` is
+                            // `null` when the seat's words matched no known signature.
+                            "stdout": failure.stdout,
+                            "reason": failure.reason.map(|r| r.as_str()),
                             "detail": failure.detail,
                             // The run, not the wall clock: this sits next to a message naming
                             // the dispatch budget, and the budget governs the run. Queue time is

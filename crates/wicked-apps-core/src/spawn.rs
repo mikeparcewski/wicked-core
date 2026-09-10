@@ -91,6 +91,97 @@ pub const ENGINE_INTERNAL_ENV: &[&str] = &[
 /// shared test-support arming below spell the variable once.
 pub const WORKER_HOME_ENV: &str = "WICKED_WORKER_HOME";
 
+/// The env var claude's CLI and Agent SDK resolve their per-user configuration directory from —
+/// user-scope settings, hooks, plugins, memory, and the LOGIN. It decides WHOSE configuration a
+/// claude process runs under, and therefore whether it is signed in at all. The ACP bridge hands
+/// its own environment to the SDK it drives (`CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ??
+/// homedir()`), and the headless CLI reads the same variable, so this ONE carrier reaches every
+/// claude seat the engine spawns — the worker (`wicked-core::acp_runner`) and the council ballot
+/// (`wicked-council::dispatch`) alike. Owned here, below both in the dependency graph, so they
+/// spell it once.
+pub const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// Set to any value to let workers AND council seats run under the operator's own CLI
+/// configuration again.
+///
+/// The escape hatch for the one legitimate case: an operator deliberately testing their own hooks
+/// or skills through a run. It is opt-IN because the safe default has to be the one you get by not
+/// knowing this exists. ONE hatch for every seat spawn — the wrapped worker's argv isolation, the
+/// ACP worker's config-dir override and the council ballot's config-dir override all read it here —
+/// because two opt-outs for one boundary is how one of them silently stops working.
+pub const INHERIT_OPERATOR_CONFIG_ENV: &str = "WICKED_WORKER_INHERIT_OPERATOR_CONFIG";
+
+/// Has the operator pulled the [`INHERIT_OPERATOR_CONFIG_ENV`] escape hatch?
+pub fn inherits_operator_config() -> bool {
+    std::env::var_os(INHERIT_OPERATOR_CONFIG_ENV).is_some()
+}
+
+/// The BASE of the engine-owned worker home: [`WORKER_HOME_ENV`] when set, else
+/// `<HOME | USERPROFILE>/.wicked-worker`. Fails only when no home directory resolves at all.
+///
+/// Reads the process environment; [`worker_home_base_from`] is the pure core for callers (and
+/// tests) that already hold the values.
+pub fn worker_home_base() -> anyhow::Result<std::path::PathBuf> {
+    worker_home_base_from(
+        std::env::var_os(WORKER_HOME_ENV),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+/// [`worker_home_base`] over explicit values: `override_base` is [`WORKER_HOME_ENV`]'s value,
+/// `home`/`userprofile` the two spellings of the home directory (unix, then Windows).
+pub fn worker_home_base_from(
+    override_base: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    userprofile: Option<std::ffi::OsString>,
+) -> anyhow::Result<std::path::PathBuf> {
+    if let Some(base) = override_base {
+        return Ok(std::path::PathBuf::from(base));
+    }
+    let home = home
+        .or(userprofile)
+        .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
+    Ok(std::path::PathBuf::from(home).join(".wicked-worker"))
+}
+
+/// The claude seat's configuration directory — `<worker home base>/claude` — the ONE answer to
+/// "which configuration, and so whose login, does a claude process the engine spawns run under".
+///
+/// Persistent and engine-owned (crew#267 option 3): the operator signs THIS directory in once
+/// (their own browser OAuth; the engine never reads, copies or holds credentials) and every
+/// claude spawn stays logged in. Three consumers, one resolver:
+///
+///  - the ACP worker spawn (`wicked-core::acp_runner`), which also creates and re-sanitizes the
+///    directory on every start;
+///  - the council ballot spawn (`wicked-council::dispatch`), which sets it on every seat (F-030:
+///    it used to inherit the daemon's `CLAUDE_CONFIG_DIR` — on a fresh install the never-signed-in
+///    dir garden is registered in — so every claude ballot exited 1 "Not logged in" and the seat
+///    was benched on every council while the worker path, resolving the worker home, ran fine);
+///  - the roster's claude `login_invocation` (`wicked-council::types::default_login_invocation`),
+///    so the command the studio shows an operator signs in EXACTLY the directory the seats run
+///    under (F-013: it used to hard-code `$HOME/.wicked-worker/claude`, wrong under
+///    [`WORKER_HOME_ENV`]).
+///
+/// Pure path resolution — no filesystem access. Creating the directory (private, symlink-refused,
+/// re-sanitized) stays with the ACP spawn path; a ballot on a not-yet-created home simply runs a
+/// CLI that is not signed in there, which is then reported as such.
+pub fn worker_claude_config_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(worker_home_base()?.join("claude"))
+}
+
+/// The [`CLAUDE_CONFIG_DIR_ENV`] value a seat spawn sets, after `hardened()`: `None` under the
+/// operator's explicit [`INHERIT_OPERATOR_CONFIG_ENV`] hatch (inherit — the operator's own
+/// configuration IS the intent), else [`worker_claude_config_dir`]. An `Err` is the resolver
+/// failing (no home directory at all); callers fail CLOSED on it — a seat that proceeded would run
+/// under the daemon's inherited configuration, which is the exact leak this exists to remove.
+pub fn seat_claude_config_dir() -> Option<anyhow::Result<std::path::PathBuf>> {
+    if inherits_operator_config() {
+        return None;
+    }
+    Some(worker_claude_config_dir())
+}
+
 /// TEST-SUPPORT — never call from runtime code. Points [`WORKER_HOME_ENV`] at one per-process
 /// temp directory for the REST of the process, so a test that reaches the engine's real ACP
 /// spawn path can never mutate the operator's REAL `~/.wicked-worker/claude` — the persistent
@@ -210,5 +301,54 @@ mod tests {
             .and_then(|(_, v)| v)
             .map(|v| v.to_string_lossy().into_owned());
         assert_eq!(found.as_deref(), Some("/run/store.db"));
+    }
+
+    /// The worker-home resolver, over explicit values so no test mutates the process environment:
+    /// the override wins outright, else `HOME`, else `USERPROFILE`, else an error — and the claude
+    /// seat dir is always `<base>/claude`.
+    #[test]
+    fn the_worker_home_base_resolves_override_then_home_then_userprofile() {
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        let base = |o: Option<&str>, h: Option<&str>, u: Option<&str>| {
+            worker_home_base_from(
+                o.map(OsString::from),
+                h.map(OsString::from),
+                u.map(OsString::from),
+            )
+        };
+        assert_eq!(
+            base(
+                Some("/tmp/fresh/worker"),
+                Some("/home/op"),
+                Some("C:\\Users\\op")
+            )
+            .unwrap(),
+            PathBuf::from("/tmp/fresh/worker"),
+            "WICKED_WORKER_HOME is the base itself, not a parent of it"
+        );
+        assert_eq!(
+            base(None, Some("/home/op"), Some("C:\\Users\\op")).unwrap(),
+            PathBuf::from("/home/op").join(".wicked-worker")
+        );
+        assert_eq!(
+            base(None, None, Some("C:\\Users\\op")).unwrap(),
+            PathBuf::from("C:\\Users\\op").join(".wicked-worker")
+        );
+        let err = base(None, None, None).expect_err("no home at all must not invent one");
+        assert!(err.to_string().contains("HOME"), "{err}");
+    }
+
+    /// The seat dir the ballot sets is exactly `<base>/claude` — the SAME directory the ACP worker
+    /// spawn ensures (`wicked-core::acp_runner::worker_config_home`, pinned to this resolver by
+    /// its own test) and the roster's claude sign-in command names.
+    #[test]
+    fn the_claude_seat_dir_is_the_worker_home_base_joined_with_claude() {
+        let base = worker_home_base().expect("this process has a home directory");
+        assert_eq!(
+            worker_claude_config_dir().unwrap(),
+            base.join("claude"),
+            "one resolver, one directory"
+        );
     }
 }

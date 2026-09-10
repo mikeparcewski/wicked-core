@@ -575,9 +575,15 @@ impl RealDispatcher {
                     kind: SeatFailureKind::NonZeroExit,
                     exit_code: run.exit_code,
                     stderr: String::new(),
+                    stdout: String::new(),
                     detail: String::new(),
+                    reason: None,
                 }
-                .with_stderr(&run.stderr),
+                .with_stderr(&run.stderr)
+                // F-031: the CLI's refusal is frequently on STDOUT with stderr empty (claude's
+                // `Not logged in · Please run /login`, exit 1); kept and classified so the
+                // failure event says WHY, not just that the seat exited 1.
+                .with_stdout(&run.stdout),
             ),
             Ok(run) => DispatchOutcome::Voted(parse_vote(cli, &run.stdout)),
         };
@@ -744,6 +750,33 @@ fn run_in_isolation(
     // and it inherited the daemon's entire environment. Latent rather than live (nothing sets
     // `WICKED_ESTATE_DB` in the daemon today) — but "latent" here means "until an operator who works
     // on estate exports it in the shell that starts the daemon".
+    //
+    // F-030: the seat's configuration — and so its LOGIN — is the worker home's, never the
+    // daemon's. `hardened()` strips only the engine's own variables, so until this the seat
+    // inherited whatever `CLAUDE_CONFIG_DIR` the daemon was started with: on a fresh install that
+    // is the dir garden is registered in and nobody ever signed in, so every claude ballot exited
+    // 1 "Not logged in" and the seat was benched on every council (4-of-5 verdicts) — while the
+    // ACP worker path, which sets the variable from the worker home, ran the same CLI fine; on a
+    // laptop with no such variable the ballots ran on the OPERATOR's `~/.claude` login by
+    // accident. One resolver for both paths (`wicked_apps_core::spawn::seat_claude_config_dir`),
+    // set on EVERY seat exactly as the ACP spawn does — only claude reads it, and a seat that
+    // never inherited the daemon's value is the point. `None` is the operator's explicit inherit
+    // hatch, the same one the worker paths honour. Fail CLOSED when it cannot be resolved: a
+    // ballot on the daemon's configuration is the defect, not a fallback.
+    let seat_config_dir = match wicked_apps_core::spawn::seat_claude_config_dir() {
+        None => None,
+        Some(Ok(dir)) => Some(dir),
+        Some(Err(e)) => {
+            return Err(SeatFailure::new(
+                SeatFailureKind::SpawnFailed,
+                format!(
+                    "seat `{}`: worker config dir unresolvable ({e}); refusing to run the ballot \
+                     under the daemon's own CLI configuration",
+                    cli.key
+                ),
+            ))
+        }
+    };
     let mut command = Command::new(program);
     command
         .hardened()
@@ -751,6 +784,11 @@ fn run_in_isolation(
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Set AFTER `hardened()`, per the ordering contract in `wicked_apps_core::spawn`: clear to a
+    // known slate, then set exactly what this path intends.
+    if let Some(dir) = &seat_config_dir {
+        command.env(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, dir);
+    }
 
     // Give the seat its own process group so the timeout path can signal the whole tree. Without
     // this, killing a CLI that shelled out leaves the grandchild alive and holding our pipes.
@@ -1281,10 +1319,163 @@ mod failure_diagnostics_tests {
             "the CLI's own stderr is the artifact that identifies the failure: {f:?}"
         );
         // And it has to reach the one-line rendering the degrade string uses.
-        let reason = f.reason();
-        assert!(reason.contains("non_zero_exit"), "{reason}");
-        assert!(reason.contains("exit 3"), "{reason}");
-        assert!(reason.contains("diagnostic-needle"), "{reason}");
+        let summary = f.summary();
+        assert!(summary.contains("non_zero_exit"), "{summary}");
+        assert!(summary.contains("exit 3"), "{summary}");
+        assert!(summary.contains("diagnostic-needle"), "{summary}");
+    }
+
+    /// Serializes the env-mutating test below (it MUTATES process-global environment the ballot
+    /// spawn resolves mid-call: `WICKED_WORKER_HOME`, `CLAUDE_CONFIG_DIR`, `PATH`) against any
+    /// future sibling. Every other test in this binary only READS those through a spawned
+    /// `sh`/`cmd` that ignores them. `#[cfg(unix)]` with its only user, or the Windows clippy job
+    /// fails on dead code.
+    #[cfg(unix)]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pin one environment variable for the test's duration; restores the prior value (or its
+    /// absence) on drop, so a failing assertion cannot leak the fixture to the next test.
+    #[cfg(unix)]
+    struct EnvPin {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+    #[cfg(unix)]
+    impl EnvPin {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            EnvPin { key, prior }
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for EnvPin {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// F-030, end to end through the real dispatcher and the REAL registry `claude` seat: a fake
+    /// `claude` on `PATH` records the `CLAUDE_CONFIG_DIR` it was handed. The ballot must run on the
+    /// worker home (`<WICKED_WORKER_HOME>/claude` — the dir the ACP worker path sets too), never
+    /// on the daemon's own `CLAUDE_CONFIG_DIR`. Deleting the `command.env(...)` line in
+    /// `run_in_isolation` fails the first assertion (the decoy is inherited); resolving a different
+    /// directory fails the second.
+    #[test]
+    #[cfg(unix)]
+    fn a_ballot_runs_on_the_worker_home_never_the_daemons_claude_config_dir() {
+        // The inherit hatch is a supported configuration: a host that sets it runs seats under the
+        // operator's config ON PURPOSE and must not fail a test about the default boundary.
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let scratch = std::env::temp_dir().join(format!(
+            "wicked-council-f030-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin = scratch.join("bin");
+        let worker_home = scratch.join("worker");
+        let decoy = scratch.join("daemon-config-dir");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&decoy).unwrap();
+        let ledger = scratch.join("seen-config-dir.txt");
+        // The fake claude: record the variable, then answer like a seat so the ballot completes.
+        let script = bin.join("claude");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{CLAUDE_CONFIG_DIR:-UNSET}}\" > \"{}\"\n\
+                 echo 'RECOMMENDATION: 1 fine'\nexit 0\n",
+                ledger.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let prior_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut path = bin.as_os_str().to_os_string();
+        path.push(":");
+        path.push(&prior_path);
+        let _path = EnvPin::set("PATH", &path);
+        let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+        let _decoy = EnvPin::set(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, &decoy);
+
+        // The production seat record, not a fixture: its `headless_invocation` resolves `claude`
+        // through PATH exactly as a governed run's ballot does.
+        let claude = crate::registry::builtin()
+            .into_iter()
+            .find(|c| c.key == "claude")
+            .expect("the registry ships a claude seat");
+        let d = RealDispatcher {
+            timeout: Duration::from_secs(30),
+            local_runner_timeout: Duration::from_secs(30),
+            ..RealDispatcher::default()
+        };
+        let outcome = d.dispatch_prompt(&claude, &task(), "ballot");
+        assert!(
+            matches!(outcome, DispatchOutcome::Voted(_)),
+            "the fake seat answers, so the ballot must complete: {outcome:?}"
+        );
+        let seen = std::fs::read_to_string(&ledger)
+            .expect("the fake claude ran and recorded its config dir")
+            .trim()
+            .to_string();
+        assert_ne!(
+            std::path::PathBuf::from(&seen),
+            decoy,
+            "the ballot inherited the DAEMON's CLAUDE_CONFIG_DIR — the F-030 defect"
+        );
+        assert_ne!(
+            seen, "UNSET",
+            "the ballot must SET the config dir, not merely not inherit"
+        );
+        assert_eq!(
+            std::path::PathBuf::from(&seen),
+            worker_home.join("claude"),
+            "the ballot runs on the worker home — the same dir the ACP worker path sets"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// F-031: a seat that exits 1 with `Not logged in · Please run /login` on STDOUT (stderr
+    /// empty — claude's actual shape) yields a record that carries the stdout tail and the
+    /// `not_logged_in` classification, so the `councilSeatFailed` event says WHY.
+    #[test]
+    fn a_seat_that_is_not_logged_in_says_so_in_the_failure_record() {
+        // `·` is left out of the Windows spelling: `cmd` echo mangles non-ASCII in some code pages.
+        let cli = shell_seq_seat(
+            "stale-login",
+            &["echo Not logged in - Please run /login", "exit 1"],
+        );
+        let f = failure_of(&cli, Duration::from_secs(30));
+        assert_eq!(f.kind, SeatFailureKind::NonZeroExit);
+        assert_eq!(f.exit_code, Some(1));
+        assert!(
+            f.stderr.trim().is_empty(),
+            "the refusal is on STDOUT, stderr stays empty: {f:?}"
+        );
+        assert!(
+            f.stdout.contains("Not logged in"),
+            "the stdout tail is the artifact that identifies the failure: {f:?}"
+        );
+        assert_eq!(
+            f.reason,
+            Some(crate::types::SeatFailureReason::NotLoggedIn),
+            "classified, so an operator sees the fix (sign in the worker home): {f:?}"
+        );
+        let summary = f.summary();
+        assert!(summary.contains("[not_logged_in]"), "{summary}");
+        assert!(summary.contains("Not logged in"), "{summary}");
     }
 
     #[test]
@@ -1732,12 +1923,12 @@ mod failure_diagnostics_tests {
     }
 
     #[test]
-    fn the_reason_line_never_spans_lines() {
+    fn the_summary_line_never_spans_lines() {
         // Degrade reasons land in single-line contexts (events, the studio's routing badge).
         let f = SeatFailure::new(SeatFailureKind::SpawnFailed, "").with_stderr("one\ntwo\nthree");
-        let reason = f.reason();
-        assert!(!reason.contains('\n'), "{reason}");
-        assert!(reason.contains("one two three"), "{reason}");
+        let summary = f.summary();
+        assert!(!summary.contains('\n'), "{summary}");
+        assert!(summary.contains("one two three"), "{summary}");
     }
 
     // ------------------------------------------------------------------

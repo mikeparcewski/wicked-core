@@ -1161,8 +1161,9 @@ fn death_context_with(proc: &AcpProcess, status: Option<std::process::ExitStatus
 /// SDK it drives in-process (`CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR ?? homedir()`),
 /// so this variable decides WHOSE configuration a worker runs under. It is the carrier the
 /// bridge honours where argv is not: flags the bridge does not parse are discarded, which is how
-/// FINDING-060 happened.
-pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+/// FINDING-060 happened. Spelled once, below this crate, so the council ballot spawn sets the
+/// SAME variable from the SAME resolver (F-030).
+pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV;
 
 /// Decide the [`CLAUDE_CONFIG_DIR_ENV`] override for an ACP worker spawn — `None` means inherit
 /// the operator's own configuration (the explicit escape hatch only).
@@ -1220,16 +1221,13 @@ fn worker_claude_config_dir(
 /// pre-main at a per-process temp base (via `emit::hermetic_test_spool`, core#311-class): a real
 /// start reached by a test re-sanitizes the resolved home, which must never be the operator's
 /// real `~/.wicked-worker`.
+///
+/// The PATH is the shared resolver's (`wicked_apps_core::spawn::worker_claude_config_dir`) — the
+/// same one the council ballot spawn sets and the roster's claude sign-in command names (F-030 /
+/// F-013). This crate owns only what happens AT that path: creation, permissions, symlink refusal
+/// and per-spawn re-sanitization ([`ensure_worker_config_home`]).
 fn worker_config_home() -> anyhow::Result<std::path::PathBuf> {
-    if let Some(base) = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV) {
-        return Ok(std::path::PathBuf::from(base).join("claude"));
-    }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".wicked-worker")
-        .join("claude"))
+    wicked_apps_core::spawn::worker_claude_config_dir()
 }
 
 /// Filesystem entries re-sanitized out of the worker home at EVERY spawn — the exact
@@ -5879,6 +5877,60 @@ mod tests {
         std::env::set_var("WICKED_WORKER_HOME", &base);
         let err = ensure_worker_config_home().expect_err("symlinked home must be refused");
         assert!(err.to_string().contains("symlink"), "{err}");
+        restore_hermetic_worker_home();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F-030 / F-013: ONE resolver for "the claude seat's config dir". The ACP worker path
+    /// (`worker_config_home`, what `start_acp_process` sets `CLAUDE_CONFIG_DIR` to), the council
+    /// ballot path (`wicked_apps_core::spawn::seat_claude_config_dir`, what `run_in_isolation`
+    /// sets) and the roster's claude `login_invocation` (what the studio tells the operator to
+    /// sign in) must all name the SAME directory under `WICKED_WORKER_HOME` — the finding was
+    /// three spellings that agreed only on the default laptop layout.
+    #[test]
+    fn the_worker_home_the_ballots_and_the_sign_in_command_resolve_to_one_dir() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let base = worker_home_base("one-resolver");
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        // Pin HOME so `registry_roster` reads NO developer `~/.config/wicked-council/clis.toml`
+        // (which could override or disable the claude seat) — the built-in roster is under test.
+        let prior_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &base);
+
+        let worker = worker_config_home().expect("worker home resolves");
+        let ballot = wicked_apps_core::spawn::worker_claude_config_dir().expect("resolves");
+        assert_eq!(worker, base.join("claude"));
+        assert_eq!(
+            worker, ballot,
+            "the ACP worker and the ballot spawn disagree on the seat dir"
+        );
+
+        let claude = crate::registry_roster()
+            .into_iter()
+            .find(|c| c.key == "claude")
+            .expect("the built-in roster seats claude");
+        let login = claude
+            .login_invocation
+            .expect("claude has a sign-in command");
+        if crate::execute_wrapped::inherits_operator_config() {
+            // The hatch: seats run on the operator's own config, so that is where to sign in.
+            assert_eq!(login, "claude");
+        } else {
+            assert_eq!(
+                login,
+                format!("CLAUDE_CONFIG_DIR=\"{}\" claude", worker.display()),
+                "the sign-in command must name the dir the seats actually run under"
+            );
+            assert!(
+                !login.contains("$HOME"),
+                "resolved, never the hard-coded default spelling (F-013): {login}"
+            );
+        }
+
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
         restore_hermetic_worker_home();
         let _ = std::fs::remove_dir_all(&base);
     }

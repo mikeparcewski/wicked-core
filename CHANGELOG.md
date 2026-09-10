@@ -511,6 +511,29 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Council ballots run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (F-030;
+  F-031, F-013).** `wicked-council`'s ballot spawn inherited whatever `CLAUDE_CONFIG_DIR` the daemon
+  was started with (`hardened()` strips only `WICKED_*`): on a fresh install that is the
+  never-signed-in dir garden is registered in, so every claude ballot exited 1 `Not logged in` and
+  the seat was benched on every council (4-of-5 verdicts) while the ACP worker path — which sets the
+  variable from the worker home — ran the same CLI fine; on a laptop with no such variable the
+  ballots ran on the OPERATOR's `~/.claude` login by accident. ONE resolver now
+  (`wicked_apps_core::spawn::{worker_home_base, worker_claude_config_dir, seat_claude_config_dir}`:
+  `$WICKED_WORKER_HOME` else `~/.wicked-worker`, joined `/claude`), used by the ACP worker spawn
+  (`acp_runner::worker_config_home` delegates to it), the ballot spawn (sets `CLAUDE_CONFIG_DIR` on
+  every seat after `hardened()`, honours the same `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` hatch —
+  the const moved below the root too — and fails CLOSED when no home resolves) and the roster's
+  claude `login_invocation`, which is now DERIVED from the resolved dir
+  (`CLAUDE_CONFIG_DIR="<resolved>/claude" claude`; plain `claude` under the hatch) instead of the
+  hard-coded `$HOME/.wicked-worker/claude` that sent an operator under `WICKED_WORKER_HOME` to sign
+  in the wrong directory (`default_login_invocation` returns `Option<String>`). Seat-failure
+  diagnostics (F-031): `SeatFailure` keeps the stdout TAIL (claude prints its refusal on stdout with
+  stderr empty) and a classified `reason` (`SeatFailureReason::NotLoggedIn` ⇢ `not_logged_in`,
+  matched over both streams); `SeatFailure::reason()` is renamed `summary()` and includes the class.
+  `councilSeatFailed` gains ADDITIVE `stdout` and `reason` (`null` when unclassified) beside
+  `stderr`/`detail` — wire shape change (additive) — crew/studio consume it via the next core-ts
+  release; the crew roster consumer of `login_invocation` sees the resolved path. Persisted
+  `seat_failures` written before this read with the new fields defaulted.
 - **ACP input-governance admission is evidence-gated (#364).** ACP permission requests now enter
   the shared policy, boundary, marker, and conformance-claim evaluator only for an ACP adapter
   explicitly marked `acp_input_governance = true`; the capability defaults off and only the
