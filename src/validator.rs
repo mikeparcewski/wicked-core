@@ -1854,6 +1854,7 @@ mod tests {
         use std::os::unix::process::CommandExt;
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "exit 3"]).process_group(0);
+        cmd.hardened();
         let mut child = cmd.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1876,6 +1877,7 @@ mod tests {
         // A running child is `false`, then observed once it exits.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 0.2; exit 0"]).process_group(0);
+        cmd.hardened();
         let mut child = cmd.spawn().unwrap();
         assert!(!has_exited_unreaped(&mut child).unwrap());
         assert_eq!(child.wait().unwrap().code(), Some(0));
