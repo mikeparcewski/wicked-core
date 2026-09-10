@@ -318,17 +318,10 @@ pub fn seat_claude_config_dir() -> Option<anyhow::Result<std::path::PathBuf>> {
 /// process and leave it on the OPERATOR's home config; exact everywhere else, where the filesystem
 /// is case-sensitive and `Claude` is a different binary from `claude`.
 pub fn binary_is_claude(bin: &str) -> bool {
-    std::path::Path::new(bin)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .map(|stem| {
-            if cfg!(windows) {
-                stem.eq_ignore_ascii_case("claude")
-            } else {
-                stem == "claude"
-            }
-        })
-        .unwrap_or(false)
+    // ONE stem judgement for every seat (core#410): the claude test is the `SeatCli` resolver
+    // narrowed to its claude arm, so the carrier test and the per-seat configuration decision can
+    // never classify the same binary two ways.
+    SeatCli::from_binary(bin) == SeatCli::Claude
 }
 
 /// What a spawn of one carrier does about [`CLAUDE_CONFIG_DIR_ENV`].
@@ -348,13 +341,280 @@ pub enum CarrierClaudeConfig {
 /// PR#413: the ballot used to export the claude dir to EVERY seat). `Err` only for a claude carrier
 /// whose dir cannot be resolved or validated — fail closed.
 pub fn claude_config_for_carrier(carrier_binary: &str) -> anyhow::Result<CarrierClaudeConfig> {
-    if !binary_is_claude(carrier_binary) {
-        return Ok(CarrierClaudeConfig::NotClaude);
+    // The seat resolver narrowed to claude (core#410): same hatch, same validated dir, same
+    // fail-closed `Err` — kept as the claude-only view its tests and the roster's sign-in
+    // command read; every spawn path applies the full [`SeatConfig`] instead.
+    match seat_config_for_carrier(carrier_binary)? {
+        SeatConfig::Isolated {
+            cli: SeatCli::Claude,
+            root: Some(dir),
+            ..
+        } => Ok(CarrierClaudeConfig::Dir(dir)),
+        SeatConfig::Isolated { .. } => Ok(CarrierClaudeConfig::NotClaude),
+        SeatConfig::Inherit if binary_is_claude(carrier_binary) => Ok(CarrierClaudeConfig::Inherit),
+        SeatConfig::Inherit => Ok(CarrierClaudeConfig::NotClaude),
     }
-    match seat_claude_config_dir() {
-        None => Ok(CarrierClaudeConfig::Inherit),
-        Some(dir) => dir.map(CarrierClaudeConfig::Dir),
+}
+
+// ── Per-seat configuration roots (core#410 — F-010 / F-068) ─────────────────────────────────────
+//
+// FINDING-061 / F-030 isolated the CLAUDE seat: `CLAUDE_CONFIG_DIR` points every claude spawn at the
+// engine-owned worker home. Every OTHER seat kept running on the operator's OWN configuration —
+// `~/.codex`, `~/.pi/agent`, `~/.copilot`, `~/.config/opencode` + `~/.local/share/opencode` — so a
+// chat seat loaded the operator's personal skills and extensions (a retired skill set, F-068) and
+// streamed a startup banner listing them into the customer's answer; and with a fresh
+// `WICKED_WORKER_HOME` the roster reported claude `signed_in:false` but the others `signed_in:true`,
+// because their credentials still lived under HOME (F-010). Each CLI has its own configuration-home
+// variable. This section names them ONCE and decides, per seat, what a spawn SETS and what it
+// STRIPS — for the ACP worker/chat spawn, the council ballot and the wrapped worker alike, and for
+// the roster's sign-in command, which must name the very directory the seats run under.
+
+/// codex's configuration home (`~/.codex` by default): `config.toml`, skills, sessions AND
+/// `auth.json` — relocating it relocates the login too, so the seat root is signed in once
+/// (`wicked-council::types::default_login_invocation`), exactly like the claude worker home.
+pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
+/// pi's agent directory (`~/.pi/agent` by default): settings, skills, extensions, prompts,
+/// sessions AND `auth.json`. Verified against the installed `pi-coding-agent` bundle, which reads
+/// exactly this variable for its agent dir.
+pub const PI_AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
+/// copilot's configuration home (`~/.copilot` by default): `config.json` (the recorded logged-in
+/// users), `mcp-config.json`, skills, agents and the package cache. Its OAuth token lives in the
+/// OS keychain, which is per-USER: a copilot seat root isolates the configuration, not the
+/// keychain entry (documented limitation).
+pub const COPILOT_HOME_ENV: &str = "COPILOT_HOME";
+/// opencode resolves its GLOBAL configuration from `$XDG_CONFIG_HOME/opencode` (`opencode.json`,
+/// agents, plugins, skills, commands), its credential store from
+/// `$XDG_DATA_HOME/opencode/auth.json` and its state from `$XDG_STATE_HOME/opencode`. Its own
+/// `OPENCODE_CONFIG_DIR` only ADDS a directory to the load order — the global one is still read
+/// (verified in the installed binary's config loader) — so isolation has to move the XDG bases.
+/// Side effect, documented: tools an opencode seat spawns (git, gh) resolve THEIR XDG-based
+/// configuration from the seat root too; `~/.gitconfig` and a `GH_TOKEN` still apply.
+pub const XDG_CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
+/// See [`XDG_CONFIG_HOME_ENV`].
+pub const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
+/// See [`XDG_CONFIG_HOME_ENV`].
+pub const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
+/// opencode's extra-config-directory knob — STRIPPED from every seat: an opencode seat's
+/// configuration is the seat root's `XDG_CONFIG_HOME/opencode`, and a foreign seat never reads it.
+pub const OPENCODE_CONFIG_DIR_ENV: &str = "OPENCODE_CONFIG_DIR";
+
+/// Every CLI-SPECIFIC configuration variable a seat spawn decides. A seat gets its OWN set and
+/// every other one STRIPPED — the daemon's `CODEX_HOME` must not ride into a pi bridge any more
+/// than its `CLAUDE_CONFIG_DIR` rides into a codex one (PR#413). The XDG bases are deliberately
+/// NOT listed: they are generic, so they are SET for opencode only and left as inherited
+/// everywhere else (stripping them from a claude seat would re-aim git/gh for nothing).
+pub const SEAT_CONFIG_ENV: &[&str] = &[
+    CLAUDE_CONFIG_DIR_ENV,
+    CODEX_HOME_ENV,
+    PI_AGENT_DIR_ENV,
+    COPILOT_HOME_ENV,
+    OPENCODE_CONFIG_DIR_ENV,
+];
+
+/// Which agent CLI a seat runs — judged on the CLI binary's file STEM (the seat record's `binary`
+/// on ACP, the template's first token when wrapped, the program a ballot execs), case-insensitive
+/// on Windows only, exactly as [`binary_is_claude`] judges claude. `Other` is a CLI this engine
+/// knows no configuration-home variable for (agy, a custom seat): it gets nothing set and every
+/// [`SEAT_CONFIG_ENV`] variable stripped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SeatCli {
+    Claude,
+    Codex,
+    Pi,
+    Copilot,
+    Opencode,
+    Other,
+}
+
+impl SeatCli {
+    /// The CLI a binary spelling names. `claude`, `/usr/local/bin/claude`, `claude.exe`,
+    /// `claude.cmd` are all claude; `claude-code-wrapper` and `pi-acp` are `Other` (a bridge is
+    /// not the CLI it carries — callers judge the SEAT binary, never the bridge).
+    pub fn from_binary(bin: &str) -> Self {
+        let Some(stem) = std::path::Path::new(bin)
+            .file_stem()
+            .and_then(|s| s.to_str())
+        else {
+            return SeatCli::Other;
+        };
+        let is = |name: &str| {
+            if cfg!(windows) {
+                stem.eq_ignore_ascii_case(name)
+            } else {
+                stem == name
+            }
+        };
+        if is("claude") {
+            SeatCli::Claude
+        } else if is("codex") {
+            SeatCli::Codex
+        } else if is("pi") {
+            SeatCli::Pi
+        } else if is("copilot") {
+            SeatCli::Copilot
+        } else if is("opencode") {
+            SeatCli::Opencode
+        } else {
+            SeatCli::Other
+        }
     }
+
+    /// The seat root's directory name under the worker home base (`<base>/<name>`) — the built-in
+    /// seat's registry key. `None` for a CLI with no known configuration-home variable.
+    pub fn root_name(self) -> Option<&'static str> {
+        match self {
+            SeatCli::Claude => Some("claude"),
+            SeatCli::Codex => Some("codex"),
+            SeatCli::Pi => Some("pi"),
+            SeatCli::Copilot => Some("copilot"),
+            SeatCli::Opencode => Some("opencode"),
+            SeatCli::Other => None,
+        }
+    }
+}
+
+/// One seat spawn's configuration decision — the [`SeatCli`]-aware generalisation of
+/// [`CarrierClaudeConfig`] (core#410). Resolved by [`seat_config_for`]; applied by
+/// [`SeatConfig::apply`] AFTER `hardened()`, per this module's ordering contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeatConfig {
+    /// The operator's [`INHERIT_OPERATOR_CONFIG_ENV`] hatch: the seat runs under the operator's
+    /// own configuration — nothing set, nothing stripped. ONE hatch for every seat and CLI.
+    Inherit,
+    /// Isolated under the worker home.
+    Isolated {
+        cli: SeatCli,
+        /// The seat's root, `<worker home base>/<root_name>` — validated like the claude dir
+        /// (absolute, normally spelled, no planted link at any component). `None` for a CLI with
+        /// no known configuration-home variable.
+        root: Option<std::path::PathBuf>,
+        /// The variables SET, in order: the CLI's own configuration-home variable(s), pointing
+        /// into `root`. Empty for a rootless CLI.
+        set: Vec<(&'static str, std::path::PathBuf)>,
+        /// The [`SEAT_CONFIG_ENV`] variables this seat does NOT read — STRIPPED, so no foreign
+        /// CLI's configuration path is ambient in the process.
+        strip: Vec<&'static str>,
+    },
+}
+
+impl SeatConfig {
+    /// Apply this decision to `cmd` — AFTER `hardened()`: strip the foreign variables, then set
+    /// this seat's own. `Inherit` touches nothing.
+    pub fn apply(&self, cmd: &mut Command) {
+        if let SeatConfig::Isolated { set, strip, .. } = self {
+            for key in strip {
+                cmd.env_remove(key);
+            }
+            for (key, value) in set {
+                cmd.env(key, value);
+            }
+        }
+    }
+
+    /// The seat root this decision runs the CLI under, when isolated with a known root.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        match self {
+            SeatConfig::Isolated {
+                root: Some(root), ..
+            } => Some(root.as_path()),
+            _ => None,
+        }
+    }
+
+    /// The claude configuration directory this decision sets — `Some` only for an isolated
+    /// CLAUDE seat (the per-session settings file is written there).
+    pub fn claude_dir(&self) -> Option<&std::path::Path> {
+        match self {
+            SeatConfig::Isolated {
+                cli: SeatCli::Claude,
+                root: Some(root),
+                ..
+            } => Some(root.as_path()),
+            _ => None,
+        }
+    }
+
+    /// Create every directory this seat is pointed at (the root and each `set` target), PRIVATE
+    /// (0700 on unix) and no-follow checked at every component first — a CLI handed a variable
+    /// naming a missing directory may refuse to start (codex) or fall back to its default home
+    /// (the very leak this closes). Idempotent; `Inherit` and a rootless seat are no-ops. Claude's
+    /// home is ALSO re-sanitized on every ACP spawn (`wicked-core::acp_runner`); that stays there
+    /// — this only guarantees existence and privacy.
+    pub fn ensure_dirs(&self) -> anyhow::Result<()> {
+        let SeatConfig::Isolated { root, set, .. } = self else {
+            return Ok(());
+        };
+        for dir in root.iter().chain(set.iter().map(|(_, d)| d)) {
+            refuse_symlinked_home(dir)?;
+            if dir.is_dir() {
+                continue;
+            }
+            let mut b = std::fs::DirBuilder::new();
+            b.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            use anyhow::Context;
+            b.create(dir)
+                .with_context(|| format!("could not create seat config root {}", dir.display()))?;
+        }
+        Ok(())
+    }
+}
+
+/// The configuration decision for ONE seat spawn of `cli` (core#410): `Inherit` under the
+/// operator's hatch; else every known CLI gets its own root under the validated worker home base
+/// — claude `<base>/claude` (`CLAUDE_CONFIG_DIR`, the dir FINDING-061 introduced), codex
+/// `<base>/codex` (`CODEX_HOME`), pi `<base>/pi` (`PI_CODING_AGENT_DIR`), copilot
+/// `<base>/copilot` (`COPILOT_HOME`), opencode `<base>/opencode/{config,data,state}`
+/// (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`) — and every OTHER seat variable
+/// stripped. An unknown CLI is isolated by stripping alone. `Err` is the resolver failing (no home
+/// directory, a relative or `..` override, a planted link); callers fail CLOSED, as for claude.
+pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
+    if inherits_operator_config() {
+        return Ok(SeatConfig::Inherit);
+    }
+    let Some(name) = cli.root_name() else {
+        return Ok(SeatConfig::Isolated {
+            cli,
+            root: None,
+            set: Vec::new(),
+            strip: SEAT_CONFIG_ENV.to_vec(),
+        });
+    };
+    let root = worker_home_base()?.join(name);
+    refuse_symlinked_home(&root)?;
+    let set: Vec<(&'static str, std::path::PathBuf)> = match cli {
+        SeatCli::Claude => vec![(CLAUDE_CONFIG_DIR_ENV, root.clone())],
+        SeatCli::Codex => vec![(CODEX_HOME_ENV, root.clone())],
+        SeatCli::Pi => vec![(PI_AGENT_DIR_ENV, root.clone())],
+        SeatCli::Copilot => vec![(COPILOT_HOME_ENV, root.clone())],
+        SeatCli::Opencode => vec![
+            (XDG_CONFIG_HOME_ENV, root.join("config")),
+            (XDG_DATA_HOME_ENV, root.join("data")),
+            (XDG_STATE_HOME_ENV, root.join("state")),
+        ],
+        SeatCli::Other => unreachable!("rootless CLIs returned above"),
+    };
+    let strip: Vec<&'static str> = SEAT_CONFIG_ENV
+        .iter()
+        .copied()
+        .filter(|var| !set.iter().any(|(own, _)| own == var))
+        .collect();
+    Ok(SeatConfig::Isolated {
+        cli,
+        root: Some(root),
+        set,
+        strip,
+    })
+}
+
+/// [`seat_config_for`] judged on the binary a spawn is about to run — the wrapped worker's
+/// template binary, the ballot's program, the ACP seat record's `binary` (never the bridge).
+pub fn seat_config_for_carrier(carrier_binary: &str) -> anyhow::Result<SeatConfig> {
+    seat_config_for(SeatCli::from_binary(carrier_binary))
 }
 
 /// TEST-SUPPORT — never call from runtime code. Points [`WORKER_HOME_ENV`] at one per-process
@@ -736,5 +996,275 @@ mod tests {
             base.join("claude"),
             "one resolver, one directory"
         );
+    }
+
+    // ── core#410: per-seat configuration roots ───────────────────────────────────────────────
+
+    /// The seat CLI is judged on the file STEM, like the claude carrier test — and a BRIDGE
+    /// (`pi-acp`, `codex-acp`, `claude-agent-acp`) is never mistaken for the CLI it carries.
+    #[test]
+    fn the_seat_cli_is_judged_on_the_file_stem_and_never_on_a_bridge() {
+        use SeatCli::*;
+        for (bin, cli) in [
+            ("claude", Claude),
+            ("/usr/local/bin/claude", Claude),
+            ("claude.exe", Claude),
+            ("codex", Codex),
+            ("/opt/homebrew/bin/codex", Codex),
+            ("codex.cmd", Codex),
+            ("pi", Pi),
+            ("copilot", Copilot),
+            ("opencode", Opencode),
+            ("agy", Other),
+            ("pi-acp", Other),
+            ("codex-acp", Other),
+            ("claude-agent-acp", Other),
+            ("claude-code-wrapper", Other),
+            ("", Other),
+        ] {
+            assert_eq!(SeatCli::from_binary(bin), cli, "{bin:?}");
+        }
+        // Case follows the OS's executable lookup, exactly as `binary_is_claude` does.
+        for spelled in ["CODEX.EXE", "Pi.cmd", "OpenCode"] {
+            assert_eq!(
+                SeatCli::from_binary(spelled) != Other,
+                cfg!(windows),
+                "{spelled}"
+            );
+        }
+        // ONE stem judgement: the claude carrier test IS the resolver's claude arm.
+        for bin in [
+            "claude",
+            "Claude",
+            "codex",
+            "pi",
+            "claude-agent-acp",
+            "/x/claude.cmd",
+        ] {
+            assert_eq!(
+                binary_is_claude(bin),
+                SeatCli::from_binary(bin) == Claude,
+                "{bin}"
+            );
+        }
+        assert_eq!(Other.root_name(), None);
+        assert_eq!(Opencode.root_name(), Some("opencode"));
+    }
+
+    /// Every known seat gets its OWN root under the worker home base through its OWN
+    /// configuration-home variable(s); every FOREIGN seat variable is stripped; the XDG bases are
+    /// set for opencode only and never stripped from anyone.
+    #[test]
+    fn every_known_seat_gets_its_own_root_and_every_foreign_seat_variable_is_stripped() {
+        use std::path::PathBuf;
+        use SeatCli::*;
+        let all = [Claude, Codex, Pi, Copilot, Opencode, Other];
+        if inherits_operator_config() {
+            for cli in all {
+                assert_eq!(
+                    seat_config_for(cli).unwrap(),
+                    SeatConfig::Inherit,
+                    "{cli:?}"
+                );
+            }
+            return;
+        }
+        let base = worker_home_base().expect("this process has a home directory");
+        let expect = |cli: SeatCli, want: Vec<(&'static str, PathBuf)>| match seat_config_for(cli)
+            .unwrap()
+        {
+            SeatConfig::Isolated {
+                cli: got_cli,
+                root,
+                set,
+                strip,
+            } => {
+                assert_eq!(got_cli, cli);
+                assert_eq!(
+                    root,
+                    Some(base.join(cli.root_name().unwrap())),
+                    "{cli:?}: the root is <base>/<name>"
+                );
+                assert_eq!(
+                    set, want,
+                    "{cli:?}: its own variable(s), pointing into the root"
+                );
+                let own: Vec<&str> = set.iter().map(|(k, _)| *k).collect();
+                for var in SEAT_CONFIG_ENV {
+                    assert_eq!(
+                        strip.contains(var),
+                        !own.contains(var),
+                        "{cli:?}: {var} is stripped iff it is not this seat's own"
+                    );
+                }
+                for xdg in [XDG_CONFIG_HOME_ENV, XDG_DATA_HOME_ENV, XDG_STATE_HOME_ENV] {
+                    assert!(
+                        !strip.contains(&xdg),
+                        "{cli:?}: XDG bases are never stripped"
+                    );
+                }
+            }
+            other => panic!("{cli:?}: expected an isolated decision, got {other:?}"),
+        };
+        expect(Claude, vec![(CLAUDE_CONFIG_DIR_ENV, base.join("claude"))]);
+        expect(Codex, vec![(CODEX_HOME_ENV, base.join("codex"))]);
+        expect(Pi, vec![(PI_AGENT_DIR_ENV, base.join("pi"))]);
+        expect(Copilot, vec![(COPILOT_HOME_ENV, base.join("copilot"))]);
+        expect(
+            Opencode,
+            vec![
+                (XDG_CONFIG_HOME_ENV, base.join("opencode").join("config")),
+                (XDG_DATA_HOME_ENV, base.join("opencode").join("data")),
+                (XDG_STATE_HOME_ENV, base.join("opencode").join("state")),
+            ],
+        );
+        // An unknown CLI is isolated by stripping alone: nothing of its own to set.
+        match seat_config_for(Other).unwrap() {
+            SeatConfig::Isolated {
+                cli: Other,
+                root: None,
+                set,
+                strip,
+            } => {
+                assert!(set.is_empty());
+                assert_eq!(strip, SEAT_CONFIG_ENV.to_vec());
+            }
+            other => panic!("expected a rootless isolated decision, got {other:?}"),
+        }
+        // The claude-only view agrees with the generalisation.
+        assert_eq!(
+            claude_config_for_carrier("claude").unwrap(),
+            CarrierClaudeConfig::Dir(base.join("claude"))
+        );
+        for foreign in ["codex", "pi", "copilot", "opencode", "agy"] {
+            assert_eq!(
+                claude_config_for_carrier(foreign).unwrap(),
+                CarrierClaudeConfig::NotClaude,
+                "{foreign}"
+            );
+        }
+    }
+
+    /// `apply` strips the foreign seat variables and sets the seat's own — after `hardened()`,
+    /// over an explicit decision (no environment read), so the mechanism is what is asserted:
+    /// a daemon carrying a decoy for EVERY seat variable hands a pi seat exactly one of them.
+    #[test]
+    fn apply_strips_every_foreign_seat_variable_and_sets_the_seats_own() {
+        use std::path::PathBuf;
+        let root = PathBuf::from(abs("worker/pi"));
+        let decision = SeatConfig::Isolated {
+            cli: SeatCli::Pi,
+            root: Some(root.clone()),
+            set: vec![(PI_AGENT_DIR_ENV, root.clone())],
+            strip: SEAT_CONFIG_ENV
+                .iter()
+                .copied()
+                .filter(|v| *v != PI_AGENT_DIR_ENV)
+                .collect(),
+        };
+        let mut cmd = Command::new("true");
+        cmd.hardened();
+        for var in SEAT_CONFIG_ENV {
+            cmd.env(var, "decoy");
+        }
+        cmd.env(XDG_CONFIG_HOME_ENV, "operator-xdg");
+        decision.apply(&mut cmd);
+        let value = |key: &str| -> Option<Option<String>> {
+            cmd.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(
+            value(PI_AGENT_DIR_ENV),
+            Some(Some(root.to_string_lossy().into_owned())),
+            "the seat's own variable points into its root"
+        );
+        for var in SEAT_CONFIG_ENV.iter().filter(|v| **v != PI_AGENT_DIR_ENV) {
+            assert_eq!(
+                value(var),
+                Some(None),
+                "{var} is removed (not merely left as decoy)"
+            );
+        }
+        assert_eq!(
+            value(XDG_CONFIG_HOME_ENV),
+            Some(Some("operator-xdg".to_string())),
+            "a generic XDG base is left alone on a non-opencode seat"
+        );
+        // `Inherit` touches nothing at all (hardened first, like every spawn site — the strip
+        // there is the engine's own variables, never a seat's).
+        let mut untouched = Command::new("true");
+        untouched.hardened();
+        untouched.env(CODEX_HOME_ENV, "decoy");
+        SeatConfig::Inherit.apply(&mut untouched);
+        assert_eq!(
+            untouched
+                .get_envs()
+                .find(|(k, _)| k.to_string_lossy() == CODEX_HOME_ENV)
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned()),
+            Some("decoy".to_string())
+        );
+    }
+
+    /// `ensure_dirs` creates every target private (0700) and refuses a planted link — the same
+    /// no-follow discipline as the claude home, now for every seat root.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_dirs_creates_every_seat_target_private_and_refuses_a_planted_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = std::env::temp_dir().join(format!(
+            "wicked-apps-core-seat-dirs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = scratch.join("worker").join("opencode");
+        let decision = SeatConfig::Isolated {
+            cli: SeatCli::Opencode,
+            root: Some(root.clone()),
+            set: vec![
+                (XDG_CONFIG_HOME_ENV, root.join("config")),
+                (XDG_DATA_HOME_ENV, root.join("data")),
+                (XDG_STATE_HOME_ENV, root.join("state")),
+            ],
+            strip: SEAT_CONFIG_ENV.to_vec(),
+        };
+        decision.ensure_dirs().expect("creates the tree");
+        decision.ensure_dirs().expect("idempotent");
+        for dir in [
+            &root,
+            &root.join("config"),
+            &root.join("data"),
+            &root.join("state"),
+        ] {
+            let meta = std::fs::metadata(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+            assert!(meta.is_dir());
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o700,
+                "{} is private",
+                dir.display()
+            );
+        }
+        // A planted link where a seat root should be: refused, never followed.
+        let operator_like = scratch.join("operator-codex");
+        std::fs::create_dir_all(&operator_like).unwrap();
+        let linked = scratch.join("worker").join("codex");
+        std::os::unix::fs::symlink(&operator_like, &linked).unwrap();
+        let planted = SeatConfig::Isolated {
+            cli: SeatCli::Codex,
+            root: Some(linked.clone()),
+            set: vec![(CODEX_HOME_ENV, linked)],
+            strip: Vec::new(),
+        };
+        let err = planted
+            .ensure_dirs()
+            .expect_err("a planted link is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert_eq!(SeatConfig::Inherit.ensure_dirs().ok(), Some(()));
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 }

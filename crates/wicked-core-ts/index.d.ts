@@ -119,21 +119,33 @@ export declare class Core {
   /** Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`). */
   ping(): Promise<string>
   /**
-   * Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13). Resolves to a
-   * JSON array of per-seat outcomes `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed`
-   * also stream to subscribers. Blocking handshakes run on the task pool, not the JS thread.
+   * Open a chat: eagerly warm one ACP session per seat (crew#165 / core#13) in a SCOPE
+   * (wicked-core#410 / wicked-crew#502). `cwd` is the seats' working directory — the chat's
+   * scratch root; omitted, a private `<tmp>/wicked-core-chat-<id>` of the chat's own, NEVER this
+   * process's cwd. `scopeJson` is `{"codeGraphDb"?: string|null, "readRoots"?: string[]}`: the
+   * estate graph the seats' READ-ONLY estate MCP is bound to (omitted/null ⇒ no estate MCP) and
+   * the repository roots in scope (advertised to a claude seat as `additionalDirectories`,
+   * recorded for every seat). Resolves to a JSON array of per-seat outcomes
+   * `[{cliKey, ok, error?}]`; `chatSessionReady`/`chatSessionFailed` also stream to
+   * subscribers. Blocking handshakes run on the task pool, not the JS thread.
    */
-  chatOpen(chatId: string, clisJson: string, cwd?: string | undefined | null): Promise<string>
+  chatOpen(chatId: string, clisJson: string, cwd?: string | undefined | null, scopeJson?: string | undefined | null): Promise<string>
   /**
    * Fan a message out to the chat's warm seats (all, or `targets_json` subset). Ack-fast:
    * resolves to the JSON array of seats targeted; replies stream as `chatDelta`/`chatReply`.
+   * `cwd` is accepted for wire compatibility and IGNORED (wicked-core#410): every turn runs in
+   * the scope recorded at `chatOpen` — a per-message working directory was the F-067 leak.
    */
   chatSend(chatId: string, text: string, targetsJson?: string | undefined | null, cwd?: string | undefined | null): Promise<string>
   /** The seats currently warm for a chat — JSON array of cli keys. */
   chatSeats(chatId: string): Promise<string>
   /**
    * Every chat currently holding pool state — JSON array of
-   * `[{chatId, seats, idleSecs}]`, sorted by id.
+   * `[{chatId, seats, idleSecs, cwd, codeGraphDb, readRoots}]`, sorted by id. `cwd` /
+   * `codeGraphDb` / `readRoots` are the scope recorded at `chatOpen` (wicked-core#410): where the
+   * seats run, the estate graph their read-only estate MCP is bound to (`null` ⇒ none), and the
+   * repository roots in scope (`[]` when none); `cwd` is `null` only for a pool entry whose scope
+   * is gone (a chat mid-close).
    *
    * Each warm seat pins an ACP bridge plus an agent child (~520 MB resident) and clients mint
    * chat ids freely, so without this an accumulation is invisible until the host runs out of

@@ -277,38 +277,51 @@ pub struct AgenticCli {
 /// override `login_invocation`. Each is the seat's OWN documented interactive flow (device-code
 /// or URL+paste), so it works inside a PTY with no localhost-callback assumptions.
 ///
-/// The claude command is DERIVED, not a literal: it names the RESOLVED worker config dir
-/// (`wicked_apps_core::spawn::seat_claude_config_dir` — the same resolver the ballot spawn and the
-/// ACP worker spawn set `CLAUDE_CONFIG_DIR` from), so what the studio tells an operator to sign in
-/// is exactly the directory the seats run under. F-013: this used to hard-code
-/// `$HOME/.wicked-worker/claude`; with `WICKED_WORKER_HOME` pointing elsewhere the operator signed
-/// in the wrong directory, the UI said "signed in" and every ballot still exited "Not logged in".
-/// Under the operator's inherit hatch the seats run on the operator's own configuration, so the
-/// sign-in is plain `claude`. When the seat dir cannot be resolved or validated (no home
-/// directory, a relative `WICKED_WORKER_HOME`, a planted symlink) there is NO sign-in command —
-/// `None`, fail closed, exactly as the ballot then refuses to spawn (codex, PR#413: a fallback to
-/// the `$HOME/.wicked-worker/claude` spelling would send the operator to sign in a directory no
-/// seat will run under). Resolved on every call — a roster read after the environment changed
-/// reads the environment, not a cached spelling.
+/// Every command is DERIVED, not a literal: it is prefixed with the seat's RESOLVED configuration
+/// root (`wicked_apps_core::spawn::seat_config_for` — the same resolver the ballot spawn, the ACP
+/// worker spawn and the wrapped worker set the seat's environment from), so what the studio tells
+/// an operator to sign in is exactly the directory the seats run under. F-013: the claude command
+/// used to hard-code `$HOME/.wicked-worker/claude`; with `WICKED_WORKER_HOME` pointing elsewhere
+/// the operator signed in the wrong directory, the UI said "signed in" and every ballot still
+/// exited "Not logged in". core#410 (F-010): the other seats' commands used to carry no root at
+/// all, so `codex login` signed in the OPERATOR's `~/.codex` while the seats (now) run under
+/// `<worker home>/codex` — the same mismatch, four more times. Under the operator's inherit hatch
+/// every seat runs on the operator's own configuration, so the commands are the plain ones. When
+/// a seat root cannot be resolved or validated (no home directory, a relative
+/// `WICKED_WORKER_HOME`, a planted symlink) there is NO sign-in command — `None`, fail closed,
+/// exactly as the spawns then refuse (codex, PR#413: a fallback to a default spelling would send
+/// the operator to sign in a directory no seat will run under). Resolved on every call — a roster
+/// read after the environment changed reads the environment, not a cached spelling.
 #[must_use]
 pub fn default_login_invocation(key: &str) -> Option<String> {
-    match key {
+    use wicked_apps_core::spawn::{seat_config_for, SeatCli, SeatConfig};
+    let (cli, login) = match key {
         // The worker home (crew#267 option 3): sign in the ENGINE-owned config dir, not the
         // operator's — inside the REPL, `/login` runs the URL+paste flow.
-        "claude" => match wicked_apps_core::spawn::seat_claude_config_dir() {
-            None => Some("claude".to_string()),
-            Some(Ok(dir)) => Some(format!(
-                "CLAUDE_CONFIG_DIR={} claude",
-                shell_double_quote(&dir.display().to_string())
-            )),
-            Some(Err(_)) => None,
-        },
-        "codex" => Some("codex login --device-auth".to_string()),
-        "copilot" => Some("copilot login".to_string()),
-        "opencode" => Some("opencode auth login".to_string()),
-        "pi" => Some("pi".to_string()),
-        "agy" => Some("agy".to_string()),
-        _ => None,
+        "claude" => (SeatCli::Claude, "claude"),
+        "codex" => (SeatCli::Codex, "codex login --device-auth"),
+        "copilot" => (SeatCli::Copilot, "copilot login"),
+        "opencode" => (SeatCli::Opencode, "opencode auth login"),
+        "pi" => (SeatCli::Pi, "pi"),
+        // No configuration-home variable is known for agy: it signs in where it runs (the
+        // operator's `~/.antigravitycli`) — a documented residual of core#410.
+        "agy" => return Some("agy".to_string()),
+        _ => return None,
+    };
+    match seat_config_for(cli) {
+        Ok(SeatConfig::Inherit) => Some(login.to_string()),
+        Ok(SeatConfig::Isolated { set, .. }) => {
+            let mut out = String::new();
+            for (var, dir) in &set {
+                out.push_str(var);
+                out.push('=');
+                out.push_str(&shell_double_quote(&dir.display().to_string()));
+                out.push(' ');
+            }
+            out.push_str(login);
+            Some(out)
+        }
+        Err(_) => None,
     }
 }
 
@@ -1064,6 +1077,10 @@ mod login_tests {
         let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
         std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
         let login = default_login_invocation("claude");
+        // core#410: read under the SAME unresolvable override — the other seats resolve through
+        // the same base and must fail closed the same way; agy has no root and is unaffected.
+        let codex = default_login_invocation("codex");
+        let agy = default_login_invocation("agy");
         match &prior {
             Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
             None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
@@ -1072,10 +1089,81 @@ mod login_tests {
             login, None,
             "fail closed: no sign-in surface for an unresolvable seat dir"
         );
-        // The other seats are unaffected — their commands carry no path.
         assert_eq!(
-            default_login_invocation("codex").as_deref(),
-            Some("codex login --device-auth")
+            codex, None,
+            "codex signs in ITS seat root, which is unresolvable here too"
+        );
+        assert_eq!(agy.as_deref(), Some("agy"));
+    }
+
+    /// core#410 (F-010): every seat's sign-in command names the SEAT ROOT the spawns run under —
+    /// the CLI's own configuration-home variable(s), the same resolver, the same base — so the
+    /// operator signs in the directory a ballot/worker/chat seat will actually read credentials
+    /// from. Without this the studio's Sign-in signed in `~/.codex` while the seat ran under
+    /// `<worker home>/codex`, and the roster read the operator's login as the seat's.
+    #[test]
+    fn every_seats_sign_in_command_names_its_own_root_under_the_worker_home() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            for (key, plain) in [
+                ("codex", "codex login --device-auth"),
+                ("pi", "pi"),
+                ("copilot", "copilot login"),
+                ("opencode", "opencode auth login"),
+            ] {
+                assert_eq!(default_login_invocation(key).as_deref(), Some(plain));
+            }
+            return;
+        }
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("wc-login-roots-{}", std::process::id()));
+        let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let got: Vec<(&str, Option<String>)> = ["codex", "pi", "copilot", "opencode", "claude"]
+            .into_iter()
+            .map(|k| (k, default_login_invocation(k)))
+            .collect();
+        match &prior {
+            Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
+            None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
+        }
+        let q = |p: std::path::PathBuf| shell_double_quote(&p.display().to_string());
+        let expect = |key: &str| got.iter().find(|(k, _)| *k == key).unwrap().1.clone();
+        assert_eq!(
+            expect("codex"),
+            Some(format!(
+                "CODEX_HOME={} codex login --device-auth",
+                q(base.join("codex"))
+            ))
+        );
+        assert_eq!(
+            expect("pi"),
+            Some(format!("PI_CODING_AGENT_DIR={} pi", q(base.join("pi"))))
+        );
+        assert_eq!(
+            expect("copilot"),
+            Some(format!(
+                "COPILOT_HOME={} copilot login",
+                q(base.join("copilot"))
+            ))
+        );
+        assert_eq!(
+            expect("opencode"),
+            Some(format!(
+                "XDG_CONFIG_HOME={} XDG_DATA_HOME={} XDG_STATE_HOME={} opencode auth login",
+                q(base.join("opencode").join("config")),
+                q(base.join("opencode").join("data")),
+                q(base.join("opencode").join("state"))
+            ))
+        );
+        assert_eq!(
+            expect("claude"),
+            Some(format!(
+                "CLAUDE_CONFIG_DIR={} claude",
+                q(base.join("claude"))
+            )),
+            "the claude spelling is unchanged by the generalisation"
         );
     }
 
