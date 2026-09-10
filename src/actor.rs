@@ -5323,7 +5323,25 @@ fn dispatch_unit(
     // logged and left unset — the fold then fails the unit CLOSED (`Unverifiable`), never clean.
     if crate::worktree_guard::applies_to(&unit) && unit.worktree_baseline.is_none() {
         if let Some(wd) = session.workdir.as_deref() {
-            match crate::worktree_guard::snapshot(std::path::Path::new(wd)) {
+            // Pinned to the REGISTERED repository (adversarial review on #414): the git dir the
+            // snapshot goes through comes from `<repo>/.git/worktrees/<id>`, never from the
+            // worktree's own `.git` file, and rides the baseline so the final comparison reuses
+            // it. No registered repo ⇒ no pin ⇒ the unit fails closed at the gate.
+            let repo_root = session
+                .repo_ref
+                .as_deref()
+                .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                .map(|r| r.root_path);
+            let snap = match repo_root {
+                Some(root) => crate::worktree_guard::snapshot(
+                    std::path::Path::new(wd),
+                    std::path::Path::new(&root),
+                ),
+                None => Err(anyhow::anyhow!(
+                    "the run has no registered repository to pin the worktree's git dir from"
+                )),
+            };
+            match snap {
                 Ok(snap) => {
                     unit.worktree_baseline = Some(snap);
                     put_node(store, unit.to_node())?;

@@ -51,6 +51,16 @@
 //! the gate turns into a denial an operator can read and act on (install the sandbox tool, or run
 //! the verify phase where one exists).
 //!
+//! ## Minimal environment
+//!
+//! A check process does NOT inherit the daemon's environment (adversarial review on #414: a
+//! repo-controlled test script with the network open could otherwise read the daemon's tokens).
+//! The environment is CLEARED and only an allow-list is passed: `PATH`, locale (`LANG`, `LC_*`),
+//! `TERM`, `USER`/`LOGNAME`, the Windows shell essentials, the toolchain's `RUSTUP_HOME`, and the
+//! isolation overrides above (`HOME`, `TMPDIR`, `XDG_*`, `npm_config_*`, `CARGO_HOME`,
+//! `CARGO_TARGET_DIR`, `CI=1`, `NO_COLOR`). No `GH_TOKEN`, no API key, no `WICKED_*` variable
+//! reaches a check — the same floor the validator sandbox applies (`validator::apply_minimal_env`).
+//!
 //! ## Detection is fail-closed
 //!
 //! A `package.json` that cannot be read or parsed, or a manifest/lockfile/`node_modules` that is a
@@ -195,6 +205,11 @@ pub struct RepoChecksReport {
     /// fails closed rather than run repo-controlled scripts unsandboxed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_error: Option<String>,
+    /// Files the checks themselves created beside a manifest that ships none (`Cargo.lock` from a
+    /// `cargo test` without a lockfile) and the engine removed afterwards — its own side effect,
+    /// never the seat's, so the worktree guard does not deny it. Disclosed, not hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_writes_removed: Vec<String>,
 }
 
 impl RepoChecksReport {
@@ -491,14 +506,65 @@ pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
         if !probed.is_file() {
             return Err("`Cargo.toml` is not a regular file".to_string());
         }
+        // With a lockfile, `--locked`: the check must not rewrite the repo's own `Cargo.lock`
+        // (the worktree guard would deny the engine's side effect). Without one, cargo WILL write
+        // a `Cargo.lock` beside the manifest — `run_with_sandbox` removes that engine-written
+        // file afterwards, provably ours because it was absent here (adversarial review on #414).
+        let has_lock = match probe(worktree, "Cargo.lock")? {
+            Some(p) if p.is_file() => true,
+            Some(_) => return Err("`Cargo.lock` is not a regular file".to_string()),
+            None => false,
+        };
         out.push(RepoCheck {
             name: "cargo-test".into(),
-            argv: s(&["cargo", "test"]),
+            argv: if has_lock {
+                s(&["cargo", "test", "--locked"])
+            } else {
+                s(&["cargo", "test"])
+            },
             source: "Cargo.toml".into(),
         });
     }
     Ok(out)
 }
+
+/// Files the engine's own checks may CREATE beside a manifest that ships none — removed after the
+/// checks so the worktree guard never denies the engine's side effect. Only a file that was
+/// ABSENT at detection time is a candidate: the seat's work is quiesced before detection, so a
+/// file that appears between detection and the end of the checks was written by the checks.
+fn engine_generated_candidates(worktree: &Path, detected: &[RepoCheck]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if detected
+        .iter()
+        .any(|c| c.name == "cargo-test" && !c.argv.iter().any(|a| a == "--locked"))
+        && !worktree.join("Cargo.lock").exists()
+    {
+        out.push("Cargo.lock");
+    }
+    out
+}
+
+/// What a check process may see of the daemon's environment — everything else is dropped
+/// (adversarial review on #414). Non-secret by construction: the search path, locale, terminal,
+/// the user's name, the Windows shell essentials (so `npm.cmd`/`sh` can start at all), and the
+/// rustup toolchain root. The isolation overrides are set on top by `CheckScratch::apply_env`.
+const CHECK_ENV_PASSTHROUGH: &[&str] = &[
+    "PATH",
+    "LANG",
+    "TERM",
+    "USER",
+    "LOGNAME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    // Windows shell/runtime essentials.
+    "SystemRoot",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "SystemDrive",
+    "NUMBER_OF_PROCESSORS",
+];
 
 /// The isolated homes the checks run with, all under the worktree's engine scratch.
 #[derive(Debug)]
@@ -508,9 +574,32 @@ pub(crate) struct CheckScratch {
 
 impl CheckScratch {
     pub(crate) fn prepare(worktree: &Path) -> std::io::Result<Self> {
-        let root = worktree
-            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
-            .join(SCRATCH_SUBDIR);
+        // The engine scratch root is repo-adjacent territory: a checkout could ship `tmp` as a
+        // SYMLINK pointing outside the worktree, and `create_dir_all` would follow it. Refuse a
+        // link at either level (adversarial review on #414) — lstat, never follow.
+        let scratch_root = worktree.join(crate::worktree_guard::ENGINE_SCRATCH_DIR);
+        for dir in [&scratch_root, &scratch_root.join(SCRATCH_SUBDIR)] {
+            match std::fs::symlink_metadata(dir) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "`{}` is a symlink — the checks' scratch must be a real directory \
+                             inside the worktree (refused, never followed)",
+                            dir.display()
+                        ),
+                    ))
+                }
+                Ok(m) if !m.is_dir() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("`{}` exists and is not a directory", dir.display()),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        let root = scratch_root.join(SCRATCH_SUBDIR);
         for sub in [
             "home",
             "npm-cache",
@@ -529,12 +618,25 @@ impl CheckScratch {
         self.root.join("home")
     }
 
-    /// Apply the isolation env to a check command. The daemon's environment is inherited through
-    /// the spawn chokepoint (`hardened()` strips every engine-internal variable) and then every
-    /// home-shaped variable is redirected under the scratch, so the check reads none of the
-    /// operator's per-user configuration and writes nothing outside the worktree.
+    /// Apply the MINIMAL environment to a check command: the daemon's environment is cleared
+    /// (`hardened()` already stripped the engine-internal variables; this drops everything else —
+    /// tokens, API keys, `WICKED_*`), only [`CHECK_ENV_PASSTHROUGH`] is copied from the daemon, and
+    /// every home-shaped variable is set under the scratch, so the check reads none of the
+    /// operator's per-user configuration or credentials and writes nothing outside the worktree.
     fn apply_env(&self, cmd: &mut Command) {
         let real_home = std::env::var_os("HOME");
+        cmd.env_clear();
+        for key in CHECK_ENV_PASSTHROUGH {
+            if let Some(val) = std::env::var_os(key) {
+                cmd.env(key, val);
+            }
+        }
+        // `LC_*` as a family (LC_CTYPE, LC_MESSAGES, …): locale, never a secret.
+        for (key, val) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("LC_") {
+                cmd.env(key, val);
+            }
+        }
         cmd.env("HOME", self.home())
             .env("TMPDIR", self.root.join("tmp"))
             .env("TMP", self.root.join("tmp"))
@@ -555,7 +657,7 @@ impl CheckScratch {
             .env("FORCE_COLOR", "0");
         // The toolchain proxies (`cargo`, `rustc` under rustup) resolve toolchains through
         // `RUSTUP_HOME`, which defaults to `$HOME/.rustup`. Moving HOME must not lose them: pin the
-        // real location explicitly when the daemon did not.
+        // real location explicitly when the daemon did not (when it did, the allow-list passed it).
         if std::env::var_os("RUSTUP_HOME").is_none() {
             if let Some(h) = real_home {
                 let rustup = Path::new(&h).join(".rustup");
@@ -595,6 +697,7 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
                 "no OS write boundary could be armed for the checks ({})",
                 sandbox_note.unwrap_or_else(|| "no OS-sandbox tool on PATH".to_string())
             )),
+            engine_writes_removed: Vec::new(),
         };
     }
     let detected = match detect(worktree) {
@@ -609,6 +712,7 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
                 sandbox_level,
                 sandbox_note,
                 sandbox_error: None,
+                engine_writes_removed: Vec::new(),
             }
         }
     };
@@ -628,9 +732,11 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
                 sandbox_level,
                 sandbox_note,
                 sandbox_error: None,
+                engine_writes_removed: Vec::new(),
             }
         }
     };
+    let candidates = engine_generated_candidates(worktree, &detected);
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -643,6 +749,17 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
         failed = !run.passed();
         checks.push(run);
     }
+    // An engine-written file (absent at detection, present now) is the checks' own side effect —
+    // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
+    let mut engine_writes_removed = Vec::new();
+    for rel in candidates {
+        let p = worktree.join(rel);
+        if let Ok(m) = std::fs::symlink_metadata(&p) {
+            if m.is_file() && std::fs::remove_file(&p).is_ok() {
+                engine_writes_removed.push(rel.to_string());
+            }
+        }
+    }
     RepoChecksReport {
         passed: !failed,
         detected,
@@ -652,19 +769,50 @@ pub(crate) fn run_with_sandbox(worktree: &Path, sandbox: WorkerSandbox) -> RepoC
         sandbox_level,
         sandbox_note,
         sandbox_error: None,
+        engine_writes_removed,
     }
 }
 
 /// A bounded tail buffer: keeps the last [`TAIL_BYTES`] bytes of a stream.
-fn drain_tail<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
+/// How long to wait for a check's stdout/stderr to reach EOF after the process group is dead. A
+/// detached descendant (`setsid`, a Node `detached` spawn with inherited stdio) can hold the pipe
+/// open forever; the drain is DETACHED after this and the tail read so far is what gets reported
+/// (adversarial review on #414 — an unbounded join wedged the verify unit).
+const DRAIN_CAP: Duration = Duration::from_secs(5);
+
+/// A stdout/stderr drain: the bounded tail accumulates in `buf` (shared, so a drain that never
+/// reaches EOF still yields what it saw), `done` fires at EOF.
+struct Drain {
+    buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drain {
+    /// The tail read so far, waiting at most `cap` for EOF; on timeout the reader thread is left
+    /// to die with the pipe (it holds only its own buffer handle).
+    fn finish(self, cap: Duration) -> Vec<u8> {
+        let _ = self.done.recv_timeout(cap);
+        let mut tail = std::mem::take(&mut *self.buf.lock().unwrap_or_else(|p| p.into_inner()));
+        if tail.len() > TAIL_BYTES {
+            let cut = tail.len() - TAIL_BYTES;
+            tail.drain(..cut);
+        }
+        tail
+    }
+}
+
+fn drain_tail<R: Read + Send + 'static>(mut r: R) -> Drain {
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(TAIL_BYTES * 2)));
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let shared = std::sync::Arc::clone(&buf);
     std::thread::spawn(move || {
-        let mut tail: Vec<u8> = Vec::with_capacity(TAIL_BYTES * 2);
-        let mut buf = [0u8; 8192];
+        let mut chunk = [0u8; 8192];
         loop {
-            match r.read(&mut buf) {
+            match r.read(&mut chunk) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    tail.extend_from_slice(&buf[..n]);
+                    let mut tail = shared.lock().unwrap_or_else(|p| p.into_inner());
+                    tail.extend_from_slice(&chunk[..n]);
                     if tail.len() > TAIL_BYTES * 2 {
                         let cut = tail.len() - TAIL_BYTES;
                         tail.drain(..cut);
@@ -672,12 +820,9 @@ fn drain_tail<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec
                 }
             }
         }
-        if tail.len() > TAIL_BYTES {
-            let cut = tail.len() - TAIL_BYTES;
-            tail.drain(..cut);
-        }
-        tail
-    })
+        let _ = done_tx.send(());
+    });
+    Drain { buf, done }
 }
 
 fn lossy(bytes: Vec<u8>) -> String {
@@ -770,13 +915,13 @@ pub(crate) fn run_one(
         }
     };
     result.exit_code = status.and_then(|st| st.code());
+    // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
+    // was read and move on rather than wait for an EOF that may never come.
     result.stdout_tail = out_h
-        .and_then(|h| h.join().ok())
-        .map(lossy)
+        .map(|d| lossy(d.finish(DRAIN_CAP)))
         .unwrap_or_default();
     result.stderr_tail = err_h
-        .and_then(|h| h.join().ok())
-        .map(lossy)
+        .map(|d| lossy(d.finish(DRAIN_CAP)))
         .unwrap_or_default();
     result.duration_ms = started.elapsed().as_millis() as u64;
     result
@@ -977,6 +1122,17 @@ mod tests {
             );
             return;
         }
+        // Item 7 (adversarial review on #414): the fixture ships no `Cargo.lock`, so cargo wrote
+        // one — the engine's own side effect — and the floor removed it again, disclosed.
+        assert_eq!(
+            report.engine_writes_removed,
+            vec!["Cargo.lock".to_string()],
+            "{report:?}"
+        );
+        assert!(
+            !wt.join("Cargo.lock").exists(),
+            "the engine-written lockfile must not be left for the worktree guard to deny"
+        );
         let c = &report.checks[0];
         assert_eq!(c.name, "cargo-test");
         assert!(
@@ -1174,6 +1330,147 @@ mod tests {
         );
     }
 
+    /// Adversarial review on #414: a check is repo-controlled code with the network open, so it
+    /// must never see the daemon's credentials. The environment is cleared to an allow-list — a
+    /// secret-looking variable planted on the daemon side is absent from the check's `env`, while
+    /// the isolation overrides and `PATH` are present.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_sees_a_minimal_environment_never_the_daemons_secrets() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        const PLANTED: &str = "WICKED_TEST_PLANTED_GH_TOKEN";
+        std::env::set_var(PLANTED, "hunter2");
+        let wt = scratch("min-env");
+        let sandbox = sandbox_for(&wt);
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        let env_dump = RepoCheck {
+            name: "test".into(),
+            argv: s(&["sh", "-c", "env"]),
+            source: "fixture".into(),
+        };
+        let r = run_one(&wt, &env_dump, &sandbox, &scratch);
+        std::env::remove_var(PLANTED);
+        assert!(r.passed(), "{r:?}");
+        let out = &r.stdout_tail;
+        assert!(
+            !out.contains(PLANTED),
+            "the planted daemon-side secret reached the check:\n{out}"
+        );
+        // Nothing secret-looking from the daemon's environment either — by name, whatever is set.
+        let leaked: Vec<String> = std::env::vars_os()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .filter(|k| {
+                let u = k.to_ascii_uppercase();
+                u.contains("TOKEN")
+                    || u.contains("SECRET")
+                    || u.contains("API_KEY")
+                    || u.contains("PASSWORD")
+            })
+            .filter(|k| out.lines().any(|l| l.starts_with(&format!("{k}="))))
+            .collect();
+        assert!(leaked.is_empty(), "leaked into the check: {leaked:?}");
+        assert!(
+            !out.lines().any(|l| l.starts_with("WICKED_")),
+            "no WICKED_* variable reaches a check:\n{out}"
+        );
+        // The allow-list and the isolation overrides ARE there.
+        let home_line = format!("HOME={}", scratch.home().display());
+        assert!(out.lines().any(|l| l == home_line), "{out}");
+        assert!(out.lines().any(|l| l == "CI=1"), "{out}");
+        assert!(out.lines().any(|l| l.starts_with("PATH=")), "{out}");
+        assert!(
+            out.lines().any(|l| l.starts_with("CARGO_TARGET_DIR=")),
+            "{out}"
+        );
+    }
+
+    /// Adversarial review on #414: a descendant that escapes the process group (`setsid`) and
+    /// keeps the check's stdout open must not wedge the verify unit — the drain is bounded and
+    /// the tail read so far is reported.
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_pipe_holder_cannot_wedge_the_check() {
+        // spawn-audit: test-only — probes whether perl exists to build the detached pipe holder.
+        if Command::new("perl").arg("-e").arg("1").output().is_err() {
+            eprintln!("perl not on PATH — the detached pipe-holder test cannot run here");
+            return;
+        }
+        let wt = scratch("pipe-holder");
+        let sandbox = sandbox_for(&wt);
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        // The check prints, then leaves a setsid'd perl holding stdout for 60 s, and exits 0.
+        let holder = RepoCheck {
+            name: "test".into(),
+            argv: s(&[
+                "sh",
+                "-c",
+                "echo before-holder; perl -e 'use POSIX; POSIX::setsid(); sleep 60' & exit 0",
+            ]),
+            source: "fixture".into(),
+        };
+        let started = Instant::now();
+        let r = run_one(&wt, &holder, &sandbox, &scratch);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the drain must be bounded (took {:?})",
+            started.elapsed()
+        );
+        assert!(r.passed(), "{r:?}");
+        assert!(r.stdout_tail.contains("before-holder"), "{r:?}");
+    }
+
+    /// Adversarial review on #414: a checkout that ships `tmp` as a SYMLINK must not have the
+    /// checks' scratch created through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_scratch_root_is_refused_not_followed() {
+        let base = scratch("symlink-tmp");
+        let wt = base.join("wt");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join(crate::worktree_guard::ENGINE_SCRATCH_DIR))
+            .unwrap();
+        let err = CheckScratch::prepare(&wt).expect_err("a symlinked tmp is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            "nothing was created through the link"
+        );
+        // The floor reports the refusal as a detection error, fail-closed.
+        let report = run_with_sandbox(&wt, sandbox_for(&wt));
+        assert!(!report.passed);
+        assert!(
+            report
+                .detect_error
+                .as_deref()
+                .is_some_and(|e| e.contains("symlink")),
+            "{report:?}"
+        );
+    }
+
+    /// `cargo test --locked` when the repo ships a lockfile (the check must not rewrite it);
+    /// plain `cargo test` when it does not — the engine-written `Cargo.lock` is then removed
+    /// after the checks (see `a_failing_cargo_test_is_captured…`).
+    #[test]
+    fn cargo_runs_locked_when_a_lockfile_ships() {
+        let wt = scratch("cargo-locked");
+        std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(wt.join("Cargo.lock"), "# lock\n").unwrap();
+        let checks = detect(&wt).unwrap();
+        assert_eq!(checks[0].argv, s(&["cargo", "test", "--locked"]));
+        assert!(engine_generated_candidates(&wt, &checks).is_empty());
+        std::fs::remove_file(wt.join("Cargo.lock")).unwrap();
+        let checks = detect(&wt).unwrap();
+        assert_eq!(checks[0].argv, s(&["cargo", "test"]));
+        assert_eq!(
+            engine_generated_candidates(&wt, &checks),
+            vec!["Cargo.lock"]
+        );
+    }
+
     #[test]
     fn stops_at_the_first_failure_and_lists_what_it_skipped() {
         let wt = scratch("stop");
@@ -1219,6 +1516,7 @@ mod tests {
             sandbox_level: sandbox.level.as_wire().to_string(),
             sandbox_note: None,
             sandbox_error: None,
+            engine_writes_removed: Vec::new(),
         };
         let denial = report.denial_reason();
         assert!(

@@ -377,9 +377,13 @@ pub(crate) fn reap_session(s: &mut PtySession, kill: bool) -> Option<i32> {
                 // Ask the whole group to terminate, then give it a brief grace to exit cleanly.
                 unsafe { sig::killpg(pgid, sig::SIGTERM) };
                 exited = reader_exited(s, Duration::from_millis(500));
+                // Then SIGKILL the group UNCONDITIONALLY (adversarial review on #414): a
+                // TERM-trapping descendant that detached its stdio lets the PTY reader EOF —
+                // `exited` is true — and would otherwise survive the session it belongs to, free
+                // to write into the worktree after the guard's final snapshot. The group is the
+                // child's own (pgid == its pid), so this can never reach the daemon.
+                unsafe { sig::killpg(pgid, sig::SIGKILL) };
                 if !exited {
-                    // Still holding the PTY open — force the group down and wait a little longer.
-                    unsafe { sig::killpg(pgid, sig::SIGKILL) };
                     exited = reader_exited(s, Duration::from_millis(1500));
                 }
             } else {

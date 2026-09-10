@@ -970,6 +970,12 @@ mod tests {
             PersistentStepRunner::session_argv(&format!("{codex} exec"), &input).unwrap(),
             s(&[&codex, "exec", "--sandbox", "read-only"])
         );
+        // `--yolo` (codex's alias of the bypass, which beats a later read-only sandbox) is dropped
+        // on this carrier too — adversarial review on #414.
+        assert_eq!(
+            PersistentStepRunner::session_argv(&format!("{codex} --yolo exec"), &input).unwrap(),
+            s(&[&codex, "exec", "--sandbox", "read-only"])
+        );
         // A CODE phase is untouched — the guard reads the def, never guesses.
         let unit = make_unit("build it", &format!("{codex} --sandbox workspace-write"));
         let input = make_input("run-code", 0, unit);
@@ -1116,6 +1122,68 @@ mod tests {
             "a writer the seat backgrounded must die with the quiesced session"
         );
         runner.drop_session("run-reopen");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Adversarial review on #414: the PTY teardown SIGKILLs the process group UNCONDITIONALLY
+    /// after the TERM grace. A descendant that traps TERM and detaches its stdio lets the PTY
+    /// reader EOF — the old "SIGKILL only if the reader has not exited" left it alive to write
+    /// into the worktree after the guard's final snapshot.
+    #[test]
+    fn a_term_trapping_detached_descendant_dies_with_the_quiesced_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-sess-trap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let late = dir.join("late.txt");
+        let pidfile = dir.join("writer.pid");
+        // A fake CLI NAMED codex: on every turn it backgrounds a TERM-immune, stdio-detached
+        // writer that lands 3 s later, records its pid, then answers the turn.
+        let codex = dir.join("codex");
+        std::fs::write(
+            &codex,
+            format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  nohup sh -c 'trap \"\" TERM; sleep 3; echo x >> \"{late}\"' </dev/null >/dev/null 2>&1 &\n  echo $! > \"{pid}\"\n  printf '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"WKRTURN:%s\"}}]}}}}\\n' \"$line\"\n  printf '{{\"type\":\"result\",\"result\":\"ok\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}\\n'\ndone\n",
+                late = late.display(),
+                pid = pidfile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = format!("{} --sandbox workspace-write", codex.display());
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        // A NO-CODE unit: its session is quiesced the moment the turn ends.
+        let mut evaluator = make_unit("verify the fix", &invocation);
+        evaluator.worktree_guarded = true;
+        let out = runner.run_unit(&make_input("run-trap", 0, evaluator));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the fixture recorded its writer's pid")
+            .trim()
+            .parse()
+            .unwrap();
+        // The writer is TERM-immune, so only the unconditional SIGKILL of the group explains its
+        // death; give the kernel a moment to reap and the would-be write its full window.
+        std::thread::sleep(std::time::Duration::from_millis(3500));
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !alive,
+            "the TERM-trapping writer (pid {pid}) survived the quiesce"
+        );
+        assert!(
+            !late.exists(),
+            "the detached writer must never land after the quiesce"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

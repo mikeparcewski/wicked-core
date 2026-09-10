@@ -95,8 +95,12 @@ impl KillHandle {
             guard.take()
         };
         if let Some(mut child) = taken {
-            let _ = child.kill();
-            let _ = child.wait();
+            // The bridge was spawned in its OWN process group (`process_group(0)` at spawn), so
+            // kill the GROUP — the bridge, the CLI it wraps and anything either backgrounded — and
+            // reap BOUNDED (adversarial review on #414: a direct-child kill left a bridge's shell
+            // children alive to write past a no-code unit's final snapshot).
+            crate::validator::kill_child_tree(&mut child);
+            crate::validator::reap_bounded(&mut child);
         }
     }
 }
@@ -864,6 +868,12 @@ struct AcpProcess {
     /// (codex round 3): the name is unique per spawn (`write_session_settings`), so no racing
     /// launch shares or deletes it, and it is reaped exactly once — here, on drop, by its owner.
     session_dir: Option<std::path::PathBuf>,
+    /// F-036 (adversarial review on #414): whether this process was opened for a NO-CODE phase
+    /// (`executes_code: false`). Like the PTY carrier's `PtySession.no_code`, a process serves only
+    /// turns of its own posture — a creator's process is never handed to the evaluator that follows
+    /// (it could background a writer past the guard's final snapshot), and a no-code phase's
+    /// process is killed, group and all, the moment its unit ends.
+    no_code: bool,
 }
 
 impl Drop for AcpProcess {
@@ -2347,6 +2357,7 @@ fn start_acp_process_with_write_roots(
 
     Ok(AcpProcess {
         kill_handle: Arc::new(KillHandle::new(child)),
+        no_code: false,
         write_lock: Arc::new(Mutex::new(())),
         stdin,
         line_rx: rx,
@@ -4428,6 +4439,21 @@ impl AcpStepRunner {
     /// Close all ACP sessions for `run_id` and kill their child processes. Idempotent.
     /// Call this after the last unit of a run completes (mirrors
     /// [`PersistentStepRunner::drop_session`]).
+    /// Drop ONE `(run_id, cli_key)` session — the process is killed (group and all) and reaped
+    /// when the last `Arc` lets go, which for a caller that has released its guard is right here.
+    /// The run's other seats keep their sessions.
+    fn drop_session_key(&self, key: &(String, String)) {
+        let removed = {
+            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+            guard.remove(key)
+        };
+        drop(removed);
+        self.write_reg
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(rid, skey, _), _| !(rid == &key.0 && skey == &key.1));
+    }
+
     pub fn drop_session(&self, run_id: &str) {
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         // v3.1 §3: each session's per-process settings directory goes with its `AcpProcess` —
@@ -4639,6 +4665,29 @@ impl AcpStepRunner {
         // the unit is REFUSED by name.
         let session_key = (run_id.clone(), cli_key.clone());
         let probe = self.probe_cached_session(&session_key);
+        // F-036 (adversarial review on #414): a cached process is reused ONLY when its posture
+        // matches this unit's. A no-code phase reaching the creator's (write-posture) process
+        // closes it — group killed, bounded reap — and opens a fresh one; a code phase never
+        // inherits a read-only process either. Same rule as the PTY carrier.
+        let wants_no_code = crate::worktree_guard::applies_to(&input.unit);
+        let probe =
+            match probe {
+                SessionProbe::Live(arc)
+                    if arc.lock().unwrap_or_else(|p| p.into_inner()).no_code != wants_no_code =>
+                {
+                    eprintln!(
+                    "wicked-core: run {run_id} unit {} needs a {} ACP process for `{cli_key}` but \
+                     the cached one was opened {} — closing it and starting fresh (F-036)",
+                    input.unit.ord,
+                    if wants_no_code { "read-only" } else { "write-posture" },
+                    if wants_no_code { "with write posture" } else { "read-only" }
+                );
+                    drop(arc);
+                    self.drop_session_key(&session_key);
+                    SessionProbe::Vacant
+                }
+                other => other,
+            };
         let turn = match &probe {
             SessionProbe::Live(arc) => {
                 let proc = arc.lock().unwrap_or_else(|p| p.into_inner());
@@ -4980,6 +5029,7 @@ impl AcpStepRunner {
                         // From here on this session's turns are judged against it, not against
                         // whatever `current` resolves to later.
                         proc.skills = handed.cloned();
+                        proc.no_code = wants_no_code;
                         let acp_session_id = proc.session_id.clone();
                         // A1: captured before `proc` moves into the Arc so the once-per-spawn
                         // `SandboxUnenforced` disclosure can be emitted in the `did_insert` arm.
@@ -5219,17 +5269,29 @@ impl AcpStepRunner {
         }
 
         match turn {
-            Ok(result) if result.status == StepStatus::Ok => StepOutput {
-                run_id: input.run_id.clone(),
-                unit_ix: input.unit_ix,
-                attempt: input.attempt,
-                output: result.output,
-                status: StepStatus::Ok,
-                usage: result.usage,
-                files: result.files,
-                tools: result.tools,
-                governed: gate.is_some(),
-            },
+            Ok(result) if result.status == StepStatus::Ok => {
+                if wants_no_code {
+                    // F-036 QUIESCE (adversarial review on #414): a NO-CODE unit's process — the
+                    // bridge, the CLI it wraps and anything either backgrounded — dies with the
+                    // unit, group and all, BEFORE this returns and the worker thread takes the
+                    // guard's final snapshot. Never reused anyway (the next phase either writes,
+                    // or is another no-code phase that opens its own).
+                    drop(proc);
+                    self.drop_session_key(&session_key);
+                    drop(proc_arc);
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: result.output,
+                    status: StepStatus::Ok,
+                    usage: result.usage,
+                    files: result.files,
+                    tools: result.tools,
+                    governed: gate.is_some(),
+                }
+            }
             Ok(result) if matches!(result.status, StepStatus::Cancelled | StepStatus::TimedOut) => {
                 // Turn ceiling (TimedOut) or an external cancel — drop the session either way:
                 // the reader thread may wedge on a full pipe if we leave the ACP process running
@@ -8728,6 +8790,198 @@ while True:
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// A bridge for the quiesce test: like [`write_recording_bridge`], but every `session/prompt`
+    /// also BACKGROUNDS a writer in the bridge's own process group — `sleep 30; printf x >>
+    /// src/app.ts` in the unit's cwd — and records both pids, so a test can prove the whole group
+    /// died with the unit.
+    #[cfg(unix)]
+    fn write_backgrounding_bridge(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("backgrounding-bridge");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import sys, json, os, subprocess
+ledger = sys.argv[1]
+
+def w(obj):
+    print(json.dumps(obj), flush=True)
+
+def record(entry):
+    with open(ledger, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    method = req.get("method")
+    if method == "initialize":
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "serverInfo": {"name": "backgrounding", "version": "0"}}})
+    elif method == "session/new":
+        record({"new": True, "bridge_pid": os.getpid()})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "sessionId": "bg-session", "protocolVersion": "2025-03-26"}})
+    elif method == "session/prompt":
+        p = subprocess.Popen(["sh", "-c", "sleep 30; printf x >> src/app.ts"])
+        record({"prompt": True, "bridge_pid": os.getpid(), "writer_pid": p.pid})
+        w({"jsonrpc": "2.0", "id": req["id"], "result": {
+            "stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}}})
+    elif "id" in req and method:
+        w({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "unknown"}})
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// F-036 on the ACP carrier (adversarial review on #414): the ACP process is persistent per
+    /// run, so (1) an `executes_code: false` unit must never be served by the process that served
+    /// the creator's write turn — it gets a FRESH process — and (2) that process, its group and
+    /// anything it backgrounded must be dead BEFORE `run_unit` returns, i.e. before the worker
+    /// thread takes the worktree guard's final snapshot. Driven end to end through `run_unit`
+    /// against a bridge that backgrounds `sleep 30; printf x >> src/app.ts` on every turn.
+    #[test]
+    #[cfg(unix)]
+    fn an_evaluator_unit_never_reuses_the_creators_acp_process_and_its_own_dies_with_it() {
+        use crate::skills_snapshot::test_support::scratch as canonical_scratch;
+        use crate::workflow::{StepInput, StepRunner};
+
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-quiesce");
+        let _home = EnvPin::set("HOME", &home);
+        let ledger = home.join("ledger.ndjson");
+        let bridge = write_backgrounding_bridge(&home);
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "quiesce-seat"
+display_name = "Quiesce seat"
+binary = "claude"
+headless_invocation = "claude -p \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        let app = wt.join("src").join("app.ts");
+        std::fs::write(&app, "export const a = 1;\n").unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let unit = |ord: u32, no_code: bool| -> StepInput {
+            let mut u = crate::domain::WorkUnit::pending(
+                format!("run-Q:u{ord}"),
+                "run-Q",
+                ord,
+                "do the thing",
+            );
+            u.assigned_cli = Some("quiesce-seat".to_string());
+            u.executes_code = !no_code;
+            u.worktree_guarded = no_code;
+            StepInput {
+                run_id: "run-Q".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-quiesce".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let pid_of = |v: &Value, key: &str| v[key].as_i64().expect(key) as i32;
+        let dead_within = |pid: i32, wait: Duration| -> bool {
+            let deadline = Instant::now() + wait;
+            loop {
+                // kill(pid, 0) probes existence; ESRCH once the kernel has reaped it.
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // 1. The CREATOR's turn (a code phase): opens the run's process, backgrounds a writer.
+        let out = runner.run_unit(&unit(1, false));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let e = ledger_entries(&ledger);
+        assert_eq!(e.len(), 2, "session/new + one prompt: {e:?}");
+        let bridge_a = pid_of(&e[0], "bridge_pid");
+        let writer_a = pid_of(&e[1], "writer_pid");
+        assert!(
+            !dead_within(bridge_a, Duration::from_millis(0)),
+            "the creator's process is cached and alive"
+        );
+
+        // 2. The EVALUATOR's turn (`executes_code: false`): must NOT reuse that process.
+        let out = runner.run_unit(&unit(2, true));
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let e = ledger_entries(&ledger);
+        assert_eq!(
+            e.len(),
+            4,
+            "a FRESH process: a second session/new before the second prompt: {e:?}"
+        );
+        assert_eq!(e[2]["new"], Value::Bool(true));
+        let bridge_b = pid_of(&e[2], "bridge_pid");
+        let writer_b = pid_of(&e[3], "writer_pid");
+        assert_ne!(bridge_a, bridge_b, "the evaluator got its own process");
+
+        // 3. Everything is dead BEFORE run_unit returned: the creator's process (closed on the
+        //    posture switch) with its writer, and the evaluator's own process with its writer.
+        for (what, pid) in [
+            ("creator bridge", bridge_a),
+            ("creator's backgrounded writer", writer_a),
+            ("evaluator bridge", bridge_b),
+            ("evaluator's backgrounded writer", writer_b),
+        ] {
+            assert!(
+                dead_within(pid, Duration::from_secs(2)),
+                "{what} (pid {pid}) survived the quiesce"
+            );
+        }
+        // …and the tree the guard will snapshot is exactly what the seat left.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            std::fs::read_to_string(&app).unwrap(),
+            "export const a = 1;\n",
+            "a backgrounded writer landed after the unit"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// core#396, the ACP session BINDING — end to end through `run_unit` against the recording

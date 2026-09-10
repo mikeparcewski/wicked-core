@@ -2961,7 +2961,11 @@ pub(crate) fn no_code_posture(binary: &str, flags: Vec<String>) -> Result<NoCode
             let mut i = 0;
             while i < flags.len() {
                 let flag = flags[i].as_str();
-                if flag == "--dangerously-bypass-approvals-and-sandbox" || flag == "--full-auto" {
+                // EVERY write-capable token goes (adversarial review on #414): codex's own
+                // `--yolo` is an alias of the bypass and BEATS a later `--sandbox read-only`
+                // (verified on codex-cli 0.153.x: the banner reads `sandbox: danger-full-access`),
+                // and an unrecognised grant spelling has no business surviving on a no-code phase.
+                if WRITE_CAPABLE_TOKENS.contains(&flag) {
                     i += 1;
                     continue;
                 }
@@ -5294,6 +5298,33 @@ mod tests {
         std::fs::write(&p, "#!/bin/sh\necho \"ARGV=[$*]\"\n").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    /// Adversarial review on #414: on the codex branch EVERY write-capable token is dropped — not
+    /// just two spellings. codex's own `--yolo` is an alias of the bypass and BEATS a later
+    /// `--sandbox read-only` (codex-cli 0.153.x banner: `sandbox: danger-full-access`), so a
+    /// surviving `--yolo` would have made the appended lever decorative.
+    #[test]
+    fn every_write_capable_token_is_dropped_on_the_codex_branch() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let codex = "/opt/tools/codex";
+        for tok in WRITE_CAPABLE_TOKENS {
+            let p = no_code_posture(codex, s(&[tok, "--model", "o3"])).unwrap();
+            assert_eq!(p.flags, s(&["--model", "o3"]), "`{tok}` must be dropped");
+            assert_eq!(p.lever, ReadOnlyLever::CodexSandbox);
+            assert!(
+                !p.satisfied,
+                "nothing bounds it yet — the caller appends the lever"
+            );
+            // …and with a sandbox spelled after it, the sandbox is read-only and the token gone.
+            let p = no_code_posture(codex, s(&[tok, "--sandbox", "workspace-write"])).unwrap();
+            assert_eq!(p.flags, s(&["--sandbox", "read-only"]), "`{tok}`");
+            assert!(p.satisfied);
+        }
+        // The full argv a `--yolo` template yields for a no-code unit: lever appended, no grant.
+        let mut argv = s(&[codex, "--yolo", "exec"]);
+        apply_no_code_posture(&mut argv, Vec::new()).unwrap();
+        assert_eq!(argv, s(&[codex, "exec", "--sandbox", "read-only"]));
     }
 
     /// F-036, the posture half: a NO-CODE phase (`executes_code: false`) on a codex binary runs

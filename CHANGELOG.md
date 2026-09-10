@@ -24,9 +24,15 @@ Two release tracks share this file, newest entry first regardless of track:
   - **Worktree guard** (`worktree_guard`): for a def-driven, agent-executed unit whose phase declared
     `executes_code: false` (`WorkUnit.worktree_guarded`, plan-derived like `pre_build_scope`), the
     actor snapshots the worktree at dispatch — git TREE HASH over tracked + untracked-not-ignored
-    content via a scratch copy of the index (the real index, refs and worktree are never touched;
-    the engine's own `tmp/` scratch is excluded by construction through `core.excludesFile`) plus
-    `HEAD` — and persists it ON the unit (`worktree_baseline`, restart-durable). The FINAL
+    content via a scratch index that starts EMPTY (`add -A` re-hashes every path — the real index
+    is never copied, so no `assume-unchanged` bit can hide a rewrite; the real index, refs and
+    worktree are never touched; the engine's own `tmp/` scratch is excluded by construction
+    through `core.excludesFile`) plus `HEAD`, taken THROUGH the git directory PINNED from the
+    REGISTERED repository (`<repo>/.git/worktrees/<id>`, found from the repo side — never through
+    the worktree's own `.git` file, which an evaluator can redirect to a repository it controls;
+    both escapes were reproduced by the independent review) — and persists it ON the unit
+    (`worktree_baseline` with its `git_dir`, restart-durable); the final comparison reuses exactly
+    that directory, and a baseline without the pin is unverifiable, never clean. The FINAL
     comparison is taken after everything the phase owned has run — the seat's process group killed
     on exit (the wrapped runner now spawns the seat in its own group and `killpg`s it when it
     exits, is cancelled or times out), the agent judge rendered, the repo checks run — immediately
@@ -53,7 +59,8 @@ Two release tracks share this file, newest entry first regardless of track:
     binary — the template's argv[0] as an absolute path or looked up on `PATH`
     (`/opt/homebrew/bin/codex`, `codex.exe`) — never by the seat's registry key, so a seat NAMED
     `codex` that runs some other binary is unknown and its write grants are refused rather than
-    rewritten: codex runs `--sandbox read-only`
+    rewritten: codex runs `--sandbox read-only` with EVERY write-capable token dropped (`--yolo`
+    included — codex's alias of the bypass, which beats a later read-only sandbox)
     (every sandbox spelling rewritten, the bypass and `--full-auto` dropped, one appended when none
     was declared); pi gets `--exclude-tools edit,write` (merged into an existing denylist). A
     lever-less seat whose template or posture carries ANY recognised write grant
@@ -71,8 +78,14 @@ Two release tracks share this file, newest entry first regardless of track:
     persistent PTY session carrier never reuses a session across postures: an `executes_code:
     false` phase reaching a creator-opened (write-posture) session closes it and opens a fresh
     read-only one (and a code phase never inherits a read-only session), and a no-code phase's
-    session is closed — its whole process group `killpg`ed — the moment its turn ends, before the
-    guard's final snapshot, so a writer the seat backgrounded cannot land after the comparison.
+    session is closed — its whole process group `killpg`ed, SIGTERM then an UNCONDITIONAL SIGKILL
+    (a TERM-trapping, stdio-detached descendant no longer survives a teardown whose reader
+    already saw EOF) — the moment its turn ends, before the guard's final snapshot, so a writer
+    the seat backgrounded cannot land after the comparison. The ACP carrier, persistent per run
+    too, follows the same rule: an `executes_code: false` unit never reuses the process that
+    served a write turn (a fresh bridge is started), that process is killed — group and all, the
+    bridge's kill handle now `killpg`s — the moment the unit ends and BEFORE `run_unit` returns,
+    and every bridge teardown reaps bounded.
   - **The code-writing Creator's gate evaluates something** (`bug/fix`, `feature/build`,
     `migration/execute` — compiled defs and the shipped `workflows/*.json`): each now pins the
     built-in evidence floor, so layer 1 re-derives the diff and layer 2 has a seat DISTINCT from
@@ -102,7 +115,18 @@ Two release tracks share this file, newest entry first regardless of track:
     the worktree, secret dirs unreadable, network open) with an isolated `HOME`, `npm_config_cache`,
     `CARGO_HOME`, `CARGO_TARGET_DIR` and `XDG_*` under `<worktree>/tmp/wicked-checks/`
     (`RUSTUP_HOME` preserved; `npm install --no-package-lock` when the repo ships no lockfile, so no
-    build artifact lands in the reviewed tree). A host where NO write boundary can be armed (no
+    build artifact lands in the reviewed tree) — and a MINIMAL environment: the daemon's env is
+    cleared and only `PATH`, locale, `TERM`, `USER`, the Windows shell essentials, `RUSTUP_HOME`
+    and those overrides are passed, so no token, API key or `WICKED_*` variable reaches a check
+    (a repo-controlled script with the network open could otherwise read them). The stdout/stderr
+    drains are BOUNDED after the group kill (a `setsid`-detached descendant holding the pipe
+    cannot wedge the verify unit; the tail read so far is reported); a checkout that ships `tmp`
+    as a symlink is refused, never followed, when the scratch is prepared; `cargo test` runs
+    `--locked` when the repo ships a `Cargo.lock`, and when it ships none the `Cargo.lock` cargo
+    writes — provably the engine's own (absent at detection, after the seat was quiesced) — is
+    removed after the checks and disclosed on the report (`engine_writes_removed`), so the guard
+    never denies the engine's side effect. A host where NO
+    write boundary can be armed (no
     `sandbox-exec`/`bwrap` — all of Windows) does NOT run the checks: the floor FAILS with
     `sandbox_error` (+ `sandbox_level: "best-effort"` and the probe's reason) and the gate denies —
     repo-controlled scripts never run unsandboxed. Detection is fail-closed: an unreadable or
