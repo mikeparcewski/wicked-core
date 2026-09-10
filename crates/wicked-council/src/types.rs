@@ -310,9 +310,19 @@ pub fn default_login_invocation(key: &str) -> Option<String> {
     };
     match seat_config_for(cli) {
         Ok(SeatConfig::Inherit) => Some(login.to_string()),
-        Ok(SeatConfig::Isolated { set, .. }) => {
+        Ok(cfg @ SeatConfig::Isolated { .. }) => {
+            // The sign-in command writes CREDENTIALS into the seat's directories, before any engine
+            // spawn has prepared them (Copilot, #426): prepare them here — created private, every
+            // owned directory (opencode's `<xdg>/opencode` app dirs included) no-follow checked —
+            // and fail CLOSED (no sign-in surface) on a planted link, exactly as the spawns refuse.
+            if cfg.ensure_dirs().is_err() {
+                return None;
+            }
+            let SeatConfig::Isolated { set, .. } = &cfg else {
+                unreachable!("matched Isolated above");
+            };
             let mut out = String::new();
-            for (var, dir) in &set {
+            for (var, dir) in set {
                 out.push_str(var);
                 out.push('=');
                 out.push_str(&shell_double_quote(&dir.display().to_string()));
@@ -1165,6 +1175,39 @@ mod login_tests {
             )),
             "the claude spelling is unchanged by the generalisation"
         );
+        // Copilot, #426: the directories the sign-in command will write credentials into are
+        // prepared (private) by the roster read itself — opencode's app dirs included.
+        for d in [
+            base.join("codex"),
+            base.join("pi"),
+            base.join("copilot"),
+            base.join("opencode").join("data").join("opencode"),
+        ] {
+            assert!(d.is_dir(), "{} is prepared before sign-in", d.display());
+        }
+        #[cfg(unix)]
+        {
+            // A planted link where a seat root should be: NO sign-in command (fail closed), never
+            // a command that would write the operator's credentials through the link.
+            let base2 = std::env::temp_dir().join(format!("wc-login-link-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base2);
+            std::fs::create_dir_all(&base2).unwrap();
+            let operator = base2.join("operator-pi");
+            std::fs::create_dir_all(&operator).unwrap();
+            std::os::unix::fs::symlink(&operator, base2.join("pi")).unwrap();
+            std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base2);
+            let pi = default_login_invocation("pi");
+            match &prior {
+                Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
+                None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
+            }
+            assert_eq!(
+                pi, None,
+                "a planted seat-root link yields no sign-in command"
+            );
+            let _ = std::fs::remove_dir_all(&base2);
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A path with shell-special characters survives the sign-in terminal verbatim; a Windows

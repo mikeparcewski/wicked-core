@@ -2983,6 +2983,16 @@ impl BannerGate {
         if self.passthrough {
             return Some(delta.to_string());
         }
+        // The bound is judged BEFORE retaining (Copilot, #426): one oversized banner-shaped chunk
+        // must not sit in `held` past the cap even for the length of this call. Past it, the head
+        // is content — release what is held plus this delta (a complete banner at the head is
+        // still stripped on the way out).
+        if self.held.len() + delta.len() > Self::HOLD_CAP {
+            self.passthrough = true;
+            let mut out = std::mem::take(&mut self.held);
+            out.push_str(delta);
+            return Some(strip_pi_banner(&out).to_string());
+        }
         self.held.push_str(delta);
         // Remove every COMPLETE banner at the head (observed twice in one capture, core#268).
         let stripped = strip_pi_banner(&self.held);
@@ -4224,6 +4234,57 @@ fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("refusing scratch root {} ({e})", cwd.display()))
 }
 
+/// The real path of `p` even when `p` does not exist yet: its longest EXISTING ancestor is
+/// canonicalized and the remaining segments re-appended. A lexical `resolve` would compare a path
+/// under a symlinked temp dir (macOS `/var/folders/…` → `/private/var/folders/…`) unequal to one
+/// that was resolved through the link.
+fn canonical_ish(p: &std::path::Path) -> std::path::PathBuf {
+    let mut cur = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&cur) {
+            let mut out = real;
+            for seg in tail.iter().rev() {
+                out.push(seg);
+            }
+            return out;
+        }
+        match (cur.file_name(), cur.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name.to_os_string());
+                cur = parent.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Is `file` the SAME file (device + inode) as any top-level entry of `dir` — the operational store
+/// or one of its sidecars reached through a hard link or a symlink elsewhere? Unix only; other
+/// platforms rely on the canonical-path comparison.
+fn same_file_as_a_top_level_entry_of(file: &std::path::Path, dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(target) = std::fs::metadata(file) else {
+            return false;
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            std::fs::metadata(e.path())
+                .map(|m| m.is_file() && m.dev() == target.dev() && m.ino() == target.ino())
+                .unwrap_or(false)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, dir);
+        false
+    }
+}
+
 /// The boundary a chat's seats are judged against (core#410, review): the scratch root is the ONE
 /// write root (and the cwd), the scoped repository roots are read-only, `HOME` and — for a claude
 /// seat — its worker config dir get the same carve-outs the governed boundary applies. No phase
@@ -4578,8 +4639,19 @@ impl AcpStepRunner {
         // this session (core#410, review): write = the scratch root; read = the scoped roots.
         proc.chat_boundary = Some(chat_boundary(&scope, seat_cli));
         let arc = Arc::new(Mutex::new(proc));
+        // Insert under BOTH locks, scopes then sessions (the order `chat_open` takes them): the
+        // scope this process was warmed in must still be the recorded one (Copilot, #426 — a
+        // re-open with a new scope while this seat was warming would otherwise land an old-scope
+        // process under a key the new scope now owns); a stale process is dropped, not inserted.
+        let scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
+        if scopes.get(chat_id) != Some(&scope) {
+            drop(arc);
+            return Err(format!(
+                "chat '{chat_id}': its scope changed while seat '{cli_key}' was warming — retry"
+            ));
+        }
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        // A racing ensure may have inserted first — reuse theirs, drop ours.
+        // A racing ensure (same scope, by the check above) may have inserted first — reuse theirs.
         if let Some(Some(existing)) = guard.get(&key) {
             return Ok(existing.clone());
         }
@@ -4672,15 +4744,67 @@ impl AcpStepRunner {
     ///    file of the engine's own state home — that is where the operational store and its
     ///    sidecars live, and a chat's estate MCP over the operational store is FINDING-067.
     fn validate_chat_scope(&self, scope: &ChatScope) -> Result<(), String> {
+        // The scratch root: absolute, and a STRICT descendant of the system temp directory
+        // (Copilot, #426 — an absolute-only rule let a caller name `/`, `$HOME` or the state home
+        // as the writable root, which the ensure would then have made 0700 and the boundary made
+        // writable). Judged on real paths through the longest existing ancestor, so a symlinked
+        // temp dir (macOS `/var` → `/private/var`) and a not-yet-created leaf compare correctly.
         if !scope.cwd.is_absolute() {
             return Err(format!(
                 "chat scope: cwd {} is not absolute",
                 scope.cwd.display()
             ));
         }
+        let cwd = canonical_ish(&scope.cwd);
+        let temps: Vec<std::path::PathBuf> = {
+            let mut t = vec![canonical_ish(&std::env::temp_dir())];
+            if cfg!(unix) {
+                t.push(canonical_ish(std::path::Path::new("/tmp")));
+            }
+            t
+        };
+        if !temps.iter().any(|t| cwd.starts_with(t) && cwd != *t) {
+            return Err(format!(
+                "chat scope: cwd {} must be a directory of its own under the system temp directory \
+                 ({}), never a repository, a home or the engine's state",
+                scope.cwd.display(),
+                std::env::temp_dir().display()
+            ));
+        }
+        let op_home = self.operational_home.as_deref().map(canonical_ish);
+        if let Some(op) = &op_home {
+            if cwd.starts_with(op) {
+                return Err(format!(
+                    "chat scope: cwd {} lies inside the engine's own state home",
+                    scope.cwd.display()
+                ));
+            }
+        }
+        // The read roots: absolute; the run path's exclusions; never the engine's state home or
+        // anything under it (Copilot, #426 — `validate_extra_read_roots` fences the config tree
+        // only); never equal to / containing / inside the scratch root (the claude deny rules over
+        // a root that contained the cwd would make the writable root unwritable — the two layers
+        // must agree).
         for root in &scope.read_roots {
-            if !std::path::Path::new(root).is_absolute() {
+            let p = std::path::Path::new(root);
+            if !p.is_absolute() {
                 return Err(format!("chat scope: read root {root:?} is not absolute"));
+            }
+            let r = canonical_ish(p);
+            if let Some(op) = &op_home {
+                if r.starts_with(op) {
+                    return Err(format!(
+                        "chat scope: read root {root} lies inside the engine's own state home \
+                         (FINDING-067)"
+                    ));
+                }
+            }
+            if r.starts_with(&cwd) || cwd.starts_with(&r) {
+                return Err(format!(
+                    "chat scope: read root {root} overlaps the scratch root {} — a root can neither \
+                     contain nor sit inside the chat's writable directory",
+                    scope.cwd.display()
+                ));
             }
         }
         let home = std::env::var_os("HOME")
@@ -4688,6 +4812,10 @@ impl AcpStepRunner {
             .map(std::path::PathBuf::from);
         crate::path_policy::validate_extra_read_roots(&scope.read_roots, home.as_deref())
             .map_err(|e| format!("chat scope: {e}"))?;
+        // The graph: absolute, an EXISTING file, and never the engine's own store — judged on the
+        // RESOLVED file (Copilot, #426: a symlink or hard link outside the state home that resolves
+        // to `core.db` or a sidecar passed a spelling-based check): its canonical parent must not
+        // be the state home, and on unix its (device, inode) must match no top-level entry there.
         if let Some(db) = scope.code_graph_db.as_deref() {
             let db_path = std::path::Path::new(db);
             if !db_path.is_absolute() {
@@ -4698,12 +4826,18 @@ impl AcpStepRunner {
                     "chat scope: no code graph at {db} (the estate MCP would answer for nothing)"
                 ));
             }
-            if let (Some(parent), Some(home)) = (db_path.parent(), self.operational_home.as_deref())
-            {
-                if crate::state_home::same_dir(parent, home) {
+            if let Some(op) = self.operational_home.as_deref() {
+                let resolved =
+                    std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+                let op_real = canonical_ish(op);
+                if resolved
+                    .parent()
+                    .is_some_and(|parent| crate::state_home::same_dir(parent, &op_real))
+                    || same_file_as_a_top_level_entry_of(db_path, op)
+                {
                     return Err(format!(
-                        "chat scope: {db} is a top-level file of the engine's own state home — the \
-                         operational store is never a chat's graph (FINDING-067)"
+                        "chat scope: {db} is (or resolves to) a top-level file of the engine's own \
+                         state home — the operational store is never a chat's graph (FINDING-067)"
                     ));
                 }
             }
@@ -4770,7 +4904,7 @@ impl AcpStepRunner {
         match result {
             Ok(turn) if turn.status == StepStatus::Ok => Ok(turn.output),
             Ok(turn) => {
-                self.chat_evict(chat_id, cli_key);
+                self.chat_evict(chat_id, cli_key, &arc);
                 let msg = format!(
                     "seat '{cli_key}' turn ended {:?}: {}",
                     turn.status, turn.output
@@ -4787,7 +4921,7 @@ impl AcpStepRunner {
                 Err(msg)
             }
             Err(e) => {
-                self.chat_evict(chat_id, cli_key);
+                self.chat_evict(chat_id, cli_key, &arc);
                 let msg = format!("seat '{cli_key}' session error: {e}");
                 eprintln!("[wicked-core] chat '{chat_id}' evicting {msg}");
                 Err(msg)
@@ -4795,9 +4929,16 @@ impl AcpStepRunner {
         }
     }
 
-    fn chat_evict(&self, chat_id: &str, cli_key: &str) {
+    /// Drop the seat's pool entry — but only if it is still THIS process (Copilot, #426): a
+    /// re-open with a new scope may have evicted the old process and warmed a replacement under
+    /// the same key while a turn on the old one was still in flight; that turn's failure must not
+    /// remove the replacement.
+    fn chat_evict(&self, chat_id: &str, cli_key: &str, this: &Arc<Mutex<AcpProcess>>) {
+        let key = (Self::chat_pool_key(chat_id), cli_key.to_string());
         let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        guard.remove(&(Self::chat_pool_key(chat_id), cli_key.to_string()));
+        if matches!(guard.get(&key), Some(Some(existing)) if Arc::ptr_eq(existing, this)) {
+            guard.remove(&key);
+        }
     }
 
     /// The seats currently warm for a chat (fan-out default for `targets: None`).
@@ -10573,8 +10714,113 @@ transport = "stdio"
             )
             .expect_err("operational store");
         assert!(err.contains("FINDING-067"), "{err}");
+        // …nor reached through a link elsewhere (Copilot, #426): judged on the resolved file.
+        #[cfg(unix)]
+        {
+            let link = dir.join("innocent-graph.db");
+            std::os::unix::fs::symlink(state.join("core.db"), &link).unwrap();
+            let err = r
+                .chat_open(
+                    "oplink",
+                    &[],
+                    ChatScope {
+                        code_graph_db: Some(link.to_string_lossy().into_owned()),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("symlink to the operational store");
+            assert!(err.contains("FINDING-067"), "{err}");
+            let hard = dir.join("hard-graph.db");
+            std::fs::hard_link(state.join("core.db"), &hard).unwrap();
+            let err = r
+                .chat_open(
+                    "ophard",
+                    &[],
+                    ChatScope {
+                        code_graph_db: Some(hard.to_string_lossy().into_owned()),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("hard link to the operational store");
+            assert!(err.contains("FINDING-067"), "{err}");
+        }
+        // The scratch root must be a directory of its own under the system temp dir — never `/`,
+        // the temp dir itself, the state home or a home directory (Copilot, #426).
+        for bad in [
+            std::path::PathBuf::from("/"),
+            std::env::temp_dir(),
+            state.clone(),
+            state.join("chats"),
+        ] {
+            let err = r
+                .chat_open(
+                    "badcwd",
+                    &[],
+                    ChatScope {
+                        cwd: bad.clone(),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("dangerous cwd");
+            assert!(
+                err.contains("system temp") || err.contains("state home"),
+                "{}: {err}",
+                bad.display()
+            );
+        }
+        // A read root inside the engine's state home, or overlapping the scratch root, is refused.
+        for (root, needle) in [
+            (state.join("project-graphs"), "state home"),
+            (base.cwd.clone(), "overlaps"),
+            (base.cwd.parent().unwrap().to_path_buf(), "overlaps"),
+        ] {
+            let err = r
+                .chat_open(
+                    "badroot",
+                    &[],
+                    ChatScope {
+                        read_roots: vec![root.to_string_lossy().into_owned()],
+                        ..base.clone()
+                    },
+                )
+                .expect_err("dangerous read root");
+            assert!(err.contains(needle), "{}: {err}", root.display());
+        }
         // Nothing was recorded for any refused chat.
         assert!(r.chat_scopes.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Copilot, #426: a turn's eviction removes only the process IT ran on — a replacement warmed
+    /// under the same key by a re-open with a new scope survives the old turn's cleanup.
+    #[test]
+    #[cfg(unix)]
+    fn evicting_a_chat_seat_removes_only_the_process_the_turn_ran_on() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("chat-evict-identity");
+        let script = stub_idle_bridge(&dir);
+        let a = Arc::new(Mutex::new(
+            start_acp_process(&stub_config(&script, None), &dir, None, None).expect("a"),
+        ));
+        let b = Arc::new(Mutex::new(
+            start_acp_process(&stub_config(&script, None), &dir, None, None).expect("b"),
+        ));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let key = (AcpStepRunner::chat_pool_key("c1"), "claude".to_string());
+        r.sessions
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Some(Arc::clone(&a)));
+        // The old turn (ran on `b`, since replaced) fails: the replacement `a` stays.
+        r.chat_evict("c1", "claude", &b);
+        assert!(r.sessions.lock().unwrap().contains_key(&key));
+        // A turn on `a` itself fails: its own entry goes.
+        r.chat_evict("c1", "claude", &a);
+        assert!(!r.sessions.lock().unwrap().contains_key(&key));
+        drop(a);
+        drop(b);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10999,10 +11245,17 @@ transport = "stdio"
         let open = "pi v1.0\n---\n## Skills\n";
         assert_eq!(g.push(open), None);
         assert_eq!(g.finish(), Some(open.to_string()));
-        // The hold is bounded: past the cap a banner-shaped head is released as content.
+        // The hold is bounded: past the cap a banner-shaped head is released as content — judged
+        // BEFORE retaining, so `held` never exceeds the cap even for one oversized chunk (Copilot).
         let mut g = BannerGate::default();
         let huge = format!("pi v1.0\n---\n{}", "x".repeat(BannerGate::HOLD_CAP + 1));
         assert_eq!(g.push(&huge), Some(huge.clone()));
+        assert!(g.held.is_empty());
+        let mut g = BannerGate::default();
+        assert_eq!(g.push("pi v1.0\n"), None);
+        let big = "y".repeat(BannerGate::HOLD_CAP);
+        assert_eq!(g.push(&big), Some(format!("pi v1.0\n{big}")));
+        assert!(g.held.is_empty(), "nothing is retained past the cap");
         // `finish` on a complete banner with nothing after it delivers nothing.
         let mut g = BannerGate::default();
         assert_eq!(g.push(banner), None);
