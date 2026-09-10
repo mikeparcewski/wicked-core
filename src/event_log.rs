@@ -413,10 +413,12 @@ pub fn read_run(root: &Path, run_id: &str) -> Vec<serde_json::Value> {
         return Vec::new();
     };
     let mut out = parse_log(&raw);
-    let seqs: Vec<u64> = out.iter().map(|v| seq_of(v).unwrap_or(0)).collect();
-    let distinct: HashSet<u64> = seqs.iter().copied().collect();
-    if distinct.len() == seqs.len() {
-        // Stable, so records without a `seq` (none are written today) keep their file order.
+    // `seq` is an order only when EVERY record carries one and no value repeats. A record without
+    // one (nothing written today, but a log is data on disk) must not be read as `seq: 0` and
+    // sorted ahead of the history — Copilot on #420 — so its presence pins the read to file order.
+    let seqs: Vec<Option<u64>> = out.iter().map(seq_of).collect();
+    let distinct: HashSet<u64> = seqs.iter().flatten().copied().collect();
+    if seqs.iter().all(Option::is_some) && distinct.len() == seqs.len() {
         out.sort_by_key(|v| seq_of(v).unwrap_or(0));
     }
     out
@@ -1014,6 +1016,29 @@ mod tests {
                 "unitExecuting"
             ],
             "a repeated seq means the counter restarted; file order is the emission order"
+        );
+    }
+
+    /// Copilot on #420: a record WITHOUT a `seq` must not be read as `seq: 0` and sorted ahead of the
+    /// history. Nothing writes such a record today, but a log is data on disk; if one is there,
+    /// `seq` is not an order for that file and file order stands — here `[2, none, 1]` stays put
+    /// rather than becoming `[none, 1, 2]`.
+    #[test]
+    fn a_record_without_seq_pins_the_read_to_file_order() {
+        let root = tmp("seqless");
+        let mut raw = String::new();
+        raw.push_str(&recorded_line("unitDone", 2, 1_000, 2));
+        raw.push_str("{\"type\":\"unitDone\",\"session\":\"r\",\"ord\":7,\"ts\":1000}\n");
+        raw.push_str(&recorded_line("unitDone", 1, 1_000, 1));
+        write_log(&root, "r", &raw);
+        let ords: Vec<u64> = read_run(&root, "r")
+            .iter()
+            .map(|v| v["ord"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            ords,
+            [2, 7, 1],
+            "file order — seq is not an order for this file"
         );
     }
 
