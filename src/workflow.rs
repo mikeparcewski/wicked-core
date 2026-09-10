@@ -661,6 +661,15 @@ pub enum WorkflowDefError {
         phase: String,
         dep: String,
     },
+    /// An `executes_code` agent phase whose gate would evaluate NOTHING (F-039): no
+    /// `validator_pin` (so neither the deterministic floor nor the agent judge can run) and no
+    /// human gate. Its gate would fold `combined: true` over an empty evaluation — the exact
+    /// record a governed `bug/fix` produced (`agentVerdict: None, hasDeterministicFloor: false,
+    /// evaluatorPolicies: []`). Refused at registration; the message names the phase and every
+    /// remedy. `workflow::ungated_code_phases` is the pure lint a consumer can run first.
+    GateEvaluatesNothing {
+        phase: String,
+    },
 }
 
 impl std::fmt::Display for WorkflowDefError {
@@ -675,6 +684,15 @@ impl std::fmt::Display for WorkflowDefError {
                 f,
                 "phase {phase} depends on {dep}, which is not declared before it \
                  (declaration order must be execution order — dependencies point backward)"
+            ),
+            WorkflowDefError::GateEvaluatesNothing { phase } => write!(
+                f,
+                "gate evaluates nothing: {phase} — the phase declares executes_code but pins no \
+                 validator and has no human gate, so its gate would approve with nothing \
+                 checked. Pin the built-in evidence floor (validator_pin \"{}\" — the run left \
+                 a change in its worktree, judged by a seat distinct from the creator), pin a \
+                 phase-specific validator, or gate the phase with human_confirm",
+                crate::builtin_floors::EVIDENCE_FLOOR_PIN
             ),
         }
     }
@@ -765,7 +783,7 @@ impl WorkflowRegistry {
         let def = enforce_verified_evidence(def);
         // AFTER the two passes above, so a same-id replacement that lost a pin gets it back
         // before this judges it, and a `verified_evidence` phase is already floored.
-        let def = arm_ungated_code_phases(def);
+        refuse_ungated_code_phases(&def)?;
         self.defs.insert(def.id.clone(), def);
         Ok(())
     }
@@ -934,29 +952,20 @@ pub fn ungated_code_phases(def: &WorkflowDef) -> Vec<String> {
         .collect()
 }
 
-/// Registration ARMS every phase [`ungated_code_phases`] names with the built-in evidence floor,
-/// loudly — the same fail-closed direction as [`enforce_verified_evidence`]: make the gate real
-/// rather than let a code phase approve nothing. Arming, not refusing, is deliberate: wicked-crew
-/// composes PER-RUN defs under fresh ids (`feature-pr`, `bug-pr`, …) from a mirror of the shipped
-/// defs, so a refusal here would fail every default code-work launch on an engine upgrade until
-/// the mirror caught up — a runtime coupling between two repos disguised as a validation error.
-/// The invariant that matters ("never `combined: true` over nothing evaluated") holds either way;
-/// the log line tells the author what was pinned and how to choose differently.
-fn arm_ungated_code_phases(mut def: WorkflowDef) -> WorkflowDef {
-    for id in ungated_code_phases(&def) {
-        eprintln!(
-            "wicked-core: workflow `{}` phase `{id}` declares executes_code but pins no validator \
-             and has no human gate — its gate would evaluate NOTHING (F-039). PINNING the built-in \
-             evidence floor ({}) so the gate re-derives the diff and a distinct seat judges it. Pin \
-             a phase-specific validator or gate the phase with human_confirm to choose otherwise.",
-            def.id,
-            crate::builtin_floors::EVIDENCE_FLOOR_PIN
-        );
-        if let Some(phase) = def.phases.iter_mut().find(|p| p.id == id) {
-            phase.validator_pin = Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN.to_string());
-        }
+/// Registration REFUSES a def with any phase [`ungated_code_phases`] names — the contract is
+/// that a workflow whose code phase would fold `combined: true` over nothing evaluated does not
+/// load. The shipped defs pin their code phases explicitly (`bug/fix`, `feature/build`,
+/// `migration/execute`); an author's def is told exactly which phase and the three remedies.
+/// Refusal rather than repair (codex review on #414): a gate silently injected at load is a gate
+/// nobody chose, and the cost of a refused def is a legible error at load — the same failure
+/// shape every other `WorkflowDefError` has. Runs AFTER `carry_shadowed_pins` and
+/// `enforce_verified_evidence`, so a same-id overlay copy that dropped a shipped pin is repaired
+/// by the shadow rule before this judges it; only a def that never had a gate is refused.
+fn refuse_ungated_code_phases(def: &WorkflowDef) -> Result<(), WorkflowDefError> {
+    match ungated_code_phases(def).into_iter().next() {
+        Some(phase) => Err(WorkflowDefError::GateEvaluatesNothing { phase }),
+        None => Ok(()),
     }
-    def
 }
 
 /// A `verified_evidence` phase must be able to DELIVER the re-verification it declares
@@ -1764,11 +1773,11 @@ mod workflow_def_tests {
     }
 
     /// F-039: an `executes_code` agent phase with an `auto` gate and no pin would fold `combined:
-    /// true` over nothing evaluated — registration ARMS it with the evidence floor (loudly), the
-    /// pure query names it, and a pin / a human gate / a Tool executor each satisfy the rule so the
-    /// shipped built-ins are untouched by it.
+    /// true` over nothing evaluated — registration REFUSES it by name ("gate evaluates nothing:
+    /// <phase>"), the pure lint names it, and a pin / a human gate / a Tool executor each satisfy
+    /// the rule so the shipped built-ins load untouched.
     #[test]
-    fn a_code_phase_whose_gate_evaluates_nothing_is_armed_at_registration() {
+    fn a_code_phase_whose_gate_evaluates_nothing_is_refused_at_registration() {
         let ungated = WorkflowDef {
             id: "ungated".to_string(),
             phases: vec![
@@ -1786,23 +1795,28 @@ mod workflow_def_tests {
             "the lint names exactly the code phase whose gate evaluates nothing"
         );
         let mut reg = WorkflowRegistry::default();
-        reg.register(ungated).expect("armed, not refused");
-        let def = reg.get("ungated").unwrap();
+        let err = reg
+            .register(ungated)
+            .expect_err("a code phase with no pin and no human gate must be refused");
         assert_eq!(
-            def.phases[1].validator_pin.as_deref(),
-            Some(crate::builtin_floors::EVIDENCE_FLOOR_PIN),
-            "the code phase gains the evidence floor at registration"
+            err,
+            WorkflowDefError::GateEvaluatesNothing {
+                phase: "fix".to_string()
+            }
         );
-        assert_eq!(
-            def.phases[0].validator_pin, None,
-            "the recon phase is not a code phase and gains nothing"
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("gate evaluates nothing: fix")
+                && msg.contains(crate::builtin_floors::EVIDENCE_FLOOR_PIN)
+                && msg.contains("human_confirm"),
+            "the error names the phase and every remedy: {msg}"
         );
         assert!(
-            ungated_code_phases(def).is_empty(),
-            "the registered def passes the lint"
+            reg.get("ungated").is_none(),
+            "a refused def is not registered"
         );
 
-        // The three ways an author satisfies the rule on their own terms — none is touched.
+        // The three ways an author satisfies the rule — each registers and is left as authored.
         let with = |id: &str, fix: PhaseDef| WorkflowDef {
             id: id.to_string(),
             phases: vec![fix],
@@ -1837,6 +1851,21 @@ mod workflow_def_tests {
                 "`{id}` satisfies the rule on its own terms and is left exactly as authored"
             );
         }
+        // `verified_evidence` arms a pin BEFORE the rule runs, so it satisfies it too.
+        reg.register(with(
+            "verified",
+            PhaseDef::new("fix", StageKind::Build).codes().verified(),
+        ))
+        .expect("verified_evidence is floored at registration, which the rule sees");
+        // A same-id re-registration that DROPPED a shipped pin is repaired by the shadow rule
+        // before this judges it — the refusal is for defs that never had a gate.
+        reg.register(bug_def()).unwrap();
+        let mut stripped = bug_def();
+        for p in stripped.phases.iter_mut() {
+            p.validator_pin = None;
+        }
+        reg.register(stripped)
+            .expect("carry_shadowed_pins restores the shipped pins before the refusal judges");
         // Every shipped built-in already carries its pins: the lint is silent on them.
         for id in WorkflowRegistry::with_defaults().ids() {
             let def = WorkflowRegistry::with_defaults();

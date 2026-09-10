@@ -20,7 +20,9 @@
 //! * `package.json` → its `typecheck`, `lint` and `test` scripts (those present, in that order),
 //!   via the package manager the lockfile names (`pnpm-lock.yaml` → pnpm, `yarn.lock` → yarn, else
 //!   npm), preceded by an install when `node_modules/` is absent (`npm ci` with a lockfile, `npm
-//!   install` without; the pnpm/yarn frozen-lockfile equivalents);
+//!   install` without; the pnpm/yarn frozen-lockfile equivalents) — ALWAYS with
+//!   `--ignore-scripts`: a dependency's lifecycle script is the one piece of repo-controlled code
+//!   the floor has no reason to run;
 //! * `Cargo.toml` → `cargo test`.
 //!
 //! Each command's exit code, duration and the TAIL of its stdout/stderr are captured as a
@@ -30,9 +32,28 @@
 //! the first failure: the evidence of the failure is what the gate needs, and a failing typecheck
 //! makes the suite behind it moot.
 //!
-//! A repository that declares NO detectable checks yields a report with no runs and `passed:
-//! true` — disclosed as such on the event (`checks: []`), never silently. That is "nothing to
-//! re-verify", which is a different statement from "could not re-verify" and is reported as one.
+//! ## Containment: the checks are repo-controlled code
+//!
+//! A `test` script is arbitrary code the repository chose. It runs the way the engine runs an
+//! ungoverned worker: inside the OS write boundary the worker sandbox provides
+//! ([`crate::validator::detect_worker_sandbox`] — macOS `sandbox-exec`, Linux `bwrap`; writes
+//! confined to the worktree, the curated secret directories unreadable, network open because
+//! installs need it), with an ISOLATED `HOME` and package caches under the worktree's engine
+//! scratch (`<worktree>/tmp/wicked-checks/…` — `HOME`, `npm_config_cache`, `CARGO_HOME`,
+//! `XDG_*`), so no check reads the operator's `~/.npmrc`, `~/.cargo/config.toml` or credentials,
+//! and nothing it writes lands outside the tree. `RUSTUP_HOME` is preserved so the toolchain
+//! proxies still resolve. When no sandbox tool is on the host (Windows), the floor runs with the
+//! env isolation alone and SAYS SO on the report (`sandbox_level: "best-effort"`) — the same
+//! disclose-and-continue posture the worker sandbox takes (DES-GOV-008 A1), never a silent claim
+//! of containment.
+//!
+//! ## Detection is fail-closed
+//!
+//! A `package.json` that cannot be read or parsed, or a manifest/lockfile/`node_modules` that is a
+//! SYMLINK (probed with `lstat`, never followed), fails the floor with the reason: an unverifiable
+//! manifest is not "no checks", it is "cannot tell what the checks are". Only a repository with NO
+//! manifest at all yields a report with no runs and `passed: true` — disclosed as such on the
+//! event (`checks: []`), never silently.
 //!
 //! ## Why the engine runs them rather than trusting the seat
 //!
@@ -40,20 +61,16 @@
 //! point is WHO the record belongs to: an exit code the engine observed is evidence; a sentence
 //! in a transcript is a claim. Running them again costs minutes of machine time per verify phase
 //! and buys the one property the gate exists for.
-//!
-//! ## Environment
-//!
-//! The checks inherit the daemon's environment through the spawn chokepoint (`hardened()` strips
-//! every engine-internal variable), plus `CI=1` so watch-mode test runners run once, and colour
-//! disabled so the captured tails are legible. They run in the worktree with the worktree as cwd.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
+
+use crate::validator::WorkerSandbox;
 
 /// The criterion this floor asserts — phrased as the property, because it is what an operator
 /// reads on `GateEvaluated.criterion` and in a denial.
@@ -68,6 +85,9 @@ pub const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 pub const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// How much of each stream's TAIL is kept as evidence.
 pub const TAIL_BYTES: usize = 4096;
+/// Where the checks' isolated `HOME` and caches live: under the worktree's engine scratch, which
+/// the worktree guard excludes from its snapshot by construction and the OS boundary contains.
+pub const SCRATCH_SUBDIR: &str = "wicked-checks";
 
 /// One check the floor detected: a name, the exact argv, and where it was read from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,20 +163,37 @@ impl CheckRun {
 /// Everything the floor observed for one unit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepoChecksReport {
-    /// What was detected, in run order.
+    /// What was detected, in run order (empty when detection failed — see `detect_error`).
     pub detected: Vec<RepoCheck>,
     /// What actually ran (a prefix of `detected` — the floor stops at the first failure).
     pub checks: Vec<CheckRun>,
     /// Detected checks that never ran because an earlier one failed.
     pub skipped: Vec<String>,
-    /// True iff every detected check ran and exited 0 (vacuously true when nothing was detected —
-    /// see the module doc; the event discloses `checks: []`).
+    /// True iff detection succeeded and every detected check ran and exited 0 (vacuously true when
+    /// nothing was detected — see the module doc; the event discloses `checks: []`).
     pub passed: bool,
+    /// Why detection itself failed (unreadable/malformed manifest, a symlinked probe) — the floor
+    /// FAILS with this reason rather than reporting "no checks".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detect_error: Option<String>,
+    /// The OS write-containment level the checks ran under (`sandboxed` / `best-effort`), the
+    /// wire spelling of [`SandboxLevel`].
+    #[serde(default)]
+    pub sandbox_level: String,
+    /// Why the level is below `sandboxed`, when it is — verbatim from the worker-sandbox probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_note: Option<String>,
 }
 
 impl RepoChecksReport {
     /// The operator-facing denial when `!passed`.
     pub fn denial_reason(&self) -> String {
+        if let Some(e) = &self.detect_error {
+            return format!(
+                "repo checks floor failed: {CRITERION}. The repository's checks could not be \
+                 determined: {e} (fail-closed — an unverifiable manifest is not \"no checks\")."
+            );
+        }
         let failed: Vec<String> = self
             .checks
             .iter()
@@ -195,6 +232,9 @@ impl RepoChecksReport {
 
     /// A one-line account for `GateEvaluated`/logs: `install: exit 0 (31.2s), test: exit 1 (…)`.
     pub fn summary(&self) -> String {
+        if let Some(e) = &self.detect_error {
+            return format!("checks could not be determined: {e}");
+        }
         if self.detected.is_empty() {
             return "no repository checks detected (no package.json scripts among typecheck/lint/\
                     test, no Cargo.toml)"
@@ -227,14 +267,29 @@ fn last_lines(tail: &str) -> String {
     }
 }
 
+/// `lstat` a probe path WITHOUT following links. `Ok(None)` = absent; `Ok(Some(meta))` = present
+/// and not a symlink; `Err` = a symlink (refused — a manifest that points elsewhere is not the
+/// repository's) or an unreadable entry.
+fn probe(worktree: &Path, rel: &str) -> Result<Option<std::fs::Metadata>, String> {
+    let p = worktree.join(rel);
+    match std::fs::symlink_metadata(&p) {
+        Ok(m) if m.file_type().is_symlink() => Err(format!(
+            "`{rel}` is a symlink (the floor never follows links out of the worktree)"
+        )),
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("`{rel}` could not be inspected: {e}")),
+    }
+}
+
 /// Which package manager a Node repo uses, read off its lockfile (npm when none says otherwise).
-fn package_manager(worktree: &Path) -> &'static str {
-    if worktree.join("pnpm-lock.yaml").is_file() {
-        "pnpm"
-    } else if worktree.join("yarn.lock").is_file() {
-        "yarn"
+fn package_manager(worktree: &Path) -> Result<&'static str, String> {
+    if probe(worktree, "pnpm-lock.yaml")?.is_some() {
+        Ok("pnpm")
+    } else if probe(worktree, "yarn.lock")?.is_some() {
+        Ok("yarn")
     } else {
-        "npm"
+        Ok("npm")
     }
 }
 
@@ -243,66 +298,183 @@ fn s(v: &[&str]) -> Vec<String> {
 }
 
 /// Detect the repository's own checks in `worktree`. Pure over the filesystem — runs nothing.
-pub fn detect(worktree: &Path) -> Vec<RepoCheck> {
+/// `Err` when a manifest exists but cannot be trusted (unreadable, malformed, a symlink).
+pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
     let mut out = Vec::new();
-    let pkg = worktree.join("package.json");
-    if let Ok(raw) = std::fs::read_to_string(&pkg) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let scripts = json.get("scripts").and_then(|v| v.as_object());
-            let pm = package_manager(worktree);
-            let wanted: Vec<&str> = ["typecheck", "lint", "test"]
-                .into_iter()
-                .filter(|k| scripts.is_some_and(|m| m.get(*k).and_then(|v| v.as_str()).is_some()))
-                .collect();
-            if !wanted.is_empty() {
-                if !worktree.join("node_modules").is_dir() {
-                    let (argv, source) = match pm {
-                        "pnpm" => (
-                            s(&["pnpm", "install", "--frozen-lockfile"]),
-                            "pnpm-lock.yaml (node_modules absent)",
-                        ),
-                        "yarn" => (
-                            s(&["yarn", "install", "--frozen-lockfile"]),
-                            "yarn.lock (node_modules absent)",
-                        ),
-                        _ if worktree.join("package-lock.json").is_file() => (
-                            s(&["npm", "ci", "--no-audit", "--no-fund"]),
-                            "package-lock.json (node_modules absent)",
-                        ),
-                        _ => (
-                            s(&["npm", "install", "--no-audit", "--no-fund"]),
-                            "package.json (node_modules absent, no lockfile)",
-                        ),
-                    };
-                    out.push(RepoCheck {
-                        name: "install".into(),
-                        argv,
-                        source: source.into(),
-                    });
-                }
-                for k in wanted {
-                    out.push(RepoCheck {
-                        name: k.to_string(),
-                        argv: s(&[pm, "run", k]),
-                        source: format!("package.json scripts.{k}"),
-                    });
-                }
+    if let Some(meta) = probe(worktree, "package.json")? {
+        if !meta.is_file() {
+            return Err("`package.json` is not a regular file".to_string());
+        }
+        let raw = std::fs::read_to_string(worktree.join("package.json"))
+            .map_err(|e| format!("`package.json` could not be read: {e}"))?;
+        let json: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("`package.json` is not valid JSON: {e}"))?;
+        let scripts = match json.get("scripts") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Object(m)) => Some(m),
+            Some(_) => return Err("`package.json` `scripts` is not an object".to_string()),
+        };
+        let pm = package_manager(worktree)?;
+        let wanted: Vec<&str> = ["typecheck", "lint", "test"]
+            .into_iter()
+            .filter(|k| scripts.is_some_and(|m| m.get(*k).and_then(|v| v.as_str()).is_some()))
+            .collect();
+        if !wanted.is_empty() {
+            let node_modules = probe(worktree, "node_modules")?;
+            if node_modules.is_none() {
+                let has_lock = probe(worktree, "package-lock.json")?.is_some();
+                let (argv, source) = match pm {
+                    "pnpm" => (
+                        s(&["pnpm", "install", "--frozen-lockfile", "--ignore-scripts"]),
+                        "pnpm-lock.yaml (node_modules absent)",
+                    ),
+                    "yarn" => (
+                        s(&["yarn", "install", "--frozen-lockfile", "--ignore-scripts"]),
+                        "yarn.lock (node_modules absent)",
+                    ),
+                    _ if has_lock => (
+                        s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
+                        "package-lock.json (node_modules absent)",
+                    ),
+                    _ => (
+                        s(&[
+                            "npm",
+                            "install",
+                            "--ignore-scripts",
+                            "--no-audit",
+                            "--no-fund",
+                        ]),
+                        "package.json (node_modules absent, no lockfile)",
+                    ),
+                };
+                out.push(RepoCheck {
+                    name: "install".into(),
+                    argv,
+                    source: source.into(),
+                });
+            }
+            for k in wanted {
+                out.push(RepoCheck {
+                    name: k.to_string(),
+                    argv: s(&[pm, "run", k]),
+                    source: format!("package.json scripts.{k}"),
+                });
             }
         }
     }
-    if worktree.join("Cargo.toml").is_file() {
+    if let Some(meta) = probe(worktree, "Cargo.toml")? {
+        if !meta.is_file() {
+            return Err("`Cargo.toml` is not a regular file".to_string());
+        }
         out.push(RepoCheck {
             name: "cargo-test".into(),
             argv: s(&["cargo", "test"]),
             source: "Cargo.toml".into(),
         });
     }
-    out
+    Ok(out)
 }
 
-/// Detect and run the checks in `worktree`, stopping at the first failure.
+/// The isolated homes the checks run with, all under the worktree's engine scratch.
+#[derive(Debug)]
+pub(crate) struct CheckScratch {
+    root: PathBuf,
+}
+
+impl CheckScratch {
+    pub(crate) fn prepare(worktree: &Path) -> std::io::Result<Self> {
+        let root = worktree
+            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+            .join(SCRATCH_SUBDIR);
+        for sub in [
+            "home",
+            "npm-cache",
+            "cargo-home",
+            "xdg-config",
+            "xdg-cache",
+            "tmp",
+        ] {
+            std::fs::create_dir_all(root.join(sub))?;
+        }
+        Ok(Self { root })
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    /// Apply the isolation env to a check command. The daemon's environment is inherited through
+    /// the spawn chokepoint (`hardened()` strips every engine-internal variable) and then every
+    /// home-shaped variable is redirected under the scratch, so the check reads none of the
+    /// operator's per-user configuration and writes nothing outside the worktree.
+    fn apply_env(&self, cmd: &mut Command) {
+        let real_home = std::env::var_os("HOME");
+        cmd.env("HOME", self.home())
+            .env("TMPDIR", self.root.join("tmp"))
+            .env("TMP", self.root.join("tmp"))
+            .env("TEMP", self.root.join("tmp"))
+            .env("XDG_CONFIG_HOME", self.root.join("xdg-config"))
+            .env("XDG_CACHE_HOME", self.root.join("xdg-cache"))
+            .env("npm_config_cache", self.root.join("npm-cache"))
+            .env("npm_config_update_notifier", "false")
+            .env("npm_config_fund", "false")
+            .env("npm_config_audit", "false")
+            .env("CARGO_HOME", self.root.join("cargo-home"))
+            .env("CI", "1")
+            .env("NO_COLOR", "1")
+            .env("FORCE_COLOR", "0");
+        // The toolchain proxies (`cargo`, `rustc` under rustup) resolve toolchains through
+        // `RUSTUP_HOME`, which defaults to `$HOME/.rustup`. Moving HOME must not lose them: pin the
+        // real location explicitly when the daemon did not.
+        if std::env::var_os("RUSTUP_HOME").is_none() {
+            if let Some(h) = real_home {
+                let rustup = Path::new(&h).join(".rustup");
+                if rustup.is_dir() {
+                    cmd.env("RUSTUP_HOME", rustup);
+                }
+            }
+        }
+    }
+}
+
+/// Detect and run the checks in `worktree`, stopping at the first failure. Fail-closed on a
+/// detection error (see the module doc).
 pub fn run(worktree: &Path) -> RepoChecksReport {
-    let detected = detect(worktree);
+    let sandbox = crate::validator::detect_worker_sandbox(&[worktree.to_path_buf()]);
+    let sandbox_level = sandbox.level.as_wire().to_string();
+    let sandbox_note = sandbox.downgrade_reason.clone();
+    let detected = match detect(worktree) {
+        Ok(d) => d,
+        Err(e) => {
+            return RepoChecksReport {
+                detected: Vec::new(),
+                checks: Vec::new(),
+                skipped: Vec::new(),
+                passed: false,
+                detect_error: Some(e),
+                sandbox_level,
+                sandbox_note,
+            }
+        }
+    };
+    let scratch = match CheckScratch::prepare(worktree) {
+        Ok(s) => s,
+        Err(e) => {
+            return RepoChecksReport {
+                detected,
+                checks: Vec::new(),
+                skipped: Vec::new(),
+                passed: false,
+                detect_error: Some(format!(
+                    "the checks' isolated scratch under `{}/{SCRATCH_SUBDIR}` could not be \
+                     created: {e}",
+                    crate::worktree_guard::ENGINE_SCRATCH_DIR
+                )),
+                sandbox_level,
+                sandbox_note,
+            }
+        }
+    };
     let mut checks = Vec::new();
     let mut skipped = Vec::new();
     let mut failed = false;
@@ -311,7 +483,7 @@ pub fn run(worktree: &Path) -> RepoChecksReport {
             skipped.push(check.name.clone());
             continue;
         }
-        let run = run_one(worktree, check);
+        let run = run_one(worktree, check, &sandbox, &scratch);
         failed = !run.passed();
         checks.push(run);
     }
@@ -320,6 +492,9 @@ pub fn run(worktree: &Path) -> RepoChecksReport {
         detected,
         checks,
         skipped,
+        detect_error: None,
+        sandbox_level,
+        sandbox_note,
     }
 }
 
@@ -352,8 +527,14 @@ fn lossy(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Run one check in `worktree` under its timeout, capturing exit code + stream tails.
-pub fn run_one(worktree: &Path, check: &RepoCheck) -> CheckRun {
+/// Run one check in `worktree` under its timeout, inside `sandbox`'s write boundary with the
+/// isolated `scratch` homes, capturing exit code + stream tails.
+pub(crate) fn run_one(
+    worktree: &Path,
+    check: &RepoCheck,
+    sandbox: &WorkerSandbox,
+    scratch: &CheckScratch,
+) -> CheckRun {
     let started = Instant::now();
     let mut result = CheckRun {
         name: check.name.clone(),
@@ -377,17 +558,19 @@ pub fn run_one(worktree: &Path, check: &RepoCheck) -> CheckRun {
         result.duration_ms = started.elapsed().as_millis() as u64;
         return result;
     };
+    // `[<sandbox wrapper…>] <exe> <args…>` — an empty wrapper is the disclosed best-effort floor.
+    let mut full: Vec<String> = sandbox.wrapper.clone();
+    full.push(exe.to_string_lossy().into_owned());
+    full.extend(check.argv[1..].iter().cloned());
     // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(&full[0]);
     cmd.hardened()
-        .args(&check.argv[1..])
+        .args(&full[1..])
         .current_dir(worktree)
-        .env("CI", "1")
-        .env("NO_COLOR", "1")
-        .env("FORCE_COLOR", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    scratch.apply_env(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -422,6 +605,8 @@ pub fn run_one(worktree: &Path, check: &RepoCheck) -> CheckRun {
             }
         }
     };
+    // Quiesce: nothing the check backgrounded may keep running (or writing) into the next stage.
+    crate::validator::kill_child_tree(&mut child);
     result.exit_code = status.and_then(|st| st.code());
     result.stdout_tail = out_h
         .and_then(|h| h.join().ok())
@@ -438,7 +623,7 @@ pub fn run_one(worktree: &Path, check: &RepoCheck) -> CheckRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::validator::SandboxLevel;
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -451,8 +636,12 @@ mod tests {
         dir
     }
 
+    fn sandbox_for(wt: &Path) -> WorkerSandbox {
+        crate::validator::detect_worker_sandbox(&[wt.to_path_buf()])
+    }
+
     #[test]
-    fn detects_node_scripts_with_install_when_node_modules_is_absent() {
+    fn detects_node_scripts_with_an_ignore_scripts_install_when_node_modules_is_absent() {
         let wt = scratch("detect-node");
         std::fs::write(
             wt.join("package.json"),
@@ -460,24 +649,29 @@ mod tests {
         )
         .unwrap();
         std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
-        let names: Vec<(String, Vec<String>)> =
-            detect(&wt).into_iter().map(|c| (c.name, c.argv)).collect();
+        let names: Vec<(String, Vec<String>)> = detect(&wt)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.name, c.argv))
+            .collect();
         assert_eq!(
             names,
             vec![
                 (
                     "install".to_string(),
-                    s(&["npm", "ci", "--no-audit", "--no-fund"])
+                    s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"])
                 ),
                 ("typecheck".to_string(), s(&["npm", "run", "typecheck"])),
                 ("test".to_string(), s(&["npm", "run", "test"])),
             ],
-            "install first (lockfile ⇒ ci), then typecheck/lint/test in that order, only those present"
+            "install first (lockfile ⇒ ci, lifecycle scripts NEVER run), then typecheck/lint/test \
+             in that order, only those present"
         );
         // node_modules present ⇒ no install step.
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
         assert_eq!(
             detect(&wt)
+                .unwrap()
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
@@ -496,21 +690,78 @@ mod tests {
         std::fs::write(wt.join("pnpm-lock.yaml"), "").unwrap();
         std::fs::create_dir_all(wt.join("node_modules")).unwrap();
         std::fs::write(wt.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
-        let checks = detect(&wt);
+        let checks = detect(&wt).unwrap();
         assert_eq!(checks[0].argv, s(&["pnpm", "run", "lint"]));
         assert_eq!(checks[1].name, "cargo-test");
         assert_eq!(checks[1].argv, s(&["cargo", "test"]));
         // No manifests at all ⇒ nothing detected, and a run of it is a vacuous pass that SAYS so.
         let empty = scratch("detect-empty");
-        assert!(detect(&empty).is_empty());
+        assert!(detect(&empty).unwrap().is_empty());
         let report = run(&empty);
-        assert!(report.passed && report.checks.is_empty());
+        assert!(report.passed && report.checks.is_empty() && report.detect_error.is_none());
         assert!(report.summary().contains("no repository checks detected"));
+        assert!(
+            !report.sandbox_level.is_empty(),
+            "the containment level is always disclosed"
+        );
+    }
+
+    /// Codex review on #414: an unreadable or malformed manifest, or a probe that is a symlink,
+    /// is NOT "no checks" — the floor FAILS with the reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_malformed_or_symlinked_manifest_fails_the_floor_by_name() {
+        let wt = scratch("detect-bad");
+        std::fs::write(wt.join("package.json"), "not a manifest").unwrap();
+        let err = detect(&wt).expect_err("malformed package.json must not read as no checks");
+        assert!(err.contains("not valid JSON"), "{err}");
+        let report = run(&wt);
+        assert!(!report.passed && report.checks.is_empty());
+        assert!(
+            report.denial_reason().contains("not valid JSON")
+                && report.denial_reason().contains("fail-closed"),
+            "{}",
+            report.denial_reason()
+        );
+
+        // `scripts` of the wrong shape.
+        std::fs::write(wt.join("package.json"), r#"{"scripts":"nope"}"#).unwrap();
+        assert!(detect(&wt)
+            .expect_err("scripts must be an object")
+            .contains("not an object"));
+
+        // A symlinked manifest / lockfile / node_modules is refused, never followed.
+        let outside = scratch("detect-outside");
+        std::fs::write(
+            outside.join("package.json"),
+            r#"{"scripts":{"test":"true"}}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(wt.join("package.json")).unwrap();
+        std::os::unix::fs::symlink(outside.join("package.json"), wt.join("package.json")).unwrap();
+        let err = detect(&wt).expect_err("a symlinked manifest is refused");
+        assert!(
+            err.contains("symlink") && err.contains("package.json"),
+            "{err}"
+        );
+        std::fs::remove_file(wt.join("package.json")).unwrap();
+        std::fs::write(wt.join("package.json"), r#"{"scripts":{"test":"true"}}"#).unwrap();
+        std::os::unix::fs::symlink(&outside, wt.join("node_modules")).unwrap();
+        let err = detect(&wt).expect_err("a symlinked node_modules is refused");
+        assert!(err.contains("node_modules"), "{err}");
+        std::fs::remove_file(wt.join("node_modules")).unwrap();
+        std::fs::write(wt.join("Cargo.toml"), "").unwrap();
+        std::fs::remove_file(wt.join("Cargo.toml")).unwrap();
+        std::os::unix::fs::symlink(outside.join("package.json"), wt.join("Cargo.toml")).unwrap();
+        assert!(detect(&wt)
+            .expect_err("a symlinked Cargo.toml is refused")
+            .contains("Cargo.toml"));
     }
 
     /// The brief's test, in the medium every `cargo test` host has: a fixture crate whose one test
     /// fails. The floor must capture the non-zero exit AND the assertion text in the tail, and
-    /// report the failure as a denial.
+    /// report the failure as a denial — running with the isolated `CARGO_HOME`/`HOME` and inside
+    /// whatever OS boundary the host offers.
     #[test]
     fn captures_a_failing_cargo_test_as_evidence_and_denies() {
         let wt = scratch("cargo-fail");
@@ -526,15 +777,7 @@ mod tests {
              \"BOOM the floor must see this\");\n    }\n}\n",
         )
         .unwrap();
-        // Keep the fixture's build artifacts under the fixture, not the developer's target dir.
-        // (`CARGO_TARGET_DIR` is inherited through the spawn chokepoint; it is not engine-internal.)
-        let prior = std::env::var_os("CARGO_TARGET_DIR");
-        std::env::set_var("CARGO_TARGET_DIR", wt.join("target"));
         let report = run(&wt);
-        match prior {
-            Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
-            None => std::env::remove_var("CARGO_TARGET_DIR"),
-        }
         assert!(
             !report.passed,
             "a failing test must fail the floor: {report:?}"
@@ -543,8 +786,10 @@ mod tests {
         assert_eq!(c.name, "cargo-test");
         assert!(
             c.exit_code.is_some_and(|e| e != 0),
-            "the non-zero exit is captured: {:?}",
-            c.exit_code
+            "the non-zero exit is captured: {:?} ({} / {})",
+            c.exit_code,
+            c.stdout_tail,
+            c.stderr_tail
         );
         assert!(!c.timed_out && c.spawn_error.is_none());
         let combined = format!("{}\n{}", c.stdout_tail, c.stderr_tail);
@@ -557,6 +802,12 @@ mod tests {
             denial.contains("cargo-test: exit") && denial.contains(CRITERION),
             "the denial names the check and the criterion: {denial}"
         );
+        // The isolated homes exist under the engine scratch, never elsewhere.
+        assert!(wt
+            .join(crate::worktree_guard::ENGINE_SCRATCH_DIR)
+            .join(SCRATCH_SUBDIR)
+            .join("cargo-home")
+            .is_dir());
     }
 
     /// The brief's literal case — a failing `npm test`. Runs where npm is on PATH (every hosted
@@ -584,14 +835,94 @@ mod tests {
         assert_eq!(
             c.exit_code,
             Some(3),
-            "npm propagates the script's exit code"
+            "npm propagates the script's exit code ({} / {})",
+            c.stdout_tail,
+            c.stderr_tail
         );
         assert!(c.stdout_tail.contains("NPM BOOM"), "{}", c.stdout_tail);
+    }
+
+    /// Codex review on #414: a check is repo-controlled code and runs INSIDE the OS write boundary —
+    /// a script that writes outside the worktree fails, and the write never lands. Exercised
+    /// wherever the host has a write-containing sandbox tool (`sandbox-exec` / `bwrap`); a host
+    /// without one is the disclosed best-effort floor and is not a kernel claim to test.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_that_writes_outside_the_worktree_fails_the_floor() {
+        let base = scratch("contain");
+        let wt = base.join("wt");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let sandbox = sandbox_for(&wt);
+        if sandbox.level != SandboxLevel::Sandboxed {
+            eprintln!(
+                "repo_checks: no write-containing sandbox on this host ({}) — containment cannot \
+                 be exercised here",
+                sandbox.downgrade_reason.as_deref().unwrap_or("?")
+            );
+            return;
+        }
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        // Premise: an INSIDE write under the same wrapper works (bwrap present but unusable — no
+        // user namespaces — is an environmental skip, never a false kernel claim).
+        let inside = RepoCheck {
+            name: "test".into(),
+            argv: s(&[
+                "sh",
+                "-c",
+                "printf y > \"$1\"",
+                "_",
+                &wt.join("ok").to_string_lossy(),
+            ]),
+            source: "fixture".into(),
+        };
+        if !run_one(&wt, &inside, &sandbox, &scratch).passed() {
+            eprintln!("repo_checks: the sandbox wrapper cannot run on this host — skipping");
+            return;
+        }
+        let pwned = outside.join("pwned");
+        let escaping = RepoCheck {
+            name: "test".into(),
+            argv: s(&[
+                "sh",
+                "-c",
+                "printf x > \"$1\"",
+                "_",
+                &pwned.to_string_lossy(),
+            ]),
+            source: "fixture".into(),
+        };
+        let r = run_one(&wt, &escaping, &sandbox, &scratch);
+        assert!(!r.passed(), "an outside write must fail the check: {r:?}");
+        assert!(!pwned.exists(), "the outside write must never land on disk");
+        assert!(
+            r.stderr_tail.contains("Permission denied")
+                || r.stderr_tail.contains("Operation not permitted"),
+            "the check observed the OS denial: {}",
+            r.stderr_tail
+        );
+        // And the operator's real HOME is not the check's HOME.
+        let home_probe = RepoCheck {
+            name: "test".into(),
+            argv: s(&["sh", "-c", "printf %s \"$HOME\""]),
+            source: "fixture".into(),
+        };
+        let r = run_one(&wt, &home_probe, &sandbox, &scratch);
+        assert!(r.passed());
+        assert!(
+            r.stdout_tail
+                .starts_with(&scratch.home().to_string_lossy().to_string()),
+            "HOME is the isolated scratch home, got {}",
+            r.stdout_tail
+        );
     }
 
     #[test]
     fn stops_at_the_first_failure_and_lists_what_it_skipped() {
         let wt = scratch("stop");
+        let sandbox = sandbox_for(&wt);
+        let scratch = CheckScratch::prepare(&wt).unwrap();
         // A check that cannot even spawn fails the floor and skips everything after it.
         let checks = vec![
             RepoCheck {
@@ -613,7 +944,7 @@ mod tests {
                 skipped.push(c.name.clone());
                 continue;
             }
-            let r = run_one(&wt, c);
+            let r = run_one(&wt, c, &sandbox, &scratch);
             failed = !r.passed();
             runs.push(r);
         }
@@ -628,6 +959,9 @@ mod tests {
             checks: runs,
             skipped,
             passed: false,
+            detect_error: None,
+            sandbox_level: sandbox.level.as_wire().to_string(),
+            sandbox_note: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -651,7 +985,9 @@ mod tests {
             eprintln!("repo_checks: sh not on PATH — skipping the bounded-tail check");
             return;
         }
-        let r = run_one(&wt, &echo);
+        let sandbox = sandbox_for(&wt);
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        let r = run_one(&wt, &echo, &sandbox, &scratch);
         assert!(r.passed(), "{r:?}");
         assert!(
             r.stdout_tail.len() <= TAIL_BYTES,

@@ -24,67 +24,96 @@ Two release tracks share this file, newest entry first regardless of track:
   - **Worktree guard** (`worktree_guard`): for a def-driven, agent-executed unit whose phase declared
     `executes_code: false` (`WorkUnit.worktree_guarded`, plan-derived like `pre_build_scope`), the
     actor snapshots the worktree at dispatch — git TREE HASH over tracked + untracked-not-ignored
-    content via a scratch copy of the index (the real index, refs and worktree are never touched)
-    plus `HEAD` — and persists it ON the unit (`worktree_baseline`, restart-durable). When the
-    seat's work ends the worker thread re-snapshots and compares; any non-exempt path that differs,
-    or a moved `HEAD`, DENIES the unit at the gate fold (deny-dominates, source `worktree_guard`,
-    judged BEFORE the pinned diff floor that would otherwise pass a rewritten tree) and emits the
-    new `evaluatorMutatedWorktree` event (`session, ord, attempt, cli, phase, beforeTree,
-    afterTree, headMoved, changed[{status,path}], exempted[…]`). Exempt — recorded, never denied:
-    the phase's `required_deliverables`, the engine scratch `tmp/` and `.codegraph/`, and
-    documentation paths (the same predicate the pre-build scope gate uses). Fail-closed: a guarded
-    unit whose outcome is missing or unverifiable is denied, never assumed clean. The guard denies;
-    it does not revert — the denial names the paths, both tree ids and the one-line `git read-tree
-    --reset -u <before>` restore. A human APPROVING a mutation-denied gate re-baselines the
-    re-dispatch; a restart-driven redrive keeps the persisted baseline. Tool units and
-    prose-planned runs are never guarded.
-  - **Read-only posture for no-code phases on non-claude seats** (`execute_wrapped::no_code_posture`,
-    the crew#427 posture path): codex runs `--sandbox read-only` (every sandbox spelling rewritten,
-    the bypass dropped, one appended when none was declared); pi gets `--exclude-tools edit,write`
-    (merged into an existing denylist). A seat with NO lever whose resolved posture explicitly
-    grants writes (`--allow-all-tools`, `--allow-all`, `--dangerously-skip-permissions`,
-    `--dangerously-bypass-approvals-and-sandbox`, `--yolo`, `--auto`) has the launch REFUSED
-    before any process spawns (`read-only posture refused the launch: …`, naming the token, seat
-    and clis.toml remedy); a lever-less seat with a bare posture runs, and the existing
-    `governanceUnenforced` reason says the worktree guard — not the posture — is what holds the
-    line. The governed carriers gain the matching **NO-CODE phase scope**: `WICKED_NO_CODE_SCOPE`
-    on the hook subprocess, `BoundaryCtx::no_code_scope` on the ACP carrier — `Write`/`Edit`/
-    `NotebookEdit` to a non-documentation path is refused up front for ANY `executes_code: false`
-    phase (the pre-build scope covered only the ladder before the first code phase).
+    content via a scratch copy of the index (the real index, refs and worktree are never touched;
+    the engine's own `tmp/` scratch is excluded by construction through `core.excludesFile`) plus
+    `HEAD` — and persists it ON the unit (`worktree_baseline`, restart-durable). The FINAL
+    comparison is taken after everything the phase owned has run — the seat's process group killed
+    on exit (the wrapped runner now spawns the seat in its own group and `killpg`s it when it
+    exits, is cancelled or times out), the agent judge rendered, the repo checks run — immediately
+    before the result is posted to the gate fold, so a delayed write from a backgrounded process or
+    a "passing" check script that edits a tracked file is caught too. Any non-exempt path that
+    differs, or a moved `HEAD`, DENIES the unit (deny-dominates, source `worktree_guard`, judged
+    BEFORE the pinned diff floor that would otherwise pass a rewritten tree) and emits the new
+    `evaluatorMutatedWorktree` event (`session, ord, attempt, cli, phase, beforeTree, afterTree,
+    headMoved, changed[{status,path}], exempted[…]`). The ONE exemption is the phase's own declared
+    `required_deliverables` (`domain-extraction/coverage` writes `coverage-report.json` at the
+    worktree root and its pinned validator reads it there) — disclosed on the event, never denied;
+    there is no documentation and no in-tree-graph exemption. Fail-closed: a guarded unit whose
+    outcome is missing or unverifiable is denied, never assumed clean. The guard denies; it does not
+    revert — the denial names the paths, both tree ids and the one-line `git read-tree --reset -u
+    <before>` restore. A human APPROVING a mutation-denied gate re-baselines the re-dispatch; a
+    restart-driven redrive keeps the persisted baseline. Tool units and prose-planned runs are never
+    guarded.
+  - **Read-only posture for no-code phases on non-claude seats** — ONE launch boundary for every
+    argv-building carrier (`execute_wrapped::apply_no_code_posture`: the wrapped one-shot runner
+    AND the persistent PTY session runner), applied to the template's own tokens and the seat's
+    resolved posture. Seats are recognised by registry key OR by the binary's normalised file stem
+    (`/opt/homebrew/bin/codex`, `codex.exe`, an alias key): codex runs `--sandbox read-only`
+    (every sandbox spelling rewritten, the bypass and `--full-auto` dropped, one appended when none
+    was declared); pi gets `--exclude-tools edit,write` (merged into an existing denylist). A
+    lever-less seat whose template or posture carries ANY recognised write grant
+    (`--allow-all-tools`, `--allow-all`, `--dangerously-skip-permissions`,
+    `--dangerously-bypass-approvals-and-sandbox`, `--full-auto`, `--yolo`, `--auto`,
+    `--approve-all`, or codex's `--sandbox workspace-write`/`danger-full-access` spellings on an
+    unrecognised seat) has the launch REFUSED before any process spawns or PTY opens (`read-only
+    posture refused the launch: …`, naming the token, seat and clis.toml remedy); a lever-less seat
+    with a bare posture runs, and the existing `governanceUnenforced` reason says the worktree
+    guard — not the posture — is what holds the line. The governed carriers gain the matching
+    **NO-CODE phase scope**: `WICKED_NO_CODE_SCOPE` (+ `WICKED_NO_CODE_DELIVERABLES`) on the hook
+    subprocess, `BoundaryCtx::{no_code_scope, no_code_deliverables}` on the ACP carrier —
+    `Write`/`Edit`/`NotebookEdit` to anything but a declared deliverable is refused up front for
+    ANY `executes_code: false` phase (the pre-build scope keeps its documentation allowance; the
+    no-code scope has none, matching the guard).
   - **The code-writing Creator's gate evaluates something** (`bug/fix`, `feature/build`,
     `migration/execute` — compiled defs and the shipped `workflows/*.json`): each now pins the
     built-in evidence floor, so layer 1 re-derives the diff and layer 2 has a seat DISTINCT from
-    the creator judge it (`evaluator_distinct`). Registration ARMS an `executes_code` agent phase
-    that has no `validator_pin` and no `human_confirm` gate with the same floor, loudly ("phase
-    `fix` declares executes_code but pins no validator and has no human gate — its gate would
-    evaluate NOTHING (F-039). PINNING the built-in evidence floor…") — after `carry_shadowed_pins`
-    and `enforce_verified_evidence` have run; `workflow::ungated_code_phases(&def)` is the pure
-    lint a consumer can run first. Arming rather than refusing is deliberate: wicked-crew composes
-    per-run defs under fresh ids (`feature-pr`, …) from a mirror of the shipped defs, and a refusal
-    would fail every default code-work launch on an engine upgrade until the mirror caught up. Tool
-    phases are exempt (their exit code is their gate).
+    the creator judge it. Registration REFUSES an `executes_code` agent phase with no
+    `validator_pin` and no `human_confirm` gate — `WorkflowDefError::GateEvaluatesNothing`, "gate
+    evaluates nothing: fix — … pin the built-in evidence floor (…), a phase-specific validator, or
+    gate the phase with human_confirm" — after `carry_shadowed_pins` and `enforce_verified_evidence`
+    have run, so a stale same-id overlay copy that dropped a shipped pin is repaired by the shadow
+    rule, and only a def that never had a gate is refused. `workflow::ungated_code_phases(&def)`
+    is the pure lint a consumer runs first. Tool phases are exempt (their exit code is their gate).
+    **Coupling to note:** wicked-crew composes per-run defs (`feature-pr`, …) from a mirror of the
+    shipped defs — a mirror without these pins is refused at registration until the crew release
+    that carries them (wicked-crew#507) is deployed alongside this engine.
   - **Repo checks floor** (`repo_checks`): for the def's code-VERIFYING unit (`verified_evidence`
     with an `executes_code` Creator upstream — `bug/verify`, `feature/test`, `migration/verify`;
     `WorkUnit.repo_checks_floor`), the engine runs the repository's OWN checks in the worktree
     after the seat's work, off the actor thread: `package.json` `typecheck`/`lint`/`test` scripts
-    (those present, in that order, via the lockfile's package manager, `npm ci`/`install` first
-    when `node_modules/` is absent) and `Cargo.toml` → `cargo test`; each under a 20-minute bound
-    (15 for install), `CI=1`, colour off, own process group. Exit code, duration and 4 KiB
-    stdout/stderr TAILS ride the new `repoChecksEvaluated` event (`session, ord, attempt, passed,
-    criterion, checks[{name, argv, source, exitCode, timedOut, spawnError, durationMs, stdoutTail,
+    (those present, in that order, via the lockfile's package manager; `npm ci`/`install` first
+    when `node_modules/` is absent — ALWAYS `--ignore-scripts`) and `Cargo.toml` → `cargo test`;
+    each under a 20-minute bound (15 for install), own process group, killed on exit. The checks are
+    repo-controlled code and run CONTAINED: inside the worker OS write boundary
+    (`validator::detect_worker_sandbox` — macOS `sandbox-exec` / Linux `bwrap`, writes confined to
+    the worktree, secret dirs unreadable, network open) with an isolated `HOME`, `npm_config_cache`,
+    `CARGO_HOME` and `XDG_*` under `<worktree>/tmp/wicked-checks/` (`RUSTUP_HOME` preserved); a
+    host without a sandbox tool runs with the env isolation alone and SAYS SO (`sandbox_level:
+    "best-effort"` + the reason on the report). Detection is fail-closed: an unreadable or malformed
+    `package.json`, or a symlinked manifest/lockfile/`node_modules` (probed with `lstat`, never
+    followed), FAILS the floor with the reason — only a repo with no manifest at all is a disclosed
+    vacuous pass (`checks: []`, `passed: true`). Exit code, duration and 4 KiB stdout/stderr TAILS
+    ride the new `repoChecksEvaluated` event (`session, ord, attempt, passed, criterion,
+    checks[{name, argv, source, exitCode, timedOut, spawnError, durationMs, stdoutTail,
     stderrTail}], skipped`) and the unit record (`repo_checks`); a non-zero exit, timeout or
-    unspawnable command DENIES (source `repo_checks`), stopping at the first failure. Nothing
-    detected ⇒ `checks: []`, `passed: true`, disclosed as such. `gateEvaluated.hasDeterministicFloor`
-    is now true when EITHER instrument ran and `criterion` names both (`; `-joined);
-    `deterministicPass` covers both. Checks are not run over a tree the guard already caught being
-    rewritten. `Command::ApplyStepResult` and the bus `task.completed` payload carry the new
-    `UnitEvidence {worktree_guard, repo_checks}` (serde-default; a pre-evidence payload folds a
-    GUARDED unit closed). Tests: an evaluator whose fake seat edits a file is denied with the
-    path listed and the event emitted (real repo + worktree, through the actor); a code phase with
-    no pin is armed at registration; the floor captures a failing `cargo test` (exit 101 + the
-    assertion text in the tail) and a failing `npm test` (exit 3); the codex argv for a no-code
-    phase is `--sandbox read-only`; a write-capable lever-less seat is refused before launch.
-  `wicked-core-ts` pins both new wire shapes and documents them in `CoreEventJson`.
+    unspawnable command DENIES (source `repo_checks`), stopping at the first failure.
+    `gateEvaluated.hasDeterministicFloor` is now true when EITHER instrument ran and `criterion`
+    names both (`; `-joined); `deterministicPass` covers both. Checks are not run over a tree the
+    guard's first look already caught being rewritten. `Command::ApplyStepResult` and the bus
+    `task.completed` payload carry the new `UnitEvidence {worktree_guard, repo_checks}`
+    (serde-default; a pre-evidence payload folds a GUARDED unit closed).
+  Tests: an evaluator whose fake seat edits a file is denied with the path listed and the event
+  emitted (real repo + worktree, through the actor); a PASSING `npm test` that appends to a tracked
+  file is caught by the final comparison; a backgrounded writer dies with the seat's process group;
+  a code phase with no pin is refused at registration ("gate evaluates nothing: fix"); the floor
+  captures a failing `cargo test` (exit 101 + the assertion text in the tail) and a failing `npm
+  test` (exit 3); a check that writes outside the worktree fails the floor and never lands (where
+  the host has a sandbox tool); a malformed or symlinked manifest fails the floor by name; the
+  codex argv for a no-code phase is `--sandbox read-only` by key, alias and absolute path, on both
+  carriers; a write-capable lever-less seat is refused before launch on both carriers.
+  `wicked-core-ts` pins both new wire shapes and documents them in `CoreEventJson`; its
+  `package-lock.json` now pins the five platform packages to the published 0.7.17 artifacts
+  (`npm ci` on current npm refuses lock entries without a version — the types-test step).
 - **Seat selection honours skill portability (#401)** — distribution narrows a unit's candidate
   seats to what its skills admit BEFORE the council votes: a unit whose `skill_ref` (or a
   transitive mandate) is `portable: false` in the handed snapshot — or whose root is the

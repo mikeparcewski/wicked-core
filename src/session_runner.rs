@@ -160,7 +160,11 @@ impl PersistentStepRunner {
     /// reloaded registry and name another binary). Like the wrapped-CLI argv but without
     /// `-p`/`--print`: the process stays alive and reads successive prompts from stdin.
     /// `--output-format stream-json --verbose` is injected for claude so its output is parseable.
-    fn session_argv(invocation: &str, input: &StepInput) -> Vec<String> {
+    /// `Err` is a refused launch (F-036): a NO-CODE unit on a lever-less non-claude seat whose
+    /// template grants writes — the same boundary the wrapped runner applies
+    /// (`execute_wrapped::apply_no_code_posture`), so no carrier can launch an evaluator with a
+    /// write-capable posture.
+    fn session_argv(invocation: &str, input: &StepInput) -> Result<Vec<String>, String> {
         // Build argv without a real prompt — the placeholder expands to an empty string and the
         // trailing `--` + empty arg are stripped below.
         let mut argv = build_argv(invocation, "", &input.unit.allowed_skills);
@@ -173,8 +177,24 @@ impl PersistentStepRunner {
             argv.retain(|a| a != "-p" && a != "--print");
             // Inject stream-json (skipped when the template already carries --output-format).
             inject_claude_stream_flags(&mut argv);
+        } else if crate::worktree_guard::applies_to(&input.unit) {
+            // F-036: a NO-CODE phase on a non-claude seat crosses the shared launch boundary —
+            // the template's tokens are rewritten to the seat's read-only lever (codex
+            // `--sandbox read-only`, pi `--exclude-tools edit,write`), a write grant on a
+            // lever-less seat refuses the launch. This carrier resolves no `trust_flags`, so the
+            // template is the whole posture here.
+            let cli_key = input.unit.assigned_cli.as_deref().unwrap_or("claude");
+            let lever =
+                crate::execute_wrapped::apply_no_code_posture(cli_key, &mut argv, Vec::new())?;
+            eprintln!(
+                "wicked-core: unit {} (phase `{}`, executes_code:false) opens a persistent \
+                 session on '{cli_key}' with the read-only posture {} (F-036)",
+                input.unit.ord,
+                input.unit.phase_id().unwrap_or("?"),
+                lever.describe()
+            );
         }
-        argv
+        Ok(argv)
     }
 }
 
@@ -297,7 +317,15 @@ impl PersistentStepRunner {
                     .workdir
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let cmd = Self::session_argv(&invocation, input);
+                let cmd = match Self::session_argv(&invocation, input) {
+                    Ok(cmd) => cmd,
+                    Err(why) => {
+                        return failed_output(
+                            input,
+                            format!("read-only posture refused the launch: {why}"),
+                        )
+                    }
+                };
                 // Subscribe BEFORE open so we catch the TerminalOpened event.
                 let pre = self.subscribe();
                 let tid = match self.open_terminal(cwd, cmd) {
@@ -862,6 +890,66 @@ mod tests {
         // Explicit teardown — closes the PTY cleanly.
         runner.drop_session("run-shared-session");
         wait_for(&events, |e| matches!(e, CoreEvent::TerminalExited { .. }));
+    }
+
+    /// F-036 (codex review on #414): the persistent PTY carrier crosses the SAME no-code launch
+    /// boundary as the wrapped runner — a codex-keyed `executes_code: false` unit opens its session
+    /// with `--sandbox read-only` (the template's own tokens rewritten, the lever appended once),
+    /// and a lever-less seat whose template grants writes is refused before any PTY opens.
+    #[test]
+    fn a_no_code_unit_opens_its_pty_session_read_only_and_a_write_grant_is_refused() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // codex, by key: the template carries the bounded posture; the session argv is read-only.
+        let mut unit = make_unit("verify the fix", "codex --sandbox workspace-write");
+        unit.assigned_cli = Some("codex".to_string());
+        unit.worktree_guarded = true;
+        let input = make_input("run-ro", 0, unit);
+        let argv = PersistentStepRunner::session_argv("codex --sandbox workspace-write", &input)
+            .expect("codex has a lever");
+        assert_eq!(argv, s(&["codex", "--sandbox", "read-only"]));
+        // codex by BINARY STEM under an alias key, no sandbox in the template: the lever is appended.
+        let mut unit = make_unit("verify the fix", "/opt/tools/codex.exe exec");
+        unit.assigned_cli = Some("reviewer".to_string());
+        unit.worktree_guarded = true;
+        let input = make_input("run-ro-alias", 0, unit);
+        let argv = PersistentStepRunner::session_argv("/opt/tools/codex.exe exec", &input).unwrap();
+        assert_eq!(
+            argv,
+            s(&["/opt/tools/codex.exe", "exec", "--sandbox", "read-only"])
+        );
+        // A CODE phase is untouched — the guard reads the def, never guesses.
+        let mut unit = make_unit("build it", "codex --sandbox workspace-write");
+        unit.assigned_cli = Some("codex".to_string());
+        let input = make_input("run-code", 0, unit);
+        assert_eq!(
+            PersistentStepRunner::session_argv("codex --sandbox workspace-write", &input).unwrap(),
+            s(&["codex", "--sandbox", "workspace-write"])
+        );
+        // A lever-less seat whose TEMPLATE grants writes: refused before any PTY opens.
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _embedder = EmbedderPin::hash();
+        let (core, runner) = crate::Core::spawn_with_pty_sessions(unique_db());
+        let events = core.subscribe();
+        let mut unit = make_unit("verify the fix", "copilot --allow-all-tools -p");
+        unit.assigned_cli = Some("copilot".to_string());
+        unit.worktree_guarded = true;
+        let input = make_input("run-refused", 0, unit);
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+        assert!(
+            out.output.contains("read-only posture refused the launch")
+                && out.output.contains("--allow-all-tools"),
+            "{}",
+            out.output
+        );
+        while let Ok(ev) = events.try_recv() {
+            assert!(
+                !matches!(ev, CoreEvent::TerminalOpened { .. }),
+                "a refused launch must open no PTY"
+            );
+        }
     }
 
     /// core#396 (codex round 8, ADJUDICATED): the persistent PTY carrier does not load the skills

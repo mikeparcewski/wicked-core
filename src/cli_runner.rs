@@ -674,11 +674,14 @@ fn run_unit_and_judge_with_roster(
     crate::workflow::UnitEvidence,
 ) {
     let output = runner.run_unit_streaming(input, emit_delta);
-    // F-036 WORKTREE GUARD — compared IMMEDIATELY after the seat's own work and before anything
-    // else touches the tree (the judge seat below, the repo checks after it), so every path the
-    // comparison names is the seat's doing and nothing else's. Only for a unit that folded Ok:
-    // a failed unit fails on its own account and never reaches the gate this feeds.
-    let worktree_guard = if output.status == StepStatus::Ok {
+    // F-036 WORKTREE GUARD, first look — taken right after the seat's own work so the repo checks
+    // below are never run over a tree the seat already rewrote (they would certify the wrong
+    // code). This is NOT the outcome the gate sees: the FINAL comparison is taken at the very end
+    // of this function, after the judge and the checks, so a write that lands after the seat
+    // returns (a backgrounded process, a "passing" check script that edits a tracked file) is
+    // caught too (codex review on #414). Only for a unit that folded Ok: a failed unit fails on
+    // its own account and never reaches the gate this feeds.
+    let guard_first_look = if output.status == StepStatus::Ok {
         crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
     } else {
         None
@@ -763,10 +766,10 @@ fn run_unit_and_judge_with_roster(
     // guard already caught the seat rewriting the tree (checks over a rewritten tree would
     // certify the wrong code, and the gate denies on the mutation regardless).
     let guard_denies = matches!(
-        &worktree_guard,
+        &guard_first_look,
         Some(crate::worktree_guard::WorktreeGuardOutcome::Mutated(m)) if m.denies()
     ) || matches!(
-        &worktree_guard,
+        &guard_first_look,
         Some(crate::worktree_guard::WorktreeGuardOutcome::Unverifiable(_))
     );
     let repo_checks = match input.workdir.as_deref() {
@@ -792,6 +795,16 @@ fn run_unit_and_judge_with_roster(
             Some(report)
         }
         _ => None,
+    };
+    // F-036 WORKTREE GUARD, the FINAL comparison — the last thing this thread does before the
+    // result is posted to the gate fold. Everything the phase owned has run and been quiesced by
+    // now (the seat's process group is killed when it exits; each check's group likewise), so
+    // this is the tree the gate is actually judging. The first look above only decided whether
+    // the checks were worth running; the fold sees THIS.
+    let worktree_guard = if output.status == StepStatus::Ok {
+        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
+    } else {
+        None
     };
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,

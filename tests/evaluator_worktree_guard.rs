@@ -172,7 +172,10 @@ fn make_git_repo(name: &str, cargo_test: Option<bool>) -> PathBuf {
              \"REPO CHECK BOOM\");\n    }\n}\n"
         };
         std::fs::write(repo.join("src/lib.rs"), body).unwrap();
-        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        // `cargo test` writes `target/` AND generates `Cargo.lock` in a fixture that ships none.
+        // Both are ignored, as a library crate's `.gitignore` would — anything else the check
+        // wrote would (correctly) trip the worktree guard's FINAL comparison.
+        std::fs::write(repo.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
     }
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-qm", "init"]);
@@ -476,6 +479,70 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
             .any(|ev| matches!(ev, CoreEvent::EvaluatorMutatedWorktree { .. })),
         "a clean evaluator produces no mutation event"
     );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Codex review on #414: a "passing" check script that EDITS a tracked file. The evaluator leaves
+/// the tree alone and the repo checks exit 0 — yet the gate must DENY on the worktree guard,
+/// because the FINAL comparison is taken after the checks ran, not right after the seat returned.
+/// Needs `npm` on PATH (every hosted CI runner; developer machines) — otherwise says so.
+#[test]
+fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
+    if Command::new("npm").arg("--version").output().is_err() {
+        eprintln!("npm not on PATH — the mutating-check test cannot run here");
+        return;
+    }
+    let repo = make_git_repo("mutating-check", None);
+    // A `test` script that passes while appending to a tracked source file; node_modules present
+    // so the floor installs nothing (no network).
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"name":"mutating-check","version":"0.0.0","scripts":{"test":"node -e \"require('fs').appendFileSync('src/app.ts','// touched by the test script\\n')\""}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("node_modules")).unwrap();
+    std::fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "add a mutating test script"]);
+
+    let (core, _ran) = core_for("mutating-check", VerifyBehaviour::LeavesTreeAlone);
+    let entry = core
+        .register_repo(RepoSpec {
+            name: "mutating-check".into(),
+            root_path: repo.to_str().unwrap().into(),
+            registered_at: 1,
+        })
+        .expect("register");
+    let events = core.subscribe();
+    core.launch_run(bug_run("r-mutating", &entry.id))
+        .expect("launch");
+    assert!(
+        wait_status(&core, "r-mutating", SessionStatus::AwaitingHuman),
+        "a check that edits the tree must not certify it"
+    );
+    let evs = drain(&events);
+    let verify = gate_for(&evs, 4);
+    assert!(!verify.combined);
+    assert_eq!(
+        verify.denial_source.as_deref(),
+        Some("worktree_guard"),
+        "the FINAL comparison caught the check's write: {:?}",
+        verify.denial_reason
+    );
+    assert!(
+        verify
+            .denial_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("M src/app.ts")),
+        "{:?}",
+        verify.denial_reason
+    );
+    // The checks themselves PASSED and were recorded — the passing script is exactly the trap.
+    let checks_passed = evs.iter().find_map(|ev| match ev {
+        CoreEvent::RepoChecksEvaluated { ord: 4, passed, .. } => Some(*passed),
+        _ => None,
+    });
+    assert_eq!(checks_passed, Some(true), "the mutating check exited 0");
     let _ = std::fs::remove_dir_all(&repo);
 }
 

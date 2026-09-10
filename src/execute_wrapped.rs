@@ -1253,13 +1253,15 @@ impl WrappedCliStepRunner {
             let posture = resolve_seat_posture(&cli_key);
             // F-036: a unit whose phase declared `executes_code: false` (an evaluator, a recon
             // rung, a review) runs with a READ-ONLY tool posture where this seat has a lever —
-            // codex `--sandbox read-only`, pi `--exclude-tools edit,write` — and is REFUSED when
-            // the seat has no lever AND its resolved posture explicitly grants writes. A seat with
+            // codex `--sandbox read-only`, pi `--exclude-tools edit,write` — applied to the
+            // template's own tokens AND the resolved posture at the shared launch boundary
+            // (`apply_no_code_posture`, the same one the persistent-session carrier crosses).
+            // A seat with no lever whose template or posture grants writes is REFUSED; a seat with
             // no lever and no write grant runs, disclosed: the worktree guard catches its writes
             // after the fact (`worktree_guard`), and the record says so.
-            let posture = if crate::worktree_guard::applies_to(&input.unit) {
-                match no_code_posture(&cli_key, &binary, posture) {
-                    Ok((flags, ReadOnlyLever::None)) => {
+            if crate::worktree_guard::applies_to(&input.unit) {
+                match apply_no_code_posture(&cli_key, &mut argv, posture) {
+                    Ok(ReadOnlyLever::None) => {
                         let note = format!(
                             "phase `{}` declares executes_code:false but seat '{cli_key}' exposes \
                              no read-only posture lever, so writes are not prevented at the tool \
@@ -1268,24 +1270,19 @@ impl WrappedCliStepRunner {
                         );
                         eprintln!("wicked-core: {note}");
                         no_lever_note = Some(note);
-                        flags
                     }
-                    Ok((flags, lever)) => {
-                        eprintln!(
-                            "wicked-core: unit {} (phase `{}`, executes_code:false) runs on \
-                             '{cli_key}' with the read-only posture {} (F-036)",
-                            input.unit.ord,
-                            input.unit.phase_id().unwrap_or("?"),
-                            lever.describe()
-                        );
-                        flags
-                    }
+                    Ok(lever) => eprintln!(
+                        "wicked-core: unit {} (phase `{}`, executes_code:false) runs on \
+                         '{cli_key}' with the read-only posture {} (F-036)",
+                        input.unit.ord,
+                        input.unit.phase_id().unwrap_or("?"),
+                        lever.describe()
+                    ),
                     Err(why) => return posture_refusal(input, &why),
                 }
             } else {
-                posture
-            };
-            apply_seat_posture(&mut argv, &posture);
+                apply_seat_posture(&mut argv, &posture);
+            }
             // v3.2 §2: the seat's PER-LAUNCH skills delivery — pi's `--no-skills --skill <dir>…`,
             // copilot's `--add-dir <view>` — rides the argv exactly like its posture (before any
             // `--` guard). opencode's rides the env, set on the command below. Nothing is written
@@ -1600,6 +1597,23 @@ impl WrappedCliStepRunner {
                 // for what a hook cannot see (`Bash` heredocs). Set ONLY when the flag is on.
                 if crate::worktree_guard::applies_to(&input.unit) {
                     cmd.env(crate::gate_hook::NO_CODE_SCOPE_ENV, "1");
+                    // …and the phase's DECLARED deliverables, which the scope must let it write
+                    // (Copilot on #414) — `PATH`-joined like the roots. A deliverable spelled with
+                    // the separator cannot ride this carrier; it is logged and the guard's own
+                    // exemption (which reads the unit directly) still covers it after the fact.
+                    if !input.unit.required_deliverables.is_empty() {
+                        match std::env::join_paths(&input.unit.required_deliverables) {
+                            Ok(joined) => {
+                                cmd.env(crate::gate_hook::NO_CODE_DELIVERABLES_ENV, joined);
+                            }
+                            Err(e) => eprintln!(
+                                "wicked-core: unit {} declares a deliverable the hook env cannot \
+                                 carry ({e}); the tool-call scope will not exempt it (the worktree \
+                                 guard still does)",
+                                input.unit.ord
+                            ),
+                        }
+                    }
                 }
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
@@ -2845,132 +2859,238 @@ impl ReadOnlyLever {
             ReadOnlyLever::None => "(no lever)",
         }
     }
+
+    /// The flags that put this lever's seat in read-only mode when its posture named none.
+    pub(crate) fn flags(self) -> Vec<String> {
+        match self {
+            ReadOnlyLever::CodexSandbox => vec!["--sandbox".to_string(), "read-only".to_string()],
+            ReadOnlyLever::PiExcludeTools => {
+                vec!["--exclude-tools".to_string(), "edit,write".to_string()]
+            }
+            ReadOnlyLever::None => Vec::new(),
+        }
+    }
 }
 
 /// Tokens that GRANT writes/approvals outright on some seat. A NO-CODE phase may not launch on a
-/// lever-less seat whose posture carries one of these — there is nothing to downgrade it with.
-/// (codex's are handled by rewriting, not refusing: it has a lever.)
-pub(crate) const WRITE_CAPABLE_TOKENS: [&str; 6] = [
+/// lever-less seat whose posture or template carries one of these — there is nothing to downgrade
+/// it with. codex's own spellings (`--sandbox workspace-write`, `danger-full-access`, the blanket
+/// bypass, `--full-auto`) are REWRITTEN on a recognised codex seat and REFUSED anywhere else — an
+/// unrecognised alias of codex must not slip a write-capable sandbox through the lever-less branch.
+pub(crate) const WRITE_CAPABLE_TOKENS: [&str; 8] = [
     "--allow-all-tools",
     "--allow-all",
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
+    "--full-auto",
     "--yolo",
     "--auto",
+    "--approve-all",
 ];
 
+/// codex's sandbox modes, as `-s/--sandbox` values.
+const CODEX_SANDBOX_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
+const CODEX_WRITE_MODES: [&str; 2] = ["workspace-write", "danger-full-access"];
+
+/// The lower-cased file stem of a CLI binary spelling — `/opt/homebrew/bin/codex` → `codex`,
+/// `codex.exe` → `codex`, `Codex` → `codex` — so a seat is recognised by what actually runs, not
+/// by the registry key an operator happened to give it (codex review on #414: an alias or an
+/// absolute path must not fall into the lever-less branch).
+pub(crate) fn cli_stem(binary: &str) -> String {
+    // Split on BOTH separators regardless of host: a `clis.toml` authored on Windows names
+    // `C:\\tools\\codex.exe`, and `Path::file_stem` on unix would keep the whole thing.
+    let last = binary
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(binary)
+        .to_ascii_lowercase();
+    // Strip only the Windows executable suffixes — a dot inside a name (`codex-1.2`) is kept.
+    [".exe", ".cmd", ".bat", ".com"]
+        .iter()
+        .find_map(|ext| last.strip_suffix(*ext))
+        .map(str::to_string)
+        .unwrap_or(last)
+}
+
+/// The known seat a `(cli_key, binary)` pair denotes, by key OR by normalised binary stem.
+fn known_seat(cli_key: &str, binary: &str) -> Option<&'static str> {
+    let key = cli_key.to_ascii_lowercase();
+    let stem = cli_stem(binary);
+    ["codex", "pi"]
+        .into_iter()
+        .find(|known| key == *known || stem == *known)
+}
+
+/// Whether `tok` (with its following token, when one exists) is a codex sandbox flag naming a
+/// WRITE-capable mode: `--sandbox workspace-write`, `-s danger-full-access`, `--sandbox=…`.
+fn codex_write_sandbox(tok: &str, next: Option<&str>) -> bool {
+    if let Some(mode) = tok
+        .strip_prefix("--sandbox=")
+        .or_else(|| tok.strip_prefix("-s="))
+    {
+        return CODEX_WRITE_MODES.contains(&mode);
+    }
+    (tok == "--sandbox" || tok == "-s") && next.is_some_and(|v| CODEX_WRITE_MODES.contains(&v))
+}
+
+/// The outcome of [`no_code_posture`] over one flag list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoCodePosture {
+    /// The flags, rewritten: a codex sandbox is read-only, the bypass gone; a pi denylist carries
+    /// `edit,write`; anything else passed through untouched.
+    pub(crate) flags: Vec<String>,
+    pub(crate) lever: ReadOnlyLever,
+    /// Whether the rewritten flags ALREADY put the seat in read-only mode (a sandbox flag was
+    /// present and is now `read-only`; a pi denylist was present and now carries `edit,write`).
+    /// When false on a seat WITH a lever, the caller appends [`ReadOnlyLever::flags`].
+    pub(crate) satisfied: bool,
+}
+
 /// The posture a NON-claude seat runs a NO-CODE phase under (F-036 — `executes_code: false`, the
-/// evaluator/recon/review rungs): the seat's resolved `posture`, downgraded to read-only where the
-/// seat has a lever; otherwise passed through unless it explicitly grants writes, which is refused.
+/// evaluator/recon/review rungs), applied to ONE flag list (the seat's resolved `trust_flags`, or a
+/// launch template's own tokens, or a persistent session's argv tail): downgraded to read-only
+/// where the seat has a lever; otherwise passed through unless it grants writes, which is refused.
+/// Recognition is by registry key OR by the binary's normalised file stem, so `my-codex` /
+/// `/usr/local/bin/codex` / `codex.exe` are all codex.
 ///
-/// * codex (`binary`/`cli_key` `codex`): every `-s/--sandbox` value becomes `read-only`
-///   (`--sandbox=<mode>` too), the blanket bypass and any stray mode token are dropped, and a
-///   `--sandbox read-only` is appended when the posture named no sandbox at all. This is exactly
-///   codex's own read-only mode — the one crew#427 moved review seats OFF so they could run the
-///   suite; a no-code phase does not need to write to run it (`npm test` writes only ignored
-///   artifacts and the in-boundary scratch).
-/// * pi: `--exclude-tools edit,write` is appended (merged into an existing `--exclude-tools`/`-xt`
-///   value). `bash` stays — the phase must be able to run tests — so this is a posture, not a
-///   guarantee; the worktree guard holds the rest.
-/// * anything else: `Err` naming the write-capable token when the posture carries one (the launch
-///   is refused with that reason); else `Ok((posture, None))` and the caller discloses.
+/// * codex: every `-s/--sandbox` value becomes `read-only` (`--sandbox=<mode>` too); the blanket
+///   bypass, `--full-auto` and any stray mode token are dropped. This is codex's own read-only
+///   mode — the one crew#427 moved review seats OFF so they could run the suite; a no-code phase
+///   does not need to write to run it.
+/// * pi: `edit,write` is merged into an existing `--exclude-tools`/`-xt` value. `bash` stays — the
+///   phase must be able to run tests — so this is a posture, not a guarantee; the worktree guard
+///   holds the rest.
+/// * anything else: `Err` naming the token when the flags carry ANY recognised write grant — the
+///   generic tokens AND codex's write-capable sandbox spellings (an unrecognised codex alias must
+///   not launch with `workspace-write`); else `Ok` with the flags untouched and `lever: None`.
 pub(crate) fn no_code_posture(
     cli_key: &str,
     binary: &str,
-    posture: Vec<String>,
-) -> Result<(Vec<String>, ReadOnlyLever), String> {
-    const READ_ONLY: &str = "read-only";
-    const SANDBOX_MODES: [&str; 3] = ["read-only", "workspace-write", "danger-full-access"];
-    let is = |name: &str| cli_key == name || binary == name;
-    if is("codex") {
-        let mut out: Vec<String> = Vec::with_capacity(posture.len() + 2);
-        let mut has_sandbox = false;
-        let mut i = 0;
-        while i < posture.len() {
-            let flag = posture[i].as_str();
-            if flag == "--dangerously-bypass-approvals-and-sandbox" {
-                i += 1;
-                continue;
-            }
-            if let Some(mode) = flag
-                .strip_prefix("--sandbox=")
-                .or_else(|| flag.strip_prefix("-s="))
-            {
-                let _ = mode;
-                has_sandbox = true;
-                out.push(format!("--sandbox={READ_ONLY}"));
-                i += 1;
-                continue;
-            }
-            if flag == "--sandbox" || flag == "-s" {
-                has_sandbox = true;
-                out.push("--sandbox".to_string());
-                out.push(READ_ONLY.to_string());
-                // Consume the value token only when it IS a mode; a following flag stays.
-                if posture
-                    .get(i + 1)
-                    .is_some_and(|v| SANDBOX_MODES.contains(&v.as_str()))
-                {
-                    i += 2;
-                } else {
+    flags: Vec<String>,
+) -> Result<NoCodePosture, String> {
+    match known_seat(cli_key, binary) {
+        Some("codex") => {
+            let mut out: Vec<String> = Vec::with_capacity(flags.len() + 2);
+            let mut has_sandbox = false;
+            let mut i = 0;
+            while i < flags.len() {
+                let flag = flags[i].as_str();
+                if flag == "--dangerously-bypass-approvals-and-sandbox" || flag == "--full-auto" {
                     i += 1;
+                    continue;
                 }
-                continue;
-            }
-            if SANDBOX_MODES.contains(&flag) {
-                // A stray mode token not owned by a `--sandbox`: drop it rather than leak it.
-                i += 1;
-                continue;
-            }
-            out.push(flag.to_string());
-            i += 1;
-        }
-        if !has_sandbox {
-            out.push("--sandbox".to_string());
-            out.push(READ_ONLY.to_string());
-        }
-        return Ok((out, ReadOnlyLever::CodexSandbox));
-    }
-    if is("pi") {
-        let mut out = posture;
-        let pos = out
-            .iter()
-            .position(|f| f == "--exclude-tools" || f == "-xt");
-        match pos {
-            Some(p) if p + 1 < out.len() && !out[p + 1].starts_with('-') => {
-                let mut tools: Vec<String> = out[p + 1]
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                for t in ["edit", "write"] {
-                    if !tools.iter().any(|x| x == t) {
-                        tools.push(t.to_string());
+                if flag.starts_with("--sandbox=") || flag.starts_with("-s=") {
+                    has_sandbox = true;
+                    out.push("--sandbox=read-only".to_string());
+                    i += 1;
+                    continue;
+                }
+                if flag == "--sandbox" || flag == "-s" {
+                    has_sandbox = true;
+                    out.push("--sandbox".to_string());
+                    out.push("read-only".to_string());
+                    // Consume the value token only when it IS a mode; a following flag stays.
+                    if flags
+                        .get(i + 1)
+                        .is_some_and(|v| CODEX_SANDBOX_MODES.contains(&v.as_str()))
+                    {
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
+                    continue;
                 }
-                out[p + 1] = tools.join(",");
+                if CODEX_SANDBOX_MODES.contains(&flag) {
+                    // A stray mode token not owned by a `--sandbox`: drop it rather than leak it.
+                    i += 1;
+                    continue;
+                }
+                out.push(flag.to_string());
+                i += 1;
             }
-            _ => {
-                out.push("--exclude-tools".to_string());
-                out.push("edit,write".to_string());
-            }
+            Ok(NoCodePosture {
+                flags: out,
+                lever: ReadOnlyLever::CodexSandbox,
+                satisfied: has_sandbox,
+            })
         }
-        return Ok((out, ReadOnlyLever::PiExcludeTools));
+        Some("pi") => {
+            let mut out = flags;
+            let pos = out
+                .iter()
+                .position(|f| f == "--exclude-tools" || f == "-xt");
+            let satisfied = match pos {
+                Some(p) if p + 1 < out.len() && !out[p + 1].starts_with('-') => {
+                    let mut tools: Vec<String> = out[p + 1]
+                        .split(',')
+                        .map(|t| t.trim().to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    for t in ["edit", "write"] {
+                        if !tools.iter().any(|x| x == t) {
+                            tools.push(t.to_string());
+                        }
+                    }
+                    out[p + 1] = tools.join(",");
+                    true
+                }
+                _ => false,
+            };
+            Ok(NoCodePosture {
+                flags: out,
+                lever: ReadOnlyLever::PiExcludeTools,
+                satisfied,
+            })
+        }
+        _ => {
+            for (i, tok) in flags.iter().enumerate() {
+                let next = flags.get(i + 1).map(String::as_str);
+                if WRITE_CAPABLE_TOKENS.contains(&tok.as_str()) || codex_write_sandbox(tok, next) {
+                    return Err(format!(
+                        "seat '{cli_key}' ({binary}) would launch a phase that declares \
+                         executes_code:false with the WRITE-CAPABLE posture token `{tok}` \
+                         ({flags:?}), and this seat exposes no read-only lever the engine can \
+                         apply — refusing the launch rather than letting an evaluator/recon phase \
+                         run with writes granted (F-036). Remove `{tok}` from the seat's \
+                         `trust_flags`/invocation in your wicked-council clis.toml, or route the \
+                         phase to a seat with a lever (codex: `--sandbox read-only`; pi: \
+                         `--exclude-tools edit,write`) or to the governed claude seat."
+                    ));
+                }
+            }
+            Ok(NoCodePosture {
+                flags,
+                lever: ReadOnlyLever::None,
+                satisfied: true,
+            })
+        }
     }
-    if let Some(tok) = posture
-        .iter()
-        .find(|f| WRITE_CAPABLE_TOKENS.contains(&f.as_str()))
-    {
-        return Err(format!(
-            "seat '{cli_key}' ({binary}) resolved a WRITE-CAPABLE posture {posture:?} for a phase \
-             that declares executes_code:false, and this seat exposes no read-only lever the engine \
-             can apply — refusing the launch rather than letting an evaluator/recon phase run with \
-             `{tok}` (F-036). Declare `trust_flags` without `{tok}` for '{cli_key}' in your \
-             wicked-council clis.toml, or route the phase to a seat with a lever (codex: `--sandbox \
-             read-only`; pi: `--exclude-tools edit,write`) or to the governed claude seat."
-        ));
+}
+
+/// The shared launch boundary for a NO-CODE phase on a non-claude seat, for EVERY argv-building
+/// carrier (the wrapped one-shot runner and the persistent PTY session runner): rewrite the
+/// template's own tokens (`argv[1..]`) AND the seat's resolved posture through [`no_code_posture`],
+/// then append the lever's flags when neither already put the seat in read-only mode. `Err` is the
+/// refusal (a write grant on a lever-less seat) — the caller fails the unit before anything spawns.
+/// Returns the lever, for the disclosure the caller records.
+pub(crate) fn apply_no_code_posture(
+    cli_key: &str,
+    argv: &mut Vec<String>,
+    posture: Vec<String>,
+) -> Result<ReadOnlyLever, String> {
+    let Some(binary) = argv.first().cloned() else {
+        return Ok(ReadOnlyLever::None);
+    };
+    let tail = argv.split_off(1);
+    let t = no_code_posture(cli_key, &binary, tail)?;
+    argv.extend(t.flags);
+    let p = no_code_posture(cli_key, &binary, posture)?;
+    let mut flags = p.flags;
+    if !(t.satisfied || p.satisfied) {
+        flags.extend(p.lever.flags());
     }
-    Ok((posture, ReadOnlyLever::None))
+    apply_seat_posture(argv, &flags);
+    Ok(p.lever)
 }
 
 /// The [`StepOutput`] for a unit whose launch [`no_code_posture`] REFUSED: nothing ran, nothing was
@@ -3053,6 +3173,16 @@ fn run_bounded(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // The seat runs in its OWN process group (pgid == its pid), so that when it exits — or is
+        // cancelled / timed out — the engine can kill everything it backgrounded with one
+        // `killpg` and the group is never the daemon's own (F-036 quiesce, codex review on #414:
+        // a delayed write from a process the seat left behind must not land after the worktree
+        // guard's comparison and still fold as clean).
+        cmd.process_group(0);
+    }
     let mut child = cmd.spawn()?;
     let so = child.stdout.take().expect("piped stdout");
     let se = child.stderr.take().expect("piped stderr");
@@ -3112,7 +3242,13 @@ fn run_bounded(
         // `Cancelled` vs `TimedOut` instead of conflating both into one status (616c8661).
         let (code, killed_by) = loop {
             match child_ref.try_wait() {
-                Ok(Some(status)) => break (status.code().unwrap_or(-1), None),
+                Ok(Some(status)) => {
+                    // QUIESCE (F-036): the seat exited; reap anything it backgrounded in its
+                    // group so no phase-owned process outlives the phase. The group is the
+                    // child's own (see the spawn), so this can never signal the launcher.
+                    crate::validator::kill_child_tree(child_ref);
+                    break (status.code().unwrap_or(-1), None);
+                }
                 Ok(None) => {
                     if cancel
                         .as_ref()
@@ -3121,12 +3257,12 @@ fn run_bounded(
                         // Run-terminal cancellation: kill + reap NOW (the late StepOutput is
                         // discarded by the actor's stale-result guard; the kill is the part
                         // that matters — crew#277's orphaned worker).
-                        let _ = child_ref.kill();
+                        crate::validator::kill_child_tree(child_ref);
                         let _ = child_ref.wait();
                         break (-1, Some(CANCELLED));
                     }
                     if start.elapsed() > timeout {
-                        let _ = child_ref.kill();
+                        crate::validator::kill_child_tree(child_ref);
                         let _ = child_ref.wait();
                         break (-1, Some(TIMED_OUT));
                     }
@@ -5159,27 +5295,27 @@ mod tests {
 
     /// F-036, the posture half: a NO-CODE phase (`executes_code: false`) on a codex seat runs under
     /// codex's own READ-ONLY sandbox — every sandbox spelling is rewritten, the blanket bypass is
-    /// dropped, and a posture with no sandbox at all gains one. A code phase is untouched.
+    /// dropped, and a posture with no sandbox at all is reported unsatisfied so the caller appends
+    /// one. Recognition is by key OR by the binary's file stem (alias, absolute path, `.exe`).
     #[test]
     fn no_code_posture_puts_codex_in_its_read_only_sandbox() {
-        let ro = || vec!["--sandbox".to_string(), "read-only".to_string()];
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // The shipped bounded posture (workspace-write) → read-only.
+        let ro = || s(&["--sandbox", "read-only"]);
+        // The shipped bounded posture (workspace-write) → read-only, satisfied.
+        let p = no_code_posture("codex", "codex", s(&["--sandbox", "workspace-write"])).unwrap();
         assert_eq!(
-            no_code_posture("codex", "codex", s(&["--sandbox", "workspace-write"])).unwrap(),
-            (ro(), ReadOnlyLever::CodexSandbox)
+            (p.flags, p.lever, p.satisfied),
+            (ro(), ReadOnlyLever::CodexSandbox, true)
         );
-        // The blanket bypass (a stale clis.toml) → dropped, read-only appended.
-        assert_eq!(
-            no_code_posture(
-                "codex",
-                "codex",
-                s(&["--dangerously-bypass-approvals-and-sandbox"])
-            )
-            .unwrap()
-            .0,
-            ro()
-        );
+        // The blanket bypass (a stale clis.toml) → dropped; nothing bounds it yet → unsatisfied.
+        let p = no_code_posture(
+            "codex",
+            "codex",
+            s(&["--dangerously-bypass-approvals-and-sandbox", "--full-auto"]),
+        )
+        .unwrap();
+        assert_eq!((p.flags, p.satisfied), (vec![], false));
+        assert_eq!(ReadOnlyLever::CodexSandbox.flags(), ro());
         // `=`-attached and short spellings, other flags preserved in place.
         assert_eq!(
             no_code_posture(
@@ -5188,24 +5324,36 @@ mod tests {
                 s(&["--model", "o3", "--sandbox=danger-full-access"])
             )
             .unwrap()
-            .0,
+            .flags,
             s(&["--model", "o3", "--sandbox=read-only"])
         );
         assert_eq!(
             no_code_posture("codex", "codex", s(&["-s", "workspace-write", "--json"]))
                 .unwrap()
-                .0,
+                .flags,
             s(&["--sandbox", "read-only", "--json"])
         );
-        // No sandbox declared at all → one is added.
-        assert_eq!(no_code_posture("codex", "codex", vec![]).unwrap().0, ro());
         // A bare `--sandbox` followed by a NON-mode flag: bounded, and the flag is kept.
         assert_eq!(
             no_code_posture("codex", "codex", s(&["--sandbox", "--json"]))
                 .unwrap()
-                .0,
+                .flags,
             s(&["--sandbox", "read-only", "--json"])
         );
+        // ALIASES (codex review on #414): the key may be anything, the binary may be an absolute
+        // path or a Windows spelling — the STEM says codex, so the lever applies.
+        for (key, bin) in [
+            ("my-codex", "/opt/homebrew/bin/codex"),
+            ("reviewer", "codex.exe"),
+            ("Codex-Seat", "C:\\tools\\Codex.EXE"),
+            ("codex", "/some/other/binary"),
+        ] {
+            let p = no_code_posture(key, bin, s(&["--sandbox", "workspace-write"])).unwrap();
+            assert_eq!(p.lever, ReadOnlyLever::CodexSandbox, "{key} / {bin}");
+            assert_eq!(p.flags, ro(), "{key} / {bin}");
+        }
+        assert_eq!(cli_stem("C:\\tools\\Codex.EXE"), "codex");
+        assert_eq!(cli_stem("/usr/local/bin/pi"), "pi");
     }
 
     /// pi's lever is its tool denylist: `edit,write` are excluded (merged into an existing
@@ -5213,36 +5361,45 @@ mod tests {
     #[test]
     fn no_code_posture_excludes_pis_write_tools() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let p = no_code_posture("pi", "pi", vec![]).unwrap();
         assert_eq!(
-            no_code_posture("pi", "pi", vec![]).unwrap(),
-            (
-                s(&["--exclude-tools", "edit,write"]),
-                ReadOnlyLever::PiExcludeTools
-            )
+            (p.flags, p.lever, p.satisfied),
+            (vec![], ReadOnlyLever::PiExcludeTools, false)
         );
         assert_eq!(
-            no_code_posture("pi", "pi", s(&["--exclude-tools", "web,edit", "-a"]))
-                .unwrap()
-                .0,
+            ReadOnlyLever::PiExcludeTools.flags(),
+            s(&["--exclude-tools", "edit,write"])
+        );
+        let p = no_code_posture(
+            "pi",
+            "/usr/local/bin/pi",
+            s(&["--exclude-tools", "web,edit", "-a"]),
+        )
+        .unwrap();
+        assert_eq!(
+            p.flags,
             s(&["--exclude-tools", "web,edit,write", "-a"]),
             "an existing denylist is merged, never duplicated or clobbered"
         );
+        assert!(p.satisfied);
     }
 
-    /// A seat with NO lever: passes through when its posture grants nothing (the caller discloses
-    /// and the worktree guard holds the line), and is REFUSED when the posture explicitly grants
-    /// writes — there is nothing to downgrade `--allow-all-tools` with.
+    /// A seat with NO lever: passes through when its flags grant nothing (the caller discloses
+    /// and the worktree guard holds the line), and is REFUSED when they grant writes — the generic
+    /// tokens AND codex's write-capable sandbox spellings, so an unrecognised codex alias cannot
+    /// slip `workspace-write` through this branch.
     #[test]
     fn no_code_posture_refuses_a_write_capable_leverless_seat_and_passes_a_bare_one() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let p = no_code_posture("copilot", "copilot", vec![]).unwrap();
         assert_eq!(
-            no_code_posture("copilot", "copilot", vec![]).unwrap(),
-            (vec![], ReadOnlyLever::None)
+            (p.flags, p.lever, p.satisfied),
+            (vec![], ReadOnlyLever::None, true)
         );
         assert_eq!(
             no_code_posture("copilot", "copilot", s(&["--add-dir", "/x"]))
                 .unwrap()
-                .1,
+                .lever,
             ReadOnlyLever::None
         );
         let err = no_code_posture("copilot", "copilot", s(&["--allow-all-tools"]))
@@ -5260,6 +5417,127 @@ mod tests {
                 "`{tok}` is write-capable on a lever-less seat"
             );
         }
+        for flags in [
+            s(&["--sandbox", "workspace-write"]),
+            s(&["-s", "danger-full-access"]),
+            s(&["--sandbox=workspace-write"]),
+        ] {
+            assert!(
+                no_code_posture("mystery", "mystery-cli", flags.clone()).is_err(),
+                "codex's write-capable sandbox spelling on an UNRECOGNISED seat is refused: {flags:?}"
+            );
+        }
+        assert!(
+            no_code_posture("mystery", "mystery-cli", s(&["--sandbox", "read-only"])).is_ok(),
+            "a read-only sandbox spelling grants nothing"
+        );
+    }
+
+    /// The shared launch boundary rewrites the TEMPLATE's own tokens too, appends the lever's flags
+    /// only when nothing already bounds the seat, and refuses a write grant embedded in a template.
+    #[test]
+    fn apply_no_code_posture_covers_template_tokens_and_appends_the_lever_once() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // A codex template carrying the bypass + a prompt, posture bounded: the bypass is dropped,
+        // the posture becomes read-only, nothing is appended twice.
+        let mut argv = s(&[
+            "/opt/homebrew/bin/codex",
+            "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "the prompt",
+        ]);
+        let lever = apply_no_code_posture("codex", &mut argv, s(&["--sandbox", "workspace-write"]))
+            .unwrap();
+        assert_eq!(lever, ReadOnlyLever::CodexSandbox);
+        assert_eq!(
+            argv,
+            s(&[
+                "/opt/homebrew/bin/codex",
+                "exec",
+                "the prompt",
+                "--sandbox",
+                "read-only"
+            ])
+        );
+        // No sandbox anywhere: the lever's flags are appended before a `--` guard when one exists.
+        let mut argv = s(&["codex", "exec", "--", "the prompt"]);
+        apply_no_code_posture("codex", &mut argv, vec![]).unwrap();
+        assert_eq!(
+            argv,
+            s(&[
+                "codex",
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--",
+                "the prompt"
+            ])
+        );
+        // A lever-less seat whose TEMPLATE grants writes is refused, whatever its posture says.
+        let mut argv = s(&["copilot", "--allow-all-tools", "-p", "the prompt"]);
+        let err = apply_no_code_posture("copilot", &mut argv, vec![]).expect_err("refused");
+        assert!(err.contains("--allow-all-tools"));
+        // An empty argv is left alone (the launch fails on its own account downstream).
+        let mut empty: Vec<String> = vec![];
+        assert_eq!(
+            apply_no_code_posture("codex", &mut empty, vec![]).unwrap(),
+            ReadOnlyLever::None
+        );
+    }
+
+    /// QUIESCE (codex review on #414): a seat that backgrounds a writer and exits must not leave
+    /// it running into the guard's comparison — the wrapped runner kills the seat's whole process
+    /// group when the seat exits, so the delayed write never lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_backgrounded_writer_dies_with_the_seat_it_belongs_to() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-quiesce-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let late = dir.join("late.txt");
+        let script = dir.join("seat.sh");
+        // The seat: start a background job that writes AFTER a delay, then exit immediately —
+        // exactly the "delayed write after seat exit" shape.
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n(sleep 1; echo late > \"{}\") &\nexit 0\n",
+                late.display()
+            ),
+        )
+        .unwrap();
+        let mut u = WorkUnit::pending("s:verify", "s", 4, "verify");
+        u.assigned_cli = Some("sh".to_string());
+        u.assigned_invocation = Some(format!("sh {} {{PROMPT}}", script.display()));
+        let input = StepInput {
+            run_id: "run-quiesce".to_string(),
+            unit_ix: 3,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        std::thread::sleep(std::time::Duration::from_millis(2500));
+        assert!(
+            !late.exists(),
+            "the backgrounded writer must have died with the seat's process group"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// END-TO-END through `run_unit`: the same codex-key seat as the bounded-posture test above,

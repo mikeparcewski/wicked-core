@@ -16,10 +16,14 @@
 //!    agent-executed unit of a BOUND run), the actor takes a [`WorktreeSnapshot`] — the git TREE
 //!    HASH of the worktree as it stands (tracked + untracked-but-not-ignored content) plus `HEAD`
 //!    — and persists it ON THE UNIT so it survives a daemon restart.
-//! 2. When the unit's work finishes, the worker thread takes a second snapshot and
-//!    [`compare`]s. Any non-exempt path that differs, or a moved `HEAD`, is a
-//!    [`WorktreeMutation`] — carried to the gate fold, which DENIES the unit (deny-dominates,
-//!    source `worktree_guard`) and emits `evaluatorMutatedWorktree` naming every path.
+//! 2. When the unit's work is COMPLETELY over — the seat's process tree quiesced, the agent judge
+//!    rendered, the repo checks run — the worker thread takes the FINAL snapshot immediately
+//!    before the result is posted to the gate fold and [`compare`]s it with the baseline. Any
+//!    non-exempt path that differs, or a moved `HEAD`, is a [`WorktreeMutation`] — the fold
+//!    DENIES the unit (deny-dominates, source `worktree_guard`) and emits
+//!    `evaluatorMutatedWorktree` naming every path. A comparison taken any earlier would miss a
+//!    write that lands after the seat returns (a backgrounded process, a "passing" check script
+//!    that edits a tracked file) and still fold `combined: true` over it.
 //!
 //! Independent of the CLI, its governance adapter, and its sandbox: the same git plumbing judges a
 //! claude, codex, pi or copilot seat, on the wrapped or the ACP carrier. A seat's read-only
@@ -36,18 +40,23 @@
 //! than a full re-hash, so a snapshot is cheap even on a large tree. The diff between two
 //! snapshots is `git diff-tree -r --name-status` over the two tree objects — a pure object read.
 //!
-//! ## What is exempt (recorded, never denied)
+//! ## What the snapshot does not see: the engine's own scratch
 //!
-//! * the phase's own `required_deliverables` — an Evaluator that writes its declared report
-//!   (`domain-extraction/coverage` → `coverage-report.json`) is doing its job;
-//! * the engine's in-boundary scratch (`tmp/`, where `TMPDIR` is pointed) and an in-tree code
-//!   graph (`.codegraph/`, which the estate tools update for a repo that tracks one);
-//! * DOCUMENTATION paths, by the same predicate the pre-build phase-scope gate uses
-//!   (`actor::is_documentation_change`): an evaluator may write up its findings; it may not touch
-//!   the code under review. This keeps the two scope gates consistent with each other.
+//! The engine points every worker's `TMPDIR` at `<worktree>/tmp` (core#264, crew#427 — so a
+//! bounded seat's temp files land inside its own write boundary), and the repo checks' isolated
+//! `HOME`/package caches live there too. That directory is the engine's, not the work's, and the
+//! snapshot excludes it BY CONSTRUCTION — through git's own exclude mechanism
+//! (`core.excludesFile` for the scratch `add -A`), exactly like a `.gitignore`d build output —
+//! rather than by filtering paths out of a diff. Nothing else is excluded.
 //!
-//! Exempt changes still ride the `evaluatorMutatedWorktree` event (as `exempted`) and the unit
-//! record, so an operator sees them; they simply do not deny.
+//! ## The one exemption: the phase's DECLARED deliverables
+//!
+//! A path the phase itself declared in `required_deliverables` — `domain-extraction/coverage`
+//! writes `coverage-report.json` at the worktree root, and its pinned validator reads it from
+//! there — is the phase doing its job. Such a change is recorded on the event (`exempted`) and
+//! does not deny. There is NO documentation exemption and NO in-tree-graph exemption: an
+//! evaluator's write-up belongs in its output, not in the tree, and an in-tree `.codegraph/`
+//! that moves under a recon phase is a defect to surface, not to hide.
 //!
 //! ## Honest limits
 //!
@@ -58,6 +67,10 @@
 //!   object, and the denial names the one-line restore. Auto-revert is a deliberate non-goal for
 //!   this change: discarding files an operator may still want to inspect is a bigger decision
 //!   than refusing to certify them.
+//! * A process that escapes the seat's process group (a `setsid` daemon) can still write after
+//!   the final snapshot. The wrapped runner kills the seat's whole group when the seat exits,
+//!   and the final snapshot is taken as late as the pipeline allows; what lands after that is
+//!   the next phase's baseline problem, and its gate.
 //! * A human who APPROVES a mutation-denied gate accepts the tree as it stands: the re-dispatch
 //!   re-baselines. A restart-driven re-dispatch never does — the persisted baseline is kept.
 
@@ -68,7 +81,8 @@ use serde::{Deserialize, Serialize};
 use wicked_apps_core::spawn::HardenedCommand;
 
 /// The content identity of a worktree at one instant: its `HEAD` and the tree hash of everything
-/// git would commit (`add -A`, so `.gitignore` applies). Persisted on the unit at dispatch.
+/// git would commit (`add -A`, so `.gitignore` applies; the engine scratch excluded). Persisted on
+/// the unit at dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeSnapshot {
     /// `HEAD`'s commit id; empty on an unborn branch.
@@ -92,10 +106,9 @@ pub struct ChangedPath {
 pub struct WorktreeMutation {
     pub before: WorktreeSnapshot,
     pub after: WorktreeSnapshot,
-    /// The changes that DENY — every differing path not covered by an exemption.
+    /// The changes that DENY — every differing path that is not a declared deliverable.
     pub changed: Vec<ChangedPath>,
-    /// Differing paths an exemption covers (documentation, declared deliverables, engine scratch).
-    /// Disclosed, never denied.
+    /// Differing paths the phase DECLARED as its `required_deliverables`. Disclosed, never denied.
     pub exempted: Vec<ChangedPath>,
     /// `HEAD` moved between the snapshots — the unit committed, amended or reset the run branch.
     pub head_moved: bool,
@@ -118,16 +131,17 @@ pub enum WorktreeGuardOutcome {
         before: WorktreeSnapshot,
         after: WorktreeSnapshot,
     },
-    /// The tree differs (possibly only in exempt paths — see [`WorktreeMutation::denies`]).
+    /// The tree differs (possibly only in declared deliverables — see [`WorktreeMutation::denies`]).
     Mutated(WorktreeMutation),
     /// The comparison itself could not be made (git failed, no baseline was persisted at
     /// dispatch). Fail-closed: the fold denies with this reason rather than assuming clean.
     Unverifiable(String),
 }
 
-/// Path prefixes the engine itself writes under a worktree, or that hold tool state rather than
-/// the work under review. Relative, `/`-separated, as `diff-tree` reports them.
-pub const EXEMPT_PREFIXES: [&str; 2] = ["tmp/", ".codegraph/"];
+/// The engine's in-boundary scratch directory, relative to the worktree root — where every
+/// worker's `TMPDIR` points (`execute_wrapped::redirect_scratch_into_boundary`) and where the
+/// repo checks keep their isolated `HOME`/caches. Excluded from the snapshot by construction.
+pub const ENGINE_SCRATCH_DIR: &str = "tmp";
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -191,6 +205,14 @@ pub fn snapshot(worktree: &Path) -> anyhow::Result<WorktreeSnapshot> {
     let head = git_string(worktree, &["rev-parse", "--verify", "--quiet", "HEAD"], &[])
         .unwrap_or_default();
     let tmp_index = scratch_index_path();
+    // The engine scratch is excluded through git's own exclude mechanism — a scratch excludes
+    // file naming `/tmp/` at the repo root — so it never enters the snapshot, exactly like a
+    // `.gitignore`d artifact. `-c core.excludesFile` REPLACES the operator's global excludes for
+    // this one command, which is the deterministic choice: a snapshot must not depend on the
+    // daemon host's `~/.gitignore_global`.
+    let excludes = tmp_index.with_extension("exclude");
+    std::fs::write(&excludes, format!("/{ENGINE_SCRATCH_DIR}/\n"))?;
+    let excludes_arg = format!("core.excludesFile={}", excludes.display());
     // Seed the scratch index from the real one so `add -A` is a stat-cache walk, not a full
     // re-hash. A missing real index (freshly initialised repo) is fine — `add -A` builds it.
     if let Ok(real) = index_path(worktree) {
@@ -198,12 +220,17 @@ pub fn snapshot(worktree: &Path) -> anyhow::Result<WorktreeSnapshot> {
     }
     let env: [(&str, &Path); 1] = [("GIT_INDEX_FILE", tmp_index.as_path())];
     let result = (|| -> anyhow::Result<String> {
-        git(worktree, &["add", "-A", "--", "."], &env)?;
+        git(
+            worktree,
+            &["-c", &excludes_arg, "add", "-A", "--", "."],
+            &env,
+        )?;
         git_string(worktree, &["write-tree"], &env)
     })();
     // Scratch hygiene on every exit — including `add`'s `<index>.lock` if it was left behind.
     let _ = std::fs::remove_file(&tmp_index);
     let _ = std::fs::remove_file(tmp_index.with_extension("idx.lock"));
+    let _ = std::fs::remove_file(&excludes);
     let tree = result?;
     Ok(WorktreeSnapshot {
         head,
@@ -227,8 +254,8 @@ fn parse_name_status_z(raw: &[u8]) -> Vec<ChangedPath> {
 
 /// Re-snapshot `worktree` and compare it with `before`. `Ok(None)` when nothing changed;
 /// `Ok(Some(mutation))` otherwise — check [`WorktreeMutation::denies`], because a mutation whose
-/// every path is exempt (documentation, a declared deliverable) is disclosed, not denied.
-/// `exempt` decides per repo-relative path.
+/// every path is a declared deliverable is disclosed, not denied. `exempt` decides per
+/// repo-relative path.
 pub fn compare(
     worktree: &Path,
     before: &WorktreeSnapshot,
@@ -267,19 +294,27 @@ pub fn compare(
     }))
 }
 
-/// Is `path` (repo-relative, `/`-separated) exempt for `unit`: an engine-owned prefix, one of the
-/// phase's declared deliverables (the file itself or anything beneath a declared directory), or a
-/// documentation path per the shared phase-scope predicate.
+/// Is `path` (repo-relative, `/`-separated) exempt for `unit`: ONLY one of the phase's declared
+/// `required_deliverables` (the file itself or anything beneath a declared directory). Documentation
+/// and in-tree tool state are deliberately NOT exempt — see the module doc.
 pub(crate) fn is_exempt_for_unit(unit: &crate::domain::WorkUnit, path: &str) -> bool {
-    let path = path.trim_start_matches("./");
-    if EXEMPT_PREFIXES.iter().any(|p| path.starts_with(p)) {
-        return true;
-    }
-    let declared = unit.required_deliverables.iter().any(|d| {
+    matches_declared_deliverable(path, &unit.required_deliverables)
+}
+
+/// Is `path` (repo-relative) one of the phase's declared `required_deliverables` — the file itself,
+/// or anything beneath a declared directory? Shared by the worktree guard's exemption and the
+/// NO-CODE tool-call scope (`gate_hook::phase_scope_denial`), so the two can never disagree about
+/// what an `executes_code: false` phase may write (Copilot on #414: `domain-extraction/coverage`
+/// must be able to `Write` its declared `coverage-report.json`). Windows-shaped input is
+/// normalised to `/`.
+pub(crate) fn matches_declared_deliverable(path: &str, deliverables: &[String]) -> bool {
+    let norm = path.replace('\\', "/");
+    let path = norm.trim_start_matches("./");
+    deliverables.iter().any(|d| {
+        let d = d.replace('\\', "/");
         let d = d.trim_start_matches("./").trim_end_matches('/');
         !d.is_empty() && (path == d || path.starts_with(&format!("{d}/")))
-    });
-    declared || crate::actor::is_documentation_change(path)
+    })
 }
 
 /// Run the guard for one finished unit: the worker-thread half. `None` when the unit is not
@@ -498,46 +533,79 @@ mod tests {
     }
 
     #[test]
-    fn an_untouched_tree_is_clean_and_ignored_files_never_count() {
+    fn an_untouched_tree_is_clean_and_ignored_or_engine_scratch_files_never_count() {
         let wt = creator_worktree("clean");
         let unit = guarded_unit(&[]);
         let before = snapshot(&wt).unwrap();
-        // The evaluator installs deps and runs tests — ignored artifacts only.
+        // The evaluator installs deps and runs tests — ignored artifacts only …
         std::fs::create_dir_all(wt.join("node_modules/x")).unwrap();
         std::fs::write(wt.join("node_modules/x/index.js"), "x").unwrap();
+        // … and its temp files land in the ENGINE's scratch (`TMPDIR=<worktree>/tmp`), which the
+        // snapshot excludes by construction, exactly like a gitignored path.
+        std::fs::create_dir_all(wt.join(ENGINE_SCRATCH_DIR).join("wicked-checks/home")).unwrap();
+        std::fs::write(wt.join(ENGINE_SCRATCH_DIR).join("scratch.txt"), "scratch").unwrap();
         assert!(
             compare(&wt, &before, &|p| is_exempt_for_unit(&unit, p))
                 .unwrap()
                 .is_none(),
-            "gitignored artifacts are not a mutation"
+            "gitignored artifacts and the engine scratch are not a mutation"
         );
     }
 
     #[test]
-    fn exempt_paths_are_disclosed_but_do_not_deny() {
-        let wt = creator_worktree("exempt");
-        let unit = guarded_unit(&["coverage-report.json"]);
+    fn documentation_and_in_tree_tool_state_are_not_exempt() {
+        // Codex review on #414: an evaluator's write-up belongs in its OUTPUT, not in the tree it
+        // is judging, and an in-tree code graph moving under a recon phase is a defect to surface
+        // (core#406), not to hide. Only DECLARED deliverables are exempt.
+        let wt = creator_worktree("no-exemptions");
+        let unit = guarded_unit(&[]);
         let before = snapshot(&wt).unwrap();
-        std::fs::create_dir_all(wt.join("tmp")).unwrap();
-        std::fs::write(wt.join("tmp/scratch.txt"), "scratch").unwrap(); // engine scratch
-        std::fs::write(wt.join("coverage-report.json"), "{}").unwrap(); // declared deliverable
         std::fs::create_dir_all(wt.join("docs")).unwrap();
-        std::fs::write(wt.join("docs/review.md"), "# findings").unwrap(); // documentation
+        std::fs::write(wt.join("docs/review.md"), "# findings").unwrap();
+        std::fs::write(wt.join("NOTES.txt"), "notes").unwrap();
+        std::fs::create_dir_all(wt.join(".codegraph")).unwrap();
+        std::fs::write(wt.join(".codegraph/estate.db"), "db").unwrap();
+        let m = compare(&wt, &before, &|p| is_exempt_for_unit(&unit, p))
+            .unwrap()
+            .expect("the tree changed");
+        assert!(m.denies(), "documentation and tool state DENY: {m:?}");
+        let mut paths: Vec<&str> = m.changed.iter().map(|c| c.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![".codegraph/estate.db", "NOTES.txt", "docs/review.md"]
+        );
+        assert!(m.exempted.is_empty());
+    }
+
+    #[test]
+    fn a_declared_deliverable_is_disclosed_but_does_not_deny() {
+        let wt = creator_worktree("deliverable");
+        let unit = guarded_unit(&["coverage-report.json", "out/"]);
+        let before = snapshot(&wt).unwrap();
+        std::fs::write(wt.join("coverage-report.json"), "{}").unwrap(); // declared file
+        std::fs::create_dir_all(wt.join("out")).unwrap();
+        std::fs::write(wt.join("out/report.json"), "{}").unwrap(); // under a declared directory
 
         let m = compare(&wt, &before, &|p| is_exempt_for_unit(&unit, p))
             .unwrap()
             .expect("the tree changed");
         assert!(
             !m.denies(),
-            "only exempt paths changed — disclosed, not denied: {m:?}"
+            "only declared deliverables changed — disclosed, not denied: {m:?}"
         );
         let mut ex: Vec<&str> = m.exempted.iter().map(|c| c.path.as_str()).collect();
         ex.sort();
-        assert_eq!(
-            ex,
-            vec!["coverage-report.json", "docs/review.md", "tmp/scratch.txt"]
-        );
+        assert_eq!(ex, vec!["coverage-report.json", "out/report.json"]);
         assert!(m.changed.is_empty());
+        // An undeclared sibling still denies.
+        std::fs::write(wt.join("other.json"), "{}").unwrap();
+        let m = compare(&wt, &before, &|p| is_exempt_for_unit(&unit, p))
+            .unwrap()
+            .unwrap();
+        assert!(m.denies());
+        assert_eq!(m.changed.len(), 1);
+        assert_eq!(m.changed[0].path, "other.json");
     }
 
     #[test]
@@ -609,6 +677,29 @@ mod tests {
         assert!(matches!(
             outcome_for_unit(&unit, Some(&dir)),
             Some(WorktreeGuardOutcome::Unverifiable(_))
+        ));
+    }
+
+    #[test]
+    fn declared_deliverable_matching_is_exact_or_beneath_a_declared_directory() {
+        let d = vec!["coverage-report.json".to_string(), "out/".to_string()];
+        assert!(matches_declared_deliverable("coverage-report.json", &d));
+        assert!(matches_declared_deliverable("./coverage-report.json", &d));
+        assert!(matches_declared_deliverable("out/x/y.json", &d));
+        assert!(
+            matches_declared_deliverable("out\\x.json", &d),
+            "Windows spelling normalises"
+        );
+        assert!(!matches_declared_deliverable(
+            "coverage-report.json.bak",
+            &d
+        ));
+        assert!(!matches_declared_deliverable("outer/x.json", &d));
+        assert!(!matches_declared_deliverable("src/out/x.json", &d));
+        assert!(!matches_declared_deliverable("anything", &[]));
+        assert!(!matches_declared_deliverable(
+            "x",
+            &["".to_string(), "./".to_string()]
         ));
     }
 }

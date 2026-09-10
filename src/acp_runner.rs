@@ -4844,6 +4844,7 @@ impl AcpStepRunner {
                     // F-036: the NO-CODE scope, same route — the ACP carrier answers the
                     // seat's permission requests in-process, so the flag rides the boundary.
                     no_code_scope: crate::worktree_guard::applies_to(&input.unit),
+                    no_code_deliverables: input.unit.required_deliverables.clone(),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -5170,6 +5171,7 @@ impl AcpStepRunner {
                         claude_config_dir: boundary.claude_config_dir.clone(),
                         pre_build_scope: boundary.pre_build_scope,
                         no_code_scope: boundary.no_code_scope,
+                        no_code_deliverables: boundary.no_code_deliverables.clone(),
                     }),
                 }
             },

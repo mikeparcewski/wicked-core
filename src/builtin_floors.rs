@@ -449,9 +449,8 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             for (i, phase) in def.phases.iter().enumerate() {
                 // F-039: the shipped JSON copies must pin the code-writing Creators exactly as the
-                // compiled defs do — a JSON that lost this pin would be ARMED at registration
-                // (`arm_ungated_code_phases`, loudly), so this check is what keeps the shipped files
-                // from shipping a gate the engine has to repair.
+                // compiled defs do — a JSON that lost this pin would be REFUSED at registration
+                // (`GateEvaluatesNothing`), so this check is what keeps the shipped files loadable.
                 if phase.role == PhaseRole::Creator && phase.executes_code {
                     assert_eq!(
                         phase.validator_pin.as_deref(),
