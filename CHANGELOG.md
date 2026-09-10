@@ -538,7 +538,14 @@ Two release tracks share this file, newest entry first regardless of track:
   prints its refusal on stdout with stderr empty), stderr as HEAD+TAIL around an elision marker, and
   a classified `reason` (`SeatFailureReason::NotLoggedIn` ⇢ `not_logged_in`) judged over the
   UNTRUNCATED streams (`with_output`), so a signature past the 4 KiB cap still classifies;
-  `SeatFailure::reason()` is renamed `summary()` and includes the class.
+  `SeatFailure::reason()` is renamed `summary()` and includes the class. Review round 2 hardening:
+  the resolver also refuses `.`/`..` segments and walks EVERY component from the filesystem root
+  to the leaf refusing planted (non-root-owned) symlinks — applied inside `worker_claude_config_dir`
+  so every consumer gets the same validated path; the WRAPPED worker applies the same carrier
+  decision (`execute_wrapped::exec` sets the worker home for a claude carrier, strips the variable
+  for any other — wrapped claude no longer runs on the operator's login by accident); and an ACP
+  launch reads its `[cli.acp]` transport and its seat identity off ONE registry record
+  (`acp_launch_facts`; the unit path reuses its single `seat` read).
   `councilSeatFailed` gains ADDITIVE `stdout` and `reason` (`null` when unclassified) beside
   `stderr`/`detail` — wire shape change (additive) — crew/studio consume it via the next core-ts
   release; the crew roster consumer of `login_invocation` sees the resolved path. Persisted

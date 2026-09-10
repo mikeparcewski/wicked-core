@@ -1591,6 +1591,66 @@ mod failure_diagnostics_tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// codex r2, PR#413: a link at an INTERMEDIATE component of `WICKED_WORKER_HOME` (not the leaf,
+    /// not its parent) is refused for the ballot too — the seat is never spawned.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_intermediate_component_refuses_the_claude_ballot_before_spawning() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let scratch = f030_scratch("mid-symlink");
+        let bin = scratch.join("bin");
+        let real = scratch.join("real");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(real.join("worker")).unwrap();
+        // `<scratch>/mid -> <scratch>/real`; the declared home is `<scratch>/mid/worker`, so the
+        // planted component sits two levels above the `claude` leaf.
+        std::os::unix::fs::symlink(&real, scratch.join("mid")).unwrap();
+        let worker_home = scratch.join("mid").join("worker");
+        let ledger = scratch.join("seen-config-dir.txt");
+        fake_recording_cli(&bin, "claude", &ledger);
+        let _path = path_with(&bin);
+        let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+
+        let outcome = quick_dispatcher().dispatch_prompt(&registry_seat("claude"), &task(), "b");
+        let DispatchOutcome::Failed(f) = outcome else {
+            panic!("a ballot through a symlinked component must be refused: {outcome:?}");
+        };
+        assert_eq!(f.kind, SeatFailureKind::SpawnFailed);
+        assert!(f.detail.contains("symlink"), "{f:?}");
+        assert!(!ledger.exists(), "the seat must never have been spawned");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// codex r2, PR#413: a `..` segment in `WICKED_WORKER_HOME` reads as absolute but re-aims the
+    /// resolved dir; refused before any spawn, like a relative path.
+    #[test]
+    fn a_dotdot_segment_in_the_worker_home_refuses_the_claude_ballot_before_spawning() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let sneaky = std::env::temp_dir().join("x").join("..").join("y");
+        assert!(
+            sneaky.is_absolute(),
+            "the fixture must read as absolute to be a fair test"
+        );
+        let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &sneaky);
+        let cli = seat(
+            "claude",
+            "claude",
+            "wicked-council-no-such-dir/claude --print",
+        );
+        let f = failure_of(&cli, Duration::from_secs(5));
+        assert_eq!(f.kind, SeatFailureKind::SpawnFailed);
+        assert!(
+            f.detail.contains("segment") && f.detail.contains("refusing to run the ballot"),
+            "refused at the resolver, before the spawn: {f:?}"
+        );
+    }
+
     /// F-031: a seat that exits 1 with `Not logged in · Please run /login` on STDOUT (stderr
     /// empty — claude's actual shape) yields a record that carries the stdout tail and the
     /// `not_logged_in` classification, so the `councilSeatFailed` event says WHY.

@@ -1014,7 +1014,12 @@ mod login_tests {
         // own config. (Under the operator's inherit hatch the seats DO run on the operator's
         // config, and the sign-in is plain `claude`; a host with the hatch set is a supported
         // configuration, not a failure of this test.)
-        let claude = default_login_invocation("claude").unwrap();
+        let claude = default_login_invocation("claude").unwrap_or_else(|| {
+            panic!(
+                "claude has no sign-in command on this host — the seat dir did not resolve: {:?}",
+                wicked_apps_core::spawn::seat_claude_config_dir()
+            )
+        });
         match wicked_apps_core::spawn::seat_claude_config_dir() {
             None => assert_eq!(claude, "claude"),
             Some(dir) => {

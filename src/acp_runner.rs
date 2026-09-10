@@ -4249,18 +4249,16 @@ impl AcpStepRunner {
                 return Ok(arc.clone());
             }
         }
-        let config =
-            acp_config_for(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
+        // ONE registry read for this launch: the transport config AND the seat identity come off
+        // the same record (codex r2, PR#413).
+        let (config, seat_is_claude) =
+            acp_launch_facts(cli_key).ok_or_else(|| format!("no ACP config for '{cli_key}'"))?;
         if config.transport == AcpTransport::Http {
             return Err(format!(
                 "ACP HTTP transport not supported for chat ('{cli_key}')"
             ));
         }
         // Chat is repo-less exploration → no estate MCP server (FINDING-122).
-        let seat_is_claude = matches!(
-            acp_seat_identity(cli_key),
-            crate::skills_snapshot::WorkerCli::Claude
-        );
         let proc = start_acp_process(
             &config,
             cwd,
@@ -4620,6 +4618,10 @@ impl AcpStepRunner {
         // wrapped fallback below judges the CLI on its own terms.
         let seat = registry_record(&cli_key);
         let worker_cli = seat_identity_of(seat.as_ref(), &cli_key);
+        // Judged off THIS record — the same one whose `[cli.acp]` decides the transport below
+        // (`acp_cfg_probe`) — never a second registry read (codex r2, PR#413: a clis.toml edit
+        // between two reads would pair one record's bridge with another's identity).
+        let seat_is_claude = matches!(worker_cli, crate::skills_snapshot::WorkerCli::Claude);
         // core#396 / v3.1 §4 — admission, BEFORE the operator messages below are consumed
         // (at-most-once) and before any session is opened, with the CACHED SESSION FIRST and ONE
         // policy for cached and fresh alike (`admit_turn`, codex round 4): a session this run
@@ -4966,10 +4968,7 @@ impl AcpStepRunner {
                     extra_write_roots,
                     &estate_provenance,
                     &delivery,
-                    matches!(
-                        acp_seat_identity(&cli_key),
-                        crate::skills_snapshot::WorkerCli::Claude
-                    ),
+                    seat_is_claude,
                     Some((run_id.as_str(), cli_key.as_str())),
                     self.operational_home.as_deref(),
                 ) {
@@ -5300,8 +5299,8 @@ impl AcpStepRunner {
                             "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
                              (crew#267). One-time fix: run \
                              `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude login` yourself, then \
-                             every worker stays logged in. Using single-shot fallback meanwhile, \
-                             which runs under the operator's own auth"
+                             every worker stays logged in. Using single-shot fallback meanwhile — \
+                             it runs under the SAME worker home, so it needs the same sign-in"
                         ),
                         fallback_kind::AUTH_REQUIRED,
                     )
@@ -5487,11 +5486,20 @@ pub(crate) fn seat_identity_of(
     crate::skills_snapshot::WorkerCli::for_binaries(&seat_binary, &carrier_binary, cli_key)
 }
 
-fn acp_config_for(cli_key: &str) -> Option<AcpConfig> {
-    // The MERGED registry, not builtin(): a user record replaces its built-in wholesale,
-    // so its [cli.acp] table (or its absence) must decide the transport here exactly as
-    // it does everywhere else.
-    registry_record(cli_key).and_then(|c| c.acp)
+/// ONE registry read for ONE ACP launch: the seat's `[cli.acp]` transport config AND whether the
+/// seat is claude (`seat_identity_of` on the SAME record), or `None` when the seat has no ACP
+/// config. The MERGED registry, not `builtin()`: a user record replaces its built-in wholesale,
+/// so its `[cli.acp]` table (or its absence) must decide the transport here exactly as it does
+/// everywhere else — and its `binary` decides the identity off that same record, never a second,
+/// independent read that a concurrent `clis.toml` edit could make disagree (codex r2, PR#413).
+fn acp_launch_facts(cli_key: &str) -> Option<(AcpConfig, bool)> {
+    let record = registry_record(cli_key);
+    let config = record.as_ref().and_then(|c| c.acp.clone())?;
+    let seat_is_claude = matches!(
+        seat_identity_of(record.as_ref(), cli_key),
+        crate::skills_snapshot::WorkerCli::Claude
+    );
+    Some((config, seat_is_claude))
 }
 
 /// Make the wire-visible disclosure for a governed unit using an ACP adapter that has not passed
@@ -5935,6 +5943,69 @@ mod tests {
             );
         }
         restore_hermetic_worker_home();
+    }
+
+    /// codex r2, PR#413: the ACP launch's transport config and its seat identity are read off ONE
+    /// registry record (`acp_launch_facts`), so an operator override that changes a seat's `binary`
+    /// changes its identity in the SAME resolution that hands out its bridge — never one record's
+    /// bridge paired with another's identity. Pins HOME so the override is the only `clis.toml`.
+    #[test]
+    fn acp_launch_facts_couple_the_bridge_and_the_identity_from_one_record() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = worker_home_base("launch-facts-home");
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            r#"
+[[cli]]
+key = "claude"
+display_name = "Not actually claude"
+binary = "some-other-cli"
+headless_invocation = "some-other-cli -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/overridden/bridge-a"
+transport = "stdio"
+
+[[cli]]
+key = "skills-seat"
+display_name = "Claude under another key"
+binary = "claude"
+headless_invocation = "claude -p \"{PROMPT}\""
+
+[cli.acp]
+binary = "/opt/overridden/bridge-b"
+transport = "stdio"
+"#,
+        )
+        .unwrap();
+        let prior_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &home);
+        let a = acp_launch_facts("claude");
+        let b = acp_launch_facts("skills-seat");
+        let none = acp_launch_facts("no-such-seat");
+        match prior_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        let (cfg_a, claude_a) = a.expect("the override has an ACP table");
+        assert_eq!(
+            cfg_a.binary, "/opt/overridden/bridge-a",
+            "the bridge off THAT record"
+        );
+        assert!(
+            !claude_a,
+            "the key says claude but THAT record's binary does not — identity follows the record"
+        );
+        let (cfg_b, claude_b) = b.expect("the override has an ACP table");
+        assert_eq!(cfg_b.binary, "/opt/overridden/bridge-b");
+        assert!(
+            claude_b,
+            "a claude binary under another key IS a claude seat"
+        );
+        assert!(none.is_none(), "no record, no launch facts");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A NON-claude bridge (codex, pi, copilot, opencode) gets no ambient claude configuration

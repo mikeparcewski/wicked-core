@@ -1421,6 +1421,41 @@ impl WrappedCliStepRunner {
             // exceptions.
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
+            // The seat-aware CLAUDE_CONFIG_DIR decision on the WRAPPED carrier too (codex r2,
+            // PR#413): `hardened()` strips only the engine's own variables, so a wrapped worker
+            // inherited whatever the daemon carried — a non-claude seat an ambient claude config
+            // path it never reads, a claude seat the OPERATOR's login (worked by accident on a
+            // laptop, failed 100% wherever the daemon had a `CLAUDE_CONFIG_DIR`). Judged on the
+            // template's binary through the SAME resolver as the ACP spawn and the ballot: a
+            // claude carrier gets the validated worker home (the login the operator signed in
+            // once), a non-claude carrier gets the variable STRIPPED, the inherit hatch keeps the
+            // operator's own. Fail CLOSED on a resolver error — the launch is refused, never run
+            // under the daemon's configuration.
+            match wicked_apps_core::spawn::claude_config_for_carrier(&binary) {
+                Ok(wicked_apps_core::spawn::CarrierClaudeConfig::Dir(dir)) => {
+                    cmd.env(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, dir);
+                }
+                Ok(wicked_apps_core::spawn::CarrierClaudeConfig::NotClaude) => {
+                    cmd.env_remove(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV);
+                }
+                Ok(wicked_apps_core::spawn::CarrierClaudeConfig::Inherit) => {}
+                Err(e) => {
+                    return StepOutput {
+                        run_id: input.run_id.clone(),
+                        unit_ix: input.unit_ix,
+                        attempt: input.attempt,
+                        output: format!(
+                            "(worker config dir refused the launch of `{cli_key}`: {e}; refusing \
+                             to run the worker under the daemon's own CLI configuration)"
+                        ),
+                        status: StepStatus::Failed,
+                        usage: None,
+                        files: Vec::new(),
+                        tools: Vec::new(),
+                        governed: false,
+                    };
+                }
+            }
             // v3.2 §2, opencode's lever: `OPENCODE_CONFIG_CONTENT` composed WITH whatever the
             // daemon's environment already carries (the operator's own content, if any), gaining
             // `skills.paths` — one path per portable skill in the snapshot. Set AFTER `hardened()`
@@ -4340,6 +4375,129 @@ mod tests {
             out.output.contains("SEEN=[UNSET]"),
             "the worker must not inherit an estate store from the environment; got: {}",
             out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex r2, PR#413: a NON-claude WRAPPED worker (the carrier here is `sh`) gets no ambient
+    /// claude configuration path — the daemon's own `CLAUDE_CONFIG_DIR` is STRIPPED, not inherited.
+    /// A real child records what it saw.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_claude_wrapped_worker_gets_no_ambient_claude_config_dir() {
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("wicked-claude-cfg-strip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.sh");
+        std::fs::write(&probe, "echo \"SEEN=[${CLAUDE_CONFIG_DIR:-UNSET}]\"\n").unwrap();
+        // The daemon's own claude config dir — what a non-claude worker must NOT see.
+        let decoy = dir.join("daemon-config-dir");
+        std::fs::create_dir_all(&decoy).unwrap();
+        let _decoy = VarGuard::set(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, &decoy);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("probe".to_string());
+        u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
+        let input = StepInput {
+            run_id: "run-cfg-strip".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = WrappedCliStepRunner::default().run_unit(&input);
+        assert!(
+            out.output.contains("SEEN=[UNSET]"),
+            "a non-claude wrapped worker must see NO claude config dir — the daemon's is stripped; \
+             got: {}",
+            out.output
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex r2, PR#413: a CLAUDE wrapped worker runs on the worker home — the same validated dir
+    /// the ACP spawn and the ballot use — never on the daemon's `CLAUDE_CONFIG_DIR`. A fake `claude`
+    /// (claude-stemmed binary, so the carrier test selects it) records the variable into a ledger;
+    /// stdout is left to the stream-json adapter.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_wrapped_worker_runs_on_the_worker_home_not_the_daemons_config_dir() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            // The hatch is a supported configuration: the worker inherits ON PURPOSE.
+            return;
+        }
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-claude-cfg-worker-home-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        let worker_home = dir.join("worker");
+        let decoy = dir.join("daemon-config-dir");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&worker_home).unwrap();
+        std::fs::create_dir_all(&decoy).unwrap();
+        let ledger = dir.join("seen-config-dir.txt");
+        let claude = bin.join("claude");
+        std::fs::write(
+            &claude,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{CLAUDE_CONFIG_DIR:-UNSET}}\" > \"{}\"\nexit 0\n",
+                ledger.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _home = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+        let _decoy = VarGuard::set(wicked_apps_core::spawn::CLAUDE_CONFIG_DIR_ENV, &decoy);
+
+        let mut u = WorkUnit::pending("s:u1", "s", 1, "do it");
+        u.assigned_cli = Some("claude".to_string());
+        u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
+        let input = StepInput {
+            run_id: "run-cfg-worker-home".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: u,
+            workflow_id: "wf-x".to_string(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let _out = WrappedCliStepRunner::default().run_unit(&input);
+        let seen = std::fs::read_to_string(&ledger)
+            .expect("the fake claude ran and recorded its config dir")
+            .trim()
+            .to_string();
+        assert_ne!(
+            std::path::PathBuf::from(&seen),
+            decoy,
+            "the wrapped worker inherited the DAEMON's CLAUDE_CONFIG_DIR"
+        );
+        assert_eq!(
+            std::path::PathBuf::from(&seen),
+            worker_home.join("claude"),
+            "the wrapped claude worker runs on the worker home — the same dir the ACP spawn and the \
+             ballot use"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -136,7 +136,11 @@ pub fn worker_home_base() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// [`worker_home_base`] over explicit values: `override_base` is [`WORKER_HOME_ENV`]'s value,
-/// `home`/`userprofile` the two spellings of the home directory (unix, then Windows).
+/// `home`/`userprofile` the two spellings of the home directory. The platform's NATIVE spelling
+/// is consulted first — `USERPROFILE` on Windows (always `C:\Users\<u>`; a Windows host's `HOME`,
+/// when set at all, is frequently a Git-Bash/MSYS `/c/Users/<u>` that is not absolute in the
+/// Windows sense), `HOME` everywhere else — with the other as the fallback. Same order Rust's own
+/// `home_dir` uses.
 pub fn worker_home_base_from(
     override_base: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
@@ -145,15 +149,22 @@ pub fn worker_home_base_from(
     if let Some(base) = override_base {
         return absolute_or_refuse(std::path::PathBuf::from(base), WORKER_HOME_ENV);
     }
-    let (source, home) = match (home, userprofile) {
-        (Some(h), _) => ("HOME", h),
-        (None, Some(u)) => ("USERPROFILE", u),
-        (None, None) => anyhow::bail!("neither HOME nor USERPROFILE is set"),
+    let (primary, secondary) = if cfg!(windows) {
+        (("USERPROFILE", userprofile), ("HOME", home))
+    } else {
+        (("HOME", home), ("USERPROFILE", userprofile))
+    };
+    let (source, home) = match (primary, secondary) {
+        ((name, Some(v)), _) | ((_, None), (name, Some(v))) => (name, v),
+        ((_, None), (_, None)) => anyhow::bail!("neither HOME nor USERPROFILE is set"),
     };
     Ok(absolute_or_refuse(std::path::PathBuf::from(home), source)?.join(".wicked-worker"))
 }
 
-/// The worker home must be spelled absolutely by whichever variable supplied it.
+/// The worker home must be spelled absolutely AND normally by whichever variable supplied it: no
+/// `.` or `..` segments (codex r2, PR#413 — `..` re-aims the resolved dir outside the declared base
+/// while still reading as absolute). Not `fs::canonicalize`d: that FOLLOWS links, which is exactly
+/// what [`refuse_symlinked_home`] exists to refuse, and the home may not exist yet.
 fn absolute_or_refuse(
     path: std::path::PathBuf,
     source: &str,
@@ -169,27 +180,58 @@ fn absolute_or_refuse(
             path.display()
         );
     }
+    // Judged on the literal spelling: `Path::components()` silently normalizes `.` away, and a
+    // `..` that survives it would be resolved by the kernel at every consumer independently.
+    let spelled = path.as_os_str().to_string_lossy();
+    if spelled
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+    {
+        anyhow::bail!(
+            "{source}={} contains a `.` or `..` segment; the worker home must be spelled as a plain \
+             absolute path (a `..` re-aims the resolved directory outside the declared base)",
+            path.display()
+        );
+    }
     Ok(path)
 }
 
-/// Refuse a worker config home whose directory — or whose parent — is a symlink, judged on
-/// `symlink_metadata` (never a following stat). A link planted at either component re-aims every
-/// write the CLI makes there AND every credential it reads: `<worker home>/claude -> ~/.claude`
-/// would hand a seat the OPERATOR's login. ONE check for both spawn paths (codex review, PR#413:
-/// the ACP spawn refused this and the ballot spawn did not). A missing component is fine — the
-/// ACP spawn creates the home on first start.
+/// Refuse a worker config home reached through a PLANTED symlink at ANY component — judged on
+/// `symlink_metadata` (never a following stat), walking from the filesystem root of the declared
+/// path down to the leaf (codex r2, PR#413: checking only the leaf and its parent let an
+/// intermediate link re-aim `CLAUDE_CONFIG_DIR` and the ACP sanitization outside the declared
+/// target). A link planted at any component re-aims every write the CLI makes there AND every
+/// credential it reads: `<worker home>/claude -> ~/.claude` would hand a seat the OPERATOR's
+/// login. ONE check for every consumer — applied by [`worker_claude_config_dir`] itself, and again
+/// by the ACP spawn's `ensure_worker_config_home` after it creates the home.
+///
+/// "Planted" means writable by the user this engine runs as. A symlink component owned by root
+/// (unix uid 0 — macOS's `/var -> /private/var` and `/tmp -> /private/tmp`, an NFS automount's
+/// `/home/<u>`) is system-managed and cannot be planted by a same-uid attacker; it is followed.
+/// Every other symlink component is refused by name. On non-unix hosts (no owner uid to judge)
+/// every symlink component is refused. A missing component ends the walk — nothing below it exists
+/// yet; the ACP spawn creates the home on first start.
 pub fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
-    for probe in [dir.parent(), Some(dir)].into_iter().flatten() {
-        match std::fs::symlink_metadata(probe) {
+    let mut probe = std::path::PathBuf::new();
+    for component in dir.components() {
+        probe.push(component.as_os_str());
+        // A bare Windows drive prefix (`C:`) is not a filesystem entry — it is stat'ed together
+        // with the root separator on the next component (`C:\`).
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&probe) {
             Ok(m) if m.file_type().is_symlink() => {
-                anyhow::bail!(
-                    "refusing worker config home {}: {} is a symlink",
-                    dir.display(),
-                    probe.display()
-                );
+                if symlink_is_planted(&m) {
+                    anyhow::bail!(
+                        "refusing worker config home {}: {} is a symlink",
+                        dir.display(),
+                        probe.display()
+                    );
+                }
             }
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
             Err(e) => {
                 anyhow::bail!(
                     "refusing worker config home {}: cannot stat {} ({e})",
@@ -200,6 +242,21 @@ pub fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a symlink with these (non-following) metadata could have been planted by the user this
+/// engine runs as: on unix, any owner but root; elsewhere, always.
+fn symlink_is_planted(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid() != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
+    }
 }
 
 /// The claude seat's configuration directory — `<worker home base>/claude` — the ONE answer to
@@ -221,28 +278,31 @@ pub fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
 ///    under (F-013: it used to hard-code `$HOME/.wicked-worker/claude`, wrong under
 ///    [`WORKER_HOME_ENV`]).
 ///
-/// Pure path resolution (always absolute, see [`worker_home_base`]) — no filesystem access. The
-/// no-follow validation every consumer must apply before USING the path is
-/// [`refuse_symlinked_home`]; [`seat_claude_config_dir`] applies it. Creating the directory
-/// (private, re-sanitized) stays with the ACP spawn path; a ballot on a not-yet-created home simply
-/// runs a CLI that is not signed in there, which is then reported as such.
+/// The ONE validated form every consumer uses (codex r2, PR#413): absolute and normally spelled
+/// (see [`worker_home_base`]) AND no-follow checked at every component ([`refuse_symlinked_home`])
+/// — so the ACP spawn, the ballot spawn, the wrapped worker and the sign-in command all name, and
+/// run under, the same directory. Creating the directory (private, re-sanitized) stays with the ACP
+/// spawn path; a ballot on a not-yet-created home simply runs a CLI that is not signed in there,
+/// which is then reported as such.
 pub fn worker_claude_config_dir() -> anyhow::Result<std::path::PathBuf> {
-    Ok(worker_home_base()?.join("claude"))
+    let dir = worker_home_base()?.join("claude");
+    refuse_symlinked_home(&dir)?;
+    Ok(dir)
 }
 
 /// The [`CLAUDE_CONFIG_DIR_ENV`] value a CLAUDE seat spawn sets, after `hardened()`: `None` under
 /// the operator's explicit [`INHERIT_OPERATOR_CONFIG_ENV`] hatch (inherit — the operator's own
-/// configuration IS the intent), else the VALIDATED [`worker_claude_config_dir`] — absolute by
-/// construction and no-follow checked ([`refuse_symlinked_home`]). An `Err` is the resolver
-/// failing (no home directory, a relative override, a planted link); callers fail CLOSED on it — a
-/// seat that proceeded would run under the daemon's inherited configuration, or under whatever
-/// directory a link points at, which are the exact leaks this exists to remove. Carrier-agnostic:
-/// [`claude_config_for_carrier`] is the seat-aware form spawns use.
+/// configuration IS the intent), else the validated [`worker_claude_config_dir`]. An `Err` is the
+/// resolver failing (no home directory, a relative or `..` override, a planted link at any
+/// component); callers fail CLOSED on it — a seat that proceeded would run under the daemon's
+/// inherited configuration, or under whatever directory a link points at, which are the exact leaks
+/// this exists to remove. Carrier-agnostic: [`claude_config_for_carrier`] is the seat-aware form
+/// spawns use.
 pub fn seat_claude_config_dir() -> Option<anyhow::Result<std::path::PathBuf>> {
     if inherits_operator_config() {
         return None;
     }
-    Some(worker_claude_config_dir().and_then(|dir| refuse_symlinked_home(&dir).map(|()| dir)))
+    Some(worker_claude_config_dir())
 }
 
 /// Whether `bin` names claude: judged on the file STEM so `claude`, `/usr/local/bin/claude`,
@@ -435,14 +495,28 @@ mod tests {
             PathBuf::from(&worker),
             "WICKED_WORKER_HOME is the base itself, not a parent of it"
         );
+        // Both set: the platform's NATIVE spelling wins (USERPROFILE on Windows, HOME elsewhere).
+        let native = if cfg!(windows) { &profile } else { &home };
         assert_eq!(
             base(None, Some(&home), Some(&profile)).unwrap(),
-            PathBuf::from(&home).join(".wicked-worker")
+            PathBuf::from(native).join(".wicked-worker")
         );
+        // Only the other one set: it is the fallback on every platform.
         assert_eq!(
             base(None, None, Some(&profile)).unwrap(),
             PathBuf::from(&profile).join(".wicked-worker")
         );
+        assert_eq!(
+            base(None, Some(&home), None).unwrap(),
+            PathBuf::from(&home).join(".wicked-worker")
+        );
+        // A Windows host whose HOME is a Git-Bash spelling still resolves through USERPROFILE.
+        if cfg!(windows) {
+            assert_eq!(
+                base(None, Some("/c/Users/op"), Some(&profile)).unwrap(),
+                PathBuf::from(&profile).join(".wicked-worker")
+            );
+        }
         let err = base(None, None, None).expect_err("no home at all must not invent one");
         assert!(err.to_string().contains("HOME"), "{err}");
     }
@@ -554,7 +628,52 @@ mod tests {
         let err = refuse_symlinked_home(&scratch.join("linked-base").join("claude"))
             .expect_err("link at the parent");
         assert!(err.to_string().contains("symlink"), "{err}");
+        // codex r2: a link at an INTERMEDIATE component — two levels above the leaf, where the old
+        // leaf+parent check never looked — is refused too, and named.
+        std::os::unix::fs::symlink(&operator_like, scratch.join("mid")).unwrap();
+        let deep = scratch.join("mid").join("worker").join("claude");
+        let err = refuse_symlinked_home(&deep).expect_err("link at an intermediate component");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&scratch.join("mid").display().to_string()),
+            "names the planted component: {err}"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// codex r2, PR#413: a `.` or `..` segment is refused at the resolver even though the path
+    /// reads as absolute — a `..` re-aims the resolved dir outside the declared base, and each
+    /// consumer would otherwise have the kernel resolve it independently.
+    #[test]
+    fn a_dot_or_dotdot_segment_in_the_worker_home_is_refused() {
+        use std::ffi::OsString;
+        let home = abs("home/op");
+        for bad in [
+            abs("home/op/../other"),
+            abs("home/./op/worker"),
+            abs("home/op/worker/.."),
+        ] {
+            let err =
+                worker_home_base_from(Some(OsString::from(&bad)), None, None).expect_err(&bad);
+            assert!(err.to_string().contains("segment"), "{bad}: {err}");
+            assert!(err.to_string().contains(WORKER_HOME_ENV), "{bad}: {err}");
+        }
+        // The home directory spelling is held to the same bar.
+        let err = worker_home_base_from(None, Some(OsString::from(abs("home/../op"))), None)
+            .expect_err("dotdot in HOME");
+        assert!(err.to_string().contains("segment"), "{err}");
+        // A plain absolute path — and a leading `.` that is merely part of a NAME — still resolve.
+        assert!(worker_home_base_from(Some(OsString::from(&home)), None, None).is_ok());
+        assert!(
+            worker_home_base_from(
+                Some(OsString::from(abs("home/op/.wicked-worker"))),
+                None,
+                None
+            )
+            .is_ok(),
+            "`.wicked-worker` is a name, not a `.` segment"
+        );
     }
 
     /// The seat dir the ballot sets is exactly `<base>/claude` — the SAME directory the ACP worker
