@@ -15,6 +15,30 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Added
+- **Dead letters carry when and who; the emit seam gets a read side and a drain (wicked-crew#495,
+  acceptance finding F-022).** Every record the emit seam spools to the dead-letter outbox
+  (`wicked-apps-core::emit`, `WICKED_APPS_EMIT_DEADLETTER`) is now stamped with `ts` (epoch
+  milliseconds, the CoreEvent convention), `pid`, and `origin` — the launcher's "who am I" from the
+  new `WICKED_APPS_EMIT_ORIGIN` variable (`emit::ORIGIN_ENV`; wicked-crew `serve` exports
+  `wicked-crew@<version> serve pid=… port=… db=…`), absent when unset. Before this a host-wide
+  outbox of 3,400+ governance events (every default install dead-lettered every conformance claim,
+  phase transition and rule-lifecycle event, because nothing set `WICKED_ESTATE_DB`) had no
+  recoverable order and no way to tell two daemons' entries apart. Two library functions and two
+  `Core` statics on `wicked-core-ts` close the loop: `emit::count_events(&store)` /
+  `Core.eventStoreCount(dbPath)` (EVENT nodes on a store, read-only — crew's `/diagnostics`
+  reports `governance.records.total` / `sinceBoot`), and `emit::replay_outbox(path, &mut store)` /
+  `Core.replayEmitOutbox(outboxPath, dbPath)` (each record lands as the EVENT node it should have
+  been, with its ORIGINAL `ts` restored so id order stays chronological, plus `replayed: true`,
+  `replayed_at_ms`, `deadletter_reason` and `spooled_by` provenance; torn or non-record lines are
+  reported verbatim in `{ read, replayed, already_present, failed: [{ line, reason }] }`, never
+  re-spooled and never fatal — behind `wicked-crew governance replay`). Replay is IDEMPOTENT: a
+  replayed node's id is the spool line's SHA-256 (first 16 hex) plus its original stamp — never the
+  replaying pid or a fresh sequence — so the same line replayed twice (a second run on an archive,
+  a restore-and-retry) lands once and is reported `already_present`; each record is its own
+  autocommit upsert, so a failed record leaves no open batch for the next one to commit into and is
+  repaired by the next replay. The `open shared store failed: …` reason redacts URL userinfo before
+  it reaches stderr or the spool. No default changes: the spool path resolution and the store
+  resolution are untouched; crew resolves and exports both variables from its state home.
 - **Evaluator phases cannot mutate the worktree; `verify` runs the repo's own checks as a
   deterministic floor (F-036 / F-039).** The acceptance run's `bug/verify` evaluator (codex,
   unchecked — governance is claude-only) REWROTE the fix it was reviewing and passed its own gate
