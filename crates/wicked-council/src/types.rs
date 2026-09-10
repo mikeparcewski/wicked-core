@@ -997,6 +997,11 @@ mod login_tests {
     /// the platform hosts them in a PTY and never implements provider auth itself.
     #[test]
     fn every_builtin_seat_has_a_default_login_invocation() {
+        // READ side of the crate-wide env lock: the claude sign-in command below RESOLVES
+        // `WICKED_WORKER_HOME`, which the env-mutating tests in this binary pin to fixtures.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         // Iterated off the REAL registry so a newly added seat without a sign-in command
         // fails here (Copilot, PR#278) — a hardcoded key list can't catch new seats.
         let builtins = crate::registry::builtin();
@@ -1042,10 +1047,6 @@ mod login_tests {
         }
     }
 
-    /// Serializes the env-mutating login test against the dispatch tests that mutate the same
-    /// variables (they live in another module of this binary; cargo runs them in parallel).
-    static LOGIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// codex, PR#413: when the seat dir cannot be resolved there is NO sign-in command — the ballot
     /// refuses to spawn on that value, so a fallback spelling would send the operator to sign in a
     /// directory no seat runs under. A relative `WICKED_WORKER_HOME` is the reproducible case.
@@ -1055,7 +1056,11 @@ mod login_tests {
             // Under the hatch the sign-in is plain `claude` regardless of the worker home.
             return;
         }
-        let _g = LOGIN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // WRITE side of the crate-wide env lock: this test MUTATES `WICKED_WORKER_HOME`, which the
+        // dispatch module's tests also pin (Copilot, PR#413: one lock, not one per module).
+        let _g = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
         std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
         let login = default_login_invocation("claude");

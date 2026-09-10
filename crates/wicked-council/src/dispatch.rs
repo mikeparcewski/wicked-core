@@ -1335,11 +1335,12 @@ mod failure_diagnostics_tests {
         assert!(summary.contains("diagnostic-needle"), "{summary}");
     }
 
-    /// Serializes the env-mutating tests below (they MUTATE process-global environment the ballot
-    /// spawn resolves mid-call: `WICKED_WORKER_HOME`, `CLAUDE_CONFIG_DIR`, `PATH`) against each
-    /// other. Every other test in this binary only READS those through a spawned `sh`/`cmd` that
-    /// ignores them.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The CRATE-WIDE env lock (`crate::test_env`), not a module-local one (Copilot, PR#413): the
+    /// tests below MUTATE process-global environment the ballot spawn resolves mid-call
+    /// (`WICKED_WORKER_HOME`, `CLAUDE_CONFIG_DIR`, `PATH`), and the `types` module's tests resolve
+    /// and mutate the same variables in this same binary. Mutators hold `write()`. Every other test
+    /// here only READS those through a spawned `sh`/`cmd` that ignores them.
+    use crate::test_env::ENV_LOCK;
 
     /// Pin one environment variable for the test's duration; restores the prior value (or its
     /// absence) on drop, so a failing assertion cannot leak the fixture to the next test.
@@ -1439,7 +1440,7 @@ mod failure_diagnostics_tests {
         if wicked_apps_core::spawn::inherits_operator_config() {
             return;
         }
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let scratch = f030_scratch("claude");
         let bin = scratch.join("bin");
         let worker_home = scratch.join("worker");
@@ -1488,7 +1489,7 @@ mod failure_diagnostics_tests {
     #[test]
     #[cfg(unix)]
     fn a_non_claude_ballot_gets_no_ambient_claude_config_dir() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let scratch = f030_scratch("codex");
         let bin = scratch.join("bin");
         let worker_home = scratch.join("worker");
@@ -1529,7 +1530,7 @@ mod failure_diagnostics_tests {
             // Under the hatch no worker dir is resolved for the ballot at all.
             return;
         }
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
         let cli = seat(
             "claude",
@@ -1563,7 +1564,7 @@ mod failure_diagnostics_tests {
         if wicked_apps_core::spawn::inherits_operator_config() {
             return;
         }
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let scratch = f030_scratch("symlink");
         let bin = scratch.join("bin");
         let worker_home = scratch.join("worker");
@@ -1599,7 +1600,7 @@ mod failure_diagnostics_tests {
         if wicked_apps_core::spawn::inherits_operator_config() {
             return;
         }
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let scratch = f030_scratch("mid-symlink");
         let bin = scratch.join("bin");
         let real = scratch.join("real");
@@ -1634,7 +1635,7 @@ mod failure_diagnostics_tests {
         if wicked_apps_core::spawn::inherits_operator_config() {
             return;
         }
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
         for spelled in [
             r"C:\wicked-council-no-such-dir\CLAUDE.EXE --print",
@@ -1656,7 +1657,7 @@ mod failure_diagnostics_tests {
     #[test]
     #[cfg(unix)]
     fn a_differently_cased_claude_is_not_a_claude_carrier_on_a_case_sensitive_filesystem() {
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
         let cli = seat(
             "claude",
@@ -1682,7 +1683,7 @@ mod failure_diagnostics_tests {
         if wicked_apps_core::spawn::inherits_operator_config() {
             return;
         }
-        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let sneaky = std::env::temp_dir().join("x").join("..").join("y");
         assert!(
             sneaky.is_absolute(),
