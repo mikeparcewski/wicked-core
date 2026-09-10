@@ -127,7 +127,7 @@ impl FromNode for RepoEntry {
         let mut entry: RepoEntry =
             serde_json::from_value(serde_json::Value::Object(node.metadata.clone()))
                 .map_err(|e| anyhow::anyhow!("node {} is not a valid RepoEntry: {e}", node.name))?;
-        let (code_graph_db, findings) = code_graph_db_and_findings(&entry.root_path);
+        let (code_graph_db, findings) = code_graph_db_and_findings(&entry.id, &entry.root_path);
         entry.code_graph_db = code_graph_db;
         entry.findings = findings;
         Ok(entry)
@@ -137,8 +137,9 @@ impl FromNode for RepoEntry {
 /// This repo's code-graph path, absolute, derived from its root through the engine's ONE resolver
 /// (`code_graph::resolved_code_graph_db`: `<repo-graph root>/<key>/estate.db`, never in the tree —
 /// core#406), plus the checkout diagnostics that ride the record with it. The only spelling any
-/// consumer needs.
-fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
+/// consumer needs. `repo_id` is only for the messages (the re-onboard remedy names the real
+/// `POST /repos/<id>/onboard`).
+fn code_graph_db_and_findings(repo_id: &str, root_path: &str) -> (String, Vec<RepoFinding>) {
     let root = Path::new(root_path);
     let mut findings = Vec::new();
     let code_graph_db = match crate::code_graph::resolved_code_graph_db(root) {
@@ -171,7 +172,7 @@ fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
         } else {
             format!(
                 "no graph has been indexed under the state home yet — re-run onboarding \
-                 (POST /repos/<id>/onboard) to build {code_graph_db}"
+                 (POST /repos/{repo_id}/onboard) to build {code_graph_db}"
             )
         };
         findings.push(RepoFinding {
@@ -193,7 +194,7 @@ fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
 /// [`code_graph_db_and_findings`]'s path half — what the tests compare records against.
 #[cfg(test)]
 fn code_graph_db(root_path: &str) -> String {
-    code_graph_db_and_findings(root_path).0
+    code_graph_db_and_findings("test-repo", root_path).0
 }
 
 /// The one-line boot notice for a registered repo that carries an in-tree graph and has NO live
@@ -311,9 +312,10 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         })?
         .to_string_lossy()
         .into_owned();
-    let (code_graph_db, findings) = code_graph_db_and_findings(&root_path);
+    let id = slug(&spec.name);
+    let (code_graph_db, findings) = code_graph_db_and_findings(&id, &root_path);
     let entry = RepoEntry {
-        id: slug(&spec.name),
+        id,
         name: spec.name,
         code_graph_db,
         findings,
@@ -1342,7 +1344,7 @@ mod tests {
         let in_tree = dirty.join(crate::code_graph::code_graph_rel());
         std::fs::create_dir_all(in_tree.parent().unwrap()).unwrap();
         std::fs::write(&in_tree, b"indexed in-tree by an older engine").unwrap();
-        let (db, findings) = code_graph_db_and_findings(dirty.to_str().unwrap());
+        let (db, findings) = code_graph_db_and_findings("dirty", dirty.to_str().unwrap());
         assert_eq!(
             db,
             crate::code_graph::repo_graph_db_at(&root, &dirty).to_string_lossy(),
@@ -1365,7 +1367,7 @@ mod tests {
         // there — and the boot notice fires for exactly this state.
         assert!(
             findings[0].message.contains("re-run onboarding")
-                && findings[0].message.contains("POST /repos/<id>/onboard")
+                && findings[0].message.contains("POST /repos/dirty/onboard")
                 && !findings[0].message.contains("the live graph is"),
             "{}",
             findings[0].message
@@ -1390,7 +1392,7 @@ mod tests {
         // Once a graph exists under the root, the message flips to "live" and the notice stops.
         std::fs::create_dir_all(Path::new(&db).parent().unwrap()).unwrap();
         std::fs::write(&db, b"indexed under the state home").unwrap();
-        let (_, live_findings) = code_graph_db_and_findings(dirty.to_str().unwrap());
+        let (_, live_findings) = code_graph_db_and_findings("dirty", dirty.to_str().unwrap());
         assert!(
             live_findings[0]
                 .message
@@ -1424,7 +1426,7 @@ mod tests {
         // A clean checkout → the root path, no findings, and deriving pollutes nothing.
         let clean = base.join("clean");
         std::fs::create_dir_all(&clean).unwrap();
-        let (db, findings) = code_graph_db_and_findings(clean.to_str().unwrap());
+        let (db, findings) = code_graph_db_and_findings("clean", clean.to_str().unwrap());
         assert_eq!(
             db,
             crate::code_graph::repo_graph_db_at(&root, &clean).to_string_lossy()

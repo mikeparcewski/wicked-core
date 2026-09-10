@@ -698,11 +698,14 @@ struct StepBudget {
 }
 
 impl StepBudget {
-    /// The boot-time budget: 256 pages a step, ~5 s of a locked source, 60 s wall clock, and a
-    /// step cap (2 GB at 4 KiB pages) that only a restarting backup could reach first.
+    /// The boot-time budget: 256 pages a step, ~5 s of a locked source, and the 60 s WALL CLOCK
+    /// as the real bound. The step cap is a backstop far above any legacy graph's size (50 000 ×
+    /// 256 pages ≈ 50 GB at 4 KiB pages) — it exists so a backup that a live writer keeps
+    /// restarting cannot spin past the wall clock unnoticed, never to fail a large graph that the
+    /// clock would have allowed (independent review R2).
     const BOOT: StepBudget = StepBudget {
         pages_per_step: 256,
-        max_steps: 2_000,
+        max_steps: 50_000,
         max_locked_steps: 200,
         max_wall: std::time::Duration::from_secs(60),
     };
