@@ -23,7 +23,7 @@
 //! The spool root resolves via `std::env::var_os("HOME")` / `USERPROFILE` joined with
 //! `std::path::Path` segments (never a hardcoded `~`), overridable via [`DEADLETTER_ENV`].
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -397,24 +397,23 @@ fn parse_spool_line(line: &str) -> Result<SpoolLine, String> {
 /// without a stamp lands at replay time. Every replayed node also keeps its provenance:
 /// `replayed: true`, the `deadletter_reason` it was spooled with, and `spooled_by` (the origin)
 /// when present. Failures are REPORTED, never re-spooled here (the caller owns the live outbox and
-/// decides what to append back); one bad line never stops the rest. Reads the file in one pass;
-/// the caller is expected to have moved the live outbox aside first so a concurrent emitter's
-/// appends are not read half-written.
+/// decides what to append back); one bad line never stops the rest. Streams the file line by
+/// line — never the whole outbox in memory (a host-wide outbox once reached 227 MB); an I/O error
+/// mid-file surfaces as the `Err`. The caller is expected to have moved the live outbox aside
+/// first so a concurrent emitter's appends are not read half-written.
 pub fn replay_outbox(path: &Path, store: &mut dyn GraphStore) -> std::io::Result<ReplayReport> {
-    let body = std::fs::read_to_string(path)?;
+    let reader = BufReader::new(std::fs::File::open(path)?);
     let mut report = ReplayReport::default();
-    for line in body.lines() {
+    for line in reader.lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
         report.read += 1;
-        let parsed = match parse_spool_line(line) {
+        let parsed = match parse_spool_line(&line) {
             Ok(p) => p,
             Err(reason) => {
-                report.failed.push(ReplayFailure {
-                    line: line.to_string(),
-                    reason,
-                });
+                report.failed.push(ReplayFailure { line, reason });
                 continue;
             }
         };
@@ -439,7 +438,7 @@ pub fn replay_outbox(path: &Path, store: &mut dyn GraphStore) -> std::io::Result
         match write_event_node(store, node) {
             Ok(()) => report.replayed += 1,
             Err(e) => report.failed.push(ReplayFailure {
-                line: line.to_string(),
+                line,
                 reason: format!("store write failed: {e}"),
             }),
         }
