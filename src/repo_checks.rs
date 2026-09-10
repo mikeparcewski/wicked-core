@@ -288,10 +288,12 @@ fn last_lines(tail: &str) -> String {
     }
 }
 
-/// A probed worktree entry: present, not a symlink, and opened without following links.
+/// A probed worktree entry: present, not a symlink, and — for a regular file — opened without
+/// following links (`file` is `None` for a directory: a directory is only ever tested for
+/// presence, never read, and Windows refuses to `open` one).
 struct Probed {
     meta: std::fs::Metadata,
-    file: std::fs::File,
+    file: Option<std::fs::File>,
 }
 
 impl Probed {
@@ -341,6 +343,14 @@ fn probe(worktree: &Path, rel: &str) -> Result<Option<Probed>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("`{rel}` could not be inspected: {e}")),
     };
+    if lstat.is_dir() {
+        // Presence is all a directory probe answers (`node_modules/`); nothing is read from it,
+        // so there is no open to race — the lstat already refused a link.
+        return Ok(Some(Probed {
+            meta: lstat,
+            file: None,
+        }));
+    }
     let file = match open_nofollow(&p) {
         Ok(f) => f,
         Err(e) => {
@@ -384,7 +394,10 @@ fn probe(worktree: &Path, rel: &str) -> Result<Option<Probed>, String> {
     if meta.file_type().is_symlink() {
         return Err(format!("`{rel}` is a symlink (refused)"));
     }
-    Ok(Some(Probed { meta, file }))
+    Ok(Some(Probed {
+        meta,
+        file: Some(file),
+    }))
 }
 
 /// Which package manager a Node repo uses, read off its lockfile (npm when none says otherwise).
@@ -406,15 +419,14 @@ fn s(v: &[&str]) -> Vec<String> {
 /// `Err` when a manifest exists but cannot be trusted (unreadable, malformed, a symlink).
 pub fn detect(worktree: &Path) -> Result<Vec<RepoCheck>, String> {
     let mut out = Vec::new();
-    if let Some(mut probed) = probe(worktree, "package.json")? {
-        if !probed.is_file() {
+    if let Some(probed) = probe(worktree, "package.json")? {
+        let is_file = probed.is_file();
+        let Some(mut file) = probed.file.filter(|_| is_file) else {
             return Err("`package.json` is not a regular file".to_string());
-        }
+        };
         // Read from the descriptor the probe opened — never the path again.
         let mut raw = String::new();
-        probed
-            .file
-            .read_to_string(&mut raw)
+        file.read_to_string(&mut raw)
             .map_err(|e| format!("`package.json` could not be read: {e}"))?;
         let json: serde_json::Value = serde_json::from_str(&raw)
             .map_err(|e| format!("`package.json` is not valid JSON: {e}"))?;

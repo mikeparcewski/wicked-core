@@ -265,6 +265,56 @@ struct Gate {
     combined: bool,
 }
 
+/// Codex review on #414: the repo checks floor NEVER runs repo-controlled scripts without an OS
+/// write boundary — on a host with no `sandbox-exec`/`bwrap` (a bare Linux CI runner) the floor
+/// fails CLOSED and the gate denies with that reason. The tests below that expect the checks to
+/// have RUN branch on this: where the host cannot arm a boundary they assert the fail-closed
+/// contract instead (denied, source `repo_checks`, nothing ran) — never a silent skip.
+fn checks_refused_without_a_boundary(gate: &Gate) -> bool {
+    gate.denial_source.as_deref() == Some("repo_checks")
+        && gate
+            .denial_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("no OS write boundary could be armed"))
+}
+
+/// The fail-closed shape on the wire: `repoChecksEvaluated` fired for `ord`, `passed: false`, no
+/// check ran, and the gate's reason says the checks were NOT run.
+fn assert_fail_closed_without_boundary(evs: &[CoreEvent], gate: &Gate, ord: u32) {
+    eprintln!(
+        "evaluator_worktree_guard: no OS-sandbox tool on this host — asserting the fail-closed \
+         repo-checks contract instead of the ran-checks path"
+    );
+    assert!(
+        !gate.combined && !gate.deterministic_pass,
+        "{:?}",
+        gate.denial_reason
+    );
+    assert!(
+        gate.denial_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("NOT run") && r.contains("fail-closed")),
+        "{:?}",
+        gate.denial_reason
+    );
+    let (passed, checks) = evs
+        .iter()
+        .find_map(|ev| match ev {
+            CoreEvent::RepoChecksEvaluated {
+                ord: o,
+                passed,
+                checks,
+                ..
+            } if *o == ord => Some((*passed, checks.clone())),
+            _ => None,
+        })
+        .expect("repoChecksEvaluated emitted even when the floor refused to run");
+    assert!(
+        !passed && checks.is_empty(),
+        "nothing may run unsandboxed: {checks:?}"
+    );
+}
+
 fn gate_for(events: &[CoreEvent], want_ord: u32) -> Gate {
     events
         .iter()
@@ -425,10 +475,25 @@ fn a_clean_evaluator_passes_and_the_repo_checks_are_the_gates_evidence() {
     let events = core.subscribe();
     core.launch_run(bug_run("r-clean", &entry.id))
         .expect("launch");
-    assert!(
-        wait_status(&core, "r-clean", SessionStatus::Completed),
-        "a clean evaluator over passing checks completes the run"
-    );
+    let completed = wait_status(&core, "r-clean", SessionStatus::Completed);
+    if !completed {
+        // The one legitimate way this run does NOT complete: the host cannot arm a write
+        // boundary, so the floor refused to run the checks and the gate escalated.
+        assert!(
+            wait_status(&core, "r-clean", SessionStatus::AwaitingHuman),
+            "a clean evaluator over passing checks completes the run"
+        );
+        let evs = drain(&events);
+        let verify = gate_for(&evs, 4);
+        assert!(
+            checks_refused_without_a_boundary(&verify),
+            "a clean evaluator over passing checks completes the run: {:?}",
+            verify.denial_reason
+        );
+        assert_fail_closed_without_boundary(&evs, &verify, 4);
+        let _ = std::fs::remove_dir_all(&repo);
+        return;
+    }
     let evs = drain(&events);
 
     let verify = gate_for(&evs, 4);
@@ -518,6 +583,18 @@ fn a_passing_check_that_mutates_source_is_caught_by_the_final_comparison() {
     let evs = drain(&events);
     let verify = gate_for(&evs, 4);
     assert!(!verify.combined);
+    if checks_refused_without_a_boundary(&verify) {
+        // No boundary ⇒ the mutating script never ran, so there is no write for the final
+        // comparison to catch; the floor's refusal is the denial, and the tree stayed clean.
+        assert_fail_closed_without_boundary(&evs, &verify, 4);
+        assert!(
+            !evs.iter()
+                .any(|ev| matches!(ev, CoreEvent::EvaluatorMutatedWorktree { .. })),
+            "nothing ran, so nothing mutated"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+        return;
+    }
     assert_eq!(
         verify.denial_source.as_deref(),
         Some("worktree_guard"),
@@ -571,6 +648,11 @@ fn a_failing_repo_check_denies_the_verify_gate_with_the_exit_code_as_evidence() 
         "the deterministic layer failed — the repo checks are part of it"
     );
     assert_eq!(verify.denial_source.as_deref(), Some("repo_checks"));
+    if checks_refused_without_a_boundary(&verify) {
+        assert_fail_closed_without_boundary(&evs, &verify, 4);
+        let _ = std::fs::remove_dir_all(&repo);
+        return;
+    }
     let reason = verify.denial_reason.expect("reason");
     assert!(
         reason.contains("cargo-test: exit 101") && reason.contains("test result: FAILED"),
