@@ -768,7 +768,7 @@ mod tests {
             before
                 .git_dir
                 .as_deref()
-                .is_some_and(|d| d.contains(".git/worktrees/")),
+                .is_some_and(|d| d.replace('\\', "/").contains(".git/worktrees/")),
             "pinned from the registered repo: {:?}",
             before.git_dir
         );
