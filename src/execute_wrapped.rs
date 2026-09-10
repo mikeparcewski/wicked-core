@@ -285,10 +285,12 @@ const DENIED_HOME_SUBDIRS: &[&str] = &[
     // the one database whose loss ends the campaign. The MCP no longer hands a worker this store; this
     // is the other half — a worker that goes looking for it by path.
     ".wicked-crew",
-    // The operator's own default code graph (a DIFFERENT repo's index) AND, since the estate-home
-    // ADR (code_graph.rs), the per-repo graph root — this deny governs the FILE tools only; the
-    // worker reaches its OWN graph through the estate MCP and Bash, which is how graph access is
-    // supposed to happen, and file-tool reads of sibling repos' graphs stay denied.
+    // The operator's own default code graph (a DIFFERENT repo's index) AND the pre-core#406
+    // `repo-graphs` root (the migration source, left in place). The LIVE per-repo graphs sit under
+    // the state home (`<state home>/repo-graphs`, code_graph.rs ADR) — `.wicked-crew` above for the
+    // default daemon, the state-home registry rule for a custom `--db`. Either way this deny governs
+    // the FILE tools only; the worker reaches its OWN graph through the estate MCP and Bash, which is
+    // how graph access is supposed to happen, and file-tool reads of sibling repos' graphs stay denied.
     ".wicked-estate",
     ".wicked-brain",     // an index of a DIFFERENT repo than the one under test
     ".something-wicked", // ecosystem app state (event outbox, app dbs)
@@ -1418,10 +1420,9 @@ impl WrappedCliStepRunner {
             // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP
             // admission, and wrapped deny fence. It is WRITE containment only — not a read jail
             // or exfiltration/DLP protection; worker model egress remains open.
-            let graph_write = input
-                .governance
-                .as_ref()
-                .and_then(|g| graph_write_dir(g.code_graph_db.as_deref()));
+            let graph_write = input.governance.as_ref().and_then(|g| {
+                graph_write_dir(g.code_graph_db.as_deref(), self.operational_home.as_deref())
+            });
             let worker_write_roots = input.governance.as_ref().map_or_else(
                 || vec![cwd.clone()],
                 |g| armed_write_root_paths(&cwd, &g.extra_write_roots, graph_write.as_deref()),
@@ -1565,17 +1566,19 @@ impl WrappedCliStepRunner {
                 arm_worker_estate_channel(&mut cmd, g);
                 // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE roots are the
                 // worktree FIRST, then only the LAUNCHER-declared deliverable roots riding the
-                // governance context (core#259 — validated at launch against the pin tree), plus —
-                // when and only when the repo's graph lives in the ESTATE HOME — that graph's own
-                // key directory (WAL-mode SQLite creates `-wal`/`-shm`/journal siblings; see
-                // `graph_write_dir`); guarded by `the_launcher_arms_the_write_root`: any wider
-                // root would let a governed worker rewrite the pin/workflow that gates its own
-                // work (the FINDING-098 escape). The graph dir is ENGINE-resolved off the actor's
-                // `code_graph_db`, never worker-controlled, and is exactly one key dir — a sibling
-                // repo's graph stays out of reach. A LEGACY in-tree graph adds no write root
-                // (byte-identical pre-ADR boundary): the extractor's annotation writes ride
-                // `wicked-estate annotate` (a Bash call), which `boundary_denial` does not
-                // path-judge; only Write/Edit/Read tool-calls carrying a `path` are judged.
+                // governance context (core#259 — validated at launch against the pin tree), plus
+                // that graph's own key directory under THIS daemon's repo-graph root (WAL-mode
+                // SQLite creates `-wal`/`-shm`/journal siblings; see `graph_write_dir`); guarded
+                // by `the_launcher_arms_the_write_root`: any wider root would let a governed
+                // worker rewrite the pin/workflow that gates its own work (the FINDING-098
+                // escape). The graph dir is ENGINE-resolved off the actor's `code_graph_db`,
+                // never worker-controlled, and is exactly one key dir — a sibling repo's graph
+                // stays out of reach. A `code_graph_db` in any other shape (an in-tree path from a
+                // pre-core#406 record included) adds NO write root: a graph is never in the tree,
+                // and widening on a path nobody vouched for is the escape itself. The extractor's
+                // annotation writes ride `wicked-estate annotate` (a Bash call), which
+                // `boundary_denial` does not path-judge; only Write/Edit/Read tool-calls carrying
+                // a `path` are judged.
                 cmd.env(
                     crate::gate_hook::WRITE_ROOTS_ENV,
                     armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref()),
@@ -1600,23 +1603,23 @@ impl WrappedCliStepRunner {
                 }
                 // READS are the evidence-driven widening (the old "read roots stay empty" comment
                 // invited it). Measured across live domain-extraction runs, the boundary denied the
-                // worker reading, in turn, its own skill docs and then the repo's OWN SOURCE — a
-                // LEGACY in-tree graph's file paths anchor to the REPO ROOT it was indexed from,
-                // not the worktree, so the worker reads source there. Both are READ-ONLY: the write
-                // root grows only the estate-home graph dir (above), so this cannot reopen the
-                // pin-rewrite escape. Worktree reads are already covered by the write root; this
-                // ADDS the graph-derived root + the skill/plugin dir.
-                // `<repo>/.codegraph/estate.db` → widen the READ boundary to the repo root;
-                // `<estate_root>/<key>/estate.db` → to EXACTLY that key dir (per-key precision —
-                // never the whole repo-graphs root; a sibling repo's graph must stay unreachable).
+                // worker reading, in turn, its own skill docs and then its graph. Both are
+                // READ-ONLY: the write root grows only the graph's key dir (above), so this cannot
+                // reopen the pin-rewrite escape. Worktree reads are already covered by the write
+                // root; this ADDS the graph-derived root + the skill/plugin dir.
+                // `<repo-graph root>/<key>/estate.db` → widen the READ boundary to EXACTLY that key
+                // dir (per-key precision — never the whole repo-graphs root; a sibling repo's graph
+                // must stay unreachable); the root is THIS daemon's (its state home, core#406).
                 // The skill/plugin dir rides along, and so do the LAUNCH-declared
                 // `extra_read_roots` (core#294 — validated at launch like the write extras, and
                 // read-only by construction: they join THIS list, never the write roots above).
                 // ONE assembly shared with the ACP carrier (core#260) — see
-                // `assemble_read_roots`. A mis-shaped `code_graph_db` is NOT widened (the
-                // helper's shape check), reported here so the operator sees why.
+                // `assemble_read_roots`. A mis-shaped `code_graph_db` — an in-tree
+                // `<repo>/.codegraph/estate.db` from a pre-core#406 record included — is NOT
+                // widened (the helper's shape check), reported here so the operator sees why.
                 let read_roots: Vec<std::ffi::OsString> = assemble_read_roots(
                     g.code_graph_db.as_deref(),
+                    self.operational_home.as_deref(),
                     &g.extra_read_roots,
                     g.skills_root.as_deref(),
                 )
@@ -1624,12 +1627,12 @@ impl WrappedCliStepRunner {
                 .map(PathBuf::into_os_string)
                 .collect();
                 if let Some(db) = g.code_graph_db.as_deref() {
-                    if repo_read_root(Some(db)).is_none() {
+                    if repo_read_root(Some(db), self.operational_home.as_deref()).is_none() {
                         eprintln!(
                             "wicked-core: code_graph_db {db:?} is not an absolute code-graph \
-                             path in either home (<repo>/.codegraph/estate.db or \
-                             <estate-home>/<key>/estate.db); not widening the read boundary \
-                             for unit {}",
+                             path under this daemon's repo-graph root \
+                             (<state home>/repo-graphs/<key>/estate.db; a graph is never inside \
+                             the checkout — core#406); not widening the read boundary for unit {}",
                             input.unit.id
                         );
                     }
@@ -1769,8 +1772,9 @@ impl WrappedCliStepRunner {
 /// The `WICKED_WRITE_ROOTS` value for a governed unit (core#259): the unit cwd FIRST, widened by
 /// ONLY the launcher-declared extras riding the governance context — validated at launch against
 /// the pin tree, so this join cannot introduce a root the launch did not judge — plus, when the
-/// repo's graph lives in the estate home, that graph's own key directory (`graph_dir`, from
-/// [`graph_write_dir`]: engine-resolved, per-key precise, `None` for legacy in-tree graphs). When
+/// repo has a graph under this daemon's repo-graph root, that graph's own key directory
+/// (`graph_dir`, from [`graph_write_dir`]: engine-resolved, per-key precise, `None` for anything
+/// not in that shape — an in-tree path included, core#406). When
 /// a root cannot be joined (it contains the platform's PATH separator), falls back to the NARROW
 /// cwd-only boundary — dropping the widening is a degraded run; dropping the boundary would be an
 /// escape.
@@ -2263,17 +2267,17 @@ struct GovLaunch {
     /// The unit's WORKFLOW phase id (e.g. `review`) — set as `WICKED_GATE_PHASE_ID` so the hook's
     /// policy `select` matches an operator-authored `applies_to` (FINDING-021). Empty ⇒ unset.
     phase_id: String,
-    /// The repo's code-graph store (engine-resolved: legacy `<repo>/.codegraph/estate.db`, or the
-    /// estate home's `<estate_root>/<key>/estate.db` — see `code_graph.rs`), when this unit runs
+    /// The repo's code-graph store (engine-resolved: `<state home>/repo-graphs/<key>/estate.db`,
+    /// never inside the checkout — see `code_graph.rs`, core#406), when this unit runs
     /// against a registered repo. Used to (a) point the worker's estate MCP at the repo-local
-    /// graph, (b) widen the READ boundary — to the repo root for a legacy graph (its paths anchor
-    /// there, not to the worktree), to exactly the key dir for an estate-home one — and (c) set
+    /// graph, (b) widen the READ boundary to exactly the graph's key dir — and (c) set
     /// `$WICKED_ESTATE_DB` so the worker's estate CLI channel (`wicked-core coverage`,
     /// `wicked-estate`) resolves the SAME repo graph — see [`arm_worker_estate_channel`].
-    /// The WRITE boundary widens ONLY for an estate-home graph, and only by its own key dir
-    /// (WAL/journal siblings; [`graph_write_dir`]); a legacy graph widens nothing — the
-    /// extractor's store annotations ride Bash, which the boundary does not path-judge (and a
-    /// wider write root would let a worker rewrite its own gate pin). `None` for a repo-less run.
+    /// The WRITE boundary widens ONLY by that same key dir (WAL/journal siblings;
+    /// [`graph_write_dir`]); a path in any other shape — the pre-core#406 in-tree one included —
+    /// widens nothing: the extractor's store annotations ride Bash, which the boundary does not
+    /// path-judge, and a wider write root would let a worker rewrite its own gate pin. `None` for
+    /// a repo-less run.
     code_graph_db: Option<String>,
     /// LAUNCHER-declared extra WRITE roots for the run's deliverables (core#259), copied from
     /// [`crate::workflow::GovernanceContext::extra_write_roots`] — already validated at launch
@@ -2300,7 +2304,7 @@ struct GovLaunch {
 /// rejected genuinely-covered work — and no human-confirm could clear it, because a conditional gate
 /// RE-DISPATCHES the unit (re-running the stale worker) rather than accepting the verdict.
 ///
-/// Set to `code_graph_db` — the repo's own engine-resolved graph (in either home; `code_graph.rs`),
+/// Set to `code_graph_db` — the repo's own engine-resolved graph (under the state home; `code_graph.rs`),
 /// the SAME store FINDING-069
 /// already hands the worker's estate MCP and the one store the worker is allowed to write. NEVER
 /// `gov.db_path` (the operational store): a worker `wicked-estate index .` against the repo graph
@@ -2315,13 +2319,13 @@ fn arm_worker_estate_channel(cmd: &mut Command, gov: &GovLaunch) {
 
 /// The graph-derived READ root for a governed unit whose repo has a code graph, or `None`.
 ///
-/// Shape recognition is [`crate::code_graph::classify_code_graph_db_at`] — the ONE recognizer for
-/// both homes — and the grant follows the home:
-///   - LEGACY `<repo>/.codegraph/estate.db` → the repo root, two levels up (the graph is inside
-///     it, and its file paths anchor there). Byte-identical pre-ADR behavior.
-///   - ESTATE HOME `<estate_root>/<key>/estate.db` → EXACTLY that key directory. Never the
-///     repo-graphs root or the estate home above it: every other repo's graph is one sibling
-///     over, and a worker must not be able to reach it.
+/// Shape recognition is [`crate::code_graph::classify_code_graph_db_at`] — the ONE recogniser —
+/// against THIS daemon's repo-graph root, derived from `state_home` (the runner's
+/// `operational_home`: the same `--db` parent the actor binds; core#406), so a daemon on a custom
+/// `--db` grants under ITS root, not the default home's:
+///   - `<root>/<key>/estate.db` → EXACTLY that key directory. Never the repo-graphs root or the
+///     state home above it: every other repo's graph is one sibling over, and a worker must not
+///     be able to reach it.
 ///
 /// Everything else is fail-closed (no widening):
 ///   - Not absolute — `register-repo --path ./repo` used to store a relative root, so a relative
@@ -2329,61 +2333,55 @@ fn arm_worker_estate_channel(cmd: &mut Command, gov: &GovLaunch) {
 ///     `path_policy` resolves it against the worker's worktree cwd, widening reads to the WRONG
 ///     tree (or not at all). The boundary requires absolute roots (the WRITE root is the absolute
 ///     worktree cwd for the same reason), so a relative value is a shape mismatch, not a root.
-///   - Wrong shape — anything in neither home is not a code graph; taking `parent()`s off an
-///     arbitrary path would hand the worker an over-broad read root.
-fn repo_read_root(code_graph_db: Option<&str>) -> Option<std::ffi::OsString> {
+///   - The legacy in-tree shape `<repo>/.codegraph/estate.db` — a graph is never in the tree
+///     (core#406), so such a value is a pre-#406 record mid-upgrade or a forgery; the pre-#406
+///     grant (the whole repo root) is exactly the widening a worker must not get off it.
+///   - Wrong shape — anything else is not a code graph; taking `parent()`s off an arbitrary path
+///     would hand the worker an over-broad read root.
+fn repo_read_root(
+    code_graph_db: Option<&str>,
+    state_home: Option<&Path>,
+) -> Option<std::ffi::OsString> {
     repo_read_root_at(
         code_graph_db,
-        crate::code_graph::repo_graph_root().as_deref(),
+        crate::code_graph::repo_graph_root_for(state_home).as_deref(),
     )
 }
 
-/// [`repo_read_root`] with the estate root injected — pure, so the grant tests never read env.
+/// [`repo_read_root`] with the repo-graph root injected — pure, so the grant tests never read env.
 fn repo_read_root_at(
     code_graph_db: Option<&str>,
-    estate_root: Option<&Path>,
+    graph_root: Option<&Path>,
 ) -> Option<std::ffi::OsString> {
-    use crate::code_graph::CodeGraphHome;
-    let home = crate::code_graph::classify_code_graph_db_at(
-        std::path::Path::new(code_graph_db?),
-        estate_root,
-    )?;
-    Some(match home {
-        CodeGraphHome::InTree { repo_root } => repo_root.into_os_string(),
-        CodeGraphHome::EstateHome { key_dir } => key_dir.into_os_string(),
-    })
+    crate::code_graph::classify_code_graph_db_at(std::path::Path::new(code_graph_db?), graph_root)
+        .map(PathBuf::into_os_string)
 }
 
-/// The estate-home graph directory a governed worker needs WRITE access to — opening a WAL-mode
-/// SQLite db creates `-wal`/`-shm`/journal files IN ITS DIRECTORY (the same fact
+/// The graph directory a governed worker needs WRITE access to — opening a WAL-mode SQLite db
+/// creates `-wal`/`-shm`/journal files IN ITS DIRECTORY (the same fact
 /// `validator::run_validator_reporting` grants its coverage sandbox for; P8 #9 / core#217) — or
-/// `None` for a legacy in-tree graph (no write root, byte-identical pre-ADR boundary; its
-/// annotation writes ride Bash, which the boundary does not path-judge) and for anything that is
-/// not a code graph (fail-closed). Per-key precise: the grant is EXACTLY `<estate_root>/<key>/`,
-/// so a sibling repo's graph stays out of a worker's write reach.
-pub(crate) fn graph_write_dir(code_graph_db: Option<&str>) -> Option<PathBuf> {
+/// `None` for anything that is not a code graph under THIS daemon's root (fail-closed; the in-tree
+/// shape included — core#406). Per-key precise: the grant is EXACTLY `<root>/<key>/`, so a sibling
+/// repo's graph stays out of a worker's write reach. `state_home` as in [`repo_read_root`].
+pub(crate) fn graph_write_dir(
+    code_graph_db: Option<&str>,
+    state_home: Option<&Path>,
+) -> Option<PathBuf> {
     graph_write_dir_at(
         code_graph_db,
-        crate::code_graph::repo_graph_root().as_deref(),
+        crate::code_graph::repo_graph_root_for(state_home).as_deref(),
     )
 }
 
-/// [`graph_write_dir`] with the estate root injected — pure, so the grant tests never read env.
-fn graph_write_dir_at(code_graph_db: Option<&str>, estate_root: Option<&Path>) -> Option<PathBuf> {
-    use crate::code_graph::CodeGraphHome;
-    match crate::code_graph::classify_code_graph_db_at(
-        std::path::Path::new(code_graph_db?),
-        estate_root,
-    )? {
-        CodeGraphHome::EstateHome { key_dir } => Some(key_dir),
-        CodeGraphHome::InTree { .. } => None,
-    }
+/// [`graph_write_dir`] with the repo-graph root injected — pure, so the grant tests never read env.
+fn graph_write_dir_at(code_graph_db: Option<&str>, graph_root: Option<&Path>) -> Option<PathBuf> {
+    crate::code_graph::classify_code_graph_db_at(std::path::Path::new(code_graph_db?), graph_root)
 }
 
 /// The READ roots for a governed unit, as ONE assembly both carriers share (core#260): the
 /// evidence-derived set — the worker's skill/plugin dir plus the graph-derived root
-/// ([`repo_read_root`]: the repo root for a legacy in-tree graph, exactly the key dir for an
-/// estate-home one) — widened by the LAUNCH-declared `extra_read_roots` (core#294, validated at
+/// ([`repo_read_root`]: exactly the graph's key dir under this daemon's repo-graph root; nothing
+/// for any other shape) — widened by the LAUNCH-declared `extra_read_roots` (core#294, validated at
 /// launch by `validate_extra_read_roots`; the read mirror of core#259's write extras). READ-ONLY
 /// by construction: nothing assembled here ever reaches a write list, so the widening cannot
 /// reopen the FINDING-098 pin-rewrite escape. The wrapped path env-joins these onto the
@@ -2391,6 +2389,9 @@ fn graph_write_dir_at(code_graph_db: Option<&str>, estate_root: Option<&Path>) -
 /// assemblies would drift the first time one grew a root.
 pub(crate) fn assemble_read_roots(
     code_graph_db: Option<&str>,
+    // The daemon's state home (the runner's `operational_home`), against which `code_graph_db` is
+    // recognised (core#406). `None`: no store behind this launch — the default root applies.
+    state_home: Option<&Path>,
     extra_read_roots: &[String],
     skills_root: Option<&Path>,
 ) -> Vec<PathBuf> {
@@ -2405,8 +2406,8 @@ pub(crate) fn assemble_read_roots(
     if let Some(root) = skills_root {
         roots.push(root.to_path_buf());
     }
-    if let Some(repo_root) = repo_read_root(code_graph_db) {
-        roots.push(PathBuf::from(repo_root));
+    if let Some(key_dir) = repo_read_root(code_graph_db, state_home) {
+        roots.push(PathBuf::from(key_dir));
     }
     roots.extend(extra_read_roots.iter().map(PathBuf::from));
     roots
@@ -3706,69 +3707,102 @@ mod tests {
             .expect("the isolation flags inject");
     }
 
-    /// The read-boundary derivation (#213 review), LEGACY shape — byte-identical to the pre-ADR
-    /// behavior (AC4c): the repo root is widened ONLY for an absolute, legacy-shaped path. A
-    /// relative `code_graph_db` (a repo registered with a relative `--path`) must NOT widen —
-    /// pushed as a READ root it would resolve against the worker's worktree, widening reads to the
-    /// wrong tree. Built cross-platform off `current_dir()` so the "absolute" case is genuinely
-    /// absolute on Windows too (a leading `/` is NOT absolute there — the trap FINDING-069 already
-    /// caught once).
+    /// The read-boundary derivation (#213 review), in-tree shape: NEVER widened (core#406 — a graph
+    /// is never in the tree, so a `code_graph_db` in that shape is a pre-#406 record mid-upgrade or a
+    /// forgery, and pushing the repo root as a READ root off it hands the worker a tree nobody
+    /// vouched for). Relative and mis-shaped paths stay fail-closed as before. Built cross-platform
+    /// off `current_dir()` so the "absolute" case is genuinely absolute on Windows too.
     #[test]
-    fn repo_read_root_requires_an_absolute_codegraph_shaped_path() {
-        use std::ffi::OsString;
+    fn an_in_tree_shaped_code_graph_db_never_widens_any_boundary() {
         let base = std::env::current_dir().unwrap();
-
-        // absolute + shaped → the repo root, two levels up.
+        let state_home = base.join("wc-state-home");
         let db = base.join("repo").join(crate::code_graph::code_graph_rel());
-        assert_eq!(
-            repo_read_root(db.to_str()),
-            Some(OsString::from(base.join("repo"))),
-            "an absolute legacy in-tree graph widens to <repo>"
-        );
-        // …and the legacy arm is estate-root-INDEPENDENT: same answer whatever root is live, so
-        // the env-reading wrapper and the injected core cannot disagree on legacy paths.
-        for root in [None, Some(base.join("somewhere-else"))] {
+        for root in [
+            None,
+            Some(base.join("somewhere-else")),
+            Some(state_home.join("repo-graphs")),
+        ] {
             assert_eq!(
                 repo_read_root_at(db.to_str(), root.as_deref()),
-                Some(OsString::from(base.join("repo"))),
+                None,
+                "an in-tree shaped path is not a graph — no read root, whatever root is live"
             );
+            assert_eq!(graph_write_dir_at(db.to_str(), root.as_deref()), None);
         }
-
+        // Through the env/state-home-reading wrappers too.
+        for sh in [None, Some(state_home.as_path())] {
+            assert_eq!(repo_read_root(db.to_str(), sh), None);
+            assert_eq!(graph_write_dir(db.to_str(), sh), None);
+        }
         // relative + shaped → None (would resolve against the worktree cwd).
         let rel = Path::new("repo").join(crate::code_graph::code_graph_rel());
-        assert_eq!(
-            repo_read_root(rel.to_str()),
-            None,
-            "a relative code_graph_db must not widen the read boundary"
-        );
-
+        assert_eq!(repo_read_root(rel.to_str(), Some(&state_home)), None);
         // absolute but wrong shape → None (arbitrary path, over-broad root otherwise).
         let wrong = base.join("repo").join("build").join("estate.db");
-        assert_eq!(
-            repo_read_root(wrong.to_str()),
-            None,
-            "non-.codegraph parent is not a code graph"
-        );
-
+        assert_eq!(repo_read_root(wrong.to_str(), Some(&state_home)), None);
         // absent → None.
-        assert_eq!(repo_read_root(None), None);
-
-        // And a legacy graph adds NO write root — the pre-ADR write boundary, byte for byte.
-        assert_eq!(graph_write_dir_at(db.to_str(), None), None);
+        assert_eq!(repo_read_root(None, Some(&state_home)), None);
     }
 
-    /// AC4a+b — the ESTATE-HOME grants are per-key precise: read AND write land on EXACTLY the
-    /// graph's own `<estate_root>/<key>/` directory, and the grant computed for key A contains
-    /// neither the sibling key B's dir nor the repo-graphs root itself (the boundary's root test
-    /// is root-or-descendant — `path_policy` — so "not a prefix" IS "not reachable").
+    /// core#406: the grants follow the STATE HOME the launcher carries (the runner's
+    /// `operational_home`, the same `--db` parent the actor binds), so a daemon on a custom `--db`
+    /// grants exactly `<its state home>/repo-graphs/<key>/` — and the same path judged against
+    /// ANOTHER daemon's state home is not a graph at all.
     #[test]
-    fn estate_home_grants_are_per_key_precise_and_siblings_stay_out_of_reach() {
+    fn grants_follow_the_state_home_the_launcher_carries() {
+        // The env override outranks the state home; hold the read side so no mutator flips it,
+        // and skip when the process was started with one.
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var_os(crate::code_graph::REPO_GRAPH_ROOT_ENV).is_some_and(|v| !v.is_empty()) {
+            eprintln!("skipping: WICKED_ESTATE_REPO_GRAPH_ROOT is set in this process");
+            return;
+        }
         let base = std::env::current_dir().unwrap();
-        let estate_root = base.join("wc-grants-estate");
+        let state_home = base.join("wc-custom-state-home");
+        let repo = base.join("wc-custom-repo");
+        let key_dir = state_home
+            .join("repo-graphs")
+            .join(crate::code_graph::repo_graph_key(&repo));
+        let db = key_dir.join(crate::code_graph::CODE_GRAPH_DB_FILE);
+        assert_eq!(
+            repo_read_root(db.to_str(), Some(&state_home)).map(PathBuf::from),
+            Some(key_dir.clone()),
+            "the read grant is the key dir under THIS daemon's root"
+        );
+        assert_eq!(
+            graph_write_dir(db.to_str(), Some(&state_home)),
+            Some(key_dir.clone()),
+            "so is the write grant"
+        );
+        assert_eq!(
+            repo_read_root(db.to_str(), Some(&base.join("wc-other-state-home"))),
+            None,
+            "another daemon's state home does not recognise this daemon's graph — no grant"
+        );
+        assert_eq!(
+            assemble_read_roots(db.to_str(), Some(&state_home), &[], None)
+                .into_iter()
+                .filter(|r| r == &key_dir)
+                .count(),
+            1,
+            "the shared assembly carries exactly that key dir"
+        );
+    }
+
+    /// AC4a+b — the grants are per-key precise: read AND write land on EXACTLY the graph's own
+    /// `<root>/<key>/` directory, and the grant computed for key A contains neither the sibling
+    /// key B's dir nor the repo-graphs root itself (the boundary's root test is
+    /// root-or-descendant — `path_policy` — so "not a prefix" IS "not reachable").
+    #[test]
+    fn grants_are_per_key_precise_and_siblings_stay_out_of_reach() {
+        let base = std::env::current_dir().unwrap();
+        let estate_root = base.join("wc-grants-root");
         let repo_a = base.join("wc-grants-a");
         let repo_b = base.join("wc-grants-b");
-        let db_a = crate::code_graph::estate_home_graph_db_at(&estate_root, &repo_a);
-        let db_b = crate::code_graph::estate_home_graph_db_at(&estate_root, &repo_b);
+        let db_a = crate::code_graph::repo_graph_db_at(&estate_root, &repo_a);
+        let db_b = crate::code_graph::repo_graph_db_at(&estate_root, &repo_b);
         let key_dir_a = db_a.parent().unwrap().to_path_buf();
         let key_dir_b = db_b.parent().unwrap().to_path_buf();
         assert_ne!(key_dir_a, key_dir_b, "precondition: distinct keys");
@@ -3776,9 +3810,9 @@ mod tests {
         // (a) READ and WRITE grants are exactly key A's dir.
         let read_a = repo_read_root_at(db_a.to_str(), Some(&estate_root))
             .map(std::path::PathBuf::from)
-            .expect("an estate-home graph grants a read root");
+            .expect("a graph under the root grants a read root");
         let write_a = graph_write_dir_at(db_a.to_str(), Some(&estate_root))
-            .expect("an estate-home graph grants its key dir for WAL/journal writes");
+            .expect("a graph under the root grants its key dir for WAL/journal writes");
         assert_eq!(read_a, key_dir_a);
         assert_eq!(write_a, key_dir_a);
         assert_ne!(
@@ -3792,7 +3826,7 @@ mod tests {
             "a worker granted key A must not reach key B: {key_dir_b:?} vs {read_a:?}"
         );
 
-        // Fail-closed edges of the estate-home shape: relative, wrong root, root itself.
+        // Fail-closed edges of the shape: relative, wrong root, root itself.
         let rel = db_a.strip_prefix(&base).unwrap();
         assert!(!rel.is_absolute(), "precondition");
         assert_eq!(repo_read_root_at(rel.to_str(), Some(&estate_root)), None);
@@ -3836,8 +3870,8 @@ mod tests {
         #[cfg(windows)]
         let declared = "C:\\srv\\grounding-repo".to_string();
 
-        let base = assemble_read_roots(None, &[], None);
-        let widened = assemble_read_roots(None, std::slice::from_ref(&declared), None);
+        let base = assemble_read_roots(None, None, &[], None);
+        let widened = assemble_read_roots(None, None, std::slice::from_ref(&declared), None);
         assert_eq!(
             &widened[..base.len()],
             &base[..],
@@ -5851,8 +5885,9 @@ mod tests {
         let inbox = "/abs/drafts-inbox".to_string();
 
         // No widening: exactly the cwd (the pre-#259 boundary, byte-identical). This is also the
-        // LEGACY-graph write boundary (AC4c): a legacy in-tree graph yields no graph dir at all
-        // (`graph_write_dir` → None), so its arming is indistinguishable from no-graph.
+        // boundary for a `code_graph_db` in any shape but `<root>/<key>/estate.db` (an in-tree path
+        // from a pre-core#406 record, say): `graph_write_dir` → None, so its arming is
+        // indistinguishable from no-graph.
         assert_eq!(armed_write_roots(cwd, &[], None), cwd.as_os_str());
 
         // With extras: split_paths recovers [cwd, inbox] in that order.
@@ -5864,8 +5899,8 @@ mod tests {
             "cwd first, then the declared inbox"
         );
 
-        // With an estate-home graph dir: it joins AFTER the declared extras — the worker's
-        // WAL/journal writes land in exactly its own key dir, nothing wider.
+        // With a graph key dir: it joins AFTER the declared extras — the worker's WAL/journal
+        // writes land in exactly its own key dir, nothing wider.
         let key_dir = std::path::Path::new("/estate/repo-abc123def456");
         let joined = armed_write_roots(cwd, std::slice::from_ref(&inbox), Some(key_dir));
         let roots: Vec<std::path::PathBuf> = std::env::split_paths(&joined).collect();
@@ -7628,8 +7663,8 @@ mod tests {
         // HOME-swapping test cannot change it between the two (the module rule).
         let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let root = std::path::Path::new("/snapshots/9");
-        let base = assemble_read_roots(None, &[], None);
-        let widened = assemble_read_roots(None, &[], Some(root));
+        let base = assemble_read_roots(None, None, &[], None);
+        let widened = assemble_read_roots(None, None, &[], Some(root));
         assert_eq!(
             widened.len(),
             base.len() + 1,
@@ -7680,6 +7715,7 @@ mod tests {
         // declared extra and the snapshot.
         let exported = assemble_read_roots(
             g.code_graph_db.as_deref(),
+            None,
             &g.extra_read_roots,
             g.skills_root.as_deref(),
         );
@@ -8522,7 +8558,7 @@ mod tests {
             let inv = "claude -p {PROMPT}";
             let mut argv = build_argv(inv, &prompt, &[]);
             inject_isolation_flags(&mut argv, inv, Some(&admitted.root));
-            let reads = assemble_read_roots(None, &[], Some(&admitted.root));
+            let reads = assemble_read_roots(None, None, &[], Some(&admitted.root));
             let search = crate::skills_snapshot::admit_refs(
                 Some(snap.clone()),
                 &crate::skills_snapshot::RequiredRefs::seat(["wicked-garden-search"]),
@@ -9062,12 +9098,17 @@ mod project_graph_end_to_end_tests {
         let dir = std::env::temp_dir().join(format!("wicked-pge2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // Pin the repo-graph root under the scratch dir (core#406): the actor below binds its state
+        // home from `estate.db`'s parent anyway, but the env override outranks it, so a concurrent
+        // override test cannot move the root mid-run — and nothing lands in a real home.
+        let graph_root = crate::code_graph::test_support::GraphRootPin::at(&dir);
 
         let repo_root = dir.join("alpha");
         git_repo(&repo_root);
         // The run repo's OWN graph, on disk and healthy — so "bound to the project graph" is a
-        // CHOICE between two live stores, not the only answer available.
-        let repo_graph = repo_root.join(crate::code_graph::code_graph_rel());
+        // CHOICE between two live stores, not the only answer available. Under the repo-graph
+        // root, never in the checkout (core#406).
+        let repo_graph = crate::code_graph::repo_graph_db_at(&graph_root.root, &repo_root);
         graph_with(&repo_graph, &["alpha"]);
 
         // The project's co-located graph: the run's repo AND a sibling it could never see before.

@@ -702,6 +702,48 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Repo graphs live under the daemon state home; an in-tree `.codegraph/` is never adopted
+  (#406; F-016 / F-024).** `registerRepo`/onboarding minted every repo's code graph under the
+  OPERATOR's `~/.wicked-estate/repo-graphs/<key>` whatever `--db` said — two daemons on one host
+  shared and clobbered graphs, `--db` did not relocate the data a customer backs up or isolates,
+  and crew's diagnostics could not list the store — and, when the checkout happened to carry (or
+  git-TRACK) `.codegraph/estate.db`, the "legacy-first" resolver adopted that file as the live
+  graph and read-only onboarding wrote INTO the customer's tree (`git status` dirty; a
+  `git checkout .` silently reverting the graph). Now ONE deterministic rule
+  (`code_graph.rs` ADR): `$WICKED_ESTATE_REPO_GRAPH_ROOT` when set, else
+  `<state home>/repo-graphs/<key>/estate.db` where the state home is the canonical parent of the
+  engine's own `--db` (the actor binds it per thread from the store it was spawned on —
+  `code_graph::StateHomeScope`, the `GOV_DB_PATH` idiom; the launchers pass their
+  `operational_home`; the two off-actor readers `coverage_report_for_repo` / `graph_kinds_for_repo`
+  take the daemon's store path), else the DEFAULT state home `~/.wicked-crew/repo-graphs` for a
+  library caller that never spawned a `Core`. The resolver NEVER reads or writes a graph inside
+  `root_path`: a checkout carrying `.codegraph/` gets its graph under the state home like every
+  other repo and a new `findings` entry on its `RepoEntry` (`RepoFinding { code:
+  "in_tree_code_graph_ignored", message, path }` — additive on the wire, re-derived on every read
+  like `code_graph_db`, logged once at registration) telling the operator to delete / `git rm
+  --cached` it. The sandbox grants follow: `classify_code_graph_db_at` recognises ONLY
+  `<root>/<key>/estate.db` (the `CodeGraphHome::InTree` arm is gone — an in-tree-shaped
+  `code_graph_db` widens no read or write boundary), and the grants are derived from the state home
+  the launcher carries, so a custom-`--db` daemon grants exactly `<its state home>/repo-graphs/
+  <key>/`. `repo-graphs` is registered in the state-home subtree fixture
+  (`tests/fixtures/state-home-subtrees.json`, owner `engine`; crew mirrors it byte for byte), so the
+  worker Read fence denies the subtree and a daemon that has indexed a repo is not refused at
+  launch. **Migration, once, at boot:** a registered repo whose graph sits under the old
+  `~/.wicked-estate/repo-graphs/<key>` and nowhere under the new root is copied through SQLite's
+  online-backup API (page-consistent even for a WAL-mode db another connection holds open; the
+  `rusqlite` `backup` feature) and logged one line per repo; the source is LEFT IN PLACE for the
+  operator to remove once the new daemon is verified and an existing destination is never
+  overwritten. The copy is crash-safe and bounded: it lands in `<key>/estate.db.migrating-<pid>`
+  and is renamed onto `estate.db` only on `Done` (a boot killed mid-copy leaves nothing at the
+  served path; the next boot sweeps the stray temp and copies again), a locked source, a
+  restarting backup or 60 s of wall clock fail it closed, and a failed copy removes its temp so
+  the repo simply re-indexes. **Repos indexed in-tree are not migrated** (an in-tree graph is never
+  read): they come through the upgrade with no live graph — the record's finding says "no graph has
+  been indexed under the state home yet — re-run onboarding (`POST /repos/:id/onboard`)" instead of
+  asserting a live path, and the boot logs one such line per affected repo next to the migration
+  notices. New public helper
+  `repo_graph_root_for_store(db_path)` spells a daemon's root for out-of-process consumers. Repo
+  side: wicked-interactive#213 / wicked-studio#220 untrack their `.codegraph/estate.db`.
 - **Event `seq` stays monotonic across daemon restarts (core#408, F-035).** The durable per-run
   event log stamped `seq` from a process-wide counter that started at 0 with every daemon, so a run
   resumed after a restart recorded its new events with `seq` 0, 1, … while its history already held

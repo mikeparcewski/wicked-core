@@ -56,6 +56,13 @@
       "worker_read": "none (a run's project graph is handed to the engine by explicit dbPath, not read through the state home)"
     },
     {
+      "name": "repo-graphs",
+      "kind": "dir",
+      "owner": "engine",
+      "source": "wicked-core src/code_graph.rs repo_graph_root — <state home>/repo-graphs/<repo-dir-name>-<12-hex>/estate.db, the per-repo code graphs (core#406: the state home is the canonical parent of the engine's --db; $WICKED_ESTATE_REPO_GRAPH_ROOT relocates the root wholesale); crew never spells this path — it reads the engine's code_graph_db on the repo record",
+      "worker_read": "none (a governed worker reaches its OWN graph through the estate MCP / $WICKED_ESTATE_DB, and the boundary grants exactly its <key>/ dir for WAL siblings; the file tools are denied the whole subtree — every other repo's graph is one sibling over)"
+    },
+    {
       "name": "project-settings.json",
       "kind": "file",
       "owner": "crew",

@@ -357,10 +357,11 @@ fn setup(
         // the suite (a fork bomb). Pin $WICKED_CORE_EXE to the real binary Cargo built so the Tool
         // (and the coverage recompute, same resolver) invoke the actual engine.
         std::env::set_var("WICKED_CORE_EXE", BIN);
-        // Estate-home ADR (code_graph.rs): a fresh repo's code_graph_db resolves into
-        // `$WICKED_ESTATE_REPO_GRAPH_ROOT` (else the developer's REAL `~/.wicked-estate/repo-graphs`).
-        // Point it at a per-process scratch so the seeds below never touch a real home — the same
-        // hermetic override crew's project graphs use.
+        // Repo-graph root (code_graph.rs ADR, core#406): a fresh repo's code_graph_db resolves into
+        // `$WICKED_ESTATE_REPO_GRAPH_ROOT` when set (else `<state home>/repo-graphs` — the parent of
+        // the store the Core below is spawned on, itself a scratch dir). Pin the override too, so a
+        // concurrent env test cannot move the root mid-run — the same hermetic override crew's
+        // project graphs use.
         std::env::set_var(
             "WICKED_ESTATE_REPO_GRAPH_ROOT",
             std::env::temp_dir().join(format!("wicked-core-e2e-estate-{}", std::process::id())),

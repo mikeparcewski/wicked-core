@@ -92,7 +92,9 @@ pub use campaign::{
     CampaignNode, CampaignStatus, EdgeCondition, FailurePolicy, NodeStatus, RunSpec,
 };
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
-pub use code_graph::{index_repo, rank_symbols, recon_repo, RankedSymbol};
+pub use code_graph::{
+    index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, RankedSymbol,
+};
 pub use command::InjectTarget;
 pub use docs::{list_docs, new_doc, read_doc, write_doc, DocMeta};
 pub use domain::{
@@ -139,7 +141,10 @@ pub use project::{
     Project, ProjectGraphBinding, ProjectMember, ProjectPatch, ProjectStatus, DEFAULT_PROJECT_ID,
     MEMBER_KIND_RUN, PROJECT, PROJECT_MEMBER,
 };
-pub use repo::{coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoSpec};
+pub use repo::{
+    coverage_report_for_repo, get_repo, graph_kinds_for_repo, RepoEntry, RepoFinding, RepoSpec,
+    FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
+};
 pub use repo_checks::{CheckRun, RepoCheck, RepoChecksReport};
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,

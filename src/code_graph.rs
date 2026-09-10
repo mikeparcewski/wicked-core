@@ -7,44 +7,80 @@
 //! `estate-rank` (PageRank) crates it already links. Indexing is a build step; operating on the graph
 //! is the runtime — keeping them separate is what lets us be graph-native without bloat.
 //!
-//! # WHERE A REPO'S GRAPH LIVES (ADR, 2026-08-29)
+//! # WHERE A REPO'S GRAPH LIVES (ADR, 2026-08-29; revised 2026-09-10 for core#406)
 //!
-//! **Estate home by default.** A fresh repo's graph is minted at
-//! `<estate_root>/<key>/estate.db`, where `estate_root` is `$WICKED_ESTATE_REPO_GRAPH_ROOT` when
-//! set, else `<home>/.wicked-estate/repo-graphs` (`$HOME`, or `$USERPROFILE` on Windows), and
-//! `<key>` is [`repo_graph_key`]'s `<repo-dir-name>-<12-hex-of-sha256(canonical-root)>`. The old
-//! default — `<repo>/.codegraph/estate.db`, INSIDE the working tree — polluted every checkout it
-//! touched: a 185 MB database in the tree of a repo whose owner never asked for one, showing up in
-//! `git status` on unignored repos and in every backup/sync tool watching the tree. wicked-crew
-//! moved PROJECT graphs out for exactly this reason (crew#330, `graph-paths.ts`); this applies the
-//! same posture one level down. A directory per key (rather than `<key>.db` files in one flat
-//! folder) keeps the db and its WAL/journal siblings together, so removing a repo's graph is one
-//! `rm -rf` that cannot strand a `-wal` describing a database that is gone.
+//! **Under the daemon's state home.** A repo's graph is at `<root>/<key>/estate.db`, where `root`
+//! is [`repo_graph_root`] — in precedence order:
 //!
-//! **Legacy-first, never a silent migration.** If `<repo>/.codegraph/estate.db` EXISTS, both the
-//! read path ([`existing_code_graph`]) and the write path ([`code_graph_path_for_write`]) keep
-//! using it. An already-indexed repo must never be re-pointed at an empty database — "nothing
-//! found" about a repo full of code is FINDING-069's exact failure, and a resolver that answered
-//! "estate home" while 185 MB sat in-tree would reintroduce it wholesale. Migration is MANUAL and
-//! operator-driven: move `<repo>/.codegraph/estate.db` to `<estate_root>/<key>/estate.db` (mint
-//! the key with [`repo_graph_key`]) and delete `<repo>/.codegraph/`, or simply delete
-//! `<repo>/.codegraph/` and re-index.
+//! 1. `$WICKED_ESTATE_REPO_GRAPH_ROOT`, when set (the escape hatch for tests and proof scripts —
+//!    the same contract as crew's `WICKED_CREW_PROJECT_GRAPH_ROOT`; an ABSOLUTE path, the sandbox
+//!    grants fail closed on relative ones);
+//! 2. `<state home>/repo-graphs`, where the state home is the canonical parent of the engine's
+//!    own `--db` (`state_home::operational_home_of_db`) — the ONE storage root the operator keeps,
+//!    the directory crew's `--db` relocates wholesale (crew#330), and the directory the worker Read
+//!    fence classifies entry by entry (`repo-graphs` is registered in
+//!    `tests/fixtures/state-home-subtrees.json`, byte-identical in core and crew);
+//! 3. `<home>/.wicked-crew/repo-graphs` — the DEFAULT state home — for a library consumer or test
+//!    thread that never spawned a `Core` (the fallback crew's `crewStateHome()` makes for the
+//!    same callers);
 //!
-//! **Per-key sandbox grants.** A governed worker whose graph lives in the estate home is granted
-//! read+write on EXACTLY its own `<estate_root>/<key>/` directory (write because opening a
-//! WAL-mode SQLite db creates `-wal`/`-shm`/journal files in its directory) — never the whole
-//! `repo-graphs` root or the estate home, because every OTHER repo's graph lives one sibling over
-//! and a worker must not be able to reach it. Legacy in-tree graphs keep the pre-existing behavior
-//! byte for byte: the READ boundary widens to the repo root (the graph is inside it, and its file
-//! paths anchor there), and no write root is added. [`classify_code_graph_db_at`] is the one shape
-//! recognizer both grants key off. Note the trade the estate home makes: its graphs' file paths
-//! still anchor to the repo root the indexer ran over, but the per-key grant does not include that
-//! root — a worker reads source from its own worktree instead.
+//! and `<key>` is [`repo_graph_key`]'s `<repo-dir-name>-<12-hex-of-sha256(canonical-root)>`. A
+//! directory per key (rather than `<key>.db` files in one flat folder) keeps the db and its
+//! WAL/journal siblings together, so removing a repo's graph is one `rm -rf` that cannot strand a
+//! `-wal` describing a database that is gone.
 //!
-//! **Env override.** `$WICKED_ESTATE_REPO_GRAPH_ROOT` relocates the root wholesale — the escape
-//! hatch that lets tests and proof scripts run without touching a developer's real home (the same
-//! contract as crew's `WICKED_CREW_PROJECT_GRAPH_ROOT`). Set it to an ABSOLUTE path; the sandbox
-//! grants fail closed on relative ones. TH-8's environment manifest should list this variable.
+//! The state home reaches this resolver through [`StateHomeScope`]: the actor binds its thread to
+//! the store it was spawned on before it serves a command (the `GOV_DB_PATH` idiom), and the two
+//! off-actor readers (`repo::coverage_report_for_repo`, `repo::graph_kinds_for_repo`) bind a
+//! scope from the store path they were handed. The launchers, which already carry the runner's
+//! `operational_home`, pass it explicitly ([`repo_graph_root_for`]). No process-global: two
+//! engines in one process (crew's test workers) resolve independently.
+//!
+//! **Why not the estate home.** The 2026-08 cut minted graphs under `<home>/.wicked-estate/
+//! repo-graphs` — the OPERATOR's home, whatever `--db` said. Two daemons on one host shared and
+//! clobbered each other's graphs, `--db` did not relocate the data a customer backs up or isolates,
+//! and crew's diagnostics could not list a store outside the state home (core#406, F-016). That
+//! directory is now read exactly once, at boot, as the MIGRATION SOURCE — see below — and never
+//! written.
+//!
+//! **Never inside the working tree.** The pre-ADR default — `<repo>/.codegraph/estate.db`,
+//! INSIDE the checkout — polluted every tree it touched, and the 2026-08 "legacy-first" rule that
+//! kept adopting an existing in-tree file made placement NON-DETERMINISTIC across repos: a checkout
+//! whose git history happened to TRACK `.codegraph/estate.db` (two of the family's own repos did)
+//! got its graph written INTO the customer's tree by "read-only" onboarding — `git status` dirty,
+//! a `git checkout .` silently reverting the graph (core#406, F-024). So this resolver NEVER reads
+//! or writes a graph inside `root_path`: an in-tree `.codegraph/` is IGNORED and REPORTED — a
+//! `findings` entry on the repo record (`repo::RepoFinding`, code `in_tree_code_graph_ignored`)
+//! names the directory so the operator can delete/untrack it — and the live graph is minted under
+//! the state home like every other repo's. The in-tree spelling survives here only as
+//! [`CODE_GRAPH_DB_REL`] / [`in_tree_code_graph_dir`], to recognise and report it.
+//!
+//! **Migration, once, at boot.** The first actor boot over a store whose registered repos have a
+//! graph under the old `<home>/.wicked-estate/repo-graphs/<key>` and none under the new root copies
+//! each one — [`migrate_legacy_repo_graphs`], through SQLite's online-backup API (page-consistent
+//! even for a WAL-mode db another connection still holds open; a plain file copy of
+//! `estate.db`+`-wal`+`-shm` is not) — and logs one line per repo. The key is a pure function of
+//! the repo root, so the source and destination agree without a lookup table. The SOURCE IS LEFT
+//! IN PLACE (an operator deletes `~/.wicked-estate/repo-graphs` once the new daemon is verified;
+//! the engine never deletes anything it did not write) and a destination that already exists is
+//! never overwritten. The copy is CRASH-SAFE: the backup lands in a temp sibling
+//! (`<key>/estate.db.migrating-<pid>`) that is renamed onto `estate.db` only when the backup
+//! reports `Done`, so a boot killed mid-copy leaves nothing at the path the resolver serves; the
+//! next boot sweeps the stray temp and copies again. The backup is bounded (locked source, total
+//! steps, wall clock) and a copy that fails removes its temp so the repo simply re-indexes at its
+//! next onboarding instead of reading a torn database. Repos that were indexed IN-TREE (the F-024
+//! checkouts) are NOT migrated — an in-tree graph is never read — so they come through the
+//! upgrade with no live graph: the repo record's finding says so and names the remedy (re-run
+//! onboarding), and the boot logs one such line per affected repo next to the migration notices.
+//!
+//! **Per-key sandbox grants.** A governed worker is granted read+write on EXACTLY its own
+//! `<root>/<key>/` directory (write because opening a WAL-mode SQLite db creates `-wal`/`-shm`/
+//! journal files in its directory) — never the `repo-graphs` root or the state home, because every
+//! OTHER repo's graph lives one sibling over and a worker must not be able to reach it.
+//! [`classify_code_graph_db_at`] is the one shape recogniser both grants key off; a path in the
+//! in-tree shape classifies as NOTHING (no grant — the graph is never there). Note the trade: a
+//! graph's file paths still anchor to the repo root the indexer ran over, but the per-key grant
+//! does not include that root — a worker reads source from its own worktree instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -150,7 +186,7 @@ pub(crate) fn indexer_bin() -> String {
             return b;
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home_dir() {
         let p = Path::new(&home).join(".cargo/bin/wicked-estate");
         if p.exists() {
             return p.display().to_string();
@@ -159,47 +195,126 @@ pub(crate) fn indexer_bin() -> String {
     "wicked-estate".to_string()
 }
 
-/// Where a repo's LEGACY in-tree code graph lives, relative to its root. The ONE spelling.
+/// The LEGACY in-tree spelling, `<repo>/.codegraph/estate.db` — a TEST STAND-IN now.
 ///
-/// `.codegraph/estate.db` rather than this engine's own `.wicked/` namespace, because that is the
-/// path that has the data. Both spellings existed — the engine indexed to `.wicked/code-graph.db`
-/// while crew's onboarding launched `wicked-estate index --db <repo>/.codegraph/estate.db` — and in
-/// the deployed topology crew drives onboarding, so on a real repo the 185 MB graph sat at
-/// `.codegraph/estate.db` and `.wicked/code-graph.db` did not exist at all (FINDING-069). Picking the
-/// engine's spelling would have been the tidier name and would have orphaned every indexed repo.
+/// `.codegraph/estate.db` is the path crew's pre-ADR onboarding indexed to (`wicked-estate index
+/// --db <repo>/.codegraph/estate.db`), and for a while the engine's own spelling disagreed with it
+/// (`.wicked/code-graph.db`), so a worker queried a database nothing had written (FINDING-069).
+/// The ONE spelling was then pinned here and the resolver kept ADOPTING an existing in-tree file.
+/// core#406 ends that: no production code path spells this file any more (the module ADR) —
+/// production recognises the DIRECTORY, [`IN_TREE_CODE_GRAPH_DIR`], to report it. The tests keep
+/// this constant to build the decoys and stand-in paths they prove are never adopted or widened.
 ///
-/// No NEW graph is minted here anymore (see the module ADR — fresh repos get the estate home), but
-/// a repo that already has this file keeps it, forever, for the same never-orphan reason.
-///
-/// Written with `/` because that is how every other artifact in the ecosystem spells it — the crew
-/// CLI flag, the JS `join`, this doc. Do NOT hand it to [`Path::join`] whole; use
-/// [`code_graph_rel`], which is the only correct way to turn it into a path.
+/// Written with `/` because that is how every other artifact in the ecosystem spells it. Do NOT
+/// hand it to [`Path::join`] whole; use [`code_graph_rel`], which is the only correct way to turn
+/// it into a path.
+#[cfg(test)]
 pub(crate) const CODE_GRAPH_DB_REL: &str = ".codegraph/estate.db";
 
-/// The filename every code-graph database carries, in BOTH homes (`<repo>/.codegraph/estate.db`
-/// and `<estate_root>/<key>/estate.db`).
+/// `<repo>/.codegraph` — the directory a pre-core#406 engine (or crew's pre-ADR onboarding) indexed
+/// INTO the working tree. The ONE production spelling of the in-tree shape: never resolved,
+/// recognised by [`has_in_tree_code_graph`] so the repo record can report it.
+pub(crate) const IN_TREE_CODE_GRAPH_DIR: &str = ".codegraph";
+
+/// The filename every code-graph database carries: `<root>/<key>/estate.db`.
 pub(crate) const CODE_GRAPH_DB_FILE: &str = "estate.db";
 
-/// Env var overriding the estate-home root for per-repo graphs — see [`repo_graph_root`] and the
+/// Env var overriding the repo-graph root wholesale — precedence 1 in [`repo_graph_root`] and the
 /// module ADR. TH-8's environment manifest should list it.
 pub(crate) const REPO_GRAPH_ROOT_ENV: &str = "WICKED_ESTATE_REPO_GRAPH_ROOT";
 
-/// The estate home every NEW repo graph hangs off: `$WICKED_ESTATE_REPO_GRAPH_ROOT` when set,
-/// else `<home>/.wicked-estate/repo-graphs` (home = `$HOME`, or `$USERPROFILE` on Windows).
-/// `None` when no home can be resolved at all; the resolver then falls back to the legacy
-/// in-tree spelling — the only address left, and the pre-ADR behavior.
+/// The state-home subtree every repo graph hangs off: `<state home>/repo-graphs`. Registered in
+/// `tests/fixtures/state-home-subtrees.json` (owner `engine`; crew mirrors the file byte for byte)
+/// so the worker Read fence classifies — and denies — it like every other state-home store.
+pub(crate) const REPO_GRAPHS_DIRNAME: &str = "repo-graphs";
+
+/// Where the pre-core#406 engine kept every repo graph: `<home>/.wicked-estate/repo-graphs`. Read
+/// once, at boot, as the migration SOURCE ([`migrate_legacy_repo_graphs`]); never written.
+pub(crate) const LEGACY_ESTATE_HOME_DIRNAME: &str = ".wicked-estate";
+
+/// `$HOME`, or `$USERPROFILE` on Windows.
+fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+}
+
+thread_local! {
+    /// The state home this thread's resolver is bound to — the actor thread binds the store it was
+    /// spawned on ([`StateHomeScope::for_store`]); an unbound thread resolves the default state
+    /// home. Thread-local rather than process-global on purpose: two engines in one process (crew's
+    /// test workers, a harness spawning several `Core`s) must resolve independently, and a
+    /// process-global set by the latest spawn would silently hand one daemon's graphs to another's
+    /// state home.
+    static BOUND_STATE_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// RAII binding of the calling thread's repo-graph resolver to a state home (module ADR). Holds
+/// for the guard's lifetime and restores the previous binding on drop, so an off-actor reader can
+/// scope a store's state home around one `get_repo` without disturbing the thread it runs on.
+#[must_use = "the binding lasts only as long as this guard is held"]
+pub(crate) struct StateHomeScope {
+    prev: Option<PathBuf>,
+}
+
+impl StateHomeScope {
+    /// Bind to the state home of the store at `db_path` — its canonical parent directory
+    /// (`state_home::operational_home_of_db`); `:memory:` and `postgres://` stores have none, and
+    /// the thread then resolves the default state home.
+    pub(crate) fn for_store(db_path: &str) -> Self {
+        Self::bind(crate::state_home::operational_home_of_db(db_path))
+    }
+
+    /// Bind to an explicit state home (`None` unbinds).
+    pub(crate) fn bind(state_home: Option<PathBuf>) -> Self {
+        let prev = BOUND_STATE_HOME.with(|c| c.replace(state_home));
+        StateHomeScope { prev }
+    }
+}
+
+impl Drop for StateHomeScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        BOUND_STATE_HOME.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// The state home the calling thread is bound to, if any.
+pub(crate) fn bound_state_home() -> Option<PathBuf> {
+    BOUND_STATE_HOME.with(|c| c.borrow().clone())
+}
+
+/// The root every repo graph hangs off, for the CALLING THREAD: the env override, else the bound
+/// state home's `repo-graphs`, else the default state home's (module ADR, precedence 1–3). `None`
+/// only when no override is set and no home can be resolved at all; the resolvers then answer
+/// nothing — never an in-tree path.
 pub(crate) fn repo_graph_root() -> Option<PathBuf> {
+    repo_graph_root_for(bound_state_home().as_deref())
+}
+
+/// [`repo_graph_root`] for an EXPLICIT state home — what the launchers pass (they already carry
+/// the runner's `operational_home`, derived from the same `--db` the actor binds). Env override
+/// first, then `state_home`, then the default state home.
+pub(crate) fn repo_graph_root_for(state_home: Option<&Path>) -> Option<PathBuf> {
     repo_graph_root_from(
         std::env::var_os(REPO_GRAPH_ROOT_ENV),
-        std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+        state_home,
+        home_dir(),
     )
 }
 
-/// [`repo_graph_root`]'s pure core, split out so the override precedence is testable without
-/// mutating process env (env mutation races parallel tests; the few tests that must mutate hold
+/// The repo-graph root of the daemon whose operational store is at `db_path`:
+/// `<canonical parent of db_path>/repo-graphs` (env override first, default state home when the
+/// path names no directory — `:memory:`, `postgres://`). The one spelling an out-of-process
+/// consumer (crew's diagnostics, a proof script) needs to locate a daemon's repo graphs.
+pub fn repo_graph_root_for_store(db_path: &str) -> Option<PathBuf> {
+    repo_graph_root_for(crate::state_home::operational_home_of_db(db_path).as_deref())
+}
+
+/// [`repo_graph_root`]'s pure core, split out so the precedence is testable without mutating
+/// process env (env mutation races parallel tests; the few tests that must mutate hold
 /// [`REPO_GRAPH_ROOT_ENV_LOCK`]).
 fn repo_graph_root_from(
     override_root: Option<std::ffi::OsString>,
+    state_home: Option<&Path>,
     home: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
     if let Some(r) = override_root {
@@ -207,8 +322,27 @@ fn repo_graph_root_from(
             return Some(PathBuf::from(r));
         }
     }
-    home.filter(|h| !h.is_empty())
-        .map(|h| Path::new(&h).join(".wicked-estate").join("repo-graphs"))
+    if let Some(sh) = state_home {
+        return Some(sh.join(REPO_GRAPHS_DIRNAME));
+    }
+    home.filter(|h| !h.is_empty()).map(|h| {
+        Path::new(&h)
+            .join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME)
+            .join(REPO_GRAPHS_DIRNAME)
+    })
+}
+
+/// The pre-core#406 root, `<home>/.wicked-estate/repo-graphs` — the migration SOURCE only.
+pub(crate) fn legacy_repo_graph_root() -> Option<PathBuf> {
+    legacy_repo_graph_root_from(home_dir())
+}
+
+fn legacy_repo_graph_root_from(home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    home.filter(|h| !h.is_empty()).map(|h| {
+        Path::new(&h)
+            .join(LEGACY_ESTATE_HOME_DIRNAME)
+            .join(REPO_GRAPHS_DIRNAME)
+    })
 }
 
 /// Sanitized-stem budget: 51 + `-` + 12 hex = exactly estate's 64-byte label ceiling — the same
@@ -216,7 +350,7 @@ fn repo_graph_root_from(
 const KEY_HASH_LEN: usize = 12;
 const KEY_STEM_LEN: usize = 64 - 1 - KEY_HASH_LEN;
 
-/// The estate-home directory key for one repo:
+/// The graph directory key for one repo:
 /// `<repo-dir-name>-<first 12 hex of sha256(canonicalized absolute repo root)>`.
 ///
 /// The dir name is what lets an operator map a key back to a repo without a lookup table; the
@@ -231,7 +365,8 @@ const KEY_STEM_LEN: usize = 64 - 1 - KEY_HASH_LEN;
 /// Canonicalization (falling back to [`std::path::absolute`], then the path as given, for a root
 /// that is gone) is what makes the key STABLE across spellings: `/var/...` and `/private/var/...`,
 /// a relative registration and its absolute record, all hash to the same key — so the record, the
-/// indexer, and the dispatch-time resolver land on the same directory.
+/// indexer, the dispatch-time resolver, and the boot-time migration all land on the same
+/// directory, under whichever root is live.
 pub(crate) fn repo_graph_key(repo: &Path) -> String {
     use sha2::{Digest, Sha256};
     let canon = std::fs::canonicalize(repo)
@@ -266,77 +401,55 @@ pub(crate) fn repo_graph_key(repo: &Path) -> String {
     format!("{stem}-{digest}")
 }
 
-/// One repo's estate-home graph db under a given root — the estate-home half of the resolver,
-/// split out so tests can spell the expected path without a second hand-join.
-pub(crate) fn estate_home_graph_db_at(estate_root: &Path, repo: &Path) -> PathBuf {
-    estate_root
-        .join(repo_graph_key(repo))
-        .join(CODE_GRAPH_DB_FILE)
+/// One repo's graph db under a given root — `<root>/<key>/estate.db` — split out so tests can
+/// spell the expected path without a second hand-join.
+pub(crate) fn repo_graph_db_at(root: &Path, repo: &Path) -> PathBuf {
+    root.join(repo_graph_key(repo)).join(CODE_GRAPH_DB_FILE)
 }
 
 /// Where `repo`'s code graph lives — or would live, for a repo never indexed. THE resolver: every
 /// spelling of a per-repo graph path (the record's `code_graph_db`, the indexer's `--db`, the
-/// dispatch-time MCP scope) comes from here.
-///
-/// LEGACY-FIRST: an existing `<repo>/.codegraph/estate.db` wins unconditionally (module ADR — an
-/// indexed repo never migrates silently and never orphans). Only a repo with no in-tree graph
-/// resolves to the estate home.
-pub(crate) fn resolved_code_graph_db(repo: &Path) -> PathBuf {
+/// dispatch-time MCP scope) comes from here. `None` when no root resolves at all (module ADR) —
+/// never a path inside `repo`.
+pub(crate) fn resolved_code_graph_db(repo: &Path) -> Option<PathBuf> {
     resolved_code_graph_db_at(repo, repo_graph_root().as_deref())
 }
 
-/// [`resolved_code_graph_db`] with the estate home injected — the pure core tests drive without
-/// mutating process env.
-fn resolved_code_graph_db_at(repo: &Path, estate_root: Option<&Path>) -> PathBuf {
-    let legacy = repo.join(code_graph_rel());
-    if legacy.is_file() {
-        return legacy;
-    }
-    match estate_root {
-        Some(root) => estate_home_graph_db_at(root, repo),
-        None => legacy,
-    }
+/// [`resolved_code_graph_db`] with the root injected — the pure core tests drive without
+/// mutating process env. Whether `<repo>/.codegraph/` exists is deliberately NOT consulted.
+fn resolved_code_graph_db_at(repo: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    root.map(|r| repo_graph_db_at(r, repo))
 }
 
-/// Which home a RESOLVED `code_graph_db` value belongs to — the ONE shape recognition the sandbox
-/// grants key off (`execute_wrapped::repo_read_root` / `graph_write_dir`). `None` means "not a
-/// code graph": relative paths, wrong filenames, and paths under neither home are all fail-closed
-/// (no grant), because taking a parent off an arbitrary path hands a worker an over-broad root.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CodeGraphHome {
-    /// `<repo>/.codegraph/estate.db` — legacy, in-tree. Grant: READ on the repo root (the graph is
-    /// inside it, and its file paths anchor there). Unchanged pre-ADR behavior.
-    InTree { repo_root: PathBuf },
-    /// `<estate_root>/<key>/estate.db` — the estate home. Grant: read+write on EXACTLY the key
-    /// directory (WAL/journal siblings), NEVER the root above it — a worker must not be able to
-    /// reach another repo's graph one sibling over.
-    EstateHome { key_dir: PathBuf },
+/// `<repo>/.codegraph` — the directory a pre-core#406 engine (or crew's pre-ADR onboarding)
+/// indexed INTO the working tree. Never resolved; recognised so it can be reported.
+pub(crate) fn in_tree_code_graph_dir(repo: &Path) -> PathBuf {
+    repo.join(IN_TREE_CODE_GRAPH_DIR)
 }
 
-/// Classify an ABSOLUTE graph path against an injected estate root (pure; see the enum docs).
-/// Callers resolving against the live environment pass `repo_graph_root().as_deref()`.
-///
-/// The estate-home arm matches only a db whose parent-of-parent IS `estate_root` and whose key
-/// segment passes estate's label rule — an env root that moved since the path was minted, or a
-/// key-shaped segment somewhere else on disk, classifies as nothing and grants nothing.
-pub(crate) fn classify_code_graph_db_at(
-    db: &Path,
-    estate_root: Option<&Path>,
-) -> Option<CodeGraphHome> {
+/// Whether the checkout at `repo` carries a `.codegraph` entry of ANY kind (directory, stray
+/// file, symlink — `symlink_metadata`, so a dangling link is still reported and never followed).
+/// The repo record turns a `true` into its `in_tree_code_graph_ignored` finding.
+pub(crate) fn has_in_tree_code_graph(repo: &Path) -> bool {
+    std::fs::symlink_metadata(in_tree_code_graph_dir(repo)).is_ok()
+}
+
+/// Classify an ABSOLUTE graph path against an injected root (pure): `Some(<root>/<key>)` — the
+/// EXACT key directory — for `<root>/<key>/estate.db` whose key segment passes estate's label
+/// rule, `None` for everything else. This is the ONE shape recognition the sandbox grants key off
+/// (`execute_wrapped::repo_read_root` / `graph_write_dir`): relative paths, wrong filenames, a db
+/// directly under the root, a key dir under a DIFFERENT root (an env root that moved since the
+/// path was minted), and the legacy in-tree shape `<repo>/.codegraph/estate.db` all classify as
+/// nothing and grant nothing — taking a parent off an arbitrary path hands a worker an over-broad
+/// root, and a graph is never in the tree (module ADR).
+pub(crate) fn classify_code_graph_db_at(db: &Path, root: Option<&Path>) -> Option<PathBuf> {
     if !db.is_absolute() || db.file_name().is_none_or(|n| n != CODE_GRAPH_DB_FILE) {
         return None;
     }
     let dir = db.parent()?;
-    if dir.file_name().is_some_and(|n| n == ".codegraph") {
-        return dir.parent().map(|repo_root| CodeGraphHome::InTree {
-            repo_root: repo_root.to_path_buf(),
-        });
-    }
-    let root = estate_root?;
+    let root = root?;
     if dir.parent() == Some(root) && dir.file_name().is_some_and(is_valid_key) {
-        return Some(CodeGraphHome::EstateHome {
-            key_dir: dir.to_path_buf(),
-        });
+        return Some(dir.to_path_buf());
     }
     None
 }
@@ -357,11 +470,13 @@ fn is_valid_key(seg: &std::ffi::OsStr) -> bool {
 
 /// Serializes tests that MUTATE `WICKED_ESTATE_REPO_GRAPH_ROOT` (write side) against tests that
 /// resolve through it (read side) — the acp_runner ENV_LOCK pattern (core#285), shared crate-wide
-/// because the mutating tests live in more than one module.
+/// because the mutating tests live in more than one module. A bound [`StateHomeScope`] is
+/// thread-local and needs no lock; the env override is process-wide and does.
 #[cfg(test)]
 pub(crate) static REPO_GRAPH_ROOT_ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
-/// [`CODE_GRAPH_DB_REL`] as a path, one segment at a time, so the separator is the platform's.
+/// [`CODE_GRAPH_DB_REL`] as a path, one segment at a time, so the separator is the platform's
+/// (test stand-in, like the constant).
 ///
 /// `repo.join(CODE_GRAPH_DB_REL)` looks like it does this and does not: `join` appends the argument
 /// as a SINGLE component and leaves its `/` untouched, so on Windows it yields
@@ -369,39 +484,48 @@ pub(crate) static REPO_GRAPH_ROOT_ENV_LOCK: std::sync::RwLock<()> = std::sync::R
 /// that crew's Node-side `join` produces for the same repo. Both open the same file, and every
 /// comparison between them is false. The first cut of the FINDING-069 fix had exactly this bug,
 /// with a doc comment asserting the opposite; Windows CI caught it and macOS/Linux could not have.
+#[cfg(test)]
 pub(crate) fn code_graph_rel() -> PathBuf {
     CODE_GRAPH_DB_REL.split('/').collect()
 }
 
-/// A repo's code-graph path, resolved for a WRITER, with its parent directory created.
+/// A repo's code-graph path, resolved for a WRITER, with its key directory created.
 ///
-/// Separate from [`existing_code_graph`] on purpose. This one is allowed to bring the file into
+/// Separate from [`existing_code_graph`] on purpose. This one is allowed to bring the directory into
 /// existence; the read side is not. Collapsing them is what made FINDING-069 undetectable: the
 /// consumer called this, `create_dir_all` succeeded, and it returned a path to a database that had
 /// never been indexed — so "no graph" and "graph right here" were the same value.
 ///
-/// LEGACY-FIRST like every resolver arm: an already-indexed repo's writes keep landing on its
-/// in-tree graph (refreshing the store crew's onboarding built, never forking a second one in the
-/// estate home); only a repo with no in-tree graph mints there.
+/// Always under the live root (module ADR): a repo carrying an in-tree `.codegraph/` still mints
+/// here, never refreshes the in-tree file. An error when no root resolves — never a fallback into
+/// the working tree.
 pub(crate) fn code_graph_path_for_write(repo: &Path) -> std::io::Result<PathBuf> {
     code_graph_path_for_write_at(repo, repo_graph_root().as_deref())
 }
 
-/// [`code_graph_path_for_write`] with the estate home injected (pure apart from the
-/// `create_dir_all`; tests drive it at a scratch root so nothing touches a real home).
-fn code_graph_path_for_write_at(
-    repo: &Path,
-    estate_root: Option<&Path>,
-) -> std::io::Result<PathBuf> {
-    let graph = resolved_code_graph_db_at(repo, estate_root);
+/// [`code_graph_path_for_write`] with the root injected (pure apart from the `create_dir_all`;
+/// tests drive it at a scratch root so nothing touches a real home).
+fn code_graph_path_for_write_at(repo: &Path, root: Option<&Path>) -> std::io::Result<PathBuf> {
+    let graph = resolved_code_graph_db_at(repo, root).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no repo-graph root resolves for {}: set {REPO_GRAPH_ROOT_ENV}, run under a daemon \
+                 (the root is <state home>/{REPO_GRAPHS_DIRNAME}), or set HOME (USERPROFILE on \
+                 Windows) — a graph is never minted inside the working tree",
+                repo.display()
+            ),
+        )
+    })?;
     if let Some(parent) = graph.parent() {
         std::fs::create_dir_all(parent)?;
     }
     Ok(graph)
 }
 
-/// A repo's code graph if it has actually been indexed — `None` when the file is in NEITHER home
-/// (legacy in-tree first, then the estate home; module ADR).
+/// A repo's code graph if it has actually been indexed — `None` when the file is not under the
+/// live root (module ADR). An in-tree `<repo>/.codegraph/estate.db` is NOT a graph this engine
+/// will read.
 ///
 /// Creates nothing. A consumer choosing a store to hand a governed worker must treat `None` as "no
 /// graph, ship no estate MCP" and never as license to substitute the operational store, which is the
@@ -410,10 +534,257 @@ pub(crate) fn existing_code_graph(repo: &Path) -> Option<PathBuf> {
     existing_code_graph_at(repo, repo_graph_root().as_deref())
 }
 
-/// [`existing_code_graph`] with the estate home injected — the pure core tests drive.
-fn existing_code_graph_at(repo: &Path, estate_root: Option<&Path>) -> Option<PathBuf> {
-    let graph = resolved_code_graph_db_at(repo, estate_root);
-    graph.is_file().then_some(graph)
+/// [`existing_code_graph`] with the root injected — the pure core tests drive.
+fn existing_code_graph_at(repo: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    resolved_code_graph_db_at(repo, root).filter(|g| g.is_file())
+}
+
+// ── one-time migration from the estate home (core#406) ──────────────────────────────────────────
+
+/// What the boot-time migration did for one registered repo. Repos with nothing to migrate (no
+/// legacy graph, or a graph already under the live root) produce no entry — the common case, and
+/// silent on purpose: this runs on every boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GraphMigration {
+    /// The legacy graph was copied to the live root. The source is left in place.
+    Copied {
+        repo_id: String,
+        from: PathBuf,
+        to: PathBuf,
+    },
+    /// The copy failed; the partial destination was removed, so the repo re-indexes at its next
+    /// onboarding rather than reading a torn database. The source is untouched.
+    Failed {
+        repo_id: String,
+        from: PathBuf,
+        to: PathBuf,
+        error: String,
+    },
+}
+
+impl GraphMigration {
+    /// The one-line operator notice the actor logs.
+    pub(crate) fn notice(&self) -> String {
+        match self {
+            GraphMigration::Copied { repo_id, from, to } => format!(
+                "wicked-core: migrated repo `{repo_id}`'s code graph {} -> {} (core#406: repo \
+                 graphs live under the daemon state home); the old copy is left in place — remove \
+                 the old `{LEGACY_ESTATE_HOME_DIRNAME}/{REPO_GRAPHS_DIRNAME}` directory once this \
+                 daemon is verified",
+                from.display(),
+                to.display()
+            ),
+            GraphMigration::Failed {
+                repo_id,
+                from,
+                to,
+                error,
+            } => format!(
+                "wicked-core: could not migrate repo `{repo_id}`'s code graph {} -> {}: {error}; \
+                 the old copy is untouched and the repo will re-index at its next onboarding",
+                from.display(),
+                to.display()
+            ),
+        }
+    }
+}
+
+/// Bring every registered repo's graph from the pre-core#406 estate home under the live root —
+/// ONCE (a destination that exists is never touched), through SQLite's online-backup API, leaving
+/// the source in place (module ADR). `repos` is `(repo id, repo root)` for each registered repo;
+/// the root of the calling thread ([`repo_graph_root`]) is the destination.
+pub(crate) fn migrate_legacy_repo_graphs<'a>(
+    repos: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> Vec<GraphMigration> {
+    match (repo_graph_root(), legacy_repo_graph_root()) {
+        (Some(root), Some(legacy)) => migrate_legacy_repo_graphs_at(repos, &root, &legacy),
+        _ => Vec::new(),
+    }
+}
+
+/// [`migrate_legacy_repo_graphs`] with both roots injected — pure apart from the copies.
+fn migrate_legacy_repo_graphs_at<'a>(
+    repos: impl IntoIterator<Item = (&'a str, &'a Path)>,
+    root: &Path,
+    legacy_root: &Path,
+) -> Vec<GraphMigration> {
+    // The override can name the legacy directory itself (an operator who pinned it); then there
+    // is nothing to move and copying a graph onto itself would be the one way to corrupt it.
+    if same_root(root, legacy_root) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (repo_id, repo) in repos {
+        let from = repo_graph_db_at(legacy_root, repo);
+        let to = repo_graph_db_at(root, repo);
+        // A boot killed mid-copy leaves `estate.db.migrating-<pid>` beside — never AT — the
+        // served path; sweep it before deciding, so the copy below starts clean.
+        if let Some(key_dir) = to.parent() {
+            sweep_stray_migrations(key_dir);
+        }
+        if to.exists() || !from.is_file() {
+            continue;
+        }
+        out.push(match copy_sqlite_db(&from, &to, &StepBudget::BOOT) {
+            Ok(()) => GraphMigration::Copied {
+                repo_id: repo_id.to_string(),
+                from,
+                to,
+            },
+            Err(error) => {
+                // The temp is already gone (`copy_sqlite_db` removes it on every error); take the
+                // key dir with it when the failed copy was the only thing in it, so a repo that
+                // never had a graph under the root is left exactly as it was found.
+                if let Some(dir) = to.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                GraphMigration::Failed {
+                    repo_id: repo_id.to_string(),
+                    from,
+                    to,
+                    error,
+                }
+            }
+        });
+    }
+    out
+}
+
+/// The infix of a migration's temp sibling: `estate.db.migrating-<pid>`, in the key dir. Not
+/// `estate.db`, so nothing the resolver serves (`is_file` on `estate.db`) ever names a copy in
+/// flight; not a `-wal`/`-shm` spelling, so SQLite never mistakes it for a sidecar.
+const MIGRATING_INFIX: &str = ".migrating-";
+
+/// Remove every `estate.db.migrating-*` a crashed boot left in `key_dir` (nothing else — a key
+/// dir holds the live db and its WAL siblings, which are never touched here).
+fn sweep_stray_migrations(key_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(key_dir) else {
+        return;
+    };
+    let prefix = format!("{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}");
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(&prefix))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Whether two roots name the same directory, by canonical spelling when both exist and by
+/// lexical equality otherwise.
+fn same_root(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// How much work one backup may do before it is declared failed (fail closed, never a boot that
+/// hangs): SQLite RESTARTS an online backup whenever another connection writes the source, so a
+/// still-running pre-upgrade indexer can keep `More` coming forever — hence the wall clock and the
+/// step cap on top of the locked-source cap.
+struct StepBudget {
+    /// Pages copied per `step`.
+    pages_per_step: std::ffi::c_int,
+    /// Total `step` calls (any result) before giving up.
+    max_steps: u32,
+    /// Consecutive-or-not `Busy`/`Locked` results before giving up (each sleeps 25 ms).
+    max_locked_steps: u32,
+    /// Wall clock for the whole copy.
+    max_wall: std::time::Duration,
+}
+
+impl StepBudget {
+    /// The boot-time budget: 256 pages a step, ~5 s of a locked source, and the 60 s WALL CLOCK
+    /// as the real bound. The step cap is a backstop far above any legacy graph's size (50 000 ×
+    /// 256 pages ≈ 50 GB at 4 KiB pages) — it exists so a backup that a live writer keeps
+    /// restarting cannot spin past the wall clock unnoticed, never to fail a large graph that the
+    /// clock would have allowed (independent review R2).
+    const BOOT: StepBudget = StepBudget {
+        pages_per_step: 256,
+        max_steps: 50_000,
+        max_locked_steps: 200,
+        max_wall: std::time::Duration::from_secs(60),
+    };
+}
+
+/// Copy one SQLite database `from` → `to` with the online-backup API: a page-consistent snapshot
+/// even of a WAL-mode db another process still has open, which a byte copy of `estate.db` +
+/// `-wal` + `-shm` is not. CRASH-SAFE: the backup is written to a temp sibling
+/// (`<to>.migrating-<pid>`) and renamed onto `to` only after `StepResult::Done`, so no partially
+/// written database ever sits at the path the resolver serves. `to`'s directory is created; `to`
+/// must not exist. Every error path removes the temp; the budget bounds the copy.
+fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<(), String> {
+    use rusqlite::{backup::Backup, backup::StepResult, Connection, OpenFlags};
+    let dir = to
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", to.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(
+        "{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| -> Result<(), String> {
+        let src = Connection::open_with_flags(
+            from,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("open source {}: {e}", from.display()))?;
+        let mut dst = Connection::open(&tmp)
+            .map_err(|e| format!("create destination {}: {e}", tmp.display()))?;
+        {
+            let backup = Backup::new(&src, &mut dst).map_err(|e| format!("start backup: {e}"))?;
+            let started = std::time::Instant::now();
+            let mut steps = 0u32;
+            let mut locked_steps = 0u32;
+            loop {
+                if started.elapsed() > budget.max_wall {
+                    return Err(format!(
+                        "backup exceeded its wall clock ({} s)",
+                        budget.max_wall.as_secs()
+                    ));
+                }
+                steps += 1;
+                if steps > budget.max_steps {
+                    return Err(format!(
+                        "backup exceeded its step budget ({} steps of {} pages)",
+                        budget.max_steps, budget.pages_per_step
+                    ));
+                }
+                match backup
+                    .step(budget.pages_per_step)
+                    .map_err(|e| format!("backup step: {e}"))?
+                {
+                    StepResult::Done => break,
+                    StepResult::More => {}
+                    StepResult::Busy | StepResult::Locked => {
+                        locked_steps += 1;
+                        if locked_steps > budget.max_locked_steps {
+                            return Err("source database stayed locked".to_string());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    // `StepResult` is `#[non_exhaustive]`: a variant this rusqlite does not know
+                    // is not a copy we can vouch for — fail closed.
+                    other => return Err(format!("unexpected backup step result: {other:?}")),
+                }
+            }
+        }
+        // Both connections closed before the rename: a WAL-mode `tmp` with an open connection
+        // still has `-wal`/`-shm` siblings, and a rename under an open handle is not portable.
+        drop(dst);
+        drop(src);
+        std::fs::rename(&tmp, to)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), to.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Index `repo` into its code graph via the wicked-estate indexer subprocess. Returns the db path.
@@ -507,6 +878,51 @@ pub fn recon_repo(repo: &Path, n: usize) -> anyhow::Result<Vec<RankedSymbol>> {
     rank_symbols(&graph, n)
 }
 
+/// Test support shared by every module whose tests need a KNOWN repo-graph root.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+
+    /// Pin the repo-graph root to `<dir>/repo-graphs` for the pin's lifetime: holds the crate-wide
+    /// env WRITE lock, sets `WICKED_ESTATE_REPO_GRAPH_ROOT` (precedence 1 — it outranks any bound
+    /// state home and the default home alike), and restores the previous value on drop. What a
+    /// test gets: a deterministic root whatever thread binding or process env is live, and
+    /// hermeticity — nothing resolves into, or is minted under, a real home. Do not take the env
+    /// lock again while holding a pin (`RwLock` is not reentrant).
+    #[must_use = "the pin lasts only as long as this guard is held"]
+    pub(crate) struct GraphRootPin {
+        _env: std::sync::RwLockWriteGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+        pub root: PathBuf,
+    }
+
+    impl GraphRootPin {
+        pub(crate) fn at(dir: &Path) -> Self {
+            let env = super::REPO_GRAPH_ROOT_ENV_LOCK
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            let prev = std::env::var_os(super::REPO_GRAPH_ROOT_ENV);
+            let root = dir.join(super::REPO_GRAPHS_DIRNAME);
+            std::fs::create_dir_all(&root).unwrap();
+            std::env::set_var(super::REPO_GRAPH_ROOT_ENV, &root);
+            GraphRootPin {
+                _env: env,
+                prev,
+                root,
+            }
+        }
+    }
+
+    impl Drop for GraphRootPin {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var(super::REPO_GRAPH_ROOT_ENV, v),
+                None => std::env::remove_var(super::REPO_GRAPH_ROOT_ENV),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,15 +940,31 @@ mod tests {
         dir
     }
 
-    /// The consumer-facing literals, pinned. Every out-of-process consumer joins the LEGACY
-    /// spelling onto a repo root — crew did it in five places, and when the engine's spelling and
-    /// crew's disagreed the worker got a database nothing had written (FINDING-069). Changing
-    /// either is a coordinated release, not a rename.
+    /// The consumer-facing literals, pinned. The in-tree spelling is what a checkout's `.codegraph/`
+    /// is recognised by (and reported as); the root dirname is the state-home registry entry; the
+    /// env name is the documented override. Changing any is a coordinated release, not a rename.
     #[test]
     fn the_spellings_are_the_ones_consumers_expect() {
         assert_eq!(CODE_GRAPH_DB_REL, ".codegraph/estate.db");
+        assert_eq!(IN_TREE_CODE_GRAPH_DIR, ".codegraph");
+        // The production directory spelling and the test stand-in file spelling are ONE shape.
+        assert_eq!(
+            CODE_GRAPH_DB_REL,
+            format!("{IN_TREE_CODE_GRAPH_DIR}/{CODE_GRAPH_DB_FILE}")
+        );
         assert_eq!(CODE_GRAPH_DB_FILE, "estate.db");
         assert_eq!(REPO_GRAPH_ROOT_ENV, "WICKED_ESTATE_REPO_GRAPH_ROOT");
+        assert_eq!(REPO_GRAPHS_DIRNAME, "repo-graphs");
+        assert_eq!(LEGACY_ESTATE_HOME_DIRNAME, ".wicked-estate");
+        // The registry entry the fence classifies `<state home>/repo-graphs` by MUST exist, or
+        // every governed launch on a daemon that has indexed a repo is refused by name.
+        assert!(
+            crate::state_home::registry()
+                .expect("the embedded registry parses")
+                .classify(REPO_GRAPHS_DIRNAME)
+                .is_some(),
+            "`{REPO_GRAPHS_DIRNAME}` must be registered in tests/fixtures/state-home-subtrees.json"
+        );
         // Joined SEGMENT BY SEGMENT, so the separator is the platform's and a consumer's
         // `join(root, '.codegraph', 'estate.db')` produces a byte-identical string. This is a
         // no-op on Unix and load-bearing on Windows: `Path::join` given the whole
@@ -544,33 +976,92 @@ mod tests {
             Path::new("/repo").join(code_graph_rel()),
             Path::new("/repo").join(".codegraph").join("estate.db"),
         );
+        assert_eq!(
+            in_tree_code_graph_dir(Path::new("/repo")),
+            Path::new("/repo").join(".codegraph")
+        );
     }
 
-    /// The override wins over the home; the home default is `<home>/.wicked-estate/repo-graphs`;
-    /// no home at all resolves to nothing (the resolver then stays in-tree). Pure — no env.
+    /// Precedence 1–3 of the module ADR, pure: the override wins outright; a bound state home
+    /// puts the root at `<state home>/repo-graphs`; an unbound thread gets the DEFAULT state home
+    /// `<home>/.wicked-crew/repo-graphs`; nothing at all resolves to nothing. The legacy estate
+    /// home is NEVER an answer — it is the migration source only.
     #[test]
-    fn the_root_is_the_override_then_the_home_then_nothing() {
+    fn the_root_is_the_override_then_the_state_home_then_the_default_state_home() {
         let over = Some(std::ffi::OsString::from("/x/graphs"));
         let home = Some(std::ffi::OsString::from("/home/u"));
+        let sh = PathBuf::from("/srv/crew-state");
         assert_eq!(
-            repo_graph_root_from(over.clone(), home.clone()),
+            repo_graph_root_from(over.clone(), Some(&sh), home.clone()),
             Some(PathBuf::from("/x/graphs")),
-            "the env override wins outright"
+            "the env override wins outright, even over a bound state home"
         );
         assert_eq!(
-            repo_graph_root_from(None, home),
+            repo_graph_root_from(None, Some(&sh), home.clone()),
+            Some(sh.join("repo-graphs")),
+            "a bound state home puts the root at <state home>/repo-graphs"
+        );
+        assert_eq!(
+            repo_graph_root_from(None, None, home.clone()),
+            Some(
+                Path::new("/home/u")
+                    .join(".wicked-crew")
+                    .join("repo-graphs")
+            ),
+            "no binding falls back to the DEFAULT state home — never the estate home"
+        );
+        assert_eq!(
+            repo_graph_root_from(Some(std::ffi::OsString::new()), None, None),
+            None,
+            "an EMPTY override does not name a root, and no home resolves to nothing"
+        );
+        assert_eq!(
+            legacy_repo_graph_root_from(home),
             Some(
                 Path::new("/home/u")
                     .join(".wicked-estate")
                     .join("repo-graphs")
             ),
-            "no override falls back to the home default"
+            "the legacy root is the pre-#406 estate home"
         );
+    }
+
+    /// The store path → root derivation the launchers and out-of-process consumers use: the
+    /// canonical parent of `--db`, plus `repo-graphs`. `:memory:` names no directory.
+    #[test]
+    fn the_root_for_a_store_is_its_parent_plus_repo_graphs() {
+        // Holds the read side of the env lock: the override would outrank the derivation.
+        let _env = REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var_os(REPO_GRAPH_ROOT_ENV).is_some_and(|v| !v.is_empty()) {
+            eprintln!("skipping: {REPO_GRAPH_ROOT_ENV} is set in this process");
+            return;
+        }
+        let state_home = scratch("root-for-store");
+        let db = state_home.join("core.db");
+        // Spelled the way `operational_home_of_db` spells it: canonical, with Windows' `\\?\`
+        // verbatim prefix stripped (`simplify_verbatim`) — a raw `canonicalize` keeps the prefix
+        // and is unequal to the engine's answer on Windows.
+        let canonical =
+            crate::skills_snapshot::simplify_verbatim(std::fs::canonicalize(&state_home).unwrap());
         assert_eq!(
-            repo_graph_root_from(Some(std::ffi::OsString::new()), None),
-            None,
-            "an EMPTY override does not name a root, and no home resolves to nothing"
+            repo_graph_root_for_store(db.to_str().unwrap()),
+            Some(canonical.join("repo-graphs"))
         );
+        // Through a bound scope on THIS thread, the same answer — and it is undone on drop.
+        let before = repo_graph_root();
+        {
+            let _scope = StateHomeScope::for_store(db.to_str().unwrap());
+            assert_eq!(bound_state_home(), Some(canonical.clone()));
+            assert_eq!(repo_graph_root(), Some(canonical.join("repo-graphs")));
+        }
+        assert_eq!(bound_state_home(), None, "the scope unbinds on drop");
+        assert_eq!(repo_graph_root(), before);
+        // A store that names no directory binds nothing, so the default applies.
+        let _scope = StateHomeScope::for_store(":memory:");
+        assert_eq!(bound_state_home(), None);
+        let _ = std::fs::remove_dir_all(&state_home);
     }
 
     /// The key: `<dir-name>-<12 hex>`, estate-label-legal, stable across spellings of one root,
@@ -620,89 +1111,100 @@ mod tests {
         assert!(is_valid_key(std::ffi::OsStr::new(&key_w)), "{key_w}");
     }
 
-    /// AC2 — CONTINUITY, the hard requirement: a repo with an in-tree graph keeps it for read AND
-    /// write, even when a perfectly good estate home (holding this very repo's key!) exists. An
-    /// already-indexed repo never migrates silently and never orphans (FINDING-069's lesson).
+    /// core#406, the headline: a checkout carrying `<repo>/.codegraph/estate.db` (a graph an older
+    /// engine indexed in-tree, or one its git history TRACKS) is NEVER adopted — not for
+    /// resolution, not for read, not for write. The record resolves under the live root; the read
+    /// side answers `None` until something indexes THERE; the write side mints THERE; the in-tree
+    /// file is neither read nor touched — it is only recognised, for the repo-card finding.
     #[test]
-    fn a_repo_with_a_legacy_in_tree_graph_keeps_it_for_read_and_write() {
-        let base = scratch("legacy-first");
+    fn an_in_tree_graph_is_never_adopted_for_resolution_read_or_write() {
+        let base = scratch("never-in-tree");
         let repo = base.join("repo");
-        let legacy = repo.join(code_graph_rel());
-        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
-        std::fs::write(&legacy, b"185 MB of graph, notionally").unwrap();
-        // A rival estate-home graph for the SAME repo — the resolver must not even look at it.
-        let estate_root = base.join("estate");
-        let rival = estate_home_graph_db_at(&estate_root, &repo);
-        std::fs::create_dir_all(rival.parent().unwrap()).unwrap();
-        std::fs::write(&rival, b"an empty fork nothing should ever read").unwrap();
+        let in_tree = repo.join(code_graph_rel());
+        std::fs::create_dir_all(in_tree.parent().unwrap()).unwrap();
+        std::fs::write(&in_tree, b"185 MB of graph, notionally, tracked by git").unwrap();
+        let in_tree_before = std::fs::metadata(&in_tree).unwrap().modified().unwrap();
+        let root = base.join("state-home").join("repo-graphs");
+        let want = repo_graph_db_at(&root, &repo);
 
         assert_eq!(
-            resolved_code_graph_db_at(&repo, Some(&estate_root)),
-            legacy,
-            "resolution is legacy-first"
+            resolved_code_graph_db_at(&repo, Some(&root)),
+            Some(want.clone()),
+            "resolution is the live root, whatever sits in the tree"
         );
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&estate_root)).as_deref(),
-            Some(legacy.as_path()),
-            "the READ path keeps the in-tree graph"
+            existing_code_graph_at(&repo, Some(&root)),
+            None,
+            "the READ path does not see the in-tree file — nothing under the root has been indexed"
         );
         assert_eq!(
-            code_graph_path_for_write_at(&repo, Some(&estate_root)).unwrap(),
-            legacy,
-            "the WRITE path keeps refreshing the in-tree graph — never a silent fork"
+            code_graph_path_for_write_at(&repo, Some(&root)).unwrap(),
+            want,
+            "the WRITE path mints under the root — never refreshes the in-tree file"
         );
+        assert!(want.parent().unwrap().is_dir(), "the key dir is created");
+        assert!(
+            has_in_tree_code_graph(&repo),
+            "…and the in-tree directory IS recognised, so the record can report it"
+        );
+        assert!(!has_in_tree_code_graph(&base.join("clean")));
+        assert_eq!(
+            std::fs::metadata(&in_tree).unwrap().modified().unwrap(),
+            in_tree_before,
+            "the customer's file is untouched"
+        );
+        // Once the indexer writes under the root, the read side finds it there.
+        std::fs::write(&want, b"indexed").unwrap();
+        assert_eq!(
+            existing_code_graph_at(&repo, Some(&root)).as_deref(),
+            Some(want.as_path())
+        );
+        // No root at all: NOTHING resolves — never a fallback into the tree (the pre-#406
+        // behaviour), and the write side is an error rather than a path.
+        assert_eq!(resolved_code_graph_db_at(&repo, None), None);
+        assert_eq!(existing_code_graph_at(&repo, None), None);
+        let err = code_graph_path_for_write_at(&repo, None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(err.to_string().contains(REPO_GRAPH_ROOT_ENV), "{err}");
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// AC1's resolver half: a repo with NO in-tree graph mints in the estate home — the key dir is
-    /// created under the injected root, the working tree stays untouched, and the read side still
-    /// answers `None` until something actually indexes.
+    /// A repo with no in-tree graph mints under the root — the key dir is created, the working
+    /// tree stays untouched, and the read side still answers `None` until something indexes.
     #[test]
-    fn a_repo_without_a_legacy_graph_mints_in_the_estate_home() {
-        let base = scratch("estate-mint");
+    fn a_fresh_repo_mints_under_the_root_and_leaves_the_tree_clean() {
+        let base = scratch("mint");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let estate_root = base.join("estate");
+        let root = base.join("repo-graphs");
 
-        let want = estate_home_graph_db_at(&estate_root, &repo);
-        assert_eq!(resolved_code_graph_db_at(&repo, Some(&estate_root)), want);
+        let want = repo_graph_db_at(&root, &repo);
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&estate_root)),
+            resolved_code_graph_db_at(&repo, Some(&root)),
+            Some(want.clone())
+        );
+        assert_eq!(
+            existing_code_graph_at(&repo, Some(&root)),
             None,
             "no graph anywhere ⇒ None — never a path to a database nothing wrote (FINDING-069)"
         );
-
-        let for_write = code_graph_path_for_write_at(&repo, Some(&estate_root)).unwrap();
+        let for_write = code_graph_path_for_write_at(&repo, Some(&root)).unwrap();
         assert_eq!(for_write, want);
         assert!(want.parent().unwrap().is_dir(), "the key dir is created");
         assert!(
-            !repo.join(code_graph_rel()).parent().unwrap().exists(),
-            "the working tree is NOT polluted — that is the whole point of the estate home"
+            !in_tree_code_graph_dir(&repo).exists(),
+            "the working tree is NOT polluted — that is the whole point"
         );
-
-        // Once the indexer writes the file, the read side finds it there.
-        std::fs::write(&want, b"indexed").unwrap();
-        assert_eq!(
-            existing_code_graph_at(&repo, Some(&estate_root)).as_deref(),
-            Some(want.as_path())
-        );
-
-        // No home at all: the resolver stays in-tree (the only address left).
-        assert_eq!(
-            resolved_code_graph_db_at(&repo, None),
-            repo.join(code_graph_rel())
-        );
-
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// AC3 — the env override, END TO END through the public (env-reading) resolver: everything
-    /// lands under the override, and the real default home's key dir for this repo is never
-    /// created. Holds the crate-wide write lock; every other resolver test injects its root and
-    /// never reads env.
+    /// The env override, END TO END through the public (env-reading) resolvers, over a bound state
+    /// home: everything lands under the override, and neither the bound state home's root nor the
+    /// real default home's key dir for this repo is ever created. Holds the crate-wide write lock;
+    /// every other resolver test injects its root and never reads env.
     #[test]
-    fn the_env_override_redirects_the_root_away_from_the_real_home() {
+    fn the_env_override_redirects_the_root_away_from_every_home() {
         let _env = REPO_GRAPH_ROOT_ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -711,20 +1213,22 @@ mod tests {
         let base = scratch("env-override");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let estate_root = base.join("estate");
-        std::env::set_var(REPO_GRAPH_ROOT_ENV, &estate_root);
+        let over = base.join("override");
+        std::env::set_var(REPO_GRAPH_ROOT_ENV, &over);
+        let state_home = base.join("state-home");
+        std::fs::create_dir_all(&state_home).unwrap();
+        let _scope = StateHomeScope::for_store(state_home.join("core.db").to_str().unwrap());
 
-        let resolved = resolved_code_graph_db(&repo);
+        let resolved = resolved_code_graph_db(&repo).expect("a root resolves");
         let for_write = code_graph_path_for_write(&repo).unwrap();
-        assert_eq!(resolved, estate_home_graph_db_at(&estate_root, &repo));
+        assert_eq!(resolved, repo_graph_db_at(&over, &repo));
         assert_eq!(for_write, resolved);
-        assert!(resolved.starts_with(&estate_root), "{resolved:?}");
-
-        // Nothing under the DEFAULT home root for this repo's key — the override redirected it.
-        if let Some(default_root) = repo_graph_root_from(
-            None,
-            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
-        ) {
+        assert!(resolved.starts_with(&over), "{resolved:?}");
+        assert!(
+            !state_home.join("repo-graphs").exists(),
+            "the override outranks the bound state home"
+        );
+        if let Some(default_root) = repo_graph_root_from(None, None, home_dir()) {
             assert!(
                 !default_root.join(repo_graph_key(&repo)).exists(),
                 "the override must keep the real home untouched"
@@ -738,55 +1242,243 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The shape recognition the sandbox grants key off: exactly the two homes, nothing else.
+    /// The shape recognition the sandbox grants key off: exactly `<root>/<key>/estate.db` → the
+    /// key dir; everything else — the legacy in-tree shape included — is NOT a graph (no grant).
     #[test]
-    fn classification_recognizes_exactly_the_two_shapes() {
+    fn classification_recognizes_only_the_state_home_shape() {
         let base = scratch("classify");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        let estate_root = base.join("estate");
+        let root = base.join("repo-graphs");
         let key = repo_graph_key(&repo);
 
-        // Legacy in-tree → InTree, repo root recovered.
+        let db = repo_graph_db_at(&root, &repo);
         assert_eq!(
-            classify_code_graph_db_at(&repo.join(code_graph_rel()), Some(&estate_root)),
-            Some(CodeGraphHome::InTree {
-                repo_root: repo.clone()
-            }),
-        );
-        // Estate home → EstateHome, EXACTLY the key dir.
-        let db = estate_home_graph_db_at(&estate_root, &repo);
-        assert_eq!(
-            classify_code_graph_db_at(&db, Some(&estate_root)),
-            Some(CodeGraphHome::EstateHome {
-                key_dir: estate_root.join(&key)
-            }),
+            classify_code_graph_db_at(&db, Some(&root)),
+            Some(root.join(&key)),
+            "the live shape classifies to EXACTLY the key dir"
         );
 
-        // Everything else is NOT a graph (fail-closed: no grant).
         for (why, bad) in [
-            ("relative", PathBuf::from("repo").join(code_graph_rel())),
-            ("wrong filename", estate_root.join(&key).join("other.db")),
             (
-                "db directly under the root",
-                estate_root.join(CODE_GRAPH_DB_FILE),
+                "the legacy in-tree shape — a graph is never in the tree (core#406)",
+                repo.join(code_graph_rel()),
             ),
+            ("relative", PathBuf::from("repo").join(code_graph_rel())),
+            ("wrong filename", root.join(&key).join("other.db")),
+            ("db directly under the root", root.join(CODE_GRAPH_DB_FILE)),
             (
                 "key dir under a DIFFERENT root",
                 base.join("elsewhere").join(&key).join(CODE_GRAPH_DB_FILE),
             ),
             (
                 "traversal-shaped key segment",
-                estate_root.join("..").join(CODE_GRAPH_DB_FILE),
+                root.join("..").join(CODE_GRAPH_DB_FILE),
             ),
         ] {
             assert!(
-                classify_code_graph_db_at(&bad, Some(&estate_root)).is_none(),
+                classify_code_graph_db_at(&bad, Some(&root)).is_none(),
                 "{why} must not classify as a graph: {bad:?}"
             );
         }
-        // And with NO estate root resolvable, only the legacy shape classifies.
+        // And with NO root resolvable, nothing classifies — not even the live shape.
         assert!(classify_code_graph_db_at(&db, None).is_none());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A real SQLite db with `n` rows in `t`, as the indexer would leave one (WAL mode). The
+    /// writer connection is RETURNED and kept open by the caller, so the rows sit in an
+    /// un-checkpointed WAL while another connection still holds the db — the shape a live daemon's
+    /// graph has, and the case a byte copy of `estate.db` alone would get wrong.
+    fn sqlite_with_rows(path: &Path, n: usize) -> rusqlite::Connection {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = rusqlite::Connection::open(path).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        c.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        c.execute_batch("CREATE TABLE t (v INTEGER)").unwrap();
+        for i in 0..n {
+            c.execute("INSERT INTO t (v) VALUES (?1)", [i as i64])
+                .unwrap();
+        }
+        c
+    }
+
+    fn row_count(path: &Path) -> i64 {
+        let c =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        c.query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// The boot-time migration: a registered repo whose graph sits under the legacy estate home and
+    /// nowhere under the live root is copied ONCE (page-consistent, WAL included), the source is
+    /// left in place, a second boot is a silent no-op, a repo already under the root is never
+    /// overwritten, and a repo with no legacy graph produces nothing.
+    #[test]
+    fn migration_copies_a_legacy_graph_once_and_leaves_the_source_in_place() {
+        let base = scratch("migrate");
+        let legacy_root = base.join(".wicked-estate").join("repo-graphs");
+        let root = base.join("state-home").join("repo-graphs");
+        let alpha = base.join("alpha");
+        let beta = base.join("beta");
+        let gamma = base.join("gamma");
+        for r in [&alpha, &beta, &gamma] {
+            std::fs::create_dir_all(r).unwrap();
+        }
+        // alpha: legacy only → migrates. beta: legacy AND live → the live one wins, untouched.
+        // gamma: never indexed → nothing.
+        let _alpha_writer = sqlite_with_rows(&repo_graph_db_at(&legacy_root, &alpha), 7);
+        let _beta_legacy_writer = sqlite_with_rows(&repo_graph_db_at(&legacy_root, &beta), 3);
+        let _beta_live_writer = sqlite_with_rows(&repo_graph_db_at(&root, &beta), 1);
+        let beta_live_before = std::fs::read(repo_graph_db_at(&root, &beta)).unwrap();
+        let repos = [
+            ("alpha", alpha.as_path()),
+            ("beta", beta.as_path()),
+            ("gamma", gamma.as_path()),
+        ];
+
+        let out = migrate_legacy_repo_graphs_at(repos, &root, &legacy_root);
+        assert_eq!(
+            out,
+            vec![GraphMigration::Copied {
+                repo_id: "alpha".into(),
+                from: repo_graph_db_at(&legacy_root, &alpha),
+                to: repo_graph_db_at(&root, &alpha),
+            }],
+            "exactly alpha migrates: {out:?}"
+        );
+        assert_eq!(
+            row_count(&repo_graph_db_at(&root, &alpha)),
+            7,
+            "the copy is page-consistent — the un-checkpointed WAL rows arrived too, with the \
+             source still open"
+        );
+        assert!(
+            repo_graph_db_at(&legacy_root, &alpha).is_file(),
+            "the source is left in place — the engine deletes nothing it did not write"
+        );
+        assert_eq!(
+            std::fs::read(repo_graph_db_at(&root, &beta)).unwrap(),
+            beta_live_before,
+            "a graph already under the root is never overwritten"
+        );
+        assert!(
+            !root.join(repo_graph_key(&gamma)).exists(),
+            "a repo with no legacy graph mints nothing"
+        );
+        assert!(out[0].notice().contains("alpha") && out[0].notice().contains("core#406"));
+
+        // Second boot: nothing left to do.
+        assert_eq!(
+            migrate_legacy_repo_graphs_at(repos, &root, &legacy_root),
+            vec![]
+        );
+        // The override pointed at the legacy directory itself: nothing to move, nothing touched.
+        assert_eq!(
+            migrate_legacy_repo_graphs_at(repos, &legacy_root, &legacy_root),
+            vec![]
+        );
+        // A source that is not a database fails CLOSED: reported, the torn destination removed.
+        let delta = base.join("delta");
+        std::fs::create_dir_all(&delta).unwrap();
+        let bad = repo_graph_db_at(&legacy_root, &delta);
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, b"not a sqlite database").unwrap();
+        let out = migrate_legacy_repo_graphs_at([("delta", delta.as_path())], &root, &legacy_root);
+        assert!(
+            matches!(&out[..], [GraphMigration::Failed { repo_id, .. }] if repo_id == "delta"),
+            "{out:?}"
+        );
+        assert!(
+            !root.join(repo_graph_key(&delta)).exists(),
+            "a failed copy leaves no torn destination for a worker to open"
+        );
+        assert!(bad.is_file(), "…and the source is untouched");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F1 of the independent review: the copy is crash-safe. A backup that stops early (budget
+    /// exhausted here; a SIGKILL in production) leaves NOTHING at the served path — the resolver
+    /// answers `None`, never a torn `estate.db` — and the next boot sweeps the stray temp sibling
+    /// and copies the intact legacy source in full.
+    #[test]
+    fn an_interrupted_migration_leaves_no_torn_graph_and_completes_on_the_next_boot() {
+        let base = scratch("migrate-interrupted");
+        let legacy_root = base.join(".wicked-estate").join("repo-graphs");
+        let root = base.join("state-home").join("repo-graphs");
+        let repo = base.join("alpha");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Many pages, so a one-page step cannot finish in one go.
+        let from = repo_graph_db_at(&legacy_root, &repo);
+        let _writer = sqlite_with_rows(&from, 5_000);
+        let to = repo_graph_db_at(&root, &repo);
+        let key_dir = to.parent().unwrap().to_path_buf();
+
+        // 1. The copy is interrupted (one step of one page, then the budget runs out).
+        let starved = StepBudget {
+            pages_per_step: 1,
+            max_steps: 1,
+            max_locked_steps: 1,
+            max_wall: std::time::Duration::from_secs(60),
+        };
+        let err = copy_sqlite_db(&from, &to, &starved).unwrap_err();
+        assert!(err.contains("step budget"), "{err}");
+        assert!(
+            !to.exists(),
+            "nothing is ever written AT the served path before Done"
+        );
+        assert_eq!(
+            existing_code_graph_at(&repo, Some(&root)),
+            None,
+            "the resolver never sees a copy in flight"
+        );
+        assert!(
+            std::fs::read_dir(&key_dir)
+                .map(|d| d.count() == 0)
+                .unwrap_or(true),
+            "the failed copy removed its temp"
+        );
+
+        // 2. A CRASH mid-copy: the temp sibling is left behind (simulated), still nothing at
+        //    `estate.db` — the resolver still answers None.
+        let stray = key_dir.join(format!("{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}424242"));
+        std::fs::write(&stray, b"half a database").unwrap();
+        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+
+        // 3. Next boot: the stray is swept and the legacy source is copied in full.
+        let out = migrate_legacy_repo_graphs_at([("alpha", repo.as_path())], &root, &legacy_root);
+        assert!(
+            matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
+            "{out:?}"
+        );
+        assert!(
+            !stray.exists(),
+            "the stray temp from the crashed boot is swept"
+        );
+        assert_eq!(
+            row_count(&to),
+            5_000,
+            "the second boot copies the intact source in full"
+        );
+        assert_eq!(
+            existing_code_graph_at(&repo, Some(&root)).as_deref(),
+            Some(to.as_path())
+        );
+        assert!(
+            std::fs::read_dir(&key_dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(MIGRATING_INFIX)),
+            "no temp sibling survives a completed copy"
+        );
+        // A third boot: nothing to do (and the completed copy is never re-copied).
+        assert_eq!(
+            migrate_legacy_repo_graphs_at([("alpha", repo.as_path())], &root, &legacy_root),
+            vec![]
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

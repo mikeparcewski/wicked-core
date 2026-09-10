@@ -1776,9 +1776,10 @@ impl Core {
     /// `core.db`), which holds run/governance nodes but none of a repo's domain/requirement nodes, so
     /// it reports a vacuous `coverage: 1.0` over an empty denominator and cannot name a repo. This
     /// resolves the repo from the registry, opens its `code_graph_db` (the engine-resolved path
-    /// every consumer shares — the legacy in-tree `<root>/.codegraph/estate.db` for a repo that
-    /// already has one, else the estate home's `<estate_root>/<key>/estate.db`; see wicked-core's
-    /// `code_graph.rs` ADR), and recomputes over it. An unknown `repo_ref` is an
+    /// every consumer shares — `<daemon state home>/repo-graphs/<key>/estate.db`, never inside the
+    /// checkout; see wicked-core's `code_graph.rs` ADR, core#406), and recomputes over it. The
+    /// daemon's own store path is handed along so the repo graph resolves under THIS daemon's
+    /// state home off the actor thread. An unknown `repo_ref` is an
     /// ERROR, never a silent vacuous report — the caller must name a real repo.
     /// Resolves to the coverage report as a JSON string (`ts_return_type` pins it — the crew adapter
     /// used to cast away an `unknown` here; #225 review).
@@ -1790,7 +1791,8 @@ impl Core {
             let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
             // The resolve-repo → open-its-store → recompute logic lives in wicked-core so it is
             // unit-testable there (this napi layer stays thin glue). An unknown repo errors.
-            let report = wicked_core::coverage_report_for_repo(&daemon, &repo_ref).map_err(err)?;
+            let report =
+                wicked_core::coverage_report_for_repo(&daemon, &db_path, &repo_ref).map_err(err)?;
             serde_json::to_string(&report).map_err(err)
         })
     }
@@ -1804,7 +1806,8 @@ impl Core {
         task(move || {
             use wicked_apps_core::open_store_ro;
             let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
-            let kinds = wicked_core::graph_kinds_for_repo(&daemon, &repo_ref).map_err(err)?;
+            let kinds =
+                wicked_core::graph_kinds_for_repo(&daemon, &db_path, &repo_ref).map_err(err)?;
             let shaped: Vec<_> = kinds
                 .into_iter()
                 .map(|(kind, count)| serde_json::json!({ "kind": kind, "count": count }))
