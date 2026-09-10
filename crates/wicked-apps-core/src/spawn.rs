@@ -311,10 +311,23 @@ pub fn seat_claude_config_dir() -> Option<anyhow::Result<std::path::PathBuf>> {
 /// (`wicked-core::execute_wrapped::binary_is_claude` delegates here), the ACP runner to the seat
 /// record's `binary`, the council ballot to the program it is about to exec. Known boundary (M7):
 /// a claude-compatible binary under another name is not recognised.
+///
+/// The comparison follows the OS's own executable lookup (codex r3, PR#413): case-INSENSITIVE on
+/// Windows, where `CLAUDE.EXE` and `Claude.cmd` launch the same program as `claude.exe` — an
+/// exact match there would classify them `NotClaude`, strip `CLAUDE_CONFIG_DIR` from a claude
+/// process and leave it on the OPERATOR's home config; exact everywhere else, where the filesystem
+/// is case-sensitive and `Claude` is a different binary from `claude`.
 pub fn binary_is_claude(bin: &str) -> bool {
     std::path::Path::new(bin)
         .file_stem()
-        .map(|s| s == "claude")
+        .and_then(|s| s.to_str())
+        .map(|stem| {
+            if cfg!(windows) {
+                stem.eq_ignore_ascii_case("claude")
+            } else {
+                stem == "claude"
+            }
+        })
         .unwrap_or(false)
 }
 
@@ -561,6 +574,16 @@ mod tests {
         ] {
             assert!(binary_is_claude(yes), "{yes}");
         }
+        // codex r3: the comparison follows the OS's executable lookup — Windows launches
+        // `CLAUDE.EXE` / `Claude.cmd` as claude and so must the carrier test; a case-sensitive
+        // filesystem does not, so `Claude` stays a different binary there.
+        for spelled in ["CLAUDE.EXE", "Claude.cmd", r"C:\Tools\CLAUDE.exe", "Claude"] {
+            assert_eq!(
+                binary_is_claude(spelled),
+                cfg!(windows),
+                "{spelled}: case-insensitive on Windows only"
+            );
+        }
         for no in [
             "codex",
             "pi",
@@ -570,6 +593,32 @@ mod tests {
             "claude-agent-acp",
         ] {
             assert!(!binary_is_claude(no), "{no}");
+        }
+    }
+
+    /// codex r3: on Windows an upper/mixed-case `.exe`/`.cmd` spelling reaches the SAME carrier
+    /// decision as `claude` — never `NotClaude` (which would strip the variable from a claude
+    /// process and leave it on the operator's home config). Elsewhere it is not claude at all.
+    #[test]
+    fn a_case_variant_claude_spelling_reaches_the_claude_carrier_decision_on_windows() {
+        for spelled in ["CLAUDE.EXE", "Claude.cmd", r"C:\Tools\CLAUDE.exe"] {
+            let decision = claude_config_for_carrier(spelled);
+            if cfg!(windows) {
+                match decision {
+                    Ok(CarrierClaudeConfig::NotClaude) => {
+                        panic!("{spelled} launches claude on Windows and must be treated as claude")
+                    }
+                    Ok(CarrierClaudeConfig::Inherit) => assert!(inherits_operator_config()),
+                    Ok(CarrierClaudeConfig::Dir(d)) => assert!(d.ends_with("claude"), "{spelled}"),
+                    Err(e) => panic!("{spelled}: this host's worker home should resolve: {e}"),
+                }
+            } else {
+                assert_eq!(
+                    decision.unwrap(),
+                    CarrierClaudeConfig::NotClaude,
+                    "{spelled}: exact on a case-sensitive filesystem"
+                );
+            }
         }
     }
 

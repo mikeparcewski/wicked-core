@@ -6113,6 +6113,20 @@ mod tests {
         assert!(binary_is_claude("claude.exe"));
         assert!(!binary_is_claude("agy"));
         assert!(!binary_is_claude("claude-code-wrapper"));
+        // codex r3, PR#413: the wrapped template's binary is judged the way the OS launches it —
+        // `CLAUDE.EXE` / `Claude.cmd` are claude on Windows (so the worker home, not a stripped
+        // variable, reaches the process) and a different binary on a case-sensitive filesystem.
+        for spelled in ["CLAUDE.EXE", "Claude.cmd", r"C:\Tools\CLAUDE.exe"] {
+            assert_eq!(binary_is_claude(spelled), cfg!(windows), "{spelled}");
+            assert_eq!(
+                matches!(
+                    wrapped_seat_identity("claude", Some(format!("{spelled} -p {{PROMPT}}"))),
+                    crate::skills_snapshot::WorkerCli::Claude
+                ),
+                cfg!(windows),
+                "{spelled}: the wrapped seat identity follows the same test"
+            );
+        }
     }
 
     #[test]

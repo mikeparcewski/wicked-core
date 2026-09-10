@@ -6008,6 +6008,28 @@ transport = "stdio"
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// codex r3, PR#413: the ACP seat identity — judged off the record's `binary` through the same
+    /// carrier test as the ballot and the wrapped runner — follows the OS's executable lookup: a
+    /// record spelling its binary `CLAUDE.EXE` / `Claude.cmd` is a claude seat on Windows (so the
+    /// bridge gets the worker home, never a stripped variable), and not one on a case-sensitive
+    /// filesystem.
+    #[test]
+    fn a_case_variant_claude_binary_is_a_claude_seat_exactly_where_the_os_launches_it_as_one() {
+        use crate::skills_snapshot::WorkerCli;
+        for spelled in ["CLAUDE.EXE", "Claude.cmd", r"C:\Tools\CLAUDE.exe"] {
+            let identity = WorkerCli::for_binaries(spelled, "claude-agent-acp", "claude");
+            assert_eq!(
+                matches!(identity, WorkerCli::Claude),
+                cfg!(windows),
+                "{spelled}: {identity:?}"
+            );
+        }
+        assert!(matches!(
+            WorkerCli::for_binaries("claude", "claude-agent-acp", "claude"),
+            WorkerCli::Claude
+        ));
+    }
+
     /// A NON-claude bridge (codex, pi, copilot, opencode) gets no ambient claude configuration
     /// path: the daemon's own `CLAUDE_CONFIG_DIR` is stripped, not forwarded, and the engine-owned
     /// claude home is neither handed to it nor ensured on its account (codex, PR#413).

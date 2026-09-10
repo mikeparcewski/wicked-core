@@ -1624,6 +1624,57 @@ mod failure_diagnostics_tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
+    /// codex r3, PR#413 (Windows): an upper-case `CLAUDE.EXE` seat IS a claude carrier there, so
+    /// the ballot consults the worker-home resolver for it — proven pre-spawn: with a relative
+    /// `WICKED_WORKER_HOME` the ballot is refused at the resolver, which a `NotClaude` seat would
+    /// never reach (it would try to spawn the missing binary instead).
+    #[test]
+    #[cfg(windows)]
+    fn an_upper_case_claude_exe_seat_is_a_claude_carrier_for_the_ballot() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            return;
+        }
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
+        for spelled in [
+            r"C:\wicked-council-no-such-dir\CLAUDE.EXE --print",
+            r"C:\wicked-council-no-such-dir\Claude.cmd --print",
+        ] {
+            let cli = seat("claude", "claude", spelled);
+            let f = failure_of(&cli, Duration::from_secs(5));
+            assert_eq!(f.kind, SeatFailureKind::SpawnFailed, "{spelled}: {f:?}");
+            assert!(
+                f.detail.contains("must be absolute"),
+                "{spelled}: must be classified claude and refused at the resolver: {f:?}"
+            );
+        }
+    }
+
+    /// codex r3, PR#413 (unix): the filesystem is case-sensitive, so `Claude` is NOT claude — the
+    /// ballot does not consult the worker-home resolver for it (a relative `WICKED_WORKER_HOME`
+    /// does not refuse it; it fails on the missing binary instead).
+    #[test]
+    #[cfg(unix)]
+    fn a_differently_cased_claude_is_not_a_claude_carrier_on_a_case_sensitive_filesystem() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _home = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
+        let cli = seat(
+            "claude",
+            "Claude",
+            "/wicked-council-no-such-dir/Claude --print",
+        );
+        let f = failure_of(&cli, Duration::from_secs(5));
+        assert_eq!(f.kind, SeatFailureKind::SpawnFailed);
+        assert!(
+            !f.detail.contains("must be absolute"),
+            "not a claude carrier here, so the resolver is never consulted: {f:?}"
+        );
+        assert!(
+            f.detail.contains("Claude"),
+            "fails on the binary itself: {f:?}"
+        );
+    }
+
     /// codex r2, PR#413: a `..` segment in `WICKED_WORKER_HOME` reads as absolute but re-aims the
     /// resolved dir; refused before any spawn, like a relative path.
     #[test]

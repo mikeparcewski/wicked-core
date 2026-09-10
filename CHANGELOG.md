@@ -545,7 +545,9 @@ Two release tracks share this file, newest entry first regardless of track:
   decision (`execute_wrapped::exec` sets the worker home for a claude carrier, strips the variable
   for any other — wrapped claude no longer runs on the operator's login by accident); and an ACP
   launch reads its `[cli.acp]` transport and its seat identity off ONE registry record
-  (`acp_launch_facts`; the unit path reuses its single `seat` read).
+  (`acp_launch_facts`; the unit path reuses its single `seat` read). The shared `binary_is_claude`
+  carrier test follows the OS's executable lookup: case-insensitive on Windows (`CLAUDE.EXE`,
+  `Claude.cmd` are claude there), exact elsewhere.
   `councilSeatFailed` gains ADDITIVE `stdout` and `reason` (`null` when unclassified) beside
   `stderr`/`detail` — wire shape change (additive) — crew/studio consume it via the next core-ts
   release; the crew roster consumer of `login_invocation` sees the resolved path. Persisted
