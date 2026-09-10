@@ -1670,8 +1670,9 @@ fn resolved_binary_version_matches(binary: &str, expected: &str) -> bool {
 
 /// The shape the spawn tests drive (TEST-ONLY since core#410: the unit path and the chat path
 /// both call [`start_acp_process_with_write_roots`] directly — the unit with its governance
-/// facts, the chat with its recorded scope).
-#[cfg(test)]
+/// facts, the chat with its recorded scope). `unix` like its only callers, the shell-script
+/// stub wrappers — on Windows it would be dead code under `-D warnings`.
+#[cfg(all(test, unix))]
 fn start_acp_process(
     config: &AcpConfig,
     cwd: &std::path::Path,
@@ -4182,6 +4183,29 @@ pub struct ChatScope {
     pub read_roots: Vec<String>,
 }
 
+/// Create a chat's scratch root for its seats — PRIVATE (0700 on unix) and never through a
+/// planted link (Copilot, #426): the default root sits under the system temp directory, where
+/// another local user can pre-place a symlink under a predictable name, and `create_dir_all`
+/// alone would follow it and hand the seats that target as their cwd. `refuse_symlinked_home`
+/// is the same no-follow walk the worker config homes get (root-owned system links such as
+/// macOS's `/var -> /private/var` are followed; anything plantable is refused by name).
+fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
+    wicked_apps_core::spawn::refuse_symlinked_home(cwd)
+        .map_err(|e| format!("refusing scratch root {} ({e})", cwd.display()))?;
+    if cwd.is_dir() {
+        return Ok(());
+    }
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(cwd)
+        .map_err(|e| format!("cannot create scratch root {} ({e})", cwd.display()))
+}
+
 impl ChatScope {
     /// The private scratch root a chat runs in when its opener names none:
     /// `<system temp>/wicked-core-chat-<id>`. NEVER the daemon's cwd (F-067: a daemon started
@@ -4472,12 +4496,7 @@ impl AcpStepRunner {
             .get(chat_id)
             .cloned()
             .ok_or_else(|| format!("chat '{chat_id}' has no scope recorded — open it first"))?;
-        std::fs::create_dir_all(&scope.cwd).map_err(|e| {
-            format!(
-                "chat '{chat_id}': cannot create its scratch root {} ({e})",
-                scope.cwd.display()
-            )
-        })?;
+        ensure_chat_scratch_root(&scope.cwd).map_err(|e| format!("chat '{chat_id}': {e}"))?;
         // Grounded on the scope's graph — the READ-ONLY estate MCP, the same seam governed
         // workers get (DES-GROUNDING-001; formerly "chat is repo-less exploration → no estate
         // MCP", FINDING-122) — in its scratch cwd, with the scoped repository roots advertised.
@@ -4511,16 +4530,34 @@ impl AcpStepRunner {
     /// `ChatSessionFailed` emitted for each. The scope is RECORDED first (core#410 / crew#502) so
     /// every later ensure — a re-warm after an eviction, a turn on a seat that was never warm —
     /// lands in the same cwd, on the same graph, with the same read roots.
+    ///
+    /// Re-opening a chat that already holds a DIFFERENT scope EVICTS its warm seats first (the
+    /// pool entries are dropped, no `ChatClosed` — the chat is not closing), so they re-warm in
+    /// the new scope here rather than keep running in the old cwd while the record says
+    /// otherwise (Copilot, #426). A re-open with the SAME scope is a plain ensure. When no seat
+    /// is warm afterwards (every start failed, or `clis` was empty) the scope is DROPPED again:
+    /// the pool is what the reaper and the enumerate surface see, so a scope with no pool entry
+    /// would be held by nothing that can reclaim it — the caller opens again.
     pub fn chat_open(
         &self,
         chat_id: &str,
         clis: &[String],
         scope: ChatScope,
     ) -> Vec<(String, Result<(), String>)> {
-        self.chat_scopes
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(chat_id.to_string(), scope);
+        {
+            let mut scopes = self.chat_scopes.lock().unwrap_or_else(|p| p.into_inner());
+            let changed = scopes
+                .get(chat_id)
+                .is_some_and(|recorded| *recorded != scope);
+            if changed {
+                let prefix = Self::chat_pool_key(chat_id);
+                self.sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|(rid, _), _| rid != &prefix);
+            }
+            scopes.insert(chat_id.to_string(), scope);
+        }
         let opened: Vec<(String, Result<(), String>)> = clis
             .iter()
             .map(|cli| {
@@ -4539,6 +4576,18 @@ impl AcpStepRunner {
                 (cli.clone(), outcome)
             })
             .collect();
+        if self.chat_seats(chat_id).is_empty() {
+            // Nothing warmed: hold no scope (and no activity stamp) for a chat the pool does not
+            // know — see the doc above.
+            self.chat_scopes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(chat_id);
+            self.chat_activity
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(chat_id);
+        }
         // Enforce the cap only AFTER the new chat is warm and touched, so it is the freshest entry
         // and therefore the last possible victim. Doing it first would let a full pool evict a
         // chat, warm the new one, and leave the pool at the cap anyway — same memory, one more
@@ -10285,6 +10334,80 @@ transport = "stdio"
         );
         drop(dir);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Copilot, #426: a re-open with a DIFFERENT scope evicts the chat's pool entries (the seats
+    /// re-warm in the new scope), a re-open with the SAME scope leaves them alone — and a chat
+    /// that ends up with no warm seat holds no scope, so nothing un-reapable is left behind.
+    #[test]
+    fn reopening_with_a_new_scope_evicts_the_old_seats_and_a_seatless_chat_holds_no_scope() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let key = (AcpStepRunner::chat_pool_key("c1"), "claude".to_string());
+        let scope_a = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-scope-a"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let scope_b = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-scope-b"),
+            ..scope_a.clone()
+        };
+        // A recorded scope A with a pool entry (None slot: constructing a live child is not the
+        // point here). Re-open with the SAME scope and no seats to warm: the entry is untouched.
+        r.sessions.lock().unwrap().insert(key.clone(), None);
+        r.chat_scopes
+            .lock()
+            .unwrap()
+            .insert("c1".to_string(), scope_a.clone());
+        let _ = r.chat_open("c1", &[], scope_a.clone());
+        assert!(
+            r.sessions.lock().unwrap().contains_key(&key),
+            "a same-scope re-open evicts nothing"
+        );
+        // Re-open with a DIFFERENT scope: the stale entry is evicted...
+        r.chat_scopes
+            .lock()
+            .unwrap()
+            .insert("c1".to_string(), scope_a.clone());
+        let _ = r.chat_open("c1", &[], scope_b);
+        assert!(
+            !r.sessions.lock().unwrap().contains_key(&key),
+            "a re-open with a different scope evicts the seats warmed in the old one"
+        );
+        // ...and since nothing warmed (no clis), no scope is held for a chat the pool forgot.
+        assert!(r.chat_scopes.lock().unwrap().get("c1").is_none());
+        assert!(r.chat_activity.lock().unwrap().get("c1").is_none());
+        // Every seat failing to start (an unknown cli) ends the same way: outcome reported,
+        // nothing held.
+        let opened = r.chat_open("c2", &["no-such-cli-xyz".to_string()], scope_a);
+        assert!(opened[0].1.is_err());
+        assert!(r.chat_scopes.lock().unwrap().get("c2").is_none());
+        assert!(r.chat_list().is_empty());
+    }
+
+    /// Copilot, #426: the scratch root is never reached through a planted link — a symlink where
+    /// the chat's cwd should be refuses the ensure before any seat spawns.
+    #[test]
+    #[cfg(unix)]
+    fn a_planted_symlink_at_the_chat_scratch_root_refuses_the_seat() {
+        let dir = scratch("chat-scratch-link");
+        let operator_like = dir.join("operator-home");
+        std::fs::create_dir_all(&operator_like).unwrap();
+        let linked = dir.join("chat-cwd");
+        std::os::unix::fs::symlink(&operator_like, &linked).unwrap();
+        let err = ensure_chat_scratch_root(&linked).expect_err("a planted link is refused");
+        assert!(err.contains("symlink"), "{err}");
+        // A real (or not-yet-existing) directory is created private.
+        let fresh = dir.join("fresh").join("nested");
+        ensure_chat_scratch_root(&fresh).expect("creates");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        ensure_chat_scratch_root(&fresh).expect("idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
