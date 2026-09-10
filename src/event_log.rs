@@ -82,6 +82,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::event::CoreEvent;
 
@@ -327,21 +328,43 @@ pub fn persisted_max_seq(path: &Path) -> Option<u64> {
     inspect_log(path).max_seq
 }
 
+/// Log paths this PROCESS has already appended to — the state behind the per-run restart seed.
+///
+/// Process-wide, like [`SEQ`], and for the same reason: "the engine that wrote the previous record
+/// is gone" is a property of the process, not of any one [`EventSink`] — and it is what lets
+/// [`append`] keep its plain `(root, event)` signature while still seeding. First touch of a path
+/// in this process ⇒ consult the persisted history. One entry per run the process touches over its
+/// lifetime, a few dozen bytes each — the same growth the writer's handle cache is bounded against,
+/// and the same order of magnitude as the run ids the store already holds.
+static CONTINUED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// `true` exactly once per log path per process: on the first call for it.
+fn first_touch(path: &Path) -> bool {
+    let mut touched = CONTINUED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if touched.contains(path) {
+        return false;
+    }
+    touched.insert(path.to_path_buf());
+    true
+}
+
 /// Queue one event for its run's log under `root`. Returns whether a record was ENQUEUED — the write
 /// itself happens on the writer thread, so this is not a durability acknowledgement (use [`flush`]).
 ///
-/// `continued` is the set of runs this engine has already recorded for. The FIRST record for a run
-/// is where the persisted history is consulted: the process-wide counter is raised past the run's
-/// largest recorded `seq`, so a daemon restart cannot make the new events sort before the old ones
-/// (core#408), and — when there WAS history — the record is stamped `daemonRestarted: true`. Every
-/// later record for that run is a plain append. Any sink that can write must pass its own set; a
-/// path that skipped this would reintroduce the restart at 0, which is why this is not a bare
-/// `(root, event)` call.
+/// The FIRST record this process writes for a run ([`first_touch`]) is where the persisted history
+/// is consulted: the process-wide counter is raised past the run's largest recorded `seq`, so a
+/// daemon restart cannot make the new events sort before the old ones (core#408), and — when there
+/// WAS history — the record is stamped `daemonRestarted: true`. Every later record for that run is a
+/// plain append. The state lives in this module rather than in a caller-supplied argument so that
+/// every path to the log, including this public one, upholds the guarantee by construction.
 ///
 /// `false` means one of three things: the event was a declared streaming exclusion, it was not
 /// run-scoped, or the writer channel is gone. Best-effort throughout: a full disk or a permissions
 /// problem costs the record, never the run and never the live fanout.
-fn append(root: &Path, ev: &CoreEvent, continued: &mut HashSet<String>) -> bool {
+pub fn append(root: &Path, ev: &CoreEvent) -> bool {
     // Cheapest test first, and deliberately BEFORE `to_json`: the excluded variants outnumber
     // everything else by orders of magnitude, and this runs on the actor thread.
     if is_high_volume(ev) {
@@ -352,11 +375,11 @@ fn append(root: &Path, ev: &CoreEvent, continued: &mut HashSet<String>) -> bool 
         return false;
     };
     let path = run_log_path(root, &run_id);
-    // First record THIS engine writes for the run: continue from wherever the run's history already
+    // First record THIS process writes for the run: continue from wherever the run's history already
     // reached. No flush of the writer queue is needed here — anything still queued for this run was
     // stamped by this same process's counter, which is already past it; only a PREVIOUS process's
     // records (on disk) can be ahead of the counter.
-    let (restarted, torn_tail) = if continued.insert(run_id.clone()) {
+    let (restarted, torn_tail) = if first_touch(&path) {
         let prior = inspect_log(&path);
         if let Some(max) = prior.max_seq {
             SEQ.fetch_max(max.saturating_add(1), Ordering::Relaxed);
@@ -437,12 +460,6 @@ pub struct EventSink {
     /// Where this sink records. `None` ⇒ fan out only, for embedders and tests that want no
     /// filesystem writes.
     root: Option<PathBuf>,
-    /// Runs this sink has already recorded for. A sink lives as long as the engine that owns it (in
-    /// production, the daemon process), so "not yet in here" means "this engine's first record for
-    /// the run" — the point where the persisted history seeds the counter and the restart marker is
-    /// stamped (core#408). Grows by one id per run the engine touches; bounded by the same thing the
-    /// writer's handle cache is, and a few dozen bytes per entry.
-    continued: HashSet<String>,
 }
 
 impl EventSink {
@@ -451,7 +468,6 @@ impl EventSink {
         Self {
             subscribers: Vec::new(),
             root: Some(root),
-            continued: HashSet::new(),
         }
     }
 
@@ -467,7 +483,7 @@ impl EventSink {
     /// evidence.
     pub fn emit(&mut self, ev: CoreEvent) {
         if let Some(root) = &self.root {
-            append(root, &ev, &mut self.continued);
+            append(root, &ev);
         }
         self.subscribers.retain(|s| s.send(ev.clone()).is_ok());
     }
@@ -842,7 +858,7 @@ mod tests {
         ));
         write_log(&root, "r", &raw);
 
-        // A new sink is a new engine — in production, the restarted daemon.
+        // This process has never appended to that log — exactly the restarted daemon's position.
         let mut sink = EventSink::persistent(root.clone());
         sink.emit(CoreEvent::Resumed {
             session: "r".to_string(),
