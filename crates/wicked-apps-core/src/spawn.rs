@@ -117,7 +117,13 @@ pub fn inherits_operator_config() -> bool {
 }
 
 /// The BASE of the engine-owned worker home: [`WORKER_HOME_ENV`] when set, else
-/// `<HOME | USERPROFILE>/.wicked-worker`. Fails only when no home directory resolves at all.
+/// `<HOME | USERPROFILE>/.wicked-worker`. ALWAYS an absolute path: an empty or relative override
+/// (or home directory) is a configuration error and is REFUSED — the three consumers (the ACP
+/// worker spawn, the council ballot spawn, the roster's sign-in command) would each resolve a
+/// relative dir against a different working directory and silently disagree on which directory
+/// "the worker home" is (codex review, PR#413). Deliberately NOT canonicalized: the home may not
+/// exist yet on a fresh install (the ACP spawn creates it), and following symlinks is exactly what
+/// [`refuse_symlinked_home`] forbids.
 ///
 /// Reads the process environment; [`worker_home_base_from`] is the pure core for callers (and
 /// tests) that already hold the values.
@@ -137,12 +143,63 @@ pub fn worker_home_base_from(
     userprofile: Option<std::ffi::OsString>,
 ) -> anyhow::Result<std::path::PathBuf> {
     if let Some(base) = override_base {
-        return Ok(std::path::PathBuf::from(base));
+        return absolute_or_refuse(std::path::PathBuf::from(base), WORKER_HOME_ENV);
     }
-    let home = home
-        .or(userprofile)
-        .ok_or_else(|| anyhow::anyhow!("neither HOME nor USERPROFILE is set"))?;
-    Ok(std::path::PathBuf::from(home).join(".wicked-worker"))
+    let (source, home) = match (home, userprofile) {
+        (Some(h), _) => ("HOME", h),
+        (None, Some(u)) => ("USERPROFILE", u),
+        (None, None) => anyhow::bail!("neither HOME nor USERPROFILE is set"),
+    };
+    Ok(absolute_or_refuse(std::path::PathBuf::from(home), source)?.join(".wicked-worker"))
+}
+
+/// The worker home must be spelled absolutely by whichever variable supplied it.
+fn absolute_or_refuse(
+    path: std::path::PathBuf,
+    source: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    if path.as_os_str().is_empty() {
+        anyhow::bail!("{source} is set but empty; the worker home must be an absolute path");
+    }
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "{source}={} is a relative path; the worker home must be absolute (ACP workers, council \
+             ballots and the sign-in command would each resolve it against a different working \
+             directory)",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
+/// Refuse a worker config home whose directory — or whose parent — is a symlink, judged on
+/// `symlink_metadata` (never a following stat). A link planted at either component re-aims every
+/// write the CLI makes there AND every credential it reads: `<worker home>/claude -> ~/.claude`
+/// would hand a seat the OPERATOR's login. ONE check for both spawn paths (codex review, PR#413:
+/// the ACP spawn refused this and the ballot spawn did not). A missing component is fine — the
+/// ACP spawn creates the home on first start.
+pub fn refuse_symlinked_home(dir: &std::path::Path) -> anyhow::Result<()> {
+    for probe in [dir.parent(), Some(dir)].into_iter().flatten() {
+        match std::fs::symlink_metadata(probe) {
+            Ok(m) if m.file_type().is_symlink() => {
+                anyhow::bail!(
+                    "refusing worker config home {}: {} is a symlink",
+                    dir.display(),
+                    probe.display()
+                );
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                anyhow::bail!(
+                    "refusing worker config home {}: cannot stat {} ({e})",
+                    dir.display(),
+                    probe.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The claude seat's configuration directory — `<worker home base>/claude` — the ONE answer to
@@ -154,32 +211,77 @@ pub fn worker_home_base_from(
 ///
 ///  - the ACP worker spawn (`wicked-core::acp_runner`), which also creates and re-sanitizes the
 ///    directory on every start;
-///  - the council ballot spawn (`wicked-council::dispatch`), which sets it on every seat (F-030:
-///    it used to inherit the daemon's `CLAUDE_CONFIG_DIR` — on a fresh install the never-signed-in
-///    dir garden is registered in — so every claude ballot exited 1 "Not logged in" and the seat
-///    was benched on every council while the worker path, resolving the worker home, ran fine);
+///  - the council ballot spawn (`wicked-council::dispatch`), which sets it on every CLAUDE seat
+///    (F-030: it used to inherit the daemon's `CLAUDE_CONFIG_DIR` — on a fresh install the
+///    never-signed-in dir garden is registered in — so every claude ballot exited 1 "Not logged
+///    in" and the seat was benched on every council while the worker path, resolving the worker
+///    home, ran fine);
 ///  - the roster's claude `login_invocation` (`wicked-council::types::default_login_invocation`),
 ///    so the command the studio shows an operator signs in EXACTLY the directory the seats run
 ///    under (F-013: it used to hard-code `$HOME/.wicked-worker/claude`, wrong under
 ///    [`WORKER_HOME_ENV`]).
 ///
-/// Pure path resolution — no filesystem access. Creating the directory (private, symlink-refused,
-/// re-sanitized) stays with the ACP spawn path; a ballot on a not-yet-created home simply runs a
-/// CLI that is not signed in there, which is then reported as such.
+/// Pure path resolution (always absolute, see [`worker_home_base`]) — no filesystem access. The
+/// no-follow validation every consumer must apply before USING the path is
+/// [`refuse_symlinked_home`]; [`seat_claude_config_dir`] applies it. Creating the directory
+/// (private, re-sanitized) stays with the ACP spawn path; a ballot on a not-yet-created home simply
+/// runs a CLI that is not signed in there, which is then reported as such.
 pub fn worker_claude_config_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(worker_home_base()?.join("claude"))
 }
 
-/// The [`CLAUDE_CONFIG_DIR_ENV`] value a seat spawn sets, after `hardened()`: `None` under the
-/// operator's explicit [`INHERIT_OPERATOR_CONFIG_ENV`] hatch (inherit — the operator's own
-/// configuration IS the intent), else [`worker_claude_config_dir`]. An `Err` is the resolver
-/// failing (no home directory at all); callers fail CLOSED on it — a seat that proceeded would run
-/// under the daemon's inherited configuration, which is the exact leak this exists to remove.
+/// The [`CLAUDE_CONFIG_DIR_ENV`] value a CLAUDE seat spawn sets, after `hardened()`: `None` under
+/// the operator's explicit [`INHERIT_OPERATOR_CONFIG_ENV`] hatch (inherit — the operator's own
+/// configuration IS the intent), else the VALIDATED [`worker_claude_config_dir`] — absolute by
+/// construction and no-follow checked ([`refuse_symlinked_home`]). An `Err` is the resolver
+/// failing (no home directory, a relative override, a planted link); callers fail CLOSED on it — a
+/// seat that proceeded would run under the daemon's inherited configuration, or under whatever
+/// directory a link points at, which are the exact leaks this exists to remove. Carrier-agnostic:
+/// [`claude_config_for_carrier`] is the seat-aware form spawns use.
 pub fn seat_claude_config_dir() -> Option<anyhow::Result<std::path::PathBuf>> {
     if inherits_operator_config() {
         return None;
     }
-    Some(worker_claude_config_dir())
+    Some(worker_claude_config_dir().and_then(|dir| refuse_symlinked_home(&dir).map(|()| dir)))
+}
+
+/// Whether `bin` names claude: judged on the file STEM so `claude`, `/usr/local/bin/claude`,
+/// `claude.exe` and `claude.cmd` all resolve, and `claude-code-wrapper` does not. THE carrier test
+/// every path applies — the wrapped runner to its template's first token
+/// (`wicked-core::execute_wrapped::binary_is_claude` delegates here), the ACP runner to the seat
+/// record's `binary`, the council ballot to the program it is about to exec. Known boundary (M7):
+/// a claude-compatible binary under another name is not recognised.
+pub fn binary_is_claude(bin: &str) -> bool {
+    std::path::Path::new(bin)
+        .file_stem()
+        .map(|s| s == "claude")
+        .unwrap_or(false)
+}
+
+/// What a spawn of one carrier does about [`CLAUDE_CONFIG_DIR_ENV`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarrierClaudeConfig {
+    /// Not a claude carrier (codex, pi, copilot, opencode, …): it never reads the variable, so it
+    /// gets NO ambient claude configuration path at all — callers STRIP an inherited one rather
+    /// than hand a foreign process the daemon's (or the operator's) claude config dir for nothing.
+    NotClaude,
+    /// A claude carrier under the operator's inherit hatch: keep the operator's own configuration.
+    Inherit,
+    /// A claude carrier: set the variable to this validated worker dir.
+    Dir(std::path::PathBuf),
+}
+
+/// The seat-aware decision for one spawn, from the binary it is about to run (codex review,
+/// PR#413: the ballot used to export the claude dir to EVERY seat). `Err` only for a claude carrier
+/// whose dir cannot be resolved or validated — fail closed.
+pub fn claude_config_for_carrier(carrier_binary: &str) -> anyhow::Result<CarrierClaudeConfig> {
+    if !binary_is_claude(carrier_binary) {
+        return Ok(CarrierClaudeConfig::NotClaude);
+    }
+    match seat_claude_config_dir() {
+        None => Ok(CarrierClaudeConfig::Inherit),
+        Some(dir) => dir.map(CarrierClaudeConfig::Dir),
+    }
 }
 
 /// TEST-SUPPORT — never call from runtime code. Points [`WORKER_HOME_ENV`] at one per-process
@@ -306,6 +408,16 @@ mod tests {
     /// The worker-home resolver, over explicit values so no test mutates the process environment:
     /// the override wins outright, else `HOME`, else `USERPROFILE`, else an error — and the claude
     /// seat dir is always `<base>/claude`.
+    /// An absolute fixture path spelled for the HOST platform — `is_absolute` needs a drive on
+    /// Windows and a leading `/` elsewhere, so one literal cannot serve both.
+    fn abs(tail: &str) -> String {
+        if cfg!(windows) {
+            format!("C:\\{}", tail.replace('/', "\\"))
+        } else {
+            format!("/{tail}")
+        }
+    }
+
     #[test]
     fn the_worker_home_base_resolves_override_then_home_then_userprofile() {
         use std::ffi::OsString;
@@ -317,26 +429,132 @@ mod tests {
                 u.map(OsString::from),
             )
         };
+        let (worker, home, profile) = (abs("tmp/fresh/worker"), abs("home/op"), abs("Users/op"));
         assert_eq!(
-            base(
-                Some("/tmp/fresh/worker"),
-                Some("/home/op"),
-                Some("C:\\Users\\op")
-            )
-            .unwrap(),
-            PathBuf::from("/tmp/fresh/worker"),
+            base(Some(&worker), Some(&home), Some(&profile)).unwrap(),
+            PathBuf::from(&worker),
             "WICKED_WORKER_HOME is the base itself, not a parent of it"
         );
         assert_eq!(
-            base(None, Some("/home/op"), Some("C:\\Users\\op")).unwrap(),
-            PathBuf::from("/home/op").join(".wicked-worker")
+            base(None, Some(&home), Some(&profile)).unwrap(),
+            PathBuf::from(&home).join(".wicked-worker")
         );
         assert_eq!(
-            base(None, None, Some("C:\\Users\\op")).unwrap(),
-            PathBuf::from("C:\\Users\\op").join(".wicked-worker")
+            base(None, None, Some(&profile)).unwrap(),
+            PathBuf::from(&profile).join(".wicked-worker")
         );
         let err = base(None, None, None).expect_err("no home at all must not invent one");
         assert!(err.to_string().contains("HOME"), "{err}");
+    }
+
+    /// An empty or relative worker home is a configuration error, refused by the resolver itself
+    /// — so the ACP spawn, the ballot spawn and the sign-in command all refuse the SAME way instead
+    /// of each resolving `relative/claude` against its own working directory (codex, PR#413).
+    #[test]
+    fn an_empty_or_relative_worker_home_is_refused_by_every_consumer_at_the_resolver() {
+        use std::ffi::OsString;
+        let base = |o: Option<&str>, h: Option<&str>| {
+            worker_home_base_from(o.map(OsString::from), h.map(OsString::from), None)
+        };
+        let home = abs("home/op");
+        for bad in ["", "relative/worker", "./worker", "worker"] {
+            let err = base(Some(bad), Some(&home)).expect_err(bad);
+            assert!(
+                err.to_string().contains("absolute"),
+                "override {bad:?} must be refused as non-absolute: {err}"
+            );
+            assert!(
+                err.to_string().contains(WORKER_HOME_ENV),
+                "names the source: {err}"
+            );
+        }
+        // The home directory spelling is held to the same bar.
+        let err = base(None, Some("relative-home")).expect_err("relative HOME");
+        assert!(err.to_string().contains("absolute"), "{err}");
+        assert!(err.to_string().contains("HOME"), "{err}");
+        // And a good one still resolves.
+        assert!(base(Some(&abs("abs/worker")), None).is_ok());
+    }
+
+    /// The carrier test is on the file stem, so the three paths that apply it agree.
+    #[test]
+    fn binary_is_claude_judges_the_file_stem() {
+        for yes in [
+            "claude",
+            "/usr/local/bin/claude",
+            "claude.exe",
+            "claude.cmd",
+        ] {
+            assert!(binary_is_claude(yes), "{yes}");
+        }
+        for no in [
+            "codex",
+            "pi",
+            "copilot",
+            "opencode",
+            "claude-code-wrapper",
+            "claude-agent-acp",
+        ] {
+            assert!(!binary_is_claude(no), "{no}");
+        }
+    }
+
+    /// A non-claude carrier gets NO claude configuration path — the decision is made before any
+    /// resolver runs, so it holds even where the worker home is unresolvable.
+    #[test]
+    fn a_non_claude_carrier_gets_no_claude_config_decision_at_all() {
+        for other in ["codex", "pi", "copilot", "opencode", "/opt/bin/codex"] {
+            assert_eq!(
+                claude_config_for_carrier(other).unwrap(),
+                CarrierClaudeConfig::NotClaude,
+                "{other}"
+            );
+        }
+        // A claude carrier decides between the hatch and a validated dir (whichever this host's
+        // environment selects — both are legitimate; neither is `NotClaude`).
+        match claude_config_for_carrier("claude") {
+            Ok(CarrierClaudeConfig::Inherit) => assert!(inherits_operator_config()),
+            Ok(CarrierClaudeConfig::Dir(d)) => {
+                assert!(d.is_absolute(), "{}", d.display());
+                assert!(d.ends_with("claude"));
+            }
+            Ok(CarrierClaudeConfig::NotClaude) => panic!("claude is a claude carrier"),
+            Err(e) => panic!("this host's worker home should resolve: {e}"),
+        }
+    }
+
+    /// The no-follow check shared by both spawn paths: a link at the home, or at its parent, is
+    /// refused; a real directory and a not-yet-created one pass.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_worker_home_or_parent_is_refused_without_following_it() {
+        let scratch = std::env::temp_dir().join(format!(
+            "wicked-apps-core-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = scratch.join("worker");
+        let operator_like = scratch.join("operator-config");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&operator_like).unwrap();
+        // Not created yet: fine (the ACP spawn creates it).
+        assert!(refuse_symlinked_home(&base.join("claude")).is_ok());
+        // A real directory: fine.
+        std::fs::create_dir_all(base.join("real")).unwrap();
+        assert!(refuse_symlinked_home(&base.join("real")).is_ok());
+        // `<home>/claude -> <operator-like dir>`: refused, and the target is never consulted.
+        std::os::unix::fs::symlink(&operator_like, base.join("claude")).unwrap();
+        let err = refuse_symlinked_home(&base.join("claude")).expect_err("link at the home");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        // A link at the PARENT is refused too.
+        std::os::unix::fs::symlink(&operator_like, scratch.join("linked-base")).unwrap();
+        let err = refuse_symlinked_home(&scratch.join("linked-base").join("claude"))
+            .expect_err("link at the parent");
+        assert!(err.to_string().contains("symlink"), "{err}");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     /// The seat dir the ballot sets is exactly `<base>/claude` — the SAME directory the ACP worker

@@ -284,23 +284,25 @@ pub struct AgenticCli {
 /// `$HOME/.wicked-worker/claude`; with `WICKED_WORKER_HOME` pointing elsewhere the operator signed
 /// in the wrong directory, the UI said "signed in" and every ballot still exited "Not logged in".
 /// Under the operator's inherit hatch the seats run on the operator's own configuration, so the
-/// sign-in is plain `claude`. Resolved on every call — a roster read after the environment changed
+/// sign-in is plain `claude`. When the seat dir cannot be resolved or validated (no home
+/// directory, a relative `WICKED_WORKER_HOME`, a planted symlink) there is NO sign-in command —
+/// `None`, fail closed, exactly as the ballot then refuses to spawn (codex, PR#413: a fallback to
+/// the `$HOME/.wicked-worker/claude` spelling would send the operator to sign in a directory no
+/// seat will run under). Resolved on every call — a roster read after the environment changed
 /// reads the environment, not a cached spelling.
 #[must_use]
 pub fn default_login_invocation(key: &str) -> Option<String> {
     match key {
         // The worker home (crew#267 option 3): sign in the ENGINE-owned config dir, not the
         // operator's — inside the REPL, `/login` runs the URL+paste flow.
-        "claude" => Some(match wicked_apps_core::spawn::seat_claude_config_dir() {
-            None => "claude".to_string(),
-            Some(Ok(dir)) => format!(
+        "claude" => match wicked_apps_core::spawn::seat_claude_config_dir() {
+            None => Some("claude".to_string()),
+            Some(Ok(dir)) => Some(format!(
                 "CLAUDE_CONFIG_DIR={} claude",
                 shell_double_quote(&dir.display().to_string())
-            ),
-            // No home directory resolves at all — the seats cannot resolve one either. Fall back
-            // to the shell-expanded default spelling rather than invent a path.
-            Some(Err(_)) => r#"CLAUDE_CONFIG_DIR="$HOME/.wicked-worker/claude" claude"#.to_string(),
-        }),
+            )),
+            Some(Err(_)) => None,
+        },
         "codex" => Some("codex login --device-auth".to_string()),
         "copilot" => Some("copilot login".to_string()),
         "opencode" => Some("opencode auth login".to_string()),
@@ -672,8 +674,10 @@ pub struct SeatFailure {
     pub kind: SeatFailureKind,
     /// The process exit code, when the process ran to completion.
     pub exit_code: Option<i32>,
-    /// Captured stderr, truncated to [`STDERR_CAPTURE_LIMIT`]. `run_in_isolation` already
-    /// piped stderr and then dropped it on the floor; this is that artifact, kept.
+    /// Captured stderr within [`STDERR_CAPTURE_LIMIT`]: the whole text when it fits, else its HEAD
+    /// and TAIL around an elision marker — a usage message or a stack trace's head, AND the final
+    /// error line (codex, PR#413: a head-only cut lost a `Not logged in` printed last). `run_in_isolation`
+    /// already piped stderr and then dropped it on the floor; this is that artifact, kept.
     pub stderr: String,
     /// The TAIL of captured stdout, truncated to [`STDERR_CAPTURE_LIMIT`] — kept only when the seat
     /// FAILED (a vote is parsed from stdout, never stored here). F-031: claude prints `Not logged
@@ -684,9 +688,11 @@ pub struct SeatFailure {
     pub stdout: String,
     /// The OS/IO error text, where the branch has one.
     pub detail: String,
-    /// The classified cause, when the seat's own words match a known signature. Derived from
-    /// `stdout`/`stderr` by [`Self::with_stdout`] / [`Self::with_stderr`] (recomputed on each, so
-    /// it reflects both streams however they were attached) — never set by hand.
+    /// The classified cause, when the seat's own words match a known signature. Judged over the
+    /// UNTRUNCATED streams as they are attached ([`Self::with_output`] over both at once;
+    /// [`Self::with_stdout`] / [`Self::with_stderr`] over the full text given plus whatever the
+    /// other field holds, never downgrading an earlier positive) — so a signature past the storage
+    /// cap still classifies even where the stored text no longer shows it. Never set by hand.
     #[serde(default)]
     pub reason: Option<SeatFailureReason>,
 }
@@ -694,6 +700,47 @@ pub struct SeatFailure {
 /// Cap on retained stderr per seat. Enough to carry a usage message or a stack trace's head,
 /// bounded so a runaway CLI cannot balloon an event payload or the task record.
 pub const STDERR_CAPTURE_LIMIT: usize = 4096;
+
+/// The marker stored between the kept head and tail of an over-cap stderr.
+const ELISION_MARKER: &str = "\n…[truncated]…\n";
+
+/// The last [`STDERR_CAPTURE_LIMIT`] bytes of `s`, cut forward to a char boundary (whole
+/// characters only; at most one partial character dropped from the front).
+fn tail_within_cap(s: &str) -> String {
+    if s.len() <= STDERR_CAPTURE_LIMIT {
+        return s.to_string();
+    }
+    let mut start = s.len() - STDERR_CAPTURE_LIMIT;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_string()
+}
+
+/// `s` whole when it fits [`STDERR_CAPTURE_LIMIT`]; else its head and tail around
+/// [`ELISION_MARKER`], the two halves cut on char boundaries so the total stays valid UTF-8 and
+/// within the cap.
+fn head_and_tail_within_cap(s: &str) -> String {
+    if s.len() <= STDERR_CAPTURE_LIMIT {
+        return s.to_string();
+    }
+    let budget = STDERR_CAPTURE_LIMIT - ELISION_MARKER.len();
+    // Head: walk BACK to a boundary (never past the budget).
+    let mut head_end = budget / 2;
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    // Tail: walk FORWARD to a boundary (never past the budget).
+    let mut tail_start = s.len() - (budget - head_end);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let mut out = String::with_capacity(STDERR_CAPTURE_LIMIT);
+    out.push_str(&s[..head_end]);
+    out.push_str(ELISION_MARKER);
+    out.push_str(&s[tail_start..]);
+    out
+}
 
 impl SeatFailure {
     /// A failure with no captured process output — the pre-spawn branches.
@@ -708,39 +755,31 @@ impl SeatFailure {
         }
     }
 
-    /// Attach captured stderr, truncated on a char boundary so the result stays valid UTF-8.
-    pub fn with_stderr(mut self, stderr: &str) -> Self {
-        let end = if stderr.len() <= STDERR_CAPTURE_LIMIT {
-            stderr.len()
-        } else {
-            // `floor_char_boundary` is unstable; walk back to the nearest boundary ourselves.
-            let mut i = STDERR_CAPTURE_LIMIT;
-            while i > 0 && !stderr.is_char_boundary(i) {
-                i -= 1;
-            }
-            i
-        };
-        self.stderr = stderr[..end].to_string();
-        self.reason = SeatFailureReason::classify(&self.stdout, &self.stderr);
+    /// Attach BOTH captured streams of a completed process: classified over the full text of each
+    /// FIRST (codex, PR#413: classifying after the cut missed a signature past 4096 bytes), then
+    /// stored within the cap — stderr as head+tail, stdout as tail.
+    pub fn with_output(mut self, stdout: &str, stderr: &str) -> Self {
+        self.reason = SeatFailureReason::classify(stdout, stderr);
+        self.stdout = tail_within_cap(stdout);
+        self.stderr = head_and_tail_within_cap(stderr);
         self
     }
 
-    /// Attach the TAIL of captured stdout (the last [`STDERR_CAPTURE_LIMIT`] bytes, cut on a char
-    /// boundary so the result stays valid UTF-8) and re-classify the failure over both streams.
+    /// Attach captured stderr: classified over its FULL text (with whatever stdout is already
+    /// attached; an earlier positive classification is kept), then stored as head+tail within
+    /// [`STDERR_CAPTURE_LIMIT`], cut on char boundaries so the result stays valid UTF-8.
+    pub fn with_stderr(mut self, stderr: &str) -> Self {
+        self.reason = SeatFailureReason::classify(&self.stdout, stderr).or(self.reason);
+        self.stderr = head_and_tail_within_cap(stderr);
+        self
+    }
+
+    /// Attach captured stdout: classified over its FULL text (with whatever stderr is already
+    /// attached; an earlier positive classification is kept), then stored as its TAIL within
+    /// [`STDERR_CAPTURE_LIMIT`] — a CLI states its final error last.
     pub fn with_stdout(mut self, stdout: &str) -> Self {
-        let start = if stdout.len() <= STDERR_CAPTURE_LIMIT {
-            0
-        } else {
-            // Walk FORWARD to the nearest boundary: the tail keeps whole characters, dropping at
-            // most one partial one from the front.
-            let mut i = stdout.len() - STDERR_CAPTURE_LIMIT;
-            while i < stdout.len() && !stdout.is_char_boundary(i) {
-                i += 1;
-            }
-            i
-        };
-        self.stdout = stdout[start..].to_string();
-        self.reason = SeatFailureReason::classify(&self.stdout, &self.stderr);
+        self.reason = SeatFailureReason::classify(stdout, &self.stderr).or(self.reason);
+        self.stdout = tail_within_cap(stdout);
         self
     }
 
@@ -978,6 +1017,38 @@ mod login_tests {
         }
     }
 
+    /// Serializes the env-mutating login test against the dispatch tests that mutate the same
+    /// variables (they live in another module of this binary; cargo runs them in parallel).
+    static LOGIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// codex, PR#413: when the seat dir cannot be resolved there is NO sign-in command — the ballot
+    /// refuses to spawn on that value, so a fallback spelling would send the operator to sign in a
+    /// directory no seat runs under. A relative `WICKED_WORKER_HOME` is the reproducible case.
+    #[test]
+    fn no_sign_in_command_when_the_seat_dir_is_unresolvable() {
+        if wicked_apps_core::spawn::inherits_operator_config() {
+            // Under the hatch the sign-in is plain `claude` regardless of the worker home.
+            return;
+        }
+        let _g = LOGIN_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var_os(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, "relative/worker");
+        let login = default_login_invocation("claude");
+        match &prior {
+            Some(v) => std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, v),
+            None => std::env::remove_var(wicked_apps_core::spawn::WORKER_HOME_ENV),
+        }
+        assert_eq!(
+            login, None,
+            "fail closed: no sign-in surface for an unresolvable seat dir"
+        );
+        // The other seats are unaffected — their commands carry no path.
+        assert_eq!(
+            default_login_invocation("codex").as_deref(),
+            Some("codex login --device-auth")
+        );
+    }
+
     /// A path with shell-special characters survives the sign-in terminal verbatim; a Windows
     /// path's backslashes (not special before an ordinary character) pass through unchanged.
     #[test]
@@ -1073,6 +1144,51 @@ mod failure_reason_tests {
         let cut = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stdout(&straddle);
         assert!(std::str::from_utf8(cut.stdout.as_bytes()).is_ok());
         assert!(cut.stdout.len() <= STDERR_CAPTURE_LIMIT);
+    }
+
+    /// codex, PR#413: an auth signature BEYOND the 4096-byte storage cap must still classify, and
+    /// the stored stderr must still SHOW it (head + tail, not head only). Both streams.
+    #[test]
+    fn an_auth_signature_beyond_the_cap_is_classified_and_the_tail_is_kept() {
+        let noise = "x".repeat(STDERR_CAPTURE_LIMIT + 500);
+        let stderr =
+            format!("usage: seat [options]\n{noise}\nerror: Not logged in · Please run /login");
+        let f = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_output("", &stderr);
+        assert_eq!(
+            f.reason,
+            Some(SeatFailureReason::NotLoggedIn),
+            "classified past the cap"
+        );
+        assert!(f.stderr.len() <= STDERR_CAPTURE_LIMIT, "{}", f.stderr.len());
+        assert!(
+            f.stderr.starts_with("usage: seat [options]"),
+            "the head survives"
+        );
+        assert!(
+            f.stderr
+                .ends_with("error: Not logged in · Please run /login"),
+            "the tail survives: {:?}",
+            &f.stderr[f.stderr.len().saturating_sub(80)..]
+        );
+        assert!(f.stderr.contains("…[truncated]…"), "the cut is visible");
+        // The same through the single-stream setter.
+        let g = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stderr(&stderr);
+        assert_eq!(g.reason, Some(SeatFailureReason::NotLoggedIn));
+        assert!(g.stderr.ends_with("Please run /login"));
+        // A signature at the HEAD of an over-cap stdout: the stored tail no longer shows it, but
+        // the classification — judged over the full text — does.
+        let stdout = format!("Not logged in\n{noise}\n{noise}");
+        let h = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_output(&stdout, "");
+        assert_eq!(h.reason, Some(SeatFailureReason::NotLoggedIn));
+        assert!(h.stdout.len() <= STDERR_CAPTURE_LIMIT);
+        // Attaching the other (empty) stream afterwards never downgrades the classification.
+        let h = h.with_stderr("");
+        assert_eq!(h.reason, Some(SeatFailureReason::NotLoggedIn));
+        // Head+tail cuts land on char boundaries.
+        let wide = "é".repeat(STDERR_CAPTURE_LIMIT);
+        let w = SeatFailure::new(SeatFailureKind::NonZeroExit, "").with_stderr(&wide);
+        assert!(w.stderr.len() <= STDERR_CAPTURE_LIMIT);
+        assert!(w.stderr.starts_with('é') && w.stderr.ends_with('é'));
     }
 
     /// Records persisted before `stdout`/`reason` existed still read (both default).

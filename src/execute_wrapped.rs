@@ -211,10 +211,9 @@ impl OutputAdapter for ClaudeStreamJson {
 /// runs interactively and the adapter degrades to passthrough. (M9: a raw stdout line containing invalid
 /// UTF-8 is dropped by the `map_while(Result::ok)` line reader — a pre-existing, accepted boundary.)
 pub(crate) fn binary_is_claude(bin: &str) -> bool {
-    std::path::Path::new(bin)
-        .file_stem()
-        .map(|s| s == "claude")
-        .unwrap_or(false)
+    // ONE carrier test for every path — the council ballot spawn (below this crate) applies the
+    // same one to the program it execs (PR#413).
+    wicked_apps_core::spawn::binary_is_claude(bin)
 }
 
 /// The invocation template ONE wrapped launch of `cli_key` runs: the unit's own
