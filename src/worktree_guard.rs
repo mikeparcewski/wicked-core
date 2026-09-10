@@ -53,11 +53,14 @@
 //!
 //! The snapshot is taken THROUGH the git directory pinned from the REGISTERED repository at
 //! dispatch ([`pinned_git_dir`]: `<repo>/.git/worktrees/<id>`, found from the repo side), never
-//! through the worktree's own `.git` file, and its scratch index starts EMPTY — the real index is
-//! never copied, so no `assume-unchanged` bit can tell `add -A` to skip a rewritten file. Both were
-//! reproduced escapes (adversarial review on #414): a redirected `.git` file made both snapshots
-//! describe a repository the evaluator controlled, and an inherited `assume-unchanged` bit made a
-//! rewrite hash as its cached original. Full re-hash, pinned directory — on purpose.
+//! through the worktree's own `.git` file, and its scratch index is seeded from `HEAD`'s tree —
+//! never copied from the real index, so no `assume-unchanged` bit can tell `add -A` to skip a
+//! rewritten file, and never empty, so a committed path that an ignore rule matches stays tracked
+//! and its rewrite is seen. All three were reproduced escapes (adversarial review on #414): a
+//! redirected `.git` file made both snapshots describe a repository the evaluator controlled, an
+//! inherited `assume-unchanged` bit made a rewrite hash as its cached original, and an empty seed
+//! dropped a committed-but-ignored file from both snapshots. Full re-hash, HEAD-seeded, pinned
+//! directory — on purpose.
 //!
 //! ## No exemptions
 //!
@@ -289,10 +292,20 @@ fn plain_path(p: PathBuf) -> PathBuf {
 }
 
 /// Take the worktree's content snapshot THROUGH `git_dir` (see [`pinned_git_dir`]). Never modifies
-/// the real index, any ref, or the worktree: the scratch index is seeded EMPTY and `add -A` hashes
-/// every path — the real index is never copied, so no per-entry `assume-unchanged` bit (which
-/// tells `add` to trust the cached hash and skip the file) can hide a rewrite (adversarial review
-/// on #414: `git update-index --assume-unchanged src/a.ts` + rewrite used to snapshot as Clean).
+/// the real index, any ref, or the worktree. The scratch index is seeded from `HEAD`'s tree
+/// (`git read-tree HEAD`; an unborn HEAD seeds it empty) — NEVER copied from the real index — and
+/// `add -A` then re-hashes every path:
+///
+/// * seeding from HEAD keeps every COMMITTED path tracked, including one matched by an ignore rule
+///   (a committed `dist/`, `*.min.js`, `.vscode/settings.json`, a lockfile under `*.lock`): an
+///   empty seed would treat it as untracked-and-ignored and leave it out of BOTH snapshots, so a
+///   rewrite of it compared Clean (adversarial review on #414, second pass);
+/// * not copying the real index means no per-entry `assume-unchanged` bit (which tells `add` to
+///   trust the cached hash and skip the file) can hide a rewrite — the bit lives only in the real
+///   index, and a HEAD-seeded entry carries no stat cache at all, so every path is hashed
+///   (adversarial review on #414, first pass: `git update-index --assume-unchanged src/a.ts` +
+///   rewrite used to snapshot as Clean).
+///
 /// The full re-hash is the price, paid on purpose.
 fn snapshot_through(worktree: &Path, git_dir: &Path) -> anyhow::Result<WorktreeSnapshot> {
     let pinned: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
@@ -319,6 +332,11 @@ fn snapshot_through(worktree: &Path, git_dir: &Path) -> anyhow::Result<WorktreeS
         ("GIT_INDEX_FILE", tmp_index.as_path()),
     ];
     let result = (|| -> anyhow::Result<String> {
+        // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
+        // unborn branch there is nothing to seed: `add -A` builds the index from scratch.
+        if !head.is_empty() {
+            git(worktree, &["read-tree", "HEAD"], &env)?;
+        }
         git(
             worktree,
             &["-c", &excludes_arg, "add", "-A", "--", "."],
@@ -537,8 +555,13 @@ mod tests {
         run_git(&repo, &["config", "user.name", "t"]);
         run_git(&repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("src/a.ts"), "export const a = 1;\n").unwrap();
-        std::fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "node_modules/\n*.local.json\n").unwrap();
+        // A COMMITTED file that an ignore rule matches (a `.vscode/settings.json`, a built
+        // `dist/`): tracked despite the rule, so the guard must keep seeing it.
+        std::fs::create_dir_all(repo.join("config")).unwrap();
+        std::fs::write(repo.join("config/settings.local.json"), "{\"port\":1}\n").unwrap();
         run_git(&repo, &["add", "-A"]);
+        run_git(&repo, &["add", "-f", "config/settings.local.json"]);
         run_git(&repo, &["commit", "-qm", "base"]);
         let wt = base.join("wt");
         run_git(
@@ -652,6 +675,40 @@ mod tests {
             compare(&wt, &before).unwrap().is_none(),
             "gitignored artifacts and the engine scratch are not a mutation"
         );
+    }
+
+    /// Adversarial review on #414 (second pass, HIGH, reproduced): a COMMITTED file that an ignore
+    /// rule matches. Seeding the scratch index EMPTY treated it as untracked-and-ignored, so `add
+    /// -A` left it out of BOTH snapshots and a rewrite compared Clean. Seeded from HEAD, the path
+    /// is in the baseline tree and its rewrite is a denying mutation by name.
+    #[test]
+    fn a_rewrite_of_a_committed_but_ignored_file_is_a_denying_mutation() {
+        let wt = creator_worktree("tracked-ignored");
+        let repo = repo_of(&wt);
+        // Premise: the rule matches it AND it is tracked.
+        let ignored = run_git(&wt, &["check-ignore", "config/settings.local.json"]);
+        assert!(
+            ignored.contains("settings.local.json"),
+            "the ignore rule must match"
+        );
+        let before = snapshot(&wt, &repo).unwrap();
+        let listed = run_git(&wt, &["ls-tree", "-r", "--name-only", &before.tree]);
+        assert!(
+            listed.lines().any(|l| l == "config/settings.local.json"),
+            "the committed-but-ignored file is in the baseline tree: {listed}"
+        );
+        std::fs::write(wt.join("config/settings.local.json"), "{\"port\":6666}\n").unwrap();
+        let m = compare(&wt, &before)
+            .unwrap()
+            .expect("the rewrite is a mutation");
+        assert_eq!(
+            m.changed
+                .iter()
+                .map(|c| format!("{} {}", c.status, c.path))
+                .collect::<Vec<_>>(),
+            vec!["M config/settings.local.json"]
+        );
+        assert!(m.denies());
     }
 
     /// Adversarial review on #414 (CRITICAL, reproduced): `git update-index --assume-unchanged

@@ -24,10 +24,12 @@ Two release tracks share this file, newest entry first regardless of track:
   - **Worktree guard** (`worktree_guard`): for a def-driven, agent-executed unit whose phase declared
     `executes_code: false` (`WorkUnit.worktree_guarded`, plan-derived like `pre_build_scope`), the
     actor snapshots the worktree at dispatch — git TREE HASH over tracked + untracked-not-ignored
-    content via a scratch index that starts EMPTY (`add -A` re-hashes every path — the real index
-    is never copied, so no `assume-unchanged` bit can hide a rewrite; the real index, refs and
-    worktree are never touched; the engine's own `tmp/` scratch is excluded by construction
-    through `core.excludesFile`) plus `HEAD`, taken THROUGH the git directory PINNED from the
+    content via a scratch index seeded from `HEAD`'s tree (`read-tree HEAD`, then `add -A`
+    re-hashes every path — never copied from the real index, so no `assume-unchanged` bit can hide
+    a rewrite, and never empty, so a committed path that an ignore rule matches stays tracked and
+    its rewrite is seen; the real index, refs and worktree are never touched; the engine's own
+    `tmp/` scratch is excluded by construction through `core.excludesFile`) plus `HEAD`, taken
+    THROUGH the git directory PINNED from the
     REGISTERED repository (`<repo>/.git/worktrees/<id>`, found from the repo side — never through
     the worktree's own `.git` file, which an evaluator can redirect to a repository it controls;
     both escapes were reproduced by the independent review) — and persists it ON the unit

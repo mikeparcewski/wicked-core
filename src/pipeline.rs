@@ -820,6 +820,7 @@ pub(crate) fn apply_and_finish_unit(
     // depth event. A failing check denies (source `repo_checks`). Fail-closed on a missing report
     // for a unit the floor governs — unless the guard already denied, in which case the checks
     // were deliberately not run over a rewritten tree and the guard's denial is the honest one.
+    let guard_denied = guard_denial.is_some();
     let checks_denial: Option<String> = match &evidence.repo_checks {
         Some(report) => {
             unit.repo_checks = Some(report.clone());
@@ -1018,7 +1019,7 @@ pub(crate) fn apply_and_finish_unit(
         || (unit.repo_checks_floor
             && unit.tool_cmd.is_none()
             && workdir.is_some()
-            && guard_denial.is_none());
+            && !guard_denied);
     let has_deterministic_floor = unit.validator.is_some() || checks_ran;
     let criterion = match (
         unit.validator.as_ref().map(|v| v.criterion.clone()),

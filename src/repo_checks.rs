@@ -600,6 +600,30 @@ impl CheckScratch {
             }
         }
         let root = scratch_root.join(SCRATCH_SUBDIR);
+        // The leaves too (adversarial review on #414, LOW): `create_dir_all` would follow a
+        // committed symlink-to-directory at a leaf. Refuse a link at any leaf before creating.
+        for sub in [
+            "home",
+            "npm-cache",
+            "cargo-home",
+            "cargo-target",
+            "xdg-config",
+            "xdg-cache",
+            "tmp",
+        ] {
+            if let Ok(m) = std::fs::symlink_metadata(root.join(sub)) {
+                if m.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "`{}` is a symlink — the checks' scratch leaves must be real \
+                             directories (refused, never followed)",
+                            root.join(sub).display()
+                        ),
+                    ));
+                }
+            }
+        }
         for sub in [
             "home",
             "npm-cache",
