@@ -892,6 +892,11 @@ pub(crate) fn run(
         ) {
             eprintln!("{}", outcome.notice());
         }
+        // The repos the migration cannot help (F-024: indexed IN-TREE, which is never read) come
+        // through the upgrade with no live graph — name each one and the remedy, once, here.
+        for notice in repos.iter().filter_map(crate::repo::boot_notice) {
+            eprintln!("{notice}");
+        }
     }
     // Startup orphan reaper (FINDING-003): worktrees of runs in a TERMINAL status are reaped when
     // clean (the same rule the terminal-status reap applies — so a crash between a run finishing

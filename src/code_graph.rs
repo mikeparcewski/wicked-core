@@ -62,9 +62,16 @@
 //! `estate.db`+`-wal`+`-shm` is not) — and logs one line per repo. The key is a pure function of
 //! the repo root, so the source and destination agree without a lookup table. The SOURCE IS LEFT
 //! IN PLACE (an operator deletes `~/.wicked-estate/repo-graphs` once the new daemon is verified;
-//! the engine never deletes anything it did not write), a destination that already exists is
-//! never overwritten, and a copy that fails is removed so the repo simply re-indexes at its next
-//! onboarding instead of reading a torn database.
+//! the engine never deletes anything it did not write) and a destination that already exists is
+//! never overwritten. The copy is CRASH-SAFE: the backup lands in a temp sibling
+//! (`<key>/estate.db.migrating-<pid>`) that is renamed onto `estate.db` only when the backup
+//! reports `Done`, so a boot killed mid-copy leaves nothing at the path the resolver serves; the
+//! next boot sweeps the stray temp and copies again. The backup is bounded (locked source, total
+//! steps, wall clock) and a copy that fails removes its temp so the repo simply re-indexes at its
+//! next onboarding instead of reading a torn database. Repos that were indexed IN-TREE (the F-024
+//! checkouts) are NOT migrated — an in-tree graph is never read — so they come through the
+//! upgrade with no live graph: the repo record's finding says so and names the remedy (re-run
+//! onboarding), and the boot logs one such line per affected repo next to the migration notices.
 //!
 //! **Per-key sandbox grants.** A governed worker is granted read+write on EXACTLY its own
 //! `<root>/<key>/` directory (write because opening a WAL-mode SQLite db creates `-wal`/`-shm`/
@@ -74,8 +81,6 @@
 //! in-tree shape classifies as NOTHING (no grant — the graph is never there). Note the trade: a
 //! graph's file paths still anchor to the repo root the indexer ran over, but the per-key grant
 //! does not include that root — a worker reads source from its own worktree instead.
-
-//! grants fail closed on relative ones. TH-8's environment manifest should list this variable.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -181,7 +186,7 @@ pub(crate) fn indexer_bin() -> String {
             return b;
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = home_dir() {
         let p = Path::new(&home).join(".cargo/bin/wicked-estate");
         if p.exists() {
             return p.display().to_string();
@@ -612,19 +617,26 @@ fn migrate_legacy_repo_graphs_at<'a>(
     for (repo_id, repo) in repos {
         let from = repo_graph_db_at(legacy_root, repo);
         let to = repo_graph_db_at(root, repo);
+        // A boot killed mid-copy leaves `estate.db.migrating-<pid>` beside — never AT — the
+        // served path; sweep it before deciding, so the copy below starts clean.
+        if let Some(key_dir) = to.parent() {
+            sweep_stray_migrations(key_dir);
+        }
         if to.exists() || !from.is_file() {
             continue;
         }
-        out.push(match copy_sqlite_db(&from, &to) {
+        out.push(match copy_sqlite_db(&from, &to, &StepBudget::BOOT) {
             Ok(()) => GraphMigration::Copied {
                 repo_id: repo_id.to_string(),
                 from,
                 to,
             },
             Err(error) => {
-                // Never leave a torn destination: `existing_code_graph` would hand it to a worker.
+                // The temp is already gone (`copy_sqlite_db` removes it on every error); take the
+                // key dir with it when the failed copy was the only thing in it, so a repo that
+                // never had a graph under the root is left exactly as it was found.
                 if let Some(dir) = to.parent() {
-                    let _ = std::fs::remove_dir_all(dir);
+                    let _ = std::fs::remove_dir(dir);
                 }
                 GraphMigration::Failed {
                     repo_id: repo_id.to_string(),
@@ -638,6 +650,29 @@ fn migrate_legacy_repo_graphs_at<'a>(
     out
 }
 
+/// The infix of a migration's temp sibling: `estate.db.migrating-<pid>`, in the key dir. Not
+/// `estate.db`, so nothing the resolver serves (`is_file` on `estate.db`) ever names a copy in
+/// flight; not a `-wal`/`-shm` spelling, so SQLite never mistakes it for a sidecar.
+const MIGRATING_INFIX: &str = ".migrating-";
+
+/// Remove every `estate.db.migrating-*` a crashed boot left in `key_dir` (nothing else — a key
+/// dir holds the live db and its WAL siblings, which are never touched here).
+fn sweep_stray_migrations(key_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(key_dir) else {
+        return;
+    };
+    let prefix = format!("{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}");
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(&prefix))
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Whether two roots name the same directory, by canonical spelling when both exist and by
 /// lexical equality otherwise.
 fn same_root(a: &Path, b: &Path) -> bool {
@@ -647,43 +682,106 @@ fn same_root(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// How much work one backup may do before it is declared failed (fail closed, never a boot that
+/// hangs): SQLite RESTARTS an online backup whenever another connection writes the source, so a
+/// still-running pre-upgrade indexer can keep `More` coming forever — hence the wall clock and the
+/// step cap on top of the locked-source cap.
+struct StepBudget {
+    /// Pages copied per `step`.
+    pages_per_step: std::ffi::c_int,
+    /// Total `step` calls (any result) before giving up.
+    max_steps: u32,
+    /// Consecutive-or-not `Busy`/`Locked` results before giving up (each sleeps 25 ms).
+    max_locked_steps: u32,
+    /// Wall clock for the whole copy.
+    max_wall: std::time::Duration,
+}
+
+impl StepBudget {
+    /// The boot-time budget: 256 pages a step, ~5 s of a locked source, 60 s wall clock, and a
+    /// step cap (2 GB at 4 KiB pages) that only a restarting backup could reach first.
+    const BOOT: StepBudget = StepBudget {
+        pages_per_step: 256,
+        max_steps: 2_000,
+        max_locked_steps: 200,
+        max_wall: std::time::Duration::from_secs(60),
+    };
+}
+
 /// Copy one SQLite database `from` → `to` with the online-backup API: a page-consistent snapshot
 /// even of a WAL-mode db another process still has open, which a byte copy of `estate.db` +
-/// `-wal` + `-shm` is not. `to`'s directory is created; `to` must not exist. Bounded: a source
-/// that stays locked (`Busy`/`Locked` for more than a few seconds) is an error, never a boot that
-/// hangs.
-fn copy_sqlite_db(from: &Path, to: &Path) -> Result<(), String> {
+/// `-wal` + `-shm` is not. CRASH-SAFE: the backup is written to a temp sibling
+/// (`<to>.migrating-<pid>`) and renamed onto `to` only after `StepResult::Done`, so no partially
+/// written database ever sits at the path the resolver serves. `to`'s directory is created; `to`
+/// must not exist. Every error path removes the temp; the budget bounds the copy.
+fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<(), String> {
     use rusqlite::{backup::Backup, backup::StepResult, Connection, OpenFlags};
-    if let Some(dir) = to.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    }
-    let src = Connection::open_with_flags(
-        from,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| format!("open source {}: {e}", from.display()))?;
-    let mut dst =
-        Connection::open(to).map_err(|e| format!("create destination {}: {e}", to.display()))?;
-    let backup = Backup::new(&src, &mut dst).map_err(|e| format!("start backup: {e}"))?;
-    // 256 pages per step; up to ~5 s of a locked source before giving up.
-    const MAX_LOCKED_STEPS: u32 = 200;
-    let mut locked_steps = 0u32;
-    loop {
-        match backup.step(256).map_err(|e| format!("backup step: {e}"))? {
-            StepResult::Done => return Ok(()),
-            StepResult::More => {}
-            StepResult::Busy | StepResult::Locked => {
-                locked_steps += 1;
-                if locked_steps > MAX_LOCKED_STEPS {
-                    return Err("source database stayed locked".to_string());
+    let dir = to
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", to.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(
+        "{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp);
+    let result = (|| -> Result<(), String> {
+        let src = Connection::open_with_flags(
+            from,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("open source {}: {e}", from.display()))?;
+        let mut dst = Connection::open(&tmp)
+            .map_err(|e| format!("create destination {}: {e}", tmp.display()))?;
+        {
+            let backup = Backup::new(&src, &mut dst).map_err(|e| format!("start backup: {e}"))?;
+            let started = std::time::Instant::now();
+            let mut steps = 0u32;
+            let mut locked_steps = 0u32;
+            loop {
+                if started.elapsed() > budget.max_wall {
+                    return Err(format!(
+                        "backup exceeded its wall clock ({} s)",
+                        budget.max_wall.as_secs()
+                    ));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(25));
+                steps += 1;
+                if steps > budget.max_steps {
+                    return Err(format!(
+                        "backup exceeded its step budget ({} steps of {} pages)",
+                        budget.max_steps, budget.pages_per_step
+                    ));
+                }
+                match backup
+                    .step(budget.pages_per_step)
+                    .map_err(|e| format!("backup step: {e}"))?
+                {
+                    StepResult::Done => break,
+                    StepResult::More => {}
+                    StepResult::Busy | StepResult::Locked => {
+                        locked_steps += 1;
+                        if locked_steps > budget.max_locked_steps {
+                            return Err("source database stayed locked".to_string());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    // `StepResult` is `#[non_exhaustive]`: a variant this rusqlite does not know
+                    // is not a copy we can vouch for — fail closed.
+                    other => return Err(format!("unexpected backup step result: {other:?}")),
+                }
             }
-            // `StepResult` is `#[non_exhaustive]`: a variant this rusqlite does not know is not a
-            // copy we can vouch for — fail closed (the caller removes the torn destination).
-            other => return Err(format!("unexpected backup step result: {other:?}")),
         }
+        // Both connections closed before the rename: a WAL-mode `tmp` with an open connection
+        // still has `-wal`/`-shm` siblings, and a rename under an open handle is not portable.
+        drop(dst);
+        drop(src);
+        std::fs::rename(&tmp, to)
+            .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), to.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
+    result
 }
 
 /// Index `repo` into its code graph via the wicked-estate indexer subprocess. Returns the db path.
@@ -1295,6 +1393,89 @@ mod tests {
             "a failed copy leaves no torn destination for a worker to open"
         );
         assert!(bad.is_file(), "…and the source is untouched");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F1 of the independent review: the copy is crash-safe. A backup that stops early (budget
+    /// exhausted here; a SIGKILL in production) leaves NOTHING at the served path — the resolver
+    /// answers `None`, never a torn `estate.db` — and the next boot sweeps the stray temp sibling
+    /// and copies the intact legacy source in full.
+    #[test]
+    fn an_interrupted_migration_leaves_no_torn_graph_and_completes_on_the_next_boot() {
+        let base = scratch("migrate-interrupted");
+        let legacy_root = base.join(".wicked-estate").join("repo-graphs");
+        let root = base.join("state-home").join("repo-graphs");
+        let repo = base.join("alpha");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Many pages, so a one-page step cannot finish in one go.
+        let from = repo_graph_db_at(&legacy_root, &repo);
+        let _writer = sqlite_with_rows(&from, 5_000);
+        let to = repo_graph_db_at(&root, &repo);
+        let key_dir = to.parent().unwrap().to_path_buf();
+
+        // 1. The copy is interrupted (one step of one page, then the budget runs out).
+        let starved = StepBudget {
+            pages_per_step: 1,
+            max_steps: 1,
+            max_locked_steps: 1,
+            max_wall: std::time::Duration::from_secs(60),
+        };
+        let err = copy_sqlite_db(&from, &to, &starved).unwrap_err();
+        assert!(err.contains("step budget"), "{err}");
+        assert!(
+            !to.exists(),
+            "nothing is ever written AT the served path before Done"
+        );
+        assert_eq!(
+            existing_code_graph_at(&repo, Some(&root)),
+            None,
+            "the resolver never sees a copy in flight"
+        );
+        assert!(
+            std::fs::read_dir(&key_dir)
+                .map(|d| d.count() == 0)
+                .unwrap_or(true),
+            "the failed copy removed its temp"
+        );
+
+        // 2. A CRASH mid-copy: the temp sibling is left behind (simulated), still nothing at
+        //    `estate.db` — the resolver still answers None.
+        let stray = key_dir.join(format!("{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}424242"));
+        std::fs::write(&stray, b"half a database").unwrap();
+        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+
+        // 3. Next boot: the stray is swept and the legacy source is copied in full.
+        let out = migrate_legacy_repo_graphs_at([("alpha", repo.as_path())], &root, &legacy_root);
+        assert!(
+            matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
+            "{out:?}"
+        );
+        assert!(
+            !stray.exists(),
+            "the stray temp from the crashed boot is swept"
+        );
+        assert_eq!(
+            row_count(&to),
+            5_000,
+            "the second boot copies the intact source in full"
+        );
+        assert_eq!(
+            existing_code_graph_at(&repo, Some(&root)).as_deref(),
+            Some(to.as_path())
+        );
+        assert!(
+            std::fs::read_dir(&key_dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(MIGRATING_INFIX)),
+            "no temp sibling survives a completed copy"
+        );
+        // A third boot: nothing to do (and the completed copy is never re-copied).
+        assert_eq!(
+            migrate_legacy_repo_graphs_at([("alpha", repo.as_path())], &root, &legacy_root),
+            vec![]
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

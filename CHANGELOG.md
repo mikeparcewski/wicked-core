@@ -690,8 +690,16 @@ Two release tracks share this file, newest entry first regardless of track:
   `~/.wicked-estate/repo-graphs/<key>` and nowhere under the new root is copied through SQLite's
   online-backup API (page-consistent even for a WAL-mode db another connection holds open; the
   `rusqlite` `backup` feature) and logged one line per repo; the source is LEFT IN PLACE for the
-  operator to remove once the new daemon is verified, an existing destination is never overwritten,
-  and a failed copy removes its torn destination so the repo simply re-indexes. New public helper
+  operator to remove once the new daemon is verified and an existing destination is never
+  overwritten. The copy is crash-safe and bounded: it lands in `<key>/estate.db.migrating-<pid>`
+  and is renamed onto `estate.db` only on `Done` (a boot killed mid-copy leaves nothing at the
+  served path; the next boot sweeps the stray temp and copies again), a locked source, a
+  restarting backup or 60 s of wall clock fail it closed, and a failed copy removes its temp so
+  the repo simply re-indexes. **Repos indexed in-tree are not migrated** (an in-tree graph is never
+  read): they come through the upgrade with no live graph — the record's finding says "no graph has
+  been indexed under the state home yet — re-run onboarding (`POST /repos/:id/onboard`)" instead of
+  asserting a live path, and the boot logs one such line per affected repo next to the migration
+  notices. New public helper
   `repo_graph_root_for_store(db_path)` spells a daemon's root for out-of-process consumers. Repo
   side: wicked-interactive#213 / wicked-studio#220 untrack their `.codegraph/estate.db`.
 - **Council ballots run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (F-030;

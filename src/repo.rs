@@ -158,13 +158,21 @@ fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
     };
     if crate::code_graph::has_in_tree_code_graph(root) {
         let in_tree = crate::code_graph::in_tree_code_graph_dir(root);
+        // RE-DERIVED, never asserted: "live" means a file the resolver would serve exists at the
+        // resolved path right now. A repo indexed only in-tree (the F-024 checkouts) has none
+        // until it is onboarded again — say so, and name the remedy.
         let live = if code_graph_db.is_empty() {
             format!(
                 "no live graph path resolves yet — see the `{FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE}` \
                  finding; once one does it will be under the daemon state home"
             )
-        } else {
+        } else if Path::new(&code_graph_db).is_file() {
             format!("the live graph is {code_graph_db}")
+        } else {
+            format!(
+                "no graph has been indexed under the state home yet — re-run onboarding \
+                 (POST /repos/<id>/onboard) to build {code_graph_db}"
+            )
         };
         findings.push(RepoFinding {
             code: FINDING_IN_TREE_CODE_GRAPH_IGNORED.to_string(),
@@ -186,6 +194,30 @@ fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
 #[cfg(test)]
 fn code_graph_db(root_path: &str) -> String {
     code_graph_db_and_findings(root_path).0
+}
+
+/// The one-line boot notice for a registered repo that carries an in-tree graph and has NO live
+/// graph under the state home — the F-024 checkouts after the core#406 upgrade (the boot-time
+/// migration copies only from the old estate home; an in-tree graph is never read). `None` for a
+/// clean checkout, for a repo whose live graph exists, and for a repo with no resolvable root
+/// (that one carries its own finding). Logged by the actor next to the migration notices, so an
+/// upgrade names every repo that needs re-onboarding instead of leaving them silently graph-less.
+pub(crate) fn boot_notice(entry: &RepoEntry) -> Option<String> {
+    let root = Path::new(&entry.root_path);
+    if entry.code_graph_db.is_empty()
+        || !crate::code_graph::has_in_tree_code_graph(root)
+        || Path::new(&entry.code_graph_db).is_file()
+    {
+        return None;
+    }
+    Some(format!(
+        "wicked-core: repo `{}`: in-tree graph {} is ignored and no live graph exists under the \
+         state home yet (core#406) — re-run onboarding (POST /repos/{}/onboard) to build {}",
+        entry.id,
+        crate::code_graph::in_tree_code_graph_dir(root).display(),
+        entry.id,
+        entry.code_graph_db
+    ))
 }
 
 /// What a caller asks to register. The id/branch are resolved by [`register_repo`].
@@ -1325,9 +1357,54 @@ mod tests {
         );
         assert!(
             findings[0].message.contains("git rm --cached") && findings[0].message.contains(&db),
-            "the message says how to clear it and where the live graph is: {}",
+            "the message says how to clear it and names the root path: {}",
             findings[0].message
         );
+        // RE-DERIVED (independent review F2): nothing indexed under the root yet ⇒ the message
+        // says so and names the remedy, never "the live graph is <path>" for a path that is not
+        // there — and the boot notice fires for exactly this state.
+        assert!(
+            findings[0].message.contains("re-run onboarding")
+                && findings[0].message.contains("POST /repos/<id>/onboard")
+                && !findings[0].message.contains("the live graph is"),
+            "{}",
+            findings[0].message
+        );
+        let entry = RepoEntry {
+            id: "dirty".into(),
+            name: "Dirty".into(),
+            root_path: dirty.to_string_lossy().into_owned(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: db.clone(),
+            findings: findings.clone(),
+        };
+        let notice = boot_notice(&entry).expect("in-tree graph + no live graph ⇒ a boot notice");
+        assert!(
+            notice.contains("repo `dirty`")
+                && notice.contains("re-run onboarding")
+                && notice.contains("POST /repos/dirty/onboard")
+                && notice.contains(&db),
+            "{notice}"
+        );
+        // Once a graph exists under the root, the message flips to "live" and the notice stops.
+        std::fs::create_dir_all(Path::new(&db).parent().unwrap()).unwrap();
+        std::fs::write(&db, b"indexed under the state home").unwrap();
+        let (_, live_findings) = code_graph_db_and_findings(dirty.to_str().unwrap());
+        assert!(
+            live_findings[0]
+                .message
+                .contains(&format!("the live graph is {db}"))
+                && !live_findings[0].message.contains("re-run onboarding"),
+            "{}",
+            live_findings[0].message
+        );
+        assert_eq!(
+            boot_notice(&entry),
+            None,
+            "a live graph needs no re-onboard notice"
+        );
+        std::fs::remove_file(&db).unwrap();
         // …and the record round-trips with the finding re-derived, not persisted.
         let mut node = RepoEntry {
             id: "dirty".into(),
@@ -1356,6 +1433,19 @@ mod tests {
         assert!(
             !crate::code_graph::in_tree_code_graph_dir(&clean).exists(),
             "deriving the record path must not pollute the working tree"
+        );
+        assert_eq!(
+            boot_notice(&RepoEntry {
+                id: "clean".into(),
+                name: "Clean".into(),
+                root_path: clean.to_string_lossy().into_owned(),
+                default_branch: "main".into(),
+                registered_at: 0,
+                code_graph_db: db,
+                findings,
+            }),
+            None,
+            "a clean checkout gets no boot notice"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
