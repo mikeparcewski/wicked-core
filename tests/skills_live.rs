@@ -291,9 +291,13 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
         ),
     )
     .unwrap();
+    // The identity fields `load_published` requires, in crew's shape (as the shared
+    // `tests/support/skills_snapshot_fixture.rs` writes them): a 64-hex `contentHash`, a 64-hex
+    // `gardenSource.baseline` (the env the `.venv` link may reach), and `venv` — `skipped`: no
+    // env was provisioned, so no link. A placeholder baseline is refused at load (Copilot, #399).
     std::fs::write(
         snapshot.join("snapshot.json"),
-        "{\"gen\":1,\"contentHash\":\"sha256:live-fixture\",\"gardenSource\":{\"kind\":\"directory\",\"path\":\"/fixture\",\"plugin_version\":\"0.0.0\",\"baseline\":\"live-fixture\"},\"skills\":[{\"name\":\"wicked-garden-wicked-probe\",\"dir\":\"skills/wicked-probe\",\"kind\":\"module\",\"core\":false,\"portable\":true,\"nested\":false}]}",
+        "{\"gen\":1,\"contentHash\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"gardenSource\":{\"kind\":\"directory\",\"path\":\"/fixture\",\"plugin_version\":\"0.0.0\",\"baseline\":\"0000000000000000000000000000000000000000000000000000000000000001\"},\"venv\":\"skipped\",\"skills\":[{\"name\":\"wicked-garden-wicked-probe\",\"dir\":\"skills/wicked-probe\",\"kind\":\"module\",\"core\":false,\"portable\":true,\"nested\":false}]}",
     )
     .unwrap();
     // RAII pins (Copilot, review pass 7): restored on drop — a failing assertion below included —
