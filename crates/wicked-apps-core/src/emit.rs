@@ -219,20 +219,21 @@ pub fn emit_event(event: &EmitEvent) -> bool {
 
 /// Redact the userinfo of every `scheme://user:password@host` URL inside `text` (`scheme://***@host`),
 /// so a store spec that carries credentials is never printed to stderr or written into a spool
-/// record's `deadletter_reason`. Text without a URL, or a URL without userinfo, is unchanged.
+/// record's `deadletter_reason`. GREEDY on purpose: a raw password may contain `/`, `?` or `#`
+/// (`postgres://u:p/a?s#s@h/db`), so the userinfo is taken up to the LAST `@` before the URL ends
+/// (whitespace, a quote, `)` or `]` — characters no URL contains); over-redacting a rare `@` in a
+/// path (`…/db@x` → `***@x`) is the safe failure. Text without a URL, or a URL without an `@`,
+/// is unchanged.
 pub fn redact_userinfo(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(scheme_end) = rest.find("://") {
         let (head, tail) = rest.split_at(scheme_end + 3);
         out.push_str(head);
-        // userinfo runs to the first `@` before the authority ends (`/`, `?`, `#`, whitespace, quotes).
-        let authority_end = tail
-            .find(|c: char| {
-                matches!(c, '/' | '?' | '#' | '"' | '\'' | ')' | ']') || c.is_whitespace()
-            })
+        let url_end = tail
+            .find(|c: char| matches!(c, '"' | '\'' | ')' | ']') || c.is_whitespace())
             .unwrap_or(tail.len());
-        match tail[..authority_end].rfind('@') {
+        match tail[..url_end].rfind('@') {
             Some(at) => {
                 out.push_str("***");
                 rest = &tail[at..];
@@ -455,7 +456,10 @@ fn parse_spool_line(line: &str) -> Result<SpoolLine, String> {
 /// a previous replay left half-written is completed rather than skipped). A record's original `ts`
 /// (millis) — when it carries one — becomes the node's `ts_nanos` and the id prefix, so the store's
 /// id-ordered scan stays chronological; a record without a stamp keeps `ts_nanos: 0` (unknown, not
-/// invented) and lands at the front of that order. Every replayed node keeps its provenance:
+/// invented) and lands at the front of that order — and, being content-addressed with no stamp to
+/// tell them apart, BYTE-IDENTICAL unstamped lines (two pre-stamp dead letters of the same event)
+/// share one id and land once; the second is reported `already_present`. Stamped lines never
+/// conflate unless their `ts` and content both match. Every replayed node keeps its provenance:
 /// `replayed: true`, `replayed_at_ms`, the `deadletter_reason` it was spooled with, and `spooled_by`
 /// (the origin) when present. Each record is written on its OWN autocommit statement — no shared
 /// write batch — so a failed record leaves no open transaction for the next one to commit into,
@@ -503,15 +507,20 @@ pub fn replay_outbox(path: &Path, store: &mut dyn GraphStore) -> std::io::Result
             "replayed_at_ms".to_string(),
             serde_json::json!(now_millis()),
         );
+        // A LEGACY line (written before the open-failure reason was redacted) can carry a
+        // credentialed URL in its reason; it must not become durable store metadata. The line
+        // itself stays verbatim in `ReplayFailure` — the caller needs it byte-exact.
         if let Some(reason) = parsed.reason {
             node.metadata.insert(
                 "deadletter_reason".to_string(),
-                serde_json::Value::String(reason),
+                serde_json::Value::String(redact_userinfo(&reason)),
             );
         }
         if let Some(origin) = parsed.origin {
-            node.metadata
-                .insert("spooled_by".to_string(), serde_json::Value::String(origin));
+            node.metadata.insert(
+                "spooled_by".to_string(),
+                serde_json::Value::String(redact_userinfo(&origin)),
+            );
         }
         // One autocommit upsert per record — deliberately NOT `write_event_node`'s batch: the
         // `GraphStore` trait has no rollback, so a batch left open by a failed record would be
@@ -883,6 +892,14 @@ mod tests {
             "postgresql://***@h/db and mysql://***@c/d"
         );
         assert_eq!(redact_userinfo("postgres://h/db"), "postgres://h/db");
+        // GREEDY: a raw password containing `/`, `?` or `#` is still redacted up to the last `@`.
+        assert_eq!(
+            redact_userinfo("open estate store at \"postgres://u:p/a?s#s@h:5432/db\": boom"),
+            "open estate store at \"postgres://***@h:5432/db\": boom"
+        );
+        assert_eq!(redact_userinfo("mysql://u:p@ss@h/db"), "mysql://***@h/db");
+        // Over-redaction of a rare `@` in a path is the safe failure, never a leak.
+        assert_eq!(redact_userinfo("postgres://h/db@x"), "postgres://***@x");
         assert_eq!(
             redact_userinfo(
                 "open estate store at \"/state/core.db.governance/governance.db\": locked"
@@ -893,5 +910,59 @@ mod tests {
             redact_userinfo("no shared store (WICKED_ESTATE_DB unset)"),
             "no shared store (WICKED_ESTATE_DB unset)"
         );
+    }
+
+    /// #428 — a LEGACY spool line whose reason (or origin) carries a credentialed URL is redacted
+    /// before it becomes durable store metadata; the failure report still carries lines verbatim.
+    /// And C6: byte-identical UNSTAMPED lines are content-addressed with no stamp to tell them
+    /// apart, so they conflate onto one node (the second is `already_present`).
+    #[test]
+    fn replay_redacts_legacy_reasons_and_conflates_identical_unstamped_lines() {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-apps-replay-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outbox = dir.join("emit-outbox.ndjson");
+        let legacy = serde_json::json!({
+            "type": EV_POLICY_EVALUATED,
+            "domain": "wicked-governance",
+            "subdomain": "governance.evaluation",
+            "payload": { "claim_id": "c1" },
+            "deadletter_reason": "open shared store failed: open estate store at \"postgres://u:s3cret@h/db\": boom",
+            "origin": "postgres://u:s3cret@h/db"
+        });
+        let torn = r#"{"type":"x","domain":"postgres://u:s3cret@h/db"#;
+        std::fs::write(&outbox, format!("{legacy}\n{legacy}\n{torn}\n")).unwrap();
+        let mut store = SqliteStore::in_memory().expect("open in-memory estate store");
+        let report = replay_outbox(&outbox, &mut store).unwrap();
+        let _ = std::fs::remove_file(&outbox);
+        assert_eq!(
+            (
+                report.read,
+                report.replayed,
+                report.already_present,
+                report.failed.len()
+            ),
+            (3, 1, 1, 1),
+            "two identical unstamped lines conflate onto one node"
+        );
+        assert_eq!(count_events(&store).unwrap(), 1);
+        let nodes = store
+            .find_symbols(&SymbolQuery {
+                kinds: vec![NodeKind::Other(EVENT.to_string())],
+                ..Default::default()
+            })
+            .unwrap();
+        let stored = serde_json::to_string(&nodes[0].metadata).unwrap();
+        assert!(
+            !stored.contains("s3cret"),
+            "no credential in store metadata: {stored}"
+        );
+        assert_eq!(
+            nodes[0].metadata["deadletter_reason"],
+            "open shared store failed: open estate store at \"postgres://***@h/db\": boom"
+        );
+        assert_eq!(nodes[0].metadata["spooled_by"], "postgres://***@h/db");
+        // The failure report keeps the line VERBATIM — the caller must be able to re-spool it byte-exact.
+        assert_eq!(report.failed[0].line, torn);
     }
 }
