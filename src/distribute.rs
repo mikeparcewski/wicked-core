@@ -334,6 +334,14 @@ fn seat_candidates(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: how many seat judgements [`seat_is_claude`] has made on THIS thread.
+    /// [`seat_candidates`] judges on its caller's thread, so a test reads exactly its own pass —
+    /// each roster seat once, not once per unit per seat.
+    static SEAT_JUDGEMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Is the roster seat `key` one the delivery can hand a NON-PORTABLE skill to — a claude seat on
 /// BOTH carriers (design v3.2 §3)? Judged by the SAME resolutions the two runners make at launch
 /// (#402 review pass 2), never by the roster record's own fields: the ACP carrier reloads the
@@ -347,6 +355,8 @@ fn seat_candidates(
 /// two carriers would disagree about is therefore refused loudly at plan time, not seated.
 fn seat_is_claude(clis: &[AgenticCli], key: &str) -> bool {
     use crate::skills_snapshot::WorkerCli;
+    #[cfg(test)]
+    SEAT_JUDGEMENTS.with(|n| n.set(n.get() + 1));
     let acp = crate::acp_runner::acp_seat_identity(key);
     let wrapped = crate::execute_wrapped::wrapped_seat_identity(key, invocation_of(clis, key));
     matches!(acp, WorkerCli::Claude) && matches!(wrapped, WorkerCli::Claude)
@@ -1355,6 +1365,40 @@ mod tests {
         )
         .expect("a tool unit has no seat to constrain");
         assert!(dists[0].seat_constraint.is_none());
+    }
+
+    /// The eligible claude seats are judged ONCE per pass (Copilot, #402 review pass 4): a plan
+    /// with several Claude-only units resolves each roster seat exactly once — one merged-registry
+    /// read per seat, not per seat per unit — and every such unit receives the identical roster.
+    /// Mutation: recompute inside the per-unit closure and the count becomes units × seats.
+    #[test]
+    fn several_claude_only_units_judge_each_roster_seat_once_and_see_one_roster() {
+        let (_home, _env, _) = hermetic_home("route-once-home");
+        let snapshot = published("route-once");
+        let roster = [seat_running("claude", "claude"), seat_running("pi", "pi")];
+        let units: Vec<WorkUnit> = (1..=4)
+            .map(|ord| skilled(ord, "wicked-garden-repo-learn"))
+            .collect();
+        let before = super::SEAT_JUDGEMENTS.with(|n| n.get());
+        let candidates = seat_candidates(&units, &roster, Some(&snapshot)).expect("candidates");
+        let judged = super::SEAT_JUDGEMENTS.with(|n| n.get()) - before;
+        assert_eq!(
+            judged,
+            roster.len(),
+            "each roster seat is judged once per pass, not {} units × {} seats",
+            units.len(),
+            roster.len()
+        );
+        let rosters: Vec<Vec<String>> = candidates
+            .iter()
+            .map(|c| {
+                let (eligible, _why) = c.as_ref().expect("a Claude-only unit is constrained");
+                eligible.iter().map(|s| s.key.clone()).collect()
+            })
+            .collect();
+        assert_eq!(rosters.len(), units.len());
+        assert!(rosters.iter().all(|r| r == &rosters[0]), "{rosters:?}");
+        assert_eq!(rosters[0], vec!["claude".to_string()]);
     }
 
     /// Evaluator ≠ creator must not undo the narrowing: a Claude-only REVIEW unit whose council
