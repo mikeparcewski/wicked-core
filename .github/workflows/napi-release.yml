@@ -266,9 +266,9 @@ jobs:
   #
   # ci.yml is deliberately left on `npm ci`: that failure IS the lock-sync guarantee doing its job
   # on a lockfile that is genuinely out of sync, so this job removes the cause instead of teaching
-  # CI to tolerate it. It waits for the registry to serve all six packages (npm processes a publish
-  # asynchronously — "a few minutes"; ~8 min observed on crew #514), regenerates the lockfile on
-  # `main`, and opens a lockfile-only PR. It never pushes to main.
+  # CI to tolerate it. It waits for the registry to serve the main package and every platform
+  # package (npm processes a publish asynchronously — "a few minutes"; ~8 min observed on crew
+  # #514), regenerates the lockfile on `main`, and opens a lockfile-only PR. It never pushes to main.
   lockfile:
     name: re-stamp main's lockfile (opens a PR)
     needs: publish
@@ -323,7 +323,7 @@ jobs:
             echo "restamp=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Wait until the registry serves all six packages (up to 15 min)
+      - name: Wait until the registry serves every package (up to 15 min)
         if: steps.version.outputs.restamp == 'true'
         shell: bash
         env:
@@ -333,10 +333,15 @@ jobs:
           # `--prefer-online`: the registry serves packuments with `cache-control: max-age=300`, so
           # without it a 30 s poll can keep re-reading the stale, pre-publish packument from npm's
           # local cache for five minutes after the registry has caught up.
-          packages="wicked-core-ts"
-          for abi in darwin-x64 darwin-arm64 linux-x64-gnu linux-arm64-gnu win32-x64-msvc; do
-            packages="${packages} wicked-core-ts-${abi}"
-          done
+          # `timeout 60` on every lookup: npm's own fetch timeout is 5 min with retries, so an
+          # unbounded `npm view` could outlive the deadline below (Copilot on #427).
+          #
+          # The platform packages are whatever package.json's optionalDependencies declare — the
+          # same entries the publish job stamps — so a new target cannot be left un-awaited here
+          # (Copilot on #427).
+          packages="wicked-core-ts $(node -p "Object.keys(require('./package.json').optionalDependencies).join(' ')")"
+          count="$(echo "$packages" | wc -w | tr -d ' ')"
+          echo "  awaiting ${count} packages:${packages}"
           started="$(date +%s)"
           deadline=$(( started + 15 * 60 ))
           attempt=0
@@ -344,14 +349,14 @@ jobs:
             attempt=$(( attempt + 1 ))
             missing=""
             for pkg in $packages; do
-              if served="$(npm view --prefer-online "${pkg}@${VERSION}" version 2>/dev/null)" \
+              if served="$(timeout 60 npm view --prefer-online "${pkg}@${VERSION}" version 2>/dev/null)" \
                  && [ "$served" = "$VERSION" ]; then
                 continue
               fi
               missing="${missing} ${pkg}"
             done
             if [ -z "$missing" ]; then
-              echo "  ok — all six packages resolve at ${VERSION} after $(( $(date +%s) - started ))s (attempt ${attempt})"
+              echo "  ok — all ${count} packages resolve at ${VERSION} after $(( $(date +%s) - started ))s (attempt ${attempt})"
               break
             fi
             now="$(date +%s)"
@@ -371,6 +376,17 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+          # The wait above can last 15 minutes; re-base on the current main and re-check the manifest
+          # so the re-stamp cannot pair a newer package.json with this release's entries (Copilot on
+          # #427).
+          git fetch -q origin main
+          git reset -q --hard origin/main
+          MANIFEST="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "$MANIFEST" ]; then
+            echo "::warning::main moved to ${MANIFEST} while waiting for the registry; its lockfile now describes ${MANIFEST}, not the released ${VERSION}, so there is nothing to re-stamp for this tag. Skipping."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefer-online
           # Lockfile-only by construction — refuse to open a PR that carries anything else. Counted
           # rather than compared against a path, so the check does not depend on how `git status`
