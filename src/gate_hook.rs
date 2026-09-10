@@ -288,7 +288,7 @@ fn in_system_temp(resolved: &std::path::Path) -> bool {
 /// The pure boundary judgement both carriers share: roots, cwd AND home are PARAMETERS, never
 /// ambient process state, so the wrapped subprocess (env-armed) and the in-process ACP bridge
 /// (context-armed, core#260) cannot diverge on what "outside the boundary" means.
-fn boundary_denial_with(
+pub(crate) fn boundary_denial_with(
     roots: &crate::path_policy::AllowedRoots,
     cwd: &std::path::Path,
     home: Option<&std::path::Path>,

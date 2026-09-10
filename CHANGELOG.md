@@ -47,7 +47,13 @@ Two release tracks share this file, newest entry first regardless of track:
   private `<tmp>/wicked-core-chat-<id>` of the chat's own), their `session/new` advertises the
   READ-ONLY estate MCP over the scope's graph (DES-GROUNDING-001 — the grounding governed workers
   get) and the scoped repository roots as a claude seat's `additionalDirectories`; a seat re-warmed
-  after an eviction lands in the same scope; `chat_list` reports it. core-ts: `chatOpen(chatId,
+  after an eviction lands in the same scope; `chat_list` reports it. The read roots are read-only
+  IN FACT, for every seat: a claude seat's session fence denies `Edit`/`Write`/`NotebookEdit` under
+  them, and every seat's `session/request_permission` is judged against the chat's boundary (the
+  scratch root writable, the roots readable, nothing path-bearing beyond either) — a chat turn used
+  to answer every permission request `allow`. The scope is validated before it is recorded:
+  absolute roots outside the engine's own trees (`validate_extra_read_roots`), an existing graph
+  that is never a top-level file of the engine's own state home. core-ts: `chatOpen(chatId,
   clisJson, cwd?, scopeJson?)` (`{"codeGraphDb"?, "readRoots"?}`), `chatSend`'s `cwd` accepted and
   ignored, `chatList` rows gain `cwd` / `codeGraphDb` / `readRoots`.
 

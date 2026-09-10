@@ -77,7 +77,7 @@ pub(crate) mod test_env {
 }
 
 pub use acp_runner::AcpStepRunner;
-pub use acp_runner::{ChatInfo, ChatScope};
+pub use acp_runner::{ChatInfo, ChatOpenOutcomes, ChatScope};
 pub use actor::{RunBusy, RunExists};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
@@ -350,9 +350,11 @@ impl Core {
         chat_id: &str,
         clis: &[String],
         scope: ChatScope,
-    ) -> anyhow::Result<Vec<(String, Result<(), String>)>> {
+    ) -> anyhow::Result<ChatOpenOutcomes> {
         let runner = self.chat_runner()?;
-        Ok(runner.chat_open(chat_id, clis, scope))
+        runner
+            .chat_open(chat_id, clis, scope)
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Fan `text` out to the chat's warm seats (all, or the named subset) — one thread per

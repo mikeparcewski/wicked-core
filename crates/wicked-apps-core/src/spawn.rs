@@ -543,14 +543,29 @@ impl SeatConfig {
     /// every ACP spawn (`wicked-core::acp_runner`); that stays there — this guarantees existence
     /// and privacy.
     pub fn ensure_dirs(&self) -> anyhow::Result<()> {
-        let SeatConfig::Isolated { root, set, .. } = self else {
-            return Ok(());
-        };
-        for dir in root.iter().chain(set.iter().map(|(_, d)| d)) {
-            ensure_private_dir(dir)
+        for dir in self.owned_dirs() {
+            ensure_private_dir(&dir)
                 .map_err(|e| anyhow::anyhow!("seat config root {}: {e}", dir.display()))?;
         }
         Ok(())
+    }
+
+    /// Every directory the CLI will actually READ under this decision: the root, each `set`
+    /// target — and, for opencode, the APP directory under each XDG base (`<base>/opencode`),
+    /// which is what the CLI resolves its config, `auth.json` and state from. Checking only the
+    /// XDG parents left a pre-planted `<root>/data/opencode` link undetected (Copilot, #426).
+    pub fn owned_dirs(&self) -> Vec<std::path::PathBuf> {
+        let SeatConfig::Isolated { cli, root, set, .. } = self else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<std::path::PathBuf> = root.iter().cloned().collect();
+        for (_, dir) in set {
+            dirs.push(dir.clone());
+            if *cli == SeatCli::Opencode {
+                dirs.push(dir.join("opencode"));
+            }
+        }
+        dirs
     }
 }
 
@@ -1276,6 +1291,37 @@ mod tests {
                 dir.display()
             );
         }
+        // opencode's APP directories under the XDG bases are ensured and checked too.
+        for app in ["config", "data", "state"] {
+            let d = root.join(app).join("opencode");
+            assert!(d.is_dir(), "{} is created", d.display());
+            assert_eq!(
+                std::fs::metadata(&d).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        // A planted link at the APP directory (`<root>/data/opencode -> operator's store`) is
+        // refused even though its XDG parent is a real directory (Copilot, #426).
+        let other_root = scratch.join("worker2").join("opencode");
+        std::fs::create_dir_all(other_root.join("data")).unwrap();
+        let operator_store = scratch.join("operator-opencode-data");
+        std::fs::create_dir_all(&operator_store).unwrap();
+        std::os::unix::fs::symlink(&operator_store, other_root.join("data").join("opencode"))
+            .unwrap();
+        let planted_app = SeatConfig::Isolated {
+            cli: SeatCli::Opencode,
+            root: Some(other_root.clone()),
+            set: vec![
+                (XDG_CONFIG_HOME_ENV, other_root.join("config")),
+                (XDG_DATA_HOME_ENV, other_root.join("data")),
+                (XDG_STATE_HOME_ENV, other_root.join("state")),
+            ],
+            strip: Vec::new(),
+        };
+        let err = planted_app
+            .ensure_dirs()
+            .expect_err("a planted app-dir link is refused");
+        assert!(err.to_string().contains("symlink"), "{err}");
         // A planted link where a seat root should be: refused, never followed.
         let operator_like = scratch.join("operator-codex");
         std::fs::create_dir_all(&operator_like).unwrap();
