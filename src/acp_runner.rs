@@ -1864,7 +1864,7 @@ fn same_plugin_path(existing: &str, root: &std::path::Path) -> bool {
 /// governance context used to arm `WICKED_WRITE_ROOTS`; Boundary 1 is WRITE containment only,
 /// not exfiltration protection, a read jail, or a replacement for ACP governance.
 ///
-/// Nine parameters, each a distinct launch fact documented inline below; bundling them into a
+/// Ten parameters, each a distinct launch fact documented inline below; bundling them into a
 /// struct would touch every test spawn in this file for no gain in clarity.
 #[allow(clippy::too_many_arguments)]
 fn start_acp_process_with_write_roots(

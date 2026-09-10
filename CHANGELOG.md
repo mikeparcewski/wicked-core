@@ -512,6 +512,24 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.18** — npm release carrying the two engine changes since 0.7.17: council ballots
+  run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (#413, F-030 / F-031 / F-013
+  — ONE carrier-aware, fail-closed resolver in `wicked_apps_core::spawn` shared by the ACP worker
+  spawn, the wrapped worker and the ballot spawn; `councilSeatFailed` gains ADDITIVE `stdout` +
+  `reason` (`not_logged_in`); the roster's claude `login_invocation` — `registryRoster()` — is the
+  RESOLVED absolute worker dir, and no command at all when it cannot be resolved); and evaluator
+  phases cannot mutate the worktree while `verify` runs the repo's own checks as a deterministic
+  floor (#414, F-036 / F-039 — the worktree guard denying ANY change under an `executes_code:
+  false` phase with the new `evaluatorMutatedWorktree` event, the read-only no-code posture on
+  non-claude seats (codex `--sandbox read-only`, pi `--exclude-tools edit,write`, a write-capable
+  lever-less seat refused before launch), registration refusing a code phase whose gate evaluates
+  nothing (`WorkflowDefError::GateEvaluatesNothing` / `UnverifiedEvidence`), and the sandboxed
+  `repo_checks` floor with the new `repoChecksEvaluated` event; `UnitEvidence {worktree_guard,
+  repo_checks}` rides `ApplyStepResult` and the bus `task.completed` payload, serde-default). Both
+  #414 events are pinned in `index.d.ts` / `CoreEventJson`. **Coupling to note:** a wicked-crew
+  whose mirrored defs lack the #414 gate pins is refused at registration by this engine — deploy
+  alongside the crew release that carries them (wicked-crew#507). Also carries the
+  `start_acp_process_with_write_roots` doc fix parked from #413 ("Nine parameters" → ten).
 - **core-ts 0.7.17** — npm release carrying the three engine changes since 0.7.16: the skills
   snapshot engine (#399 — one skills input, `WICKED_SKILLS_SNAPSHOT`, handed to both carriers —
   ACP `plugins` handshake bound to the cached session / wrapped `--plugin-dir` — joined to the
@@ -678,6 +696,25 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Event `seq` stays monotonic across daemon restarts (core#408, F-035).** The durable per-run
+  event log stamped `seq` from a process-wide counter that started at 0 with every daemon, so a run
+  resumed after a restart recorded its new events with `seq` 0, 1, … while its history already held
+  0–294 — and `GET /runs/:id/events`, which sorted by `seq`, returned the new events BEFORE the old
+  ones. Every consumer taking the tail as "latest" (the studio now-bar, crew's relays, the
+  acceptance poller) read the pre-restart `awaitingHuman` as current while the run had moved on.
+  The first record a process writes for a run now continues from the largest `seq` already in that
+  run's log (raised into the counter with `fetch_max` so other in-flight runs stay monotonic too),
+  with the first-touch check, the seed, the stamp and the enqueue under one lock so concurrent
+  callers cannot slip below the history; `seq` is therefore strictly increasing within a run for the
+  run's whole life. That first post-restart record also carries `daemonRestarted: true`
+  (envelope-only, like `ts`/`seq`; absent everywhere else) so a consumer can see the boundary
+  instead of inferring it. The reader no longer sorts: for the append-only single-writer log, file
+  order IS emission order, so a log a pre-fix engine wrote across a restart — a repeated or a gapped
+  second `seq` run — reads back exactly as emitted instead of interleaved. Proven across a REAL
+  process boundary: the e2e re-executes the test binary as the "restarted daemon", which approves
+  the gate and finishes the run. core-ts: `runEvents` states the contract and the hand-authored
+  `index.d.ts` gains `RecordedEventJson` (`ts`, `seq`, `daemonRestarted?: true`) with compile-time
+  assertions in `types-test/`.
 - **Council ballots run on the seat's worker home, not the daemon's `CLAUDE_CONFIG_DIR` (F-030;
   F-031, F-013).** `wicked-council`'s ballot spawn inherited whatever `CLAUDE_CONFIG_DIR` the daemon
   was started with (`hardened()` strips only `WICKED_*`): on a fresh install that is the

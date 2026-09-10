@@ -9,5 +9,5 @@
     "types": [],
     "skipLibCheck": true
   },
-  "files": ["seat-constraint.assert.ts"]
+  "files": ["seat-constraint.assert.ts", "recorded-event.assert.ts"]
 }

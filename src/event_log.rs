@@ -15,9 +15,26 @@
 //! - `ts` — capture-time epoch millis. Nothing in the domain model carries a time value (`WorkUnit`,
 //!   `AgentSession` and `Node` are all timeless), so ordering and duration were previously
 //!   unrecoverable after the fact. Stamped here, at the single emit point, rather than inferred later.
-//! - `seq` — a per-process monotonic counter. Millisecond stamps collide freely (a burst of events
-//!   from one actor turn shares a millisecond), so `ts` alone cannot order a run. `seq` is the tiebreak
-//!   and makes the total order recoverable.
+//! - `seq` — a monotonic counter. Millisecond stamps collide freely (a burst of events from one actor
+//!   turn shares a millisecond), so `ts` alone cannot order a run. `seq` is the tiebreak and makes the
+//!   total order recoverable. It is strictly increasing within a run for the run's WHOLE life — across
+//!   daemon restarts, not just within one process (core#408): the counter is process-wide, but the
+//!   first record a process writes for a run continues from the largest `seq` already in that run's
+//!   log. Before that seed the counter restarted at 0 with the daemon, so a resumed run's new events
+//!   sorted BEFORE its old ones and every "latest event" consumer (the studio now-bar, crew's relays,
+//!   the acceptance poller) read the pre-restart tail as current — at exactly the moment an operator
+//!   most needed the truth.
+//! - `daemonRestarted: true` — on ONE record per restart: the first one a fresh engine writes for a
+//!   run that already had history. A consumer keeping per-run state across the gap can see the
+//!   boundary rather than infer it from a `seq` jump. Absent everywhere else (never `false`).
+//!
+//! All three are envelope fields of the durable log only. The live `/ws` frame is the bare
+//! [`CoreEvent::to_json`] object and carries none of them.
+//!
+//! The seed costs one read of the run's own log per run per process — lossy decode plus a `Value`
+//! parse of every line, on the emitting thread because the seed must precede that record's stamp —
+//! bounded by the log itself (tens of KB typically, a few MB for the longest runs) and paid once, not
+//! per event.
 //!
 //! ## Where it lives: beside the store, not in a global directory
 //!
@@ -66,14 +83,21 @@
 //! policy is wanted it belongs above this module, as an explicit operator-facing prune with its own
 //! record of what it removed — not as an implicit default that quietly loses evidence.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::event::CoreEvent;
 
 /// Process-wide monotonic sequence. Shared across runs on purpose: it makes the interleaving of
 /// concurrent runs recoverable too, which a per-run counter would lose.
+///
+/// Starts at 0 with the process and is raised (`fetch_max`) past a run's persisted history the first
+/// time this process records for that run — see [`inspect_log`] and the module docs. Raising
+/// rather than assigning keeps it monotonic for every OTHER run already in flight: a seed can only
+/// move the counter forward.
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Path-escape a run id injectively so it can name a file. Same scheme as [`crate::gate_hook`]'s:
@@ -248,8 +272,97 @@ pub fn flush() {
     }
 }
 
+/// The envelope `seq` of a recorded line, if it carries one.
+fn seq_of(v: &serde_json::Value) -> Option<u64> {
+    v.get("seq").and_then(|s| s.as_u64())
+}
+
+/// Every parseable record in a raw NDJSON log, in file order. Unparseable lines are skipped rather
+/// than failing the read: a torn final line from a crash mid-append must not make the preceding
+/// history unreadable — and must not stop a restarted engine from seeding its counter off it.
+fn parse_log(raw: &str) -> Vec<serde_json::Value> {
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+/// What a fresh engine finds in a run's log before writing its first record for that run.
+struct PriorHistory {
+    /// The largest `seq` already recorded — where the counter must continue from. `None` when the
+    /// log is absent or holds no parseable record, i.e. the run has no history to continue.
+    max_seq: Option<u64>,
+    /// The file ends mid-line: a crash mid-append left a fragment with no terminating newline.
+    torn_tail: bool,
+}
+
+/// A run's log as text, tolerant of a torn multi-byte character.
+///
+/// A crash mid-append can cut a UTF-8 sequence in the final line, leaving the file invalid UTF-8.
+/// `read_to_string` refuses the WHOLE file for that one byte — a complete history would read as
+/// empty, and a restarted engine, finding "no history", would seed nothing and restart `seq` at 0:
+/// the very failure this module fixes, back through a side door. Lossy decoding confines the damage
+/// to the torn line, which is unparseable either way and already skipped. `None` ⇒ no log.
+fn read_log(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Inspect a run's log once, on the first record this engine writes for it.
+///
+/// Reads the whole file rather than seeking to its tail: a torn trailing line (crash mid-append) or
+/// a log a pre-#408 engine wrote across a restart (a second `seq` run starting at 0 AFTER the higher
+/// values) both defeat "the last line is the max". It runs once per run per engine lifetime — a
+/// per-run file of tens of KB — not once per event, so the cost stays off the emission path.
+fn inspect_log(path: &Path) -> PriorHistory {
+    let Some(raw) = read_log(path) else {
+        return PriorHistory {
+            max_seq: None,
+            torn_tail: false,
+        };
+    };
+    PriorHistory {
+        max_seq: parse_log(&raw).iter().filter_map(seq_of).max(),
+        torn_tail: !raw.is_empty() && !raw.ends_with('\n'),
+    }
+}
+
+/// The largest `seq` already recorded in the log at `path` — where a fresh engine's counter must
+/// continue from for that run. `None` when the log is absent or holds no parseable record. Test-only
+/// accessor over [`inspect_log`]; nothing outside the tests needs the max on its own.
+#[cfg(test)]
+fn persisted_max_seq(path: &Path) -> Option<u64> {
+    inspect_log(path).max_seq
+}
+
+/// Log paths this PROCESS has already appended to, and the lock every record is stamped under.
+///
+/// Process-wide, like [`SEQ`], and for the same reason: "the engine that wrote the previous record
+/// is gone" is a property of the process, not of any one [`EventSink`] — and it is what lets
+/// [`append`] keep its plain `(root, event)` signature while still seeding. First touch of a path
+/// in this process ⇒ consult the persisted history. One entry per run the process touches over its
+/// lifetime, a few dozen bytes each — the same growth the writer's handle cache is bounded against,
+/// and the same order of magnitude as the run ids the store already holds.
+///
+/// The guard is held from the first-touch check through the seed, the `seq` allocation AND the
+/// enqueue — one critical section per record. That is what makes the guarantee hold for ANY set of
+/// callers rather than only the single actor thread: a concurrent `append` for the same run cannot
+/// slip in between another caller's first touch and its seed and stamp below the persisted max (an
+/// earlier cut released the lock after the check — review of #420, F2), and `seq` order, the
+/// writer's FIFO order and therefore file order are one and the same. Uncontended in production
+/// (every emit is on the actor thread), so the cost is one lock/unlock pair per record.
+static CONTINUED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
 /// Queue one event for its run's log under `root`. Returns whether a record was ENQUEUED — the write
 /// itself happens on the writer thread, so this is not a durability acknowledgement (use [`flush`]).
+///
+/// The FIRST record this process writes for a run is where the persisted history is consulted: the
+/// process-wide counter is raised past the run's largest recorded `seq`, so a daemon restart cannot
+/// make the new events sort before the old ones (core#408), and — when there WAS history — the
+/// record is stamped `daemonRestarted: true`. Every later record for that run is a plain append. The
+/// state lives in this module, under [`CONTINUED`]'s lock, rather than in a caller-supplied argument
+/// so that every path to the log, including this public one, upholds the guarantee by construction —
+/// for concurrent callers too.
 ///
 /// `false` means one of three things: the event was a declared streaming exclusion, it was not
 /// run-scoped, or the writer channel is gone. Best-effort throughout: a full disk or a permissions
@@ -264,45 +377,82 @@ pub fn append(root: &Path, ev: &CoreEvent) -> bool {
     let Some(run_id) = run_key(&json).map(str::to_string) else {
         return false;
     };
-    // Stamped HERE, on the emitting thread, not on the writer: `ts` must be capture time and `seq`
-    // must reflect emission order, neither of which survives being assigned after a queue hop.
+    let path = run_log_path(root, &run_id);
+    // Capture time, taken before the critical section: it is when the event happened, not when the
+    // record won the lock. (`ts` was never an order — `seq` is.)
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
+    // One critical section: first-touch check → seed → stamp → enqueue (see `CONTINUED`).
+    let mut touched = CONTINUED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // First record THIS process writes for the run: continue from wherever the run's history already
+    // reached. No flush of the writer queue is needed here — anything still queued for this run was
+    // stamped by this same process's counter, which is already past it; only a PREVIOUS process's
+    // records (on disk) can be ahead of the counter.
+    let prior = if touched.contains(&path) {
+        None
+    } else {
+        let prior = inspect_log(&path);
+        if let Some(max) = prior.max_seq {
+            SEQ.fetch_max(max.saturating_add(1), Ordering::Relaxed);
+        }
+        touched.insert(path.clone());
+        Some(prior)
+    };
+    let restarted = prior.as_ref().is_some_and(|p| p.max_seq.is_some());
+    let torn_tail = prior.as_ref().is_some_and(|p| p.torn_tail);
+    // Stamped HERE, on the emitting thread, not on the writer: `seq` must reflect emission order,
+    // which does not survive being assigned after a queue hop.
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     if let Some(obj) = json.as_object_mut() {
         obj.insert("ts".to_string(), serde_json::json!(ts));
         obj.insert("seq".to_string(), serde_json::json!(seq));
+        if restarted {
+            obj.insert("daemonRestarted".to_string(), serde_json::json!(true));
+        }
     }
-    writer()
-        .send(LogMsg::Record {
-            path: run_log_path(root, &run_id),
-            line: format!("{json}\n"),
-        })
-        .is_ok()
+    // A torn trailing line (the crash that precedes a restart) has no newline. Appending straight
+    // after it would glue THIS record — the seeded, marked first one after the restart — onto the
+    // fragment, and the reader would drop both as one unparseable line. Start on a fresh line
+    // instead: the fragment stays its own unparseable line, which the reader already skips, so the
+    // crash still costs exactly the torn record and nothing after it.
+    let line = if torn_tail {
+        format!("\n{json}\n")
+    } else {
+        format!("{json}\n")
+    };
+    let enqueued = writer().send(LogMsg::Record { path, line }).is_ok();
+    drop(touched);
+    enqueued
 }
 
-/// Read a run's recorded events, oldest first. Missing log ⇒ empty (a run that never emitted, or one
-/// from before this existed — not an error). Unparseable lines are skipped rather than failing the
-/// read: a torn final line from a crash mid-append must not make the preceding history unreadable.
+/// Read a run's recorded events, oldest first — in FILE order. Missing log ⇒ empty (a run that never
+/// emitted, or one from before this existed — not an error). Unparseable lines are skipped rather
+/// than failing the read: a torn final line from a crash mid-append must not make the preceding
+/// history unreadable.
+///
+/// File order IS the emission order: the log is append-only with one writer (the FIFO writer thread,
+/// fed under the same lock that allocates `seq`), so nothing else can be — and the reader therefore
+/// never reorders. `seq` is the contract consumers read (strictly increasing within the run, its
+/// tail the latest event) and for every log written since #408 it agrees with file order by
+/// construction; it is NOT a sort key. An earlier cut sorted by `seq` "for robustness", and that is
+/// exactly what turned a pre-#408 restart — the counter reset to 0, so a second `seq` run AFTER
+/// higher values — into the reported interleaving. A repeated value is detectable; a gapped one is
+/// not (the old counter was process-wide, so a run that was not the daemon's first has gaps
+/// everywhere, and the second run can fall entirely into one — review of #420, F1). The only rule
+/// that reads every such log back as emitted is to leave the order alone.
 pub fn read_run(root: &Path, run_id: &str) -> Vec<serde_json::Value> {
     // Drain the writer first: without this a caller could read back a history missing the events it
     // just emitted, purely because they were still in the queue.
     flush();
-    let path = run_log_path(root, run_id);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let Some(raw) = read_log(&run_log_path(root, run_id)) else {
         return Vec::new();
     };
-    let mut out: Vec<serde_json::Value> = raw
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect();
-    // Append order already IS emit order for a single writer, but sorting by the envelope makes the
-    // read robust to a future concurrent writer without changing anything for today's single actor.
-    out.sort_by_key(|v| v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0));
-    out
+    parse_log(&raw)
 }
 
 /// The live subscriber list PLUS the durable log, bundled so the actor's single emit point reaches
@@ -667,5 +817,388 @@ mod tests {
         });
         assert!(read_run(&root, "np").is_empty());
         assert!(!run_log_path(&root, "np").exists());
+    }
+
+    // ── core#408: `seq` survives a daemon restart ─────────────────────────────────────────────
+
+    /// One recorded line for run `r`, as a log left by a PREVIOUS process would hold it. The only
+    /// thing one test process cannot produce for real is history stamped by another process's
+    /// counter, so these tests write that history by hand.
+    fn recorded_line(ty: &str, ord: u32, ts: u64, seq: u64) -> String {
+        format!("{{\"type\":\"{ty}\",\"session\":\"r\",\"ord\":{ord},\"ts\":{ts},\"seq\":{seq}}}\n")
+    }
+
+    fn write_log(root: &Path, run_id: &str, raw: &str) -> PathBuf {
+        let path = run_log_path(root, run_id);
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(&path, raw).unwrap();
+        path
+    }
+
+    /// The finding: a fresh engine over a run that already has history must CONTINUE the run's
+    /// `seq`, not restart it. The counter is process-wide and this binary is one process, so the
+    /// history is given a `seq` far beyond anything this process has stamped — the exact relation a
+    /// restarted daemon (counter at 0) has to the log it finds on disk. Without the seed the new
+    /// records would carry a small `seq`, sort BEFORE the history, and the tail — what every
+    /// "latest event" consumer reads — would be the stale pre-restart `awaitingHuman`.
+    #[test]
+    fn a_fresh_engine_continues_a_runs_seq_from_its_persisted_log() {
+        let root = tmp("restart-seed");
+        const PRIOR_MAX: u64 = 1 << 40;
+        let mut raw = String::new();
+        raw.push_str(&recorded_line(
+            "sessionStarted",
+            0,
+            1_700_000_000_000,
+            PRIOR_MAX - 2,
+        ));
+        raw.push_str(&recorded_line(
+            "unitDone",
+            1,
+            1_700_000_000_001,
+            PRIOR_MAX - 1,
+        ));
+        raw.push_str(&recorded_line(
+            "awaitingHuman",
+            2,
+            1_700_000_000_002,
+            PRIOR_MAX,
+        ));
+        write_log(&root, "r", &raw);
+
+        // This process has never appended to that log — exactly the restarted daemon's position.
+        let mut sink = EventSink::persistent(root.clone());
+        sink.emit(CoreEvent::Resumed {
+            session: "r".to_string(),
+            ord: 2,
+        });
+        sink.emit(CoreEvent::UnitExecuting {
+            session: "r".to_string(),
+            ord: 2,
+        });
+
+        let got = read_run(&root, "r");
+        let types: Vec<&str> = got.iter().map(|v| v["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            [
+                "sessionStarted",
+                "unitDone",
+                "awaitingHuman",
+                "resumed",
+                "unitExecuting"
+            ],
+            "history first, then the resumption — the tail is the latest event"
+        );
+        let seqs: Vec<u64> = got.iter().map(|v| v["seq"].as_u64().unwrap()).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "strictly increasing across the restart: {seqs:?}"
+        );
+        assert!(
+            seqs[3] > PRIOR_MAX,
+            "the first post-restart seq continues past the persisted max, not from this \
+             process's counter: {seqs:?}"
+        );
+
+        // The boundary is marked exactly once, on the first post-restart record.
+        assert_eq!(got[3]["daemonRestarted"], serde_json::json!(true));
+        let marked: Vec<usize> = got
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.get("daemonRestarted").is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![3],
+            "one marker per restart, on the first record after it: {got:#?}"
+        );
+    }
+
+    /// A run with no history is simply a new run: nothing to continue from and no restart to mark.
+    /// A marker here would make every run read as resumed and the field useless.
+    #[test]
+    fn a_run_without_prior_history_is_not_marked_as_restarted() {
+        let root = tmp("fresh-run");
+        let mut sink = EventSink::persistent(root.clone());
+        for ord in 0..3u32 {
+            sink.emit(CoreEvent::UnitDone {
+                session: "r".to_string(),
+                ord,
+            });
+        }
+        let got = read_run(&root, "r");
+        assert_eq!(got.len(), 3);
+        assert!(
+            got.iter().all(|v| v.get("daemonRestarted").is_none()),
+            "a fresh run carries no restart marker: {got:#?}"
+        );
+    }
+
+    /// The seed reads past a torn trailing line — the crash that most plausibly precedes a restart.
+    /// The max is taken over every parseable record, not read off the last line. And the first
+    /// post-restart record starts on a fresh line: appended straight after the newline-less
+    /// fragment it would glue onto it and both would read as one unparseable line — losing the very
+    /// record that carries the seeded `seq` and the restart marker.
+    #[test]
+    fn the_seed_survives_a_torn_trailing_line() {
+        let root = tmp("restart-torn");
+        const PRIOR_MAX: u64 = 1 << 41;
+        let mut raw = recorded_line("unitDone", 0, 1_700_000_000_000, PRIOR_MAX);
+        raw.push_str("{\"type\":\"unitDone\",\"sess");
+        let path = write_log(&root, "r", &raw);
+        assert_eq!(persisted_max_seq(&path), Some(PRIOR_MAX));
+
+        let mut sink = EventSink::persistent(root.clone());
+        sink.emit(CoreEvent::UnitDone {
+            session: "r".to_string(),
+            ord: 1,
+        });
+        let got = read_run(&root, "r");
+        assert_eq!(got.len(), 2, "the intact record plus the new one: {got:#?}");
+        assert!(got[1]["seq"].as_u64().unwrap() > PRIOR_MAX);
+        assert_eq!(got[1]["daemonRestarted"], serde_json::json!(true));
+    }
+
+    /// Copilot on #420: the crash can cut a MULTI-BYTE character in the torn line, leaving the file
+    /// invalid UTF-8. `read_to_string` would then refuse the whole file — the history would read as
+    /// empty, and the restarted engine, finding "no history", would seed nothing and restart `seq`
+    /// at 0: the finding, back through a side door. The torn line must cost only itself, for the
+    /// seed AND for the read.
+    #[test]
+    fn a_torn_multibyte_character_costs_only_the_torn_line() {
+        let root = tmp("restart-torn-utf8");
+        const PRIOR_MAX: u64 = 1 << 42;
+        let mut bytes = recorded_line("unitDone", 0, 1_700_000_000_000, PRIOR_MAX).into_bytes();
+        // "—" is E2 80 94; the crash landed after its second byte.
+        bytes.extend_from_slice(
+            b"{\"type\":\"error\",\"session\":\"r\",\"message\":\"gate \xE2\x80",
+        );
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the fixture really is invalid UTF-8"
+        );
+        let path = run_log_path(&root, "r");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(persisted_max_seq(&path), Some(PRIOR_MAX));
+        assert_eq!(
+            read_run(&root, "r").len(),
+            1,
+            "the intact record survives the torn one"
+        );
+
+        let mut sink = EventSink::persistent(root.clone());
+        sink.emit(CoreEvent::UnitDone {
+            session: "r".to_string(),
+            ord: 1,
+        });
+        let got = read_run(&root, "r");
+        assert_eq!(got.len(), 2, "{got:#?}");
+        assert!(got[1]["seq"].as_u64().unwrap() > PRIOR_MAX);
+        assert_eq!(got[1]["daemonRestarted"], serde_json::json!(true));
+    }
+
+    /// An absent or record-less log has no max — the fresh-run case, spelled at the helper.
+    #[test]
+    fn no_history_has_no_max_seq() {
+        let root = tmp("no-max");
+        assert_eq!(persisted_max_seq(&run_log_path(&root, "never")), None);
+        let path = write_log(&root, "empty", "\n\n");
+        assert_eq!(persisted_max_seq(&path), None);
+    }
+
+    /// What a pre-#408 engine left on disk: `seq` 0..=2 before the restart, then 0..=1 again after
+    /// it. File order is emission order (append-only, single writer); sorting by the REPEATED `seq`
+    /// is what put the post-restart `resumed` ahead of `sessionStarted` and left `awaitingHuman` at
+    /// the tail. The reader must hand such a log back in file order.
+    #[test]
+    fn a_log_written_across_a_pre_fix_restart_reads_back_in_emission_order() {
+        let root = tmp("legacy-restart");
+        let mut raw = String::new();
+        raw.push_str(&recorded_line("sessionStarted", 0, 1_000, 0));
+        raw.push_str(&recorded_line("unitPlanned", 1, 1_000, 1));
+        raw.push_str(&recorded_line("awaitingHuman", 1, 1_001, 2));
+        // — daemon restart: the old counter started over —
+        raw.push_str(&recorded_line("resumed", 1, 5_000, 0));
+        raw.push_str(&recorded_line("unitExecuting", 1, 5_001, 1));
+        write_log(&root, "r", &raw);
+
+        let types: Vec<String> = read_run(&root, "r")
+            .iter()
+            .map(|v| v["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "sessionStarted",
+                "unitPlanned",
+                "awaitingHuman",
+                "resumed",
+                "unitExecuting"
+            ],
+            "a repeated seq means the counter restarted; file order is the emission order"
+        );
+    }
+
+    /// Copilot on #420: a record WITHOUT a `seq` must not be read as `seq: 0` and sorted ahead of the
+    /// history. Nothing writes such a record today, but a log is data on disk; if one is there,
+    /// `seq` is not an order for that file and file order stands — here `[2, none, 1]` stays put
+    /// rather than becoming `[none, 1, 2]`.
+    #[test]
+    fn a_record_without_seq_pins_the_read_to_file_order() {
+        let root = tmp("seqless");
+        let mut raw = String::new();
+        raw.push_str(&recorded_line("unitDone", 2, 1_000, 2));
+        raw.push_str("{\"type\":\"unitDone\",\"session\":\"r\",\"ord\":7,\"ts\":1000}\n");
+        raw.push_str(&recorded_line("unitDone", 1, 1_000, 1));
+        write_log(&root, "r", &raw);
+        let ords: Vec<u64> = read_run(&root, "r")
+            .iter()
+            .map(|v| v["ord"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            ords,
+            [2, 7, 1],
+            "file order — seq is not an order for this file"
+        );
+    }
+
+    /// The reader never reorders — even a file whose line order disagrees with `seq` reads back in
+    /// file order. The single-writer log cannot produce such a file; if one exists, the lines are the
+    /// record and `seq` is what each says, not a licence to move them.
+    #[test]
+    fn a_file_whose_line_order_disagrees_with_seq_still_reads_back_in_file_order() {
+        let root = tmp("shuffled");
+        let mut raw = String::new();
+        raw.push_str(&recorded_line("unitDone", 2, 1_000, 2));
+        raw.push_str(&recorded_line("unitDone", 0, 1_000, 0));
+        raw.push_str(&recorded_line("unitDone", 1, 1_000, 1));
+        write_log(&root, "r", &raw);
+        let ords: Vec<u64> = read_run(&root, "r")
+            .iter()
+            .map(|v| v["ord"].as_u64().unwrap())
+            .collect();
+        assert_eq!(ords, [2, 0, 1], "file order, whatever seq says");
+    }
+
+    /// Review of #420, F1: a pre-#408 daemon's counter was process-wide, so a run that was not the
+    /// daemon's first had GAPS in its `seq` — and after a restart the run's next values could fall
+    /// entirely into one. No value repeats, so a "distinct ⇒ sort by seq" rule sorted the file and put
+    /// the post-restart events BETWEEN the pre-restart ones: the F-035 interleaving, with the stale
+    /// `awaitingHuman` back at the tail. File order is emission order; the reader must not reorder.
+    #[test]
+    fn a_pre_fix_restart_whose_seqs_fell_into_a_gap_reads_back_in_emission_order() {
+        let root = tmp("legacy-gap");
+        let mut raw = String::new();
+        for (ty, ord, seq) in [
+            ("sessionStarted", 0, 0),
+            ("unitPlanned", 1, 1),
+            ("unitExecuting", 1, 2),
+            ("unitDone", 1, 30),
+            ("awaitingHuman", 2, 31),
+        ] {
+            raw.push_str(&recorded_line(ty, ord, 1_000 + seq, seq));
+        }
+        // — daemon restart: the old counter started over, and this run's next values landed in the
+        //   gap another run had left —
+        for (ty, ord, seq) in [
+            ("resumed", 2, 10),
+            ("unitExecuting", 2, 11),
+            ("sessionCompleted", 2, 12),
+        ] {
+            raw.push_str(&recorded_line(ty, ord, 5_000 + seq, seq));
+        }
+        write_log(&root, "r", &raw);
+
+        let types: Vec<String> = read_run(&root, "r")
+            .iter()
+            .map(|v| v["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "sessionStarted",
+                "unitPlanned",
+                "unitExecuting",
+                "unitDone",
+                "awaitingHuman",
+                "resumed",
+                "unitExecuting",
+                "sessionCompleted"
+            ],
+            "emission order, gap or no gap"
+        );
+        assert_eq!(
+            types.last().map(String::as_str),
+            Some("sessionCompleted"),
+            "the tail is the latest event, not the pre-restart gate prompt"
+        );
+    }
+
+    /// Review of #420, F2: the seed must happen under the same lock as the first-touch check and the
+    /// stamp. With the lock released in between, a second concurrent `append` for the same run saw
+    /// "already touched", stamped from the still-unseeded counter, and landed BELOW the persisted max
+    /// (seven of eight did, in the reviewer's probe). Eight threads released together by a barrier,
+    /// each appending once to a run with a few hundred records of history: every new `seq` must be
+    /// above the history, the marker must sit on exactly one record — the lowest new `seq`, which is
+    /// also first in file order — and file order must equal `seq` order.
+    #[test]
+    fn concurrent_appends_for_one_run_all_land_above_the_persisted_history() {
+        let root = tmp("concurrent-seed");
+        const PRIOR_MAX: u64 = 1 << 44;
+        const HISTORY: u64 = 300;
+        let mut raw = String::new();
+        for i in 0..HISTORY {
+            raw.push_str(&recorded_line(
+                "unitDone",
+                i as u32,
+                1_700_000_000_000 + i,
+                PRIOR_MAX - (HISTORY - 1) + i,
+            ));
+        }
+        write_log(&root, "r", &raw);
+
+        const THREADS: u32 = 8;
+        let barrier = std::sync::Barrier::new(THREADS as usize);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let (root, barrier) = (&root, &barrier);
+                s.spawn(move || {
+                    let ev = CoreEvent::UnitDone {
+                        session: "r".to_string(),
+                        ord: 1_000 + t,
+                    };
+                    barrier.wait();
+                    assert!(append(root, &ev), "every record is enqueued");
+                });
+            }
+        });
+
+        let got = read_run(&root, "r");
+        assert_eq!(got.len(), (HISTORY + u64::from(THREADS)) as usize);
+        let new = &got[HISTORY as usize..];
+        let seqs: Vec<u64> = new.iter().map(|v| v["seq"].as_u64().unwrap()).collect();
+        assert!(
+            seqs.iter().all(|s| *s > PRIOR_MAX),
+            "every concurrent record lands above the history (max {PRIOR_MAX}): {seqs:?}"
+        );
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "file order is seq order even under concurrency: {seqs:?}"
+        );
+        let marked: Vec<usize> = new
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.get("daemonRestarted").is_some())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![0],
+            "exactly one marker, on the first post-restart record: {new:#?}"
+        );
     }
 }
