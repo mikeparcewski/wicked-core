@@ -290,6 +290,18 @@ struct PriorHistory {
     torn_tail: bool,
 }
 
+/// A run's log as text, tolerant of a torn multi-byte character.
+///
+/// A crash mid-append can cut a UTF-8 sequence in the final line, leaving the file invalid UTF-8.
+/// `read_to_string` refuses the WHOLE file for that one byte — a complete history would read as
+/// empty, and a restarted engine, finding "no history", would seed nothing and restart `seq` at 0:
+/// the very failure this module fixes, back through a side door. Lossy decoding confines the damage
+/// to the torn line, which is unparseable either way and already skipped. `None` ⇒ no log.
+fn read_log(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Inspect a run's log once, on the first record this engine writes for it.
 ///
 /// Reads the whole file rather than seeking to its tail: a torn trailing line (crash mid-append) or
@@ -297,7 +309,7 @@ struct PriorHistory {
 /// values) both defeat "the last line is the max". It runs once per run per engine lifetime — a
 /// per-run file of tens of KB — not once per event, so the cost stays off the emission path.
 fn inspect_log(path: &Path) -> PriorHistory {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    let Some(raw) = read_log(path) else {
         return PriorHistory {
             max_seq: None,
             torn_tail: false,
@@ -397,8 +409,7 @@ pub fn read_run(root: &Path, run_id: &str) -> Vec<serde_json::Value> {
     // Drain the writer first: without this a caller could read back a history missing the events it
     // just emitted, purely because they were still in the queue.
     flush();
-    let path = run_log_path(root, run_id);
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let Some(raw) = read_log(&run_log_path(root, run_id)) else {
         return Vec::new();
     };
     let mut out = parse_log(&raw);
@@ -920,6 +931,46 @@ mod tests {
         });
         let got = read_run(&root, "r");
         assert_eq!(got.len(), 2, "the intact record plus the new one: {got:#?}");
+        assert!(got[1]["seq"].as_u64().unwrap() > PRIOR_MAX);
+        assert_eq!(got[1]["daemonRestarted"], serde_json::json!(true));
+    }
+
+    /// Copilot on #420: the crash can cut a MULTI-BYTE character in the torn line, leaving the file
+    /// invalid UTF-8. `read_to_string` would then refuse the whole file — the history would read as
+    /// empty, and the restarted engine, finding "no history", would seed nothing and restart `seq`
+    /// at 0: the finding, back through a side door. The torn line must cost only itself, for the
+    /// seed AND for the read.
+    #[test]
+    fn a_torn_multibyte_character_costs_only_the_torn_line() {
+        let root = tmp("restart-torn-utf8");
+        const PRIOR_MAX: u64 = 1 << 42;
+        let mut bytes = recorded_line("unitDone", 0, 1_700_000_000_000, PRIOR_MAX).into_bytes();
+        // "—" is E2 80 94; the crash landed after its second byte.
+        bytes.extend_from_slice(
+            b"{\"type\":\"error\",\"session\":\"r\",\"message\":\"gate \xE2\x80",
+        );
+        assert!(
+            std::str::from_utf8(&bytes).is_err(),
+            "the fixture really is invalid UTF-8"
+        );
+        let path = run_log_path(&root, "r");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(persisted_max_seq(&path), Some(PRIOR_MAX));
+        assert_eq!(
+            read_run(&root, "r").len(),
+            1,
+            "the intact record survives the torn one"
+        );
+
+        let mut sink = EventSink::persistent(root.clone());
+        sink.emit(CoreEvent::UnitDone {
+            session: "r".to_string(),
+            ord: 1,
+        });
+        let got = read_run(&root, "r");
+        assert_eq!(got.len(), 2, "{got:#?}");
         assert!(got[1]["seq"].as_u64().unwrap() > PRIOR_MAX);
         assert_eq!(got[1]["daemonRestarted"], serde_json::json!(true));
     }
