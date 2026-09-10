@@ -702,6 +702,16 @@ Two release tracks share this file, newest entry first regardless of track:
   this copy. Also adds the thin root `CLAUDE.md` pointer stub (AW-1).
 
 ### Fixed
+- **Repo-graph migration hardening (#406 follow-up).** The completed copy is installed with a
+  NO-REPLACE `hard_link` + `remove_file` (a `rename` would silently replace on Unix): a graph that
+  appears at `<key>/estate.db` while the copy runs — an indexer racing the boot — wins and the temp
+  is discarded (`Install::LiveGraphWon`). A RELATIVE `WICKED_ESTATE_REPO_GRAPH_ROOT` is rejected
+  (warned once) and the precedence falls through to the state home, so the write resolver can no
+  longer mint `./<key>/estate.db` in the cwd while the sandbox classifier grants nothing. The boot
+  has an OVERALL migration budget (300 s across all repos, on top of the 60 s per copy): once spent,
+  the remaining legacy graphs are `Deferred` — reported, untouched, copied at the next boot — so an
+  upgrade with many stale or locked graphs cannot keep the daemon unavailable for N × 60 s. The
+  STEERING guide's `rules fanout` example names `<state-home>/repo-graphs/<repo-key>/estate.db`.
 - **Repo graphs live under the daemon state home; an in-tree `.codegraph/` is never adopted
   (#406; F-016 / F-024).** `registerRepo`/onboarding minted every repo's code graph under the
   OPERATOR's `~/.wicked-estate/repo-graphs/<key>` whatever `--db` said — two daemons on one host
