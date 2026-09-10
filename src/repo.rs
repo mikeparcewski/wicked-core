@@ -159,7 +159,10 @@ fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
     if crate::code_graph::has_in_tree_code_graph(root) {
         let in_tree = crate::code_graph::in_tree_code_graph_dir(root);
         let live = if code_graph_db.is_empty() {
-            "the live graph lives under the daemon state home".to_string()
+            format!(
+                "no live graph path resolves yet — see the `{FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE}` \
+                 finding; once one does it will be under the daemon state home"
+            )
         } else {
             format!("the live graph is {code_graph_db}")
         };
@@ -1367,6 +1370,19 @@ mod tests {
     /// A git repo with one commit at a scratch path. Identity and signing are set locally because
     /// `commit` fails without the first and can hang on the second, and neither is what these are
     /// about. Named per-process AND per-thread so concurrent test binaries never collide.
+    /// A fresh scratch STATE HOME for a test daemon — a sibling of the test's checkout under the
+    /// temp dir, never inside it (a repo graph must never resolve into the working tree).
+    fn scratch_state_home(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wc-state-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn git_repo(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
             "wicked-wt-{name}-{}-{:?}",
@@ -1404,11 +1420,13 @@ mod tests {
             .read()
             .unwrap_or_else(|p| p.into_inner());
         let root = git_repo("cov009");
-        // The daemon store sits in a scratch state home; bind THIS thread to it so the repo graph
-        // resolves under `<scratch>/repo-graphs` — hermetic, nothing lands in a real home — and the
-        // reader below binds the same home from the same path.
-        let daemon_path = root.join("state").join("daemon-store.db");
-        std::fs::create_dir_all(daemon_path.parent().unwrap()).unwrap();
+        // The daemon store sits in a scratch state home — a SIBLING of the checkout, never inside
+        // it (the whole point is that the graph is not in the working tree; on Linux, where the
+        // temp dir is not a symlink, a state home under `root` would put it there). Bind THIS
+        // thread to it so the repo graph resolves under `<scratch>/repo-graphs` — hermetic, nothing
+        // lands in a real home — and the reader below binds the same home from the same path.
+        let state_home = scratch_state_home("cov009");
+        let daemon_path = state_home.join("daemon-store.db");
         let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
         // The repo's OWN code graph: 3 arbitrary nodes (total counts all kinds, so plain nodes work).
         let cg_path = code_graph_db(root.to_str().unwrap());
@@ -1457,6 +1475,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state_home);
     }
 
     /// #122 web surface: `graph_kinds_for_repo` summarises a repo's OWN graph (node counts by kind),
@@ -1470,8 +1489,8 @@ mod tests {
             .read()
             .unwrap_or_else(|p| p.into_inner());
         let root = git_repo("kinds122");
-        let daemon_path = root.join("state").join("daemon-store.db");
-        std::fs::create_dir_all(daemon_path.parent().unwrap()).unwrap();
+        let state_home = scratch_state_home("kinds122");
+        let daemon_path = state_home.join("daemon-store.db");
         let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
         let cg_path = code_graph_db(root.to_str().unwrap());
         assert!(
@@ -1519,6 +1538,7 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state_home);
     }
 
     /// core#214. `register_repo` must persist an ABSOLUTE, normalised root — never the caller's

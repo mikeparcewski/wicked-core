@@ -12,7 +12,7 @@ static INDEX_GUARD: Mutex<()> = Mutex::new(());
 /// the graph under `$WICKED_ESTATE_REPO_GRAPH_ROOT` — without the override, and with no daemon state
 /// home bound on this thread, that is the developer's REAL default state home
 /// (`~/.wicked-crew/repo-graphs`). Call only under INDEX_GUARD.
-fn point_estate_home_at_scratch() {
+fn point_repo_graph_root_at_scratch() {
     std::env::set_var(
         "WICKED_ESTATE_REPO_GRAPH_ROOT",
         std::env::temp_dir().join(format!("wicked-core-p11-estate-{}", std::process::id())),
@@ -41,7 +41,7 @@ fn recon_indexes_and_ranks_a_real_codebase() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
-    point_estate_home_at_scratch();
+    point_repo_graph_root_at_scratch();
 
     // Index this crate's OWN src as a small real Rust codebase.
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -79,7 +79,7 @@ fn browse_and_node_detail_on_a_real_graph() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
-    point_estate_home_at_scratch();
+    point_repo_graph_root_at_scratch();
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let _ = wicked_core::recon_repo(&src, 5).expect("recon indexes the graph");
     // The graph THE RESOLVER placed — never a re-derived spelling (this line used to pin the

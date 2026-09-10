@@ -939,7 +939,11 @@ mod tests {
         }
         let state_home = scratch("root-for-store");
         let db = state_home.join("core.db");
-        let canonical = std::fs::canonicalize(&state_home).unwrap();
+        // Spelled the way `operational_home_of_db` spells it: canonical, with Windows' `\\?\`
+        // verbatim prefix stripped (`simplify_verbatim`) — a raw `canonicalize` keeps the prefix
+        // and is unequal to the engine's answer on Windows.
+        let canonical =
+            crate::skills_snapshot::simplify_verbatim(std::fs::canonicalize(&state_home).unwrap());
         assert_eq!(
             repo_graph_root_for_store(db.to_str().unwrap()),
             Some(canonical.join("repo-graphs"))
