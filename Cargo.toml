@@ -68,7 +68,11 @@ sha2 = "0.10"
 # (a SEPARATE db from the estate store) so core can emit/poll `wicked.*` events the JS bus reads.
 # Pinned to estate's `0.32` + `bundled` so cargo unifies one libsqlite3-sys and it builds with no
 # system sqlite (cross-platform: macOS/Linux/Windows).
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `backup`: the online-backup API (`sqlite3_backup_*`) the one-time repo-graph migration uses
+# (`code_graph::migrate_legacy_repo_graphs`, core#406) — a page-consistent copy of a WAL-mode
+# database even while another connection holds it open, which a plain file copy of `estate.db` +
+# `-wal` + `-shm` is not.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # PTY terminal sessions (DES-TERMINAL-001): cross-platform pseudo-terminal (unix + Windows ConPTY).
 # The mechanism is lifted from the retiring egui studio's `portable-pty` usage, minus the egui/vt100
 # coupling — core streams RAW bytes as events; screen emulation (vt100) is a UI concern, not core's.

@@ -8,9 +8,10 @@ use std::sync::Mutex;
 /// concurrently. The guard also serializes the env setup below.
 static INDEX_GUARD: Mutex<()> = Mutex::new(());
 
-/// Point the estate home at a per-process scratch (estate-home ADR, `code_graph.rs`): recon on a
-/// repo with no in-tree graph writes into `$WICKED_ESTATE_REPO_GRAPH_ROOT` — without the override,
-/// that is the developer's REAL `~/.wicked-estate/repo-graphs`. Call only under INDEX_GUARD.
+/// Point the repo-graph root at a per-process scratch (`code_graph.rs` ADR, core#406): recon writes
+/// the graph under `$WICKED_ESTATE_REPO_GRAPH_ROOT` — without the override, and with no daemon state
+/// home bound on this thread, that is the developer's REAL default state home
+/// (`~/.wicked-crew/repo-graphs`). Call only under INDEX_GUARD.
 fn point_estate_home_at_scratch() {
     std::env::set_var(
         "WICKED_ESTATE_REPO_GRAPH_ROOT",

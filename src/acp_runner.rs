@@ -1616,9 +1616,9 @@ fn remove_entry_no_follow(p: &std::path::Path) -> anyhow::Result<()> {
 /// <path>` plus the gate-hook's env vars; the env vars arrived, the flag did not (the bridge does
 /// not parse it), so the hook had everything it needed except the instruction to run. Governed units
 /// take the wrapped path now — see the fail-closed return in `run_unit_streaming` and FINDING-060.
-/// `code_graph_db` is the run's repo-local estate graph (engine-resolved: legacy
-/// `<repo>/.codegraph/estate.db`, or the estate home's `<estate_root>/<key>/estate.db` — see
-/// `code_graph.rs`), or `None` for an ungoverned / repo-less session. When present, the worker's `session/new` advertises the
+/// `code_graph_db` is the run's repo-local estate graph (engine-resolved:
+/// `<state home>/repo-graphs/<key>/estate.db`, never inside the checkout — see `code_graph.rs`,
+/// core#406), or `None` for an ungoverned / repo-less session. When present, the worker's `session/new` advertises the
 /// estate MCP server scoped to that store (FINDING-122) — the ACP-array twin of the wrapped path's
 /// `settings.json` injection. `None` ⇒ no estate server (never the daemon store; see FINDING-067).
 /// Bounded budget for the spawn-time version-pin probe (`AcpConfig::verified_version`,
@@ -1981,7 +1981,9 @@ fn start_acp_process_with_write_roots(
         None => true,
         Some(expected) => resolved_binary_version_matches(&config.binary, expected),
     };
-    let graph_write = crate::execute_wrapped::graph_write_dir(code_graph_db);
+    // The graph's key dir is recognised against THIS daemon's repo-graph root — derived from the
+    // same state home the fence is built from (core#406).
+    let graph_write = crate::execute_wrapped::graph_write_dir(code_graph_db, operational_home);
     let worker_write_roots = crate::execute_wrapped::armed_write_root_paths(
         cwd,
         extra_write_roots,
@@ -4847,13 +4849,15 @@ impl AcpStepRunner {
                 let boundary = crate::gate_hook::BoundaryCtx {
                     roots: crate::path_policy::AllowedRoots {
                         // WRITE mirrors the wrapped carrier's `armed_write_roots`: cwd, the
-                        // launch-validated extras, and — for an ESTATE-HOME graph only — that
-                        // graph's own key dir (WAL/journal; `graph_write_dir` is engine-resolved
-                        // and per-key precise, `None` for legacy in-tree graphs).
+                        // launch-validated extras, and that graph's own key dir under THIS
+                        // daemon's repo-graph root (WAL/journal; `graph_write_dir` is
+                        // engine-resolved and per-key precise — `None` for anything not in that
+                        // shape, an in-tree path included; core#406).
                         write: std::iter::once(unit_cwd.clone())
                             .chain(g.extra_write_roots.iter().map(std::path::PathBuf::from))
                             .chain(crate::execute_wrapped::graph_write_dir(
                                 g.code_graph_db.as_deref(),
+                                self.operational_home.as_deref(),
                             ))
                             .collect(),
                         // READ = the shared assembly: evidence-derived roots + the
@@ -4862,6 +4866,7 @@ impl AcpStepRunner {
                         // touches the write list above.
                         read: crate::execute_wrapped::assemble_read_roots(
                             g.code_graph_db.as_deref(),
+                            self.operational_home.as_deref(),
                             &g.extra_read_roots,
                             handed.map(|s| s.root.as_path()),
                         ),
@@ -5160,6 +5165,7 @@ impl AcpStepRunner {
             {
                 boundary.roots.read = crate::execute_wrapped::assemble_read_roots(
                     g.code_graph_db.as_deref(),
+                    self.operational_home.as_deref(),
                     &g.extra_read_roots,
                     bound.as_ref().map(|s| s.root.as_path()),
                 );

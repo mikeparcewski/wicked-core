@@ -744,6 +744,12 @@ pub(crate) fn run(
     // Arm the governance store path for in-process governed dispatch (DES-OUTGOV-003 §4). The store now
     // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
     GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));
+    // Bind this thread's repo-graph resolver to THIS store's state home (core#406, `code_graph.rs`
+    // ADR): every `RepoEntry` this actor reads or writes derives its `code_graph_db` under
+    // `<canonical parent of --db>/repo-graphs`, so `--db` relocates the graphs with the rest of
+    // the daemon's durable state and two daemons on one host never share a graph directory. Held
+    // for the actor's lifetime — the same `GOV_DB_PATH` idiom, one line up.
+    let _repo_graph_state_home = crate::code_graph::StateHomeScope::for_store(&path);
 
     // Seed the deterministic floor the built-in Evaluator phases pin (FINDING-025 item 1).
     //
@@ -872,13 +878,28 @@ pub(crate) fn run(
     // leaked them — the exact failure DES R1 forbids). Holds its own `pty_map` clone.
     let _pty_reaper = terminal::PtyReaper::new(pty_map.clone());
 
+    let boot_repos = crate::repo::list_repos(&store);
+    // One-time repo-graph migration (core#406, `code_graph.rs` ADR): a registered repo whose graph
+    // sits under the pre-#406 estate home (`~/.wicked-estate/repo-graphs/<key>`) and nowhere under
+    // this daemon's root is copied — page-consistent, through SQLite's backup API — and logged once
+    // per repo; the source is left in place for the operator to remove. A boot with nothing to
+    // migrate (every boot after the first) is silent and costs one `stat` per registered repo.
+    if let Ok(repos) = &boot_repos {
+        for outcome in crate::code_graph::migrate_legacy_repo_graphs(
+            repos
+                .iter()
+                .map(|r| (r.id.as_str(), std::path::Path::new(&r.root_path))),
+        ) {
+            eprintln!("{}", outcome.notice());
+        }
+    }
     // Startup orphan reaper (FINDING-003): worktrees of runs in a TERMINAL status are reaped when
     // clean (the same rule the terminal-status reap applies — so a crash between a run finishing
     // and its reap, or a run predating the reap, converges here instead of surviving restarts);
     // worktrees of LIVE runs are kept (resume); worktrees whose run id the store has never heard
     // of are force-removed. A sessions read failure SKIPS the reap: with liveness unknown, any
     // removal could take a resumable run's checkout, and leaking for one boot is the cheaper error.
-    if let Ok(repos) = crate::repo::list_repos(&store) {
+    if let Ok(repos) = boot_repos {
         if !repos.is_empty() {
             match crate::domain::all_sessions(&store) {
                 Ok(sessions) => {
@@ -9539,6 +9560,7 @@ mod worker_code_graph_tests {
             default_branch: "main".into(),
             registered_at: 0,
             code_graph_db: String::new(), // derived on read; the value written here is irrelevant
+            findings: Vec::new(),
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
@@ -9716,48 +9738,56 @@ mod worker_code_graph_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An indexed repo yields the graph the indexer wrote UNDER THE REPO-GRAPH ROOT — and a stale
+    /// `.codegraph/estate.db` sitting in the same checkout is not what the worker gets (core#406:
+    /// an in-tree graph is never adopted, so the decoy must not even be looked at).
     #[test]
-    fn an_indexed_repo_gets_the_graph_the_indexer_wrote() {
-        let mut store = open_store(Some(":memory:")).unwrap();
+    fn an_indexed_repo_gets_the_graph_the_indexer_wrote_under_the_root() {
         let root = scratch("indexed");
-        let graph = root.join(crate::code_graph::code_graph_rel());
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&scratch("indexed-root"));
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         std::fs::write(&graph, b"not really sqlite, but it is a file").unwrap();
+        let decoy = root.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        std::fs::write(&decoy, b"indexed in-tree by an older engine").unwrap();
         register(&mut store, "indexed", &root);
 
         assert_eq!(
             repo_code_graph_db(&store, Some("indexed")).as_deref(),
             Some(graph.to_string_lossy().as_ref()),
-            "the worker must get the path crew's onboarding indexed to, not a sibling"
+            "the worker must get the graph under the root — never the in-tree decoy, never a sibling"
         );
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(pin.root.parent().unwrap());
     }
 
-    /// The OTHER home (estate-home ADR, code_graph.rs): a repo with NO in-tree graph whose graph
-    /// the indexer wrote into the estate home resolves to exactly that file — and nothing was ever
-    /// minted in the working tree. Runs under the env override (write lock) so the estate home is
-    /// a scratch dir, never the developer's real one.
+    /// The env override end to end (code_graph.rs ADR, precedence 1): a repo whose graph the
+    /// indexer wrote under the override root resolves to exactly that file — and nothing was ever
+    /// minted in the working tree. Runs under the write lock so the root is a scratch dir, never
+    /// the developer's real one.
     #[test]
-    fn an_estate_home_graph_resolves_for_a_repo_with_no_in_tree_graph() {
+    fn an_override_root_graph_resolves_for_a_repo_with_no_in_tree_graph() {
         let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var_os(crate::code_graph::REPO_GRAPH_ROOT_ENV);
-        let estate_root = scratch("estate-home-root");
-        std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, &estate_root);
+        let override_root = scratch("override-root");
+        std::env::set_var(crate::code_graph::REPO_GRAPH_ROOT_ENV, &override_root);
 
         let mut store = open_store(Some(":memory:")).unwrap();
-        let root = scratch("estate-home-repo");
-        let graph = crate::code_graph::estate_home_graph_db_at(&estate_root, &root);
+        let root = scratch("override-repo");
+        let graph = crate::code_graph::repo_graph_db_at(&override_root, &root);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
-        std::fs::write(&graph, b"indexed into the estate home").unwrap();
-        register(&mut store, "estate-home", &root);
+        std::fs::write(&graph, b"indexed under the override root").unwrap();
+        register(&mut store, "override", &root);
 
         assert_eq!(
-            repo_code_graph_db(&store, Some("estate-home")).as_deref(),
+            repo_code_graph_db(&store, Some("override")).as_deref(),
             Some(graph.to_string_lossy().as_ref()),
-            "the worker must get the estate-home graph the indexer wrote"
+            "the worker must get the graph the indexer wrote under the override root"
         );
         assert!(
             !root
@@ -9773,22 +9803,24 @@ mod worker_code_graph_tests {
             None => std::env::remove_var(crate::code_graph::REPO_GRAPH_ROOT_ENV),
         }
         let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&estate_root);
+        let _ = std::fs::remove_dir_all(&override_root);
     }
 
     /// A directory at the graph's path is not a graph. `is_file` rather than `exists` because
-    /// `.codegraph/estate.db/` is precisely what a half-finished index or a bad `--db` argument
-    /// leaves behind, and handing that to a store opener fails deep inside sqlite rather than here.
+    /// `<key>/estate.db/` is precisely what a half-finished index or a bad `--db` argument leaves
+    /// behind, and handing that to a store opener fails deep inside sqlite rather than here.
     #[test]
     fn a_directory_where_the_graph_should_be_is_not_a_graph() {
-        let mut store = open_store(Some(":memory:")).unwrap();
         let root = scratch("dir-not-file");
-        std::fs::create_dir_all(root.join(crate::code_graph::code_graph_rel())).unwrap();
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&scratch("dir-not-file-root"));
+        let mut store = open_store(Some(":memory:")).unwrap();
+        std::fs::create_dir_all(crate::code_graph::repo_graph_db_at(&pin.root, &root)).unwrap();
         register(&mut store, "dir-not-file", &root);
 
         assert_eq!(repo_code_graph_db(&store, Some("dir-not-file")), None);
 
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(pin.root.parent().unwrap());
     }
 
     #[test]
@@ -9827,6 +9859,7 @@ mod project_graph_binding_tests {
             default_branch: "main".into(),
             registered_at: 0,
             code_graph_db: String::new(),
+            findings: Vec::new(),
         };
         crate::domain::put_node(store, entry.to_node()).unwrap();
         assert_eq!(entry.to_node().kind, NodeKind::Other(REPO_ENTRY.into()));
@@ -10336,9 +10369,10 @@ mod project_graph_binding_tests {
     #[test]
     fn an_unbound_run_falls_through_to_the_per_repo_graph() {
         let dir = scratch("fallthrough");
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = root.join(crate::code_graph::code_graph_rel());
+        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         std::fs::write(&repo_graph, b"a file is all this arm checks for").unwrap();
         register(&mut store, "wicked-core", &root);
@@ -10368,9 +10402,10 @@ mod project_graph_binding_tests {
     #[test]
     fn the_project_graph_wins_over_a_perfectly_good_per_repo_graph() {
         let dir = scratch("precedence");
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = root.join(crate::code_graph::code_graph_rel());
+        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         graph_with(&repo_graph, &["wicked-core"]);
         register(&mut store, "wicked-core", &root);
@@ -10404,9 +10439,10 @@ mod project_graph_binding_tests {
     #[test]
     fn a_refused_binding_falls_back_to_the_runs_own_repo_graph() {
         let dir = scratch("fallback");
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = root.join(crate::code_graph::code_graph_rel());
+        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         std::fs::write(&repo_graph, b"the run repo's own graph").unwrap();
         register(&mut store, "wicked-core", &root);
@@ -10885,20 +10921,22 @@ mod coverage_store_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The resolver points at the REPO-LOCAL graph. `existing_code_graph` is what
-    /// `repo_code_graph_db` uses once it has the repo, so this pins the half that decides WHICH
-    /// database the criterion is evaluated against.
+    /// The resolver points at the REPO's OWN graph under the repo-graph root. `existing_code_graph`
+    /// is what `repo_code_graph_db` uses once it has the repo, so this pins the half that decides
+    /// WHICH database the criterion is evaluated against.
     #[test]
-    fn the_repo_local_graph_is_what_resolves() {
+    fn the_repo_graph_under_the_root_is_what_resolves() {
         let dir = std::env::temp_dir().join(format!("cov_repo_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let want = dir.join(crate::code_graph::code_graph_rel());
+        std::fs::create_dir_all(&dir).unwrap();
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&dir.join("state"));
+        let want = crate::code_graph::repo_graph_db_at(&pin.root, &dir);
         std::fs::create_dir_all(want.parent().unwrap()).unwrap();
         std::fs::write(&want, b"x").unwrap();
         let got = crate::code_graph::existing_code_graph(&dir)
-            .expect("a repo root with .codegraph/estate.db must resolve one");
+            .expect("an indexed repo must resolve its graph under the root");
 
-        // EXACT path, not a substring. `contains(".codegraph")` would also pass if the resolver
+        // EXACT path, not a substring. A `contains("estate.db")` would also pass if the resolver
         // returned the DIRECTORY, or any other file under it — neither of which
         // `wicked-core coverage` can open. Flagged in review: a guard that accepts a near-miss
         // is not a guard.
