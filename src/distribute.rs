@@ -295,6 +295,12 @@ fn seat_candidates(
     let Some(snapshot) = snapshot else {
         return Ok(units.iter().map(|_| None).collect());
     };
+    // The eligible claude seats depend on the roster alone, never on the unit, so they are judged
+    // ONCE per call: the first Claude-only unit resolves every seat on both carriers (each a read
+    // of the merged registry) and every later one reuses that verdict — not once per unit per
+    // seat, so a `clis.toml` that changes under one distribution cannot hand two of its units two
+    // different rosters (Copilot, #402 review pass 4).
+    let mut eligible_claude: Option<Vec<AgenticCli>> = None;
     units
         .iter()
         .map(|u| {
@@ -304,11 +310,14 @@ fn seat_candidates(
             match crate::skills_snapshot::seat_requirement(snapshot, u.skill_ref.as_deref()) {
                 SeatRequirement::Any => Ok(None),
                 SeatRequirement::ClaudeOnly { skills, why } => {
-                    let eligible: Vec<AgenticCli> = clis
-                        .iter()
-                        .filter(|c| seat_is_claude(clis, &c.key))
-                        .cloned()
-                        .collect();
+                    let eligible = eligible_claude
+                        .get_or_insert_with(|| {
+                            clis.iter()
+                                .filter(|c| seat_is_claude(clis, &c.key))
+                                .cloned()
+                                .collect()
+                        })
+                        .clone();
                     if eligible.is_empty() {
                         return Err(SkillsError::NoEligibleSeat {
                             ord: u.ord,
