@@ -345,6 +345,16 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.17** — npm release carrying the three engine changes since 0.7.16: the skills
+  snapshot engine (#399 — one skills input, `WICKED_SKILLS_SNAPSHOT`, handed to both carriers —
+  ACP `plugins` handshake bound to the cached session / wrapped `--plugin-dir` — joined to the
+  READ roots, the explicit state-home Read fence with its static registry, and the degradation
+  ladder); seat routing honours skill portability (#402 — candidate seats narrowed before the
+  council votes, `NoEligibleSeat` refused at plan time, `UnitDistributed` gains the additive typed
+  `seatConstraint` mirrored as `UnitDistributedEventJson` in `index.d.ts`); and the evals lane's
+  operator-authored `effect` + `EvalReport.rule_coverage` (#398, additive wire shape). Dependency
+  note: the engine now pulls `serde_yaml` 0.9.34 (deprecated upstream; the `+deprecated` lockfile
+  pin) for the skills-manifest parse — a known, accepted residual until the parser migrates.
 - **core-ts 0.7.16** — run-provenance env: wicked-core stamps `WICKED_RUN_ID`, `WICKED_RUN_UNIT`, and `WICKED_RUN_AGENT` into the worker's estate-mcp launch env (both carriers) so proposal.submit (DES-MEM-FACETED-001) attributes proposals to the run/unit/agent.
 - **core-ts 0.7.15** — npm release carrying DES-GROUNDING-001 + gov-008 Boundary 1: governed workers
   now ground in the wicked-estate index — the estate MCP is loaded via `--mcp-config` (not the inert
