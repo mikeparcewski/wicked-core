@@ -10744,10 +10744,17 @@ transport = "stdio"
                 .expect_err("hard link to the operational store");
             assert!(err.contains("FINDING-067"), "{err}");
         }
-        // The scratch root must be a directory of its own under the system temp dir — never `/`,
-        // the temp dir itself, the state home or a home directory (Copilot, #426).
+        // The scratch root must be a directory of its own under the system temp dir — never the
+        // filesystem root (`/`, or `C:\` on Windows — spelled from the temp dir's own root so the
+        // case is absolute on every platform), the temp dir itself, the state home or a home
+        // directory (Copilot, #426).
+        let fs_root = std::env::temp_dir()
+            .ancestors()
+            .last()
+            .expect("a path has a root")
+            .to_path_buf();
         for bad in [
-            std::path::PathBuf::from("/"),
+            fs_root,
             std::env::temp_dir(),
             state.clone(),
             state.join("chats"),
