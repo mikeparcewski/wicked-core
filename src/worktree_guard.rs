@@ -685,11 +685,20 @@ mod tests {
     fn a_rewrite_of_a_committed_but_ignored_file_is_a_denying_mutation() {
         let wt = creator_worktree("tracked-ignored");
         let repo = repo_of(&wt);
-        // Premise: the rule matches it AND it is tracked.
-        let ignored = run_git(&wt, &["check-ignore", "config/settings.local.json"]);
+        // Premise: the rule matches the path (`--no-index`: a tracked file is never reported as
+        // ignored by the indexed query — exactly why an empty seed lost it) AND it is tracked.
+        let ignored = run_git(
+            &wt,
+            &["check-ignore", "--no-index", "config/settings.local.json"],
+        );
         assert!(
             ignored.contains("settings.local.json"),
             "the ignore rule must match"
+        );
+        let tracked = run_git(&wt, &["ls-files", "config/settings.local.json"]);
+        assert!(
+            tracked.contains("settings.local.json"),
+            "the file is tracked"
         );
         let before = snapshot(&wt, &repo).unwrap();
         let listed = run_git(&wt, &["ls-tree", "-r", "--name-only", &before.tree]);
