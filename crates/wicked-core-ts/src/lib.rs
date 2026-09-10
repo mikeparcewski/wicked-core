@@ -732,9 +732,11 @@ impl Core {
     /// of governance events it could not store — into the estate store at `dbPath`, writing each
     /// record as the EVENT node it should have been with its original `ts` restored
     /// (`wicked_apps_core::emit::replay_outbox`). Opens the store read-write (creating it if
-    /// missing — the caller creates the parent directory). Resolves to the JSON report
-    /// `{ read, replayed, failed: [{ line, reason }] }`; a failed entry carries its ORIGINAL line so
-    /// the caller can keep it dead-lettered. Behind `wicked-crew governance replay`.
+    /// missing — the caller creates the parent directory). IDEMPOTENT: a replayed node's id is the
+    /// spool line's content hash plus its original stamp, so the same line replayed twice lands
+    /// once. Resolves to the JSON report `{ read, replayed, already_present, failed: [{ line,
+    /// reason }] }`; a failed entry carries its ORIGINAL line so the caller can keep it
+    /// dead-lettered. Behind `wicked-crew governance replay`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn replay_emit_outbox(outbox_path: String, db_path: String) -> AsyncTask<CoreTask> {
         task(move || {

@@ -29,9 +29,15 @@ Two release tracks share this file, newest entry first regardless of track:
   reports `governance.records.total` / `sinceBoot`), and `emit::replay_outbox(path, &mut store)` /
   `Core.replayEmitOutbox(outboxPath, dbPath)` (each record lands as the EVENT node it should have
   been, with its ORIGINAL `ts` restored so id order stays chronological, plus `replayed: true`,
-  `deadletter_reason` and `spooled_by` provenance; torn or non-record lines are reported verbatim
-  in `{ read, replayed, failed: [{ line, reason }] }`, never re-spooled and never fatal — behind
-  `wicked-crew governance replay`). No default changes: the spool path resolution and the store
+  `replayed_at_ms`, `deadletter_reason` and `spooled_by` provenance; torn or non-record lines are
+  reported verbatim in `{ read, replayed, already_present, failed: [{ line, reason }] }`, never
+  re-spooled and never fatal — behind `wicked-crew governance replay`). Replay is IDEMPOTENT: a
+  replayed node's id is the spool line's SHA-256 (first 16 hex) plus its original stamp — never the
+  replaying pid or a fresh sequence — so the same line replayed twice (a second run on an archive,
+  a restore-and-retry) lands once and is reported `already_present`; each record is its own
+  autocommit upsert, so a failed record leaves no open batch for the next one to commit into and is
+  repaired by the next replay. The `open shared store failed: …` reason redacts URL userinfo before
+  it reaches stderr or the spool. No default changes: the spool path resolution and the store
   resolution are untouched; crew resolves and exports both variables from its state home.
 - **Evaluator phases cannot mutate the worktree; `verify` runs the repo's own checks as a
   deterministic floor (F-036 / F-039).** The acceptance run's `bug/verify` evaluator (codex,

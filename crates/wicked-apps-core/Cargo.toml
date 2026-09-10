@@ -19,3 +19,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+# Deterministic replay ids for dead-lettered events (`emit::replay_outbox`): the id of a replayed
+# EVENT node is the content hash of its spool line, so replaying the same line twice is a no-op.
+sha2 = "0.10"
