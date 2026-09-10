@@ -768,7 +768,6 @@ pub(crate) fn run_one(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
     use crate::validator::SandboxLevel;
 
     fn scratch(name: &str) -> PathBuf {

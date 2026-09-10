@@ -5280,7 +5280,8 @@ mod tests {
 
     /// A fake CLI whose RESOLVED stem is `name` — an executable shell script at `<dir>/<name>` that
     /// prints its argv. Recognition reads the binary, never the seat key, so the fixtures must be
-    /// spelled the way a real seat is.
+    /// spelled the way a real seat is. Unix-only: the fixture is a shell script.
+    #[cfg(unix)]
     fn fake_cli(dir: &std::path::Path, name: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let p = dir.join(name);
