@@ -148,7 +148,7 @@ fn code_graph_db_and_findings(root_path: &str) -> (String, Vec<RepoFinding>) {
                 code: FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE.to_string(),
                 message: format!(
                     "no repo-graph root resolves for this daemon (no {} override, no state home, \
-                     no HOME): the repo has no code graph until one does",
+                     no HOME / USERPROFILE): the repo has no code graph until one does",
                     crate::code_graph::REPO_GRAPH_ROOT_ENV
                 ),
                 path: None,
