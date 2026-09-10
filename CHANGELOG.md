@@ -36,9 +36,14 @@ Two release tracks share this file, newest entry first regardless of track:
   replaying pid or a fresh sequence — so the same line replayed twice (a second run on an archive,
   a restore-and-retry) lands once and is reported `already_present`; each record is its own
   autocommit upsert, so a failed record leaves no open batch for the next one to commit into and is
-  repaired by the next replay. The `open shared store failed: …` reason redacts URL userinfo before
-  it reaches stderr or the spool. No default changes: the spool path resolution and the store
-  resolution are untouched; crew resolves and exports both variables from its state home.
+  repaired by the next replay. Byte-identical UNSTAMPED lines (pre-stamp dead letters) are
+  content-addressed with no stamp to tell them apart, so they conflate onto one node (the second
+  is `already_present`); stamped lines never conflate unless `ts` and content both match. The
+  `open shared store failed: …` reason redacts URL userinfo before it reaches stderr or the spool —
+  greedily, up to the URL's last `@`, so a raw password containing `/`, `?` or `#` is still
+  redacted — and `replay_outbox` redacts a legacy record's `deadletter_reason` / `spooled_by`
+  before they become store metadata (#428). No default changes: the spool path resolution and the
+  store resolution are untouched; crew resolves and exports both variables from its state home.
 - **Evaluator phases cannot mutate the worktree; `verify` runs the repo's own checks as a
   deterministic floor (F-036 / F-039).** The acceptance run's `bug/verify` evaluator (codex,
   unchecked — governance is claude-only) REWROTE the fix it was reviewing and passed its own gate
