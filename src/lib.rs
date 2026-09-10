@@ -1169,6 +1169,11 @@ impl Core {
     /// ([`CoreEvent::to_json`], the same object `/ws` carries) plus a capture-time `ts` and an
     /// ordering `seq`.
     ///
+    /// `seq` is strictly increasing within a run for the run's whole life, ACROSS daemon restarts
+    /// (core#408): a fresh engine continues a run's `seq` from its persisted log rather than from 0,
+    /// so the tail of this list is the run's latest event. The first entry a restarted engine
+    /// records for a run carries `daemonRestarted: true`; see [`crate::event_log`].
+    ///
     /// This is the read half of FINDING-014. Consumers that need a run's event trail after the fact
     /// (evidence bundles, above all) read it HERE rather than re-deriving pseudo-events from unit
     /// records — a re-derivation cannot recover what it never saw, and invents its own type names
