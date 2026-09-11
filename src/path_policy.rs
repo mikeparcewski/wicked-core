@@ -135,50 +135,33 @@ fn resolve_symlinks(p: &Path) -> PathBuf {
     }
 }
 
-/// [`resolve_symlinks`] for a ROOT DECLARATION (core#410 hardening, reviewer R11): a missing tail
-/// that still carries a `..` segment is REFUSED rather than re-appended lexically. Re-appending is
-/// sound for a plain tail — a not-yet-created leaf under a real directory — but a `..` in it is
-/// resolved by the kernel against the real directory at every consumer, so the path the roots were
-/// judged on is not the path the worker gets (`<repo>/missing/../..` judged as inside the repo,
-/// resolved to its grandparent). [`check`] and [`deliverable_exists`] normalize before resolving,
-/// so their tails never carry one; a declared root is spelled by the caller and is not. (A `.`
-/// segment is invisible to the kernel and to `Path` alike and re-aims nothing.)
-///
-/// The existing ancestor is found by walking the spelling's PREFIXES forward (as
-/// `spawn::refuse_symlinked_home` does), never by asking the filesystem about the whole path and
-/// backing off: Windows' path layer normalizes `..` lexically BEFORE any lookup, so
-/// `canonicalize("<repo>\missing\..\..")` succeeds on the grandparent there while failing on unix —
-/// the prefix walk stops at `<repo>\missing` on every platform and judges the same tail.
+/// [`resolve_symlinks`] for a ROOT DECLARATION (core#410 hardening, reviewer R11): a spelling with
+/// a `.` or `..` component is REFUSED before any filesystem call — the rule `validate_chat_scope`
+/// applies to a chat's paths — and only a spelled-clean root goes through the symlink walk. A `..`
+/// beyond the existing ancestors, re-appended lexically, would be resolved by the kernel against the
+/// real directory at every consumer (`<repo>/missing/../..` judged as inside the repo, resolved to
+/// its grandparent); and no filesystem probe judges it the same way on every OS — Windows' path
+/// layer collapses `..` BEFORE any lookup, so `<repo>\missing\..\..` "exists" as the grandparent
+/// there. Spelling is the one platform-uniform test. [`check`] and [`deliverable_exists`] normalize
+/// before resolving and are unchanged; a declared root is spelled by the caller.
 fn resolve_symlinks_for_root(p: &Path) -> Result<PathBuf, String> {
-    if missing_tail(p).any(|c| matches!(c, Component::ParentDir)) {
-        return Err(format!(
-            "{} has a `..` segment beyond its existing ancestors and cannot be resolved safely; \
-             spell the root plainly",
-            p.display()
-        ));
-    }
+    refuse_dot_components(p)?;
     Ok(resolve_symlinks(p))
 }
 
-/// The components of `p` BELOW its longest existing prefix — the tail nothing on disk answers for.
-/// Prefixes are probed one component at a time with `metadata` (following links, as every consumer
-/// will): a `..` INSIDE the existing part is the kernel's to resolve and is judged on the real
-/// target; a `..` in the returned tail has nothing real to resolve against.
-pub(crate) fn missing_tail(p: &Path) -> impl Iterator<Item = Component<'_>> {
-    let mut probe = PathBuf::new();
-    let mut exists = true;
-    p.components().filter(move |component| {
-        if !exists {
-            return true;
-        }
-        probe.push(component.as_os_str());
-        // A bare Windows drive prefix (`C:`) is not a filesystem entry — stat'ed with the root.
-        if matches!(component, Component::Prefix(_)) {
-            return false;
-        }
-        exists = std::fs::metadata(&probe).is_ok();
-        !exists
-    })
+/// The spelling rule shared by the root resolver and `acp_runner::canonical_ish`: any `..` (or a
+/// leading `.`, the only place `Path::components()` keeps one) component refuses the path.
+pub(crate) fn refuse_dot_components(p: &Path) -> Result<(), String> {
+    if p.components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!(
+            "{} has a `.`/`..` segment and cannot be resolved safely on every platform; spell the \
+             root plainly",
+            p.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Is `path` inside the unit's boundary?
@@ -632,10 +615,10 @@ mod tests {
         assert!(e.contains("carrier"), "names the failure: {e}");
     }
 
-    /// core#410 hardening (reviewer R11): a root whose MISSING tail still carries `..` is refused
-    /// on both mirrors — never re-appended lexically and judged as if it sat where it was spelled.
-    /// A plain missing leaf (a directory the run will create) still resolves and is admitted; a
-    /// `..` under an EXISTING path is resolved by the kernel and judged on the real target.
+    /// core#410 hardening (reviewer R11): a root spelled with `..` is refused on both mirrors BY
+    /// SPELLING — never re-appended lexically and judged as if it sat where it was spelled, and
+    /// never left to a filesystem probe that Windows' path layer answers differently. A plain
+    /// missing leaf (a directory the run will create) still resolves and is admitted.
     #[test]
     fn a_root_with_dot_segments_beyond_its_existing_ancestors_is_refused_not_re_appended() {
         let home = scratch("xrr_dots_home");
@@ -666,16 +649,23 @@ mod tests {
         let leaf = repo.join("not-yet").join("created");
         validate_extra_read_roots(&[leaf.to_string_lossy().into_owned()], Some(&home))
             .expect("a plain missing leaf is admitted");
-        // `..` under an existing path is resolved by the kernel: `<repo>/sub/..` is the repo.
+        // A `..` under an EXISTING path is refused just the same — the rule is spelling, so it
+        // holds identically on every OS (Windows collapses `<repo>\sub\..` before any lookup).
         let real_dots = repo.join("sub").join("..");
-        validate_extra_read_roots(&[real_dots.to_string_lossy().into_owned()], Some(&home))
-            .expect("an existing path resolves through its `..`");
-        // …and is judged on the REAL target: `<home>/x/..` is the home, which contains the pin tree.
-        std::fs::create_dir_all(home.join("x")).unwrap();
-        let into_home = home.join("x").join("..");
-        let e = validate_extra_read_roots(&[into_home.to_string_lossy().into_owned()], Some(&home))
-            .expect_err("resolved into the home: refused as containing the pin tree");
-        assert!(e.contains("FINDING-098"), "{e}");
+        let e = validate_extra_read_roots(&[real_dots.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("a `..` is refused by spelling even under existing directories");
+        assert!(e.contains("`..`") && e.contains("refused"), "{e}");
+        // A spelled-clean root that RESOLVES into the home is still judged on the real target.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir_all(home.join("x")).unwrap();
+            let via_link = repo.join("to-home");
+            std::os::unix::fs::symlink(&home, &via_link).unwrap();
+            let e =
+                validate_extra_read_roots(&[via_link.to_string_lossy().into_owned()], Some(&home))
+                    .expect_err("resolved into the home: refused as containing the pin tree");
+            assert!(e.contains("FINDING-098"), "{e}");
+        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&repo);
     }
