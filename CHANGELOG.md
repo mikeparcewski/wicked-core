@@ -87,18 +87,23 @@ Two release tracks share this file, newest entry first regardless of track:
   shape crew's `views/copilot` takes), COPIES (codex forbids symlinks; the read-only bit is cleared
   so a later generation can remove them on Windows too), a skill's OWN files with any indexed
   skill nested below it excluded (it lands under its own name), and a `.wicked-skills-gen` marker
-  (`pending` during the copy, `done` after) keyed by generation + content hash so an unchanged
-  generation is a no-op, a new one removes exactly the entries the previous one wrote, an
-  interrupted one is repaired, and nothing else under `CODEX_HOME` — never the operator's own
-  `~/.codex` — is touched (an entry no marker lists is never replaced; refused by path). Both
-  carriers populate BEFORE the seat spawns and before `skillsSnapshotHanded {path: "wrapped_cli"
-  | "acp", cli: codex}` is emitted, through the one seat-config resolver; a failure refuses the
-  launch (`SkillsError::SeatHome`), never a launch without the skills its directive names. The
-  lever is carrier-independent (codex behind `codex-acp` is judged as codex, like pi behind
-  `pi-acp`); under the inherit-operator-config hatch there is no minted home, so admission refuses
-  a skill-bearing codex unit `NoLever` naming the hatch. Admission's portability and
-  parent-nesting rules apply to codex exactly as to pi; `NONPORTABLE_SEAT` and the views are
-  unchanged.
+  keyed by generation + content hash so an unchanged generation is a no-op and a new one replaces
+  exactly the entries the previous one wrote; nothing else under `CODEX_HOME` — never the
+  operator's own `~/.codex` — is touched (an entry no marker lists is carried across unchanged; one
+  that collides with a skill's name refuses by path). Populations of one seat home are SERIALIZED
+  by an exclusive OS file lock (`<CODEX_HOME>/.wicked-skills.lock`) — every unit of every run on a
+  daemon shares the one `<worker>/codex`, and units run on parallel threads — and every generation
+  is built COMPLETE in a uniquely named sibling directory and swapped into place by rename, so a
+  seat never spawns against a half-built tree, a waiter re-checks the marker under the lock, and
+  crash debris is swept on the next population. Both carriers populate BEFORE the seat spawns and
+  before `skillsSnapshotHanded {path: "wrapped_cli" | "acp", cli: codex}` is emitted, through the
+  one seat-config resolver; a failure refuses the launch (`SkillsError::SeatHome`), never a launch
+  without the skills its directive names. The lever is carrier-independent (codex behind
+  `codex-acp` is judged as codex, like pi behind `pi-acp`). Under the inherit-operator-config
+  hatch there is no minted home, so codex is handed NOTHING: a skill-bearing codex unit is refused
+  `NoLever` naming the hatch, a skill-less one runs exactly as before (no population, no
+  handoff). Admission's portability and parent-nesting rules apply to codex exactly as to pi;
+  `NONPORTABLE_SEAT` and the views are unchanged.
 - **Seats are handed the garden launcher root, and the ACP skills lever is judged from the SEAT
   binary (acceptance finding F-079, core#441).** Every seat that receives a skills delivery — pi,
   copilot, opencode, claude, on both carriers — now also gets `WICKED_GARDEN_ROOT=<pinned snapshot
@@ -110,7 +115,10 @@ Two release tracks share this file, newest entry first regardless of track:
   `Absent` — handed nothing, told its skill was "NOT loaded in this session", and the rig's pi unit
   emitted no `skillsSnapshotHanded`), and the bridge is handed the deliverable portable skill
   directories as `WICKED_PI_SKILL_DIRS` (one OS path-list — `:` / `;` — in `--skill` order; the
-  crew-side bridge, wicked-crew#531, turns it into `--no-skills --skill …`), with
+  crew-side bridge, wicked-crew#531, turns it into `--no-skills --skill …`; the variable being
+  SET is the delivery — an EMPTY value is a delivery of zero portable skills and means
+  `--no-skills` alone, exactly what the wrapped carrier spells, so discovery is off on both
+  carriers; UNSET means no delivery), with
   `skillsSnapshotHanded {path: "acp", cli: <seat key>}` emitted once per spawn; a skill-bearing pi
   unit over ACP is no longer refused `NoLever`. An argv-only lever (copilot's `--add-dir`) still
   needs the carrier to BE the CLI. A skill directory that cannot be spelled in the path-list

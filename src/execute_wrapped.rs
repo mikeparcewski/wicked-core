@@ -9405,6 +9405,146 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// F-079 review (core#441): under the inherit-operator-config hatch no seat home is minted,
+    /// so codex has NO lever — and that must not regress a codex unit that names no skill. Pinned
+    /// ON here (the hatch-setting precedent: `ENV_LOCK.write()` + a scoped `VarGuard`): a
+    /// skill-LESS codex unit runs `Ok` with nothing delivered — no delivery flag, no
+    /// `WICKED_GARDEN_ROOT`, no engine-set `CODEX_HOME`, and no `skills/` populated anywhere (not
+    /// under the operator's `~/.codex`, not under the worker home); a skill-BEARING codex unit is
+    /// refused `NoLever` naming the hatch, never launched. Off the hatch the same skill-less unit
+    /// still gets its minted home populated (the lever is intact).
+    #[cfg(unix)]
+    #[test]
+    fn under_the_inherit_hatch_a_skill_less_codex_unit_runs_and_a_skill_bearing_one_is_refused() {
+        use crate::skills_snapshot::test_support::{scratch, snapshot_root_with};
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = scratch("codex-hatch-home");
+        let _home = HomeGuard::pin(&home);
+        let worker_home = home.join("worker");
+        let _worker = VarGuard::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker_home);
+        // The daemon's own CODEX_HOME must not leak in and confuse "engine-set" with "inherited".
+        let _no_codex_home = VarGuard::unset(wicked_apps_core::spawn::CODEX_HOME_ENV);
+        let snapshot = snapshot_root_with(
+            &crate::skills_snapshot::test_support::gen_dir(&home.join(".wicked-crew"), "6"),
+            "6",
+            &[("domain", "wicked-garden-domain", true, &[])],
+        );
+        let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let launch = |skill: Option<&str>, tag: &str| -> (StepOutput, Option<Vec<String>>) {
+            let argv_file = wt.join(format!("argv-codex-{tag}.txt"));
+            let _ = std::fs::remove_file(&argv_file);
+            let bin = fake_recorder(&home.join("bin"), "codex", &argv_file);
+            let mut u = WorkUnit::pending(format!("h:{tag}"), "h", 1, "extract the rules");
+            u.assigned_cli = Some("codex".to_string());
+            u.skill_ref = skill.map(str::to_string);
+            u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
+            let input = StepInput {
+                run_id: format!("run-hatch-{tag}"),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-h".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            let argv = std::fs::read_to_string(&argv_file)
+                .ok()
+                .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>());
+            (out, argv)
+        };
+        let env_of = |argv: &[String], var: &str| -> String {
+            let prefix = format!("ENV {var}=");
+            argv.iter()
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("the recorder writes the {var} env line"))
+                .to_string()
+        };
+        let populated_anywhere = || -> Vec<std::path::PathBuf> {
+            [
+                home.join(".codex").join("skills"),
+                worker_home.join("codex").join("skills"),
+            ]
+            .into_iter()
+            .filter(|p| std::fs::symlink_metadata(p).is_ok())
+            .collect()
+        };
+        {
+            let _hatch = VarGuard::set(INHERIT_OPERATOR_CONFIG_ENV, std::path::Path::new("1"));
+            // Skill-less: runs, nothing delivered, nothing populated, nothing minted.
+            let (out, argv) = launch(None, "hatch-plain");
+            assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+            let argv = argv.expect("the skill-less codex unit was launched under the hatch");
+            assert!(
+                !argv.iter().any(|a| a == "--skill"
+                    || a == "--no-skills"
+                    || a == "--add-dir"
+                    || a == "--plugin-dir"),
+                "{argv:?}"
+            );
+            assert_eq!(
+                env_of(&argv, "WICKED_GARDEN_ROOT"),
+                "UNSET",
+                "no delivery ⇒ no launcher env"
+            );
+            assert_eq!(
+                env_of(&argv, "CODEX_HOME"),
+                "UNSET",
+                "the hatch mints no seat home"
+            );
+            assert!(
+                populated_anywhere().is_empty(),
+                "nothing is populated under the hatch: {:?}",
+                populated_anywhere()
+            );
+            // Skill-bearing: refused by name, naming the hatch, never launched.
+            let (out, argv) = launch(Some("wicked-garden-domain"), "hatch-skill");
+            assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
+            assert!(
+                out.output.contains("wicked-garden-domain")
+                    && out.output.contains("'codex'")
+                    && out.output.contains("engine-minted CODEX_HOME")
+                    && out.output.contains(INHERIT_OPERATOR_CONFIG_ENV),
+                "{}",
+                out.output
+            );
+            assert!(argv.is_none(), "a refused unit never launches the CLI");
+            assert!(populated_anywhere().is_empty());
+        }
+        // Off the hatch: the same skill-less unit gets its minted home populated (the lever).
+        let _no_hatch = VarGuard::unset(INHERIT_OPERATOR_CONFIG_ENV);
+        let (out, argv) = launch(None, "no-hatch-plain");
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("launched");
+        let codex_home = std::path::PathBuf::from(env_of(&argv, "CODEX_HOME"));
+        assert!(
+            codex_home
+                .join("skills")
+                .join("wicked-garden-domain")
+                .join("SKILL.md")
+                .is_file(),
+            "off the hatch the minted {} is populated",
+            codex_home.display()
+        );
+        assert_eq!(
+            env_of(&argv, "WICKED_GARDEN_ROOT"),
+            snapshot.to_string_lossy()
+        );
+        assert!(
+            std::fs::symlink_metadata(home.join(".codex")).is_err(),
+            "the operator's ~/.codex is never created"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 /// END-TO-END: the project graph a launcher binds becomes the `--db` in the worker's real

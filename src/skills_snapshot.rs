@@ -241,9 +241,11 @@ pub(crate) enum SkillsLever {
     /// ENGINE-MINTED `CODEX_HOME` (`<worker home>/codex`, private, never the operator's
     /// `~/.codex`). The engine POPULATES that directory from the pinned snapshot before the seat
     /// spawns — flat by frontmatter `name`, copies, a generation marker so an unchanged generation
-    /// is a no-op and stale generations are removed, nothing else under `CODEX_HOME` touched
-    /// ([`crate::codex_skills`]). Under the inherit-operator-config hatch there is no minted home,
-    /// so there is no lever (admission refuses a skill-bearing codex unit by name).
+    /// is a no-op and stale generations are replaced, populations of one home serialized by an
+    /// exclusive lock and swapped in COMPLETE (a seat never spawns against a half-built tree),
+    /// nothing else under `CODEX_HOME` touched ([`crate::codex_skills`]). Under the
+    /// inherit-operator-config hatch there is no minted home, so there is no lever: admission
+    /// refuses a skill-bearing codex unit by name, and a skill-less one is handed nothing.
     CodexSkillsDir,
     /// No per-launch lever: an ACP bridge that is not the CLI itself carrying an argv-only lever
     /// (copilot behind a foreign bridge), agy, any unknown binary. No lever ⇒ no skills, never a
@@ -400,6 +402,13 @@ pub(crate) const GARDEN_ROOT_ENV: &str = "WICKED_GARDEN_ROOT";
 /// (`pi-acp`): the deliverable portable skill directories as ONE OS path-list (`:` on unix, `;`
 /// on Windows), in the order [`SkillsDelivery::argv_flags`] would spell them. The crew-side
 /// bridge (wicked-crew#531) turns it into `--no-skills --skill <dir> …` on the pi it spawns.
+///
+/// Contract, spelled for the bridge: the variable being SET is the delivery — the bridge passes
+/// `--no-skills` (discovery OFF, so the seat's own skills directory is never a side channel,
+/// v3.2 §2), then one `--skill <dir>` per non-empty entry. An EMPTY value is a delivery of ZERO
+/// portable skills: `--no-skills` alone — exactly what the wrapped carrier spells for the same
+/// snapshot ([`SkillsDelivery::argv_flags`]), so the two carriers agree. UNSET means no delivery
+/// at all (a lever-less launch, a chat session): the bridge adds no skills flags.
 pub(crate) const PI_SKILL_DIRS_ENV: &str = "WICKED_PI_SKILL_DIRS";
 
 /// Where garden ships the `wicked-garden` / `wicked-garden.cmd` shim inside the bundle closure
@@ -531,10 +540,13 @@ impl SkillsDelivery {
     /// carrier's own argv when the carrier IS the CLI the flags belong to (`copilot --acp`; pi
     /// registered as its own carrier), and through the environment the bridge forwards when it is
     /// a separate program — pi's [`PI_SKILL_DIRS_ENV`] behind `pi-acp` (the bridge spawns pi with
-    /// its own args, so flags on ITS argv would reach nothing). Claude's plugin rides `session/new`
-    /// and opencode's config its own composed variable, so both are `(∅, ∅)` here. `Err` when a
-    /// skill directory cannot be spelled in a path-list ([`join_path_list`]) — surfaced as a launch
-    /// refusal ([`SkillsError::LeverConfig`]), never a truncated delivery.
+    /// its own args, so flags on ITS argv would reach nothing). A delivery of ZERO portable skills
+    /// is still a delivery on both carriers — `--no-skills` alone on the argv, the variable SET
+    /// and EMPTY behind a bridge (see [`PI_SKILL_DIRS_ENV`]) — discovery is off either way.
+    /// Claude's plugin rides `session/new` and opencode's config its own composed variable, so
+    /// both are `(∅, ∅)` here. `Err` when a skill directory cannot be spelled in a path-list
+    /// ([`join_path_list`]) — surfaced as a launch refusal ([`SkillsError::LeverConfig`]), never
+    /// a truncated delivery.
     pub(crate) fn acp_transport(
         &self,
         carrier_binary: &str,
@@ -1090,10 +1102,24 @@ impl SkillsSnapshot {
     /// flags are an approximation with no publish-time verdict behind them, so only Claude's
     /// plugin loader — which does not depend on portability — is handed the root.
     pub(crate) fn delivery(&self, cli: &WorkerCli) -> SkillsDelivery {
+        self.delivery_with(cli, crate::execute_wrapped::inherits_operator_config())
+    }
+
+    /// [`delivery`](Self::delivery) with the inherit-operator-config hatch stated explicitly
+    /// (F-079 review): under the hatch no seat home is minted, so codex has nothing to populate
+    /// and is handed NOTHING — a skill-bearing codex unit was already refused by admission naming
+    /// the hatch ([`codex_hatch_reason`]); a skill-less one runs exactly as before the lever (no
+    /// population, no refusal, no handoff) — never a delivery whose population must fail.
+    pub(crate) fn delivery_with(
+        &self,
+        cli: &WorkerCli,
+        inherits_operator_config: bool,
+    ) -> SkillsDelivery {
         if self.source == SnapshotSource::LiveCache && !matches!(cli, WorkerCli::Claude) {
             return SkillsDelivery::None;
         }
         match cli.lever() {
+            SkillsLever::CodexSkillsDir if inherits_operator_config => SkillsDelivery::None,
             SkillsLever::ClaudePlugin => SkillsDelivery::ClaudePlugin(self.root.clone()),
             SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags {
                 root: self.root.clone(),
@@ -5016,6 +5042,20 @@ mod tests {
         // with every parallel test), and the runtime population refuses a delivery with no seat
         // root the same way.
         assert!(codex_hatch_reason(false).is_none());
+        assert_eq!(
+            handed.delivery_with(&codex, true),
+            SkillsDelivery::None,
+            "no minted home ⇒ codex is handed nothing (a skill-less unit runs, nothing is populated)"
+        );
+        assert!(matches!(
+            handed.delivery_with(&codex, false),
+            SkillsDelivery::CodexSkillsDir { .. }
+        ));
+        assert_eq!(
+            handed.delivery_with(&pi, true),
+            handed.delivery_with(&pi, false),
+            "the hatch changes nothing for a lever that needs no minted home"
+        );
         let why = codex_hatch_reason(true).unwrap();
         assert!(
             why.contains("engine-minted CODEX_HOME")
@@ -7037,5 +7077,20 @@ mod tests {
             bad.acp_transport("pi").is_ok(),
             "the flags carrier spells each dir on its own"
         );
+        // A delivery of ZERO portable skills is still a delivery, and the two carriers agree on
+        // it: `--no-skills` alone on the argv (discovery OFF, nothing added), the variable SET
+        // and EMPTY behind a bridge — never unset, which would read as "no delivery" and leave
+        // discovery ON where the wrapped carrier turns it off.
+        let empty = SkillsDelivery::PiSkillFlags {
+            root: root.clone(),
+            dirs: Vec::new(),
+        };
+        assert_eq!(empty.argv_flags(), vec!["--no-skills".to_string()]);
+        let (flags, env) = empty.acp_transport("pi-acp").unwrap();
+        assert!(flags.is_empty());
+        assert_eq!(env, vec![(PI_SKILL_DIRS_ENV, OsString::new())]);
+        let (flags, env) = empty.acp_transport("pi").unwrap();
+        assert_eq!(flags, vec!["--no-skills".to_string()]);
+        assert!(env.is_empty());
     }
 }
