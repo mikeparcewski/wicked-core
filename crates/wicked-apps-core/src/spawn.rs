@@ -180,8 +180,16 @@ fn absolute_or_refuse(
             path.display()
         );
     }
-    // Judged on the literal spelling: `Path::components()` silently normalizes `.` away, and a
-    // `..` that survives it would be resolved by the kernel at every consumer independently.
+    refuse_dot_segments(&path, source)?;
+    Ok(path)
+}
+
+/// Refuse a path spelled with a `.` or `..` SEGMENT — judged on the literal spelling:
+/// `Path::components()` silently normalizes `.` away, and a `..` that survives it would be resolved
+/// by the kernel at every consumer independently, re-aiming the directory outside whatever base the
+/// spelling appeared to sit under. The one rule the worker home, the seat roots and (core#410
+/// hardening) a chat scope's cwd, read roots and graph all apply before any containment check.
+pub fn refuse_dot_segments(path: &std::path::Path, source: &str) -> anyhow::Result<()> {
     let spelled = path.as_os_str().to_string_lossy();
     if spelled
         .split(['/', '\\'])
@@ -193,7 +201,7 @@ fn absolute_or_refuse(
             path.display()
         );
     }
-    Ok(path)
+    Ok(())
 }
 
 /// Refuse a worker config home reached through a PLANTED symlink at ANY component — judged on

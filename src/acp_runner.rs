@@ -4250,23 +4250,36 @@ fn ensure_chat_scratch_root(cwd: &std::path::Path) -> Result<(), String> {
 /// canonicalized and the remaining segments re-appended. A lexical `resolve` would compare a path
 /// under a symlinked temp dir (macOS `/var/folders/…` → `/private/var/folders/…`) unequal to one
 /// that was resolved through the link.
-fn canonical_ish(p: &std::path::Path) -> std::path::PathBuf {
-    let mut cur = p.to_path_buf();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+fn canonical_ish(p: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    let dots = || {
+        Err(format!(
+            "chat scope: {} has a `..` segment beyond its existing ancestors and cannot be resolved \
+             safely; spell the path plainly",
+            p.display()
+        ))
+    };
+    let mut cur = p;
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     loop {
-        if let Ok(real) = std::fs::canonicalize(&cur) {
+        if let Ok(real) = std::fs::canonicalize(cur) {
             let mut out = real;
             for seg in tail.iter().rev() {
                 out.push(seg);
             }
-            return out;
+            return Ok(out);
         }
         match (cur.file_name(), cur.parent()) {
             (Some(name), Some(parent)) => {
-                tail.push(name.to_os_string());
-                cur = parent.to_path_buf();
+                tail.push(name);
+                cur = parent;
             }
-            _ => return p.to_path_buf(),
+            // `file_name()` is `None` for a path ending in `..`: the missing tail carries a parent
+            // step, which re-appended LEXICALLY would be resolved by the kernel against the REAL
+            // directory, re-aiming the result outside whatever the spelling appeared to sit under
+            // (core#410 hardening, reviewer R11). Refuse rather than re-append. (A `.` is invisible
+            // to both the kernel and `Path` alike and re-aims nothing.)
+            (None, Some(parent)) if parent != cur => return dots(),
+            _ => return Ok(p.to_path_buf()),
         }
     }
 }
@@ -4335,6 +4348,46 @@ fn scoped_seat_admission(
          or set `os_sandbox = true` on its [cli.acp] record",
         config.binary
     ))
+}
+
+/// The POST-SPAWN half of scoped-chat admission (core#410 hardening, deferred hunk #4):
+/// [`scoped_seat_admission`] judged the RECORD; this judges the PROCESS the spawn actually produced.
+/// A seat that relies on the kernel write floor (no permission channel) is refused when the floor
+/// did not arm (`sandbox_downgrade` — no launcher on this host, a root that failed to canonicalize);
+/// a seat that relies on ACP governance is refused when the spawn-time version pin did not prove
+/// the admitted adapter (`governance_verified == false` — unit execution downgrades such a process to
+/// ungoverned, so a scoped chat must not promise it read-only roots). Unscoped chats admit anything.
+fn scoped_seat_runtime_admission(
+    cli_key: &str,
+    scope: &ChatScope,
+    config: &AcpConfig,
+    sandbox_downgrade: Option<&(String, String)>,
+    governance_verified: bool,
+) -> Result<(), String> {
+    let scoped = scope.code_graph_db.is_some() || !scope.read_roots.is_empty();
+    if !scoped {
+        return Ok(());
+    }
+    if config.acp_input_governance {
+        if !governance_verified {
+            return Err(format!(
+                "seat '{cli_key}' cannot hold a SCOPED chat: its ACP adapter '{}' is admitted to \
+                 input governance only for its pinned build and the spawned binary did not report \
+                 it, so the permission channel the read-only boundary relies on is unproven; \
+                 refused (open the chat unscoped for this seat, or restore the pinned adapter)",
+                config.binary
+            ));
+        }
+        return Ok(());
+    }
+    if let Some((level, reason)) = sandbox_downgrade {
+        return Err(format!(
+            "seat '{cli_key}' cannot hold a SCOPED chat: it relies on the OS sandbox write floor, \
+             which did not arm on this host ({level}: {reason}); refused rather than admitted \
+             behind a read-only statement nothing enforces"
+        ));
+    }
+    Ok(())
 }
 
 /// The boundary a chat's seats are judged against (core#410, review): the scratch root is the ONE
@@ -4694,6 +4747,20 @@ impl AcpStepRunner {
             self.operational_home.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        // Admission rests on an ARMED floor and a PROVEN permission channel, not on the record's
+        // request (core#410 hardening, deferred hunk #4): a seat this spawn could not hold to the
+        // scope is dropped here — `chat_open` reports it as `ChatSessionFailed` with the reason.
+        if let Err(reason) = scoped_seat_runtime_admission(
+            cli_key,
+            &scope,
+            &config,
+            proc.sandbox_downgrade.as_ref(),
+            proc.governance_verified,
+        ) {
+            eprintln!("[wicked-core] chat '{chat_id}': refusing seat '{cli_key}': {reason}");
+            drop(proc);
+            return Err(reason);
+        }
         // The chat's filesystem boundary, judged on every permission request of every turn on
         // this session (core#410, review): write = the scratch root; read = the scoped roots.
         proc.chat_boundary = Some(chat_boundary(&scope, seat_cli));
@@ -4820,28 +4887,45 @@ impl AcpStepRunner {
         // as the writable root, which the ensure would then have made 0700 and the boundary made
         // writable). Judged on real paths through the longest existing ancestor, so a symlinked
         // temp dir (macOS `/var` → `/private/var`) and a not-yet-created leaf compare correctly.
+        //
+        // Spelling first (core#410 hardening, reviewer R11): a `.`/`..` segment ANYWHERE in the
+        // cwd, a read root or the graph is refused before any containment check — the same rule
+        // the worker home and the seat roots apply (`spawn::refuse_dot_segments`). A path like
+        // `/tmp/missing/../../<state home>` reads as under the temp base lexically while the
+        // kernel resolves it into the state home; no containment test below is trusted with it.
+        let dots = |p: &std::path::Path, what: &str| -> Result<(), String> {
+            wicked_apps_core::spawn::refuse_dot_segments(p, what)
+                .map_err(|e| format!("chat scope: {e}"))
+        };
+        dots(&scope.cwd, "cwd")?;
+        for root in &scope.read_roots {
+            dots(std::path::Path::new(root), "read root")?;
+        }
+        if let Some(db) = scope.code_graph_db.as_deref() {
+            dots(std::path::Path::new(db), "code graph")?;
+        }
         if !scope.cwd.is_absolute() {
             return Err(format!(
                 "chat scope: cwd {} is not absolute",
                 scope.cwd.display()
             ));
         }
-        let cwd = canonical_ish(&scope.cwd);
+        let cwd = canonical_ish(&scope.cwd)?;
         // The temp bases: Rust's `temp_dir()` (unix: `TMPDIR`; Windows: `TMP` then `TEMP`), `/tmp`
         // on unix, AND `TMP`/`TEMP` wherever set — Node's `os.tmpdir()`, which the daemon derives
         // its base from, consults `TMPDIR`, `TMP`, `TEMP` in that order on unix and `TEMP` before
         // `TMP` on Windows, so the two runtimes can disagree on which variable wins (independent
         // review, C5); every spelling a caller could legitimately have used is accepted.
         let temps: Vec<std::path::PathBuf> = {
-            let mut t = vec![canonical_ish(&std::env::temp_dir())];
+            let mut t = vec![canonical_ish(&std::env::temp_dir())?];
             if cfg!(unix) {
-                t.push(canonical_ish(std::path::Path::new("/tmp")));
+                t.push(canonical_ish(std::path::Path::new("/tmp"))?);
             }
             for var in ["TMP", "TEMP"] {
                 if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
                     let p = std::path::PathBuf::from(v);
                     if p.is_absolute() {
-                        t.push(canonical_ish(&p));
+                        t.push(canonical_ish(&p)?);
                     }
                 }
             }
@@ -4855,7 +4939,10 @@ impl AcpStepRunner {
                 std::env::temp_dir().display()
             ));
         }
-        let op_home = self.operational_home.as_deref().map(canonical_ish);
+        let op_home = match self.operational_home.as_deref() {
+            Some(op) => Some(canonical_ish(op)?),
+            None => None,
+        };
         if let Some(op) = &op_home {
             if cwd.starts_with(op) {
                 return Err(format!(
@@ -4874,7 +4961,17 @@ impl AcpStepRunner {
             if !p.is_absolute() {
                 return Err(format!("chat scope: read root {root:?} is not absolute"));
             }
-            let r = canonical_ish(p);
+            // A read root is a DIRECTORY the seats may read (core#410 hardening, reviewer b1–b3):
+            // a file — a hard link to `core.db` placed anywhere, a plain file — or a path that does
+            // not exist is refused outright; the identity/state-home checks below then judge the
+            // directory that is there.
+            if !p.is_dir() {
+                return Err(format!(
+                    "chat scope: read root {root} is not an existing directory (a read root names a \
+                     repository checkout; files and missing paths are refused)"
+                ));
+            }
+            let r = canonical_ish(p)?;
             if let Some(op) = &op_home {
                 if r.starts_with(op) {
                     return Err(format!(
@@ -4913,7 +5010,7 @@ impl AcpStepRunner {
             if let Some(op) = self.operational_home.as_deref() {
                 let resolved =
                     std::fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
-                let op_real = canonical_ish(op);
+                let op_real = canonical_ish(op)?;
                 if resolved
                     .parent()
                     .is_some_and(|parent| crate::state_home::same_dir(parent, &op_real))
@@ -10983,6 +11080,9 @@ transport = "stdio"
             );
         }
         // A read root inside the engine's state home, or overlapping the scratch root, is refused.
+        // (The scratch root exists here so the OVERLAP rule is what refuses it — a missing path is
+        // refused earlier, as not a directory; core#410 hardening.)
+        std::fs::create_dir_all(&base.cwd).unwrap();
         for (root, needle) in [
             (state.join("project-graphs"), "state home"),
             (base.cwd.clone(), "overlaps"),
@@ -11002,6 +11102,325 @@ transport = "stdio"
         }
         // Nothing was recorded for any refused chat.
         assert!(r.chat_scopes.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#410 hardening (independent review, R11 a1–a4): a `.`/`..` segment anywhere in a scope
+    /// path is refused BY SPELLING before any containment check, and a missing tail that carries
+    /// `..` is never re-appended lexically — `/tmp/missing/../../<state home>` used to read as under
+    /// the temp base while the kernel resolved it into the state home.
+    #[test]
+    fn a_chat_scope_with_dot_segments_is_refused_by_spelling_not_re_aimed() {
+        let dir = scratch("chat-scope-dots");
+        let state = dir.join("state");
+        std::fs::create_dir_all(state.join("project-graphs").join("p1")).unwrap();
+        std::fs::write(state.join("core.db"), b"").unwrap();
+        let graph = state.join("project-graphs").join("p1").join("estate.db");
+        std::fs::write(&graph, b"").unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut r = AcpStepRunner::new(tx);
+        r.operational_home = Some(state.clone());
+        let base = ChatScope {
+            cwd: dir.join("chats").join("c1"),
+            code_graph_db: Some(graph.to_string_lossy().into_owned()),
+            read_roots: vec![repo.to_string_lossy().into_owned()],
+        };
+        assert!(r.chat_open("ok", &[], base.clone()).is_ok());
+        let dotted = |e: &str| e.contains("`.` or `..` segment") || e.contains("`..` segment");
+        // a1: escape the temp base through a MISSING segment — lexically under `<dir>`, really the
+        // filesystem's parent of the temp dir.
+        let a1 = dir
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("elsewhere");
+        // a2: re-aim into the state home through a missing segment.
+        let a2 = dir
+            .join("chats")
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("state")
+            .join("chats");
+        // a4: a `..` under EXISTING directories (was refused by canonicalization; stays refused).
+        let a4 = state
+            .join("project-graphs")
+            .join("..")
+            .join("chats")
+            .join("c9");
+        for (name, bad) in [("a1", a1), ("a2", a2), ("a4", a4)] {
+            let err = r
+                .chat_open(
+                    "badcwd",
+                    &[],
+                    ChatScope {
+                        cwd: bad.clone(),
+                        ..base.clone()
+                    },
+                )
+                .expect_err("a dotted cwd");
+            assert!(dotted(&err), "{name} {}: {err}", bad.display());
+        }
+        // a3: a read root spelled through a missing segment.
+        let a3 = repo.join("missing").join("..");
+        let err = r
+            .chat_open(
+                "badroot",
+                &[],
+                ChatScope {
+                    read_roots: vec![a3.to_string_lossy().into_owned()],
+                    ..base.clone()
+                },
+            )
+            .expect_err("a dotted read root");
+        assert!(dotted(&err), "a3: {err}");
+        // …and a graph.
+        let dotted_graph = state
+            .join("project-graphs")
+            .join("p1")
+            .join(".")
+            .join("estate.db");
+        let err = r
+            .chat_open(
+                "badgraph",
+                &[],
+                ChatScope {
+                    code_graph_db: Some(dotted_graph.to_string_lossy().into_owned()),
+                    ..base.clone()
+                },
+            )
+            .expect_err("a dotted graph");
+        assert!(dotted(&err), "graph: {err}");
+        // The resolver itself refuses a missing tail that steps up — and still resolves a plain one.
+        let plain = dir.join("chats").join("not-yet");
+        assert!(canonical_ish(&plain).unwrap().ends_with("chats/not-yet"));
+        let err = canonical_ish(&dir.join("chats").join("missing").join("..")).expect_err("dots");
+        assert!(dotted(&err), "{err}");
+        // Nothing recorded for any refused chat (and `ok`, warming no seat, held nothing either).
+        assert!(r.chat_scopes.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#410 hardening (independent review, b1–b3): a read root is an existing DIRECTORY — a
+    /// hard link to the operational store placed outside the state home, a plain file and a
+    /// missing path are all refused, so the identity checks judge only directories that exist.
+    #[test]
+    fn a_chat_read_root_must_be_an_existing_directory() {
+        let dir = scratch("chat-scope-rootdir");
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("core.db"), b"store").unwrap();
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut r = AcpStepRunner::new(tx);
+        r.operational_home = Some(state.clone());
+        let base = ChatScope {
+            cwd: dir.join("chats").join("c1"),
+            code_graph_db: None,
+            read_roots: vec![repo.to_string_lossy().into_owned()],
+        };
+        let mut bad: Vec<(&str, std::path::PathBuf)> = vec![
+            ("b2 plain file", dir.join("notes.txt")),
+            ("b3 missing", dir.join("never-created")),
+        ];
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        #[cfg(unix)]
+        {
+            let hard = dir.join("innocent-dir");
+            std::fs::hard_link(state.join("core.db"), &hard).unwrap();
+            bad.push(("b1 hard link to core.db", hard));
+        }
+        for (name, root) in bad {
+            let err = r
+                .chat_open(
+                    "badroot",
+                    &[],
+                    ChatScope {
+                        read_roots: vec![root.to_string_lossy().into_owned()],
+                        ..base.clone()
+                    },
+                )
+                .expect_err("a non-directory read root");
+            assert!(err.contains("not an existing directory"), "{name}: {err}");
+        }
+        // The directory itself is fine.
+        assert!(r.chat_open("ok", &[], base).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// core#410 hardening (deferred hunk #4): the post-spawn half of admission judges the PROCESS —
+    /// a floor-reliant seat is refused when the floor did not arm, a governance-reliant seat when
+    /// the pin did not prove the adapter; an unscoped chat admits both, an armed/proven seat passes.
+    #[test]
+    fn scoped_seat_runtime_admission_needs_an_armed_floor_or_a_proven_channel() {
+        let scoped = ChatScope {
+            cwd: std::env::temp_dir().join("wicked-chat-rt-adm"),
+            code_graph_db: None,
+            read_roots: vec![std::env::temp_dir()
+                .join("repo")
+                .to_string_lossy()
+                .into_owned()],
+        };
+        let unscoped = ChatScope {
+            read_roots: vec![],
+            ..scoped.clone()
+        };
+        let floor = AcpConfig {
+            binary: "pi-acp".into(),
+            start_args: vec![],
+            transport: AcpTransport::default(),
+            auth_method: None,
+            acp_input_governance: false,
+            os_sandbox: true,
+            acp_governance_env: None,
+            verified_version: None,
+        };
+        let governed = AcpConfig {
+            binary: "claude-agent-acp".into(),
+            acp_input_governance: true,
+            os_sandbox: false,
+            ..floor.clone()
+        };
+        let downgrade = (
+            "best_effort".to_string(),
+            "no OS-sandbox tool on PATH".to_string(),
+        );
+        // Floor-reliant: armed → admitted; downgraded → refused, naming the gap.
+        assert!(scoped_seat_runtime_admission("pi", &scoped, &floor, None, true).is_ok());
+        let err = scoped_seat_runtime_admission("pi", &scoped, &floor, Some(&downgrade), true)
+            .expect_err("downgraded floor");
+        assert!(
+            err.contains("did not arm") && err.contains("no OS-sandbox tool on PATH"),
+            "{err}"
+        );
+        // Governance-reliant: proven → admitted (a downgrade is irrelevant — the channel is the
+        // permission request, not the floor); unproven → refused.
+        assert!(scoped_seat_runtime_admission(
+            "claude",
+            &scoped,
+            &governed,
+            Some(&downgrade),
+            true
+        )
+        .is_ok());
+        let err = scoped_seat_runtime_admission("claude", &scoped, &governed, None, false)
+            .expect_err("unproven adapter");
+        assert!(
+            err.contains("unproven") && err.contains("claude-agent-acp"),
+            "{err}"
+        );
+        // Unscoped: nothing promised, everything admitted.
+        assert!(
+            scoped_seat_runtime_admission("pi", &unscoped, &floor, Some(&downgrade), false).is_ok()
+        );
+    }
+
+    /// core#410 hardening (deferred hunk #4), end to end: a registry seat whose record ARMS the OS
+    /// sandbox is spawned on a host where no sandbox tool is on PATH — the floor downgrades — and
+    /// the scoped open refuses the seat AFTER the spawn with a `ChatSessionFailed` naming the gap;
+    /// nothing is held for it. The same seat joins an UNSCOPED chat.
+    #[test]
+    #[cfg(unix)]
+    fn a_scoped_seat_whose_sandbox_floor_downgraded_is_refused_after_the_spawn() {
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = scratch("chat-floor-downgrade");
+        let worker = dir.join("worker");
+        std::env::set_var("WICKED_WORKER_HOME", &worker);
+        let script = stub_idle_bridge(&dir);
+        let council = dir.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "stubfloor"
+display_name = "Stub floor seat"
+binary = "codex"
+headless_invocation = "codex exec \"{{PROMPT}}\""
+
+[cli.acp]
+binary = "{}"
+transport = "stdio"
+acp_input_governance = false
+os_sandbox = true
+"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+        let _home = EnvPin::set("HOME", &dir);
+        // No sandbox tool findable: the floor the record asks for cannot arm on this host.
+        let empty_path = dir.join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let _path = EnvPin::set("PATH", &empty_path);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let scoped = ChatScope {
+            cwd: dir.join("chats").join("scoped"),
+            code_graph_db: None,
+            read_roots: vec![repo.to_string_lossy().into_owned()],
+        };
+        let unscoped = ChatScope {
+            cwd: dir.join("chats").join("unscoped"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let opened = r
+            .chat_open("scoped", &["stubfloor".to_string()], scoped)
+            .expect("the scope itself is valid");
+        let seats_after_refusal = r.chat_seats("scoped");
+        let unscoped_open = r.chat_open("unscoped", &["stubfloor".to_string()], unscoped);
+        let seats_unscoped = r.chat_seats("unscoped");
+        r.chat_close("scoped", ChatCloseReason::Requested);
+        r.chat_close("unscoped", ChatCloseReason::Requested);
+        drop(_path);
+        drop(_home);
+        restore_hermetic_worker_home();
+
+        assert_eq!(opened.len(), 1);
+        let reason = opened[0].1.clone().expect_err("refused after the spawn");
+        assert!(
+            reason.contains("did not arm") && reason.contains("stubfloor"),
+            "{reason}"
+        );
+        assert!(
+            seats_after_refusal.is_empty(),
+            "nothing is held for the refused seat: {seats_after_refusal:?}"
+        );
+        let failed: Vec<(String, String)> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                crate::command::Command::EmitEvent(CoreEvent::ChatSessionFailed {
+                    cli_key,
+                    reason,
+                    ..
+                }) => Some((cli_key, reason)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            failed
+                .iter()
+                .any(|(cli, reason)| cli == "stubfloor" && reason.contains("did not arm")),
+            "the refusal is an event with the reason: {failed:?}"
+        );
+        let unscoped_open = unscoped_open.expect("valid scope");
+        assert!(
+            unscoped_open[0].1.is_ok(),
+            "an unscoped chat promises nothing and admits the seat: {:?}",
+            unscoped_open[0]
+        );
+        assert_eq!(seats_unscoped, vec!["stubfloor".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -135,6 +135,33 @@ fn resolve_symlinks(p: &Path) -> PathBuf {
     }
 }
 
+/// [`resolve_symlinks`] for a ROOT DECLARATION (core#410 hardening, reviewer R11): a missing tail
+/// that still carries a `..` segment is REFUSED rather than re-appended lexically. Re-appending is
+/// sound for a plain tail — a not-yet-created leaf under a real directory — but a `..` in it is
+/// resolved by the kernel against the real directory at every consumer, so the path the roots were
+/// judged on is not the path the worker gets (`<repo>/missing/../..` judged as inside the repo,
+/// resolved to its grandparent). [`check`] and [`deliverable_exists`] normalize before resolving,
+/// so their tails never carry one; a declared root is spelled by the caller and is not. (A `.`
+/// segment is invisible to the kernel and to `Path` alike and re-aims nothing.)
+fn resolve_symlinks_for_root(p: &Path) -> Result<PathBuf, String> {
+    let mut cur = p;
+    while std::fs::canonicalize(cur).is_err() {
+        match (cur.file_name(), cur.parent()) {
+            (Some(_), Some(parent)) => cur = parent,
+            // `file_name()` is `None` for a path ending in `..`: a parent step in the missing tail.
+            (None, Some(parent)) if parent != cur => {
+                return Err(format!(
+                    "{} has a `..` segment beyond its existing ancestors and cannot be resolved \
+                     safely; spell the root plainly",
+                    p.display()
+                ))
+            }
+            _ => break,
+        }
+    }
+    Ok(resolve_symlinks(p))
+}
+
 /// Is `path` inside the unit's boundary?
 ///
 /// `write` selects which root set applies: a read may use either list, a write only the write list.
@@ -262,7 +289,8 @@ fn validate_extra_roots(
                  character join_paths refuses); refused at launch rather than degraded at spawn"
             ));
         }
-        let resolved = resolve_symlinks(p);
+        let resolved =
+            resolve_symlinks_for_root(p).map_err(|e| format!("extra {kind} root {e}; refused"))?;
         if resolved_is_within(&resolved, &config_tree)
             || resolved_is_within(&config_tree, &resolved)
         {
@@ -583,6 +611,54 @@ mod tests {
         let e = validate_extra_write_roots(&[poisoned], Some(&home))
             .expect_err("a separator-poisoned write root must be refused");
         assert!(e.contains("carrier"), "names the failure: {e}");
+    }
+
+    /// core#410 hardening (reviewer R11): a root whose MISSING tail still carries `..` is refused
+    /// on both mirrors — never re-appended lexically and judged as if it sat where it was spelled.
+    /// A plain missing leaf (a directory the run will create) still resolves and is admitted; a
+    /// `..` under an EXISTING path is resolved by the kernel and judged on the real target.
+    #[test]
+    fn a_root_with_dot_segments_beyond_its_existing_ancestors_is_refused_not_re_appended() {
+        let home = scratch("xrr_dots_home");
+        let repo = scratch("xrr_dots_repo");
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+
+        // `<repo>/missing/../..`: lexically "inside the repo", really its grandparent.
+        let sneaky = repo.join("missing").join("..").join("..");
+        for (name, res) in [
+            (
+                "read",
+                validate_extra_read_roots(&[sneaky.to_string_lossy().into_owned()], Some(&home)),
+            ),
+            (
+                "write",
+                validate_extra_write_roots(&[sneaky.to_string_lossy().into_owned()], Some(&home)),
+            ),
+        ] {
+            let e = res.expect_err("a dot segment beyond the existing ancestors must be refused");
+            assert!(e.contains("`..`") && e.contains("refused"), "{name}: {e}");
+        }
+        // A `..` in the MIDDLE of the missing tail is the same refusal.
+        let mid = repo.join("missing").join("..").join("leaf");
+        let e = validate_extra_read_roots(&[mid.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("a `..` beyond the existing ancestors must be refused");
+        assert!(e.contains("`..`"), "{e}");
+        // A plain missing leaf still resolves: the run creates it.
+        let leaf = repo.join("not-yet").join("created");
+        validate_extra_read_roots(&[leaf.to_string_lossy().into_owned()], Some(&home))
+            .expect("a plain missing leaf is admitted");
+        // `..` under an existing path is resolved by the kernel: `<repo>/sub/..` is the repo.
+        let real_dots = repo.join("sub").join("..");
+        validate_extra_read_roots(&[real_dots.to_string_lossy().into_owned()], Some(&home))
+            .expect("an existing path resolves through its `..`");
+        // …and is judged on the REAL target: `<home>/x/..` is the home, which contains the pin tree.
+        std::fs::create_dir_all(home.join("x")).unwrap();
+        let into_home = home.join("x").join("..");
+        let e = validate_extra_read_roots(&[into_home.to_string_lossy().into_owned()], Some(&home))
+            .expect_err("resolved into the home: refused as containing the pin tree");
+        assert!(e.contains("FINDING-098"), "{e}");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
 
