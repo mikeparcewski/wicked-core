@@ -406,6 +406,25 @@ pub fn snapshot(worktree: &Path, repo_root: &Path) -> anyhow::Result<WorktreeSna
     snapshot_through(worktree, &git_dir)
 }
 
+/// (F-7R2-005, wave 6) Did the worktree's CONTENT change since `baseline`? Re-snapshots through
+/// the baseline's PINNED git dir (never the worktree's own `.git` file) and compares the tree ids
+/// — the tree over tracked + untracked-not-ignored content, so a commit of unchanged content
+/// (`HEAD` moves, tree equal) is NOT a change, while an edit, an added file or a deletion is. The
+/// default repo-checks floor and the default judge key on this for every bound agent unit the
+/// guard does not already cover. `Err` when the baseline carries no pinned git dir (a pre-pin
+/// snapshot) or git fails — callers treat unknown as CHANGED (fail-closed: the checks run).
+pub(crate) fn tree_changed_since(
+    worktree: &Path,
+    baseline: &WorktreeSnapshot,
+) -> anyhow::Result<bool> {
+    let git_dir = baseline
+        .git_dir
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the baseline snapshot carries no pinned git dir"))?;
+    let after = snapshot_through(worktree, Path::new(git_dir))?;
+    Ok(after.tree != baseline.tree)
+}
+
 /// Parse `git diff-tree -r -z --name-status --no-renames` output: `<status>\0<path>\0` pairs.
 fn parse_name_status_z(raw: &[u8]) -> Vec<ChangedPath> {
     let mut out = Vec::new();

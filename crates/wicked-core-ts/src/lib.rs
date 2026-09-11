@@ -2343,6 +2343,10 @@ mod tests {
                 combined: true,
                 judge_cli: Some(s()),
                 judge_distinct: Some(true),
+                ungated: false,
+                ungated_reason: None,
+                floor_note: None,
+                judge_skipped_reason: None,
             },
             "gateEvaluated",
             &[
@@ -2361,6 +2365,10 @@ mod tests {
                 "combined",
                 "judgeCli",
                 "judgeDistinct",
+                "ungated",
+                "ungatedReason",
+                "floorNote",
+                "judgeSkippedReason",
             ],
         );
         check(
@@ -2917,6 +2925,7 @@ mod tests {
                 fetched: true,
                 lifted: true,
                 note: None,
+                run_branch: String::new(),
             },
             "runBaseResolved",
             &[
@@ -2929,6 +2938,27 @@ mod tests {
                 "fetched",
                 "lifted",
                 "note",
+                "runBranch",
+            ],
+        );
+        // Wave 6 (F-7R2-012): a worker seat's remote-writing command refused on either carrier.
+        check(
+            CoreEvent::WorkerToolCallDenied {
+                session: s(),
+                ord: 7,
+                attempt: 0,
+                cli: s(),
+                carrier: "acp".to_string(),
+                role: s(),
+                tool: s(),
+                command: s(),
+                reason: s(),
+                remedy: s(),
+            },
+            "workerToolCallDenied",
+            &[
+                "type", "session", "ord", "attempt", "cli", "carrier", "role", "tool", "command",
+                "reason", "remedy",
             ],
         );
         check(
@@ -2940,11 +2970,17 @@ mod tests {
                 criterion: s(),
                 checks: vec![],
                 skipped: vec![],
+                sandbox_level: s(),
+                sandbox_error: None,
+                detect_error: None,
             },
             "repoChecksEvaluated",
             &[
                 "type",
                 "session",
+                "sandboxLevel",
+                "sandboxError",
+                "detectError",
                 "ord",
                 "attempt",
                 "passed",

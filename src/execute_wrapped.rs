@@ -300,7 +300,17 @@ const DENIED_HOME_SUBDIRS: &[&str] = &[
     ".gnupg",
     ".aws",
     ".config/gcloud",
+    // (review of #449, FN-5) The gh login on Linux (`hosts.yml` carries the oauth token) and
+    // git's own credential files — a seat that could READ them by path could chain them with
+    // an escape the command filter misses.
+    ".config/gh",
+    ".config/git",
 ];
+
+/// Credential FILES under `$HOME` a worker may not read or edit (review of #449, FN-5): git's
+/// plaintext credential store. Fenced as `Read(<file>)`/`Edit(<file>)` — the file form, since
+/// `<file>/**` would match nothing.
+const DENIED_HOME_FILES: &[&str] = &[".git-credentials"];
 
 /// Bash verbs that leave the worktree by construction, so no path rule can catch them.
 ///
@@ -314,6 +324,19 @@ const DENIED_BASH: &[&str] = &[
     "Bash(shutdown:*)",
     "Bash(reboot:*)",
 ];
+
+/// EVERY Bash verb the engine denies a seat: the unsalvageable machine-state verbs above plus the
+/// remote-write fence (F-7R2-012, [`crate::remote_write_fence::REMOTE_WRITE_BASH_RULES`] — `git
+/// push`, `gh pr create|merge|edit|comment`, `gh api`, `gh release`, …: delivery is the deliver
+/// phase's job). One iterator, so the three carriers (shared worker file, per-session file/ACP
+/// options, ballot argv) cannot fence different verbs.
+pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
+    DENIED_BASH.iter().copied().chain(
+        crate::remote_write_fence::REMOTE_WRITE_BASH_RULES
+            .iter()
+            .copied(),
+    )
+}
 
 /// Keep a worker session out of the operator's own machine state.
 ///
@@ -852,7 +875,26 @@ pub(crate) fn deny_rules(
         // why no `Write(<path>)` twin is emitted (wicked-crew#524 / F-3R2-004).
         rules.push(format!("Edit({p}/**)"));
     }
-    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules.extend(denied_home_file_rules()?);
+    rules.extend(denied_bash_rules().map(|s| s.to_string()));
+    Ok(rules)
+}
+
+/// The `Read(<file>)` + `Edit(<file>)` rules for [`DENIED_HOME_FILES`] (fail closed on an
+/// unspellable path, like every directory rule); nothing when no home directory is set.
+fn denied_home_file_rules() -> Result<Vec<String>, String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let mut rules = Vec::new();
+    if let Some(h) = home {
+        for file in DENIED_HOME_FILES {
+            let path = h.join(file);
+            let p = rule_path(&path).ok_or_else(|| unspellable(&path))?;
+            rules.push(format!("Read({p})"));
+            rules.push(format!("Edit({p})"));
+        }
+    }
     Ok(rules)
 }
 
@@ -883,7 +925,8 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
             rules.push(format!("{tool}({p}/**)"));
         }
     }
-    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules.extend(denied_home_file_rules()?);
+    rules.extend(denied_bash_rules().map(|s| s.to_string()));
     Ok(rules)
 }
 
@@ -906,6 +949,10 @@ pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
             }
         }
     }
+    // (review of #449, FN-4a) The Bash verb fence rides the ballot's OWN argv too, not only the
+    // shared worker file it happens to share a home with — one rule set, three carriers, no
+    // carrier whose fence depends on another file being in place.
+    rules.extend(denied_bash_rules().map(|s| s.to_string()));
     Ok(rules)
 }
 
@@ -7554,8 +7601,8 @@ mod tests {
 
     /// wicked-crew#524 follow-up (review on core#436): the council ballot's argv half of the fence
     /// — the state-home rules the shared worker file omits — completes the shared file to exactly
-    /// the rule set a snapshot-less worker launch carries; no inert form, no Bash verbs (those
-    /// ride the shared file).
+    /// the rule set a snapshot-less worker launch carries; no inert form. Since wave 6 (review of
+    /// #449, FN-4a) the Bash verb fence rides the ballot argv as well — the union stays exact.
     #[test]
     fn the_ballot_argv_rules_complete_the_shared_file_to_a_worker_launch_fence() {
         let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
@@ -7565,11 +7612,12 @@ mod tests {
         assert!(ballot.contains(&format!("Read({opr}/**)")), "{ballot:?}");
         assert!(ballot.contains(&format!("Edit({opr}/**)")), "{ballot:?}");
         assert!(
-            !ballot
-                .iter()
-                .any(|r| r.starts_with("Write(") || r.starts_with("Bash(")),
+            !ballot.iter().any(|r| r.starts_with("Write(")),
             "{ballot:?}"
         );
+        for rule in crate::remote_write_fence::REMOTE_WRITE_BASH_RULES {
+            assert!(ballot.iter().any(|r| r == rule), "ballot argv lacks {rule}");
+        }
         let mut union: Vec<String> = super::shared_deny_rules(Some(&op)).expect("shared");
         union.extend(ballot.iter().cloned());
         union.sort();
@@ -9668,6 +9716,7 @@ mod project_graph_end_to_end_tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            health: None,
         }
     }
 
@@ -9927,5 +9976,34 @@ mod project_graph_end_to_end_tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-7R2-012 (wave 6): the remote-write fence rides EVERY Bash deny list the engine writes —
+    /// the blanket per-launch fence and the shared worker file — spelled as the claude CLI
+    /// enforces Bash rules, beside the machine-state verbs it always denied.
+    #[test]
+    fn the_remote_write_fence_rides_every_bash_deny_list() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let blanket = super::deny_rules(None, None).expect("blanket fence");
+        let shared = super::shared_deny_rules(None).expect("shared fence");
+        for rules in [&blanket, &shared] {
+            for rule in crate::remote_write_fence::REMOTE_WRITE_BASH_RULES {
+                assert!(
+                    rules.iter().any(|r| r == rule),
+                    "{rule} missing from a Bash deny list: {rules:?}"
+                );
+            }
+            for base in DENIED_BASH {
+                assert!(rules.iter().any(|r| r == base), "{base} still fenced");
+            }
+        }
+        let union: Vec<&str> = denied_bash_rules().collect();
+        assert_eq!(
+            union.len(),
+            DENIED_BASH.len() + crate::remote_write_fence::REMOTE_WRITE_BASH_RULES.len(),
+            "one union, each rule once"
+        );
     }
 }

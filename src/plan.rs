@@ -77,7 +77,15 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
         .enumerate()
         .map(|(i, description)| {
             let ord = (i + 1) as u32;
-            WorkUnit::pending(format!("{session_id}:u{ord}"), session_id, ord, description)
+            let mut unit =
+                WorkUnit::pending(format!("{session_id}:u{ord}"), session_id, ord, description);
+            // F-7R2-005: a prose-planned unit declares nothing — no `executes_code`, no
+            // `verified_evidence`, no pinned validator — so nothing else will ever gate its
+            // work. It carries the DEFAULT floor: if it changes the worktree tree, the
+            // repository's own checks run and a distinct judge is convened (or the gate says
+            // `ungated`, and why).
+            unit.default_floor = true;
+            unit
         })
         .collect()
 }
@@ -217,6 +225,15 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // declared write roots.
             let is_tool = matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
             unit.worktree_guarded = !phase.executes_code && !is_tool;
+            // F-7R2-005 — the DEFAULT floor marker for an agent phase that NO LATER phase
+            // verifies: when no `verified_evidence` phase follows this one, no `repo_checks_floor`
+            // will ever re-derive its work, so a unit that changes the tree owes the repository's
+            // own checks and a distinct judge itself. A phase FOLLOWED by a verify phase leaves
+            // the floor to it (the `bug`/`feature` `fix` gate is `auto` by design and must not
+            // hard-fail on checks the def routes to `verify`'s human gate); a creator AFTER the
+            // def's verify phase is floored (review of #449, FL-3).
+            let later_verifies = def.phases[i + 1..].iter().any(|p| p.verified_evidence);
+            unit.default_floor = !is_tool && !later_verifies;
             // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a
             // `verified_evidence` agent phase with an `executes_code` Creator before it. The engine
             // runs the repository's own checks in the worktree after the seat's work and folds the

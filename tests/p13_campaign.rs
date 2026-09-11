@@ -175,6 +175,7 @@ fn cli(key: &str) -> AgenticCli {
         acp: None,
         capabilities: None,
         login_invocation: None,
+        health: None,
     }
 }
 
@@ -624,6 +625,10 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         archived_at: None,
         archive_note: None,
         verified_tree: None,
+        run_branch: None,
+        base_commit: None,
+        finished_at: None,
+        benched_seats: Vec::new(),
     }
 }
 

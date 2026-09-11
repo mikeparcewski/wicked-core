@@ -3218,7 +3218,10 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
 /// `bash` stays (the phase must run the suite): this is a posture, not a guarantee; the worktree
 /// guard holds the rest.
 pub(crate) struct AcpWritePosture {
-    /// Never `Full` — a `Full` unit carries no fence and passes `None` instead.
+    /// The unit's write posture. `Full` (a code phase, an unbound creator) fences no write-class
+    /// call — [`AcpWritePosture::judge`] lets them through — but the struct still rides every
+    /// UNIT session since wave 6, because the REMOTE-WRITE fence (F-7R2-012) judges `execute`
+    /// calls for every role and posture and needs the unit's identity to disclose a refusal.
     pub posture: crate::write_posture::WritePosture,
     /// The unit's role, named in every denial so a creator is never reported as an evaluator.
     pub role: crate::workflow::PhaseRole,
@@ -3246,6 +3249,9 @@ impl AcpWritePosture {
     /// reach a gate.
     fn judge(&self, call: &crate::acp_permission::WriteClassCall) -> Result<(), String> {
         use crate::write_posture::{role_noun, WritePosture};
+        if !self.posture.fences_writes() {
+            return Ok(()); // a `Full` unit: the ordinary boundary answers write-class calls
+        }
         let target = |c: &crate::acp_permission::WriteClassCall| {
             format!(
                 "`{}`{}{}",
@@ -4011,6 +4017,55 @@ fn answer_permission_request<W: Write>(
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
     if let Some(fence) = posture {
+        // REMOTE-WRITE FENCE (F-7R2-012): an `execute`-class call whose command pushes, opens or
+        // edits a PR, mutates through `gh api`, or cuts a release is REFUSED for every role and
+        // posture — delivery is the deliver phase's job. Answered with the seat's reject option,
+        // disclosed as `workerToolCallDenied` with the remedy, logged. One tool call, not the
+        // unit: the seat reads the remedy and continues.
+        if let Some(command) = crate::acp_permission::execute_command(&params) {
+            if let Some(hit) = crate::remote_write_fence::remote_write_command(&command) {
+                let reason = hit.reason();
+                let tool = crate::acp_permission::pretool_payload(&params)
+                    .map(|(t, _)| t)
+                    .unwrap_or_else(|| "(execute)".to_string());
+                let _ = fence
+                    .tx
+                    .send(Command::EmitEvent(CoreEvent::WorkerToolCallDenied {
+                        session: fence.run_id.clone(),
+                        ord: fence.ord,
+                        attempt: fence.attempt,
+                        cli: fence.cli.clone(),
+                        carrier: "acp".to_string(),
+                        role: crate::write_posture::role_wire(fence.role).to_string(),
+                        tool: tool.clone(),
+                        command: command.clone(),
+                        reason: reason.clone(),
+                        remedy: crate::remote_write_fence::REMEDY.to_string(),
+                    }));
+                eprintln!(
+                    "wicked-core: DENY (remote-write fence, {} unit {} on '{}'): `{command}` — {}",
+                    crate::write_posture::role_wire(fence.role),
+                    fence.ord,
+                    fence.cli,
+                    crate::remote_write_fence::REMEDY
+                );
+                let note =
+                    format!("\n[wicked-core] refused tool call `{tool}` (`{command}`): {reason}\n");
+                if output.len() + note.len() <= max_out {
+                    output.push_str(&note);
+                }
+                respond_or_note(
+                    stdin,
+                    write_lock,
+                    &req_id,
+                    crate::acp_permission::reject_result(&params),
+                    "a permission request (remote-write fence)",
+                    output,
+                    max_out,
+                );
+                return;
+            }
+        }
         if let Some(call) = crate::acp_permission::write_class_call(&params) {
             if let Err(reason) = fence.judge(&call) {
                 let _ = fence
@@ -4384,6 +4439,18 @@ pub(crate) mod fallback_kind {
     /// governed ACP claude session fails its FIRST prompt by construction. Named so the seat
     /// health surface and operators see AUTH, not a generic session death.
     pub const AUTH_REQUIRED: &str = "auth_required";
+    /// (F-7R2-019, wave 6) The ACP handshake's `authenticate` call itself FAILED and
+    /// `session/new` was then refused as unauthenticated — the seat's stored credentials are
+    /// absent or invalid. Named so the studio and the bench see AUTH, not a missing binary: the
+    /// Phase 7 re-run reported pi as `binary_unavailable` while `pi-acp` was on PATH and the
+    /// cause was a 401. NO single-shot wrapped fallback follows any auth kind — it runs under
+    /// the same worker home and fails the same way; the unit fails with the named reason and
+    /// the actor benches the seat.
+    pub const AUTH_FAILED: &str = "auth_failed";
+    /// (F-7R2-019) `session/new` was refused as unauthenticated after `authenticate` succeeded
+    /// (or no auth method was advertised at all) — the agent is signed out. Same no-fallback
+    /// rule as [`AUTH_FAILED`].
+    pub const UNAUTHENTICATED: &str = "unauthenticated";
     pub const HTTP_UNIMPLEMENTED: &str = "http_unimplemented";
     /// A governed claude unit, routed to the wrapped path on purpose. Not a failure — nothing broke
     /// — but it IS a behaviour change the operator has to be able to see: the unit runs single-shot
@@ -4409,6 +4476,55 @@ pub(crate) mod fallback_kind {
 /// Operator messages queued per run for next-turn delivery: `(original target, message)`.
 type InjectQueue = Arc<Mutex<HashMap<String, Vec<(crate::command::InjectTarget, String)>>>>;
 
+/// (F-7R2-019) `(run_id, cli_key)` sessions whose STARTUP failed on AUTHENTICATION — a later
+/// turn on the same key answers with the same refusal instead of the wrapped fallback (which
+/// `SessionProbe::FailedStartup` would otherwise take). Pruned with the run's sessions.
+type AuthFailedSessions = Arc<Mutex<HashSet<(String, String)>>>;
+
+/// (F-7R2-019) Classify a session-startup error as an AUTHENTICATION failure, by the named
+/// errors the handshake produces ([`unauthenticated_error`]) — `Some(kind)` is one of
+/// [`fallback_kind::AUTH_FAILED`] / [`fallback_kind::UNAUTHENTICATED`]; `None` is any other
+/// startup failure (missing binary, handshake timeout, …), which keeps its `binary_unavailable`
+/// slug and its single-shot fallback. Matched on the handshake's own sentences, not on a
+/// seat's free text, so a worker that merely PRINTS "unauthenticated" in its output is not
+/// misfiled here (the actor's bench classifies worker output separately).
+pub(crate) fn auth_failure_kind(startup_error: &str) -> Option<&'static str> {
+    if startup_error.contains("is still unauthenticated after `authenticate`")
+        || startup_error.contains("requires authentication but advertised no authMethods")
+    {
+        return Some(fallback_kind::UNAUTHENTICATED);
+    }
+    if startup_error.contains("requires authentication: `authenticate`") {
+        return Some(fallback_kind::AUTH_FAILED);
+    }
+    None
+}
+
+/// The [`StepOutput`] for a unit whose seat REFUSED authentication (F-7R2-019): nothing ran, no
+/// fallback was attempted, and the reason carries the seat's own refusal so the actor's bench
+/// (`SeatFailureReason::classify`) and the failover ladder act on it — the word `unauthenticated`
+/// is deliberately in the text.
+fn auth_refusal(input: &StepInput, cli_key: &str, kind: &str, why: &str) -> StepOutput {
+    let governed = false;
+    StepOutput {
+        run_id: input.run_id.clone(),
+        unit_ix: input.unit_ix,
+        attempt: input.attempt,
+        output: format!(
+            "(seat '{cli_key}' is unauthenticated — {kind}: {why}; no single-shot fallback was \
+             attempted, an authentication failure fails the same way on the wrapped carrier — sign \
+             the seat in, or let the run fail over to an eligible seat)"
+        ),
+        status: StepStatus::Failed,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        // Nothing ran and no gate was armed for a launch that never happened (the same truth
+        // `execute_wrapped::skills_refusal` tells the fold), so the fold is told exactly that.
+        governed,
+    }
+}
+
 pub struct AcpStepRunner {
     /// Back-channel to the actor's single emit point (relay via `Command::EmitEvent`).
     tx: std::sync::mpsc::Sender<Command>,
@@ -4418,6 +4534,8 @@ pub struct AcpStepRunner {
     /// (the ACP inject path — there is no PTY to write into mid-turn). Keyed by run_id;
     /// drained in [`AcpStepRunner::exec_turn`], pruned with the run's sessions.
     pending_injects: InjectQueue,
+    /// (F-7R2-019) Session keys whose startup failed on authentication — see [`AuthFailedSessions`].
+    auth_failed: AuthFailedSessions,
     /// Last activity per CHAT id — set on open, on every ensure, and on every turn.
     ///
     /// Idleness is a property of the chat, not of a seat: `chat_close` reaps a whole chat, so that
@@ -4755,6 +4873,7 @@ impl AcpStepRunner {
             tx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_injects: Arc::new(Mutex::new(HashMap::new())),
+            auth_failed: Arc::new(Mutex::new(HashSet::new())),
             chat_activity: Arc::new(Mutex::new(HashMap::new())),
             chat_scopes: Arc::new(Mutex::new(HashMap::new())),
             chat_open_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -5453,6 +5572,10 @@ impl AcpStepRunner {
         // never by name from here.
         guard.retain(|(rid, _), _| rid != run_id);
         drop(guard);
+        self.auth_failed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(rid, _)| rid != run_id);
         self.write_reg
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -6052,6 +6175,27 @@ impl AcpStepRunner {
         // snapshot it was opened with (core#396) — see the binding below the match.
         let (proc_arc, reused): (Arc<Mutex<AcpProcess>>, bool) = match probe {
             SessionProbe::FailedStartup => {
+                // (F-7R2-019) A startup that failed on AUTHENTICATION answers every later turn
+                // with the same refusal — never the wrapped fallback, which would run under the
+                // same signed-out worker home.
+                let auth_failed = self
+                    .auth_failed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&session_key);
+                if auth_failed {
+                    let reason = format!(
+                        "[wicked-core] ACP seat '{cli_key}' failed authentication when its session \
+                         started; refusing the unit without a fallback (F-7R2-019)"
+                    );
+                    emit(&format!("{reason}\n"));
+                    return auth_refusal(
+                        input,
+                        &cli_key,
+                        fallback_kind::UNAUTHENTICATED,
+                        "the session's startup was refused as unauthenticated earlier in this run",
+                    );
+                }
                 return self.fallback.run_unit_streaming(input, emit);
             }
             SessionProbe::Live(arc) => (arc, true),
@@ -6196,14 +6340,43 @@ impl AcpStepRunner {
                         (result, !did_insert)
                     }
                     Err(e) => {
+                        {
+                            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+                            guard.entry(session_key.clone()).or_insert(None);
+                        } // release sessions lock before anything blocking
+                          // (F-7R2-019) An AUTHENTICATION refusal at startup is named as such —
+                          // `auth_failed` / `unauthenticated`, never `binary_unavailable` (the
+                          // Phase 7 re-run filed pi's 401 under a missing binary) — and takes NO
+                          // single-shot fallback: the wrapped carrier runs under the same
+                          // worker home and fails identically ("No API key found"), burning a
+                          // second refusal and a `governanceUnenforced` for nothing. The unit
+                          // fails with the seat's own words; the actor benches the seat.
+                        let startup_error = e.to_string();
+                        if let Some(kind) = auth_failure_kind(&startup_error) {
+                            self.auth_failed
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(session_key.clone());
+                            let reason = format!(
+                                "[wicked-core] ACP seat '{cli_key}' failed authentication \
+                                 ({kind}): {startup_error}; NOT falling back to the single-shot \
+                                 wrapped carrier — an authentication failure fails the same way \
+                                 there (F-7R2-019)"
+                            );
+                            eprintln!("{reason}");
+                            self.emit_event(CoreEvent::AcpFallback {
+                                session: run_id.clone(),
+                                cli_key: cli_key.clone(),
+                                reason: reason.clone(),
+                                fallback_kind: kind.to_string(),
+                            });
+                            emit(&format!("{reason}\n"));
+                            return auth_refusal(input, &cli_key, kind, &startup_error);
+                        }
                         let reason = format!(
                             "[wicked-core] ACP unavailable for '{cli_key}' ({e}); \
                              using single-shot fallback"
                         );
-                        {
-                            let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
-                            guard.entry(session_key.clone()).or_insert(None);
-                        } // release sessions lock before the blocking fallback call
                         self.emit_event(CoreEvent::AcpFallback {
                             session: run_id.clone(),
                             cli_key: cli_key.clone(),
@@ -6348,7 +6521,10 @@ impl AcpStepRunner {
         // admission (`AcpWritePosture`). Disclosed once per turn so the record says which posture
         // held. A `Full` unit (an unbound creator: crew's interactive seams; any code phase)
         // carries no fence — its boundary is the ordinary cwd + extra_write_roots.
-        let fence = write_posture.fences_writes().then(|| AcpWritePosture {
+        // Wave 6 (F-7R2-012): the struct rides EVERY unit session — `judge` no-ops for a `Full`
+        // posture, while the remote-write fence in `answer_permission_request` judges every
+        // seat's `execute` calls (`git push`, `gh pr create`, …) whatever the posture.
+        let fence = Some(AcpWritePosture {
             posture: write_posture,
             role: input.unit.role,
             run_id: run_id.clone(),
@@ -6529,21 +6705,38 @@ impl AcpStepRunner {
                 // crew#267: an auth refusal is NOT a session death — name it, so the operator's
                 // fix (restore worker auth) is visible instead of a generic bridge post-mortem.
                 let auth_required = is_auth_required_error(&e);
-                let (reason, kind) = if auth_required {
+                if auth_required {
+                    // (F-7R2-019) The turn was refused with `-32000 Authentication required`:
+                    // named AUTH, and NO single-shot fallback — the wrapped carrier runs under
+                    // the SAME worker home and needs the same sign-in, so it would only burn a
+                    // second refusal. The unit fails with the operator's one-time fix in its
+                    // output; the actor benches the seat for the run.
                     let home_hint = worker_config_home()
                         .map(|d| d.display().to_string())
                         .unwrap_or_else(|_| "~/.wicked-worker/claude".to_string());
-                    (
-                        format!(
-                            "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
-                             (crew#267). One-time fix: run \
-                             `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude login` yourself, then \
-                             every worker stays logged in. Using single-shot fallback meanwhile — \
-                             it runs under the SAME worker home, so it needs the same sign-in"
-                        ),
+                    let reason = format!(
+                        "[wicked-core] ACP worker for '{cli_key}' is NOT AUTHENTICATED \
+                         (crew#267). One-time fix: run `CLAUDE_CONFIG_DIR=\"{home_hint}\" claude \
+                         login` yourself, then every worker stays logged in. NOT falling back to \
+                         the single-shot wrapped carrier — it runs under the SAME worker home, so \
+                         it needs the same sign-in (F-7R2-019)"
+                    );
+                    eprintln!("{reason}");
+                    self.emit_event(CoreEvent::AcpFallback {
+                        session: run_id.clone(),
+                        cli_key: cli_key.clone(),
+                        reason: reason.clone(),
+                        fallback_kind: fallback_kind::AUTH_REQUIRED.to_string(),
+                    });
+                    emit(&format!("{reason}\n"));
+                    return auth_refusal(
+                        input,
+                        &cli_key,
                         fallback_kind::AUTH_REQUIRED,
-                    )
-                } else {
+                        "the turn was refused with -32000 Authentication required",
+                    );
+                }
+                let (reason, kind) = {
                     (
                         format!(
                             "[wicked-core] ACP error for '{cli_key}' ({e}); \
@@ -12710,6 +12903,7 @@ os_sandbox = true
             worktree_baseline: None,
             worktree_mutation: None,
             repo_checks_floor: false,
+            default_floor: false,
             repo_checks: None,
             status: crate::domain::UnitStatus::Pending,
         }
@@ -16633,5 +16827,342 @@ transport = "stdio"
         assert!(std::fs::symlink_metadata(home.join(".codex")).is_err());
         runner.drop_session("run-codex");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// F-7R2-012 (wave 6): the ACP permission bridge refuses a REMOTE-WRITING command for every
+    /// role and posture — a `Full`-posture creator included — answering the seat's reject option
+    /// and disclosing `workerToolCallDenied` with the command and the remedy; a read passes, and
+    /// a `Full` posture still lets write-class calls through to the ordinary answer.
+    #[test]
+    fn the_permission_bridge_refuses_a_remote_write_command_for_every_posture() {
+        use serde_json::json;
+        let frame = |tool: &str, kind: &str, input: serde_json::Value, id: u64| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s",
+                    "toolName": tool,
+                    "toolCall": {"toolCallId": "tc", "kind": kind, "title": "call", "rawInput": input},
+                    "options": [
+                        {"optionId": "allow", "kind": "allow_once"},
+                        {"optionId": "reject", "kind": "reject_once"},
+                    ],
+                },
+            })
+        };
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            let line = written
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response frame written");
+            serde_json::from_str(line).unwrap()
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let full = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::Full,
+            role: crate::workflow::PhaseRole::Creator,
+            run_id: "run-1".into(),
+            ord: 7,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: "build".into(),
+            cwd: std::path::PathBuf::from("/wt"),
+            deliverable_roots: vec![],
+            home: None,
+            tx,
+        };
+        let lock = std::sync::Mutex::new(());
+
+        // 1. The observed spelling (run b86c14c1, unit 7): REFUSED + disclosed, with the remedy.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&full),
+            &frame(
+                "Bash",
+                "execute",
+                json!({"command": "git push -u origin wicked/run-1"}),
+                1,
+            ),
+            &mut output,
+            4096,
+        );
+        let v = answer_of(&sink);
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["result"]["outcome"]["optionId"], "reject", "{v}");
+        assert!(
+            output.contains("refused tool call `Bash`") && output.contains("deliver phase"),
+            "the turn output names the refusal and the remedy: {output}"
+        );
+        match rx.try_recv() {
+            Ok(crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::WorkerToolCallDenied {
+                    session,
+                    ord,
+                    cli,
+                    carrier,
+                    role,
+                    tool,
+                    command,
+                    reason,
+                    remedy,
+                    ..
+                },
+            )) => {
+                assert_eq!(
+                    (session.as_str(), ord, cli.as_str()),
+                    ("run-1", 7, "claude")
+                );
+                assert_eq!(
+                    (carrier.as_str(), role.as_str(), tool.as_str()),
+                    ("acp", "creator", "Bash")
+                );
+                assert_eq!(command, "git push -u origin wicked/run-1");
+                assert!(reason.contains("`git push`"), "{reason}");
+                assert_eq!(remedy, crate::remote_write_fence::REMEDY);
+            }
+            Ok(crate::command::Command::EmitEvent(other)) => {
+                panic!("expected workerToolCallDenied, got {other:?}")
+            }
+            Ok(_) => panic!("expected an EmitEvent command"),
+            Err(e) => panic!("no denial event was sent: {e}"),
+        }
+
+        // 2. `gh pr create` through pi's `bash` with no ACP kind: refused by tool name.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&full),
+            &frame(
+                "bash",
+                "other",
+                json!({"command": "cd /wt && gh pr create --fill"}),
+                2,
+            ),
+            &mut output,
+            4096,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "reject");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::WorkerToolCallDenied { .. }
+            ))
+        ));
+
+        // 3. A read passes to the ordinary answer (no gate, no chat boundary ⇒ permitted).
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&full),
+            &frame(
+                "Bash",
+                "execute",
+                json!({"command": "gh pr view 1 --json state"}),
+                3,
+            ),
+            &mut output,
+            4096,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
+        assert!(rx.try_recv().is_err(), "no denial event for a read");
+
+        // 4. A `Full` posture fences no write-class call: the fence rides every unit session
+        //    now, and `judge` is a no-op for it — the edit reaches the ordinary answer.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&full),
+            &frame("Edit", "edit", json!({"file_path": "/wt/src/a.rs"}), 4),
+            &mut output,
+            4096,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
+        assert!(
+            rx.try_recv().is_err(),
+            "a Full-posture creator's edit is not a denial"
+        );
+    }
+
+    /// F-7R2-019 (wave 6): the auth fallback kinds are classified from the handshake's OWN named
+    /// errors — in lockstep with `unauthenticated_error`, and surviving the stderr context the
+    /// handshake wrapper appends — and the refusal handed to the unit carries the word the
+    /// actor's bench classifies on. A missing binary keeps `binary_unavailable`.
+    #[test]
+    fn auth_failure_kinds_are_in_lockstep_with_the_named_handshake_errors() {
+        let refusal = anyhow::anyhow!("ACP server error: {{\"code\":-32000}}");
+        let methods = vec!["method-a".to_string()];
+        let still = super::unauthenticated_error(
+            "pi-acp",
+            &methods,
+            Some(&("method-a".to_string(), None)),
+            &refusal,
+        );
+        assert_eq!(
+            super::auth_failure_kind(&still.to_string()),
+            Some(super::fallback_kind::UNAUTHENTICATED)
+        );
+        let failed = super::unauthenticated_error(
+            "pi-acp",
+            &methods,
+            Some(&("method-a".to_string(), Some(anyhow::anyhow!("nope")))),
+            &refusal,
+        );
+        assert_eq!(
+            super::auth_failure_kind(&failed.to_string()),
+            Some(super::fallback_kind::AUTH_FAILED)
+        );
+        let none = super::unauthenticated_error("pi-acp", &[], None, &refusal);
+        assert_eq!(
+            super::auth_failure_kind(&none.to_string()),
+            Some(super::fallback_kind::UNAUTHENTICATED)
+        );
+        assert_eq!(
+            super::auth_failure_kind(&format!("{still}; stderr: pi-acp: 401 Unauthorized")),
+            Some(super::fallback_kind::UNAUTHENTICATED),
+            "the handshake wrapper appends stderr context after the named error"
+        );
+        assert_eq!(
+            super::auth_failure_kind("ACP unavailable for 'pi' (No such file or directory)"),
+            None,
+            "a missing binary is not an auth failure"
+        );
+        // The refusal the unit gets back: FAILED, no fallback, and classifiable as not-logged-in.
+        let input = crate::workflow::StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: crate::domain::WorkUnit::pending("r:u1", "r", 1, "do"),
+            workflow_id: "wf".into(),
+            entity_mode: crate::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out = super::auth_refusal(
+            &input,
+            "pi",
+            super::fallback_kind::UNAUTHENTICATED,
+            &still.to_string(),
+        );
+        assert_eq!(out.status, StepStatus::Failed);
+        assert!(
+            out.output.contains("no single-shot fallback"),
+            "{}",
+            out.output
+        );
+        assert_eq!(
+            wicked_council::types::SeatFailureReason::classify(&out.output, ""),
+            Some(wicked_council::types::SeatFailureReason::NotLoggedIn),
+            "the actor benches the seat from these words: {}",
+            out.output
+        );
+    }
+
+    /// Review of #449 (FN-1/FN-2/FN-3): every bypass spelling the review reproduced is refused by
+    /// the ACP permission bridge for a `Full`-posture creator — as a string command, and (the
+    /// codex `shell` shape) as an argv ARRAY — each answered with the reject option and disclosed.
+    #[test]
+    fn every_review_bypass_string_is_refused_by_the_acp_bridge() {
+        use serde_json::json;
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let full = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::Full,
+            role: crate::workflow::PhaseRole::Creator,
+            run_id: "run-1".into(),
+            ord: 7,
+            attempt: 0,
+            cli: "codex".into(),
+            phase: "build".into(),
+            cwd: std::path::PathBuf::from("/wt"),
+            deliverable_roots: vec![],
+            home: None,
+            tx,
+        };
+        let lock = std::sync::Mutex::new(());
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            let line = written
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response frame written");
+            serde_json::from_str(line).unwrap()
+        };
+        for (i, cmd) in crate::remote_write_fence::REVIEW_BYPASS_STRINGS
+            .iter()
+            .enumerate()
+        {
+            for shape in ["string", "argv"] {
+                let raw_input = if shape == "string" {
+                    json!({"command": cmd})
+                } else {
+                    // codex-acp's `shell`: the seat's shell receives the command as ONE `-lc`
+                    // script element.
+                    json!({"command": ["bash", "-lc", cmd]})
+                };
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": i,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "s",
+                        "toolCall": {"toolCallId": "tc", "name": "shell", "kind": "execute", "title": "Run command", "rawInput": raw_input},
+                        "options": [
+                            {"optionId": "allow", "kind": "allow_once"},
+                            {"optionId": "reject", "kind": "reject_once"},
+                        ],
+                    },
+                });
+                let mut sink: Vec<u8> = Vec::new();
+                let mut output = String::new();
+                super::answer_permission_request(
+                    &mut sink,
+                    &lock,
+                    None,
+                    None,
+                    Some(&full),
+                    &frame,
+                    &mut output,
+                    8192,
+                );
+                let v = answer_of(&sink);
+                assert_eq!(
+                    v["result"]["outcome"]["optionId"], "reject",
+                    "not refused on the ACP bridge ({shape}): {cmd} → {v}"
+                );
+                assert!(
+                    matches!(
+                        rx.try_recv(),
+                        Ok(crate::command::Command::EmitEvent(
+                            crate::event::CoreEvent::WorkerToolCallDenied { .. }
+                        ))
+                    ),
+                    "no workerToolCallDenied for ({shape}): {cmd}"
+                );
+            }
+        }
     }
 }

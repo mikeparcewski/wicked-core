@@ -1219,6 +1219,45 @@ fn eligible_agent_seats<'a>(
     }
 }
 
+/// (F-7R2-005, wave 6) Is there an IDENTITY-DISTINCT, usable judge seat in `roster` for a work
+/// author in `excluded_keys`? The DEFAULT judge (a unit that changed the tree without a pinned
+/// validator) runs ONLY when this holds: [`agent_validate`]'s single-runner fallback would grade
+/// a claude creator's work under claude — a self-grade — so instead the gate is marked
+/// `ungated` with the reason. Pure; the same walk `agent_validate` rotates over.
+pub(crate) fn distinct_judge_available(excluded_keys: &[&str], roster: &[AgenticCli]) -> bool {
+    !eligible_agent_seats(excluded_keys, roster).is_empty()
+}
+
+/// Chars of the unit description the default criterion quotes (a free-text unit's description
+/// can be a whole brief).
+const DEFAULT_CRITERION_DESCRIPTION_CHARS: usize = 600;
+
+/// (F-7R2-005) The criterion the DEFAULT judge applies to a unit that changed the worktree
+/// without a pinned validator: the change accomplishes the unit's stated task, the harness-stated
+/// worktree evidence backs the account, nothing unrelated or destructive rode along, and no
+/// claim of testing is taken on the seat's word. Authored here, not by the seat, so the judge
+/// never grades against a criterion the work's author wrote.
+pub(crate) fn default_judge_criterion(unit: &WorkUnit) -> String {
+    let mut description: String = unit
+        .description
+        .trim()
+        .chars()
+        .take(DEFAULT_CRITERION_DESCRIPTION_CHARS)
+        .collect();
+    if unit.description.trim().chars().count() > DEFAULT_CRITERION_DESCRIPTION_CHARS {
+        description.push_str(" […]");
+    }
+    format!(
+        "The WORK accomplishes the unit's stated task — \"{description}\" — as a coherent, \
+         reviewable change to the repository. Judge against the harness-stated WORKTREE EVIDENCE \
+         (uncommitted changes and run-branch commits), not the account alone: the changed files \
+         match what the account claims was done; nothing unrelated, destructive or out of scope \
+         rode along; any claim that tests or checks were run is backed by that evidence rather \
+         than asserted; and the unit did not push, open or edit a pull request itself (delivery \
+         belongs to the run's deliver phase)."
+    )
+}
+
 /// A run id unique to ONE `agent_validate` call.
 ///
 /// ACP sessions are keyed by `(run_id, cli_key)` and a session is a live CLI process holding
@@ -1257,10 +1296,56 @@ pub fn agent_validate(
     roster: &[AgenticCli],
     runner: &dyn StepRunner,
 ) -> anyhow::Result<AgentVerdict> {
+    agent_validate_with_refusals(criterion, work, excluded_seats, roster, runner).0
+}
+
+/// [`agent_validate`], also reporting every `(seat key, output tail)` the rotation passed over
+/// because the seat REFUSED to run (review of #449, RT-1) — the caller classifies an
+/// authentication refusal and benches the seat for the run, so the next unit's judge does not
+/// re-try it. The verdict half is byte-identical to `agent_validate`'s.
+pub(crate) fn agent_validate_with_refusals(
+    criterion: &str,
+    work: &str,
+    excluded_seats: &[&str],
+    roster: &[AgenticCli],
+    runner: &dyn StepRunner,
+) -> (anyhow::Result<AgentVerdict>, Vec<(String, String)>) {
+    let refused: std::cell::RefCell<Vec<(String, String)>> = std::cell::RefCell::new(Vec::new());
+    let verdict = agent_validate_inner(
+        criterion,
+        work,
+        excluded_seats,
+        roster,
+        runner,
+        &|seat, out| {
+            refused
+                .borrow_mut()
+                .push((seat.to_string(), out.to_string()));
+        },
+    );
+    (verdict, refused.into_inner())
+}
+
+fn agent_validate_inner(
+    criterion: &str,
+    work: &str,
+    excluded_seats: &[&str],
+    roster: &[AgenticCli],
+    runner: &dyn StepRunner,
+    on_refusal: &dyn Fn(&str, &str),
+) -> anyhow::Result<AgentVerdict> {
     // Teardown must happen on EVERY exit — verdict, rotation-exhausted bail, cancellation. Compute
     // first, release after, so no `?` or `bail!` can skip it and leak a CLI process.
     let run_id = validator_run_id();
-    let out = agent_validate_in(&run_id, criterion, work, excluded_seats, roster, runner);
+    let out = agent_validate_in(
+        &run_id,
+        criterion,
+        work,
+        excluded_seats,
+        roster,
+        runner,
+        on_refusal,
+    );
     runner.on_run_complete(&run_id);
     out
 }
@@ -1272,6 +1357,7 @@ fn agent_validate_in(
     excluded_seats: &[&str],
     roster: &[AgenticCli],
     runner: &dyn StepRunner,
+    on_refusal: &dyn Fn(&str, &str),
 ) -> anyhow::Result<AgentVerdict> {
     // The reply must commit TWICE — opening line and FINAL line, the same word both times. A model
     // that reasons its way to the other answer has to change both, and one that changes neither but
@@ -1340,6 +1426,7 @@ fn agent_validate_in(
             // so this arm covers both. That is the safe side: a seat that produced no parseable
             // output rendered no judgment, and the combine rule still means only a real PASS passes.
             StepStatus::Failed => {
+                on_refusal(&seat.key, out.output.trim());
                 refusals.push(format!("{} ({})", seat.key, out.output.trim()));
             }
             // Elicitation is not expected on a validator seat (no interactive human path exists);
@@ -2836,6 +2923,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            health: None,
         }
     }
 
@@ -3529,5 +3617,56 @@ mod triage_parse_tests {
             parse_triage_decision("DECISION: MAYBE\nunsure").0,
             TriageDecision::Escalate(_)
         ));
+    }
+
+    /// F-7R2-005 (wave 6): the default judge runs only when an identity-distinct seat exists —
+    /// the same walk the rotation takes — and its criterion quotes the task, demands the harness
+    /// evidence, and forbids self-delivery.
+    #[test]
+    fn distinct_judge_availability_mirrors_the_rotation_and_the_default_criterion_demands_evidence()
+    {
+        use crate::validator::{default_judge_criterion, distinct_judge_available};
+        use wicked_council::{Category, Confidence, InputMode};
+        let seat = |key: &str, invocation: &str| crate::AgenticCli {
+            key: key.into(),
+            display_name: key.into(),
+            binary: "unused".into(),
+            headless_invocation: invocation.into(),
+            category: Category::default(),
+            input_mode: InputMode::default(),
+            version_probe: vec![],
+            trust_flags: vec![],
+            alt_binaries: vec![],
+            confidence: Confidence::default(),
+            enabled_for_council: true,
+            acp: None,
+            capabilities: None,
+            login_invocation: None,
+            health: None,
+        };
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        assert!(distinct_judge_available(&["claude"], &roster));
+        assert!(!distinct_judge_available(&["claude", "codex"], &roster));
+        assert!(
+            !distinct_judge_available(&["claude"], &roster[..1]),
+            "a lone creator seat has no distinct judge"
+        );
+        let mut unit = crate::WorkUnit::pending("s:u1", "s", 1, "Add a note file to the repo.");
+        let criterion = default_judge_criterion(&unit);
+        assert!(
+            criterion.contains("\"Add a note file to the repo.\""),
+            "{criterion}"
+        );
+        assert!(criterion.contains("WORKTREE EVIDENCE"), "{criterion}");
+        assert!(criterion.contains("deliver phase"), "{criterion}");
+        unit.description = "x".repeat(2_000);
+        let long = default_judge_criterion(&unit);
+        assert!(
+            long.contains("[…]") && long.len() < 1_500,
+            "a brief-sized description is bounded"
+        );
     }
 }

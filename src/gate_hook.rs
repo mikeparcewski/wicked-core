@@ -368,6 +368,18 @@ pub(crate) fn boundary_denial_with(
     // which this codebase does not yet have. This closes the DIRECT, common escapes the finding names.
     if tool == "Bash" {
         if let Some(command) = context.get("command").and_then(serde_json::Value::as_str) {
+            // REMOTE-WRITE FENCE (F-7R2-012, wave 6): a `git push` / `gh pr create|merge|edit|
+            // comment` / `gh api` mutation / `gh release` from a worker seat is refused whatever
+            // path it names — delivery is the deliver phase's job. Judged on every segment of the
+            // command (`cd x && git -C x push`, `sh -c 'gh pr create …'`), not on its prefix, so
+            // the claude deny rules' blind spots are covered on the carriers that see the text.
+            // ADVISORY (`fatal: false`): blocked and audited, the seat is told the remedy and
+            // continues — the unit is not failed for asking. `evaluate_tool_call` recognises the
+            // reason's prefix and records it under its own claim id so the fold can disclose
+            // `workerToolCallDenied` with the command and the remedy.
+            if let Some(hit) = crate::remote_write_fence::remote_write_command(command) {
+                return Some((hit.reason(), false));
+            }
             for target in bash_write_targets(command) {
                 if let Err(d) = crate::path_policy::check(&target, roots, true, cwd, home) {
                     // A shell write into the SYSTEM temp is the same benign-scratch class as
@@ -977,7 +989,18 @@ pub(crate) fn evaluate_tool_call(
         // not failed for it (P8 #10 / core#219). `fatal` comes from the boundary check itself so a
         // Bash write-escape (FINDING-045) is fatal even though "Bash" is not in WRITE_TOOLS. See
         // `boundary_denial` / `append_boundary_deny`.
-        append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
+        // A REMOTE-WRITE refusal (F-7R2-012) is recorded under its own claim id, with the command
+        // segment beside the reason, so the gate fold can disclose it as `workerToolCallDenied`
+        // (`collect_hook_decisions` surfaces both) — advisory like a blocked read.
+        if reason.starts_with(REMOTE_WRITE_REASON_PREFIX) {
+            let command = context
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            append_remote_write_deny(decisions_path, scope, phase, &reason, command);
+        } else {
+            append_boundary_deny(decisions_path, scope, phase, &reason, fatal);
+        }
         eprintln!("wicked-governance: DENY ({reason})");
         return 2;
     }
@@ -1439,6 +1462,45 @@ fn append_phase_scope_deny(decisions_path: &str, scope: &str, phase: &str, reaso
 /// Either way the caller has already exited 2 — the tool-call is blocked. The `reason` carries the
 /// accurate `(write)`/`(read)` from the boundary `Denial`, so an advisory WRITE is still honestly
 /// described even though it shares the advisory prefix a read uses (the fold keys on that prefix).
+/// (F-7R2-012) Claim-id prefix of a REMOTE-WRITE refusal — a worker seat's `git push` / `gh pr
+/// create` / `gh api` mutation refused by the command filter
+/// ([`crate::remote_write_fence::remote_write_command`]). Advisory (the call is blocked, the seat
+/// continues with the remedy), recorded by [`BOUNDARY_EVALUATOR`] like the read denies, and the
+/// one claim shape the fold turns into a `workerToolCallDenied` event.
+pub(crate) const REMOTE_WRITE_DENY_PREFIX: &str = "remote-write-deny:";
+
+/// The leading text every remote-write refusal reason carries
+/// (`RemoteWriteHit::reason`), by which `evaluate_tool_call` routes it to
+/// [`append_remote_write_deny`] instead of the boundary recorder.
+pub(crate) const REMOTE_WRITE_REASON_PREFIX: &str = "remote-write fence:";
+
+/// Record a remote-write refusal: `obligations[0]` is the reason (with the remedy), `obligations[1]`
+/// the OFFENDING COMMAND, so the fold can name what the seat tried without re-parsing prose.
+fn append_remote_write_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    reason: &str,
+    command: &str,
+) {
+    let claim = ConformanceClaim {
+        claim_id: format!("{REMOTE_WRITE_DENY_PREFIX}{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec![],
+        decision: Decision::Deny,
+        obligations: vec![reason.to_string(), command.to_string()],
+        evaluated_context_ref: "sha256:remote-write-fence".to_string(),
+        criteria: format!(
+            "remote-write fence (advisory: blocked, worker continues; delivery is the deliver \
+             phase's job): {reason}"
+        ),
+        evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    let _ = append_decision(Path::new(decisions_path), &claim);
+}
+
 fn append_boundary_deny(decisions_path: &str, scope: &str, phase: &str, reason: &str, fatal: bool) {
     let (prefix, criteria) = if fatal {
         (
@@ -1484,8 +1546,12 @@ fn is_advisory_deny(claim: &ConformanceClaim) -> bool {
     if claim.decision != Decision::Deny {
         return false;
     }
+    // A refused `git push` / `gh pr create` (F-7R2-012) joins the blocked read here: the push
+    // never happened, the seat was handed the remedy — prevention, not a violation to fail the
+    // unit for.
     (claim.evaluator_identity == BOUNDARY_EVALUATOR
-        && claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX))
+        && (claim.claim_id.starts_with(BOUNDARY_READ_DENY_PREFIX)
+            || claim.claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX)))
         || (claim.evaluator_identity == PHASE_SCOPE_EVALUATOR
             && claim.claim_id.starts_with(PHASE_SCOPE_DENY_PREFIX))
 }
@@ -1524,6 +1590,26 @@ pub struct HookDecisionRecord {
     /// The first policy id that denied, when `decision == "deny"`. `None` when allowed (or when
     /// the deny came from an infra/corruption path with no policy ids).
     pub denying_policy: Option<String>,
+    /// The recording claim's id — its PREFIX names the recorder (`boundary-deny:`,
+    /// `remote-write-deny:`, `phase-scope-deny:`, a policy claim's own id).
+    pub claim_id: String,
+    /// The claim's `obligations` — for a deny, `[0]` is the operator-facing reason; a
+    /// remote-write refusal (F-7R2-012) carries the offending command at `[1]`.
+    pub obligations: Vec<String>,
+}
+
+impl HookDecisionRecord {
+    /// (F-7R2-012) Whether this record is a remote-write refusal the fold discloses as
+    /// `workerToolCallDenied`: `(reason, command)` when it is.
+    pub fn remote_write_refusal(&self) -> Option<(String, String)> {
+        if self.decision != "deny" || !self.claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX) {
+            return None;
+        }
+        Some((
+            self.obligations.first().cloned().unwrap_or_default(),
+            self.obligations.get(1).cloned().unwrap_or_default(),
+        ))
+    }
 }
 
 /// Collect the per-tool-call hook decisions for `(run_id, attempt, phase)` from the decisions
@@ -1601,6 +1687,8 @@ pub fn collect_hook_decisions(run_id: &str, attempt: u32, phase: &str) -> Vec<Ho
                 .unwrap_or_else(|| "(unknown)".to_string()),
             decision: decision_str.to_string(),
             denying_policy,
+            claim_id: claim.claim_id,
+            obligations: claim.obligations,
         });
     }
     records
@@ -4260,5 +4348,109 @@ mod phase_scope_tests {
             acp.contains("pre_build_scope: input.unit.pre_build_scope"),
             "the ACP runner no longer carries the unit's phase scope into its BoundaryCtx"
         );
+    }
+
+    /// F-7R2-012 (wave 6): a worker seat's `git push` / `gh pr create` is refused by the Bash
+    /// command filter — ADVISORY (blocked, the seat continues with the remedy), recorded under
+    /// its own claim id so the fold discloses `workerToolCallDenied` with the command, and the
+    /// allowlist reads it as advisory (never a unit denial). Reads and local git pass.
+    #[test]
+    fn a_remote_write_command_is_refused_advisory_with_the_remedy_and_disclosed_to_the_fold() {
+        let wt =
+            std::env::temp_dir().join(format!("wicked-remote-write-wt-{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let judge = |command: &str| {
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": command }),
+                "Bash",
+            )
+        };
+        let (reason, fatal) =
+            judge("cd /wt && git push -u origin wicked/run").expect("a push is refused");
+        assert!(!fatal, "advisory: the seat continues with the remedy");
+        assert!(reason.starts_with(REMOTE_WRITE_REASON_PREFIX), "{reason}");
+        assert!(
+            reason.contains(crate::remote_write_fence::REMEDY),
+            "{reason}"
+        );
+        assert!(
+            judge("gh pr create --fill").is_some(),
+            "a PR opened from a seat is refused"
+        );
+        assert!(
+            judge("gh pr view 258 --json state").is_none(),
+            "a read passes"
+        );
+        assert!(
+            judge("git add -A && git commit -qm x").is_none(),
+            "a local commit passes"
+        );
+
+        // The record the hook writes, and what the fold reads back from it.
+        let run_id = format!("remote-write-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker(&p, "unit-7").unwrap();
+        let command = "cd /wt && git push -u origin wicked/run";
+        append_remote_write_deny(p.to_str().unwrap(), "wf/unit-7", "unit-7", &reason, command);
+        let recs = collect_hook_decisions(&run_id, 0, "unit-7");
+        let (rec_reason, rec_command) = recs
+            .iter()
+            .find_map(|r| r.remote_write_refusal())
+            .expect("the fold sees the refusal");
+        assert_eq!(rec_command, command);
+        assert!(rec_reason.contains("`git push`"), "{rec_reason}");
+        assert!(recs[0].claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX));
+        // The claim itself is ADVISORY by the allowlist — prevention, not a violation.
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let claim: ConformanceClaim = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<ConformanceClaim>(l).ok())
+            .next()
+            .expect("one conformance claim recorded");
+        assert!(is_advisory_deny(&claim), "{claim:?}");
+        assert_eq!(claim.obligations.get(1).map(String::as_str), Some(command));
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// Review of #449 (FN-1/FN-2): every bypass spelling the review reproduced is refused by the
+    /// WRAPPED carrier's Bash arm — advisory, with the remedy — and nothing in the corpus is
+    /// mistaken for a path question.
+    #[test]
+    fn every_review_bypass_string_is_refused_by_the_gate_hook() {
+        let wt =
+            std::env::temp_dir().join(format!("wicked-remote-write-corpus-{}", std::process::id()));
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        for cmd in crate::remote_write_fence::REVIEW_BYPASS_STRINGS {
+            let verdict = boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            );
+            let (reason, fatal) = verdict.unwrap_or_else(|| panic!("not refused: {cmd}"));
+            assert!(!fatal, "advisory, the seat continues: {cmd}");
+            assert!(
+                reason.starts_with(REMOTE_WRITE_REASON_PREFIX)
+                    && reason.contains(crate::remote_write_fence::REMEDY),
+                "{cmd}: {reason}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&wt);
     }
 }

@@ -14,6 +14,119 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Added
+- **Wave 6 — the governed testing journey (acceptance findings F-7R2-005/006/012/013/019).**
+  - **Worker remote-write fence (F-7R2-012).** A worker seat opened wicked-studio PR #258 from
+    its own shell (`git push`, `gh pr create`) on the daemon's ambient `gh` login; the ledger
+    recorded `delivery: "none"`. Delivery is the deliver phase's job. Three layers, one module
+    (`src/remote_write_fence.rs`): (1) claude Bash deny rules spelled as the CLI enforces them
+    (`Bash(git push:*)`, `Bash(gh pr create:*)`, `Bash(gh api:*)`, `Bash(gh release:*)`, …) joined
+    into every Bash deny list — the shared worker `settings.json`, each per-session file and ACP
+    `session/new` options, the council ballot; (2) a segment-wise command filter on both carriers
+    that see the command text — the wrapped carrier's `PreToolUse` gate hook and the ACP
+    permission bridge — refusing `cd x && git -C x push`, `sh -c 'gh pr create …'`, `gh api -X
+    POST …` while letting `gh pr view`, `gh api` GETs and local git through; a refusal is ADVISORY
+    (one tool call, not the unit), answered with the remedy and disclosed as
+    **`workerToolCallDenied` {session, ord, attempt, cli, carrier, role, tool, command, reason,
+    remedy}** plus a log line — DENY-DOMINATES on git (independent review of #449, FN-1/FN-2): a
+    `git` verb not in the builtin allow-list is refused as a possible alias, `-c`/`--config-env`/
+    `GIT_CONFIG_*`/`git config` overrides of `alias.*`, `url.*`, `remote.*`, `credential.*`,
+    `core.sshCommand`… are refused before the verb is read, `gh alias` is refused whole, and the
+    parser reads `bash -e -c`, `gh pr -R o/r create`, `gh api -XPOST`, unquoted `cmd /c`,
+    `timeout -k`, array-valued ACP commands (codex `shell`) and prose titles — and, after the r2
+    review's live-git corpus, `bash -euo pipefail -c`, `bash -c -e`, `busybox sh -c`, a DECODED
+    PowerShell `-EncodedCommand` (UTF-16LE base64; an undecodable payload is refused), `env -i`,
+    `script -c`, `git subtree push`, `init.templateDir`, `gh ssh-key|gpg-key add`, `gh codespace
+    create`, `gh extension install`, and every plaintext credential read (`git credential`,
+    `git credential-store|cache|osxkeychain|…`, `gh auth token`, `gh auth status --show-token`);
+    (3) every seat spawn (wrapped, ACP, ballot — the inherit hatch included) strips the
+    `GH_*`/`GITHUB_*` tokens AND `SSH_AUTH_SOCK`/`GIT_SSH*`/`GIT_ASKPASS`/`GIT_CONFIG_*`/
+    `GIT_EXEC_PATH`/`GIT_ALLOW_PROTOCOL`, aims `GH_CONFIG_DIR` at an engine-owned credential-less
+    directory, sets `GIT_CONFIG_NOSYSTEM=1`, re-points `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` at
+    seat-owned files that COPY the operator's identity and presentation keys (`user.*`,
+    `core.editor`, `diff.*`, `color.*`, `filter.*`, … — never `[include]` their file, never
+    `url.*`/`remote.*`/`credential.*`/`alias.*`/`include*`/`core.sshCommand`/`http.*`/
+    `protocol.*`/`init.templateDir`; the r2 review reproduced an operator `url."git@github.com:".
+    pushInsteadOf` riding in through the include and sending a fenced https push to ssh) and
+    RESET credential helpers and askpass, replaces git's ssh with a program that does not exist
+    (`GIT_SSH_COMMAND` and `core.sshCommand` = `wicked-nopush-ssh`), refuses the ssh, git and
+    ext transports outright (`protocol.<name>.allow = never` — the only way to reach the
+    scp-like `user@host:` and bare `host:` remotes no URL prefix enumerates), and carries a push
+    kill on every URL-form transport with `-c` precedence (`url.wicked-nopush://.pushInsteadOf`
+    for https/http/`ssh://`/git/`git@`/`file://`/absolute and Windows paths). Exactly what layer
+    3 guarantees: a `git` running with the seat's environment intact cannot push anywhere —
+    https, `ssh://`, `git@host:`, `user@host:`, `host:`, `git://`, `file://`, a path — whether
+    the remote is spelled on its command line, in the repository's config or through an operator
+    `pushInsteadOf`, and cannot read a credential helper; fetch over https, `file://` and local
+    paths keeps working, fetch over ssh/`git://` no longer does (the engine performs the base
+    fetch; a seat cannot fetch a PRIVATE https remote either — helpers reset, no gh login). Not
+    covered by layer 3, stated: a `git` carrying its own `-c` override of a fenced key (`-c
+    protocol.ssh.allow=always -c core.sshCommand=ssh` — command-line `-c` outranks the
+    environment entries) or its own `GIT_SSH_COMMAND`, and a seat that scrubs its environment
+    (`env -i`) first — each refused as a literal by layer 2, each the stated script-file limit
+    otherwise. Fixture-tested (`wicked_apps_core::spawn::fence_remote_credentials`) against
+    `ssh://`, `ssh://user@`, `git@host:`, `nobody@host:`, `host:`, an https remote the operator's
+    global config rewrites to ssh, `file://` and path remotes, with a stub `ssh` on `PATH`
+    proving ssh is never reached under the fence and IS reached by the unfenced controls, while
+    the deliver tool phase (`run_tool_cmd`, no seat config) keeps the daemon's login and still
+    pushes. Carrier coverage, stated: the per-call command filter runs on the wrapped CLAUDE gate
+    hook and the ACP bridge; wrapped non-claude single-shot seats and ACP chat sessions are fenced
+    by layers 1 (claude only) and 3. The Bash rules ride the council ballot's own argv too (not
+    only the shared worker file), and `~/.config/gh`, `~/.config/git`, `~/.git-credentials` join
+    the read fence.
+  - **Health-aware routing with `degradedReason` (F-7R2-006).** `AgenticCli.health: Option<{usable,
+    reason}>` (additive, serde-default) carries the launcher's sign-in/usability verdict; a seat
+    with `usable: false`, or one that fails authentication IN the run (a `not_logged_in` council
+    ballot, a worker exit with an auth refusal, an ACP `auth_failed`/`unauthenticated`
+    handshake), is BENCHED for the run — persisted as `AgentSession.benched_seats [{cli, reason,
+    source}]` — and never convened (`councilConvened.clis` names only eligible seats), never the
+    evaluator≠creator reassignment's pick, never a failover target, never a triage or agent
+    judge. `unitDistributed.degradedReason` is now set on EVERY routing arm whenever eligible <
+    configured ("N of M seats benched: codex (signed out — launcher), pi (not_logged_in —
+    ballot)") — the Council arm used to emit `null` unconditionally. An all-benched roster
+    refuses the plan by name instead of parking the run at a human gate per unit. The default
+    and triage judges draw from the registry seats the RUN configured (`session.clis`) minus the
+    bench — never a registry seat the launcher did not seat — and a judge seat that refuses with
+    an authentication failure is benched (`source: "judge"`) so the next unit never re-tries it
+    (review RT-1). core#447's registry `credential`/free-tier declaration is NOT folded here (see
+    the PR body): `health` is the carrier either way and can be filled from the declaration when
+    it lands, with no wire change.
+  - **Default repo-checks floor + judge, or an honest UNGATED (F-7R2-005).** Every PROSE-planned
+    agent unit — and every agent unit of a def that declares no `verified_evidence` phase —
+    carries `WorkUnit.default_floor` (plan-time; a def that verifies owns its floor, so the
+    `bug`/`feature` `fix` gate is not hard-failed on checks the def routes to `verify`'s human
+    gate). Such a unit takes a worktree baseline at dispatch; when it CHANGED its tree it gets the
+    DEFAULT floor — the repository's own checks (`repoChecksEvaluated`, the deliver-lift machinery
+    incl. `verified_tree`) — and an agent judge distinct from the creator against an
+    engine-authored criterion when an eligible non-creator seat exists. **`gateEvaluated.ungated: bool` +
+    `ungatedReason: string | null`** (additive): `true` when no machine layer gated the unit (no
+    floor, no judge, empty policy selection — the vacuous default-allow run b86c14c1 passed seven
+    times), with the cause per absent layer ("no judge: no eligible judge seat distinct from
+    creator 'claude' …"). On a host with no OS sandbox the DEFAULT floor discloses instead of
+    denying (the declared `verified_evidence` floor stays fail-closed) — and the cause is ON THE
+    WIRE whether or not a judge ran (review FL-1/FL-2): **`repoChecksEvaluated.sandboxLevel`,
+    `sandboxError`, `detectError`** and **`gateEvaluated.floorNote`** (why the deterministic
+    layer is absent, whenever it is) + **`judgeSkippedReason`** (why no judge was convened for a
+    unit that wanted one). A changed tree with no check report denies fail-closed. The marker is
+    "no `verified_evidence` phase AFTER this unit" (FL-3). Cost, stated (FL-4): the repository's
+    own checks run once per tree-changing prose unit (bounded by `CHECK_TIMEOUT`/`INSTALL_TIMEOUT`
+    per check); a repo with no detectable manifest yields `passed: true, checks: []` — consumers
+    render "0 checks detected", never "checks passed".
+  - **Auth fallback kinds, no wrapped retry (F-7R2-019).** `acpFallback.fallbackKind` gains
+    `auth_failed` (the handshake's `authenticate` failed) and `unauthenticated` (`session/new`
+    refused after `authenticate`, or no method advertised) — pi's 401 used to be filed as
+    `binary_unavailable`. No auth kind (`auth_required` included) is followed by the single-shot
+    wrapped fallback: it runs under the same worker home and fails identically; the unit fails
+    with the seat's own words and the actor benches the seat.
+  - **Run branch recorded; worktree retained (F-7R2-013).** `AgentSession.run_branch`,
+    `base_commit` and `finished_at` (additive) are durable; `runBaseResolved` gains `runBranch`.
+    A COMPLETED run's worktree is kept until the run is archived (`ArchiveRun` reaps clean-only)
+    or `WICKED_COMPLETED_WORKTREE_KEEP_DAYS` (default 14; `0` = reap at completion) elapses — the
+    boot reaper honours the window AND every run completion sweeps expired retained trees (review
+    RN-1: no longer boot-only); a retained tree has its IGNORED files (`node_modules`, `target/`)
+    dropped at completion (`git clean -fdX`), never its tracked or untracked-not-ignored files.
+    Failed/cancelled runs are unchanged.
+
 ### Fixed
 - **core-ts build-from-source fixed; CI now syntax-checks the finalizer.** #444 left four unescaped
   backticks (`role`, `posture`, `role`) inside the template literal that `scripts/finalize-dts.mjs`

@@ -104,6 +104,7 @@ mod tests {
             worktree_baseline: None,
             worktree_mutation: None,
             repo_checks_floor: false,
+            default_floor: false,
             repo_checks: None,
         }
     }

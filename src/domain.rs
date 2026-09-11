@@ -145,6 +145,77 @@ pub struct AgentSession {
     /// checks floor passes. `#[serde(default)]` for back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_tree: Option<String>,
+    /// (F-7R2-013, wave 6) The run branch the worktree was minted on (`wicked/<run id>`, the
+    /// sanitized spelling). Recorded when the worktree is ready, durable past the worktree's
+    /// reap, so the run's diff (`base_commit..run_branch`) is servable from the registered repo
+    /// when the checkout is gone. `None` for an unbound run. `#[serde(default)]` back-compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_branch: Option<String>,
+    /// (F-7R2-013) The commit the worktree was minted FROM (`runBaseResolved.baseCommit`) — the
+    /// diff base. `None` for an unbound run, or a worktree reused from an existing branch (a
+    /// resume, a pre-provisioned tree) whose base was never observed. `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// (F-7R2-013) When this run reached a TERMINAL status (Completed / Failed / Cancelled), unix
+    /// millis. A COMPLETED run's worktree is RETAINED from here until the run is archived or the
+    /// retention window elapses (`actor::completed_worktree_retention`) — the bounded reaper.
+    /// `None` for a live run, and for runs that finished before this field existed (reaped by the
+    /// pre-wave-6 rule on the next boot). `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// (F-7R2-006, wave 6) Seats BENCHED for this run — never convened, never a failover or judge
+    /// target, never a triage judge. Two sources: the launcher's health probe on the roster it
+    /// handed (`AgenticCli::health.usable == false`) and an authentication failure observed IN
+    /// the run (a `not_logged_in` council ballot, a worker exit with an auth refusal, an ACP
+    /// `unauthenticated`/`auth_failed` handshake). Persisted so a resume never re-seats a dead
+    /// seat; rendered into `unitDistributed.degradedReason`. `#[serde(default)]` back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benched_seats: Vec<BenchedSeat>,
+}
+
+/// One seat benched for a run ([`AgentSession::benched_seats`], F-7R2-006).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchedSeat {
+    /// The roster key.
+    pub cli: String,
+    /// Why — the launcher's words (`signed out`) or the engine's classification
+    /// (`not_logged_in`, `unauthenticated`).
+    pub reason: String,
+    /// Who benched it: `launcher` (the roster's health probe), `ballot` (a council seat failure),
+    /// `worker` (a unit's worker failed with an auth refusal).
+    pub source: String,
+}
+
+impl BenchedSeat {
+    /// The one-line rendering used in `degradedReason` lists: `codex (signed out — launcher)`.
+    pub fn describe(&self) -> String {
+        format!("{} ({} — {})", self.cli, self.reason, self.source)
+    }
+}
+
+/// Add `seat` to `benched` unless a seat with the same key is already there (the first reason
+/// wins — it is the one that actually took the seat out).
+pub fn bench_seat(benched: &mut Vec<BenchedSeat>, seat: BenchedSeat) -> bool {
+    if benched.iter().any(|b| b.cli == seat.cli) {
+        return false;
+    }
+    benched.push(seat);
+    true
+}
+
+/// `"N of M seats benched: a (r — s), b (r — s)"` for `degradedReason`, or `None` when nothing is
+/// benched. `configured` is the roster size the launcher handed.
+pub fn benched_summary(benched: &[BenchedSeat], configured: usize) -> Option<String> {
+    if benched.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = benched.iter().map(BenchedSeat::describe).collect();
+    Some(format!(
+        "{} of {} seats benched: {}",
+        benched.len(),
+        configured.max(benched.len()),
+        list.join(", ")
+    ))
 }
 
 impl ToNode for AgentSession {
@@ -409,6 +480,15 @@ pub struct WorkUnit {
     /// into the gate as a deterministic floor ([`crate::repo_checks`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub repo_checks_floor: bool,
+    /// (F-7R2-005, wave 6) TRUE when this agent unit carries the DEFAULT floor: if it CHANGES the
+    /// worktree tree, the repository's own checks run and a judge distinct from the creator is
+    /// convened (or the gate says `ungated` and why). Set at plan time for every PROSE-planned
+    /// agent unit (the free-text hole run b86c14c1 fell through), and for a def-driven agent unit
+    /// only when its def declares NO `verified_evidence` phase — a def that verifies owns its
+    /// floor (`repo_checks_floor`), and running the checks at the creator's auto gate as well
+    /// would hard-fail a run the def designed to escalate at `verify`. `#[serde(default)]`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub default_floor: bool,
     /// The repo-checks evidence the fold attached: every check the engine ran, its exit code and
     /// output tails. `None` until the unit's gate folds (or when the floor does not apply).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,6 +655,7 @@ impl WorkUnit {
             worktree_baseline: None,
             worktree_mutation: None,
             repo_checks_floor: false,
+            default_floor: false,
             repo_checks: None,
             status: UnitStatus::Pending,
         }
@@ -841,6 +922,10 @@ mod tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         }
     }
 

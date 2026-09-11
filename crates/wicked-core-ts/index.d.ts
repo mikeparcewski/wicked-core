@@ -667,8 +667,19 @@ export declare class Subscription {
  * unit's actual role, `posture` is 'read-only' for an executes_code:false evaluator/recon rung or
  * 'deliverable-roots' for a bound creator writing outside its granted write roots; the type
  * name is historical, read `role`); runBaseResolved
- * {session, baseRef, baseCommit, localHead, behind, fetched, lifted, note} (which base a fresh
- * run worktree was minted from).
+ * {session, baseRef, baseCommit, localHead, behind, fetched, lifted, note, runBranch} (which base a
+ * fresh run worktree was minted from; runBranch is the `wicked/<run>` branch — wave 6).
+ * Wave 6 additions (all additive): gateEvaluated carries `ungated: boolean` + `ungatedReason:
+ * string | null` (true when NO machine layer gated the unit — render UNGATED, never "pass"),
+ * `floorNote: string | null` (why the deterministic layer is absent, whenever it is) and
+ * `judgeSkippedReason: string | null` (why no judge was convened for a unit that wanted one);
+ * repoChecksEvaluated carries `sandboxLevel: string`, `sandboxError: string | null`,
+ * `detectError: string | null` (an empty `checks` says WHY on the wire);
+ * unitDistributed.degradedReason is set on EVERY routing method whenever eligible seats <
+ * configured ("N of M seats benched: …"); workerToolCallDenied {session, ord, attempt, cli,
+ * carrier, role, tool, command, reason, remedy} (a worker seat's `git push` / `gh pr create` /
+ * `gh api` mutation refused — delivery is the deliver phase's job); acpFallback.fallbackKind gains
+ * 'auth_failed' | 'unauthenticated' (no single-shot fallback follows an auth kind).
  */
 export interface CoreEventJson {
   type: string

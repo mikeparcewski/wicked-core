@@ -262,6 +262,25 @@ pub struct UnitEvidence {
     /// the unit is approved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_tree: Option<String>,
+    /// (F-7R2-005, wave 6) Whether this AGENT unit changed the worktree tree it was handed —
+    /// judged on the worker thread against the baseline snapshot taken at dispatch (every bound
+    /// agent unit now carries one). `Some(true)` arms the DEFAULT repo-checks floor and the judge;
+    /// `Some(false)` means nothing to certify; `None` = not judged (a Tool unit, an unbound run, a
+    /// guarded unit — whose guard owns the comparison — or a pre-wave-6 payload). A `Some(true)`
+    /// with no `repo_checks` report denies the unit fail-closed at the fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_changed: Option<bool>,
+    /// (F-7R2-005) WHY no agent judge was convened for a unit that WANTED one (its tree changed
+    /// and no pinned validator gated it): "no eligible judge seat distinct from creator `x`
+    /// (roster: …; benched: …)". `None` when a judge ran or none was wanted. Rides to
+    /// `gateEvaluated.ungatedReason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub judge_skipped: Option<String>,
+    /// (wave 6, review RT-1) Judge seats that REFUSED with an authentication failure while the
+    /// agent judge rotated — the fold benches them for the run (`source: "judge"`) so the next
+    /// tree-changing unit does not re-try every dead seat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub judge_auth_refusals: Vec<String>,
 }
 
 /// A human's decision at a confirm gate. The gate is *steering*, not just bless-or-bounce: `Approve`
