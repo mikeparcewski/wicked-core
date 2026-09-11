@@ -341,11 +341,13 @@ const DENIED_BASH: &[&str] = &[
 /// logged-in worker home, which a read-only review cannot use), and the earlier "inert" claim was
 /// not re-measured on this version. Workers are pinned to `acceptEdits` below regardless, so
 /// nothing rests on the answer for them. The council's seat dispatch DOES pass the trust flag
-/// ([`wicked_council::dispatch`]) and creates no fence of its own: it reads the shared
-/// `settings.json` ONLY when an ACP worker spawn has already written it
-/// (`acp_runner::ensure_worker_config_home` is the sole writer), so a council-first ballot runs
-/// with no deny fence at all, and even with the file present the fence is only as live for seat
-/// votes as that sentence turns out to be. The real boundary belongs in the
+/// ([`wicked_council::dispatch`]) and creates no fence of its own; it reads the shared
+/// `settings.json` under the worker home, which the distributor now writes BEFORE convening any
+/// council that seats a claude carrier (`distribute::distribute_units_against` →
+/// `acp_runner::ensure_shared_worker_fence`, the same idempotent writer the ACP worker spawn
+/// uses; a council-first ballot used to run with no fence at all). With the file always present,
+/// the fence is exactly as live for seat votes as that unmeasured sentence turns out to be. The
+/// real boundary belongs in the
 /// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
 /// closes the observed leaks in the meantime and does not pretend to close the class.
 ///

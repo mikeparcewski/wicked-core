@@ -1278,6 +1278,29 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 /// whatever its own settings say; it rides each session's `session/new` options and per-session
 /// settings file instead ([`write_session_settings`]). Written atomically (tmp + rename) so a
 /// concurrent spawn's CLI never reads a torn file.
+/// The SHARED worker fence for a council ballot (wicked-crew#524 follow-up, review on core#436).
+///
+/// `wicked_council::dispatch::run_in_isolation` runs a claude seat under the worker home
+/// (`seat_config_for_carrier`) with the trust flag appended, but creates no fence: the shared
+/// `settings.json` — `permissions.deny` = [`crate::execute_wrapped::shared_deny_rules`] — used
+/// to be written only by the ACP worker spawn ([`ensure_worker_config_home`]), so a council
+/// convened before any worker had spawned ran its claude ballot with no deny fence at all. The
+/// distributor calls this before convening a council that seats a claude carrier: the SAME writer
+/// (one generator, one file), idempotent — an atomic rewrite of the same bytes — so a later worker
+/// spawn changes nothing. `operational_home` is passed as `None` because the shared file's
+/// content does not depend on it: the operational home is both fenced and a state-home candidate,
+/// so it is excluded from the shared blanket either way (its rule rides each session's options).
+///
+/// Under the operator's inherit hatch nothing is written and `Ok(None)` says so — the ballot then
+/// runs on the operator's configuration, which is what the hatch means. `Err` names why the fence
+/// could not be written; the caller refuses the council (fail closed), as the ACP spawn refuses.
+pub(crate) fn ensure_shared_worker_fence() -> anyhow::Result<Option<std::path::PathBuf>> {
+    if crate::execute_wrapped::inherits_operator_config() {
+        return Ok(None);
+    }
+    ensure_worker_config_home(None).map(Some)
+}
+
 fn ensure_worker_config_home(
     // The engine's operational state home (codex round 8): kept OUT of the shared file's blanket
     // like every state-home candidate (its fence rides each session's own configuration).
@@ -10654,6 +10677,63 @@ transport = "stdio"
             ),
             crate::execute_wrapped::inherits_operator_config()
         );
+    }
+
+    /// wicked-crew#524 follow-up (review on core#436): the council ballot path gets the shared
+    /// fence from the SAME writer the ACP spawn uses — the same bytes, idempotent — and writes
+    /// nothing under the operator's inherit hatch (saying so).
+    #[test]
+    fn the_council_ballot_fence_is_the_shared_writer_idempotent_and_hatch_aware() {
+        let _g = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let hatch = crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV;
+        let prev_hatch = std::env::var_os(hatch);
+        std::env::remove_var(hatch);
+        let base = worker_home_base("ballot-fence");
+        std::env::set_var("WICKED_WORKER_HOME", &base);
+        let first = super::ensure_shared_worker_fence()
+            .expect("the fence writes")
+            .expect("written, not inherited");
+        assert_eq!(first, base.join("claude"));
+        let bytes = std::fs::read(first.join("settings.json")).expect("settings.json written");
+        let settings: Value = serde_json::from_slice(&bytes).unwrap();
+        let deny: Vec<String> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            deny,
+            crate::execute_wrapped::shared_deny_rules(None).unwrap(),
+            "the ballot fence IS the shared fence — one generator, one file"
+        );
+        let again = super::ensure_shared_worker_fence()
+            .expect("the fence writes")
+            .expect("written");
+        assert_eq!(again, first);
+        assert_eq!(
+            std::fs::read(first.join("settings.json")).unwrap(),
+            bytes,
+            "idempotent: a second call rewrites the same bytes"
+        );
+        // The inherit hatch: nothing is written, and the caller is told so.
+        let fresh = worker_home_base("ballot-fence-hatch");
+        std::env::set_var("WICKED_WORKER_HOME", &fresh);
+        std::env::set_var(hatch, "1");
+        assert!(
+            super::ensure_shared_worker_fence()
+                .expect("the hatch is not an error")
+                .is_none(),
+            "under the hatch the ballot runs on the operator's configuration — no fence"
+        );
+        assert!(!fresh.join("claude").join("settings.json").exists());
+        match prev_hatch {
+            Some(v) => std::env::set_var(hatch, v),
+            None => std::env::remove_var(hatch),
+        }
+        restore_hermetic_worker_home();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     /// What the worker's user scope says after every re-sanitize. The deny list must be the

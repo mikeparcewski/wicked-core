@@ -183,6 +183,18 @@ pub fn distribute_units_on(
     )
 }
 
+/// Does the roster seat a claude carrier — by seat key, or by the binary's file stem (the same
+/// case-insensitive test the spawn paths apply to decide the carrier)?
+fn seats_a_claude_carrier(clis: &[AgenticCli]) -> bool {
+    clis.iter().any(|c| {
+        c.key == "claude"
+            || std::path::Path::new(&c.binary)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
+    })
+}
+
 /// The candidate seats for one unit: the roster keys and records the council votes among, and
 /// WHY they were narrowed — or `None` when every roster seat is a candidate.
 type Candidates = Option<(Vec<AgenticCli>, String)>;
@@ -463,6 +475,22 @@ fn distribute_one(
         });
     }
 
+    // wicked-crew#524 follow-up (review on core#436): the council's claude seat runs under the
+    // worker home with the trust flag appended (`wicked_council::dispatch::run_in_isolation`) and
+    // reads the SHARED `settings.json` fence there — a file only the ACP worker spawn used to
+    // write, so a council convened before any worker had spawned ran with no deny fence at all.
+    // Ensure it here, with the same idempotent writer, BEFORE any ballot; a fence that cannot be
+    // written refuses the council (fail closed), exactly as the ACP spawn refuses the worker.
+    if seats_a_claude_carrier(clis) {
+        crate::acp_runner::ensure_shared_worker_fence().map_err(|e| {
+            anyhow::anyhow!(
+                "council for {session_id}: the shared worker fence (<worker home>/claude/\
+                 settings.json) could not be written ({e}); refusing to convene a claude seat \
+                 without its deny fence"
+            )
+        })?;
+    }
+
     let estate = match db_path {
         Some(path) => EstateHandle::new(
             wicked_apps_core::SqliteStore::open(path)
@@ -718,6 +746,73 @@ mod tests {
     /// control proves the guard is scoped to len==1: there, the council DOES convene (dispatcher hit).
     /// Mutation: delete the `if let [only] = clis` short-circuit and the single-seat case dispatches
     /// (calls > 0), failing the first assertion.
+    /// wicked-crew#524 follow-up (review on core#436): convening a council that seats a claude
+    /// carrier writes the SHARED worker fence first — the file the ballot reads under the worker
+    /// home — so a council-first ballot is fenced exactly like a worker spawn. A claude-less
+    /// roster writes nothing. (The test process arms `WICKED_WORKER_HOME` to a per-process temp
+    /// home pre-main; this test re-aims it at its own fixture and restores the armed value.)
+    #[test]
+    fn convening_a_claude_seat_writes_the_shared_worker_fence_first() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let hatch = crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV;
+        let prev_hatch = std::env::var_os(hatch);
+        std::env::remove_var(hatch);
+        let base = std::env::temp_dir().join(format!("wdistribute-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
+        let (dispatcher, _calls) = spy();
+        // No claude seat ⇒ nothing is written.
+        distribute_units_on(
+            std::slice::from_ref(&unit),
+            &[seat("codex"), seat("pi")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+        )
+        .expect("distribute a claude-less roster");
+        assert!(
+            !base.join("claude").join("settings.json").exists(),
+            "a claude-less roster writes no fence"
+        );
+        // A claude seat ⇒ the shared fence exists, with the shared rules, before the ballot ran.
+        distribute_units_on(
+            std::slice::from_ref(&unit),
+            &[seat("claude"), seat("codex")],
+            "s1",
+            None,
+            &dispatcher,
+            None,
+        )
+        .expect("distribute a roster with a claude seat");
+        let bytes = std::fs::read(base.join("claude").join("settings.json"))
+            .expect("the shared fence was written before the ballot");
+        let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let deny: Vec<String> = settings["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny present")
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            deny,
+            crate::execute_wrapped::shared_deny_rules(None).unwrap(),
+            "the ballot reads the SAME fence a worker spawn writes"
+        );
+        match prev_hatch {
+            Some(v) => std::env::set_var(hatch, v),
+            None => std::env::remove_var(hatch),
+        }
+        std::env::set_var(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            wicked_apps_core::spawn::hermetic_test_worker_home(),
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_single_seat_roster_skips_the_council_and_dispatches_nothing() {
         // `distribute_units_on` resolves the skills ladder from the process environment when a
