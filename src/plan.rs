@@ -77,7 +77,15 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
         .enumerate()
         .map(|(i, description)| {
             let ord = (i + 1) as u32;
-            WorkUnit::pending(format!("{session_id}:u{ord}"), session_id, ord, description)
+            let mut unit =
+                WorkUnit::pending(format!("{session_id}:u{ord}"), session_id, ord, description);
+            // F-7R2-005: a prose-planned unit declares nothing — no `executes_code`, no
+            // `verified_evidence`, no pinned validator — so nothing else will ever gate its
+            // work. It carries the DEFAULT floor: if it changes the worktree tree, the
+            // repository's own checks run and a distinct judge is convened (or the gate says
+            // `ungated`, and why).
+            unit.default_floor = true;
+            unit
         })
         .collect()
 }
@@ -89,6 +97,8 @@ pub fn plan_units(problem: &str, session_id: &str) -> Vec<WorkUnit> {
 /// are `<session_id>:<phase_id>` (stable across resumes) — that id is the backing-phase linkage;
 /// `phase_ref` is left untouched (the execute path owns it).
 pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<WorkUnit> {
+    // F-7R2-005: does this def declare a verifying phase of its own? (See `default_floor`.)
+    let def_verifies = def.phases.iter().any(|p| p.verified_evidence);
     // Precondition: `def` is validated — phase ids are unique, so `<session>:<phase_id>` unit ids
     // are collision-free. The registry only ever hands out validated defs (`register` validates),
     // so the runtime path upholds this; the assert catches a raw unvalidated def in dev.
@@ -217,6 +227,13 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // declared write roots.
             let is_tool = matches!(phase.executor, crate::workflow::PhaseExecutor::Tool { .. });
             unit.worktree_guarded = !phase.executes_code && !is_tool;
+            // F-7R2-005 — the DEFAULT floor marker for a def that VERIFIES NOTHING: no phase
+            // declares `verified_evidence`, so no `repo_checks_floor` will ever run; every agent
+            // unit that changes the tree then owes the repository's own checks and a distinct
+            // judge. A def with a verify phase keeps that phase as its one floor (the `bug`/
+            // `feature` `fix` gate is `auto` by design and must not hard-fail on checks the
+            // def routes to `verify`'s human gate).
+            unit.default_floor = !is_tool && !def_verifies;
             // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a
             // `verified_evidence` agent phase with an `executes_code` Creator before it. The engine
             // runs the repository's own checks in the worktree after the seat's work and folds the

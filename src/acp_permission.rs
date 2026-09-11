@@ -186,6 +186,71 @@ pub(crate) fn write_class_call(params: &Value) -> Option<WriteClassCall> {
     Some(WriteClassCall { tool, kind, path })
 }
 
+/// ACP `ToolKind`s / tool names that RUN A COMMAND — the calls the remote-write fence judges
+/// (F-7R2-012). `execute` is the protocol's kind; the names are the seats' shell tools (claude's
+/// `Bash`, pi's `bash`, codex's `shell`/`exec_command`, copilot/opencode `run_command`/`terminal`).
+const EXECUTE_TOOL_NAMES: [&str; 14] = [
+    "bash",
+    "shell",
+    "sh",
+    "execute",
+    "exec",
+    "exec_command",
+    "execute_command",
+    "run_command",
+    "run_shell_command",
+    "run_terminal_cmd",
+    "shell_command",
+    "terminal",
+    "command",
+    "powershell",
+];
+
+/// The command text of an EXECUTE-class permission request, or `None` when the call runs no
+/// command. Matched by ACP `kind == "execute"` or by tool name; the text is read from the tool's
+/// own arguments (`command`, `cmd`, `commandLine`, `script`, `args` joined), falling back to
+/// `toolCall.title` for a bridge that describes the call only in prose — the remote-write fence
+/// ([`crate::remote_write_fence::remote_write_command`]) then judges that text.
+pub(crate) fn execute_command(params: &Value) -> Option<String> {
+    let kind = params
+        .pointer("/toolCall/kind")
+        .and_then(Value::as_str)
+        .map(|k| k.to_ascii_lowercase());
+    let by_kind = kind.as_deref() == Some("execute");
+    let tool = tool_name(params).map(|t| t.to_ascii_lowercase());
+    let by_name = tool
+        .as_deref()
+        .is_some_and(|t| EXECUTE_TOOL_NAMES.contains(&t) || t.ends_with("__bash"));
+    if !(by_kind || by_name) {
+        return None;
+    }
+    let input = params.pointer("/toolCall/rawInput");
+    let from_input = input.and_then(|i| {
+        ["command", "cmd", "commandLine", "command_line", "script"]
+            .into_iter()
+            .find_map(|k| i.get(k).and_then(Value::as_str))
+            .filter(|c| !c.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                i.get("args").and_then(Value::as_array).map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            })
+    });
+    from_input
+        .or_else(|| {
+            params
+                .pointer("/toolCall/title")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .map(str::to_string)
+        })
+        .filter(|c| !c.trim().is_empty())
+}
+
 /// The answer that REFUSES a call: the agent's reject option, else cancelled (never an allow).
 pub(crate) fn reject_result(params: &Value) -> Value {
     match choose_option(params.get("options").unwrap_or(&Value::Null), false) {
@@ -969,6 +1034,56 @@ mod tests {
         assert_eq!(
             tool5, "Write",
             "toolCall.name must be reached when toolName is an empty string"
+        );
+    }
+
+    /// F-7R2-012 (wave 6): the command of an EXECUTE-class request — by ACP kind or by the
+    /// seats' shell tool names, from the tool's own arguments (several spellings) or the title
+    /// as a last resort; a non-execute call yields nothing.
+    #[test]
+    fn execute_command_reads_the_shell_tools_command() {
+        let by_kind = json!({
+            "toolName": "Bash",
+            "toolCall": {"kind": "execute", "title": "Run git push", "rawInput": {"command": "git push origin main"}},
+        });
+        assert_eq!(
+            execute_command(&by_kind).as_deref(),
+            Some("git push origin main")
+        );
+        let pi_bash = json!({
+            "toolCall": {"name": "bash", "kind": "other", "rawInput": {"cmd": "gh pr create --fill"}},
+        });
+        assert_eq!(
+            execute_command(&pi_bash).as_deref(),
+            Some("gh pr create --fill")
+        );
+        let codex_shell = json!({
+            "toolCall": {"name": "shell", "rawInput": {"args": ["gh", "api", "-X", "POST", "repos/o/r/pulls"]}},
+        });
+        assert_eq!(
+            execute_command(&codex_shell).as_deref(),
+            Some("gh api -X POST repos/o/r/pulls")
+        );
+        let title_only = json!({
+            "toolCall": {"kind": "execute", "title": "git push --force"},
+        });
+        assert_eq!(
+            execute_command(&title_only).as_deref(),
+            Some("git push --force")
+        );
+        let a_read = json!({
+            "toolName": "Read",
+            "toolCall": {"kind": "read", "rawInput": {"file_path": "/wt/README.md"}},
+        });
+        assert_eq!(execute_command(&a_read), None, "a read carries no command");
+        let an_edit = json!({
+            "toolName": "Edit",
+            "toolCall": {"kind": "edit", "rawInput": {"file_path": "/wt/a.rs", "command": "not a shell"}},
+        });
+        assert_eq!(
+            execute_command(&an_edit),
+            None,
+            "an edit's `command` field is not a shell"
         );
     }
 }

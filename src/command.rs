@@ -66,6 +66,9 @@ pub(crate) enum Command {
         spec: crate::LaunchSpec,
         repo_ref: Option<String>,
         workdir: Option<String>,
+        /// (F-7R2-013) The commit the worktree was minted FROM (`RunBase::commit`), recorded on
+        /// the session as `base_commit`; `None` for a repo-less run or a reused worktree.
+        base_commit: Option<String>,
     },
     /// Internal: worktree creation failed off-thread; actor marks the run Failed.
     /// Posted by the worktree-creation worker spawned by `LaunchRun` on error.
@@ -373,7 +376,9 @@ pub(crate) enum Command {
     /// store and dispatch unit 0. Sent by the off-actor distribute thread; processed on actor thread.
     PlanReady {
         run_id: String,
-        pre: crate::pipeline::PreDistributed,
+        /// Boxed: `PreDistributed` carries the whole session record and the plan, and the
+        /// variant would otherwise dwarf every other command (clippy `large_enum_variant`).
+        pre: Box<crate::pipeline::PreDistributed>,
         distributions: Vec<crate::distribute::Distribution>,
     },
     /// Distribution failed (council error or pre-distribute error). The actor arm marks the session

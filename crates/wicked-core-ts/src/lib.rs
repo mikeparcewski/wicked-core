@@ -2343,6 +2343,8 @@ mod tests {
                 combined: true,
                 judge_cli: Some(s()),
                 judge_distinct: Some(true),
+                ungated: false,
+                ungated_reason: None,
             },
             "gateEvaluated",
             &[
@@ -2361,6 +2363,8 @@ mod tests {
                 "combined",
                 "judgeCli",
                 "judgeDistinct",
+                "ungated",
+                "ungatedReason",
             ],
         );
         check(
@@ -2917,6 +2921,7 @@ mod tests {
                 fetched: true,
                 lifted: true,
                 note: None,
+                run_branch: String::new(),
             },
             "runBaseResolved",
             &[
@@ -2929,6 +2934,27 @@ mod tests {
                 "fetched",
                 "lifted",
                 "note",
+                "runBranch",
+            ],
+        );
+        // Wave 6 (F-7R2-012): a worker seat's remote-writing command refused on either carrier.
+        check(
+            CoreEvent::WorkerToolCallDenied {
+                session: s(),
+                ord: 7,
+                attempt: 0,
+                cli: s(),
+                carrier: "acp".to_string(),
+                role: s(),
+                tool: s(),
+                command: s(),
+                reason: s(),
+                remedy: s(),
+            },
+            "workerToolCallDenied",
+            &[
+                "type", "session", "ord", "attempt", "cli", "carrier", "role", "tool", "command",
+                "reason", "remedy",
             ],
         );
         check(

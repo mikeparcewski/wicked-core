@@ -730,6 +730,7 @@ impl RunBase {
             fetched: self.fetched,
             lifted: self.lifted,
             note: self.note.clone(),
+            run_branch: worktree_branch(session),
         }
     }
 }

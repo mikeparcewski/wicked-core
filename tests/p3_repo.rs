@@ -39,6 +39,22 @@ struct WorkdirRunner {
 }
 impl StepRunner for WorkdirRunner {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
+        // Wave 6 (F-7R2-005): a prose unit that changes its worktree tree is JUDGED by a seat
+        // distinct from the creator; the engine's judge session (`session_id == "validator"`)
+        // gets a well-formed PASS so the run under test completes.
+        if input.unit.session_id == "validator" {
+            return StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: "PASS\nthe work meets the criterion\nPASS".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            };
+        }
         self.seen.lock().unwrap().push(input.workdir.clone());
         if let Some(dir) = &input.workdir {
             let _ = std::fs::write(dir.join(format!("unit-{}.txt", input.unit.ord)), "done");
@@ -73,6 +89,7 @@ fn cli(key: &str) -> AgenticCli {
         acp: None,
         capabilities: None,
         login_invocation: None,
+        health: None,
     }
 }
 

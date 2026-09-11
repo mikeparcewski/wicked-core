@@ -429,6 +429,58 @@ pub const AGY_HIDE_LOGO_ENV: &str = "AGY_CLI_HIDE_LOGO";
 /// See [`AGY_HIDE_LOGO_ENV`].
 pub const AGY_HIDE_ACCOUNT_INFO_ENV: &str = "AGY_CLI_HIDE_ACCOUNT_INFO";
 
+/// (F-7R2-012, wave 6) Remote-write CREDENTIALS a seat process never inherits. A worker seat
+/// opened a GitHub PR from its own shell (`gh pr create`, `git push`) on the daemon's ambient
+/// `gh` login — delivery is the ENGINE's job (the deliver tool phase lifts, re-verifies and
+/// pushes the run branch, then opens the PR, so the ledger records it). These are stripped from
+/// EVERY seat spawn — wrapped worker, ACP bridge, council ballot — by [`SeatConfig::apply`]; the
+/// deliver tool phase (`actor::run_tool_cmd`) is not a seat, applies no `SeatConfig`, and keeps
+/// the daemon's credentials, which is exactly the asymmetry the fence is built on.
+pub const REMOTE_CREDENTIAL_ENV: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+];
+
+/// The `gh` CLI's configuration directory variable — where it reads `hosts.yml`, the stored
+/// login `gh auth login` wrote. A seat is pointed at an ENGINE-OWNED, credential-less directory
+/// ([`seat_gh_config_dir`]) so the operator's `~/.config/gh/hosts.yml` never authenticates a
+/// seat's `gh` (and, through `gh auth git-credential`, its `git push` over https).
+pub const GH_CONFIG_DIR_ENV: &str = "GH_CONFIG_DIR";
+
+/// The name of the credential-less `gh` configuration directory under the worker home base.
+pub const GH_UNAUTHENTICATED_DIR: &str = "gh-unauthenticated";
+
+/// The credential-less `gh` configuration directory every seat runs under:
+/// `<worker home base>/gh-unauthenticated`. Never holds a `hosts.yml` the engine wrote; `gh` may
+/// create its own defaults file there, which carries no login. `Err` when the worker home base
+/// cannot be resolved (no home directory, a relative override) — callers then strip the token
+/// variables and leave `GH_CONFIG_DIR` untouched, disclosed.
+pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
+    Ok(worker_home_base()?.join(GH_UNAUTHENTICATED_DIR))
+}
+
+/// Strip the remote-write credentials from `cmd` and re-aim `gh` at the credential-less
+/// directory — the seat half of the F-7R2-012 fence, applied by [`SeatConfig::apply`] for every
+/// seat decision (the inherit hatch INCLUDED: the hatch is about whose CLI configuration a seat
+/// runs under, and `gh` is not a seat CLI — a seat never delivers, whatever it inherits).
+pub fn fence_remote_credentials(cmd: &mut Command) {
+    for key in REMOTE_CREDENTIAL_ENV {
+        cmd.env_remove(key);
+    }
+    match seat_gh_config_dir() {
+        Ok(dir) => {
+            cmd.env(GH_CONFIG_DIR_ENV, dir);
+        }
+        Err(e) => eprintln!(
+            "wicked-core: seat spawn cannot resolve the credential-less gh config dir ({e}); \
+             {GH_CONFIG_DIR_ENV} is left as inherited — the token variables are stripped and the \
+             remote-write command fence still applies"
+        ),
+    }
+}
+
 /// Every CLI-SPECIFIC configuration variable a seat spawn decides. A seat gets its OWN set and
 /// every other one STRIPPED — the daemon's `CODEX_HOME` must not ride into a pi bridge any more
 /// than its `CLAUDE_CONFIG_DIR` rides into a codex one (PR#413). The XDG bases are deliberately
@@ -537,7 +589,13 @@ pub enum SeatConfig {
 
 impl SeatConfig {
     /// Apply this decision to `cmd` — AFTER `hardened()`: strip the foreign variables, then set
-    /// this seat's own. `Inherit` touches nothing.
+    /// this seat's own. `Inherit` touches no CLI configuration.
+    ///
+    /// BOTH variants apply the remote-write credential fence ([`fence_remote_credentials`],
+    /// F-7R2-012): a seat is a creator or an evaluator, never the deliverer, so it runs without
+    /// the daemon's `GH_TOKEN`/`GITHUB_TOKEN` and with `gh` aimed at a credential-less config
+    /// directory — the inherit hatch keeps the operator's CLI configuration, not their GitHub
+    /// login. The deliver tool phase never comes through here.
     pub fn apply(&self, cmd: &mut Command) {
         if let SeatConfig::Isolated {
             cli, set, strip, ..
@@ -555,6 +613,7 @@ impl SeatConfig {
                 cmd.env(AGY_HIDE_ACCOUNT_INFO_ENV, "1");
             }
         }
+        fence_remote_credentials(cmd);
     }
 
     /// The seat root this decision runs the CLI under, when isolated with a known root.
@@ -1436,5 +1495,69 @@ mod tests {
         let err = ensure_private_dir(std::path::Path::new("relative/dir")).expect_err("relative");
         assert!(err.to_string().contains("relative"), "{err}");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// F-7R2-012 (wave 6): every seat decision — isolated or the inherit hatch — strips the
+    /// remote-write credentials and aims `gh` at the credential-less directory, while the deliver
+    /// tool phase (`hardened()` alone, no seat config) keeps the daemon's login.
+    #[test]
+    fn apply_strips_remote_credentials_and_aims_gh_at_a_credential_less_dir() {
+        use std::path::PathBuf;
+        let value = |cmd: &Command, key: &str| -> Option<Option<String>> {
+            cmd.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        let root = PathBuf::from(abs("worker/codex"));
+        for decision in [
+            SeatConfig::Inherit,
+            SeatConfig::Isolated {
+                cli: SeatCli::Codex,
+                root: Some(root.clone()),
+                set: vec![(CODEX_HOME_ENV, root.clone())],
+                strip: vec![],
+            },
+        ] {
+            let mut cmd = Command::new("true");
+            cmd.hardened();
+            for var in REMOTE_CREDENTIAL_ENV {
+                cmd.env(var, "secret");
+            }
+            decision.apply(&mut cmd);
+            for var in REMOTE_CREDENTIAL_ENV {
+                assert_eq!(
+                    value(&cmd, var),
+                    Some(None),
+                    "{decision:?}: {var} is REMOVED, not left as a decoy"
+                );
+            }
+            match value(&cmd, GH_CONFIG_DIR_ENV) {
+                Some(Some(dir)) => assert!(
+                    dir.ends_with(GH_UNAUTHENTICATED_DIR),
+                    "{decision:?}: gh is aimed at the credential-less dir, got {dir}"
+                ),
+                other => assert!(
+                    worker_home_base().is_err(),
+                    "{decision:?}: GH_CONFIG_DIR may stay unset only when the worker home base \
+                     is unresolvable, got {other:?}"
+                ),
+            }
+        }
+        // The deliver tool phase applies no seat config: `hardened()` keeps the daemon's login,
+        // and the credential fence is a SEAT rule — never folded into `hardened()`.
+        let mut deliver = Command::new("true");
+        deliver.env("GH_TOKEN", "daemon-login");
+        deliver.hardened();
+        assert_eq!(
+            value(&deliver, "GH_TOKEN"),
+            Some(Some("daemon-login".to_string())),
+            "hardened() alone must not strip GH_TOKEN — the deliver phase pushes with it"
+        );
+        assert!(
+            !ENGINE_INTERNAL_ENV
+                .iter()
+                .any(|v| REMOTE_CREDENTIAL_ENV.contains(v)),
+            "the credential fence is applied per seat, not by hardened()"
+        );
     }
 }

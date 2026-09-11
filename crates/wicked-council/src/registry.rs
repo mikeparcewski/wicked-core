@@ -119,6 +119,7 @@ impl From<TomlCli> for AgenticCli {
             acp: t.acp.map(Into::into),
             capabilities: t.capabilities,
             login_invocation: t.login_invocation,
+            health: None,
         }
     }
 }
@@ -158,6 +159,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     .into(),
             ),
             login_invocation: None,
+            health: None,
         },
         AgenticCli {
             key: "agy".into(),
@@ -195,6 +197,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     .into(),
             ),
             login_invocation: None,
+            health: None,
         },
         AgenticCli {
             key: "codex".into(),
@@ -278,6 +281,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     .into(),
             ),
             login_invocation: None,
+            health: None,
         },
         AgenticCli {
             key: "pi".into(),
@@ -316,6 +320,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     .into(),
             ),
             login_invocation: None,
+            health: None,
         },
         AgenticCli {
             key: "copilot".into(),
@@ -363,6 +368,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     .into(),
             ),
             login_invocation: None,
+            health: None,
         },
         AgenticCli {
             key: "opencode".into(),
@@ -417,6 +423,7 @@ pub fn builtin() -> Vec<AgenticCli> {
                     .into(),
             ),
             login_invocation: None,
+            health: None,
         },
     ]
 }

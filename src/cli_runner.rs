@@ -675,11 +675,14 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
+/// `benched` — the run's BENCHED seat keys (`AgentSession::benched_seats`, F-7R2-006): never a
+/// judge. The bus-mediated path passes none (the bench is not on the `DispatchedTask` wire).
 pub(crate) fn run_unit_and_judge(
     runner: &Arc<dyn StepRunner>,
     input: &StepInput,
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
+    benched: &[String],
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -691,6 +694,7 @@ pub(crate) fn run_unit_and_judge(
         agent_review_target,
         emit_delta,
         &crate::registry_roster(),
+        benched,
     )
 }
 
@@ -703,12 +707,64 @@ fn run_unit_and_judge_with_roster(
     agent_review_target: Option<&str>,
     emit_delta: &DeltaSink,
     roster: &[crate::AgenticCli],
+    benched: &[String],
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
     let output = runner.run_unit_streaming(input, emit_delta);
+    // (F-7R2-006) The seats a JUDGE may run under: the roster minus the run's bench and minus
+    // every seat the launcher's health probe declared unusable — a signed-out seat cannot render
+    // a verdict, and in run b86c14c1 the judge itself ran on such a seat and errored.
+    let eligible: Vec<crate::AgenticCli> = roster
+        .iter()
+        .filter(|c| !benched.iter().any(|b| b == &c.key))
+        .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+        .cloned()
+        .collect();
+    let roster = eligible.as_slice();
+    // (F-7R2-005) DID THE UNIT CHANGE THE TREE? For a bound AGENT unit the guard does not cover
+    // (a creator, a prose-planned unit), compare the worktree against the baseline the actor
+    // snapshotted at dispatch. `Some(true)` arms the DEFAULT floor + judge below; an unknown
+    // (no baseline persisted, git failed) is treated as CHANGED — the checks run rather than a
+    // change slipping through ungated. A guarded unit keeps `None`: the guard owns its tree.
+    let bound_agent = output.status == StepStatus::Ok
+        && input.unit.tool_cmd.is_none()
+        && input.unit.default_floor
+        && input.workdir.is_some()
+        && !crate::worktree_guard::applies_to(&input.unit);
+    let tree_changed: Option<bool> = if bound_agent {
+        let wd = input.workdir.as_deref().expect("bound");
+        match input.unit.worktree_baseline.as_ref() {
+            Some(baseline) => match crate::worktree_guard::tree_changed_since(wd, baseline) {
+                Ok(changed) => Some(changed),
+                Err(e) => {
+                    eprintln!(
+                        "wicked-core: unit {} — could not compare the worktree against its \
+                         dispatch baseline ({e}); treating the tree as CHANGED so the default \
+                         repo-checks floor runs (fail-closed, F-7R2-005)",
+                        input.unit.ord
+                    );
+                    Some(true)
+                }
+            },
+            None => {
+                eprintln!(
+                    "wicked-core: unit {} carries no dispatch baseline; treating the tree as \
+                     CHANGED so the default repo-checks floor runs (fail-closed, F-7R2-005)",
+                    input.unit.ord
+                );
+                Some(true)
+            }
+        }
+    } else {
+        None
+    };
+    // The DEFAULT floor applies to a bound agent unit that changed (or may have changed) its
+    // tree: the repository's own checks run and, when an eligible non-creator seat exists, a
+    // judge distinct from the creator renders a verdict (F-7R2-005).
+    let default_floor_applies = bound_agent && tree_changed != Some(false);
     // F-036 WORKTREE GUARD, first look — taken right after the seat's own work so the repo checks
     // below are never run over a tree the seat already rewrote (they would certify the wrong
     // code). This is NOT the outcome the gate sees: the FINAL comparison is taken at the very end
@@ -732,7 +788,7 @@ fn run_unit_and_judge_with_roster(
     // same conditions as the `agent_verdict` block below — so ordinary units pay no git spawns.
     let will_judge = output.status == StepStatus::Ok
         && input.workdir.is_some()
-        && input.unit.validator.as_ref().is_some_and(|v| v.approved);
+        && (input.unit.validator.as_ref().is_some_and(|v| v.approved) || default_floor_applies);
     let work_owned = match will_judge
         .then_some(input.workdir.as_deref())
         .flatten()
@@ -742,8 +798,11 @@ fn run_unit_and_judge_with_roster(
         None => work_owned,
     };
     let work_for_agent: &str = &work_owned;
+    // (F-7R2-005) WHY no judge ran for a unit that WANTED one — rides to `gateEvaluated.
+    // ungatedReason` so the studio says "UNGATED — no eligible judge seat" instead of "pass".
+    let mut judge_skipped: Option<String> = None;
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
-        input
+        let pinned = input
             .unit
             .validator
             .as_ref()
@@ -798,7 +857,73 @@ fn run_unit_and_judge_with_roster(
                         judge_distinct: None,
                     },
                 }
-            })
+            });
+        if pinned.is_some() {
+            pinned
+        } else if default_floor_applies {
+            // (F-7R2-005) The DEFAULT judge: no pinned validator gated this unit, but it changed
+            // the tree — so a seat DISTINCT from the creator judges the change against the
+            // engine-authored default criterion. Never the single-runner fallback (that would be
+            // a self-grade for a claude creator): with no eligible distinct seat the gate says
+            // UNGATED and why, on the wire.
+            let work_author = input
+                .unit
+                .assigned_cli
+                .as_deref()
+                .unwrap_or(crate::validator::DETERMINISTIC_VALIDATOR_SEAT);
+            let excluded = [work_author];
+            if crate::validator::distinct_judge_available(&excluded, roster) {
+                let criterion = crate::validator::default_judge_criterion(&input.unit);
+                eprintln!(
+                    "wicked-core: unit {} changed the worktree tree with no pinned validator — \
+                     convening the default judge (evaluator ≠ creator '{work_author}') \
+                     (F-7R2-005)",
+                    input.unit.ord
+                );
+                Some(
+                    match crate::validator::agent_validate(
+                        &criterion,
+                        work_for_agent,
+                        &excluded,
+                        roster,
+                        &**runner,
+                    ) {
+                        Ok(av) => av,
+                        Err(e) => crate::validator::AgentVerdict {
+                            pass: false,
+                            reasoning: format!("default judge errored (fail-closed): {e}"),
+                            judge_cli: None,
+                            judge_distinct: None,
+                        },
+                    },
+                )
+            } else {
+                let roster_keys: Vec<&str> = roster.iter().map(|c| c.key.as_str()).collect();
+                let why = format!(
+                    "no eligible judge seat distinct from creator '{work_author}' (eligible \
+                     roster: {}; benched: {})",
+                    if roster_keys.is_empty() {
+                        "none".to_string()
+                    } else {
+                        roster_keys.join(", ")
+                    },
+                    if benched.is_empty() {
+                        "none".to_string()
+                    } else {
+                        benched.join(", ")
+                    }
+                );
+                eprintln!(
+                    "wicked-core: unit {} changed the worktree tree but {why} — no judge convened; \
+                     the gate will say UNGATED unless the repo checks floor gates it (F-7R2-005)",
+                    input.unit.ord
+                );
+                judge_skipped = Some(why);
+                None
+            }
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -816,16 +941,21 @@ fn run_unit_and_judge_with_roster(
     );
     let repo_checks = match input.workdir.as_deref() {
         Some(wd)
-            if input.unit.repo_checks_floor
+            if (input.unit.repo_checks_floor || default_floor_applies)
                 && input.unit.tool_cmd.is_none()
                 && output.status == StepStatus::Ok
                 && !guard_denies =>
         {
             eprintln!(
                 "wicked-core: repo checks floor — running the repository's own checks in {} for \
-                 unit {} (F-039)",
+                 unit {} ({})",
                 wd.display(),
-                input.unit.ord
+                input.unit.ord,
+                if input.unit.repo_checks_floor {
+                    "F-039: the def's verified_evidence phase"
+                } else {
+                    "F-7R2-005: the unit changed the worktree tree — default floor"
+                }
             );
             let report = crate::repo_checks::run(wd);
             eprintln!(
@@ -908,6 +1038,8 @@ fn run_unit_and_judge_with_roster(
         worktree_guard,
         repo_checks,
         verified_tree,
+        tree_changed,
+        judge_skipped,
     };
     (output, agent_verdict, evidence)
 }
@@ -1668,6 +1800,9 @@ fn run_cli_runner(
                     &input,
                     task.agent_review_target.as_deref(),
                     &emit_delta,
+                    // The run's bench is not on the `DispatchedTask` wire (F-7R2-006): the
+                    // bus-mediated judge picks from the whole registry roster.
+                    &[],
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),
@@ -2190,6 +2325,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            health: None,
         }
     }
 
@@ -2280,7 +2416,7 @@ mod tests {
         let noop: &DeltaSink = &|_: &str| {};
         let runner: Arc<dyn StepRunner> = Arc::new(FailingRewriter);
         let (output, verdict, evidence) =
-            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[]);
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[], &[]);
         assert_eq!(output.status, StepStatus::Failed);
         assert!(verdict.is_none(), "no judge runs for a failed unit");
         assert!(
@@ -2371,7 +2507,7 @@ mod tests {
             seat("pi", "pi ask {PROMPT}"),
         ];
         let (_out, verdict, _evidence) =
-            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3);
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster3, &[]);
         assert!(
             verdict.is_some(),
             "an approved validator + workdir ⇒ a layer-2 verdict runs"
@@ -2397,7 +2533,7 @@ mod tests {
             seat("claude", "claude -p {PROMPT}"),
             seat("agy", "agy run {PROMPT}"),
         ];
-        let _ = run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2);
+        let _ = run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2, &[]);
         let seen2 = rec2.seen.lock().unwrap();
         assert_eq!(
             seen2.last().cloned().flatten(),

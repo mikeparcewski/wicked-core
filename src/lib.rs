@@ -47,6 +47,7 @@ pub mod path_policy;
 mod pipeline;
 mod plan;
 mod project;
+mod remote_write_fence;
 mod repo;
 mod repo_checks;
 mod repo_intel;
@@ -1448,6 +1449,7 @@ mod tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            health: None,
         };
 
         let dir = std::env::temp_dir().join("wicked-core-pipeline-test");

@@ -315,6 +315,19 @@ const DENIED_BASH: &[&str] = &[
     "Bash(reboot:*)",
 ];
 
+/// EVERY Bash verb the engine denies a seat: the unsalvageable machine-state verbs above plus the
+/// remote-write fence (F-7R2-012, [`crate::remote_write_fence::REMOTE_WRITE_BASH_RULES`] — `git
+/// push`, `gh pr create|merge|edit|comment`, `gh api`, `gh release`, …: delivery is the deliver
+/// phase's job). One iterator, so the three carriers (shared worker file, per-session file/ACP
+/// options, ballot argv) cannot fence different verbs.
+pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
+    DENIED_BASH.iter().copied().chain(
+        crate::remote_write_fence::REMOTE_WRITE_BASH_RULES
+            .iter()
+            .copied(),
+    )
+}
+
 /// Keep a worker session out of the operator's own machine state.
 ///
 /// Two separate leaks, one seam (FINDING-047 + FINDING-045):
@@ -852,7 +865,7 @@ pub(crate) fn deny_rules(
         // why no `Write(<path>)` twin is emitted (wicked-crew#524 / F-3R2-004).
         rules.push(format!("Edit({p}/**)"));
     }
-    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules.extend(denied_bash_rules().map(|s| s.to_string()));
     Ok(rules)
 }
 
@@ -883,7 +896,7 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
             rules.push(format!("{tool}({p}/**)"));
         }
     }
-    rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    rules.extend(denied_bash_rules().map(|s| s.to_string()));
     Ok(rules)
 }
 
@@ -9668,6 +9681,7 @@ mod project_graph_end_to_end_tests {
             acp: None,
             capabilities: None,
             login_invocation: None,
+            health: None,
         }
     }
 
@@ -9927,5 +9941,34 @@ mod project_graph_end_to_end_tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-7R2-012 (wave 6): the remote-write fence rides EVERY Bash deny list the engine writes —
+    /// the blanket per-launch fence and the shared worker file — spelled as the claude CLI
+    /// enforces Bash rules, beside the machine-state verbs it always denied.
+    #[test]
+    fn the_remote_write_fence_rides_every_bash_deny_list() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let blanket = super::deny_rules(None, None).expect("blanket fence");
+        let shared = super::shared_deny_rules(None).expect("shared fence");
+        for rules in [&blanket, &shared] {
+            for rule in crate::remote_write_fence::REMOTE_WRITE_BASH_RULES {
+                assert!(
+                    rules.iter().any(|r| r == rule),
+                    "{rule} missing from a Bash deny list: {rules:?}"
+                );
+            }
+            for base in DENIED_BASH {
+                assert!(rules.iter().any(|r| r == base), "{base} still fenced");
+            }
+        }
+        let union: Vec<&str> = denied_bash_rules().collect();
+        assert_eq!(
+            union.len(),
+            DENIED_BASH.len() + crate::remote_write_fence::REMOTE_WRITE_BASH_RULES.len(),
+            "one union, each rule once"
+        );
     }
 }

@@ -272,6 +272,17 @@ pub enum CoreEvent {
         /// judge fell back to the single default runner (prompt-only independence; see
         /// `validator::AgentVerdict`). `None` when no judge ran or the seat is unknown.
         judge_distinct: Option<bool>,
+        /// (F-7R2-005, wave 6) `true` when NOTHING gated this unit: no deterministic floor (no
+        /// pinned validator, and the repo-checks floor did not apply — the worktree tree was not
+        /// changed by an agent unit, or the run is unbound), no agent judge, and an EMPTY
+        /// evaluator-policy selection — the exact default-allow shape run b86c14c1 passed seven
+        /// times. A consumer must render it as UNGATED, never as "pass"; the narrator must never
+        /// say "checks ran" without a `repoChecksEvaluated` for the same unit. Additive.
+        ungated: bool,
+        /// WHY, when `ungated` — each absent layer and its cause ("no judge: no eligible judge
+        /// seat distinct from creator `claude` (roster: claude; benched: codex (signed out))").
+        /// `None` (wire `null`) when gated.
+        ungated_reason: Option<String>,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B2) A unit was dispatched to a worker — emitted at EVERY dispatch
     /// (initial + each re-dispatch), so a client sees rework happen. `attempt` increments on re-dispatch;
@@ -740,6 +751,30 @@ pub enum CoreEvent {
         posture: String,
         reason: String,
     },
+    /// (F-7R2-012, wave 6) A worker seat asked to run a REMOTE-WRITING command — `git push`,
+    /// `gh pr create|merge|edit|comment`, a `gh api` mutation, `gh release`, … — and the engine
+    /// REFUSED it: delivery is performed by the run's deliver phase (which lifts, re-verifies,
+    /// pushes and opens the PR so the ledger records it), never by a creator or evaluator seat.
+    /// Emitted on both carriers: the ACP permission bridge (`carrier: "acp"`) answers the seat's
+    /// `session/request_permission` with its reject option; the wrapped carrier's `PreToolUse`
+    /// gate hook (`carrier: "wrapped_cli"`) blocks the call and the fold replays the record at the
+    /// gate. `role` names the unit's role (`creator` | `evaluator` | `neutral`); `command` is the
+    /// command text the seat sent; `remedy` is what the seat was told to do instead. A refusal
+    /// costs the seat one tool call, never the unit — the seat continues with the remedy.
+    WorkerToolCallDenied {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        /// The registry seat key.
+        cli: String,
+        carrier: String,
+        role: String,
+        /// The tool the seat invoked (`Bash`, `bash`, `shell`, …).
+        tool: String,
+        command: String,
+        reason: String,
+        remedy: String,
+    },
     /// (F-3R2-013, core#431) How the run's BASE commit was chosen when its worktree was minted:
     /// the engine fetches `origin` and, when the registered clone's `HEAD` is behind the remote
     /// default branch's tip (a fast-forward), bases the run on that tip — so the worker starts
@@ -757,6 +792,10 @@ pub enum CoreEvent {
         fetched: bool,
         lifted: bool,
         note: Option<String>,
+        /// (F-7R2-013, wave 6) The run branch the worktree was minted on (`wicked/<run id>`),
+        /// recorded with `base_commit` on the session (`run_branch` / `base_commit`) so the
+        /// run's diff is servable from the branch when the worktree is gone. Additive.
+        run_branch: String,
     },
     /// (F-039) The engine ran the repository's OWN checks in the run's worktree for the def's
     /// code-verifying unit (`verified_evidence` with an `executes_code` Creator upstream) and
@@ -1176,6 +1215,8 @@ impl CoreEvent {
                 combined,
                 judge_cli,
                 judge_distinct,
+                ungated,
+                ungated_reason,
             } => json!({
                 "type": "gateEvaluated",
                 "session": session,
@@ -1192,6 +1233,8 @@ impl CoreEvent {
                 "combined": combined,
                 "judgeCli": judge_cli,
                 "judgeDistinct": judge_distinct,
+                "ungated": ungated,
+                "ungatedReason": ungated_reason,
             }),
             // (DES-STUDIO-COCKPIT-001 §3 B2) Durable-rework signal — emitted at every dispatch; `attempt>0`
             // marks a re-dispatch.
@@ -1731,6 +1774,30 @@ impl CoreEvent {
                 "posture": posture,
                 "reason": reason,
             }),
+            CoreEvent::WorkerToolCallDenied {
+                session,
+                ord,
+                attempt,
+                cli,
+                carrier,
+                role,
+                tool,
+                command,
+                reason,
+                remedy,
+            } => json!({
+                "type": "workerToolCallDenied",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "carrier": carrier,
+                "role": role,
+                "tool": tool,
+                "command": command,
+                "reason": reason,
+                "remedy": remedy,
+            }),
             CoreEvent::RunBaseResolved {
                 session,
                 base_ref,
@@ -1740,6 +1807,7 @@ impl CoreEvent {
                 fetched,
                 lifted,
                 note,
+                run_branch,
             } => json!({
                 "type": "runBaseResolved",
                 "session": session,
@@ -1750,6 +1818,7 @@ impl CoreEvent {
                 "fetched": fetched,
                 "lifted": lifted,
                 "note": note,
+                "runBranch": run_branch,
             }),
             CoreEvent::RepoChecksEvaluated {
                 session,
@@ -1992,6 +2061,8 @@ mod tests {
             combined: true,
             judge_cli: judge.map(|(k, _)| k.to_string()),
             judge_distinct: judge.map(|(_, d)| d),
+            ungated: false,
+            ungated_reason: None,
         };
         let j = ev(Some(("codex", true))).to_json();
         assert_eq!(j["type"], "gateEvaluated");
@@ -2087,6 +2158,7 @@ mod tests {
             fetched: true,
             lifted: true,
             note: None,
+            run_branch: String::new(),
         }
         .to_json();
         assert_eq!(j["type"], "runBaseResolved");

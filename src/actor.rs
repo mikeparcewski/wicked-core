@@ -1256,6 +1256,10 @@ pub(crate) fn run(
                         archived_at: None,
                         archive_note: None,
                         verified_tree: None,
+                        run_branch: None,
+                        base_commit: None,
+                        finished_at: None,
+                        benched_seats: Vec::new(),
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -1292,13 +1296,15 @@ pub(crate) fn run(
                                     // core#431 (F-3R2-013): say which base the run starts from
                                     // — the remote tip after a fetch when the clone was stale.
                                     // `None` = a live worktree was reused (a resume).
-                                    if let Some(b) = base {
+                                    let base_commit = base.as_ref().map(|b| b.commit.clone());
+                                    if let Some(b) = &base {
                                         let _ = tx.send(Command::EmitEvent(b.to_event(&rid)));
                                     }
                                     Command::WorktreeReady {
                                         spec,
                                         repo_ref: Some(ref_id),
                                         workdir: Some(wt.to_string_lossy().to_string()),
+                                        base_commit,
                                     }
                                 }
                                 Err(e) => Command::WorktreeFailed {
@@ -1315,6 +1321,7 @@ pub(crate) fn run(
                             spec,
                             repo_ref: None,
                             workdir: None,
+                            base_commit: None,
                         });
                     }
                     Ok(run_id)
@@ -1363,7 +1370,7 @@ pub(crate) fn run(
                             let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    crate::distribute::distribute_units_on(
+                                    crate::distribute::distribute_units_on_benched(
                                         &pre.units,
                                         &pre.clis,
                                         &sid,
@@ -1371,13 +1378,14 @@ pub(crate) fn run(
                                         &disp,
                                         Some(relay),
                                         op_home.as_deref(),
+                                        &pre.session.benched_seats,
                                     )
                                 }));
                             match result {
                                 Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
                                         run_id: sid,
-                                        pre,
+                                        pre: Box::new(pre),
                                         distributions,
                                     });
                                 }
@@ -1417,6 +1425,7 @@ pub(crate) fn run(
                 spec,
                 repo_ref,
                 workdir,
+                base_commit,
             } => {
                 // The worktree-creation worker finished successfully. Update the Planning stub with
                 // the resolved workdir, then proceed with pre_distribute + council distribution
@@ -1465,6 +1474,15 @@ pub(crate) fn run(
                 }
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     s.workdir = workdir.clone();
+                    // (F-7R2-013) The run branch and its base, DURABLE on the session: the diff
+                    // `base_commit..run_branch` outlives the worktree (crew's `GET /runs/:id/diff`
+                    // serves it from the registered repo once the checkout is reaped).
+                    if workdir.is_some() {
+                        s.run_branch = Some(crate::repo::worktree_branch(&run_id));
+                        if base_commit.is_some() {
+                            s.base_commit = base_commit.clone();
+                        }
+                    }
                     if let Err(e) = put_node(&mut store, s.to_node()) {
                         // Store write failure — cannot persist workdir; fail the session rather
                         // than proceeding with an inconsistent store state.
@@ -1536,7 +1554,7 @@ pub(crate) fn run(
                             let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    crate::distribute::distribute_units_on(
+                                    crate::distribute::distribute_units_on_benched(
                                         &pre.units,
                                         &pre.clis,
                                         &sid,
@@ -1544,13 +1562,14 @@ pub(crate) fn run(
                                         &disp,
                                         Some(relay),
                                         op_home.as_deref(),
+                                        &pre.session.benched_seats,
                                     )
                                 }));
                             match result {
                                 Ok(Ok(distributions)) => {
                                     let _ = tx.send(Command::PlanReady {
                                         run_id: sid,
-                                        pre,
+                                        pre: Box::new(pre),
                                         distributions,
                                     });
                                 }
@@ -1975,6 +1994,12 @@ pub(crate) fn run(
                     session.archived_at = archived.then(crate::interaction::now_millis);
                     session.archive_note = if archived { note } else { None };
                     crate::domain::put_node(&mut store, session.to_node())?;
+                    // (F-7R2-013) Archiving is the operator's write-off: a completed run's
+                    // RETAINED worktree goes now (clean-only — a dirty tree is kept and named,
+                    // as everywhere), and the run branch stays as the record.
+                    if archived {
+                        reap_terminal_worktree(&store, &session);
+                    }
                     Ok(true)
                 })());
             }
@@ -2671,6 +2696,8 @@ pub(crate) fn run(
                         let op_home = operational_home.clone();
                         let run_id_c = run_id.clone();
                         let prev_cli_c = previous_cli.clone();
+                        // (F-7R2-006) The one-unit re-council honours the run's bench too.
+                        let benched_c = session.benched_seats.clone();
                         let units_for_council = units.clone();
                         let clis_keys = session.clis.clone();
                         let ord_c = ord;
@@ -2701,7 +2728,7 @@ pub(crate) fn run(
                             let relay = council_event_relay(tx.clone());
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    crate::distribute::distribute_units_on(
+                                    crate::distribute::distribute_units_on_benched(
                                         &unit_slice,
                                         &clis,
                                         &run_id_c,
@@ -2709,6 +2736,7 @@ pub(crate) fn run(
                                         &disp,
                                         Some(relay),
                                         op_home.as_deref(),
+                                        &benched_c,
                                     )
                                 }));
                             match result {
@@ -3642,7 +3670,11 @@ pub(crate) fn resume_run_inner(
                         .as_deref()
                         .is_some_and(|r| r.contains(WORKER_FAILURE_MARKER)) =>
             {
-                Some(next_failover_seat(&units, session.unit_ix, &session.clis))
+                Some(next_failover_seat(
+                    &units,
+                    session.unit_ix,
+                    &eligible_roster_keys(&session),
+                ))
             }
             _ => None,
         };
@@ -3703,6 +3735,7 @@ pub(crate) fn resume_run_inner(
     ) {
         let mut session = session;
         session.status = SessionStatus::Failed;
+        session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
         reap_terminal_worktree(&*store, &session);
         emit(
@@ -4223,6 +4256,7 @@ fn apply_step_result(
         crate::workflow::StepStatus::Cancelled | crate::workflow::StepStatus::TimedOut
     ) {
         session.status = SessionStatus::Cancelled;
+        session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
         emit(
             subscribers,
@@ -4289,6 +4323,38 @@ fn apply_step_result(
     //   3. anything unclassified → fail as before.
     // Attempt 0 only, so a repeat refusal after the fix falls through to a real failure.
     if output.status == crate::workflow::StepStatus::Failed {
+        // (F-7R2-006) An AUTHENTICATION refusal from the worker (`Not logged in`, `401
+        // Unauthorized`, an ACP `unauthenticated`/`auth_failed` handshake refusal — the council's
+        // own `SeatFailureReason::classify` signatures) BENCHES the seat for the run before any
+        // recovery path runs: the failover ladder, the triage judge and the agent judge all read
+        // the bench, so the dead seat is never re-dispatched (run b86c14c1 parked at five human
+        // gates re-dispatching codex/pi). Persisted — a resume honours it too.
+        let auth_refusal = if unit.tool_cmd.is_none() {
+            wicked_council::types::SeatFailureReason::classify(&output.output, "")
+        } else {
+            None
+        };
+        if let Some(reason) = auth_refusal {
+            let cli = unit
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            if crate::domain::bench_seat(
+                &mut session.benched_seats,
+                crate::domain::BenchedSeat {
+                    cli: cli.clone(),
+                    reason: reason.as_str().to_string(),
+                    source: "worker".to_string(),
+                },
+            ) {
+                put_node(store, session.to_node())?;
+                eprintln!(
+                    "wicked-core: seat '{cli}' failed authentication on unit {ord} of {run_id} \
+                     ({}); benched for the run — never re-dispatched, never a judge (F-7R2-006)",
+                    reason.as_str()
+                );
+            }
+        }
         // Escalation requires a human in the loop. Autonomous sessions
         // (HumanConfirm::None — the campaign/fail-fast contract) keep mechanical
         // self-heal only; unknown failures fail exactly as they always did.
@@ -4420,6 +4486,14 @@ fn apply_step_result(
                 // The FULL output rides beside the bounded excerpt so a `Fail` decision can
                 // persist the untruncated transcript record (usability review #1).
                 let full_output = output.output.clone();
+                // (F-7R2-006) The triage judge picks from the seats this run may still use —
+                // never a benched one (in run b86c14c1 the judge itself ran on signed-out pi and
+                // errored, escalating every failure to a human).
+                let benched_keys: Vec<String> = session
+                    .benched_seats
+                    .iter()
+                    .map(|b| b.cli.clone())
+                    .collect();
                 std::thread::spawn(move || {
                     let ctx = format!("{run_id2}-u{unit_ix2}-a{attempt2}");
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4428,7 +4502,7 @@ fn apply_step_result(
                             &desc,
                             &cli,
                             invocation.as_deref().unwrap_or("(unknown)"),
-                            &crate::registry_roster(),
+                            &eligible_registry_roster(&benched_keys),
                             &*runner2,
                             &ctx,
                         )
@@ -4498,8 +4572,12 @@ fn apply_step_result(
         // Tool-executor units are excluded: `dispatch_unit` re-runs the unit's fixed `tool_cmd`
         // regardless of the seat, so "fail over to the next seat" would just re-run the same
         // command N times. Failover moves WORK between agents; there is no agent here.
+        // (F-7R2-006) An authentication refusal is a SEAT failure too — the seat is benched
+        // above, and the ladder walks the ELIGIBLE roster (configured minus benched), so the work
+        // moves to a seat that can take it instead of parking at a human gate per unit.
         if unit.tool_cmd.is_none()
-            && crate::acp_runner::is_worker_originated_failure(&output.output)
+            && (crate::acp_runner::is_worker_originated_failure(&output.output)
+                || auth_refusal.is_some())
         {
             let failed_cli = unit
                 .assigned_cli
@@ -4515,7 +4593,7 @@ fn apply_step_result(
             let seats_tried = unit.worker_failed_clis.len();
             let unit_ix = output.unit_ix;
             // Immutable selection ends the `unit` borrow; the branch re-borrows before mutating.
-            let next_seat = next_failover_seat(&units, unit_ix, &session.clis);
+            let next_seat = next_failover_seat(&units, unit_ix, &eligible_roster_keys(&session));
             if let Some(next) = next_seat {
                 let invocation = crate::registry_roster()
                     .into_iter()
@@ -4932,6 +5010,7 @@ fn fail_run(
     ord: u32,
 ) -> StepApplied {
     session.status = SessionStatus::Failed;
+    session.finished_at = Some(crate::interaction::now_millis());
     let _ = put_node(store, session.to_node());
     reap_terminal_worktree(&*store, session);
     emit(
@@ -4960,6 +5039,65 @@ fn fail_run(
 /// ([`crate::repo::reap_orphan_worktrees`]) classifies Cancelled as terminal and re-applies the
 /// same clean-only rule to it (and to anything a crash left behind), so a missed reap is a leak
 /// until next boot, not forever.
+/// (F-7R2-013, wave 6) How long a COMPLETED run's worktree is RETAINED after completion — the
+/// bounded reaper's window. The Phase 7 re-run reaped the checkout within seconds of
+/// `sessionCompleted`: `GET /runs/:id/diff` answered 409, the run page had no files view, and a
+/// unit's uncommitted edit would have died with it. A completed run keeps its tree until it is
+/// ARCHIVED (the operator's write-off — `Command::ArchiveRun`, which reaps clean-only) or this
+/// window elapses (enforced by the boot reaper: `partition_sessions_for_reap` keeps a retained
+/// run out of the reap set). `WICKED_COMPLETED_WORKTREE_KEEP_DAYS` overrides the default of
+/// [`DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS`]; `0` restores the reap-at-completion rule. Failed and
+/// cancelled runs are untouched: a failed run is resumable and re-provisions from its branch.
+pub(crate) fn completed_worktree_retention() -> Option<std::time::Duration> {
+    let days = std::env::var(COMPLETED_WORKTREE_KEEP_DAYS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS);
+    (days > 0).then(|| std::time::Duration::from_secs(days * 24 * 60 * 60))
+}
+
+/// Env override for [`completed_worktree_retention`], in whole days (`0` = reap at completion).
+pub(crate) const COMPLETED_WORKTREE_KEEP_DAYS_ENV: &str = "WICKED_COMPLETED_WORKTREE_KEEP_DAYS";
+
+/// Default retention of a completed run's worktree — long enough for a delivered PR's review
+/// cycle, bounded so a daemon never accumulates checkouts without limit.
+pub(crate) const DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS: u64 = 14;
+
+/// Whether a session's worktree is RETAINED right now: Completed, not archived, finished within
+/// the retention window. A completed run with no `finished_at` (pre-wave-6) is not retained.
+pub(crate) fn worktree_retained(session: &crate::domain::AgentSession, now_ms: i64) -> bool {
+    if session.status != SessionStatus::Completed || session.archived_at.is_some() {
+        return false;
+    }
+    let (Some(finished), Some(window)) = (session.finished_at, completed_worktree_retention())
+    else {
+        return false;
+    };
+    let window_ms = i64::try_from(window.as_millis()).unwrap_or(i64::MAX);
+    now_ms.saturating_sub(finished) < window_ms
+}
+
+/// (F-7R2-006) The run's roster keys a failover may move work to: the configured `clis` minus
+/// every benched seat. One rule with `distribute::eligible_seats`.
+fn eligible_roster_keys(session: &crate::domain::AgentSession) -> Vec<String> {
+    session
+        .clis
+        .iter()
+        .filter(|k| !session.benched_seats.iter().any(|b| &b.cli == *k))
+        .cloned()
+        .collect()
+}
+
+/// (F-7R2-006) The registry roster minus `benched` keys and minus every seat whose registry
+/// record declares itself unusable — what the triage judge may run under.
+fn eligible_registry_roster(benched: &[String]) -> Vec<crate::AgenticCli> {
+    crate::registry_roster()
+        .into_iter()
+        .filter(|c| !benched.contains(&c.key))
+        .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+        .collect()
+}
+
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let Some(repo_id) = session.repo_ref.as_ref() else {
         return;
@@ -5059,8 +5197,16 @@ fn partition_sessions_for_reap(
 ) -> (HashSet<String>, HashSet<String>) {
     let mut live = HashSet::new();
     let mut terminal = HashSet::new();
+    let now = crate::interaction::now_millis();
     for s in sessions {
         match s.status {
+            // (F-7R2-013) A COMPLETED run inside its retention window keeps its worktree — the
+            // delivered PR's files view and any uncommitted leftover live there until the run is
+            // archived or the window elapses. Kept with the live set: the boot reaper never
+            // touches it.
+            SessionStatus::Completed if worktree_retained(s, now) => {
+                live.insert(s.id.clone());
+            }
             SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => {
                 terminal.insert(s.id.clone());
             }
@@ -5399,7 +5545,14 @@ fn dispatch_unit(
     // finds the baseline already there and keeps it). Keep-first: only a human APPROVING a gate on
     // this unit clears it (`confirm_gate`), accepting the tree as it stands. A snapshot failure is
     // logged and left unset — the fold then fails the unit CLOSED (`Unverifiable`), never clean.
-    if crate::worktree_guard::applies_to(&unit) && unit.worktree_baseline.is_none() {
+    // (F-7R2-005) …and for EVERY other bound AGENT unit too: the baseline is what the worker
+    // thread compares against to know whether the unit CHANGED the tree — the trigger for the
+    // default repo-checks floor and the default judge. A Tool unit is the engine's own command
+    // and takes none.
+    if unit.tool_cmd.is_none()
+        && (crate::worktree_guard::applies_to(&unit) || unit.default_floor)
+        && unit.worktree_baseline.is_none()
+    {
         if let Some(wd) = session.workdir.as_deref() {
             // Pinned to the REGISTERED repository (adversarial review on #414): the git dir the
             // snapshot goes through comes from `<repo>/.git/worktrees/<id>`, never from the
@@ -5425,8 +5578,9 @@ fn dispatch_unit(
                     put_node(store, unit.to_node())?;
                 }
                 Err(e) => eprintln!(
-                    "wicked-core: worktree guard could not snapshot {wd} before unit {} of run \
-                     {run_id}: {e} — the unit's gate will fail closed (F-036)",
+                    "wicked-core: could not snapshot {wd} before unit {} of run {run_id}: {e} — \
+                     a guarded unit's gate fails closed (F-036); an unguarded unit is treated as \
+                     having changed the tree, so the default repo-checks floor runs (F-7R2-005)",
                     unit.ord
                 ),
             }
@@ -5703,6 +5857,8 @@ fn dispatch_unit(
                     worktree_guard: None,
                     repo_checks: lift_checks,
                     verified_tree: lift_verified_tree,
+                    tree_changed: None,
+                    judge_skipped: None,
                 }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
@@ -5726,6 +5882,13 @@ fn dispatch_unit(
         return Ok(true);
     }
 
+    // (F-7R2-006) The run's bench rides to the worker thread: the agent judge never runs on a
+    // benched seat.
+    let benched_keys: Vec<String> = session
+        .benched_seats
+        .iter()
+        .map(|b| b.cli.clone())
+        .collect();
     let runner = runner.clone();
     let tx = self_tx.clone();
     std::thread::spawn(move || {
@@ -5762,6 +5925,7 @@ fn dispatch_unit(
             &input,
             agent_review_target.as_deref(),
             &emit,
+            &benched_keys,
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,
@@ -6193,8 +6357,24 @@ fn finalize_run(
 ) -> anyhow::Result<()> {
     if let Some(mut session) = crate::domain::get_session(store, run_id)? {
         session.status = SessionStatus::Completed;
+        session.finished_at = Some(crate::interaction::now_millis());
         put_node(store, session.to_node())?;
-        reap_terminal_worktree(&*store, &session);
+        // (F-7R2-013) A completed run's worktree is RETAINED — the files view, the delivered
+        // PR's review cycle and any uncommitted leftover need it — until the run is archived or
+        // the retention window elapses (`completed_worktree_retention`); `0` days restores the
+        // reap-at-completion rule.
+        match (completed_worktree_retention(), &session.workdir) {
+            (Some(window), Some(wd)) => eprintln!(
+                "wicked-core: run {run_id} completed — keeping its worktree at {wd} for up to \
+                 {} day(s) (until archived; branch {}) (F-7R2-013)",
+                window.as_secs() / (24 * 60 * 60),
+                session
+                    .run_branch
+                    .clone()
+                    .unwrap_or_else(|| crate::repo::worktree_branch(run_id))
+            ),
+            _ => reap_terminal_worktree(&*store, &session),
+        }
     }
     emit(
         subscribers,
@@ -6505,6 +6685,7 @@ pub(crate) fn cancel_run(
         _ => {}
     }
     session.status = SessionStatus::Cancelled;
+    session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
     // A cancelled run's open prompt is dead state — resolve it `cancelled` so no skin renders a
     // gate nobody can answer (DES-PROJECT-001 §5.3). No-op when the run was answered/never paused.
@@ -6854,6 +7035,10 @@ mod gate_pause_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -7018,6 +7203,10 @@ mod terminal_gate_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -7151,6 +7340,10 @@ mod substance_gate_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -7434,6 +7627,10 @@ mod code_evidence_floor_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -7794,6 +7991,10 @@ mod deliverable_floor_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -8197,6 +8398,10 @@ mod seat_failover_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -8833,6 +9038,10 @@ mod def_gate_disclosure_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -8932,6 +9141,10 @@ mod def_gate_disclosure_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -9185,6 +9398,10 @@ mod terminal_worktree_reap_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -9215,8 +9432,39 @@ mod terminal_worktree_reap_tests {
         String::from_utf8_lossy(&out.stdout).contains(branch)
     }
 
+    /// Wave 6 (F-7R2-013): a COMPLETED run's clean worktree is RETAINED by default — the files
+    /// view and the delivered PR's review cycle need it — and `finished_at` is stamped; with the
+    /// retention knob at `0` days the pre-wave-6 rule holds: the clean checkout goes at
+    /// completion and the branch stays as the record.
     #[test]
     fn a_completed_run_reaps_its_clean_worktree_and_keeps_the_branch() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
+
+        // Default retention: the completed run KEEPS its worktree.
+        std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "kept", "r-kept");
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        finalize_run(&mut store, &mut subs, &runner, &tx, "r-kept").unwrap();
+        let session = crate::domain::get_session(&store, "r-kept")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::Completed);
+        assert!(session.finished_at.is_some(), "finished_at stamped");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            wt.exists() && crate::repo::is_live_worktree(&wt),
+            "a completed run's worktree is retained until archived or the window elapses"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // `0` days: the reap-at-completion rule.
+        std::env::set_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV, "0");
         let mut store = open_store(Some(":memory:")).unwrap();
         let (root, wt) = seeded(&mut store, "done", "r-done");
         let mut subs = crate::event_log::EventSink::default();
@@ -9235,6 +9483,10 @@ mod terminal_worktree_reap_tests {
             "the branch is the run's record and must outlive the checkout"
         );
         let _ = std::fs::remove_dir_all(&root);
+        match saved {
+            Some(v) => std::env::set_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV, v),
+            None => std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV),
+        }
     }
 
     #[test]
@@ -9616,6 +9868,10 @@ mod terminal_worktree_reap_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -9712,6 +9968,10 @@ mod worker_code_graph_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         }
     }
 
@@ -10027,6 +10287,10 @@ mod project_graph_binding_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         }
     }
 
@@ -10762,6 +11026,10 @@ mod phase_boundary_governance_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -11160,6 +11428,10 @@ mod turn_timeout_vs_cancel_tests {
             archived_at: None,
             archive_note: None,
             verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -11300,5 +11572,141 @@ mod turn_timeout_vs_cancel_tests {
         let (applied, session, _events) = fold(&mut store, &run_id, StepStatus::Cancelled, 1);
         assert!(matches!(applied, StepApplied::Finished));
         assert_eq!(session.status, SessionStatus::Cancelled);
+    }
+
+    /// F-7R2-013 (wave 6): a COMPLETED run inside its retention window KEEPS its worktree — the
+    /// boot reaper files it with the live set; archived, outside the window, pre-wave-6 (no
+    /// `finished_at`), or with retention set to `0` days, it is terminal (reaped clean-only).
+    #[test]
+    fn a_completed_run_inside_its_retention_window_is_kept_by_the_boot_reaper() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
+        std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV);
+        let now = crate::interaction::now_millis();
+        let fresh = AgentSession {
+            id: "s-fresh".into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec![],
+            status: SessionStatus::Completed,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: Some("/tmp/wt".into()),
+            repo_ref: Some("r".into()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: Some("wicked/s-fresh".into()),
+            base_commit: None,
+            finished_at: Some(now - 60_000),
+            benched_seats: Vec::new(),
+        };
+        let archived = AgentSession {
+            id: "s-archived".into(),
+            archived_at: Some(now),
+            ..fresh.clone()
+        };
+        let old = AgentSession {
+            id: "s-old".into(),
+            finished_at: Some(now - (DEFAULT_COMPLETED_WORKTREE_KEEP_DAYS as i64 + 1) * 86_400_000),
+            ..fresh.clone()
+        };
+        let legacy = AgentSession {
+            id: "s-legacy".into(),
+            finished_at: None,
+            ..fresh.clone()
+        };
+        let failed = AgentSession {
+            id: "s-failed".into(),
+            status: SessionStatus::Failed,
+            ..fresh.clone()
+        };
+        assert!(worktree_retained(&fresh, now));
+        assert!(!worktree_retained(&archived, now));
+        assert!(!worktree_retained(&old, now));
+        assert!(!worktree_retained(&legacy, now));
+        assert!(!worktree_retained(&failed, now));
+        let (live, terminal) =
+            partition_sessions_for_reap(&[fresh.clone(), archived, old, legacy, failed]);
+        assert!(
+            live.contains("s-fresh"),
+            "retained: kept out of the reap set"
+        );
+        for reaped in ["s-archived", "s-old", "s-legacy", "s-failed"] {
+            assert!(
+                terminal.contains(reaped) && !live.contains(reaped),
+                "{reaped}"
+            );
+        }
+        // `0` days restores the reap-at-completion rule.
+        std::env::set_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV, "0");
+        assert!(completed_worktree_retention().is_none());
+        assert!(!worktree_retained(&fresh, now));
+        match saved {
+            Some(v) => std::env::set_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV, v),
+            None => std::env::remove_var(COMPLETED_WORKTREE_KEEP_DAYS_ENV),
+        }
+    }
+
+    /// F-7R2-006 (wave 6): the failover roster is the configured roster minus the bench.
+    #[test]
+    fn eligible_roster_keys_drop_benched_seats() {
+        let mut session = AgentSession {
+            id: "s".into(),
+            workflow_id: "wf".into(),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["a".into(), "b".into(), "c".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            unit_ix: 0,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            benched_seats: Vec::new(),
+        };
+        assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
+        assert!(crate::domain::bench_seat(
+            &mut session.benched_seats,
+            crate::domain::BenchedSeat {
+                cli: "b".into(),
+                reason: "not_logged_in".into(),
+                source: "worker".into(),
+            },
+        ));
+        assert!(
+            !crate::domain::bench_seat(
+                &mut session.benched_seats,
+                crate::domain::BenchedSeat {
+                    cli: "b".into(),
+                    reason: "again".into(),
+                    source: "ballot".into(),
+                },
+            ),
+            "the first reason wins"
+        );
+        assert_eq!(eligible_roster_keys(&session), vec!["a", "c"]);
+        assert_eq!(
+            crate::domain::benched_summary(&session.benched_seats, 3).as_deref(),
+            Some("1 of 3 seats benched: b (not_logged_in — worker)")
+        );
     }
 }

@@ -492,8 +492,22 @@ pub(crate) fn pre_distribute(
         archived_at: None,
         archive_note: None,
         verified_tree: None,
+        run_branch: None,
+        base_commit: None,
+        finished_at: None,
+        benched_seats: Vec::new(),
     };
-    if !session_already_started {
+    if session_already_started {
+        // (F-7R2-013 / F-7R2-006) The launch stub on the store already carries what the
+        // worktree handler recorded (`run_branch`, `base_commit`) and any seats benched before
+        // this plan (a re-plan): the record written from here MUST carry them forward, or the
+        // plan overwrites the durable fields with `None` the moment it lands.
+        if let Ok(Some(existing)) = crate::domain::get_session(&*store, session_id) {
+            session.run_branch = existing.run_branch;
+            session.base_commit = existing.base_commit;
+            session.benched_seats = existing.benched_seats;
+        }
+    } else {
         put_node(store, session.to_node())?;
         emit(CoreEvent::SessionStarted {
             session: session_id.to_string(),
@@ -604,42 +618,42 @@ pub(crate) fn apply_distributions(
         u.routing = Some(dist.routing.clone());
         u.status = UnitStatus::Distributed;
         put_node(store, u.to_node())?;
-        let (routing_method, agreement_pct, returned, seated, dissent, degraded_reason) =
-            match &dist.routing {
-                RoutingInfo::Council {
-                    agreement_pct,
-                    returned,
-                    seated,
-                    dissent,
-                    ..
-                } => (
-                    "council".to_string(),
-                    Some(*agreement_pct),
-                    Some(*returned),
-                    // Already an Option — an unknown seat count stays unknown on the wire rather
-                    // than being flattened into a number no one measured.
-                    *seated,
-                    Some(*dissent),
-                    None,
-                ),
-                RoutingInfo::Degraded { reason } => (
-                    "degraded".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(reason.clone()),
-                ),
-                RoutingInfo::EvaluatorDistinct { .. } => (
-                    "evaluator_distinct".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
-                RoutingInfo::Tool => ("tool".to_string(), None, None, None, None, None),
-            };
+        // (F-7R2-006 / crew#533 anchor) `degradedReason` is the DISTRIBUTION's, on every arm:
+        // the Council arm used to emit `null` unconditionally, so a 1-of-5 council over four
+        // signed-out seats read as an undegraded verdict. `Distribution::degraded_reason` is
+        // `"N of M seats benched: …"` whenever eligible < configured, the degrade's own reason
+        // (with that summary appended) for a `Degraded` routing, `None` otherwise.
+        let (routing_method, agreement_pct, returned, seated, dissent) = match &dist.routing {
+            RoutingInfo::Council {
+                agreement_pct,
+                returned,
+                seated,
+                dissent,
+                ..
+            } => (
+                "council".to_string(),
+                Some(*agreement_pct),
+                Some(*returned),
+                // Already an Option — an unknown seat count stays unknown on the wire rather
+                // than being flattened into a number no one measured.
+                *seated,
+                Some(*dissent),
+            ),
+            RoutingInfo::Degraded { .. } => ("degraded".to_string(), None, None, None, None),
+            RoutingInfo::EvaluatorDistinct { .. } => {
+                ("evaluator_distinct".to_string(), None, None, None, None)
+            }
+            RoutingInfo::Tool => ("tool".to_string(), None, None, None, None),
+        };
+        let degraded_reason = dist
+            .degraded_reason
+            .clone()
+            .or_else(|| match &dist.routing {
+                // A distribution built without the bench pass (a hand-built one) keeps the
+                // degrade's own reason on the wire, exactly as before.
+                RoutingInfo::Degraded { reason } => Some(reason.clone()),
+                _ => None,
+            });
         emit(CoreEvent::UnitDistributed {
             session: pre.session_id.clone(),
             ord: u.ord,
@@ -652,6 +666,13 @@ pub(crate) fn apply_distributions(
             degraded_reason,
             seat_constraint: dist.seat_constraint.clone(),
         });
+    }
+    // (F-7R2-006) The bench the distribution ran under is the RUN's: persisted so every dispatch
+    // (failover, triage judge, agent judge) and any re-plan honours it. Union, first reason wins.
+    if let Some(dist) = distributions.first() {
+        for seat in &dist.benched {
+            crate::domain::bench_seat(&mut pre.session.benched_seats, seat.clone());
+        }
     }
     pre.session.status = SessionStatus::Executing;
     put_node(store, pre.session.to_node())?;
@@ -856,33 +877,74 @@ pub(crate) fn apply_and_finish_unit(
     // for a unit the floor governs — unless the guard already denied, in which case the checks
     // were deliberately not run over a rewritten tree and the guard's denial is the honest one.
     let guard_denied = guard_denial.is_some();
-    let checks_denial: Option<String> = match &evidence.repo_checks {
-        Some(report) => {
-            unit.repo_checks = Some(report.clone());
-            emit(CoreEvent::RepoChecksEvaluated {
-                session: session_id.to_string(),
-                ord: unit.ord,
-                attempt,
-                passed: report.passed,
-                criterion: crate::repo_checks::CRITERION.to_string(),
-                checks: report.checks.clone(),
-                skipped: report.skipped.clone(),
-            });
-            (!report.passed).then(|| report.denial_reason())
-        }
-        None if unit.repo_checks_floor
-            && unit.tool_cmd.is_none()
-            && workdir.is_some()
-            && guard_denial.is_none() =>
-        {
-            Some(format!(
+    // (F-7R2-005) The DEFAULT floor — a unit that changed its tree WITHOUT a declared
+    // `verified_evidence` phase — on a host where no OS write boundary can be armed: the checks
+    // are NOT run (the doctrine: never run repo-controlled scripts unsandboxed), the report says
+    // so (`repoChecksEvaluated` with `checks: []` and the sandbox error), and the gate DISCLOSES
+    // it instead of denying — the deterministic layer is absent (`ungatedReason` names the
+    // cause), the judge still gates. The DECLARED floor keeps its fail-closed denial: a def that
+    // asked for re-verification does not get a pass on a host that cannot re-verify.
+    let default_floor_refused_unsandboxed = !unit.repo_checks_floor
+        && evidence.tree_changed == Some(true)
+        && evidence
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| !r.passed && r.checks.is_empty() && r.sandbox_error.is_some());
+    let checks_denial: Option<String> =
+        match &evidence.repo_checks {
+            Some(report) => {
+                unit.repo_checks = Some(report.clone());
+                emit(CoreEvent::RepoChecksEvaluated {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    passed: report.passed,
+                    criterion: crate::repo_checks::CRITERION.to_string(),
+                    checks: report.checks.clone(),
+                    skipped: report.skipped.clone(),
+                });
+                if default_floor_refused_unsandboxed {
+                    eprintln!(
+                    "wicked-core: unit {} changed the worktree tree but the default repo-checks \
+                     floor could not run ({}); disclosed as UNGATED on the deterministic layer, \
+                     not denied (F-7R2-005)",
+                    unit.ord,
+                    report.sandbox_error.as_deref().unwrap_or("no OS write boundary")
+                );
+                    None
+                } else {
+                    (!report.passed).then(|| report.denial_reason())
+                }
+            }
+            None if unit.repo_checks_floor
+                && unit.tool_cmd.is_none()
+                && workdir.is_some()
+                && guard_denial.is_none() =>
+            {
+                Some(format!(
                 "repo checks floor did not run for this verified_evidence phase: {} — the result \
                  reached the gate without the engine's own check evidence (fail-closed)",
                 crate::repo_checks::CRITERION
             ))
-        }
-        None => None,
-    };
+            }
+            // (F-7R2-005) The DEFAULT floor: an agent unit that CHANGED the tree it was handed owes
+            // the repository's own checks — a changed tree with no report is the same fail-closed
+            // shape as a declared floor whose report never arrived.
+            None if evidence.tree_changed == Some(true)
+                && unit.tool_cmd.is_none()
+                && workdir.is_some()
+                && guard_denial.is_none() =>
+            {
+                Some(format!(
+                "repo checks floor did not run although unit {} changed the worktree tree: {} — \
+                 the result reached the gate without the engine's own check evidence (fail-closed, \
+                 F-7R2-005)",
+                unit.ord,
+                crate::repo_checks::CRITERION
+            ))
+            }
+            None => None,
+        };
     // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before the
     // denials are moved into the deny-dominance fold below, so `GateEvaluated` can carry the
     // depth. Both deterministic instruments count: the pinned validator and the repo checks.
@@ -976,6 +1038,34 @@ pub(crate) fn apply_and_finish_unit(
     if governed {
         let phase = crate::scope::unit_phase(unit.ord);
         for rec in crate::gate_hook::collect_hook_decisions(session_id, attempt, &phase) {
+            // (F-7R2-012) The wrapped carrier's gate hook refused a `git push` / `gh pr create`:
+            // the hook is a subprocess with no emit seam, so the fold discloses the refusal here
+            // from its durable record — the ACP carrier emits the same event live.
+            if let Some((reason, command)) = rec.remote_write_refusal() {
+                eprintln!(
+                    "wicked-core: unit {} ({}) on '{}' asked to run a remote-writing command and \
+                     was refused by the gate hook: `{command}` — {} (F-7R2-012)",
+                    unit.ord,
+                    crate::write_posture::role_wire(unit.role),
+                    unit.assigned_cli.as_deref().unwrap_or("claude"),
+                    crate::remote_write_fence::REMEDY
+                );
+                emit(CoreEvent::WorkerToolCallDenied {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    cli: unit
+                        .assigned_cli
+                        .clone()
+                        .unwrap_or_else(|| "claude".to_string()),
+                    carrier: "wrapped_cli".to_string(),
+                    role: crate::write_posture::role_wire(unit.role).to_string(),
+                    tool: rec.tool_name.clone(),
+                    command,
+                    reason,
+                    remedy: crate::remote_write_fence::REMEDY.to_string(),
+                });
+            }
             emit(CoreEvent::GovernanceHookFired {
                 session: session_id.to_string(),
                 ord: unit.ord,
@@ -1055,12 +1145,60 @@ pub(crate) fn apply_and_finish_unit(
     // refused to run without a boundary) OR a floor-marked unit whose report never arrived, which
     // `checks_denial` above denies fail-closed. Deriving it from the report alone made that
     // denial read as "no floor, criterion None" (Copilot on #414).
-    let checks_ran = evidence.repo_checks.is_some()
-        || (unit.repo_checks_floor
-            && unit.tool_cmd.is_none()
-            && workdir.is_some()
-            && !guard_denied);
+    let checks_ran = !default_floor_refused_unsandboxed
+        && (evidence.repo_checks.is_some()
+            || ((unit.repo_checks_floor || evidence.tree_changed == Some(true))
+                && unit.tool_cmd.is_none()
+                && workdir.is_some()
+                && !guard_denied));
     let has_deterministic_floor = unit.validator.is_some() || checks_ran;
+    // (F-7R2-005) UNGATED — nothing gated this unit: no deterministic floor, no agent judge, an
+    // empty evaluator-policy selection. Said on the wire, with the reason per absent layer, so no
+    // consumer can render the vacuous default-allow as a pass. A Tool unit is the engine's own
+    // command (its floor is the deliver lift's re-verify when it has one) and is not "ungated" in
+    // this sense; a human gate, when the def declares one, is still a gate — this flag speaks
+    // only for the machine layers.
+    let ungated = unit.tool_cmd.is_none()
+        && !has_deterministic_floor
+        && agent_verdict.is_none()
+        && evaluator_policies.is_empty();
+    let ungated_reason = ungated.then(|| {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(match (workdir.is_some(), evidence.tree_changed) {
+            (false, _) => "no deterministic floor: no pinned validator; repo checks do not apply \
+                           to an unbound run (no worktree)"
+                .to_string(),
+            (true, Some(false)) => "no deterministic floor: no pinned validator; repo checks did \
+                                    not apply (the unit left the worktree tree unchanged)"
+                .to_string(),
+            (true, None) if crate::worktree_guard::applies_to(unit) => {
+                "no deterministic floor: no pinned validator; repo checks did not apply (a \
+                 guarded executes_code:false unit — the worktree guard held the tree)"
+                    .to_string()
+            }
+            (true, Some(true)) if default_floor_refused_unsandboxed => format!(
+                "no deterministic floor: no pinned validator; the unit changed the worktree tree \
+                 but the repo checks could not run — {} (install an OS sandbox tool: \
+                 sandbox-exec on macOS, bubblewrap on Linux)",
+                evidence
+                    .repo_checks
+                    .as_ref()
+                    .and_then(|r| r.sandbox_error.clone())
+                    .unwrap_or_else(|| "no OS write boundary could be armed".to_string())
+            ),
+            (true, _) => "no deterministic floor: no pinned validator and the repo checks did \
+                          not run"
+                .to_string(),
+        });
+        parts.push(match &evidence.judge_skipped {
+            Some(why) => format!("no judge: {why}"),
+            None => "no judge: no pinned validator convened one and the unit did not change the \
+                     tree"
+                .to_string(),
+        });
+        parts.push("evaluator policies: none applied (default-allow)".to_string());
+        parts.join("; ")
+    });
     let criterion = match (
         unit.validator.as_ref().map(|v| v.criterion.clone()),
         checks_ran,
@@ -1099,6 +1237,8 @@ pub(crate) fn apply_and_finish_unit(
         combined: outcome.approved,
         judge_cli,
         judge_distinct,
+        ungated,
+        ungated_reason,
     });
     emit(CoreEvent::GateDecided {
         session: session_id.to_string(),
@@ -2085,5 +2225,110 @@ mod resolve_tests {
             remedy.contains("deadbeefdeadbeef"),
             "the message must name the pin that failed to resolve: {remedy}"
         );
+    }
+
+    /// F-7R2-006 (wave 6, crew#533's anchor): `unitDistributed.degradedReason` is the
+    /// DISTRIBUTION's on the council arm — "N of M seats benched: …" when the launcher's health
+    /// probe benched a seat — and the bench is persisted on the session for every later dispatch.
+    #[test]
+    fn apply_distributions_carries_degraded_reason_on_the_council_arm_and_persists_the_bench() {
+        use wicked_council::types::{Category, Confidence, InputMode, Vote};
+        use wicked_council::CouncilTask;
+        fn mk_cli(key: &str) -> AgenticCli {
+            AgenticCli {
+                key: key.into(),
+                display_name: key.into(),
+                binary: "unused".into(),
+                headless_invocation: format!("{key} -p {{PROMPT}}"),
+                category: Category::default(),
+                input_mode: InputMode::default(),
+                version_probe: vec![],
+                trust_flags: vec![],
+                alt_binaries: vec![],
+                confidence: Confidence::default(),
+                enabled_for_council: true,
+                acp: None,
+                capabilities: None,
+                login_invocation: None,
+                health: None,
+            }
+        }
+        /// Every seat votes for option 1 — the first ELIGIBLE candidate.
+        struct FixedDispatcher;
+        impl Dispatcher for FixedDispatcher {
+            fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+                Some(Vote {
+                    cli: cli.key.clone(),
+                    recommendation: "1 — fit".into(),
+                    top_risk: "none".into(),
+                    change_my_mind: "no".into(),
+                    disqualifier: None,
+                    confidence: Confidence::default(),
+                    provenance: "fixed".into(),
+                })
+            }
+        }
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut signed_out = mk_cli("codex");
+        signed_out.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
+        let clis = vec![mk_cli("claude"), signed_out, mk_cli("pi")];
+        let mut events: Vec<CoreEvent> = Vec::new();
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(FixedDispatcher);
+        let sid = format!("w6-degraded-{}", std::process::id());
+        let planned = plan_and_distribute(
+            &mut store,
+            &clis,
+            "Build the thing.",
+            EntityMode::Isolated,
+            &sid,
+            crate::domain::HumanConfirm::None,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            &dispatcher,
+            &mut |ev| events.push(ev),
+            None,
+            false,
+            false,
+            None,
+        )
+        .expect("plans");
+        assert!(!planned.units.is_empty());
+        let distributed: Vec<(String, Option<String>)> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                CoreEvent::UnitDistributed {
+                    routing_method,
+                    degraded_reason,
+                    cli,
+                    ..
+                } => {
+                    assert_ne!(cli, "codex", "a benched seat is never assigned");
+                    Some((routing_method.clone(), degraded_reason.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!distributed.is_empty());
+        for (method, why) in &distributed {
+            assert_eq!(
+                why.as_deref(),
+                Some("1 of 3 seats benched: codex (signed out — launcher)"),
+                "degradedReason on the `{method}` arm"
+            );
+        }
+        let session = crate::domain::get_session(&store, &sid).unwrap().unwrap();
+        assert_eq!(session.benched_seats.len(), 1);
+        assert_eq!(
+            (
+                session.benched_seats[0].cli.as_str(),
+                session.benched_seats[0].source.as_str()
+            ),
+            ("codex", "launcher")
+        );
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&sid));
     }
 }

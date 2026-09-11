@@ -271,6 +271,47 @@ pub struct AgenticCli {
     /// default for the seat key ([`default_login_invocation`]), else no sign-in surface.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_invocation: Option<String>,
+    /// (F-7R2-006, wave 6) The LAUNCHER's health verdict for this seat — the result of its
+    /// sign-in / usability probe (wicked-crew's `GET /roster` `auth` + `council_eligible`), carried
+    /// on the roster it hands the engine so routing can act on it. `Some(usable: false)` BENCHES
+    /// the seat for the run: it is never convened on a council, never picked by the
+    /// evaluator≠creator reassignment, never handed a triage or judge session, and
+    /// `unitDistributed.degradedReason` names it. `Some(usable: true)` is a seat the launcher
+    /// found signed in (or whose CLI declares a no-auth free tier); `None` (the wire default —
+    /// a launcher that predates this field, a TOML registry record) means UNKNOWN and the seat
+    /// is treated as eligible until it fails authentication in the run. Additive: absent on the
+    /// wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<SeatHealth>,
+}
+
+/// The launcher's usability verdict for one seat ([`AgenticCli::health`], F-7R2-006).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatHealth {
+    /// Whether the seat can take work: its CLI is signed in, or declares a no-auth free tier.
+    pub usable: bool,
+    /// Why not, when `usable: false` — the launcher's own words (`signed out`, `dispatch budget
+    /// exhausted`, …), rendered into `degradedReason`. `None` when usable or unstated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl SeatHealth {
+    /// A seat the launcher found usable.
+    pub fn usable() -> Self {
+        SeatHealth {
+            usable: true,
+            reason: None,
+        }
+    }
+
+    /// A seat the launcher benched, with its reason.
+    pub fn unusable(reason: impl Into<String>) -> Self {
+        SeatHealth {
+            usable: false,
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 /// Built-in sign-in commands for the known seat keys — used when a registry entry does not
