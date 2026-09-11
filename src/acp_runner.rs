@@ -1278,6 +1278,25 @@ const WORKER_HOME_SANITIZED: &[&str] = &[
 /// whatever its own settings say; it rides each session's `session/new` options and per-session
 /// settings file instead ([`write_session_settings`]). Written atomically (tmp + rename) so a
 /// concurrent spawn's CLI never reads a torn file.
+/// The claude seat's deny rules for a chat's READ-ONLY scoped roots: ONE rule per root,
+/// `Edit({root}/**)` — the write-side path form the CLI enforces, covering Write, MultiEdit and
+/// NotebookEdit. The `Write(…)` and `NotebookEdit(…)` twins this used to emit are inert on the CLI
+/// and each drew a `Permission deny rule … is not matched` warning (wicked-crew#524 follow-up,
+/// review on core#436; the same defect the worker fence had). A root the rule syntax cannot spell
+/// refuses the spawn.
+fn read_only_root_rules(roots: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut rules = Vec::with_capacity(roots.len());
+    for root in roots {
+        let p = crate::execute_wrapped::rule_path(std::path::Path::new(root)).ok_or_else(|| {
+            anyhow::anyhow!(
+                "refusing to advertise read root {root}: it cannot be spelled as a permission rule"
+            )
+        })?;
+        rules.push(format!("Edit({p}/**)"));
+    }
+    Ok(rules)
+}
+
 /// The SHARED worker fence for a council ballot (wicked-crew#524 follow-up, review on core#436).
 ///
 /// `wicked_council::dispatch::run_in_isolation` runs a claude seat under the worker home
@@ -2035,20 +2054,11 @@ fn start_acp_process_with_write_roots(
     let mut deny: Vec<String> = crate::execute_wrapped::deny_rules(skills_plugin, operational_home)
         .map_err(anyhow::Error::msg)?;
     // A CHAT's scoped repository roots are READ-ONLY (core#410, review): the claude seat's own
-    // fence says so — `Edit`/`Write`/`NotebookEdit` under each root are denied in the session's
-    // `disallowedTools` (the SDK honours them without a permission round-trip; the boundary on
-    // `session/request_permission` covers every other seat and every other tool). A root the rule
-    // syntax cannot spell refuses the spawn, like every other fenced directory.
-    for root in additional_read_roots {
-        let p = crate::execute_wrapped::rule_path(std::path::Path::new(root)).ok_or_else(|| {
-            anyhow::anyhow!(
-                "refusing to advertise read root {root}: it cannot be spelled as a permission rule"
-            )
-        })?;
-        for tool in ["Edit", "Write", "NotebookEdit"] {
-            deny.push(format!("{tool}({p}/**)"));
-        }
-    }
+    // fence says so — `Edit` under each root is denied in the session's `disallowedTools` (the SDK
+    // honours it without a permission round-trip; the boundary on `session/request_permission`
+    // covers every other seat and every other tool). A root the rule syntax cannot spell refuses
+    // the spawn, like every other fenced directory. See `read_only_root_rules`.
+    deny.extend(read_only_root_rules(additional_read_roots)?);
     let session_settings: Option<std::path::PathBuf> = match (session, &worker_config_dir) {
         (Some((run_id, cli_key)), Some(home)) => {
             Some(write_session_settings(home, run_id, cli_key, &deny)?)
@@ -10677,6 +10687,33 @@ transport = "stdio"
             ),
             crate::execute_wrapped::inherits_operator_config()
         );
+    }
+
+    /// wicked-crew#524 follow-up (review on core#436): a chat's read-only roots are fenced with
+    /// the ONE write-side form the CLI enforces — no inert `Write(…)`/`NotebookEdit(…)` twin ever
+    /// reaches the session's `disallowedTools` or its per-session settings file.
+    #[test]
+    fn read_only_roots_are_fenced_with_edit_only_no_inert_form() {
+        let a = std::env::temp_dir().join("wro-a");
+        let b = std::env::temp_dir().join("wro-b");
+        let roots = vec![
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+        ];
+        let rules = super::read_only_root_rules(&roots).expect("spellable roots");
+        let ra = crate::execute_wrapped::rule_path(&a).unwrap();
+        let rb = crate::execute_wrapped::rule_path(&b).unwrap();
+        assert_eq!(
+            rules,
+            vec![format!("Edit({ra}/**)"), format!("Edit({rb}/**)")]
+        );
+        assert!(
+            !rules.iter().any(|r| r.starts_with("Write(")
+                || r.starts_with("NotebookEdit(")
+                || r.starts_with("MultiEdit(")),
+            "{rules:?}"
+        );
+        assert!(super::read_only_root_rules(&[]).unwrap().is_empty());
     }
 
     /// wicked-crew#524 follow-up (review on core#436): the council ballot path gets the shared

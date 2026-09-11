@@ -733,6 +733,10 @@ pub(crate) fn run(
     // spec (selects estate's Postgres backend under the `postgres` feature). `AnyStore` is one
     // concrete type, so the engine below borrows it as `&dyn GraphRead` / `&mut dyn GraphStore`
     // without ever learning which backend it holds.
+    // The engine's own operational state home — fenced for every claude council BALLOT on its argv
+    // (wicked-crew#524 follow-up): the same derivation the ACP runner uses for worker launches.
+    let operational_home: Option<std::path::PathBuf> =
+        crate::state_home::operational_home_of_db(&path);
     let mut store: AnyStore = match open_store_any(Some(&path)) {
         Ok(s) => s,
         Err(e) => {
@@ -1100,6 +1104,7 @@ pub(crate) fn run(
                     workflow.as_deref(),
                     dispatcher.clone(),
                     &mut |ev| emit(&mut subscribers, ev),
+                    operational_home.as_deref(),
                 );
                 if let Err(e) = res {
                     emit(
@@ -1343,6 +1348,7 @@ pub(crate) fn run(
                         // council votes. Posts PlanReady or PlanFailed back when done.
                         let tx = self_tx.clone();
                         let disp = dispatcher.clone();
+                        let op_home = operational_home.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
                             let relay = council_event_relay(tx.clone());
@@ -1355,6 +1361,7 @@ pub(crate) fn run(
                                         None,
                                         &disp,
                                         Some(relay),
+                                        op_home.as_deref(),
                                     )
                                 }));
                             match result {
@@ -1514,6 +1521,7 @@ pub(crate) fn run(
                     Ok(pre) => {
                         let tx = self_tx.clone();
                         let disp = dispatcher.clone();
+                        let op_home = operational_home.clone();
                         std::thread::spawn(move || {
                             let sid = pre.session_id.clone();
                             let relay = council_event_relay(tx.clone());
@@ -1526,6 +1534,7 @@ pub(crate) fn run(
                                         None,
                                         &disp,
                                         Some(relay),
+                                        op_home.as_deref(),
                                     )
                                 }));
                             match result {
@@ -2650,6 +2659,7 @@ pub(crate) fn run(
                         // Re-run the council off the actor thread; post back ReassignReady.
                         let tx = self_tx.clone();
                         let disp = dispatcher.clone();
+                        let op_home = operational_home.clone();
                         let run_id_c = run_id.clone();
                         let prev_cli_c = previous_cli.clone();
                         let units_for_council = units.clone();
@@ -2689,6 +2699,7 @@ pub(crate) fn run(
                                         None,
                                         &disp,
                                         Some(relay),
+                                        op_home.as_deref(),
                                     )
                                 }));
                             match result {
@@ -3291,6 +3302,11 @@ pub(crate) fn launch_run_inner(
         Some(registry),
         false, // stub not yet created — this path is campaign-driven, needs full setup
         in_process_governance().is_some(), // actor thread: GOV_DB_PATH is set
+        // The engine's own state home, derived from the same governance store path the ACP
+        // runner fences workers from — so the run's first council ballot is fenced like a worker.
+        in_process_governance()
+            .and_then(|g| crate::state_home::operational_home_of_db(&g.db_path))
+            .as_deref(),
     )?;
     match advance_or_pause(
         store,

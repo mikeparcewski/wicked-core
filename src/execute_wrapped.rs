@@ -341,13 +341,16 @@ const DENIED_BASH: &[&str] = &[
 /// logged-in worker home, which a read-only review cannot use), and the earlier "inert" claim was
 /// not re-measured on this version. Workers are pinned to `acceptEdits` below regardless, so
 /// nothing rests on the answer for them. The council's seat dispatch DOES pass the trust flag
-/// ([`wicked_council::dispatch`]) and creates no fence of its own; it reads the shared
-/// `settings.json` under the worker home, which the distributor now writes BEFORE convening any
-/// council that seats a claude carrier (`distribute::distribute_units_against` →
-/// `acp_runner::ensure_shared_worker_fence`, the same idempotent writer the ACP worker spawn
-/// uses; a council-first ballot used to run with no fence at all). With the file always present,
-/// the fence is exactly as live for seat votes as that unmeasured sentence turns out to be. The
-/// real boundary belongs in the
+/// ([`wicked_council::dispatch`]) and creates no fence of its own, so the distributor fences the
+/// ballot BEFORE convening any council whose roster seats a claude carrier
+/// (`distribute::distribute_units_against`): the shared worker `settings.json` is written by the
+/// same idempotent writer the ACP spawn uses (`acp_runner::ensure_shared_worker_fence` — the
+/// launch-independent half), and the half that file omits by design — the state-home rules, which
+/// ACP sessions carry per session — rides the claude seat's own argv as `--disallowedTools`
+/// ([`ballot_deny_rules`]). Together they are the same rule set a worker launch carries
+/// ([`deny_rules`] with no snapshot); a council-first ballot used to run with no fence at all. How
+/// live that fence is for seat votes is exactly as live as that unmeasured sentence turns out to
+/// be. The real boundary belongs in the
 /// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
 /// closes the observed leaks in the meantime and does not pretend to close the class.
 ///
@@ -372,8 +375,9 @@ const DENIED_BASH: &[&str] = &[
 /// MANDATORY (codex round 8, CRITICAL): the engine's isolation cannot be narrowed by a template.
 /// A registry template that states `--setting-sources` or `--permission-mode` itself (either
 /// spelling) is a CONFIG ERROR naming the template and the flag — rounds 1–7 deferred to it, so a
-/// `clis.toml` line could load the operator's user scope or run under `bypassPermissions` (which
-/// makes every deny rule inert) without the explicit hatch. The ONLY way to inherit the operator's
+/// `clis.toml` line could load the operator's user scope or run under `bypassPermissions` (whose
+/// effect on explicit deny rules is UNMEASURED on the current CLI — see LIMITS above — and which
+/// is the engine's mode to state either way) without the explicit hatch. The ONLY way to inherit the operator's
 /// configuration is [`INHERIT_OPERATOR_CONFIG_ENV`], and even then the deny fence is injected: the
 /// hatch withholds the two scope/mode flags, never the `--disallowedTools` list. A template's OWN
 /// `--disallowedTools` is UNIONED into the engine's (templates may add denies, never remove one):
@@ -880,6 +884,28 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
         }
     }
     rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    Ok(rules)
+}
+
+/// The half of the fence the SHARED worker file omits by design — the state-home rules — for a
+/// claude carrier that has no per-session settings file: the council ballot (wicked-crew#524
+/// follow-up, review on core#436). ACP sessions carry these rules per session (`deny_rules` —
+/// registry or blanket); a ballot has no session, so the distributor puts the BLANKET `Read` +
+/// `Edit` over every state-home candidate (the default `~/.wicked-crew` and the engine's own
+/// operational home) on the claude seat's argv (`--disallowedTools`). Shared file ∪ this list is
+/// the same set [`deny_rules`] produces for a snapshot-less worker launch — one generator, three
+/// carriers. `Err` names an unspellable directory (fail closed, as everywhere in this module).
+pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<String>, String> {
+    let mut rules: Vec<String> = Vec::new();
+    for dir in state_home_candidates(operational_home) {
+        let p = rule_path(&dir).ok_or_else(|| unspellable(&dir))?;
+        for tool in ["Read", "Edit"] {
+            let rule = format!("{tool}({p}/**)");
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+    }
     Ok(rules)
 }
 
@@ -7306,7 +7332,8 @@ mod tests {
     /// MANDATORY isolation (codex round 8, CRITICAL — the inverse of the round-1 deference this
     /// test used to bless): a template that states `--setting-sources` or `--permission-mode`
     /// itself — either spelling — is a CONFIG ERROR naming the template and the flag, since either
-    /// one loads the operator's user scope or makes every deny rule inert without the explicit
+    /// one loads the operator's user scope or changes the permission mode the engine owns (its effect
+    /// on deny rules unmeasured on the current CLI) without the explicit
     /// hatch; and a template's own `--disallowedTools` is UNIONED into the engine's — the argv
     /// carries `Edit` AND every engine rule, in ONE flag.
     #[test]
@@ -7402,6 +7429,45 @@ mod tests {
             &["--permission-modes".to_string()],
             &["--permission-mode"]
         ));
+    }
+
+    /// wicked-crew#524 follow-up (review on core#436): the council ballot's argv half of the fence
+    /// — the state-home rules the shared worker file omits — completes the shared file to exactly
+    /// the rule set a snapshot-less worker launch carries; no inert form, no Bash verbs (those
+    /// ride the shared file).
+    #[test]
+    fn the_ballot_argv_rules_complete_the_shared_file_to_a_worker_launch_fence() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let op = std::env::temp_dir().join(format!("wballot-op-{}", std::process::id()));
+        let opr = rule_path(&op).expect("expressible");
+        let ballot = super::ballot_deny_rules(Some(&op)).expect("ballot rules");
+        assert!(ballot.contains(&format!("Read({opr}/**)")), "{ballot:?}");
+        assert!(ballot.contains(&format!("Edit({opr}/**)")), "{ballot:?}");
+        assert!(
+            !ballot
+                .iter()
+                .any(|r| r.starts_with("Write(") || r.starts_with("Bash(")),
+            "{ballot:?}"
+        );
+        let mut union: Vec<String> = super::shared_deny_rules(Some(&op)).expect("shared");
+        union.extend(ballot.iter().cloned());
+        union.sort();
+        union.dedup();
+        let mut launch = super::deny_rules(None, Some(&op)).expect("launch fence");
+        launch.sort();
+        launch.dedup();
+        assert_eq!(
+            union, launch,
+            "shared file ∪ ballot argv == the snapshot-less worker launch fence"
+        );
+        // No operational home: the default state-home candidate alone.
+        let default_only = super::ballot_deny_rules(None).expect("default candidate");
+        assert!(
+            default_only
+                .iter()
+                .any(|r| r.starts_with("Read(") && r.contains(".wicked-crew")),
+            "{default_only:?}"
+        );
     }
 
     /// wicked-crew#524 / F-3R2-004 — every claude ballot's stderr carried 12 CLI warnings:

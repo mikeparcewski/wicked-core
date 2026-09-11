@@ -159,6 +159,9 @@ pub fn distribute_units_on(
     db_path: Option<&str>,
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     relay: Option<EventRelay>,
+    // The engine's own operational state home (`state_home::operational_home_of_db`) — fenced
+    // for a claude BALLOT on its argv (wicked-crew#524 follow-up); `None` = the default candidate.
+    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<Vec<Distribution>> {
     // core#401: the skills root the seats are judged against. Resolved ONLY when a seated unit
     // names a skill — a skill-free run consults no ladder and logs no fallback line, exactly as
@@ -180,19 +183,48 @@ pub fn distribute_units_on(
         dispatcher,
         relay,
         snapshot.as_ref(),
+        operational_home,
     )
 }
 
-/// Does the roster seat a claude carrier — by seat key, or by the binary's file stem (the same
-/// case-insensitive test the spawn paths apply to decide the carrier)?
-fn seats_a_claude_carrier(clis: &[AgenticCli]) -> bool {
-    clis.iter().any(|c| {
-        c.key == "claude"
-            || std::path::Path::new(&c.binary)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case("claude"))
-    })
+/// The program token of a seat's `headless_invocation` — the SAME carrier identity the council
+/// dispatch judges (`run_in_isolation` execs the first token and hands it to
+/// `seat_config_for_carrier`): a double-quoted program or the first bare token.
+fn ballot_program(invocation: &str) -> &str {
+    let s = invocation.trim_start();
+    match s.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => s.split_whitespace().next().unwrap_or(""),
+    }
+}
+
+/// Is this seat a claude BALLOT — judged exactly as the council will exec it: the invocation's
+/// program token through the one shared carrier resolver (`binary_is_claude`; case rules follow
+/// the OS's own executable lookup), never the roster key or the record's `binary`.
+fn is_claude_ballot(cli: &AgenticCli) -> bool {
+    wicked_apps_core::spawn::binary_is_claude(ballot_program(&cli.headless_invocation))
+}
+
+/// The roster the council convenes with: every claude ballot's `trust_flags` gain
+/// `--disallowedTools <state-home rules>` (`execute_wrapped::ballot_deny_rules`) — the half of the
+/// fence the shared worker file omits by design; every other seat is handed back untouched.
+fn fenced_roster(
+    clis: &[AgenticCli],
+    operational_home: Option<&std::path::Path>,
+) -> anyhow::Result<Vec<AgenticCli>> {
+    let rules =
+        crate::execute_wrapped::ballot_deny_rules(operational_home).map_err(anyhow::Error::msg)?;
+    Ok(clis
+        .iter()
+        .cloned()
+        .map(|mut c| {
+            if is_claude_ballot(&c) && !rules.is_empty() {
+                c.trust_flags.push("--disallowedTools".into());
+                c.trust_flags.push(rules.join(","));
+            }
+            c
+        })
+        .collect())
 }
 
 /// The candidate seats for one unit: the roster keys and records the council votes among, and
@@ -202,6 +234,7 @@ type Candidates = Option<(Vec<AgenticCli>, String)>;
 /// [`distribute_units_on`] against an explicit skills root (`None` ⇒ no seat is constrained), so
 /// the routing is testable without the process environment — the same split the admission has
 /// (`resolve_ladder` / `resolve_ladder_in`).
+#[allow(clippy::too_many_arguments)] // the routing seam is testable without the process env
 pub(crate) fn distribute_units_against(
     units: &[WorkUnit],
     clis: &[AgenticCli],
@@ -210,12 +243,41 @@ pub(crate) fn distribute_units_against(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     relay: Option<EventRelay>,
     snapshot: Option<&SkillsSnapshot>,
+    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<Vec<Distribution>> {
     // Plan-time refusal (core#401): a unit whose skills only a claude seat can be handed, on a
     // roster with none, is refused HERE — before any council convenes and before any unit does
     // work — naming the skill, its portability and the seat kind required. The ladder would have
     // refused the same unit by name at launch; by then work may have been done and the escalation
     // gate cannot retarget a seat, so the run could only be cancelled.
+    // wicked-crew#524 follow-up (review on core#436): the council's claude seat runs under the
+    // worker home with the trust flag appended (`wicked_council::dispatch::run_in_isolation`) and
+    // creates no fence of its own — a council convened before any worker had spawned used to run
+    // with no deny fence at all. Fence the ROSTER here, before any ballot, in the two halves
+    // `execute_wrapped::ballot_deny_rules` documents: the shared worker `settings.json` (the same
+    // idempotent writer the ACP spawn uses) and, on the claude seat's own argv as
+    // `--disallowedTools` (the council appends `trust_flags` verbatim), the state-home rules that
+    // file omits by design. A fence that cannot be written refuses the council — fail closed,
+    // exactly as the ACP spawn refuses the worker. A roster with no claude ballot is untouched.
+    let fenced: Vec<AgenticCli>;
+    let clis: &[AgenticCli] = if clis.iter().any(is_claude_ballot) {
+        crate::acp_runner::ensure_shared_worker_fence().map_err(|e| {
+            anyhow::anyhow!(
+                "council for {session_id}: the shared worker fence (<worker home>/claude/\
+                 settings.json) could not be written ({e}); refusing to convene a claude seat \
+                 without its deny fence"
+            )
+        })?;
+        fenced = fenced_roster(clis, operational_home).map_err(|e| {
+            anyhow::anyhow!(
+                "council for {session_id}: the ballot's state-home fence could not be built ({e}); \
+                 refusing to convene a claude seat without it"
+            )
+        })?;
+        &fenced
+    } else {
+        clis
+    };
     let candidates = seat_candidates(units, clis, snapshot)?;
     let roster_keys: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
     let mut dists: Vec<Distribution> = std::thread::scope(|s| {
@@ -475,22 +537,6 @@ fn distribute_one(
         });
     }
 
-    // wicked-crew#524 follow-up (review on core#436): the council's claude seat runs under the
-    // worker home with the trust flag appended (`wicked_council::dispatch::run_in_isolation`) and
-    // reads the SHARED `settings.json` fence there — a file only the ACP worker spawn used to
-    // write, so a council convened before any worker had spawned ran with no deny fence at all.
-    // Ensure it here, with the same idempotent writer, BEFORE any ballot; a fence that cannot be
-    // written refuses the council (fail closed), exactly as the ACP spawn refuses the worker.
-    if seats_a_claude_carrier(clis) {
-        crate::acp_runner::ensure_shared_worker_fence().map_err(|e| {
-            anyhow::anyhow!(
-                "council for {session_id}: the shared worker fence (<worker home>/claude/\
-                 settings.json) could not be written ({e}); refusing to convene a claude seat \
-                 without its deny fence"
-            )
-        })?;
-    }
-
     let estate = match db_path {
         Some(path) => EstateHandle::new(
             wicked_apps_core::SqliteStore::open(path)
@@ -746,13 +792,75 @@ mod tests {
     /// control proves the guard is scoped to len==1: there, the council DOES convene (dispatcher hit).
     /// Mutation: delete the `if let [only] = clis` short-circuit and the single-seat case dispatches
     /// (calls > 0), failing the first assertion.
-    /// wicked-crew#524 follow-up (review on core#436): convening a council that seats a claude
-    /// carrier writes the SHARED worker fence first — the file the ballot reads under the worker
-    /// home — so a council-first ballot is fenced exactly like a worker spawn. A claude-less
-    /// roster writes nothing. (The test process arms `WICKED_WORKER_HOME` to a per-process temp
-    /// home pre-main; this test re-aims it at its own fixture and restores the armed value.)
+    /// Records every seat it is asked to dispatch — what the council actually convened with.
+    struct RecordingDispatcher {
+        seen: Arc<std::sync::Mutex<Vec<AgenticCli>>>,
+    }
+    impl Dispatcher for RecordingDispatcher {
+        fn dispatch(&self, cli: &AgenticCli, _task: &CouncilTask) -> Option<Vote> {
+            self.seen.lock().unwrap().push(cli.clone());
+            Some(Vote {
+                cli: cli.key.clone(),
+                recommendation: "1 — fit".into(),
+                top_risk: "none".into(),
+                change_my_mind: "no".into(),
+                disqualifier: None,
+                confidence: Confidence::default(),
+                provenance: "recording".into(),
+            })
+        }
+    }
+
+    /// A seat whose INVOCATION execs `claude` — the carrier identity the council judges.
+    fn claude_seat(key: &str) -> AgenticCli {
+        let mut c = seat(key);
+        c.binary = "claude".into();
+        c.headless_invocation = "claude -p {PROMPT}".into();
+        c.trust_flags = vec!["--dangerously-skip-permissions".into()];
+        c
+    }
+
+    /// wicked-crew#524 follow-up (review on core#436): a claude BALLOT is judged by the
+    /// invocation's program token through the shared carrier resolver — exactly what the council
+    /// execs — never by the roster key or the record's `binary`.
     #[test]
-    fn convening_a_claude_seat_writes_the_shared_worker_fence_first() {
+    fn a_claude_ballot_is_judged_by_the_invocations_program_token_like_the_council() {
+        let mut custom = seat("custom");
+        custom.headless_invocation = "claude -p {PROMPT}".into();
+        assert!(
+            is_claude_ballot(&custom),
+            "a custom key whose template execs claude IS a ballot"
+        );
+        let mut quoted = seat("q");
+        quoted.headless_invocation = "\"/opt/tools/claude\" -p {PROMPT}".into();
+        assert!(
+            is_claude_ballot(&quoted),
+            "a quoted program path is judged by its file stem"
+        );
+        let by_key_only = seat("claude"); // template `run-claude {PROMPT}`, binary `unused`
+        assert!(
+            !is_claude_ballot(&by_key_only),
+            "the key alone is not the carrier"
+        );
+        let mut binary_only = seat("x");
+        binary_only.binary = "claude".into();
+        assert!(
+            !is_claude_ballot(&binary_only),
+            "the record's binary alone is not the carrier"
+        );
+        assert_eq!(ballot_program("  codex exec {PROMPT}"), "codex");
+        assert_eq!(ballot_program("\"/a b/claude\" -p"), "/a b/claude");
+        assert_eq!(ballot_program(""), "");
+    }
+
+    /// wicked-crew#524 follow-up (review on core#436): convening a council that seats a claude
+    /// ballot writes the SHARED worker fence first AND hands the claude seat the state-home rules
+    /// that file omits — on its own argv (`--disallowedTools`), the operational home included —
+    /// so a council-first ballot is fenced like a worker launch. Every other seat is untouched; a
+    /// claude-less roster writes nothing. (The test process arms `WICKED_WORKER_HOME` to a
+    /// per-process temp home pre-main; this test re-aims it at a fixture and restores it.)
+    #[test]
+    fn convening_a_claude_ballot_writes_the_shared_fence_and_fences_the_state_home_on_argv() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -762,9 +870,14 @@ mod tests {
         let base = std::env::temp_dir().join(format!("wdistribute-fence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::env::set_var(wicked_apps_core::spawn::WORKER_HOME_ENV, &base);
+        let op_home = base.join("state");
         let unit = WorkUnit::pending("u1", "s1", 0, "Write the parser module");
-        let (dispatcher, _calls) = spy();
-        // No claude seat ⇒ nothing is written.
+        let seen: Arc<std::sync::Mutex<Vec<AgenticCli>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher: Arc<dyn Dispatcher + Send + Sync> = Arc::new(RecordingDispatcher {
+            seen: Arc::clone(&seen),
+        });
+        // No claude ballot ⇒ nothing is written, no seat is touched.
         distribute_units_on(
             std::slice::from_ref(&unit),
             &[seat("codex"), seat("pi")],
@@ -772,22 +885,31 @@ mod tests {
             None,
             &dispatcher,
             None,
+            Some(&op_home),
         )
         .expect("distribute a claude-less roster");
         assert!(
             !base.join("claude").join("settings.json").exists(),
             "a claude-less roster writes no fence"
         );
-        // A claude seat ⇒ the shared fence exists, with the shared rules, before the ballot ran.
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.trust_flags.is_empty()));
+        seen.lock().unwrap().clear();
+        // A claude ballot ⇒ the shared fence exists with the shared rules, and the claude seat's
+        // argv carries the state-home rules — the operational home included; codex is untouched.
         distribute_units_on(
             std::slice::from_ref(&unit),
-            &[seat("claude"), seat("codex")],
+            &[claude_seat("claude"), seat("codex")],
             "s1",
             None,
             &dispatcher,
             None,
+            Some(&op_home),
         )
-        .expect("distribute a roster with a claude seat");
+        .expect("distribute a roster with a claude ballot");
         let bytes = std::fs::read(base.join("claude").join("settings.json"))
             .expect("the shared fence was written before the ballot");
         let settings: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -800,7 +922,36 @@ mod tests {
         assert_eq!(
             deny,
             crate::execute_wrapped::shared_deny_rules(None).unwrap(),
-            "the ballot reads the SAME fence a worker spawn writes"
+            "the ballot reads the SAME shared fence a worker spawn writes"
+        );
+        let convened = seen.lock().unwrap().clone();
+        let claude = convened
+            .iter()
+            .find(|c| c.key == "claude")
+            .expect("the claude seat was convened");
+        let codex = convened
+            .iter()
+            .find(|c| c.key == "codex")
+            .expect("the codex seat was convened");
+        assert!(
+            codex.trust_flags.is_empty(),
+            "a non-claude seat is handed back untouched"
+        );
+        let expected = crate::execute_wrapped::ballot_deny_rules(Some(&op_home)).unwrap();
+        assert_eq!(
+            claude.trust_flags,
+            vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--disallowedTools".to_string(),
+                expected.join(","),
+            ],
+            "the claude ballot carries the state-home rules on its argv, after its own trust flag"
+        );
+        let opr = crate::execute_wrapped::rule_path(&op_home).unwrap();
+        assert!(
+            expected.contains(&format!("Read({opr}/**)"))
+                && expected.contains(&format!("Edit({opr}/**)")),
+            "{expected:?}"
         );
         match prev_hatch {
             Some(v) => std::env::set_var(hatch, v),
@@ -834,6 +985,7 @@ mod tests {
             "s1",
             None,
             &dispatcher,
+            None,
             None,
         )
         .expect("distribute a single-seat roster");
@@ -875,6 +1027,7 @@ mod tests {
             "s1",
             None,
             &dispatcher2,
+            None,
             None,
         )
         .expect("distribute a two-seat roster");
@@ -1236,6 +1389,7 @@ mod tests {
             &dispatcher,
             Some(relay),
             Some(&snapshot),
+            None,
         )
         .expect("a claude seat is on the roster: no refusal");
         assert_eq!(dists.len(), 1);
@@ -1283,6 +1437,7 @@ mod tests {
             &dispatcher,
             Some(relay),
             Some(&snapshot),
+            None,
         )
         .expect("portable skill: routed as before");
         assert!(
@@ -1326,6 +1481,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect_err("no claude seat on the roster");
         assert_eq!(
@@ -1391,6 +1547,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect("a claude seat is on the roster");
         assert_eq!(dists[0].assigned_cli, "claude");
@@ -1409,6 +1566,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect_err("Claude-less roster under the fallback");
         assert!(
@@ -1436,6 +1594,7 @@ mod tests {
             &dispatcher,
             None,
             None,
+            None,
         )
         .expect("no root ⇒ no routing-time refusal");
         assert!(
@@ -1460,6 +1619,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect("a tool unit has no seat to constrain");
         assert!(dists[0].seat_constraint.is_none());
@@ -1524,6 +1684,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect("distributed");
         // The spy votes option 1 everywhere: the builder is claude.
@@ -1625,6 +1786,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect_err("no seat resolves to claude on both carriers");
         assert!(
@@ -1652,6 +1814,7 @@ mod tests {
             &dispatcher,
             None,
             Some(&snapshot),
+            None,
         )
         .expect("the overridden `codex` seat IS a claude seat");
         assert_eq!(dists[0].assigned_cli, "codex");
