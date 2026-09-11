@@ -1463,6 +1463,7 @@ mod tests {
             None, // free-text planner (legacy path)
             Arc::new(Stub),
             &mut |ev| events.push(ev),
+            None,
         )
         .expect("run_session");
 
@@ -1509,6 +1510,7 @@ mod tests {
             Some("feature"),
             Arc::new(Stub),
             &mut |e| ev2.push(e),
+            None,
         )
         .expect("def-driven run_session");
         let funits = session_units(&store, "test-feature").unwrap();

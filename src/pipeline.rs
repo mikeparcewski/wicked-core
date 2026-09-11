@@ -46,6 +46,9 @@ pub fn run_session(
     workflow: Option<&str>,
     dispatcher: Arc<dyn Dispatcher + Send + Sync>,
     emit: &mut dyn FnMut(CoreEvent),
+    // See `plan_and_distribute`: the state home a claude ballot is fenced from; `None` on the
+    // sync/test drivers, which have no daemon state home (the default candidate is still fenced).
+    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<SessionResult> {
     // Clear any prior run's per-run governance dir for this session id (the sync driver, like
     // launch_run_inner, must not inherit a stale decisions log — a leftover Deny would spuriously fail
@@ -74,6 +77,7 @@ pub fn run_session(
         None, // legacy sync path: no actor-owned registry (uses built-ins + overlay dir per-call)
         false, // stub not yet created
         crate::actor::in_process_governance().is_some(), // propagate governance from calling thread
+        operational_home,
     )?;
 
     // ── EXECUTE — per unit: produce output (stub, inline here), then gate it. ──
@@ -685,6 +689,10 @@ pub(crate) fn plan_and_distribute(
     // GOV_DB_PATH thread-local internally. Pass in_process_governance().is_some() from the
     // calling thread; the sync/test path correctly gets false when GOV_DB_PATH is not set.
     governed: bool,
+    // The engine's own operational state home (`state_home::operational_home_of_db`), fenced for
+    // every claude council BALLOT on its argv (wicked-crew#524 follow-up). The call site supplies
+    // it for the same reason it supplies `governed`: this function reads no thread-local.
+    operational_home: Option<&std::path::Path>,
 ) -> anyhow::Result<Planned> {
     let mut pre = pre_distribute(
         store,
@@ -704,8 +712,15 @@ pub(crate) fn plan_and_distribute(
         session_already_started,
         governed,
     )?;
-    let distributions =
-        distribute::distribute_units_on(&pre.units, clis, session_id, None, dispatcher, None)?;
+    let distributions = distribute::distribute_units_on(
+        &pre.units,
+        clis,
+        session_id,
+        None,
+        dispatcher,
+        None,
+        operational_home,
+    )?;
     apply_distributions(store, &mut pre, distributions, emit)?;
     Ok(Planned {
         session: pre.session,

@@ -333,12 +333,26 @@ const DENIED_BASH: &[&str] = &[
 /// the file TOOLS (`Edit` covers every file-editing tool; a `Write(path)` rule is NOT matched by the
 /// CLI and is never emitted — [`enforceable_rule`]) — a `Bash(cat …)` of a denied path still gets
 /// through, and `DENIED_BASH` only names verbs
-/// that are unsalvageable rather than every command that could escape. The rules are also inert
-/// under `bypassPermissions` / `--dangerously-skip-permissions`, which is why the mode is pinned
-/// below; note the council's seat dispatch DOES pass that trust flag ([`wicked_council::dispatch`]),
-/// so seat votes are outside this boundary. The real boundary belongs in the PreToolUse gate-hook,
-/// which already sees every call and can reject on the resolved path; this closes the observed leaks
-/// in the meantime and does not pretend to close the class.
+/// that are unsalvageable rather than every command that could escape. Under `bypassPermissions` /
+/// `--dangerously-skip-permissions` the status of these rules is UNMEASURED on the installed CLI
+/// (2.1.268; wicked-crew#524 follow-up): its bundled SDK text says "permissionMode
+/// 'bypassPermissions' auto-approves every tool call (except explicit deny rules)", i.e. explicit
+/// deny rules would still apply — but no live probe has confirmed that here (a probe needs a
+/// logged-in worker home, which a read-only review cannot use), and the earlier "inert" claim was
+/// not re-measured on this version. Workers are pinned to `acceptEdits` below regardless, so
+/// nothing rests on the answer for them. The council's seat dispatch DOES pass the trust flag
+/// ([`wicked_council::dispatch`]) and creates no fence of its own, so the distributor fences the
+/// ballot BEFORE convening any council whose roster seats a claude carrier
+/// (`distribute::distribute_units_against`): the shared worker `settings.json` is written by the
+/// same idempotent writer the ACP spawn uses (`acp_runner::ensure_shared_worker_fence` — the
+/// launch-independent half), and the half that file omits by design — the state-home rules, which
+/// ACP sessions carry per session — rides the claude seat's own argv as `--disallowedTools`
+/// ([`ballot_deny_rules`]). Together they are the same rule set a worker launch carries
+/// ([`deny_rules`] with no snapshot); a council-first ballot used to run with no fence at all. How
+/// live that fence is for seat votes is exactly as live as that unmeasured sentence turns out to
+/// be. The real boundary belongs in the
+/// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
+/// closes the observed leaks in the meantime and does not pretend to close the class.
 ///
 /// The engine's own governance is unaffected: the gate-hook rides a wicked-written `--settings`
 /// file ([`arm_input_governance`]), which is a separate source from the three scopes named here.
@@ -361,8 +375,9 @@ const DENIED_BASH: &[&str] = &[
 /// MANDATORY (codex round 8, CRITICAL): the engine's isolation cannot be narrowed by a template.
 /// A registry template that states `--setting-sources` or `--permission-mode` itself (either
 /// spelling) is a CONFIG ERROR naming the template and the flag — rounds 1–7 deferred to it, so a
-/// `clis.toml` line could load the operator's user scope or run under `bypassPermissions` (which
-/// makes every deny rule inert) without the explicit hatch. The ONLY way to inherit the operator's
+/// `clis.toml` line could load the operator's user scope or run under `bypassPermissions` (whose
+/// effect on explicit deny rules is UNMEASURED on the current CLI — see LIMITS above — and which
+/// is the engine's mode to state either way) without the explicit hatch. The ONLY way to inherit the operator's
 /// configuration is [`INHERIT_OPERATOR_CONFIG_ENV`], and even then the deny fence is injected: the
 /// hatch withholds the two scope/mode flags, never the `--disallowedTools` list. A template's OWN
 /// `--disallowedTools` is UNIONED into the engine's (templates may add denies, never remove one):
@@ -393,8 +408,9 @@ pub(crate) fn inject_isolation_flags(
         ),
         (
             "--permission-mode",
-            "workers always run under `--permission-mode acceptEdits` (`bypassPermissions`/`auto` \
-             make every deny rule inert)",
+            "workers always run under `--permission-mode acceptEdits` (`auto` was measured to bypass \
+             every deny rule; whether `bypassPermissions` keeps explicit deny rules is unmeasured \
+             on the current CLI — the mode is the engine's to state either way)",
         ),
     ] {
         if argv_states(&stated, &[flag]) {
@@ -417,11 +433,13 @@ pub(crate) fn inject_isolation_flags(
         // under `acceptEdits` got "Claude requested permissions to write to …" with the mode left
         // unset. So the mode has to be stated, not inherited.
         //
-        // `acceptEdits` and not `bypassPermissions`/`auto`: both of those make the deny rules
-        // below inert. Measured on the live CLI with an identical probe — under `acceptEdits` the
-        // read of the operator's config was refused by the rule, under `auto` it went straight
-        // through, and under `--dangerously-skip-permissions` likewise. `acceptEdits` is the only
-        // mode where a worker can do its job AND stay inside the boundary.
+        // `acceptEdits` and not `bypassPermissions`/`auto`. Measured on an EARLIER live CLI with an
+        // identical probe — under `acceptEdits` the read of the operator's config was refused by
+        // the rule, under `auto` it went straight through, and under
+        // `--dangerously-skip-permissions` likewise. On 2.1.268 the CLI's own SDK text says
+        // `bypassPermissions` keeps explicit deny rules; that is UNMEASURED here (see the LIMITS
+        // note on `inject_isolation_flags`) and nothing below depends on it: `acceptEdits` is the
+        // only mode where a worker can do its job AND is known to stay inside the boundary.
         flags.push("--permission-mode".into());
         flags.push("acceptEdits".into());
     }
@@ -548,16 +566,32 @@ fn strip_plugin_dir(argv: &mut Vec<String>, prompt_ix: Option<usize>) -> Vec<Str
 /// to the `Edit(<path>)` form that enforces it instead of riding along inert. A BARE `Write` (the
 /// whole tool, no path) is a valid deny and is left alone.
 ///
+/// The CLI's validator (read from the installed 2.1.268 binary, wicked-crew#524 follow-up) names
+/// FOUR inert path forms, not one: `Write(<p>)`, `MultiEdit(<p>)` and `NotebookEdit(<p>)` are
+/// covered by `Edit(<p>)`; `Glob(<p>)` is covered by `Read(<p>)` ("Read rules cover all
+/// file-reading tools"). Every one of them is lifted to its enforced twin here; a bare tool name
+/// of any of them (no path) is a whole-tool deny and rides as stated.
+///
 /// Manual check against the live CLI (no automated test spawns claude): in a scratch config dir,
 /// `printf '{"permissions":{"deny":["Read(/tmp/fence/**)","Edit(/tmp/fence/**)"]}}' > s.json`,
 /// then `claude -p --settings s.json --setting-sources project,local --permission-mode acceptEdits
 /// 'use the Write tool to create /tmp/fence/probe.txt'` — expect NO `Permission deny rule` line on
 /// stderr, the write refused in the transcript, and no `/tmp/fence/probe.txt` afterwards.
 fn enforceable_rule(rule: String) -> String {
-    match rule.strip_prefix("Write(") {
-        Some(rest) if rest.ends_with(')') => format!("Edit({rest}"),
-        _ => rule,
+    const LIFTS: [(&str, &str); 4] = [
+        ("Write(", "Edit("),
+        ("MultiEdit(", "Edit("),
+        ("NotebookEdit(", "Edit("),
+        ("Glob(", "Read("),
+    ];
+    for (inert, enforced) in LIFTS {
+        if let Some(rest) = rule.strip_prefix(inert) {
+            if rest.ends_with(')') {
+                return format!("{enforced}{rest}");
+            }
+        }
     }
+    rule
 }
 
 /// Lift a template's OWN `--disallowedTools`/`--disallowed-tools` (either spelling, comma-joined
@@ -850,6 +884,28 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
         }
     }
     rules.extend(DENIED_BASH.iter().map(|s| s.to_string()));
+    Ok(rules)
+}
+
+/// The half of the fence the SHARED worker file omits by design — the state-home rules — for a
+/// claude carrier that has no per-session settings file: the council ballot (wicked-crew#524
+/// follow-up, review on core#436). ACP sessions carry these rules per session (`deny_rules` —
+/// registry or blanket); a ballot has no session, so the distributor puts the BLANKET `Read` +
+/// `Edit` over every state-home candidate (the default `~/.wicked-crew` and the engine's own
+/// operational home) on the claude seat's argv (`--disallowedTools`). Shared file ∪ this list is
+/// the same set [`deny_rules`] produces for a snapshot-less worker launch — one generator, three
+/// carriers. `Err` names an unspellable directory (fail closed, as everywhere in this module).
+pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<String>, String> {
+    let mut rules: Vec<String> = Vec::new();
+    for dir in state_home_candidates(operational_home) {
+        let p = rule_path(&dir).ok_or_else(|| unspellable(&dir))?;
+        for tool in ["Read", "Edit"] {
+            let rule = format!("{tool}({p}/**)");
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+    }
     Ok(rules)
 }
 
@@ -7267,15 +7323,17 @@ mod tests {
         assert_eq!(
             flag_value(&argv, "--permission-mode"),
             Some("acceptEdits"),
-            "`auto` and `bypassPermissions` both make --disallowedTools inert (measured); \
-             acceptEdits is the only mode that lets a worker write AND stay inside the boundary"
+            "`auto` was measured to make --disallowedTools inert and `bypassPermissions` is \
+             unmeasured on the current CLI; acceptEdits is the only mode known to let a worker \
+             write AND stay inside the boundary"
         );
     }
 
     /// MANDATORY isolation (codex round 8, CRITICAL — the inverse of the round-1 deference this
     /// test used to bless): a template that states `--setting-sources` or `--permission-mode`
     /// itself — either spelling — is a CONFIG ERROR naming the template and the flag, since either
-    /// one loads the operator's user scope or makes every deny rule inert without the explicit
+    /// one loads the operator's user scope or changes the permission mode the engine owns (its effect
+    /// on deny rules unmeasured on the current CLI) without the explicit
     /// hatch; and a template's own `--disallowedTools` is UNIONED into the engine's — the argv
     /// carries `Edit` AND every engine rule, in ONE flag.
     #[test]
@@ -7373,6 +7431,45 @@ mod tests {
         ));
     }
 
+    /// wicked-crew#524 follow-up (review on core#436): the council ballot's argv half of the fence
+    /// — the state-home rules the shared worker file omits — completes the shared file to exactly
+    /// the rule set a snapshot-less worker launch carries; no inert form, no Bash verbs (those
+    /// ride the shared file).
+    #[test]
+    fn the_ballot_argv_rules_complete_the_shared_file_to_a_worker_launch_fence() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let op = std::env::temp_dir().join(format!("wballot-op-{}", std::process::id()));
+        let opr = rule_path(&op).expect("expressible");
+        let ballot = super::ballot_deny_rules(Some(&op)).expect("ballot rules");
+        assert!(ballot.contains(&format!("Read({opr}/**)")), "{ballot:?}");
+        assert!(ballot.contains(&format!("Edit({opr}/**)")), "{ballot:?}");
+        assert!(
+            !ballot
+                .iter()
+                .any(|r| r.starts_with("Write(") || r.starts_with("Bash(")),
+            "{ballot:?}"
+        );
+        let mut union: Vec<String> = super::shared_deny_rules(Some(&op)).expect("shared");
+        union.extend(ballot.iter().cloned());
+        union.sort();
+        union.dedup();
+        let mut launch = super::deny_rules(None, Some(&op)).expect("launch fence");
+        launch.sort();
+        launch.dedup();
+        assert_eq!(
+            union, launch,
+            "shared file ∪ ballot argv == the snapshot-less worker launch fence"
+        );
+        // No operational home: the default state-home candidate alone.
+        let default_only = super::ballot_deny_rules(None).expect("default candidate");
+        assert!(
+            default_only
+                .iter()
+                .any(|r| r.starts_with("Read(") && r.contains(".wicked-crew")),
+            "{default_only:?}"
+        );
+    }
+
     /// wicked-crew#524 / F-3R2-004 — every claude ballot's stderr carried 12 CLI warnings:
     /// `Write(<path>/**) is not matched by file permission checks — only Edit(path) rules are`. The
     /// engine emitted a `Write` twin beside each `Edit` rule; the twin was inert and the operator's
@@ -7416,8 +7513,18 @@ mod tests {
                 "one write-side rule per directory: {blanket:?}"
             );
         }
-        // The helper: only the `Write(<something>)` path form is rewritten; everything else rides.
+        // The helper: only the inert PATH forms are rewritten — to the twin the CLI enforces;
+        // everything else rides.
         assert_eq!(enforceable_rule("Write(/x/**)".into()), "Edit(/x/**)");
+        assert_eq!(enforceable_rule("MultiEdit(/x/**)".into()), "Edit(/x/**)");
+        assert_eq!(
+            enforceable_rule("NotebookEdit(/x/**)".into()),
+            "Edit(/x/**)"
+        );
+        assert_eq!(enforceable_rule("Glob(/x/**)".into()), "Read(/x/**)");
+        assert_eq!(enforceable_rule("MultiEdit".into()), "MultiEdit");
+        assert_eq!(enforceable_rule("NotebookEdit".into()), "NotebookEdit");
+        assert_eq!(enforceable_rule("Glob".into()), "Glob");
         assert_eq!(
             enforceable_rule("Write(C:/Users/me/.ssh/**)".into()),
             "Edit(C:/Users/me/.ssh/**)"
