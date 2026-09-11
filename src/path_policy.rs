@@ -149,11 +149,17 @@ fn resolve_symlinks_for_root(p: &Path) -> Result<PathBuf, String> {
     Ok(resolve_symlinks(p))
 }
 
-/// The spelling rule shared by the root resolver and `acp_runner::canonical_ish`: any `..` (or a
-/// leading `.`, the only place `Path::components()` keeps one) component refuses the path.
+/// The spelling rule shared by the root resolver and `acp_runner::canonical_ish`: any `.` or `..`
+/// SEGMENT refuses the path — judged on the literal spelling, split at both separators, exactly as
+/// `spawn::refuse_dot_segments` does. Not `Path::components()`: for a Windows verbatim path
+/// (`\\?\C:\…`, which `canonicalize` produces) `components()` does NOT normalize, so a `..` there
+/// is a plain `Normal("..")` and a component match misses the very segment the filesystem then
+/// collapses (windows-latest, core#435).
 pub(crate) fn refuse_dot_components(p: &Path) -> Result<(), String> {
-    if p.components()
-        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    let spelled = p.as_os_str().to_string_lossy();
+    if spelled
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
     {
         return Err(format!(
             "{} has a `.`/`..` segment and cannot be resolved safely on every platform; spell the \
@@ -625,36 +631,52 @@ mod tests {
         let repo = scratch("xrr_dots_repo");
         std::fs::create_dir_all(repo.join("sub")).unwrap();
 
-        // `<repo>/missing/../..`: lexically "inside the repo", really its grandparent.
-        let sneaky = repo.join("missing").join("..").join("..");
+        // The platform-independent property: a `..` spelling is NEVER accepted. On unix the
+        // spelling rule names the `..`; on Windows the path layer may collapse a `..` before any
+        // code of ours sees it — `scratch()` hands back a verbatim `\\?\` path there — in which case
+        // the root reaches the containment check as the grandparent (the temp dir, which contains
+        // `home`) and is refused for THAT. Either refusal is correct; acceptance is the bug.
+        let refused = |name: &str, e: &str| {
+            assert!(e.contains("refused"), "{name}: {e}");
+            #[cfg(unix)]
+            assert!(e.contains("`..`"), "{name}: {e}");
+            #[cfg(windows)]
+            assert!(
+                e.contains("`..`") || e.contains("would expose"),
+                "{name}: {e}"
+            );
+        };
+        // `<repo>/missing/../..`, spelled as a RAW string through the production entry points:
+        // lexically "inside the repo", really its grandparent.
+        let sep = std::path::MAIN_SEPARATOR;
+        let sneaky = format!("{}{sep}missing{sep}..{sep}..", repo.display());
         for (name, res) in [
             (
                 "read",
-                validate_extra_read_roots(&[sneaky.to_string_lossy().into_owned()], Some(&home)),
+                validate_extra_read_roots(std::slice::from_ref(&sneaky), Some(&home)),
             ),
             (
                 "write",
-                validate_extra_write_roots(&[sneaky.to_string_lossy().into_owned()], Some(&home)),
+                validate_extra_write_roots(std::slice::from_ref(&sneaky), Some(&home)),
             ),
         ] {
             let e = res.expect_err("a dot segment beyond the existing ancestors must be refused");
-            assert!(e.contains("`..`") && e.contains("refused"), "{name}: {e}");
+            refused(name, &e);
         }
         // A `..` in the MIDDLE of the missing tail is the same refusal.
-        let mid = repo.join("missing").join("..").join("leaf");
-        let e = validate_extra_read_roots(&[mid.to_string_lossy().into_owned()], Some(&home))
+        let mid = format!("{}{sep}missing{sep}..{sep}leaf", repo.display());
+        let e = validate_extra_read_roots(std::slice::from_ref(&mid), Some(&home))
             .expect_err("a `..` beyond the existing ancestors must be refused");
-        assert!(e.contains("`..`"), "{e}");
+        refused("mid", &e);
         // A plain missing leaf still resolves: the run creates it.
         let leaf = repo.join("not-yet").join("created");
         validate_extra_read_roots(&[leaf.to_string_lossy().into_owned()], Some(&home))
             .expect("a plain missing leaf is admitted");
-        // A `..` under an EXISTING path is refused just the same — the rule is spelling, so it
-        // holds identically on every OS (Windows collapses `<repo>\sub\..` before any lookup).
-        let real_dots = repo.join("sub").join("..");
-        let e = validate_extra_read_roots(&[real_dots.to_string_lossy().into_owned()], Some(&home))
+        // A `..` under an EXISTING path is refused just the same — the rule is spelling.
+        let real_dots = format!("{}{sep}sub{sep}..", repo.display());
+        let e = validate_extra_read_roots(std::slice::from_ref(&real_dots), Some(&home))
             .expect_err("a `..` is refused by spelling even under existing directories");
-        assert!(e.contains("`..`") && e.contains("refused"), "{e}");
+        refused("real_dots", &e);
         // A spelled-clean root that RESOLVES into the home is still judged on the real target.
         #[cfg(unix)]
         {
