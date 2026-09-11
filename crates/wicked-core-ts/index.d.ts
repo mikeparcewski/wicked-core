@@ -658,7 +658,7 @@ export declare class Subscription {
  * core#431 additions: gateEvaluated carries `judgeCli: string | null` + `judgeDistinct: boolean |
  * null` (who rendered agentVerdict); worktreeRestored {session, ord, attempt, cli, phase, tree,
  * head, discarded} (the creator's tree was put back after an evaluator mutation);
- * deliverLiftEvaluated {session, ord, attempt, outcome: 'unchanged'|'lifted'|'conflict'|'skipped',
+ * deliverLiftEvaluated {session, ord, attempt, outcome: 'unchanged'|'lifted'|'conflict'|'skipped'|'failed',
  * baseRef, baseBefore, baseAfter, treeBefore, treeAfter, conflicts, note} (the deliver phase's
  * lift onto the remote tip, re-verified when it changed the tree); evaluatorToolCallDenied
  * {session, ord, attempt, cli, carrier, tool, kind, path, reason} (a write-class tool call an

@@ -275,9 +275,18 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
         Err(e) => return LiftReport::skipped(format!("could not pin the worktree's git dir: {e}")),
     };
     let env: [(&str, &Path); 2] = [("GIT_DIR", &git_dir), ("GIT_WORK_TREE", worktree)];
-    let fetch_note = fetch_origin_env(worktree, &env).err().map(|e| {
-        format!("`git fetch origin` failed ({e}); using the clone's existing origin/* refs")
-    });
+    // A failed fetch means the cached `origin/*` refs are NOT proof of the current tip: an
+    // `unchanged` verdict over them would let the script's own fetch + rebase ship a tree nobody
+    // verified (Copilot on #433, third pass). Skip — disclosed — and hand the script no
+    // verified base; the worktree is untouched.
+    if let Err(e) = fetch_origin_env(worktree, &env) {
+        return LiftReport::skipped(format!(
+            "`git fetch origin` failed ({e}) — the cached origin/* refs cannot stand in for the \
+             current tip, so the lift was not decided; the deliver script's own fetch and rebase \
+             stand, and no verified base is reported"
+        ));
+    }
+    let fetch_note: Option<String> = None;
     let Some(base_ref) = resolve_remote_default_env(worktree, &env) else {
         let mut note = "no remote default ref (origin/HEAD, origin/main) to lift onto".to_string();
         if let Some(f) = &fetch_note {
@@ -575,6 +584,42 @@ pub(crate) fn lift_and_reverify(
                 checks.summary()
             );
             if checks.passed {
+                // The checks are REPOSITORY-controlled code: a "passing" script can edit a
+                // tracked file or move HEAD, and the Tool path has no final worktree guard
+                // (Copilot on #433, third pass). Prove the tree the checks certified is the tree
+                // that ships — the lifted tree, on the tip — or fail closed.
+                let after = crate::worktree_guard::snapshot(&ctx.worktree, &ctx.repo_root)
+                    .map_err(|e| {
+                        format!(
+                            "deliver: the repository's checks passed on the lifted tree but the \
+                             worktree could not be re-snapshotted afterwards ({e}); nothing was \
+                             pushed — the deliver gate never pushes a tree it cannot prove."
+                        )
+                    })?;
+                let lifted_tree = report.tree_after.as_deref().unwrap_or("");
+                let tip_commit = report.base_after.as_deref().unwrap_or("");
+                if after.tree != lifted_tree || after.head != tip_commit {
+                    emit(CoreEvent::RepoChecksEvaluated {
+                        session: run_id.to_string(),
+                        ord,
+                        attempt,
+                        passed: false,
+                        criterion: crate::repo_checks::CRITERION.to_string(),
+                        checks: checks.checks.clone(),
+                        skipped: checks.skipped.clone(),
+                    });
+                    return Err(format!(
+                        "deliver: the repository's checks passed on the lifted tree but CHANGED \
+                         it while running (tree {} → {}, HEAD {} → {}) — a check script that \
+                         edits tracked files or moves HEAD leaves a tree nobody verified. Nothing \
+                         was pushed. Inspect the worktree, fix or ignore the check's writes, and \
+                         approve to retry.",
+                        short(lifted_tree),
+                        short(&after.tree),
+                        short(tip_commit),
+                        short(&after.head),
+                    ));
+                }
                 Ok(LiftClearance {
                     checks: Some(checks),
                     verified_base: report.base_after.clone(),
@@ -654,6 +699,8 @@ mod tests {
         run_git(
             &base,
             &[
+                "-c",
+                "core.autocrlf=false",
                 "clone",
                 "-q",
                 "--bare",
@@ -666,6 +713,8 @@ mod tests {
         run_git(
             &base,
             &[
+                "-c",
+                "core.autocrlf=false",
                 "clone",
                 "-q",
                 origin.to_str().unwrap(),
@@ -698,6 +747,8 @@ mod tests {
         run_git(
             base,
             &[
+                "-c",
+                "core.autocrlf=false",
                 "clone",
                 "-q",
                 base.join("origin.git").to_str().unwrap(),

@@ -1108,11 +1108,13 @@ pub fn run_validator_reporting(
 pub struct AgentVerdict {
     pub pass: bool,
     pub reasoning: String,
-    /// (core#431, F-3R2-007) The council seat KEY the judge ran under — `Some` on the inline
-    /// path (rotation pick or single-runner fallback), `None` on the bus path (the evaluator
-    /// daemon does not report its seat) and for every verdict synthesised without a seat (a
-    /// parse failure, a bus deny). Rides to `gateEvaluated.judgeCli` so evaluator ≠ creator is
-    /// auditable from the event stream.
+    /// (core#431, F-3R2-007) The council seat KEY the judge ran under — `Some` whenever a seat
+    /// ANSWERED on the inline path (rotation pick or single-runner fallback), including a
+    /// malformed answer that `parse_agent_verdict` failed closed to REJECT: that rejection is
+    /// still that seat's verdict, and the record says who rendered it. `None` when no seat
+    /// produced the verdict: the bus path (the evaluator daemon does not report its seat), a
+    /// bus-path deny, or an error raised before any seat answered. Rides to
+    /// `gateEvaluated.judgeCli` so evaluator ≠ creator is auditable from the event stream.
     pub judge_cli: Option<String>,
     /// `Some(true)` when `judge_cli` was an IDENTITY-DISTINCT seat (the rotation pick — genuine
     /// independence), `Some(false)` when the judge fell back to the single default runner

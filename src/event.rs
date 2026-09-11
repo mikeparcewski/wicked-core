@@ -703,11 +703,15 @@ pub enum CoreEvent {
     /// (F-3R2-009, core#431) An `executes_code: false` phase — an evaluator, a recon rung, a
     /// review — asked to run a WRITE-CLASS tool (edit/write/delete/move, by ACP `kind` or by
     /// tool name) and the engine REFUSED the call at the carrier's permission boundary. Fires on
-    /// the ACP carrier (`carrier: "acp"`) for EVERY seat, admitted to input governance or not:
-    /// the read-only posture no longer depends on the seat's governance adapter (the wrapped
-    /// carrier already applies `--sandbox read-only` / `--exclude-tools edit,write` at launch).
-    /// A refused call costs the seat one tool call, not the phase a retry; the worktree guard
-    /// remains the backstop for what a permission boundary cannot see (a `bash` heredoc).
+    /// the ACP carrier (`carrier: "acp"`) for a seat whose adapter is ADMITTED to input
+    /// governance — the admission proof is that the adapter blocks on
+    /// `session/request_permission` per tool call. A guarded unit on an UNADMITTED ACP seat
+    /// (pi-acp, codex-acp) never starts an ACP turn: it is routed to the wrapped carrier
+    /// (`acpFallback` with `fallbackKind: "read_only_requires_wrapped"`), where the read-only
+    /// lever is an argv fact (`--sandbox read-only` / `--exclude-tools edit,write`) and no
+    /// per-call event exists — consumers must not wait for this event on that route. A refused
+    /// call costs the seat one tool call, not the phase a retry; the worktree guard remains the
+    /// backstop for what a permission boundary cannot see (a `bash` heredoc).
     EvaluatorToolCallDenied {
         session: String,
         ord: u32,

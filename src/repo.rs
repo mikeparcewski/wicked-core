@@ -2088,6 +2088,8 @@ mod tests {
         sh(
             &base,
             &[
+                "-c",
+                "core.autocrlf=false",
                 "clone",
                 "-q",
                 "--bare",
@@ -2101,6 +2103,8 @@ mod tests {
         sh(
             &base,
             &[
+                "-c",
+                "core.autocrlf=false",
                 "clone",
                 "-q",
                 origin.to_str().unwrap(),
@@ -2114,6 +2118,8 @@ mod tests {
         sh(
             &base,
             &[
+                "-c",
+                "core.autocrlf=false",
                 "clone",
                 "-q",
                 origin.to_str().unwrap(),
