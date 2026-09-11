@@ -215,6 +215,19 @@ pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
     resolved == root_real || resolved.starts_with(&root_real)
 }
 
+/// Does a tool call's RAW path (as the agent spelled it: relative, `~`-prefixed, `..`-bearing or
+/// absolute) land inside `root`? The same normalize → symlink-resolve → containment chain
+/// [`check`] runs, exposed for a judgement that is not "inside ANY root" but "inside THIS one" —
+/// the creator write fence (F-4R2-004, `gate_hook::phase_scope_denial` /
+/// `acp_runner::answer_permission_request`) asks whether a write that already passed the
+/// filesystem boundary targets the tree under review (`cwd`) or one of the declared deliverable
+/// roots. Sharing the chain is what keeps "inside" meaning one thing on both carriers and on
+/// every OS (`/tmp`→`/private/tmp`, Windows verbatim prefixes).
+pub(crate) fn raw_resolves_within(raw: &str, cwd: &Path, home: Option<&Path>, root: &Path) -> bool {
+    let resolved = resolve_symlinks(&normalize(raw, cwd, home));
+    resolved_is_within(&resolved, root)
+}
+
 /// Validate launcher-declared extra write roots at LAUNCH time (core#259), before any session is
 /// persisted. Fails the launch loudly rather than arming a boundary that would reopen FINDING-098.
 ///

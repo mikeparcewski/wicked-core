@@ -1,0 +1,97 @@
+{
+  "finding": "F-4R2-004",
+  "source": "wicked-crew interactive-chat run 2c56cea1-5ab0-4102-8b2f-8426c77e4cbe (phase4-r2 acceptance, 2026-09-11); rig wicked-crew 0.7.29 / wicked-core-ts 0.7.20 / engine 0.4.0",
+  "note": "Every absolute path is spelled with a <ROOT> token; the test substitutes a real temp directory so containment is judged on the running OS, never on the recorded Unix spelling.",
+  "session": {
+    "id": "2c56cea1-5ab0-4102-8b2f-8426c77e4cbe",
+    "status": "failed",
+    "workflow_id": "wf-2c56cea1-5ab0-4102-8b2f-8426c77e4cbe",
+    "workdir": null,
+    "repo_ref": null,
+    "extra_write_roots": [
+      "<ROOT>"
+    ],
+    "extra_read_roots": [],
+    "clis": [
+      "claude",
+      "codex",
+      "pi",
+      "copilot",
+      "opencode"
+    ]
+  },
+  "unit": {
+    "allowed_skills": [],
+    "assigned_cli": "claude",
+    "assigned_invocation": null,
+    "collection_scope": null,
+    "conformance_ref": null,
+    "council_task_ref": null,
+    "denial_reason": null,
+    "depends_on": [
+      "understand"
+    ],
+    "description": "revise — (the run's problem statement; elided in the fixture)",
+    "gate": "auto",
+    "id": "2c56cea1-5ab0-4102-8b2f-8426c77e4cbe:revise",
+    "ord": 2,
+    "phase_ref": null,
+    "phase_status": null,
+    "required_deliverables": [],
+    "role": "creator",
+    "routing": null,
+    "session_id": "2c56cea1-5ab0-4102-8b2f-8426c77e4cbe",
+    "skill_ref": null,
+    "stage": "build",
+    "status": "done",
+    "validator": null,
+    "worktree_guarded": true
+  },
+  "request_permission_frame": {
+    "jsonrpc": "2.0",
+    "id": 339,
+    "method": "session/request_permission",
+    "params": {
+      "sessionId": "acp-2c56cea1",
+      "toolName": "Write",
+      "toolCall": {
+        "toolCallId": "toolu_revise_write",
+        "name": "Write",
+        "kind": "edit",
+        "title": "Write <ROOT>/revised.html",
+        "rawInput": {
+          "file_path": "<ROOT>/revised.html",
+          "content": "<!doctype html><html>…revised…</html>"
+        }
+      },
+      "options": [
+        {
+          "optionId": "allow",
+          "kind": "allow_once"
+        },
+        {
+          "optionId": "allow_always",
+          "kind": "allow_always"
+        },
+        {
+          "optionId": "reject",
+          "kind": "reject_once"
+        }
+      ]
+    }
+  },
+  "observed_before_fix": {
+    "event": "evaluatorToolCallDenied",
+    "ts": 1789123709208,
+    "ts_utc": "2026-09-11T10:48:29.208Z",
+    "ord": 2,
+    "cli": "claude",
+    "carrier": "acp",
+    "tool": "Write",
+    "kind": "edit",
+    "path": "<ROOT>/revised.html",
+    "reason": "phase `revise` declares executes_code:false — `Write` (kind edit) to `<ROOT>/revised.html` would change the tree under review, so it is refused at the ACP permission boundary (F-036 read-only posture). Report findings in this phase's output; a phase that must change code declares executes_code:true in the workflow def.",
+    "daemon_log": "wicked-core: DENY (read-only evaluator, unit 2): …",
+    "consequence": "the revise worker respected the refusal and returned prose; the deliverable floor (unit 3) failed: EXPECTED <ROOT>/revised.html / FOUND (nothing); sessionFailed 10:48:45Z"
+  }
+}

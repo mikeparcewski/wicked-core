@@ -704,13 +704,19 @@ pub enum CoreEvent {
         conflicts: Vec<String>,
         note: Option<String>,
     },
-    /// (F-3R2-009, core#431) An `executes_code: false` phase — an evaluator, a recon rung, a
-    /// review — asked to run a WRITE-CLASS tool (edit/write/delete/move, by ACP `kind` or by
-    /// tool name) and the engine REFUSED the call at the carrier's permission boundary. Fires on
-    /// the ACP carrier (`carrier: "acp"`) for a seat whose adapter is ADMITTED to input
-    /// governance — the admission proof is that the adapter blocks on
-    /// `session/request_permission` per tool call. A guarded unit on an UNADMITTED ACP seat
-    /// (pi-acp, codex-acp) never starts an ACP turn: it is routed to the wrapped carrier
+    /// (F-3R2-009, core#431; F-4R2-004) A FENCED unit asked to run a WRITE-CLASS tool
+    /// (edit/write/delete/move, by ACP `kind` or by tool name) and the engine REFUSED the call at
+    /// the carrier's permission boundary. Two postures fence (`posture`): `read-only` — an
+    /// `executes_code: false` evaluator or recon rung, refused every write; `deliverable-roots`
+    /// — a BOUND creator whose phase declared `executes_code: false`, allowed to write inside the
+    /// run's declared `extra_write_roots` and refused into the tree under review or anywhere
+    /// else. `role` names the unit's actual role: the TYPE NAME is historical (it predates the
+    /// creator posture) and a consumer must read `role`, not the name, to know who was refused —
+    /// before F-4R2-004 crew's interactive `revise` creator was refused its own deliverable and
+    /// logged as a "read-only evaluator". Fires on the ACP carrier (`carrier: "acp"`) for a seat
+    /// whose adapter is ADMITTED to input governance — the admission proof is that the adapter
+    /// blocks on `session/request_permission` per tool call. A read-only unit on an UNADMITTED
+    /// ACP seat (pi-acp, codex-acp) never starts an ACP turn: it is routed to the wrapped carrier
     /// (`acpFallback` with `fallbackKind: "read_only_requires_wrapped"`), where the read-only
     /// lever is an argv fact (`--sandbox read-only` / `--exclude-tools edit,write`) and no
     /// per-call event exists — consumers must not wait for this event on that route. A refused
@@ -728,6 +734,10 @@ pub enum CoreEvent {
         kind: Option<String>,
         /// The path the call targeted, when its arguments carried one.
         path: Option<String>,
+        /// The unit's role — `creator` | `evaluator` | `neutral` (F-4R2-004).
+        role: String,
+        /// The posture that refused — `read-only` | `deliverable-roots` (F-4R2-004).
+        posture: String,
         reason: String,
     },
     /// (F-3R2-013, core#431) How the run's BASE commit was chosen when its worktree was minted:
@@ -1704,6 +1714,8 @@ impl CoreEvent {
                 tool,
                 kind,
                 path,
+                role,
+                posture,
                 reason,
             } => json!({
                 "type": "evaluatorToolCallDenied",
@@ -1715,6 +1727,8 @@ impl CoreEvent {
                 "tool": tool,
                 "kind": kind,
                 "path": path,
+                "role": role,
+                "posture": posture,
                 "reason": reason,
             }),
             CoreEvent::RunBaseResolved {
@@ -2088,6 +2102,8 @@ mod tests {
             tool: "edit".into(),
             kind: Some("edit".into()),
             path: Some("src/App.tsx".into()),
+            role: "evaluator".into(),
+            posture: "read-only".into(),
             reason: "r".into(),
         }
         .to_json();
@@ -2096,6 +2112,10 @@ mod tests {
         assert_eq!(j["tool"], "edit");
         assert_eq!(j["kind"], "edit");
         assert_eq!(j["path"], "src/App.tsx");
+        // F-4R2-004: the payload names WHO was refused and by WHICH posture — the type name is
+        // historical and a creator fenced to its deliverable roots rides the same event.
+        assert_eq!(j["role"], "evaluator");
+        assert_eq!(j["posture"], "read-only");
     }
 
     /// FINDING-012: the `cliUsage` wire frame must expose the cache breakdown, so the studio Burn

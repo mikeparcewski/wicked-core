@@ -3193,29 +3193,121 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
     }
 }
 
-/// (core#431, F-3R2-009) The READ-ONLY posture of an `executes_code: false` unit on the ACP
-/// carrier — an evaluator, a recon rung, a review. The wrapped carrier puts such a seat in
-/// read-only mode at launch (`--sandbox read-only`, `--exclude-tools edit,write`); the ACP
-/// carrier has no argv to do that with, so the posture is applied where the protocol gives the
-/// client a say: every `session/request_permission`. A write-class call (edit/delete/move by
-/// ACP `kind`, or a write tool by name — `acp_permission::write_class_call`) is answered with the
-/// agent's REJECT option and disclosed as `evaluatorToolCallDenied`, for EVERY seat, admitted to
-/// input governance or not — the pi evaluator that rewrote the fix under review was unadmitted
-/// and would have been answered `allow_result`, unchecked. `bash` stays (the phase must run the
-/// suite): this is a posture, not a guarantee; the worktree guard holds the rest.
-pub(crate) struct AcpReadOnly {
+/// (core#431, F-3R2-009; F-4R2-004) The WRITE POSTURE of a fenced unit on the ACP carrier — one
+/// whose [`crate::write_posture::WritePosture`] is not `Full`. The wrapped carrier puts a
+/// read-only seat in read-only mode at launch (`--sandbox read-only`, `--exclude-tools
+/// edit,write`); the ACP carrier has no argv to do that with, so the posture is applied where
+/// the protocol gives the client a say: every `session/request_permission`. A write-class call
+/// (edit/delete/move by ACP `kind`, or a write tool by name — `acp_permission::write_class_call`)
+/// is judged BEFORE any gate, for EVERY seat, admitted to input governance or not — the pi
+/// evaluator that rewrote the fix under review was unadmitted and would have been answered
+/// `allow_result`, unchecked:
+///
+/// * `ReadOnly` (an evaluator, a recon rung, a review): every write-class call is answered with
+///   the agent's REJECT option and disclosed as `evaluatorToolCallDenied`.
+/// * `DeliverableRoots` (a BOUND creator whose phase declared `executes_code: false`): a
+///   write-class call whose target resolves INSIDE one of [`Self::deliverable_roots`] — the
+///   run's launch-validated `extra_write_roots`, where the deliverable belongs — falls through
+///   to the ordinary answer (the governance gate when admitted, else allow); one that names no
+///   path, targets the tree under review ([`Self::cwd`]) or anything else is refused and
+///   disclosed, with the CREATOR named as such. Before F-4R2-004 this posture did not exist:
+///   every guarded unit was read-only, and crew's `interactive-chat` `revise` creator had its
+///   `Write` of its own declared deliverable refused as a "read-only evaluator" (runs 37f020cc /
+///   2c56cea1).
+///
+/// `bash` stays (the phase must run the suite): this is a posture, not a guarantee; the worktree
+/// guard holds the rest.
+pub(crate) struct AcpWritePosture {
+    /// Never `Full` — a `Full` unit carries no fence and passes `None` instead.
+    pub posture: crate::write_posture::WritePosture,
+    /// The unit's role, named in every denial so a creator is never reported as an evaluator.
+    pub role: crate::workflow::PhaseRole,
     pub run_id: String,
     pub ord: u32,
     pub attempt: u32,
     /// The registry seat key (the ACP-path convention for `cli`).
     pub cli: String,
     pub phase: String,
+    /// The unit's working directory — the tree under review a `DeliverableRoots` creator may not
+    /// write, and the base for resolving a relative tool-call path.
+    pub cwd: std::path::PathBuf,
+    /// The launch-validated `extra_write_roots` a `DeliverableRoots` creator may write inside.
+    pub deliverable_roots: Vec<std::path::PathBuf>,
+    /// The `$HOME` for `~` spellings — the same home the governance boundary judges with.
+    pub home: Option<std::path::PathBuf>,
     /// Where the denial event goes (`Command::EmitEvent`).
     pub tx: std::sync::mpsc::Sender<Command>,
 }
 
-/// [`exec_turn_acp_posture`] with no read-only posture — every turn that is not an
-/// `executes_code: false` unit (chat turns, creator units, the tests' fixtures).
+impl AcpWritePosture {
+    /// Judge one write-class call under this posture: `Ok(())` lets it through to the ordinary
+    /// answer, `Err(reason)` refuses it with the operator-facing reason. Pure — the same rule the
+    /// gate hook's `phase_scope_denial` applies on the wrapped carrier, for the seats that never
+    /// reach a gate.
+    fn judge(&self, call: &crate::acp_permission::WriteClassCall) -> Result<(), String> {
+        use crate::write_posture::{role_noun, WritePosture};
+        let target = |c: &crate::acp_permission::WriteClassCall| {
+            format!(
+                "`{}`{}{}",
+                c.tool,
+                c.kind
+                    .as_deref()
+                    .map(|k| format!(" (kind {k})"))
+                    .unwrap_or_default(),
+                c.path
+                    .as_deref()
+                    .map(|p| format!(" to `{p}`"))
+                    .unwrap_or_default(),
+            )
+        };
+        match self.posture {
+            WritePosture::Full => Ok(()),
+            WritePosture::ReadOnly => Err(format!(
+                "phase `{}` plays {} and declares executes_code:false — {} would change the tree \
+                 under review, so it is refused at the ACP permission boundary (F-036 read-only \
+                 posture). Report findings in this phase's output; a phase that must change code \
+                 declares executes_code:true in the workflow def.",
+                self.phase,
+                role_noun(self.role),
+                target(call),
+            )),
+            WritePosture::DeliverableRoots => {
+                // ONE judgement with the gate hook's `phase_scope_denial` (F-02): exactly the
+                // declared roots, never the tree, never engine scratch the boundary admits.
+                let inside_roots = call.path.as_deref().is_some_and(|p| {
+                    crate::write_posture::deliverable_write_admitted(
+                        p,
+                        &self.cwd,
+                        self.home.as_deref(),
+                        &self.deliverable_roots,
+                    )
+                });
+                if inside_roots {
+                    return Ok(());
+                }
+                let roots =
+                    crate::write_posture::describe_deliverable_roots(&self.deliverable_roots);
+                Err(format!(
+                    "phase `{}` plays creator and declares executes_code:false — its deliverables \
+                     belong in the run's declared write roots ({roots}), not in the tree under \
+                     review; {} is refused at the ACP permission boundary (F-4R2-004 \
+                     deliverable-roots posture){}. Write the deliverable inside a declared root; a \
+                     phase that must change the tree itself declares executes_code:true.",
+                    self.phase,
+                    target(call),
+                    if call.path.is_none() {
+                        " because it names no path the boundary could place"
+                    } else {
+                        ""
+                    },
+                ))
+            }
+        }
+    }
+}
+
+/// [`exec_turn_acp_posture`] with no write fence — every turn whose posture is `Full` (chat
+/// turns, code-writing creators, unbound creators, the tests' fixtures).
 #[allow(clippy::too_many_arguments)]
 fn exec_turn_acp(
     proc: &mut AcpProcess,
@@ -3256,7 +3348,7 @@ fn exec_turn_acp_posture(
     epoch: u64,
     tx: &std::sync::mpsc::Sender<Command>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
-    read_only: Option<&AcpReadOnly>,
+    posture: Option<&AcpWritePosture>,
 ) -> anyhow::Result<TurnResult> {
     let id = proc.next_id;
     proc.next_id += 1;
@@ -3639,7 +3731,7 @@ prior output you are reviewing, testing, or revising."
                                                 &write_lock,
                                                 gate,
                                                 proc.chat_boundary.as_ref(),
-                                                read_only,
+                                                posture,
                                                 &v2,
                                                 &mut output,
                                                 MAX_OUT,
@@ -3762,7 +3854,7 @@ prior output you are reviewing, testing, or revising."
                                 &write_lock,
                                 gate,
                                 proc.chat_boundary.as_ref(),
-                                read_only,
+                                posture,
                                 &v,
                                 &mut output,
                                 MAX_OUT,
@@ -3895,16 +3987,18 @@ prior output you are reviewing, testing, or revising."
 /// Neither ⇒ permitted, as this path has always behaved — but said out loud rather than left to a
 /// capability we quietly withheld.
 ///
-/// `read_only` present (core#431, F-3R2-009) ⇒ the unit's phase declared `executes_code: false`:
-/// a WRITE-CLASS call is REFUSED before either branch above runs — deny-dominates, for admitted
-/// and unadmitted seats alike — and disclosed as `evaluatorToolCallDenied`.
+/// `posture` present (core#431, F-3R2-009; F-4R2-004) ⇒ the unit is FENCED: a WRITE-CLASS call is
+/// judged by [`AcpWritePosture::judge`] before either branch above runs — deny-dominates, for
+/// admitted and unadmitted seats alike. A refusal is answered with the agent's reject option and
+/// disclosed as `evaluatorToolCallDenied` carrying the unit's actual `role` and `posture`; a
+/// creator's write inside its deliverable roots passes through to the ordinary answer.
 #[allow(clippy::too_many_arguments)]
 fn answer_permission_request<W: Write>(
     stdin: &mut W,
     write_lock: &Mutex<()>,
     gate: Option<&crate::acp_permission::AcpGate<'_>>,
     chat_boundary: Option<&crate::gate_hook::BoundaryCtx>,
-    read_only: Option<&AcpReadOnly>,
+    posture: Option<&AcpWritePosture>,
     frame: &Value,
     output: &mut String,
     max_out: usize,
@@ -3916,58 +4010,50 @@ fn answer_permission_request<W: Write>(
         return; // a permission NOTIFICATION is not a thing; nothing to answer.
     };
     let params = frame.get("params").cloned().unwrap_or(Value::Null);
-    if let Some(ro) = read_only {
+    if let Some(fence) = posture {
         if let Some(call) = crate::acp_permission::write_class_call(&params) {
-            let reason = format!(
-                "phase `{}` declares executes_code:false — `{}`{}{} would change the tree under \
-                 review, so it is refused at the ACP permission boundary (F-036 read-only \
-                 posture). Report findings in this phase's output; a phase that must change \
-                 code declares executes_code:true in the workflow def.",
-                ro.phase,
-                call.tool,
-                call.kind
-                    .as_deref()
-                    .map(|k| format!(" (kind {k})"))
-                    .unwrap_or_default(),
-                call.path
-                    .as_deref()
-                    .map(|p| format!(" to `{p}`"))
-                    .unwrap_or_default(),
-            );
-            let _ = ro
-                .tx
-                .send(Command::EmitEvent(CoreEvent::EvaluatorToolCallDenied {
-                    session: ro.run_id.clone(),
-                    ord: ro.ord,
-                    attempt: ro.attempt,
-                    cli: ro.cli.clone(),
-                    carrier: "acp".to_string(),
-                    tool: call.tool.clone(),
-                    kind: call.kind.clone(),
-                    path: call.path.clone(),
-                    reason: reason.clone(),
-                }));
-            eprintln!(
-                "wicked-core: DENY (read-only evaluator, unit {}): {reason}",
-                ro.ord
-            );
-            let note = format!(
-                "\n[wicked-core] refused tool call `{}`: {reason}\n",
-                call.tool
-            );
-            if output.len() + note.len() <= max_out {
-                output.push_str(&note);
+            if let Err(reason) = fence.judge(&call) {
+                let _ = fence
+                    .tx
+                    .send(Command::EmitEvent(CoreEvent::EvaluatorToolCallDenied {
+                        session: fence.run_id.clone(),
+                        ord: fence.ord,
+                        attempt: fence.attempt,
+                        cli: fence.cli.clone(),
+                        carrier: "acp".to_string(),
+                        tool: call.tool.clone(),
+                        kind: call.kind.clone(),
+                        path: call.path.clone(),
+                        role: crate::write_posture::role_wire(fence.role).to_string(),
+                        posture: fence.posture.label().to_string(),
+                        reason: reason.clone(),
+                    }));
+                // Names the POSTURE and the ROLE — the pre-F-4R2-004 line said "read-only
+                // evaluator" for every fenced unit, creators included.
+                eprintln!(
+                    "wicked-core: DENY ({} posture, {} unit {}): {reason}",
+                    fence.posture.label(),
+                    crate::write_posture::role_wire(fence.role),
+                    fence.ord
+                );
+                let note = format!(
+                    "\n[wicked-core] refused tool call `{}`: {reason}\n",
+                    call.tool
+                );
+                if output.len() + note.len() <= max_out {
+                    output.push_str(&note);
+                }
+                respond_or_note(
+                    stdin,
+                    write_lock,
+                    &req_id,
+                    crate::acp_permission::reject_result(&params),
+                    "a permission request (write posture)",
+                    output,
+                    max_out,
+                );
+                return;
             }
-            respond_or_note(
-                stdin,
-                write_lock,
-                &req_id,
-                crate::acp_permission::reject_result(&params),
-                "a permission request (read-only posture)",
-                output,
-                max_out,
-            );
-            return;
         }
     }
     let result = match (gate, chat_boundary) {
@@ -4591,7 +4677,8 @@ fn chat_boundary(
             .ok()
             .and_then(|c| c.claude_dir().map(std::path::Path::to_path_buf)),
         pre_build_scope: false,
-        no_code_scope: false,
+        write_posture: crate::write_posture::WritePosture::Full,
+        deliverable_roots: Vec::new(),
     }
 }
 
@@ -5575,7 +5662,12 @@ impl AcpStepRunner {
         // matches this unit's. A no-code phase reaching the creator's (write-posture) process
         // closes it — group killed, bounded reap — and opens a fresh one; a code phase never
         // inherits a read-only process either. Same rule as the PTY carrier.
-        let wants_no_code = crate::worktree_guard::applies_to(&input.unit);
+        // F-4R2-004: the posture is derived from the unit's ROLE and the run's tree, not from the
+        // guard marker alone — a fenced unit (read-only OR deliverable-roots) never shares a
+        // process with a write-posture one, and is quiesced when its unit ends.
+        let write_posture =
+            crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
+        let wants_no_code = write_posture.fences_writes();
         let probe =
             match probe {
                 SessionProbe::Live(arc)
@@ -5585,8 +5677,8 @@ impl AcpStepRunner {
                     "wicked-core: run {run_id} unit {} needs a {} ACP process for `{cli_key}` but \
                      the cached one was opened {} — closing it and starting fresh (F-036)",
                     input.unit.ord,
-                    if wants_no_code { "read-only" } else { "write-posture" },
-                    if wants_no_code { "with write posture" } else { "read-only" }
+                    if wants_no_code { "fenced" } else { "write-posture" },
+                    if wants_no_code { "with write posture" } else { "fenced" }
                 );
                     drop(arc);
                     self.drop_session_key(&session_key);
@@ -5725,7 +5817,11 @@ impl AcpStepRunner {
         // `gate_ctx` match below (Copilot, second pass): that match discloses `governanceUnenforced`
         // ("answered by allow_result") for an unadmitted seat, which would be a false claim about
         // a unit that never starts an ACP turn — the wrapped runner reports its own carrier.
-        if acp_read_only_requires_wrapped(acp_cfg_probe.as_ref(), &input.unit) {
+        if acp_read_only_requires_wrapped(
+            acp_cfg_probe.as_ref(),
+            &input.unit,
+            input.workdir.is_some(),
+        ) {
             let reason = format!(
                 "[wicked-core] unit {} (phase `{}`) declares executes_code:false, and seat \
                  '{cli_key}' has an ACP adapter that is not admitted to input governance \
@@ -5828,9 +5924,12 @@ impl AcpStepRunner {
                     // carrier reads the same fact from `PRE_BUILD_SCOPE_ENV`, which this carrier
                     // has no access to (the daemon's env is the daemon's, core#260).
                     pre_build_scope: input.unit.pre_build_scope,
-                    // F-036: the NO-CODE scope, same route — the ACP carrier answers the
-                    // seat's permission requests in-process, so the flag rides the boundary.
-                    no_code_scope: crate::worktree_guard::applies_to(&input.unit),
+                    // F-036 / F-4R2-004: the WRITE POSTURE, same route — the ACP carrier answers
+                    // the seat's permission requests in-process, so the fact rides the boundary.
+                    write_posture,
+                    // The creator fence's roots (F-02): exactly `g.extra_write_roots`, the list
+                    // the wrapped launcher arms on `WICKED_DELIVERABLE_ROOTS` for its hook.
+                    deliverable_roots: crate::write_posture::deliverable_roots_of(Some(g)),
                 };
                 Some((scope, phase, decisions_path, g.db_path.clone(), boundary))
             }
@@ -6181,7 +6280,11 @@ impl AcpStepRunner {
         // the process-level pin can still fail here and downgrade this binary to unproven. A
         // guarded (executes_code:false) unit must not stay on an adapter whose permission
         // behaviour was not proven — route it to the wrapped carrier, as the static case does.
-        if acp_read_only_unproven_at_spawn(proc.governance_verified, &input.unit) {
+        if acp_read_only_unproven_at_spawn(
+            proc.governance_verified,
+            &input.unit,
+            input.workdir.is_some(),
+        ) {
             let reason = format!(
                 "[wicked-core] unit {} (phase `{}`) declares executes_code:false, and seat \
                  '{cli_key}' is admitted to input governance but the resolved ACP binary did not \
@@ -6233,31 +6336,65 @@ impl AcpStepRunner {
                         home: boundary.home.clone(),
                         claude_config_dir: boundary.claude_config_dir.clone(),
                         pre_build_scope: boundary.pre_build_scope,
-                        no_code_scope: boundary.no_code_scope,
+                        write_posture: boundary.write_posture,
+                        deliverable_roots: boundary.deliverable_roots.clone(),
                     }),
                 }
             },
         );
-        // core#431 (F-3R2-009): an `executes_code: false` unit runs READ-ONLY on this carrier
-        // too — write-class permission requests are refused whatever the seat's governance
-        // admission (`AcpReadOnly`). Disclosed once per turn so the record says the posture held.
-        let read_only = crate::worktree_guard::applies_to(&input.unit).then(|| AcpReadOnly {
+        // core#431 (F-3R2-009) / F-4R2-004: a FENCED unit — read-only (evaluator/recon) or
+        // deliverable-roots (a bound creator that declared no code) — has its write-class
+        // permission requests judged on this carrier too, whatever the seat's governance
+        // admission (`AcpWritePosture`). Disclosed once per turn so the record says which posture
+        // held. A `Full` unit (an unbound creator: crew's interactive seams; any code phase)
+        // carries no fence — its boundary is the ordinary cwd + extra_write_roots.
+        let fence = write_posture.fences_writes().then(|| AcpWritePosture {
+            posture: write_posture,
+            role: input.unit.role,
             run_id: run_id.clone(),
             ord: input.unit.ord,
             attempt: input.attempt,
             cli: cli_key.clone(),
             phase: input.unit.phase_id().unwrap_or("").to_string(),
+            cwd: unit_cwd.clone(),
+            // EXACTLY the launch-validated extra_write_roots — the same list the gate hook
+            // judges (`write_posture::deliverable_roots_of`, F-02).
+            deliverable_roots: crate::write_posture::deliverable_roots_of(
+                input.governance.as_ref(),
+            ),
+            home: std::env::var_os("HOME").map(std::path::PathBuf::from),
             tx: self.tx.clone(),
         });
-        if read_only.is_some() {
-            eprintln!(
-                "wicked-core: unit {} (phase `{}`, executes_code:false) runs on ACP seat \
-                 '{cli_key}' with the read-only posture: write-class tool calls (edit/write/\
-                 delete/move) are refused at the permission boundary; bash stays — the worktree \
-                 guard holds the rest (F-036 / core#431)",
-                input.unit.ord,
-                input.unit.phase_id().unwrap_or("?"),
-            );
+        if let Some(f) = fence.as_ref() {
+            match f.posture {
+                crate::write_posture::WritePosture::DeliverableRoots => eprintln!(
+                    "wicked-core: unit {} (phase `{}`, creator, executes_code:false) runs on ACP \
+                     seat '{cli_key}' with the deliverable-roots posture: write-class tool calls \
+                     are allowed inside the run's declared write roots ({}) and refused elsewhere, \
+                     the worktree included; bash stays — the worktree guard holds the rest (F-036 \
+                     / F-4R2-004)",
+                    input.unit.ord,
+                    input.unit.phase_id().unwrap_or("?"),
+                    if f.deliverable_roots.is_empty() {
+                        "none declared".to_string()
+                    } else {
+                        f.deliverable_roots
+                            .iter()
+                            .map(|r| r.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                ),
+                _ => eprintln!(
+                    "wicked-core: unit {} (phase `{}`, {}, executes_code:false) runs on ACP seat \
+                     '{cli_key}' with the read-only posture: write-class tool calls (edit/write/\
+                     delete/move) are refused at the permission boundary; bash stays — the \
+                     worktree guard holds the rest (F-036 / core#431)",
+                    input.unit.ord,
+                    input.unit.phase_id().unwrap_or("?"),
+                    crate::write_posture::role_noun(f.role),
+                ),
+            }
         }
         let turn = exec_turn_acp_posture(
             &mut proc,
@@ -6270,7 +6407,7 @@ impl AcpStepRunner {
             input.elicitation_epoch,
             &self.tx,
             gate.as_ref(),
-            read_only.as_ref(),
+            fence.as_ref(),
         );
         let superseded = {
             let maps = self
@@ -6650,17 +6787,23 @@ fn acp_unadmitted_but_configured(acp_cfg: Option<&AcpConfig>) -> bool {
 }
 
 /// (core#431, F-3R2-009; Copilot on #433) Must this unit leave the ACP carrier for the wrapped
-/// one to be READ-ONLY? True for a worktree-guarded (`executes_code: false`) unit on a seat that
-/// HAS an ACP config but is NOT admitted to input governance: admission is the proof that the
-/// adapter blocks on `session/request_permission` per tool call, and without it the permission-
-/// boundary posture never fires (pi-acp executes with zero round-trips). An admitted seat stays
-/// on ACP with the posture applied; a seat with no ACP config never enters this path at all; a
-/// creator unit is never rerouted (it must write). Pure — testable with a fabricated config.
+/// one to be READ-ONLY? True for a READ-ONLY-posture unit (an `executes_code: false` evaluator or
+/// recon rung — [`crate::write_posture::WritePosture::of`]) on a seat that HAS an ACP config but
+/// is NOT admitted to input governance: admission is the proof that the adapter blocks on
+/// `session/request_permission` per tool call, and without it the permission-boundary posture
+/// never fires (pi-acp executes with zero round-trips). An admitted seat stays on ACP with the
+/// posture applied; a seat with no ACP config never enters this path at all; a CREATOR unit is
+/// never rerouted (F-4R2-004: it must write its deliverable, and the wrapped carrier's read-only
+/// lever would refuse exactly that — a bound creator stays under the worktree guard instead).
+/// Pure — testable with a fabricated config.
 fn acp_read_only_requires_wrapped(
     acp_cfg: Option<&AcpConfig>,
     unit: &crate::domain::WorkUnit,
+    bound: bool,
 ) -> bool {
-    crate::worktree_guard::applies_to(unit) && acp_unadmitted_but_configured(acp_cfg)
+    crate::write_posture::WritePosture::of(unit, bound)
+        == crate::write_posture::WritePosture::ReadOnly
+        && acp_unadmitted_but_configured(acp_cfg)
 }
 
 /// (Copilot on #433, sixth pass) The per-PROCESS half of [`acp_read_only_requires_wrapped`]: a
@@ -6671,8 +6814,11 @@ fn acp_read_only_requires_wrapped(
 fn acp_read_only_unproven_at_spawn(
     governance_verified: bool,
     unit: &crate::domain::WorkUnit,
+    bound: bool,
 ) -> bool {
-    !governance_verified && crate::worktree_guard::applies_to(unit)
+    !governance_verified
+        && crate::write_posture::WritePosture::of(unit, bound)
+            == crate::write_posture::WritePosture::ReadOnly
 }
 
 #[cfg(test)]
@@ -13252,33 +13398,70 @@ os_sandbox = true
         };
         let mut evaluator = crate::domain::WorkUnit::pending("r:verify", "r", 4, "verify");
         evaluator.worktree_guarded = true;
+        evaluator.role = crate::workflow::PhaseRole::Evaluator;
         let creator = crate::domain::WorkUnit::pending("r:fix", "r", 3, "fix");
         assert!(super::acp_read_only_requires_wrapped(
             Some(&cfg(false)),
-            &evaluator
+            &evaluator,
+            true
         ));
         assert!(!super::acp_read_only_requires_wrapped(
             Some(&cfg(true)),
-            &evaluator
+            &evaluator,
+            true
         ));
-        assert!(!super::acp_read_only_requires_wrapped(None, &evaluator));
+        assert!(!super::acp_read_only_requires_wrapped(
+            None, &evaluator, true
+        ));
         assert!(!super::acp_read_only_requires_wrapped(
             Some(&cfg(false)),
-            &creator
+            &creator,
+            true
         ));
         let mut tool = evaluator.clone();
         tool.tool_cmd = Some(vec!["true".into()]);
         assert!(
-            !super::acp_read_only_requires_wrapped(Some(&cfg(false)), &tool),
+            !super::acp_read_only_requires_wrapped(Some(&cfg(false)), &tool, true),
             "a tool unit is the engine's own command, never a seat's turn"
         );
+        // F-4R2-004: a CREATOR whose phase declared `executes_code: false` is never rerouted
+        // either — bound (deliverable-roots posture, guarded by the worktree guard) or unbound
+        // (no fence at all): the wrapped carrier's read-only lever would refuse the very
+        // deliverable the phase exists to write.
+        let mut doc_creator = crate::domain::WorkUnit::pending("r:revise", "r", 2, "revise");
+        doc_creator.worktree_guarded = true;
+        doc_creator.role = crate::workflow::PhaseRole::Creator;
+        for bound in [true, false] {
+            assert!(
+                !super::acp_read_only_requires_wrapped(Some(&cfg(false)), &doc_creator, bound),
+                "bound={bound}"
+            );
+            assert!(
+                !super::acp_read_only_unproven_at_spawn(false, &doc_creator, bound),
+                "bound={bound}"
+            );
+        }
+        // A NEUTRAL recon rung is read-only and reroutes exactly like an evaluator.
+        let mut recon = crate::domain::WorkUnit::pending("r:understand", "r", 1, "understand");
+        recon.worktree_guarded = true;
+        assert!(super::acp_read_only_requires_wrapped(
+            Some(&cfg(false)),
+            &recon,
+            false
+        ));
         // Sixth pass: an ADMITTED seat whose spawned process failed its version pin is unproven
         // for this build — the guarded unit leaves for the wrapped carrier; a proven process
         // stays; a creator unit is never rerouted on this ground either.
-        assert!(super::acp_read_only_unproven_at_spawn(false, &evaluator));
-        assert!(!super::acp_read_only_unproven_at_spawn(true, &evaluator));
-        assert!(!super::acp_read_only_unproven_at_spawn(false, &creator));
-        assert!(!super::acp_read_only_unproven_at_spawn(false, &tool));
+        assert!(super::acp_read_only_unproven_at_spawn(
+            false, &evaluator, true
+        ));
+        assert!(!super::acp_read_only_unproven_at_spawn(
+            true, &evaluator, true
+        ));
+        assert!(!super::acp_read_only_unproven_at_spawn(
+            false, &creator, true
+        ));
+        assert!(!super::acp_read_only_unproven_at_spawn(false, &tool, true));
     }
 
     /// core#431 (F-3R2-009): an `executes_code: false` unit on the ACP carrier is READ-ONLY even
@@ -13311,12 +13494,17 @@ os_sandbox = true
             serde_json::from_str(line).unwrap()
         };
         let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
-        let ro = super::AcpReadOnly {
+        let ro = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::ReadOnly,
+            role: crate::workflow::PhaseRole::Evaluator,
             run_id: "run-1".into(),
             ord: 4,
             attempt: 0,
             cli: "pi".into(),
             phase: "verify".into(),
+            cwd: std::path::PathBuf::from("/wt"),
+            deliverable_roots: vec![],
+            home: None,
             tx,
         };
         let lock = std::sync::Mutex::new(());
@@ -13354,6 +13542,8 @@ os_sandbox = true
                     tool,
                     kind,
                     path,
+                    role,
+                    posture,
                     reason,
                     ..
                 },
@@ -13363,9 +13553,15 @@ os_sandbox = true
                 assert_eq!(tool, "edit");
                 assert_eq!(kind.as_deref(), Some("edit"));
                 assert_eq!(path.as_deref(), Some("src/App.tsx"));
+                assert_eq!(
+                    (role.as_str(), posture.as_str()),
+                    ("evaluator", "read-only")
+                );
                 assert!(
-                    reason.contains("verify") && reason.contains("refused"),
-                    "{reason}"
+                    reason.contains("verify")
+                        && reason.contains("refused")
+                        && reason.contains("plays evaluator"),
+                    "the denial names the rule AND the role: {reason}"
                 );
             }
             Ok(_) => panic!("expected evaluatorToolCallDenied, got a different command"),
@@ -13403,6 +13599,432 @@ os_sandbox = true
             4096,
         );
         assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
+    }
+
+    /// F-4R2-004: a CREATOR whose phase declares `executes_code: false` on a BOUND run runs under
+    /// the DELIVERABLE-ROOTS posture: its write-class request INSIDE a granted write root passes
+    /// (no denial, no event); one into the tree under review, outside every root, or naming no
+    /// path is refused — and the refusal names the CREATOR, never an evaluator. An evaluator with
+    /// the same roots stays read-only everywhere, its deliverable root included.
+    #[test]
+    fn a_creator_keeps_write_inside_its_granted_roots_and_is_fenced_outside_them() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-acp-creator-fence-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let inbox = base.join("inbox");
+        std::fs::create_dir_all(wt.join("src")).unwrap();
+        std::fs::create_dir_all(&inbox).unwrap();
+        let frame = |path: &str, id: u64| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolName": "Write",
+                    "toolCall": {"toolCallId": "t1", "name": "Write", "kind": "edit",
+                                 "rawInput": {"file_path": path, "content": "<html/>"}},
+                    "options": [
+                        {"optionId": "allow", "kind": "allow_once"},
+                        {"optionId": "reject", "kind": "reject_once"},
+                    ],
+                },
+            })
+        };
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            let line = written
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .expect("one response frame written");
+            serde_json::from_str(line).unwrap()
+        };
+        let lock = std::sync::Mutex::new(());
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let fence = |posture, role, tx: &std::sync::mpsc::Sender<crate::command::Command>| {
+            super::AcpWritePosture {
+                posture,
+                role,
+                run_id: "run-2".into(),
+                ord: 2,
+                attempt: 0,
+                cli: "claude".into(),
+                phase: "revise".into(),
+                cwd: wt.clone(),
+                deliverable_roots: vec![inbox.clone()],
+                home: None,
+                tx: tx.clone(),
+            }
+        };
+        let creator = fence(
+            crate::write_posture::WritePosture::DeliverableRoots,
+            crate::workflow::PhaseRole::Creator,
+            &tx,
+        );
+        let ask = |fence: &super::AcpWritePosture, path: &str, id: u64| {
+            let mut sink: Vec<u8> = Vec::new();
+            let mut output = String::new();
+            super::answer_permission_request(
+                &mut sink,
+                &lock,
+                None,
+                None,
+                Some(fence),
+                &frame(path, id),
+                &mut output,
+                8192,
+            );
+            (answer_of(&sink), output)
+        };
+
+        // 1. INSIDE the granted root: allowed, nothing disclosed.
+        let deliverable = inbox.join("revised.html");
+        let (v, output) = ask(&creator, deliverable.to_str().unwrap(), 1);
+        assert_eq!(
+            v["result"]["outcome"]["optionId"], "allow",
+            "a creator's Write of its deliverable inside the granted root is allowed: {v}"
+        );
+        assert!(output.is_empty(), "no refusal note: {output}");
+        assert!(
+            rx.try_recv().is_err(),
+            "an allowed write draws no denial event"
+        );
+
+        // 2. INTO the tree under review: refused, the CREATOR named, the roots named.
+        let in_tree = wt.join("src").join("app.ts");
+        let (v, output) = ask(&creator, in_tree.to_str().unwrap(), 2);
+        assert_eq!(v["result"]["outcome"]["optionId"], "reject", "{v}");
+        assert!(
+            output.contains("plays creator")
+                && output.contains(&inbox.display().to_string())
+                && !output.contains("evaluat"),
+            "the note names the creator and where the deliverable belongs: {output}"
+        );
+        match rx.try_recv() {
+            Ok(crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::EvaluatorToolCallDenied {
+                    role,
+                    posture,
+                    reason,
+                    path,
+                    ..
+                },
+            )) => {
+                assert_eq!(
+                    (role.as_str(), posture.as_str()),
+                    ("creator", "deliverable-roots")
+                );
+                assert_eq!(path.as_deref(), in_tree.to_str());
+                assert!(
+                    reason.contains("plays creator") && !reason.contains("evaluat"),
+                    "{reason}"
+                );
+            }
+            Ok(_) => panic!("expected a role-correct denial, got a different command"),
+            Err(e) => panic!("expected a role-correct denial, got no event: {e}"),
+        }
+
+        // 3. OUTSIDE every root: refused.
+        let elsewhere = base.join("elsewhere.html");
+        let (v, _) = ask(&creator, elsewhere.to_str().unwrap(), 3);
+        assert_eq!(v["result"]["outcome"]["optionId"], "reject", "{v}");
+        assert!(rx.try_recv().is_ok());
+
+        // 4. A write-class call naming NO path cannot be placed — refused (fail closed).
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&creator),
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/request_permission",
+                "params": {
+                    "sessionId": "s1",
+                    "toolCall": {"toolCallId": "t4", "name": "mkdir", "kind": "edit",
+                                 "rawInput": {}},
+                    "options": [
+                        {"optionId": "allow", "kind": "allow_once"},
+                        {"optionId": "reject", "kind": "reject_once"},
+                    ],
+                },
+            }),
+            &mut output,
+            8192,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "reject");
+        assert!(output.contains("names no path"), "{output}");
+        assert!(rx.try_recv().is_ok());
+
+        // 5. An EVALUATOR with the same roots is read-only even inside the inbox.
+        let evaluator = fence(
+            crate::write_posture::WritePosture::ReadOnly,
+            crate::workflow::PhaseRole::Evaluator,
+            &tx,
+        );
+        let (v, output) = ask(&evaluator, deliverable.to_str().unwrap(), 5);
+        assert_eq!(v["result"]["outcome"]["optionId"], "reject", "{v}");
+        assert!(
+            output.contains("plays evaluator") && output.contains("read-only posture"),
+            "{output}"
+        );
+        match rx.try_recv() {
+            Ok(crate::command::Command::EmitEvent(
+                crate::event::CoreEvent::EvaluatorToolCallDenied { role, posture, .. },
+            )) => assert_eq!(
+                (role.as_str(), posture.as_str()),
+                ("evaluator", "read-only")
+            ),
+            Ok(_) => panic!("expected the evaluator's denial, got a different command"),
+            Err(e) => panic!("expected the evaluator's denial, got no event: {e}"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F-02 (independent review of #444): the ACP fence and the gate hook derive the SAME
+    /// deliverable roots for the same unit — exactly the governance context's `extra_write_roots`
+    /// — and render the SAME verdict for every write: inside a root → admitted on both; the tree
+    /// under review, the repo-graph key dir (which the filesystem boundary admits, so the hook used
+    /// to let it through), outside every root → refused on both.
+    #[test]
+    fn both_carriers_judge_a_deliverable_roots_write_identically() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-f02-parity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let inbox = base.join("inbox");
+        let graph = base.join("repo-graphs").join("key");
+        for d in [&wt, &inbox, &graph] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let g = crate::workflow::GovernanceContext {
+            db_path: base.join("core.db").to_string_lossy().into_owned(),
+            code_graph_db: Some(graph.join("graph.db").to_string_lossy().into_owned()),
+            extra_write_roots: vec![inbox.to_string_lossy().into_owned()],
+            extra_read_roots: vec![],
+        };
+        // The ACP fence's roots (in-process) and the hook's roots (env round-trip) are one list.
+        let acp_roots = crate::write_posture::deliverable_roots_of(Some(&g));
+        let env = crate::write_posture::deliverable_roots_env(&acp_roots).unwrap();
+        let hook_roots = crate::write_posture::parse_deliverable_roots_env(Some(&env));
+        assert_eq!(acp_roots, vec![inbox.clone()]);
+        assert_eq!(hook_roots, acp_roots, "identical roots on both carriers");
+
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let fence = super::AcpWritePosture {
+            posture: crate::write_posture::WritePosture::DeliverableRoots,
+            role: crate::workflow::PhaseRole::Creator,
+            run_id: "run-parity".into(),
+            ord: 2,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: "revise".into(),
+            cwd: wt.clone(),
+            deliverable_roots: acp_roots.clone(),
+            home: None,
+            tx,
+        };
+        let call = |p: &std::path::Path| crate::acp_permission::WriteClassCall {
+            tool: "Write".into(),
+            kind: Some("edit".into()),
+            path: Some(p.to_string_lossy().into_owned()),
+        };
+        let hook = |p: &std::path::Path| {
+            crate::gate_hook::phase_scope_denial(
+                false,
+                crate::write_posture::WritePosture::DeliverableRoots,
+                &serde_json::json!({ "path": p.to_string_lossy() }),
+                "Write",
+                &wt,
+                None,
+                &hook_roots,
+            )
+        };
+        let matrix: [(&str, std::path::PathBuf, bool); 5] = [
+            ("deliverable in the root", inbox.join("revised.html"), true),
+            ("nested in the root", inbox.join("sub").join("f.html"), true),
+            ("the tree under review", wt.join("index.html"), false),
+            ("the repo-graph key dir", graph.join("graph.db-wal"), false),
+            ("outside every root", base.join("elsewhere.html"), false),
+        ];
+        for (what, path, admitted) in matrix {
+            let acp = fence.judge(&call(&path)).is_ok();
+            let gate = hook(&path).is_none();
+            assert_eq!(acp, admitted, "ACP fence on {what}: {}", path.display());
+            assert_eq!(gate, admitted, "gate hook on {what}: {}", path.display());
+            assert_eq!(acp, gate, "the two carriers disagree on {what}");
+        }
+        drop(rx);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F-4R2-004 REGRESSION FIXTURE — the `interactive-chat` run 2c56cea1 (2026-09-11 10:48:29Z),
+    /// replayed from its persisted shape (`tests/fixtures/f_4r2_004_chat2_revise_write.json`: the
+    /// `revise` unit as the engine persisted it, the session's `extra_write_roots`, and the
+    /// `session/request_permission` frame the claude seat sent for its `Write`). The run is
+    /// UNBOUND (`workdir: null`), so the creator carries NO fence and its `Write` of the declared
+    /// deliverable is allowed; had the run been bound, the same `Write` passes the
+    /// deliverable-roots fence while a write into the worktree is refused. Before the fix every
+    /// guarded unit was read-only and this exact frame was refused as a "read-only evaluator" —
+    /// the fixture keeps the observed reason so the wording regression is pinned too.
+    #[test]
+    fn f_4r2_004_chat2_revise_write_of_the_declared_deliverable_is_allowed() {
+        let raw = include_str!("../tests/fixtures/f_4r2_004_chat2_revise_write.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).expect("fixture parses");
+        let base = std::env::temp_dir().join(format!(
+            "wicked-f4r2004-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        // The fixture spells every absolute path with a `<ROOT>` token so the judgement is made
+        // over a REAL directory on the running OS (macOS `/private/tmp` aliasing, Windows verbatim
+        // prefixes) rather than over the literal Unix spelling the run recorded.
+        let root = base
+            .join("interactive-chats")
+            .join("wicked-studio-brochure-r2-m-dmsg-10");
+        std::fs::create_dir_all(&root).unwrap();
+        let sub = |s: &str| s.replace("<ROOT>", root.to_str().unwrap());
+        // Substitute INSIDE the parsed value's strings — never in the serialized JSON text, where
+        // a Windows temp path's backslashes read as escapes (windows-latest, first CI pass of this
+        // PR: "invalid escape"). The spelling is then judged literally, exactly as the runner sees
+        // it in `rawInput.file_path`.
+        fn substitute_root(v: &mut serde_json::Value, sub: &dyn Fn(&str) -> String) {
+            match v {
+                serde_json::Value::String(s) => *s = sub(s),
+                serde_json::Value::Array(items) => {
+                    items.iter_mut().for_each(|i| substitute_root(i, sub))
+                }
+                serde_json::Value::Object(map) => {
+                    map.values_mut().for_each(|i| substitute_root(i, sub))
+                }
+                _ => {}
+            }
+        }
+        let mut frame = fixture["request_permission_frame"].clone();
+        substitute_root(&mut frame, &sub);
+        let unit_json = &fixture["unit"];
+        let mut unit: crate::domain::WorkUnit = serde_json::from_value(unit_json.clone())
+            .expect("the persisted unit shape deserializes");
+        unit.tool_cmd = None;
+        assert_eq!(unit.role, crate::workflow::PhaseRole::Creator);
+        assert!(unit.worktree_guarded && !unit.executes_code);
+        assert_eq!(unit.phase_id(), Some("revise"));
+        let extra_write_roots: Vec<std::path::PathBuf> = fixture["session"]["extra_write_roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| std::path::PathBuf::from(sub(r.as_str().unwrap())))
+            .collect();
+        assert_eq!(extra_write_roots, vec![root.clone()]);
+        let bound = !fixture["session"]["workdir"].is_null();
+        assert!(!bound, "every crew interactive seam launches unbound");
+
+        // The posture the run gets after the fix: an unbound creator is NOT fenced.
+        let posture = crate::write_posture::WritePosture::of(&unit, bound);
+        assert_eq!(posture, crate::write_posture::WritePosture::Full);
+        assert!(
+            !posture.fences_writes(),
+            "no AcpWritePosture is built for this unit"
+        );
+
+        let answer_of = |sink: &[u8]| -> serde_json::Value {
+            let written = std::str::from_utf8(sink).unwrap();
+            serde_json::from_str(written.lines().find(|l| !l.trim().is_empty()).unwrap()).unwrap()
+        };
+        let lock = std::sync::Mutex::new(());
+        // Unbound (the recorded run): the frame reaches the ordinary answer and is allowed.
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            None,
+            &frame,
+            &mut output,
+            8192,
+        );
+        let v = answer_of(&sink);
+        assert_eq!(v["id"], frame["id"]);
+        assert_eq!(
+            v["result"]["outcome"]["optionId"], "allow",
+            "the revise creator's Write of revised.html is allowed: {v}"
+        );
+        assert!(output.is_empty(), "{output}");
+
+        // Bound variant: the same unit on a run WITH a worktree is fenced to its roots — the
+        // deliverable still lands, a write into the tree does not, and the wording names the
+        // creator (the recorded reason called it an evaluator).
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let posture = crate::write_posture::WritePosture::of(&unit, true);
+        assert_eq!(
+            posture,
+            crate::write_posture::WritePosture::DeliverableRoots
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<crate::command::Command>();
+        let fence = super::AcpWritePosture {
+            posture,
+            role: unit.role,
+            run_id: fixture["session"]["id"].as_str().unwrap().to_string(),
+            ord: unit.ord,
+            attempt: 0,
+            cli: "claude".into(),
+            phase: unit.phase_id().unwrap().to_string(),
+            cwd: wt.clone(),
+            deliverable_roots: extra_write_roots.clone(),
+            home: None,
+            tx,
+        };
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&fence),
+            &frame,
+            &mut output,
+            8192,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "allow");
+        assert!(rx.try_recv().is_err(), "no denial for the deliverable");
+        let mut in_tree = frame.clone();
+        in_tree["params"]["toolCall"]["rawInput"]["file_path"] =
+            serde_json::Value::String(wt.join("index.html").to_string_lossy().into_owned());
+        let mut sink: Vec<u8> = Vec::new();
+        let mut output = String::new();
+        super::answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            Some(&fence),
+            &in_tree,
+            &mut output,
+            8192,
+        );
+        assert_eq!(answer_of(&sink)["result"]["outcome"]["optionId"], "reject");
+        let recorded = fixture["observed_before_fix"]["reason"].as_str().unwrap();
+        assert!(
+            recorded.contains("read-only posture") && !recorded.contains("creator"),
+            "the fixture keeps the misworded reason the run recorded"
+        );
+        assert!(
+            output.contains("plays creator") && !output.contains("evaluat"),
+            "the wording now names the role: {output}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// End-to-end at the handshake dispatcher: a TRUE notification (id member absent) draws no

@@ -15,6 +15,48 @@ Two release tracks share this file, newest entry first regardless of track:
 ## [Unreleased]
 
 ### Fixed
+- **Creators keep `Write`/`Edit` inside their granted write roots; the read-only fence is for
+  evaluators (acceptance finding F-4R2-004, wave 5).** F-036's read-only posture was keyed on the
+  worktree guard's marker alone (`worktree_guarded` = `!executes_code && !tool`), which is a
+  SUPERSET of "evaluator": a CREATOR whose deliverable is a document outside the tree also declares
+  `executes_code: false` — every wicked-crew interactive seam (`interactive-draft/edit/chat`:
+  `draft`, `edit`, `revise`), steering `propose`, repo-learn `capture`, `memories` `store`. Those
+  runs are UNBOUND and launch with `extra_write_roots` = the per-run inbox the deliverable must
+  land in; the launch validated the root, the deliverable floor looked for the file there — and
+  the ACP permission boundary refused the creator's `Write` of that very file before the gate (which
+  carried the root in `boundary.roots.write`) could see it, logging "DENY (read-only evaluator,
+  unit 2)" for a creator. `draft`/`edit` workers routed around it via `Bash`; both
+  `interactive-chat` `revise` workers respected it → prose instead of `revised.html` → deliverable
+  floor failed → `sessionFailed` (runs 37f020cc 10:39:39Z and 2c56cea1 10:48:29Z). The write
+  posture is now derived per unit from its ROLE, the guard marker and whether the run has a tree
+  (`write_posture::WritePosture::of`), one derivation read by every carrier: `executes_code: false`
+  + evaluator/neutral ⇒ **read-only** (unchanged: every write-class call refused, bash stays);
+  `executes_code: false` + creator + BOUND ⇒ **deliverable-roots** (writes allowed inside the
+  launch-validated `extra_write_roots`, refused into the tree under review and anywhere else — the
+  worktree guard still holds the tree); `executes_code: false` + creator + UNBOUND ⇒ no fence (the
+  ordinary cwd + extras boundary; there is no tree to protect). `executes_code: false` keeps meaning
+  "does not change the tree under review", never "writes nothing". Applied on the ACP permission
+  bridge (`AcpWritePosture`, judged before any gate for admitted and unadmitted seats alike), the
+  gate hook's phase scope (`WICKED_NO_CODE_SCOPE` keeps the `1` spelling for read-only — so a
+  same-version pre-posture hook binary on PATH still reads an evaluator's fence as ON — and adds
+  `deliverable-roots`; the creator's roots ride `WICKED_DELIVERABLE_ROOTS`, exactly the extras, so
+  the hook and the ACP fence judge one identical root set — never the repo-graph key dir the
+  filesystem boundary also admits), the wrapped argv lever and the PTY session
+  (only the read-only posture takes `--sandbox read-only` / `--exclude-tools`; a deliverable-roots
+  creator on a lever-less seat is guard-only and told so in its prompt), and process/session
+  isolation + quiesce (any fenced unit). The read-only-requires-wrapped reroute applies to the
+  read-only posture only — a creator is never sent to a carrier whose lever would refuse its
+  deliverable. Wording: the log line names the posture and the role (`DENY (deliverable-roots
+  posture, creator unit 2)`), the reason says `plays creator`/`plays evaluator`, and
+  `evaluatorToolCallDenied` gains `role` (`creator` | `evaluator` | `neutral`) and `posture`
+  (`read-only` | `deliverable-roots`) — the type name is historical; consumers read `role`. Tests:
+  the posture table, the gate hook's creator fence (in-tree refused, declared root allowed, `..`
+  judged on the resolved target, wording never says evaluator), the ACP fence (creator allowed
+  inside its root / refused in-tree, outside, and path-less; evaluator refused everywhere), the
+  reroute exemption, and a regression fixture replayed from run 2c56cea1's persisted unit, session
+  and `session/request_permission` frame (`tests/fixtures/f_4r2_004_chat2_revise_write.json`).
+  Crew's workflow declarations were already right (`role: creator`, `executes_code: false`,
+  deliverable in `extraWriteRoots`) and are unchanged.
 - **Chat scope validator hardening (core#410 follow-up; reviewer R11/b1–b3).** A `.`/`..` segment
   anywhere in a chat scope's cwd, read roots or graph is refused by spelling before any containment
   check (the worker-home rule, `spawn::refuse_dot_segments`), and a path whose MISSING tail still
