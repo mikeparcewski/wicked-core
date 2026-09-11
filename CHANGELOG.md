@@ -675,6 +675,29 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.21** — npm release carrying the three engine changes since 0.7.20, all on main tip
+  d5b12bb: **#442** (core#441, acceptance finding F-079) — every seat that receives a skills
+  delivery (pi, copilot, opencode, claude; both carriers) is also handed `WICKED_GARDEN_ROOT=<pinned
+  snapshot root>` and `<root>/scripts` at the front of `PATH`, derived from the same generation as
+  the skills, so the `wicked-garden` launcher resolves the snapshot's synced `.venv`; over ACP the
+  skills lever is judged from the SEAT binary, so pi behind `pi-acp` is judged as pi and handed the
+  deliverable portable skill directories as `WICKED_PI_SKILL_DIRS` (the variable being SET is the
+  delivery, an EMPTY value means `--no-skills` alone, UNSET means no delivery), with
+  `skillsSnapshotHanded {path: "acp", cli: <seat key>}` emitted once per spawn. **#443** (core#441,
+  F-079) — the codex skills lever: the engine-minted `CODEX_HOME/skills` is populated from the
+  pinned snapshot (flat by frontmatter name, copies, serialized by an exclusive OS file lock, a
+  per-generation `.wicked-skills-gen` marker so an unchanged generation is a no-op and a new one
+  replaces exactly what the previous generation wrote), before the seat spawns and before
+  `skillsSnapshotHanded {cli: codex}` is emitted, on both carriers. **#444** (acceptance finding
+  F-4R2-004) — the creator write posture is derived per unit from its ROLE (`WritePosture::of`):
+  `executes_code: false` + evaluator ⇒ read-only (unchanged), + creator + BOUND ⇒ deliverable-roots
+  (writes allowed inside the launch-validated `extra_write_roots`, refused into the tree under
+  review), + creator + UNBOUND ⇒ no fence; `evaluatorToolCallDenied` gains the additive `role`
+  (`creator` | `evaluator` | `neutral`) and `posture` (`read-only` | `deliverable-roots`) fields,
+  and the gate hook (`WICKED_DELIVERABLE_ROOTS`) and the ACP fence judge ONE identical
+  deliverable-root set. Wire shape: additive only. **Coupling to note:** wicked-crew 0.7.30 pins
+  `wicked-core-ts ^0.7.21`, `wicked-crew-api-types` 0.35.0 and `agent-acp-bridges` 1.1.1 (the
+  crew-side `pi-acp` bridge that turns `WICKED_PI_SKILL_DIRS` into `--no-skills --skill …`).
 - **core-ts 0.7.20** — npm release carrying the one engine change since 0.7.19, #433 (core#431 — the
   Phase 3 acceptance re-run findings F-3R2-013 / -010 / -007 / -009): deliver lifts onto the current
   base — a freshly minted worktree is based on the fetched remote default tip when the clone's
