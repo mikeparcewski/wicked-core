@@ -453,9 +453,12 @@ pub const REMOTE_CREDENTIAL_ENV: &[&str] = &[
     "GIT_SSH_VARIANT",
     "GIT_CONFIG_PARAMETERS",
     "GIT_CONFIG_COUNT",
-    "GIT_CONFIG_NOSYSTEM",
     "GIT_EXEC_PATH",
     "GIT_PROXY_COMMAND",
+    // (review of #449, r2) `GIT_ALLOW_PROTOCOL` outranks every `protocol.<name>.allow` config
+    // entry: an inherited allow-list must not undo the ssh/git/ext refusal below.
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_PROTOCOL_FROM_USER",
 ];
 
 /// Name PREFIXES of remote-write credential variables stripped by enumeration (their suffix is
@@ -467,6 +470,19 @@ pub const REMOTE_CREDENTIAL_ENV_PREFIXES: &[&str] =
 /// The scheme every seat push is rewritten to — one git has no remote helper for, so the push
 /// fails before any transport is contacted ("unable to find remote helper for 'wicked-nopush'").
 pub const NOPUSH_SCHEME: &str = "wicked-nopush://";
+
+/// The ssh program a fenced seat's git is given — as `GIT_SSH_COMMAND` in its environment AND
+/// as `core.sshCommand` in its config: a program that does not exist, so an ssh transport git
+/// still reaches fails "cannot run wicked-nopush-ssh" before any key is read, and the name says
+/// why. Review of #449 (r2, R2-2): scp-like remotes with a non-`git` or no user
+/// (`nobody@host:path`, `host:path`) are ssh remotes no URL-prefix kill can enumerate.
+pub const NOPUSH_SSH_COMMAND: &str = "wicked-nopush-ssh";
+
+/// git transports a fenced seat may not use at all (`protocol.<name>.allow = never`, read AND
+/// write): ssh in every spelling (scp-like included), the bare git protocol and `ext::` (an
+/// arbitrary command as a remote). https/http, `file://` and local paths stay allowed — a seat
+/// still fetches over them — and are push-killed by [`nopush_url_prefixes`].
+pub const NOPUSH_PROTOCOLS: &[&str] = &["ssh", "git", "ext"];
 
 /// URL prefixes rewritten for PUSH ONLY (`url.<NOPUSH_SCHEME>.pushInsteadOf`): every transport
 /// git speaks — https/http, ssh (URL and scp-like `git@host:` forms), the git protocol, `file://`
@@ -503,23 +519,37 @@ pub fn nopush_url_prefixes() -> Vec<String> {
     all
 }
 
-/// The `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` entries a seat spawn carries —
-/// git reads them with the precedence of `-c` (above every config FILE), so a repo-level
-/// `credential.helper` or `url.*.pushInsteadOf` cannot undo them: the push kill for every
-/// transport, credential helpers reset (an empty `credential.helper` clears the list), no askpass
-/// program. Returned as `(name, value)` pairs, `GIT_CONFIG_COUNT` last.
-pub fn nopush_git_config_env() -> Vec<(String, String)> {
+/// Every git config entry the fence sets, as `(key, value)` pairs in the order git must read
+/// them (for a single-valued key the later entry wins): the push kill for every URL-form
+/// transport (`url.wicked-nopush://.pushInsteadOf`), credential helpers reset (an empty
+/// `credential.helper` clears the list), no askpass program, the ssh program replaced by
+/// [`NOPUSH_SSH_COMMAND`], and the ssh/git/ext transports refused outright
+/// (`protocol.<name>.allow = never`, [`NOPUSH_PROTOCOLS`]). Carried twice: as the seat's
+/// `GIT_CONFIG_*` environment ([`nopush_git_config_env`]) and, LAST, in the seat-owned global
+/// file ([`seat_git_config_files`]).
+pub fn nopush_git_config_entries() -> Vec<(String, String)> {
     let mut entries: Vec<(String, String)> = nopush_url_prefixes()
         .iter()
-        .map(|p| {
-            (
-                format!("url.{NOPUSH_SCHEME}.pushInsteadOf"),
-                (*p).to_string(),
-            )
-        })
+        .map(|p| (format!("url.{NOPUSH_SCHEME}.pushInsteadOf"), p.clone()))
         .collect();
     entries.push(("credential.helper".to_string(), String::new()));
     entries.push(("core.askPass".to_string(), String::new()));
+    entries.push((
+        "core.sshCommand".to_string(),
+        NOPUSH_SSH_COMMAND.to_string(),
+    ));
+    for proto in NOPUSH_PROTOCOLS {
+        entries.push((format!("protocol.{proto}.allow"), "never".to_string()));
+    }
+    entries
+}
+
+/// The `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` spelling of
+/// [`nopush_git_config_entries`] — git reads them with the precedence of `-c` (above every
+/// config FILE), so a repo-level `credential.helper` or `url.*.pushInsteadOf` cannot undo them.
+/// Returned as `(name, value)` pairs, `GIT_CONFIG_COUNT` last.
+pub fn nopush_git_config_env() -> Vec<(String, String)> {
+    let entries = nopush_git_config_entries();
     let mut env: Vec<(String, String)> = Vec::with_capacity(entries.len() * 2 + 1);
     for (i, (key, value)) in entries.iter().enumerate() {
         env.push((format!("GIT_CONFIG_KEY_{i}"), key.clone()));
@@ -530,43 +560,33 @@ pub fn nopush_git_config_env() -> Vec<(String, String)> {
 }
 
 /// The seat-owned git config files a seat spawn is pointed at (`GIT_CONFIG_GLOBAL`,
-/// `GIT_CONFIG_SYSTEM`), under [`seat_gh_config_dir`]: the GLOBAL file includes the operator's
-/// own global config (so `user.name`/`user.email`, `core.*`, `diff.*` keep working for the seat's
-/// commits) and then RESETS the credential helpers, askpass and the push transports; the SYSTEM
-/// file is empty (a system `credential.helper = manager`, as Git for Windows installs, never
-/// reaches a seat). Written idempotently on every spawn; `Err` when the worker home base cannot
-/// be resolved or the files cannot be written — callers then rely on the environment entries
-/// alone (which already outrank every file).
-pub fn seat_git_config_files() -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+/// `GIT_CONFIG_SYSTEM`), under [`seat_gh_config_dir`]. The GLOBAL file carries a COPY of the
+/// operator's identity and presentation settings — only the keys [`seat_copies_git_config_key`]
+/// admits (`user.*`, `core.editor`, `diff.*`, `color.*`, …), read from the operator's own global
+/// config as git resolves it from `cwd` (an `includeIf "gitdir:…"` identity applies to the
+/// worktree the seat works in) — followed, LAST, by every entry of
+/// [`nopush_git_config_entries`]. The operator's file is never `[include]`d: review of #449 (r2,
+/// R2-1) reproduced an operator `url."git@github.com:".pushInsteadOf = https://github.com/`
+/// riding in through the include and winning the longest-prefix match, so a fenced https push
+/// reached ssh. Nothing of `url.*`, `remote.*`, `credential.*`, `include*`, `alias.*`,
+/// `core.sshCommand`, `http.*`, `protocol.*`, `init.templateDir`… is copied
+/// ([`SEAT_GIT_CONFIG_NEVER_PREFIXES`]). The SYSTEM file is empty (a system `credential.helper =
+/// manager`, as Git for Windows installs, never reaches a seat).
+///
+/// The global file is content-addressed (`gitconfig-<hash>`): identical settings share one
+/// immutable file, so concurrent seat spawns never read a half-written one and an operator whose
+/// identity differs per repository gets the right one per worktree. `Err` when the worker home
+/// base cannot be resolved or the files cannot be written — callers then rely on the environment
+/// entries alone (which already outrank every file).
+pub fn seat_git_config_files(
+    cwd: Option<&std::path::Path>,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
     use anyhow::Context;
     let dir = seat_gh_config_dir()?;
     ensure_private_dir(&dir)?;
-    let global = dir.join("gitconfig");
+    let content = seat_global_git_config(&operator_git_identity_config(cwd));
+    let global = dir.join(format!("gitconfig-{}", content_hash(&content)));
     let system = dir.join("gitconfig-system");
-    let mut content = String::from(
-        "# Written by wicked-core on every seat spawn (F-7R2-012, wave 6). A worker seat's git\n\
-         # reads THIS as its global config: the operator's own global config is included below\n\
-         # (identity, editor, diff settings keep working), then every credential helper and\n\
-         # askpass program is reset and every push transport is re-aimed at a scheme git has no\n\
-         # helper for. Fetch and pull are untouched. Delivery is the deliver phase's job.\n",
-    );
-    for path in operator_global_git_configs() {
-        // git's include syntax accepts forward slashes on every platform; a backslash would be
-        // read as an escape.
-        let spelled = path.to_string_lossy().replace('\\', "/");
-        content.push_str(&format!("[include]\n\tpath = {spelled}\n"));
-    }
-    content.push_str("[credential]\n\thelper =\n[core]\n\taskPass =\n");
-    content.push_str(&format!("[url \"{NOPUSH_SCHEME}\"]\n"));
-    for prefix in nopush_url_prefixes() {
-        // A value that begins with a backslash is quoted so git reads it literally.
-        if prefix.starts_with('\\') {
-            let escaped = prefix.replace('\\', "\\\\");
-            content.push_str(&format!("\tpushInsteadOf = \"{escaped}\"\n"));
-        } else {
-            content.push_str(&format!("\tpushInsteadOf = {prefix}\n"));
-        }
-    }
     write_if_changed(&global, &content).context("seat global gitconfig")?;
     write_if_changed(
         &system,
@@ -576,26 +596,238 @@ pub fn seat_git_config_files() -> anyhow::Result<(std::path::PathBuf, std::path:
     Ok((global, system))
 }
 
-/// The operator's global git config file(s) that exist: `$GIT_CONFIG_GLOBAL` when set, else
-/// `$XDG_CONFIG_HOME/git/config` (or `~/.config/git/config`) and `~/.gitconfig` — the same two
-/// files git itself reads, in git's order.
-fn operator_global_git_configs() -> Vec<std::path::PathBuf> {
-    if let Some(explicit) = std::env::var_os("GIT_CONFIG_GLOBAL") {
-        let p = std::path::PathBuf::from(explicit);
-        return if p.is_file() { vec![p] } else { Vec::new() };
+/// git config SECTIONS a seat's copy of the operator's global config admits whole (every key
+/// under them): identity and signing, presentation, and the diff/merge/filter drivers a
+/// repository's checkout may depend on (`filter.lfs.*`). A driver is a command the seat runs
+/// under its own fenced environment — nothing a seat could not run from its shell anyway.
+pub const SEAT_GIT_CONFIG_COPIED_SECTIONS: &[&str] = &[
+    "user",
+    "gpg",
+    "commit",
+    "tag",
+    "diff",
+    "difftool",
+    "merge",
+    "mergetool",
+    "color",
+    "pull",
+    "rebase",
+    "log",
+    "status",
+    "advice",
+    "pager",
+    "interactive",
+    "safe",
+    "filter",
+];
+
+/// Individual keys admitted from sections that also carry something a seat may not have
+/// (`core.sshCommand`, `init.templateDir`).
+pub const SEAT_GIT_CONFIG_COPIED_KEYS: &[&str] = &[
+    "core.editor",
+    "core.pager",
+    "core.autocrlf",
+    "core.eol",
+    "core.safecrlf",
+    "core.ignorecase",
+    "core.quotepath",
+    "core.filemode",
+    "core.symlinks",
+    "core.longpaths",
+    "core.excludesfile",
+    "core.attributesfile",
+    "core.precomposeunicode",
+    "core.commentchar",
+    "core.whitespace",
+    "init.defaultbranch",
+];
+
+/// Key prefixes (case-folded) NEVER copied, whatever the lists above say — a superset of what the
+/// command filter refuses a seat to override (`remote_write_fence::FENCED_GIT_CONFIG_KEY_PREFIXES`,
+/// pinned in lockstep by a test there): an alias, a URL rewrite, a remote, a credential helper,
+/// an include, a transport program or option, a hooks/template directory, a filesystem monitor.
+pub const SEAT_GIT_CONFIG_NEVER_PREFIXES: &[&str] = &[
+    "alias.",
+    "url.",
+    "remote.",
+    "branch.",
+    "credential.",
+    "include.",
+    "includeif.",
+    "core.sshcommand",
+    "core.askpass",
+    "core.gitproxy",
+    "core.hookspath",
+    "core.fsmonitor",
+    "http.",
+    "https.",
+    "ssh.",
+    "protocol.",
+    "uploadpack.",
+    "receive.",
+    "init.templatedir",
+];
+
+/// Whether one operator global-config key (`section[.subsection].name`, as `git config --list`
+/// prints it) is copied into the seat-owned global file: never a [`SEAT_GIT_CONFIG_NEVER_PREFIXES`]
+/// match; otherwise a [`SEAT_GIT_CONFIG_COPIED_SECTIONS`] section or a
+/// [`SEAT_GIT_CONFIG_COPIED_KEYS`] key.
+pub fn seat_copies_git_config_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    if SEAT_GIT_CONFIG_NEVER_PREFIXES
+        .iter()
+        .any(|p| lower.starts_with(p))
+    {
+        return false;
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from);
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| home.as_ref().map(|h| h.join(".config")))
-        .map(|c| c.join("git").join("config"));
-    [xdg, home.map(|h| h.join(".gitconfig"))]
+    let section = lower.split('.').next().unwrap_or("");
+    SEAT_GIT_CONFIG_COPIED_SECTIONS.contains(&section)
+        || SEAT_GIT_CONFIG_COPIED_KEYS.contains(&lower.as_str())
+}
+
+/// The operator's global git config entries a seat may carry: `git config --global --list -z`
+/// resolved from `cwd`, filtered through [`seat_copies_git_config_key`]. Empty when git is
+/// unavailable or the operator has no global config (the seat then commits with whatever the
+/// repository itself configures).
+fn operator_git_identity_config(cwd: Option<&std::path::Path>) -> Vec<(String, Option<String>)> {
+    let mut git = Command::new("git");
+    git.hardened();
+    git.args(["config", "--global", "--list", "-z"]);
+    git.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(dir) = cwd {
+        git.current_dir(dir);
+    }
+    let out = match git.output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return Vec::new(),
+    };
+    parse_git_config_list_z(&out)
         .into_iter()
-        .flatten()
-        .filter(|p| p.is_file())
+        .filter(|(k, _)| seat_copies_git_config_key(k))
         .collect()
+}
+
+/// `git config --list -z` output: `key\nvalue\0` per entry, `key\0` for an entry without a value.
+fn parse_git_config_list_z(out: &[u8]) -> Vec<(String, Option<String>)> {
+    String::from_utf8_lossy(out)
+        .split('\0')
+        .filter(|e| !e.is_empty())
+        .map(|entry| match entry.split_once('\n') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (entry.to_string(), None),
+        })
+        .collect()
+}
+
+/// The text of the seat-owned global git config for one set of copied operator entries: the
+/// copied entries grouped under their section headers, then every [`nopush_git_config_entries`]
+/// entry LAST (the later entry wins a single-valued key; the push kill is a `pushInsteadOf` set
+/// no copied entry competes with).
+fn seat_global_git_config(copied: &[(String, Option<String>)]) -> String {
+    let mut content = String::from(
+        "# Written by wicked-core on every seat spawn (F-7R2-012, wave 6). A worker seat's git\n\
+         # reads THIS as its global config: the operator's identity and presentation settings are\n\
+         # COPIED below (never included — nothing about remotes, URLs, credentials, aliases or\n\
+         # transports crosses), then every credential helper and askpass program is reset, every\n\
+         # URL-form push transport is re-aimed at a scheme git has no helper for, ssh is replaced\n\
+         # by a program that does not exist and the ssh/git/ext transports are refused outright.\n\
+         # Fetch over https, file:// and local paths is untouched. Delivery is the deliver phase's\n\
+         # job.\n",
+    );
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for (key, value) in copied {
+        let Some((header, name)) = git_config_header_and_name(key) else {
+            continue;
+        };
+        let line = match value {
+            Some(v) if v.is_empty() => format!("\t{name} =\n"),
+            Some(v) => format!("\t{name} = {}\n", git_config_value(v)),
+            None => format!("\t{name}\n"),
+        };
+        match sections.iter_mut().find(|(h, _)| *h == header) {
+            Some((_, lines)) => lines.push(line),
+            None => sections.push((header, vec![line])),
+        }
+    }
+    for (header, lines) in sections {
+        content.push_str(&header);
+        content.push('\n');
+        for line in lines {
+            content.push_str(&line);
+        }
+    }
+    let mut current = String::new();
+    for (key, value) in nopush_git_config_entries() {
+        let Some((header, name)) = git_config_header_and_name(&key) else {
+            continue;
+        };
+        if header != current {
+            content.push_str(&header);
+            content.push('\n');
+            current = header;
+        }
+        if value.is_empty() {
+            content.push_str(&format!("\t{name} =\n"));
+        } else {
+            content.push_str(&format!("\t{name} = {}\n", git_config_value(&value)));
+        }
+    }
+    content
+}
+
+/// `section[.subsection].name` → (`[section]` or `[section "subsection"]`, `name`), spelled as
+/// git's file syntax requires; `None` for a key git could not have printed (an invalid section
+/// or variable name, a subsection with a newline).
+fn git_config_header_and_name(key: &str) -> Option<(String, String)> {
+    let (section, rest) = key.split_once('.')?;
+    let (subsection, name) = match rest.rsplit_once('.') {
+        Some((sub, name)) => (Some(sub), name),
+        None => (None, rest),
+    };
+    let valid_section = !section.is_empty()
+        && section
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let valid_name = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    if !valid_section || !valid_name {
+        return None;
+    }
+    let header = match subsection {
+        Some(sub) if sub.contains('\n') => return None,
+        Some(sub) => format!(
+            "[{section} \"{}\"]",
+            sub.replace('\\', "\\\\").replace('"', "\\\"")
+        ),
+        None => format!("[{section}]"),
+    };
+    Some((header, name.to_string()))
+}
+
+/// A config VALUE as git's file syntax reads it back literally: plain when it can be, otherwise
+/// double-quoted with `\\`, `\"`, newline and tab escaped.
+fn git_config_value(v: &str) -> String {
+    let plain = !v.is_empty()
+        && !v.starts_with(char::is_whitespace)
+        && !v.ends_with(char::is_whitespace)
+        && !v.contains(['\\', '"', '#', ';', '\n', '\t']);
+    if plain {
+        return v.to_string();
+    }
+    let escaped = v
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
+}
+
+/// A stable hex digest of a file's content (the name of the content-addressed seat config).
+fn content_hash(content: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
 fn write_if_changed(path: &std::path::Path, content: &str) -> std::io::Result<()> {
@@ -605,7 +837,17 @@ fn write_if_changed(path: &std::path::Path, content: &str) -> std::io::Result<()
     {
         return Ok(());
     }
-    std::fs::write(path, content)
+    // Written whole, then renamed into place: a seat spawning concurrently reads either the old
+    // file or the new one, never a partial write.
+    let tmp = path.with_file_name(format!(
+        "{}.{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// The `gh` CLI's configuration directory variable — where it reads `hosts.yml`, the stored
@@ -634,15 +876,27 @@ pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
 ///
 /// Four things, in order: (1) every variable in [`REMOTE_CREDENTIAL_ENV`] and every one matching
 /// [`REMOTE_CREDENTIAL_ENV_PREFIXES`] in the daemon's environment is REMOVED — tokens, the ssh
-/// agent socket, askpass helpers, seat-supplied ssh commands, environment-injected git config;
-/// (2) `GH_CONFIG_DIR` → the credential-less directory, `GIT_TERMINAL_PROMPT=0` (a push that
-/// reaches an auth prompt fails instead of hanging the seat); (3) the transport kill rides the
-/// spawn as `GIT_CONFIG_COUNT`/`KEY`/`VALUE` entries ([`nopush_git_config_env`]) — `-c`
-/// precedence, above every file; (4) `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` → the seat-owned
-/// files ([`seat_git_config_files`]), so the operator's `~/.gitconfig` credential helpers and
-/// `~/.git-credentials` are never consulted while identity settings still are. Review of #449
-/// (FN-1): before this, `HOME`, `SSH_AUTH_SOCK` and the helpers rode into the seat, so
-/// `git -c alias.p=push p` pushed over ssh with nothing in the way.
+/// agent socket, askpass helpers, seat-supplied ssh commands, environment-injected git config,
+/// an inherited protocol allow-list; (2) `GH_CONFIG_DIR` → the credential-less directory,
+/// `GIT_TERMINAL_PROMPT=0` (a push that reaches an auth prompt fails instead of hanging the
+/// seat), `GIT_CONFIG_NOSYSTEM=1`, and `GIT_SSH_COMMAND` → [`NOPUSH_SSH_COMMAND`] (git's ssh is
+/// a program that does not exist — the environment outranks every `core.sshCommand`, a `-c`
+/// included); (3) the transport kill rides the spawn as `GIT_CONFIG_COUNT`/`KEY`/`VALUE` entries
+/// ([`nopush_git_config_env`]) — `-c` precedence, above every file: the URL-form push kill,
+/// helpers reset, `protocol.ssh|git|ext.allow = never`; (4) `GIT_CONFIG_GLOBAL`/
+/// `GIT_CONFIG_SYSTEM` → the seat-owned files ([`seat_git_config_files`]): the operator's
+/// identity COPIED (never included), their credential helpers, URL rewrites and
+/// `~/.git-credentials` never consulted.
+///
+/// What this guarantees, exactly (review of #449, r2): a `git` that runs with the seat's
+/// environment intact cannot push anywhere — https/http, `ssh://`, `git@host:`, `user@host:`,
+/// `host:`, `git://`, `file://` and path remotes alike, whether the remote is spelled on the
+/// command line, in the repository's config or through an operator `pushInsteadOf` — and cannot
+/// read a credential helper. A `git` invocation carrying its OWN override of a fenced key
+/// (`-c protocol.ssh.allow=always`, `-c credential.helper=…`; command-line `-c` outranks the
+/// environment entries) or its own `GIT_SSH_COMMAND` is refused as a literal by the command
+/// filter; one hidden in a script file is the stated limit, as is a seat that scrubs its
+/// environment (`env -i`) before calling git — the literal is refused, the script file is not.
 pub fn fence_remote_credentials(cmd: &mut Command) {
     for key in REMOTE_CREDENTIAL_ENV {
         cmd.env_remove(key);
@@ -657,6 +911,8 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
         }
     }
     cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
+    cmd.env("GIT_SSH_COMMAND", NOPUSH_SSH_COMMAND);
     for (name, value) in nopush_git_config_env() {
         cmd.env(name, value);
     }
@@ -670,7 +926,8 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
              push transports are killed and the remote-write command fence still applies"
         ),
     }
-    match seat_git_config_files() {
+    let cwd = cmd.get_current_dir().map(|p| p.to_path_buf());
+    match seat_git_config_files(cwd.as_deref()) {
         Ok((global, system)) => {
             cmd.env("GIT_CONFIG_GLOBAL", global);
             cmd.env("GIT_CONFIG_SYSTEM", system);
@@ -1728,13 +1985,14 @@ mod tests {
             decision.apply(&mut cmd);
             for var in REMOTE_CREDENTIAL_ENV {
                 // Every planted value is gone — REMOVED, or (for `GIT_CONFIG_COUNT`, which the
-                // transport kill re-sets to its own count) replaced by the engine's own value.
+                // transport kill re-sets to its own count, and `GIT_SSH_COMMAND`, re-set to the
+                // program that does not exist) replaced by the engine's own value.
                 assert_ne!(
                     value(&cmd, var),
                     Some(Some("secret".to_string())),
                     "{decision:?}: {var} must not survive as planted"
                 );
-                if *var != "GIT_CONFIG_COUNT" {
+                if !matches!(*var, "GIT_CONFIG_COUNT" | "GIT_SSH_COMMAND") {
                     assert_eq!(
                         value(&cmd, var),
                         Some(None),
@@ -1772,11 +2030,22 @@ mod tests {
         );
     }
 
-    /// Review of #449, FN-1(b): the seat spawn strips the ssh/git credential paths too, kills
-    /// every push transport with `-c` precedence, and re-points git's global/system config at
-    /// seat-owned files — while `hardened()` alone (the deliver tool phase) keeps all of it.
+    /// Serializes the spawn tests that mutate the process environment (`fence_remote_credentials`
+    /// enumerates it; the fixtures plant `GIT_CONFIG_KEY_n` / `GIT_CONFIG_GLOBAL`).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Review of #449, FN-1(b) + r2 R2-1/R2-2: the seat spawn strips the ssh/git credential paths,
+    /// kills every URL-form push transport with `-c` precedence, replaces git's ssh with a program
+    /// that does not exist, refuses the ssh/git/ext transports, and re-points git's global/system
+    /// config at seat-owned files that never include the operator's — while `hardened()` alone
+    /// (the deliver tool phase) keeps all of it.
     #[test]
     fn fence_strips_ssh_and_git_credential_paths_and_kills_every_push_transport() {
+        let _env = lock_env();
         let value = |cmd: &Command, key: &str| -> Option<Option<String>> {
             cmd.get_envs()
                 .find(|(k, _)| k.to_string_lossy() == key)
@@ -1802,7 +2071,6 @@ mod tests {
         std::env::remove_var("GIT_CONFIG_VALUE_97");
         for var in [
             "SSH_AUTH_SOCK",
-            "GIT_SSH_COMMAND",
             "GIT_ASKPASS",
             "GIT_CONFIG_PARAMETERS",
             "GIT_EXEC_PATH",
@@ -1812,6 +2080,12 @@ mod tests {
             assert_eq!(value(&cmd, var), Some(None), "{var} is REMOVED");
         }
         assert_eq!(value(&cmd, "GIT_TERMINAL_PROMPT"), Some(Some("0".into())));
+        assert_eq!(value(&cmd, "GIT_CONFIG_NOSYSTEM"), Some(Some("1".into())));
+        assert_eq!(
+            value(&cmd, "GIT_SSH_COMMAND"),
+            Some(Some(NOPUSH_SSH_COMMAND.into())),
+            "the seat's ssh is a program that does not exist (R2-2)"
+        );
         let count: usize = value(&cmd, "GIT_CONFIG_COUNT")
             .flatten()
             .expect("the transport kill rides GIT_CONFIG_COUNT")
@@ -1819,6 +2093,8 @@ mod tests {
             .unwrap();
         let mut push_kills = 0;
         let mut helper_reset = false;
+        let mut ssh_dead = false;
+        let mut refused_protocols: Vec<String> = Vec::new();
         for i in 0..count {
             let key = value(&cmd, &format!("GIT_CONFIG_KEY_{i}"))
                 .flatten()
@@ -1834,7 +2110,30 @@ mod tests {
                 assert!(val.is_empty(), "an empty helper RESETS the list");
                 helper_reset = true;
             }
+            if key == "core.sshCommand" {
+                assert_eq!(val, NOPUSH_SSH_COMMAND);
+                ssh_dead = true;
+            }
+            if let Some(proto) = key
+                .strip_prefix("protocol.")
+                .and_then(|k| k.strip_suffix(".allow"))
+            {
+                assert_eq!(val, "never", "{key}");
+                refused_protocols.push(proto.to_string());
+            }
         }
+        assert!(
+            ssh_dead,
+            "core.sshCommand rides the environment entries too"
+        );
+        assert_eq!(
+            refused_protocols,
+            NOPUSH_PROTOCOLS
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>(),
+            "ssh, git and ext are refused outright; https/file/local stay for reads"
+        );
         assert_eq!(
             push_kills,
             nopush_url_prefixes().len(),
@@ -1865,6 +2164,15 @@ mod tests {
                 text.contains("pushInsteadOf = ssh://") && text.contains("pushInsteadOf = git@")
             );
             assert!(text.contains("helper =") && text.contains("askPass ="));
+            assert!(
+                !text.contains("[include]") && !text.contains("includeIf"),
+                "the operator's config is COPIED, never included (R2-1): {text}"
+            );
+            assert!(
+                text.contains(&format!("sshCommand = {NOPUSH_SSH_COMMAND}"))
+                    && text.contains("[protocol \"ssh\"]\n\tallow = never"),
+                "{text}"
+            );
         }
         // The deliver tool phase: hardened() alone keeps every one of these.
         let mut deliver = Command::new("true");
@@ -1886,13 +2194,153 @@ mod tests {
         );
     }
 
-    /// Review of #449, FN-1: the transport kill HOLDS — a seat-fenced `git push` fails before any
-    /// transport is contacted on an ssh remote (URL and scp-like), a `file://` remote and an
-    /// absolute-path remote, aliased (`git -c alias.p=push p`) or not; the same command WITHOUT
-    /// the fence pushes to the path remote (the fixture would otherwise have pushed), and
-    /// `git fetch` from it still works under the fence.
+    /// Review of #449, r2 R2-1: the seat-owned global file COPIES the operator's identity and
+    /// presentation keys and nothing else — no URL rewrite, remote, credential helper, include,
+    /// alias, ssh command or template directory crosses, whatever the operator's global config
+    /// holds — and the fence entries come LAST, so the seat's `core.sshCommand` is the program
+    /// that does not exist even when the operator sets one.
+    #[test]
+    fn the_seat_gitconfig_copies_identity_keys_only_and_never_includes_the_operator_file() {
+        let listed = b"user.name\nOperator\0user.email\nop@example.invalid\0user.signingkey\nABC\0\
+core.editor\nvim\0core.sshcommand\nssh -i ~/.ssh/op\0core.askpass\n/usr/bin/askpass\0\
+core.hookspath\n/tmp/hooks\0credential.helper\nosxkeychain\0\
+credential.https://github.com.helper\n!gh auth git-credential\0\
+url.git@github.com:.pushinsteadof\nhttps://github.com/\0url.git@github.com:.insteadof\ngh:\0\
+remote.pushdefault\norigin\0alias.p\npush\0include.path\n~/.gitconfig-work\0\
+includeif.gitdir:~/w/.path\n~/.gitconfig-w\0init.templatedir\n/tmp/tpl\0init.defaultbranch\nmain\0\
+diff.sopsdiffer.textconv\nsops -d\0merge.tool\nvimdiff\0color.ui\nauto\0pull.rebase\ntrue\0\
+http.https://example.invalid.sslverify\nfalse\0protocol.ssh.allow\nalways\0ssh.variant\nssh\0\
+filter.lfs.smudge\ngit-lfs smudge -- %f\0commit.gpgsign\ntrue\0safe.directory\n*\0\
+rebase.autosquash\0";
+        let parsed = parse_git_config_list_z(listed);
+        assert_eq!(parsed.len(), 28, "{parsed:?}");
+        assert!(parsed.contains(&("rebase.autosquash".to_string(), None)));
+        let copied: Vec<(String, Option<String>)> = parsed
+            .into_iter()
+            .filter(|(k, _)| seat_copies_git_config_key(k))
+            .collect();
+        let keys: Vec<&str> = copied.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "user.name",
+                "user.email",
+                "user.signingkey",
+                "core.editor",
+                "init.defaultbranch",
+                "diff.sopsdiffer.textconv",
+                "merge.tool",
+                "color.ui",
+                "pull.rebase",
+                "filter.lfs.smudge",
+                "commit.gpgsign",
+                "safe.directory",
+                "rebase.autosquash",
+            ],
+            "identity, presentation and drivers cross; nothing else does"
+        );
+        let text = seat_global_git_config(&copied);
+        for must in [
+            "[user]\n\tname = Operator\n\temail = op@example.invalid\n\tsigningkey = ABC\n",
+            "[core]\n\teditor = vim\n",
+            "[diff \"sopsdiffer\"]\n\ttextconv = sops -d\n",
+            "[filter \"lfs\"]\n\tsmudge = git-lfs smudge -- %f\n",
+            "[rebase]\n\tautosquash\n",
+            "[init]\n\tdefaultbranch = main\n",
+        ] {
+            assert!(text.contains(must), "missing {must:?} in:\n{text}");
+        }
+        for never in [
+            "ssh -i",
+            "askpass = /usr",
+            "hookspath",
+            "osxkeychain",
+            "gh auth git-credential",
+            "github.com",
+            "pushinsteadof",
+            "insteadof = gh:",
+            "pushdefault",
+            "[alias]",
+            "[include",
+            "templatedir",
+            "sslverify",
+            "allow = always",
+            "[ssh]",
+        ] {
+            assert!(
+                !text.contains(never),
+                "{never:?} must not cross into:\n{text}"
+            );
+        }
+        // The fence entries are LAST and single-valued keys resolve to the seat's own values.
+        let fence_start = text.find(&format!("[url \"{NOPUSH_SCHEME}\"]")).unwrap();
+        let fence = &text[fence_start..];
+        assert!(text[..fence_start].contains("[user]"));
+        assert!(fence.contains(&format!(
+            "[core]\n\taskPass =\n\tsshCommand = {NOPUSH_SSH_COMMAND}\n"
+        )));
+        assert!(fence.contains("[credential]\n\thelper =\n"));
+        for proto in NOPUSH_PROTOCOLS {
+            assert!(fence.contains(&format!("[protocol \"{proto}\"]\n\tallow = never\n")));
+        }
+        assert!(
+            fence.contains("pushInsteadOf = \"\\\\\\\\\"\n"),
+            "UNC prefix quoted: {fence}"
+        );
+        // Values git could not read back literally are quoted and escaped; odd keys are dropped.
+        assert_eq!(git_config_value("plain"), "plain");
+        assert_eq!(git_config_value("a b"), "a b");
+        assert_eq!(git_config_value(" lead"), "\" lead\"");
+        assert_eq!(git_config_value("x;y"), "\"x;y\"");
+        assert_eq!(git_config_value("q\"b\\n\n"), "\"q\\\"b\\\\n\\n\"");
+        assert_eq!(
+            git_config_header_and_name("diff.a\"b.command"),
+            Some(("[diff \"a\\\"b\"]".to_string(), "command".to_string()))
+        );
+        assert_eq!(git_config_header_and_name("nodot"), None);
+        assert_eq!(git_config_header_and_name("user.1name"), None);
+        assert_eq!(git_config_header_and_name("us er.name"), None);
+        // Every key the never-list names is refused even when its section is admitted.
+        for key in [
+            "core.sshCommand",
+            "core.askPass",
+            "core.hooksPath",
+            "core.fsmonitor",
+            "init.templateDir",
+            "credential.helper",
+            "url.x.pushInsteadOf",
+            "alias.p",
+            "include.path",
+            "includeIf.gitdir:x.path",
+            "remote.origin.pushurl",
+            "branch.main.remote",
+            "http.proxy",
+            "protocol.allow",
+        ] {
+            assert!(!seat_copies_git_config_key(key), "{key}");
+        }
+        for key in [
+            "user.name",
+            "core.editor",
+            "diff.x.command",
+            "gpg.format",
+            "safe.directory",
+        ] {
+            assert!(seat_copies_git_config_key(key), "{key}");
+        }
+    }
+
+    /// Review of #449, FN-1 + r2 R2-1/R2-2: the transport kill HOLDS — a seat-fenced `git push`
+    /// fails before any transport is contacted on an ssh remote (URL, `git@host:`, `user@host:`
+    /// and bare `host:` scp-like), an https remote the OPERATOR's global config rewrites to ssh
+    /// (`url."git@localhost:".pushInsteadOf = https://localhost/`, the reviewer's exp2), a
+    /// `file://` remote and an absolute-path remote, aliased (`git -c alias.p=push p`) or not,
+    /// and a stub `ssh` on `PATH` proves ssh is never reached; the same commands WITHOUT the
+    /// fence reach the stub (the operator rewrite is live) and push to the path remote, and
+    /// `git fetch` from the path remote still works under the fence.
     #[test]
     fn a_fenced_seat_cannot_push_over_any_transport_while_the_deliver_phase_can() {
+        let _env = lock_env();
         let base = std::env::temp_dir().join(format!(
             "wicked-nopush-{}-{:?}",
             std::process::id(),
@@ -1903,12 +2351,56 @@ mod tests {
         let clone = base.join("clone");
         std::fs::create_dir_all(&bare).unwrap();
         std::fs::create_dir_all(&clone).unwrap();
+        // The operator's global config: an identity plus the exp2 rewrite that sent a fenced https
+        // push to ssh through the seat file's `[include]` (r2, R2-1). Planted through
+        // `GIT_CONFIG_GLOBAL` for the fence's identity copy AND the unfenced control.
+        let op_global = base.join("operator-gitconfig");
+        std::fs::write(
+            &op_global,
+            "[user]\n\tname = Operator\n\temail = op@example.invalid\n\
+             [url \"git@localhost:\"]\n\tpushInsteadOf = https://localhost/\n\
+             [credential]\n\thelper = store\n",
+        )
+        .unwrap();
+        let prior_global = std::env::var_os("GIT_CONFIG_GLOBAL");
+        std::env::set_var("GIT_CONFIG_GLOBAL", &op_global);
+        // A stub `ssh` first on PATH: it records that git reached ssh, then fails the way a
+        // refused connection would. Unix only — a `PATH` stub needs a shebang.
+        let stub_dir = base.join("stub");
+        let marker = base.join("ssh-ran");
+        std::fs::create_dir_all(&stub_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let stub = stub_dir.join("ssh");
+            std::fs::write(
+                &stub,
+                format!(
+                    "#!/bin/sh\ntouch '{}'\nexit 255\n",
+                    marker.to_string_lossy()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path_with_stub = format!(
+            "{}{}{}",
+            stub_dir.to_string_lossy(),
+            if cfg!(windows) { ";" } else { ":" },
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let ssh_reached = || marker.is_file();
+        let reset_ssh = || {
+            let _ = std::fs::remove_file(&marker);
+        };
         // spawn-audit: test-only fixture spawns; the fence under test is applied to the LAST one.
         let git = |cwd: &std::path::Path, args: &[&str], fenced: bool| -> (bool, String) {
             let mut c = Command::new("git");
             c.hardened();
             c.args(args).current_dir(cwd);
             c.env("GIT_CONFIG_NOSYSTEM", "1");
+            c.env("PATH", &path_with_stub);
+            c.env("GIT_CONFIG_GLOBAL", &op_global);
             if fenced {
                 fence_remote_credentials(&mut c);
             }
@@ -1925,8 +2417,13 @@ mod tests {
                 ),
             )
         };
+        let restore_global = |prior: &Option<std::ffi::OsString>| match prior {
+            Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
+            None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        };
         if !git(&bare, &["init", "-q", "--bare"], false).0 {
             eprintln!("no usable git on this host — skipping the transport-kill fixture");
+            restore_global(&prior_global);
             let _ = std::fs::remove_dir_all(&base);
             return;
         }
@@ -1945,7 +2442,14 @@ mod tests {
         let bare_url = bare.to_string_lossy().replace('\\', "/");
         let remotes = [
             ("sshurl", "ssh://example.invalid/o/r.git".to_string()),
+            ("sshuserurl", "ssh://nobody@localhost/o/r.git".to_string()),
             ("scp", "git@example.invalid:o/r.git".to_string()),
+            // (r2, R2-2) scp-like with another user, and with no user at all — ssh remotes no
+            // URL prefix enumerates; the reviewer's exp1 reached ssh on both.
+            ("scpuser", "nobody@localhost:o/r.git".to_string()),
+            ("scphost", "localhost:o/r.git".to_string()),
+            // (r2, R2-1) https, which the OPERATOR's global config rewrites to `git@localhost:`.
+            ("https", "https://localhost/o/r.git".to_string()),
             ("fileurl", format!("file://{bare_url}")),
             ("path", bare_url.clone()),
         ];
@@ -1955,14 +2459,18 @@ mod tests {
                 "{name}"
             );
         }
-        // Under the fence: every push fails on the kill, before any transport is contacted.
+        // Under the fence: every push fails on the kill, before any transport is contacted —
+        // the URL-form ones on the missing `wicked-nopush` helper, the scp-like ones on the
+        // refused ssh transport — and ssh is never reached.
         for (name, _) in &remotes {
+            reset_ssh();
             let (ok, out) = git(&clone, &["push", name, "HEAD:refs/heads/main"], true);
             assert!(!ok, "a fenced push to remote {name} must fail: {out}");
             assert!(
-                out.contains("wicked-nopush"),
-                "the failure is the transport kill, not a network error (remote {name}): {out}"
+                out.contains("wicked-nopush") || out.contains("transport 'ssh' not allowed"),
+                "the failure is the fence, not a network error (remote {name}): {out}"
             );
+            assert!(!ssh_reached(), "ssh was reached for remote {name}: {out}");
         }
         // The alias spelling the review reproduced: still killed by layer 3.
         let (ok, out) = git(
@@ -1971,10 +2479,34 @@ mod tests {
             true,
         );
         assert!(!ok && out.contains("wicked-nopush"), "{out}");
+        // The seat's global config carries the operator's identity but not the rewrite.
+        let (ok, out) = git(&clone, &["config", "--global", "--get", "user.name"], true);
+        assert!(ok && out.trim() == "Operator", "identity copied: {out}");
+        let (ok, out) = git(
+            &clone,
+            &["config", "--global", "--get-regexp", "^url\\..*insteadof"],
+            true,
+        );
+        assert!(
+            !out.contains("localhost"),
+            "the operator's pushInsteadOf never crosses (ok={ok}): {out}"
+        );
         // Fetch keeps working under the fence (pushInsteadOf never touches fetch).
         let (ok, out) = git(&clone, &["fetch", "path"], true);
         assert!(ok, "a fenced fetch from the path remote works: {out}");
-        // Control — the same push WITHOUT the fence lands (the deliver phase's shape).
+        // Controls WITHOUT the fence (the deliver phase's shape): the operator's rewrite is live
+        // and the scp-like remote is an ssh remote — both reach the stub ssh …
+        #[cfg(unix)]
+        for name in ["https", "scpuser", "scphost"] {
+            reset_ssh();
+            let (_, out) = git(&clone, &["push", name, "HEAD:refs/heads/main"], false);
+            assert!(
+                ssh_reached(),
+                "the unfenced push to {name} must reach ssh (the fixture's control): {out}"
+            );
+        }
+        reset_ssh();
+        // … and the path push lands.
         let (ok, out) = git(&clone, &["push", "path", "HEAD:refs/heads/main"], false);
         assert!(
             ok,
@@ -1982,6 +2514,7 @@ mod tests {
         );
         let (ok, refs) = git(&bare, &["show-ref", "refs/heads/main"], false);
         assert!(ok && refs.contains("refs/heads/main"), "{refs}");
+        restore_global(&prior_global);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

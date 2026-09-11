@@ -35,17 +35,29 @@
 //! 3. **Credential and transport stripping**
 //!    (`wicked_apps_core::spawn::fence_remote_credentials`) — every seat spawn runs without the
 //!    `GH_*`/`GITHUB_*` tokens, without `SSH_AUTH_SOCK` / `GIT_SSH*` / `GIT_ASKPASS` /
-//!    `GIT_CONFIG_*`, with `gh` aimed at a credential-less config directory, with git's global
-//!    and system config re-pointed at seat-owned files that RESET credential helpers, and with a
-//!    transport-agnostic push kill (`url.wicked-nopush://.pushInsteadOf = https:// | ssh:// |
-//!    git@ | file:// | …`) so a push over ANY transport — aliased or not, keys on disk or not —
-//!    fails "unable to find remote helper" while fetch and pull keep working. The deliver tool
-//!    phase applies no seat config and keeps the daemon's login.
+//!    `GIT_CONFIG_*` / `GIT_ALLOW_PROTOCOL`, with `gh` aimed at a credential-less config
+//!    directory, with git's global and system config re-pointed at seat-owned files that COPY
+//!    the operator's identity keys (never `[include]` their file — review r2, R2-1) and RESET
+//!    credential helpers, with git's ssh replaced by a program that does not exist
+//!    (`GIT_SSH_COMMAND` and `core.sshCommand`), with the ssh/git/ext transports refused
+//!    (`protocol.<name>.allow = never` — so `user@host:` and bare `host:` remotes die too, R2-2)
+//!    and with a push kill on every URL-form transport (`url.wicked-nopush://.pushInsteadOf =
+//!    https:// | ssh:// | git@ | file:// | …`). Fetch over https, `file://` and local paths keeps
+//!    working; fetch over ssh does not. The deliver tool phase applies no seat config and keeps
+//!    the daemon's login.
 //!
 //! Stated limit, as everywhere in this codebase: the shell is Turing-complete, so a determined
 //! escape (`base64 | sh`, a script file, a variable holding the verb, a renamed binary) can evade
-//! a scan of the literal command. Layer 3 is what holds then — and since wave 6's review it holds
-//! on every transport git knows, not only on gh-authenticated https.
+//! a scan of the literal command. Layer 3 is what holds then, and what it holds is exactly this:
+//! a `git` that runs with the seat's environment intact cannot push anywhere — https, `ssh://`,
+//! `git@host:`, `user@host:`, `host:`, `git://`, `file://`, a path — whether the remote is
+//! spelled on its command line, in the repository's config or through an operator
+//! `pushInsteadOf`, and cannot read a credential helper. Not covered by layer 3: a `git`
+//! carrying its OWN override of a fenced key (`-c protocol.ssh.allow=always -c
+//! core.sshCommand=ssh` — command-line `-c` outranks the environment entries) or its own
+//! `GIT_SSH_COMMAND`, and a seat that scrubs its environment (`env -i`) first. This module
+//! refuses every one of those as a literal; hidden in a script file they are the stated limit —
+//! disclosed here rather than promised away.
 
 /// The claude CLI's Bash deny rules for remote-writing `git`/`gh` invocations — PREFIX rules
 /// (`Bash(<prefix>:*)`), the one Bash rule form the CLI matches (wicked-crew#524 / F-3R2-004:
@@ -61,6 +73,14 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(git svn dcommit:*)",
     "Bash(git p4 submit:*)",
     "Bash(git lfs push:*)",
+    "Bash(git subtree push:*)",
+    "Bash(git credential:*)",
+    "Bash(git credential-cache:*)",
+    "Bash(git credential-store:*)",
+    "Bash(git credential-osxkeychain:*)",
+    "Bash(git credential-manager:*)",
+    "Bash(git credential-libsecret:*)",
+    "Bash(git credential-wincred:*)",
     "Bash(git config alias.:*)",
     "Bash(git config --global:*)",
     "Bash(git config --system:*)",
@@ -75,6 +95,7 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(gh pr ready:*)",
     "Bash(gh pr lock:*)",
     "Bash(gh pr unlock:*)",
+    "Bash(gh pr update-branch:*)",
     "Bash(gh api:*)",
     "Bash(gh alias:*)",
     "Bash(gh release:*)",
@@ -84,6 +105,12 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(gh issue close:*)",
     "Bash(gh issue reopen:*)",
     "Bash(gh issue delete:*)",
+    "Bash(gh issue transfer:*)",
+    "Bash(gh issue pin:*)",
+    "Bash(gh issue unpin:*)",
+    "Bash(gh issue lock:*)",
+    "Bash(gh issue unlock:*)",
+    "Bash(gh issue develop:*)",
     "Bash(gh repo create:*)",
     "Bash(gh repo delete:*)",
     "Bash(gh repo edit:*)",
@@ -91,6 +118,9 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(gh repo sync:*)",
     "Bash(gh repo archive:*)",
     "Bash(gh repo rename:*)",
+    "Bash(gh repo unarchive:*)",
+    "Bash(gh repo deploy-key:*)",
+    "Bash(gh repo autolink:*)",
     "Bash(gh auth:*)",
     "Bash(gh workflow run:*)",
     "Bash(gh workflow enable:*)",
@@ -104,6 +134,30 @@ pub(crate) const REMOTE_WRITE_BASH_RULES: &[&str] = &[
     "Bash(gh gist create:*)",
     "Bash(gh gist edit:*)",
     "Bash(gh gist delete:*)",
+    "Bash(gh cache delete:*)",
+    "Bash(gh project create:*)",
+    "Bash(gh project edit:*)",
+    "Bash(gh project delete:*)",
+    "Bash(gh project close:*)",
+    "Bash(gh project item-add:*)",
+    "Bash(gh project item-edit:*)",
+    "Bash(gh project item-delete:*)",
+    // (review of #449, r2 R2-4) account keys, codespaces and extensions.
+    "Bash(gh ssh-key add:*)",
+    "Bash(gh ssh-key delete:*)",
+    "Bash(gh gpg-key add:*)",
+    "Bash(gh gpg-key delete:*)",
+    "Bash(gh codespace create:*)",
+    "Bash(gh codespace delete:*)",
+    "Bash(gh codespace edit:*)",
+    "Bash(gh codespace rebuild:*)",
+    "Bash(gh codespace stop:*)",
+    "Bash(gh extension install:*)",
+    "Bash(gh extension upgrade:*)",
+    "Bash(gh extension remove:*)",
+    "Bash(gh ext install:*)",
+    "Bash(gh ext upgrade:*)",
+    "Bash(gh ext remove:*)",
 ];
 
 /// The remedy every refusal carries to the seat and onto the wire (`workerToolCallDenied.remedy`).
@@ -115,8 +169,8 @@ pub(crate) const REMEDY: &str = "delivery is performed by the run's deliver phas
 /// One remote-writing invocation the filter found in a command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteWriteHit {
-    /// The program judged (`git`, `gh`, or `env` for a fenced environment variable set in the
-    /// seat's shell).
+    /// The program judged (`git`, `gh`, `env` for a fenced environment variable set in the
+    /// seat's shell, or `pwsh` for an encoded PowerShell payload the filter cannot decode).
     pub program: &'static str,
     /// The verb path that writes remotely (`push`, `pr create`, `api (mutation)`, `alias`,
     /// `-c alias.p (config override)`, `unknown subcommand p (possible alias)`, …).
@@ -201,9 +255,19 @@ const GH_REMOTE_WRITE_VERBS: &[(&str, &[&str])] = &[
             "item-delete",
         ],
     ),
+    // (review of #449, r2 R2-4) account keys, codespaces, extensions.
+    ("ssh-key", &["add", "delete"]),
+    ("gpg-key", &["add", "delete"]),
+    (
+        "codespace",
+        &["create", "delete", "edit", "rebuild", "stop"],
+    ),
+    ("extension", &["install", "upgrade", "remove"]),
+    ("ext", &["install", "upgrade", "remove"]),
 ];
 
-/// `gh` subcommands denied WHOLE, whatever follows: `auth` mints, prints or moves credentials;
+/// `gh` subcommands denied WHOLE, whatever follows: `auth` mints, prints or moves credentials
+/// (`gh auth token`, `gh auth status --show-token` are plaintext reads — review r2, R2-3);
 /// `alias` defines a verb every other rule is blind to (review of #449, FN-1).
 const GH_DENIED_WHOLE: &[&str] = &["auth", "alias"];
 
@@ -245,9 +309,6 @@ const GIT_KNOWN_SUBCOMMANDS: &[&str] = &[
     "commit-tree",
     "config",
     "count-objects",
-    "credential",
-    "credential-cache",
-    "credential-store",
     "describe",
     "diagnose",
     "diff",
@@ -370,13 +431,16 @@ const GIT_REMOTE_WRITE_PAIRS: &[(&str, &str)] = &[
     ("p4", "submit"),
     ("lfs", "push"),
     ("lfs", "migrate"),
+    ("subtree", "push"),
 ];
 
 /// git config keys (case-folded prefixes) a seat may not override or write: an alias defeats the
 /// verb filter; `url.*` / `remote.*` re-aim where a push goes (and would undo layer 3's
 /// `pushInsteadOf` kill); `credential.*`, `core.sshCommand`, `core.askPass`, `core.gitProxy`,
 /// `http.*`, `ssh.*`, `protocol.*` reach credentials or transports; `include.*` pulls in a file the
-/// filter cannot read; `core.hooksPath` runs scripts the filter never sees.
+/// filter cannot read; `core.hooksPath` and `init.templateDir` run scripts the filter never sees.
+/// The seat gitconfig copy (`wicked_apps_core::spawn::seat_copies_git_config_key`) refuses every
+/// prefix here too — pinned in lockstep by a test below.
 const FENCED_GIT_CONFIG_KEY_PREFIXES: &[&str] = &[
     "alias.",
     "url.",
@@ -394,6 +458,7 @@ const FENCED_GIT_CONFIG_KEY_PREFIXES: &[&str] = &[
     "includeif.",
     "uploadpack.",
     "receive.",
+    "init.templatedir",
 ];
 
 /// Environment variables (name prefixes) a seat may not set for a git invocation — they inject
@@ -409,6 +474,8 @@ const FENCED_GIT_ENV_PREFIXES: &[&str] = &[
     "GIT_EXEC_PATH",
     "GIT_PROXY_COMMAND",
     "GIT_TEMPLATE_DIR",
+    "GIT_ALLOW_PROTOCOL",
+    "GIT_PROTOCOL_FROM_USER",
     "GH_TOKEN",
     "GITHUB_TOKEN",
     "GH_ENTERPRISE_TOKEN",
@@ -438,7 +505,6 @@ const WRAPPERS: &[&str] = &[
     "timeout",
     "doas",
     "caffeinate",
-    "script",
 ];
 
 /// POSIX-family shells whose `-c` cluster names a script argument.
@@ -631,15 +697,14 @@ fn program_index(tokens: &[String]) -> Option<(usize, Vec<String>)> {
                     i += 1; // the duration
                 }
             } else {
-                // `nice -n N` / `stdbuf -oL` / `env -i` / `sudo -u user`: skip the wrapper's own
-                // dashed options and their values.
+                // `nice -n N` / `stdbuf -o L` / `env -i` / `sudo -u user`: skip the wrapper's
+                // own dashed options, with a value only for the options of THAT wrapper that
+                // take one (`env -i` takes none — `env -i git push` is `git push`; review r2).
+                let value_flags = wrapper_value_flags(&stem);
                 while i < tokens.len() && tokens[i].starts_with('-') {
                     let opt = tokens[i].as_str();
                     i += 1;
-                    if matches!(opt, "-u" | "-g" | "-n" | "-o" | "-e" | "-i" | "-C" | "-P")
-                        && i < tokens.len()
-                        && !tokens[i].starts_with('-')
-                    {
+                    if value_flags.contains(&opt) && i < tokens.len() {
                         i += 1;
                     }
                 }
@@ -650,31 +715,103 @@ fn program_index(tokens: &[String]) -> Option<(usize, Vec<String>)> {
     }
 }
 
-/// The SCRIPT a POSIX-family shell is asked to run: the argument after a short-flag cluster
-/// containing `c` (`-c`, `-lc`, `-ic`, `-ec`, `-xc`); `-o <opt>` pairs are skipped; a bare `-e`
-/// (errexit) is NOT a script flag (review of #449, FN-2). `None` when the shell is invoked on a
-/// file or interactively.
+/// A wrapper's options that take a SEPARATE value (skipped with it); every other dashed option
+/// is skipped alone.
+fn wrapper_value_flags(stem: &str) -> &'static [&'static str] {
+    match stem {
+        "env" => &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+        "sudo" | "doas" => &["-u", "-g", "-C", "-p", "-h", "-U", "-r", "-t", "-T", "-D"],
+        "nice" => &["-n", "--adjustment"],
+        "stdbuf" => &["-i", "-o", "-e", "--input", "--output", "--error"],
+        "xargs" => &["-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s"],
+        "time" => &["-f", "-o", "--format", "--output"],
+        "exec" => &["-a"],
+        "caffeinate" => &["-t", "-w"],
+        _ => &[],
+    }
+}
+
+/// The SCRIPT a POSIX-family shell is asked to run: the first non-option argument after a
+/// short-flag cluster containing `c` (`-c`, `-lc`, `-ic`, `-ec`, `-euc`, `-xc`, and `bash -c -e
+/// '…'` too); a `-o <opt>` pair — or a cluster ENDING in `o` (`-euo pipefail`) — is skipped with
+/// its value (review of #449, FN-2 + r2 R2-4); a bare `-e` (errexit) is NOT a script flag; `--`
+/// ends the options. `None` when the shell is invoked on a FILE or interactively — the stated
+/// limit.
 fn sh_script(args: &[String]) -> Option<&str> {
+    let mut saw_c = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "-o" {
+        if a == "--" {
+            return if saw_c {
+                args.get(i + 1).map(String::as_str)
+            } else {
+                None
+            };
+        }
+        if a == "-o" || a == "+o" {
             i += 2;
             continue;
         }
-        if a == "--" {
-            return None;
+        if a.starts_with("--") {
+            i += 1; // `--posix`, `--norc`, `--login`
+            continue;
         }
-        let cluster = a.starts_with('-') && !a.starts_with("--") && a.len() <= 6;
-        if cluster && a[1..].contains('c') {
-            return args.get(i + 1).map(String::as_str);
+        let cluster = (a.starts_with('-') || a.starts_with('+')) && a.len() > 1 && a.len() <= 8;
+        if cluster {
+            if a.starts_with('-') && a[1..].contains('c') {
+                saw_c = true;
+            }
+            i += if a.ends_with('o') { 2 } else { 1 };
+            continue;
         }
-        if !a.starts_with('-') {
-            return None; // a script FILE — the stated limit
-        }
-        i += 1;
+        return if saw_c { Some(a) } else { None }; // else a script FILE — the stated limit
     }
     None
+}
+
+/// PowerShell's script: `-Command`/`-c` (any unambiguous prefix) takes the REST of the line;
+/// `-EncodedCommand`/`-e`/`-ec`/`-enc` takes ONE base64 token of UTF-16LE text, decoded here
+/// (review of #449, r2 R2-4). `Err` when an encoded payload does not decode — a seat gets no
+/// benefit of the doubt for a payload the filter cannot read.
+fn pwsh_script(args: &[String]) -> Result<Option<String>, ()> {
+    for (i, arg) in args.iter().enumerate() {
+        let lower = arg.to_ascii_lowercase();
+        let Some(flag) = lower.strip_prefix('-').or_else(|| lower.strip_prefix('/')) else {
+            continue;
+        };
+        if flag.is_empty() {
+            continue;
+        }
+        if flag == "ec" || "encodedcommand".starts_with(flag) {
+            return match args.get(i + 1).and_then(|t| decode_utf16le_base64(t)) {
+                Some(script) => Ok(Some(script)),
+                None => Err(()),
+            };
+        }
+        if "command".starts_with(flag) {
+            let rest = &args[i + 1..];
+            return Ok((!rest.is_empty()).then(|| rest.join(" ")));
+        }
+    }
+    Ok(None)
+}
+
+/// PowerShell's `-EncodedCommand` payload: base64 (padded or not) of UTF-16LE text.
+fn decode_utf16le_base64(token: &str) -> Option<String> {
+    use base64::Engine;
+    let token = token.trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(token))
+        .ok()?;
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    let units: Vec<u16> = (0..bytes.len() / 2)
+        .map(|i| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]))
+        .collect();
+    String::from_utf16(&units).ok()
 }
 
 /// The script `pwsh -Command …` / `cmd /c …` runs: the REST of the arguments, joined — both
@@ -729,17 +866,35 @@ fn judge_tokens(tokens: &[String]) -> Option<(&'static str, String)> {
             let script = args.join(" ");
             remote_write_command(&script).map(|h| (h.program, h.verb))
         }
-        p if SH_INTERPRETERS.contains(&p) => sh_script(args)
-            .and_then(remote_write_command)
-            .map(|h| (h.program, h.verb)),
-        p if PWSH_INTERPRETERS.contains(&p) => {
-            rest_script(args, &["-Command", "-c", "-EncodedCommand"])
-                .and_then(|s| remote_write_command(&s))
+        p if SH_INTERPRETERS.contains(&p) => {
+            // `busybox sh -c …`: the applet name comes first (review r2, R2-4).
+            let args = match args.first().map(|a| program_stem(a)) {
+                Some(applet) if p == "busybox" && SH_INTERPRETERS.contains(&applet.as_str()) => {
+                    &args[1..]
+                }
+                _ => args,
+            };
+            sh_script(args)
+                .and_then(remote_write_command)
                 .map(|h| (h.program, h.verb))
         }
+        p if PWSH_INTERPRETERS.contains(&p) => match pwsh_script(args) {
+            Ok(script) => script
+                .and_then(|s| remote_write_command(&s))
+                .map(|h| (h.program, h.verb)),
+            Err(()) => Some(("pwsh", "-EncodedCommand (undecodable payload)".to_string())),
+        },
         p if CMD_INTERPRETERS.contains(&p) => rest_script(args, &["/c", "/k"])
             .and_then(|s| remote_write_command(&s))
             .map(|h| (h.program, h.verb)),
+        "script" => {
+            // util-linux/BSD `script [-q] -c <command> [file]` runs a command under a pty.
+            args.iter()
+                .position(|a| a == "-c" || a == "--command")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| remote_write_command(s))
+                .map(|h| (h.program, h.verb))
+        }
         _ => None,
     }
 }
@@ -797,6 +952,11 @@ fn judge_git_subcommand(sub: &str, rest: &[String]) -> Option<String> {
     if sub.starts_with("remote-") {
         // `git remote-https origin <url>` speaks the transport protocol directly.
         return Some(format!("{sub} (transport helper)"));
+    }
+    if sub == "credential" || sub.starts_with("credential-") {
+        // `git credential fill`, `git credential-store get`, `git credential-osxkeychain get`:
+        // plaintext credential reads (review of #449, r2 R2-3).
+        return Some(format!("{sub} (credential read)"));
     }
     if !GIT_KNOWN_SUBCOMMANDS.contains(&sub) {
         return Some(format!("unknown subcommand {sub} (possible alias)"));
@@ -934,6 +1094,27 @@ pub(crate) const REVIEW_BYPASS_STRINGS: &[&str] = &[
     "git send-email --to x@example.invalid HEAD~1",
     "git svn dcommit",
     "git lfs push origin main",
+    // (r2) R2-3 credential reads, R2-4 parser gaps, `env -i`.
+    "bash -euo pipefail -c 'git push'",
+    "bash -c -e 'git push'",
+    "busybox sh -c 'git push'",
+    "pwsh -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
+    "powershell -nop -e ZwBoACAAcAByACAAYwByAGUAYQB0AGUAIAAtAC0AZgBpAGwAbAA=",
+    "git subtree push -P sub origin main",
+    "git -c init.templateDir=/tmp/t init",
+    "gh ssh-key add k.pub",
+    "gh gpg-key add k.asc",
+    "gh codespace create",
+    "gh extension install o/gh-x",
+    "git credential fill",
+    "git credential-store --file ~/.git-credentials get",
+    "git credential-cache get",
+    "git credential-osxkeychain get",
+    "gh auth token",
+    "gh auth status --show-token",
+    "env -i git push",
+    "script -q -c 'git push' /dev/null",
+    "GIT_ALLOW_PROTOCOL=ssh git push",
 ];
 
 #[cfg(test)]
@@ -1264,6 +1445,171 @@ mod tests {
             "Bash(git --config-env:*)",
         ] {
             assert!(REMOTE_WRITE_BASH_RULES.contains(&must), "{must}");
+        }
+    }
+
+    /// Review of #449, r2 R2-3: plaintext credential reads are refused on every spelling — the
+    /// builtin, the helpers, the dashed stem, and `gh auth`'s token prints.
+    #[test]
+    fn credential_reads_are_refused() {
+        for (cmd, verb) in [
+            ("git credential fill", "credential (credential read)"),
+            (
+                "git credential-store --file ~/.git-credentials get",
+                "credential-store (credential read)",
+            ),
+            (
+                "git credential-cache get",
+                "credential-cache (credential read)",
+            ),
+            (
+                "git credential-osxkeychain get",
+                "credential-osxkeychain (credential read)",
+            ),
+            (
+                "git-credential-store get",
+                "credential-store (credential read)",
+            ),
+            (
+                "cd /tmp && git credential approve < c",
+                "credential (credential read)",
+            ),
+        ] {
+            assert_eq!(hit(cmd), Some(("git", verb.into())), "{cmd}");
+        }
+        assert_eq!(hit("gh auth token"), Some(("gh", "auth".into())));
+        assert_eq!(
+            hit("gh auth status --show-token"),
+            Some(("gh", "auth".into()))
+        );
+        assert!(
+            !GIT_KNOWN_SUBCOMMANDS
+                .iter()
+                .any(|s| s.starts_with("credential")),
+            "credential verbs are refused by name, never allowed as builtins"
+        );
+        for rule in [
+            "Bash(git credential:*)",
+            "Bash(git credential-store:*)",
+            "Bash(git credential-cache:*)",
+        ] {
+            assert!(REMOTE_WRITE_BASH_RULES.contains(&rule), "{rule}");
+        }
+    }
+
+    /// Review of #449, r2 R2-4: the fresh corpus, each a literal spelling — and the reads next
+    /// to each still pass.
+    #[test]
+    fn r2_parser_gaps_are_closed() {
+        let push = Some(("git", "push".to_string()));
+        let pr_create = Some(("gh", "pr create".to_string()));
+        assert_eq!(hit("bash -euo pipefail -c 'git push'"), push);
+        assert_eq!(hit("bash -c -e 'git push'"), push);
+        assert_eq!(hit("sh -c -- 'gh pr create'"), pr_create);
+        assert_eq!(hit("bash -euo pipefail -c 'git status'"), None);
+        assert_eq!(hit("bash -euo pipefail ./run.sh"), None, "a script file");
+        assert_eq!(hit("busybox sh -c 'git push'"), push);
+        assert_eq!(hit("busybox ash -lc 'gh pr create --fill'"), pr_create);
+        assert_eq!(hit("busybox ls -la"), None);
+        // `-EncodedCommand`: base64 of UTF-16LE "git push" / "gh pr create --fill" / "git status".
+        assert_eq!(hit("pwsh -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA=="), push);
+        assert_eq!(
+            hit("powershell -nop -e ZwBoACAAcAByACAAYwByAGUAYQB0AGUAIAAtAC0AZgBpAGwAbAA="),
+            pr_create
+        );
+        assert_eq!(
+            hit("pwsh -EncodedCommand ZwBpAHQAIABzAHQAYQB0AHUAcwA="),
+            None
+        );
+        assert_eq!(
+            hit("pwsh -ec not-base64!"),
+            Some(("pwsh", "-EncodedCommand (undecodable payload)".into())),
+            "an undecodable payload gets no benefit of the doubt"
+        );
+        assert_eq!(hit("pwsh -ep Bypass -c git push"), push);
+        assert_eq!(hit("pwsh -NoProfile -Command git status"), None);
+        assert_eq!(
+            hit("git subtree push -P sub origin main"),
+            Some(("git", "subtree push".into()))
+        );
+        assert_eq!(hit("git subtree pull -P sub origin main"), None);
+        assert_eq!(
+            hit("git -c init.templateDir=/tmp/t init"),
+            Some(("git", "-c init.templateDir (config override)".into()))
+        );
+        assert!(hit("git config --global init.templateDir /tmp/t").is_some());
+        assert_eq!(hit("git -c init.defaultBranch=main init"), None);
+        for (cmd, verb) in [
+            ("gh ssh-key add k.pub", "ssh-key add"),
+            ("gh gpg-key add k.asc", "gpg-key add"),
+            ("gh codespace create -R o/r", "codespace create"),
+            ("gh extension install o/gh-x", "extension install"),
+            ("gh ext install o/gh-x", "ext install"),
+        ] {
+            assert_eq!(hit(cmd), Some(("gh", verb.into())), "{cmd}");
+        }
+        assert_eq!(hit("gh ssh-key list"), None);
+        assert_eq!(hit("gh extension list"), None);
+        assert_eq!(hit("gh codespace list"), None);
+        // Wrapper options: only the wrapper's own value-taking options consume a token.
+        assert_eq!(hit("env -i git push"), push);
+        assert_eq!(hit("env -u FOO git push"), push);
+        assert_eq!(hit("env -i PATH=/usr/bin git push"), push);
+        assert_eq!(hit("stdbuf -o L git push"), push);
+        assert_eq!(hit("nice -n 5 git push"), push);
+        assert_eq!(hit("script -q -c 'git push' /dev/null"), push);
+        assert_eq!(hit("script -q typescript"), None);
+        assert!(hit("GIT_ALLOW_PROTOCOL=ssh git push").is_some());
+        assert!(hit("export GIT_ALLOW_PROTOCOL=ssh; git fetch").is_some());
+    }
+
+    /// Every `gh <command> <verb>` the filter refuses has a claude Bash rule for the same
+    /// spelling (or for the whole command), and so does every command denied whole — one
+    /// generator, three carriers, no drift.
+    #[test]
+    fn every_gh_remote_write_verb_has_a_bash_rule() {
+        for (command, verbs) in GH_REMOTE_WRITE_VERBS {
+            for verb in verbs.iter() {
+                let exact = format!("Bash(gh {command} {verb}:*)");
+                let whole = format!("Bash(gh {command}:*)");
+                assert!(
+                    REMOTE_WRITE_BASH_RULES.contains(&exact.as_str())
+                        || REMOTE_WRITE_BASH_RULES.contains(&whole.as_str()),
+                    "{exact} (or {whole}) is missing"
+                );
+            }
+        }
+        for whole in GH_DENIED_WHOLE {
+            let rule = format!("Bash(gh {whole}:*)");
+            assert!(REMOTE_WRITE_BASH_RULES.contains(&rule.as_str()), "{rule}");
+        }
+        for (a, b) in GIT_REMOTE_WRITE_PAIRS {
+            let rule = format!("Bash(git {a} {b}:*)");
+            assert!(
+                REMOTE_WRITE_BASH_RULES.contains(&rule.as_str())
+                    || matches!((*a, *b), ("svn", "branch" | "tag") | ("lfs", "migrate")),
+                "{rule}"
+            );
+        }
+    }
+
+    /// Review of #449, r2 R2-1: every config key prefix the filter fences is refused by the seat
+    /// gitconfig copy too (`wicked_apps_core::spawn::seat_copies_git_config_key`) — the two lists
+    /// cannot drift in the direction that lets an operator's fenced key ride into a seat.
+    #[test]
+    fn the_seat_gitconfig_copy_refuses_every_fenced_key_prefix() {
+        for prefix in FENCED_GIT_CONFIG_KEY_PREFIXES {
+            let key = format!("{prefix}x");
+            assert!(
+                !wicked_apps_core::spawn::seat_copies_git_config_key(&key),
+                "{key} would be copied into a seat's global git config"
+            );
+        }
+        for key in ["user.email", "user.name", "core.editor", "diff.x.textconv"] {
+            assert!(
+                wicked_apps_core::spawn::seat_copies_git_config_key(key),
+                "{key}"
+            );
         }
     }
 

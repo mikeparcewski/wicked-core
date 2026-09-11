@@ -33,21 +33,47 @@ Two release tracks share this file, newest entry first regardless of track:
     `GIT_CONFIG_*`/`git config` overrides of `alias.*`, `url.*`, `remote.*`, `credential.*`,
     `core.sshCommand`… are refused before the verb is read, `gh alias` is refused whole, and the
     parser reads `bash -e -c`, `gh pr -R o/r create`, `gh api -XPOST`, unquoted `cmd /c`,
-    `timeout -k`, array-valued ACP commands (codex `shell`) and prose titles; (3) every seat spawn
-    (wrapped, ACP, ballot — the inherit hatch included) strips the `GH_*`/`GITHUB_*` tokens AND
-    `SSH_AUTH_SOCK`/`GIT_SSH*`/`GIT_ASKPASS`/`GIT_CONFIG_*`/`GIT_EXEC_PATH`, aims `GH_CONFIG_DIR`
-    at an engine-owned credential-less directory, re-points `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
-    at seat-owned files that include the operator's identity settings but RESET credential
-    helpers and askpass, and carries a transport-agnostic push kill with `-c` precedence
-    (`url.wicked-nopush://.pushInsteadOf` for https/http/ssh/git/`git@`/`file://`/absolute paths
-    — fetch and pull untouched), so `git -c alias.p=push p` over an ssh remote fails "unable to
-    find remote helper" (`wicked_apps_core::spawn::fence_remote_credentials`; fixture-tested
-    against ssh/scp/file/path remotes), while the deliver tool phase (`run_tool_cmd`, no seat
-    config) keeps the daemon's login and still pushes. Carrier coverage, stated: the per-call
-    command filter runs on the wrapped CLAUDE gate hook and the ACP bridge; wrapped non-claude
-    single-shot seats and ACP chat sessions are fenced by layers 1 (claude only) and 3. The Bash
-    rules ride the council ballot's own argv too (not only the shared worker file), and
-    `~/.config/gh`, `~/.config/git`, `~/.git-credentials` join the read fence.
+    `timeout -k`, array-valued ACP commands (codex `shell`) and prose titles — and, after the r2
+    review's live-git corpus, `bash -euo pipefail -c`, `bash -c -e`, `busybox sh -c`, a DECODED
+    PowerShell `-EncodedCommand` (UTF-16LE base64; an undecodable payload is refused), `env -i`,
+    `script -c`, `git subtree push`, `init.templateDir`, `gh ssh-key|gpg-key add`, `gh codespace
+    create`, `gh extension install`, and every plaintext credential read (`git credential`,
+    `git credential-store|cache|osxkeychain|…`, `gh auth token`, `gh auth status --show-token`);
+    (3) every seat spawn (wrapped, ACP, ballot — the inherit hatch included) strips the
+    `GH_*`/`GITHUB_*` tokens AND `SSH_AUTH_SOCK`/`GIT_SSH*`/`GIT_ASKPASS`/`GIT_CONFIG_*`/
+    `GIT_EXEC_PATH`/`GIT_ALLOW_PROTOCOL`, aims `GH_CONFIG_DIR` at an engine-owned credential-less
+    directory, sets `GIT_CONFIG_NOSYSTEM=1`, re-points `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` at
+    seat-owned files that COPY the operator's identity and presentation keys (`user.*`,
+    `core.editor`, `diff.*`, `color.*`, `filter.*`, … — never `[include]` their file, never
+    `url.*`/`remote.*`/`credential.*`/`alias.*`/`include*`/`core.sshCommand`/`http.*`/
+    `protocol.*`/`init.templateDir`; the r2 review reproduced an operator `url."git@github.com:".
+    pushInsteadOf` riding in through the include and sending a fenced https push to ssh) and
+    RESET credential helpers and askpass, replaces git's ssh with a program that does not exist
+    (`GIT_SSH_COMMAND` and `core.sshCommand` = `wicked-nopush-ssh`), refuses the ssh, git and
+    ext transports outright (`protocol.<name>.allow = never` — the only way to reach the
+    scp-like `user@host:` and bare `host:` remotes no URL prefix enumerates), and carries a push
+    kill on every URL-form transport with `-c` precedence (`url.wicked-nopush://.pushInsteadOf`
+    for https/http/`ssh://`/git/`git@`/`file://`/absolute and Windows paths). Exactly what layer
+    3 guarantees: a `git` running with the seat's environment intact cannot push anywhere —
+    https, `ssh://`, `git@host:`, `user@host:`, `host:`, `git://`, `file://`, a path — whether
+    the remote is spelled on its command line, in the repository's config or through an operator
+    `pushInsteadOf`, and cannot read a credential helper; fetch over https, `file://` and local
+    paths keeps working, fetch over ssh/`git://` no longer does (the engine performs the base
+    fetch; a seat cannot fetch a PRIVATE https remote either — helpers reset, no gh login). Not
+    covered by layer 3, stated: a `git` carrying its own `-c` override of a fenced key (`-c
+    protocol.ssh.allow=always -c core.sshCommand=ssh` — command-line `-c` outranks the
+    environment entries) or its own `GIT_SSH_COMMAND`, and a seat that scrubs its environment
+    (`env -i`) first — each refused as a literal by layer 2, each the stated script-file limit
+    otherwise. Fixture-tested (`wicked_apps_core::spawn::fence_remote_credentials`) against
+    `ssh://`, `ssh://user@`, `git@host:`, `nobody@host:`, `host:`, an https remote the operator's
+    global config rewrites to ssh, `file://` and path remotes, with a stub `ssh` on `PATH`
+    proving ssh is never reached under the fence and IS reached by the unfenced controls, while
+    the deliver tool phase (`run_tool_cmd`, no seat config) keeps the daemon's login and still
+    pushes. Carrier coverage, stated: the per-call command filter runs on the wrapped CLAUDE gate
+    hook and the ACP bridge; wrapped non-claude single-shot seats and ACP chat sessions are fenced
+    by layers 1 (claude only) and 3. The Bash rules ride the council ballot's own argv too (not
+    only the shared worker file), and `~/.config/gh`, `~/.config/git`, `~/.git-credentials` join
+    the read fence.
   - **Health-aware routing with `degradedReason` (F-7R2-006).** `AgenticCli.health: Option<{usable,
     reason}>` (additive, serde-default) carries the launcher's sign-in/usability verdict; a seat
     with `usable: false`, or one that fails authentication IN the run (a `not_logged_in` council
