@@ -11223,17 +11223,16 @@ transport = "stdio"
             code_graph_db: None,
             read_roots: vec![repo.to_string_lossy().into_owned()],
         };
-        let mut bad: Vec<(&str, std::path::PathBuf)> = vec![
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        // b1: a HARD LINK to the operational store, placed outside the state home (NTFS has hard
+        // links too, so this case runs on every platform).
+        let hard = dir.join("innocent-dir");
+        std::fs::hard_link(state.join("core.db"), &hard).unwrap();
+        let bad = [
+            ("b1 hard link to core.db", hard),
             ("b2 plain file", dir.join("notes.txt")),
             ("b3 missing", dir.join("never-created")),
         ];
-        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
-        #[cfg(unix)]
-        {
-            let hard = dir.join("innocent-dir");
-            std::fs::hard_link(state.join("core.db"), &hard).unwrap();
-            bad.push(("b1 hard link to core.db", hard));
-        }
         for (name, root) in bad {
             let err = r
                 .chat_open(

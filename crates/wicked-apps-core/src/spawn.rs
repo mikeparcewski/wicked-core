@@ -188,7 +188,9 @@ fn absolute_or_refuse(
 /// `Path::components()` silently normalizes `.` away, and a `..` that survives it would be resolved
 /// by the kernel at every consumer independently, re-aiming the directory outside whatever base the
 /// spelling appeared to sit under. The one rule the worker home, the seat roots and (core#410
-/// hardening) a chat scope's cwd, read roots and graph all apply before any containment check.
+/// hardening) a chat scope's cwd, read roots and graph all apply before any containment check; the
+/// message names `source` (the requirement's owner: `WICKED_WORKER_HOME`, `read root`, …), never a
+/// fixed role (Copilot, #435).
 pub fn refuse_dot_segments(path: &std::path::Path, source: &str) -> anyhow::Result<()> {
     let spelled = path.as_os_str().to_string_lossy();
     if spelled
@@ -196,8 +198,8 @@ pub fn refuse_dot_segments(path: &std::path::Path, source: &str) -> anyhow::Resu
         .any(|segment| segment == "." || segment == "..")
     {
         anyhow::bail!(
-            "{source}={} contains a `.` or `..` segment; the worker home must be spelled as a plain \
-             absolute path (a `..` re-aims the resolved directory outside the declared base)",
+            "{source}={} contains a `.` or `..` segment; spell it as a plain absolute path (a `..` \
+             re-aims the resolved directory outside the declared base)",
             path.display()
         );
     }
