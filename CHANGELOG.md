@@ -78,6 +78,24 @@ Two release tracks share this file, newest entry first regardless of track:
   ignored, `chatList` rows gain `cwd` / `codeGraphDb` / `readRoots`.
 
 ### Added
+- **Seats are handed the garden launcher root, and the ACP skills lever is judged from the SEAT
+  binary (acceptance finding F-079, core#441).** Every seat that receives a skills delivery — pi,
+  copilot, opencode, claude, on both carriers — now also gets `WICKED_GARDEN_ROOT=<pinned snapshot
+  root>` and `<root>/scripts` at the front of `PATH`, both derived from the SAME generation the
+  skills came from (`SkillsDelivery` carries its root), so wicked-garden's `wicked-garden` launcher
+  resolves the snapshot's synced `.venv` and never an npm package of another version; a seat handed
+  nothing (codex, agy) gets neither. Over ACP the lever is decided off the SEAT binary for the
+  levers that ride the environment: pi behind the separate `pi-acp` bridge is judged as pi (was
+  `Absent` — handed nothing, told its skill was "NOT loaded in this session", and the rig's pi unit
+  emitted no `skillsSnapshotHanded`), and the bridge is handed the deliverable portable skill
+  directories as `WICKED_PI_SKILL_DIRS` (one OS path-list — `:` / `;` — in `--skill` order; the
+  crew-side bridge, wicked-crew#531, turns it into `--no-skills --skill …`), with
+  `skillsSnapshotHanded {path: "acp", cli: <seat key>}` emitted once per spawn; a skill-bearing pi
+  unit over ACP is no longer refused `NoLever`. An argv-only lever (copilot's `--add-dir`) still
+  needs the carrier to BE the CLI. A skill directory that cannot be spelled in the path-list
+  refuses the launch naming the variable (never a truncated delivery). Admission,
+  `NONPORTABLE_SEAT`, `deliverable_portable` and the views are unchanged; codex stays lever-less
+  (follow-up on the same issue).
 - **Dead letters carry when and who; the emit seam gets a read side and a drain (wicked-crew#495,
   acceptance finding F-022).** Every record the emit seam spools to the dead-letter outbox
   (`wicked-apps-core::emit`, `WICKED_APPS_EMIT_DEADLETTER`) is now stamped with `ts` (epoch

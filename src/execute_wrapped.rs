@@ -1637,6 +1637,16 @@ impl WrappedCliStepRunner {
                     );
                 }
             }
+            // F-079 (core#441): every seat handed a delivery — pi, copilot, opencode, claude —
+            // also gets the launcher environment of THAT generation: `WICKED_GARDEN_ROOT=<root>`
+            // (garden's `wicked-garden` launcher resolves its root from it first, so a skill's
+            // `wicked-garden run …` never falls back to an npm package of another version) and
+            // `<root>/scripts` at the front of `PATH` (where garden ships the shim). Both derive
+            // from the same pinned `SkillsDelivery` root, both are read-only paths inside the
+            // fence's allowed slot; a seat handed nothing (codex, agy) is handed neither.
+            for (k, v) in delivery.launcher_env(std::env::var_os("PATH").as_deref()) {
+                cmd.env(k, v);
+            }
             // Point EVERY seat's scratch INSIDE the boundary (core#264, widened for crew#427): this
             // used to live in the claude-only `gov_env` arm, so a non-claude evaluator (codex, under
             // its own `--sandbox workspace-write`) got no in-boundary scratch and its `mktemp` /
@@ -7810,8 +7820,9 @@ mod tests {
     }
 
     /// A fake CLI named `name` — the stem selects the seat's lever (v3.2) — that records its argv
-    /// one token per line into `argv_file`, then one `ENV OPENCODE_CONFIG_CONTENT=<value|UNSET>`
-    /// line, so a test can read back both carriers a launch used.
+    /// one token per line into `argv_file`, then one `ENV <VAR>=<value|UNSET>` line each for
+    /// `OPENCODE_CONFIG_CONTENT`, `WICKED_GARDEN_ROOT`, `WICKED_PI_SKILL_DIRS` and `PATH`, so a
+    /// test can read back both carriers a launch used and the launcher environment (F-079).
     #[cfg(unix)]
     fn fake_recorder(
         bin_dir: &std::path::Path,
@@ -7824,7 +7835,10 @@ mod tests {
             &bin,
             format!(
                 "#!/bin/sh\n{{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; printf 'ENV \
-                 OPENCODE_CONFIG_CONTENT=%s\\n' \"${{OPENCODE_CONFIG_CONTENT:-UNSET}}\"; }} > \"{}\"\n",
+                 OPENCODE_CONFIG_CONTENT=%s\\n' \"${{OPENCODE_CONFIG_CONTENT:-UNSET}}\"; printf 'ENV \
+                 WICKED_GARDEN_ROOT=%s\\n' \"${{WICKED_GARDEN_ROOT:-UNSET}}\"; printf 'ENV \
+                 WICKED_PI_SKILL_DIRS=%s\\n' \"${{WICKED_PI_SKILL_DIRS:-UNSET}}\"; printf 'ENV \
+                 PATH=%s\\n' \"${{PATH:-UNSET}}\"; }} > \"{}\"\n",
                 argv_file.display()
             ),
         )
@@ -8691,11 +8705,40 @@ mod tests {
                 .map(|s| s.lines().map(str::to_string).collect::<Vec<_>>());
             (out, argv)
         };
-        let env_line = |argv: &[String]| -> String {
+        let env_of = |argv: &[String], var: &str| -> String {
+            let prefix = format!("ENV {var}=");
             argv.iter()
-                .find_map(|l| l.strip_prefix("ENV OPENCODE_CONFIG_CONTENT="))
-                .expect("the recorder writes the env line")
+                .find_map(|l| l.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("the recorder writes the {var} env line"))
                 .to_string()
+        };
+        let env_line = |argv: &[String]| -> String { env_of(argv, "OPENCODE_CONFIG_CONTENT") };
+        // F-079 (core#441): every DELIVERED seat is also handed the launcher environment of the
+        // same generation — `WICKED_GARDEN_ROOT=<snapshot>` and `<snapshot>/scripts` at the front
+        // of the daemon's own PATH — and never pi's bridge-only path-list on the wrapped carrier
+        // (the flags ride the argv). A seat handed nothing is handed neither.
+        let scripts_prefix = format!(
+            "{}{}",
+            snapshot.join("scripts").display(),
+            crate::skills_snapshot::PATH_LIST_SEPARATOR
+        );
+        let daemon_path = std::env::var("PATH").unwrap_or_default();
+        let assert_launcher_env = |argv: &[String], seat: &str| {
+            assert_eq!(
+                env_of(argv, "WICKED_GARDEN_ROOT"),
+                snapshot.to_string_lossy(),
+                "{seat}: the launcher root is the pinned generation"
+            );
+            let path = env_of(argv, "PATH");
+            assert!(
+                path.starts_with(&scripts_prefix) && path.ends_with(&daemon_path),
+                "{seat}: PATH must be <snapshot>/scripts + the inherited PATH: {path}"
+            );
+            assert_eq!(
+                env_of(argv, "WICKED_PI_SKILL_DIRS"),
+                "UNSET",
+                "{seat}: the path-list is for a separate ACP bridge, never the wrapped carrier"
+            );
         };
         let domain = snapshot.join("skills").join("domain");
         let a11y = snapshot.join("skills").join("qe").join("a11y");
@@ -8725,6 +8768,7 @@ mod tests {
             .any(|a| a == extractor.to_string_lossy().as_ref()));
         assert!(plugin_dirs(&argv).is_empty());
         assert_eq!(env_line(&argv), "UNSET");
+        assert_launcher_env(&argv, "pi");
 
         // copilot: the published view, and only that.
         let (out, argv) = launch("copilot", Some("wicked-garden-domain"));
@@ -8735,6 +8779,7 @@ mod tests {
             "{argv:?}"
         );
         assert!(!argv.iter().any(|a| a == "--skill" || a == "--no-skills"));
+        assert_launcher_env(&argv, "copilot");
 
         // opencode: skills.paths in the composed config, no flags.
         let (out, argv) = launch("opencode", Some("wicked-garden-domain"));
@@ -8747,14 +8792,17 @@ mod tests {
             "{composed}"
         );
         assert!(!argv.iter().any(|a| a == "--skill" || a == "--add-dir"));
+        assert_launcher_env(&argv, "opencode");
 
-        // claude: its own lever, unchanged.
+        // claude: its own lever, unchanged — and the same launcher environment.
         let (out, argv) = launch("claude", Some("wicked-garden-domain"));
         assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let argv = argv.expect("claude was launched");
         assert_eq!(
-            plugin_dirs(&argv.expect("claude was launched")),
+            plugin_dirs(&argv),
             vec![snapshot.to_string_lossy().as_ref()]
         );
+        assert_launcher_env(&argv, "claude");
 
         // codex: no lever. Invoking a skill ⇒ refused by name, never launched; no skill ⇒ runs
         // with nothing delivered.
@@ -8779,6 +8827,15 @@ mod tests {
             "{argv:?}"
         );
         assert_eq!(env_line(&argv), "UNSET");
+        // Handed nothing ⇒ no launcher environment either: no root, no path-list, and the PATH
+        // is the daemon's own, unprefixed.
+        assert_eq!(env_of(&argv, "WICKED_GARDEN_ROOT"), "UNSET");
+        assert_eq!(env_of(&argv, "WICKED_PI_SKILL_DIRS"), "UNSET");
+        assert!(
+            !env_of(&argv, "PATH").starts_with(&scripts_prefix),
+            "{}",
+            env_of(&argv, "PATH")
+        );
 
         // No side channel: the user's CLI trees and the snapshot are byte-identical.
         for (d, fp) in user_dirs.iter().zip(before.iter()) {

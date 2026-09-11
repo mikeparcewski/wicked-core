@@ -210,10 +210,14 @@ impl SkillEntry {
 /// How a CLI receives skills for ONE launch (design v3.2 §2): a wicked-OWNED lever the engine
 /// pulls at spawn — never a write into the user's own CLI directories (`~/.codex/skills`,
 /// `~/.pi/agent/skills`, `~/.config/opencode/skills`, `~/.copilot`, `~/.claude/plugins`), which
-/// the additive mirror of v3 would have been and which is withdrawn. Decided off the binary the
-/// launch actually runs — the CLI itself on the wrapped path, the ACP BRIDGE on the ACP path: a
-/// bridge that is a separate program (`pi-acp`, `codex-acp`) forwards no CLI flags, so it has no
-/// lever even where the CLI does.
+/// the additive mirror of v3 would have been and which is withdrawn. Decided off the SEAT's
+/// binary when the lever rides the ENVIRONMENT (pi's `WICKED_PI_SKILL_DIRS`, which the ACP
+/// bridge forwards as `--no-skills --skill …`; opencode's `OPENCODE_CONFIG_CONTENT`, which the CLI
+/// reads itself), because the environment reaches the CLI through any carrier — the CLI on the
+/// wrapped path, a separate bridge program (`pi-acp`) on the ACP path (F-079, core#441). An
+/// argv-only lever (copilot's `--add-dir`) is decided off the binary the launch actually runs: a
+/// bridge that is a separate program forwards no CLI flags, so such a lever exists only where the
+/// carrier IS the CLI (`copilot --acp`). See [`WorkerCli::for_binaries`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkillsLever {
     /// Claude: the plugin loader — `--plugin-dir <snapshot>` (wrapped) / `session/new`
@@ -230,9 +234,10 @@ pub(crate) enum SkillsLever {
     /// recursively for `**/SKILL.md`)"), composed WITH the governance content the seat already
     /// injects.
     OpencodeConfig,
-    /// No per-launch lever: codex 0.153 (`-c`/`--add-dir`/profiles load no skills), any ACP bridge
-    /// that is not the CLI itself, any unknown binary. No lever ⇒ no skills, never a side channel
-    /// (v3.2 §3): a unit that requires a skill on such a seat is refused by name.
+    /// No per-launch lever: codex 0.153 (`-c`/`--add-dir`/profiles load no skills), an ACP bridge
+    /// that is not the CLI itself carrying an argv-only lever (copilot behind a foreign bridge),
+    /// any unknown binary. No lever ⇒ no skills, never a side channel (v3.2 §3): a unit that
+    /// requires a skill on such a seat is refused by name.
     ///
     /// Documented residual (codex round 9, ADJUDICATED; follow-up core#400): "no skills" is what
     /// WICKED delivers — nothing. The seat still runs under the operator's own configuration
@@ -273,6 +278,19 @@ impl SkillsLever {
             SkillsLever::PiSkillFlags | SkillsLever::OpencodeConfig
         )
     }
+
+    /// Does this lever reach the CLI through its ENVIRONMENT — so a separate ACP bridge program
+    /// carries it (F-079, core#441)? pi's delivery rides [`PI_SKILL_DIRS_ENV`], which the bridge
+    /// turns into `--no-skills --skill …` on the CLI it spawns; opencode's rides
+    /// [`OPENCODE_CONFIG_ENV`], which opencode reads itself wherever it runs. Claude's plugin
+    /// rides `session/new` (its own bridge honours it) and copilot's `--add-dir` is argv the
+    /// bridge would have to forward — neither is judged here.
+    pub(crate) fn rides_environment(self) -> bool {
+        matches!(
+            self,
+            SkillsLever::PiSkillFlags | SkillsLever::OpencodeConfig
+        )
+    }
 }
 
 /// The CLI a unit will run on, as admission needs to know it: Claude reaches skills through the
@@ -290,13 +308,26 @@ impl WorkerCli {
     /// `execute_wrapped::binary_is_claude` judges), `carrier_binary` is what this launch actually
     /// spawns (the same CLI when wrapped; the ACP bridge when not), and `cli_key` names the seat
     /// in a refusal.
+    ///
+    /// The lever is the SEAT's when it rides the environment ([`SkillsLever::rides_environment`]:
+    /// pi over `pi-acp` is judged as pi — the bridge forwards `WICKED_PI_SKILL_DIRS`; opencode
+    /// over `opencode acp` as opencode), and the CARRIER's otherwise (copilot's `--add-dir` is
+    /// argv only a carrier that IS copilot applies; codex and agy have none either way). Before
+    /// F-079 every ACP launch was judged on the carrier, so a pi seat behind `pi-acp` was
+    /// `Absent`: handed nothing, told its skill was "NOT loaded", and never reported a handoff.
     pub(crate) fn for_binaries(cli_binary: &str, carrier_binary: &str, cli_key: &str) -> Self {
         if crate::execute_wrapped::binary_is_claude(cli_binary) {
             return WorkerCli::Claude;
         }
+        let seat = SkillsLever::for_binary(cli_binary);
+        let lever = if seat.rides_environment() {
+            seat
+        } else {
+            SkillsLever::for_binary(carrier_binary)
+        };
         WorkerCli::Other {
             key: cli_key.to_string(),
-            lever: SkillsLever::for_binary(carrier_binary),
+            lever,
         }
     }
 
@@ -319,7 +350,10 @@ impl std::fmt::Display for WorkerCli {
 
 /// What ONE launch is handed, in the shape its lever takes (v3.2 §2) — computed from the admitted
 /// snapshot and the seat by [`SkillsSnapshot::delivery`], consumed by the spawn paths. Every
-/// variant names paths INSIDE the snapshot; nothing here is ever written anywhere.
+/// variant names paths INSIDE the snapshot; nothing here is ever written anywhere. Every
+/// non-`None` variant carries the pinned snapshot `root` it was derived from, so the launcher
+/// environment a seat is handed alongside its skills ([`launcher_env`](Self::launcher_env)) can
+/// only ever name the generation the skills came from (F-079, core#441).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SkillsDelivery {
     /// No lever, or no snapshot: the worker runs without wicked skills.
@@ -327,11 +361,11 @@ pub(crate) enum SkillsDelivery {
     /// The snapshot root, for Claude's plugin loader.
     ClaudePlugin(PathBuf),
     /// The portable skill directories, for pi's `--skill` flags (after `--no-skills`).
-    PiSkillFlags(Vec<PathBuf>),
+    PiSkillFlags { root: PathBuf, dirs: Vec<PathBuf> },
     /// `<snapshot>/views/copilot`, for copilot's `--add-dir`.
-    CopilotAddDir(PathBuf),
+    CopilotAddDir { root: PathBuf, view: PathBuf },
     /// The portable skill directories, for opencode's `skills.paths`.
-    OpencodeConfig(Vec<PathBuf>),
+    OpencodeConfig { root: PathBuf, dirs: Vec<PathBuf> },
 }
 
 /// The env var opencode reads its whole configuration from (the seat's governance content
@@ -339,19 +373,137 @@ pub(crate) enum SkillsDelivery {
 /// value, never into `~/.config/opencode`.
 pub(crate) const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 
+/// The env var wicked-garden's `wicked-garden` launcher resolves its root from FIRST (F-079):
+/// under crew every seat handed a delivery gets the pinned snapshot root, so the launcher never
+/// falls back to an npm package of another version and uses the snapshot's synced `.venv`. Set
+/// per launch from the same generation the skills came from — a publish mid-run cannot re-aim a
+/// running seat (the `WICKED_SKILLS_SNAPSHOT` rule).
+pub(crate) const GARDEN_ROOT_ENV: &str = "WICKED_GARDEN_ROOT";
+
+/// The env var pi's delivery rides when the ACP carrier is a separate bridge program
+/// (`pi-acp`): the deliverable portable skill directories as ONE OS path-list (`:` on unix, `;`
+/// on Windows), in the order [`SkillsDelivery::argv_flags`] would spell them. The crew-side
+/// bridge (wicked-crew#531) turns it into `--no-skills --skill <dir> …` on the pi it spawns.
+pub(crate) const PI_SKILL_DIRS_ENV: &str = "WICKED_PI_SKILL_DIRS";
+
+/// Where garden ships the `wicked-garden` / `wicked-garden.cmd` shim inside the bundle closure
+/// (`scripts/**` rides every snapshot, `crew/skills/bundle.ts`); prepended to a delivered seat's
+/// `PATH` so `wicked-garden run …` in a skill's text resolves to THIS generation's launcher.
+pub(crate) const SCRIPTS_DIR: &str = "scripts";
+
+/// The separator of a `PATH`-shaped list on this host — the one `std::env::split_paths` splits
+/// on. Spelled here so the pure helpers can be exercised with the OTHER platform's separator.
+pub(crate) const PATH_LIST_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
+/// `(name, value)` environment pairs a launch sets on the seat's command, in order.
+pub(crate) type EnvPairs = Vec<(&'static str, std::ffi::OsString)>;
+
+/// `prefix` followed by `existing`, joined with `sep` — a `PATH` list with one entry pushed to
+/// the FRONT. An empty or absent `existing` yields the prefix alone (no trailing separator, which
+/// some shells read as "the current directory"). Pure: no platform lookups, so the Windows `;`
+/// shape is testable on every host.
+pub(crate) fn prepend_path_entry(
+    prefix: &Path,
+    existing: Option<&std::ffi::OsStr>,
+    sep: &str,
+) -> std::ffi::OsString {
+    let mut out = std::ffi::OsString::from(prefix.as_os_str());
+    if let Some(rest) = existing.filter(|e| !e.is_empty()) {
+        out.push(sep);
+        out.push(rest);
+    }
+    out
+}
+
+/// `entries` joined with `sep` into one `PATH`-shaped list, in order. An entry that itself
+/// contains `sep` cannot be spelled in such a list — the consumer would split it in two — so it
+/// is an `Err` naming the entry (fail closed: never a silently truncated skill path). Pure, like
+/// [`prepend_path_entry`].
+pub(crate) fn join_path_list(entries: &[PathBuf], sep: &str) -> Result<std::ffi::OsString, String> {
+    let mut out = std::ffi::OsString::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.to_string_lossy().contains(sep) {
+            return Err(format!(
+                "skill directory {} contains the path-list separator `{sep}` and cannot be \
+                 spelled in a {sep}-separated list",
+                entry.display()
+            ));
+        }
+        if i > 0 {
+            out.push(sep);
+        }
+        out.push(entry.as_os_str());
+    }
+    Ok(out)
+}
+
 impl SkillsDelivery {
+    /// The pinned snapshot root every non-`None` delivery was derived from — the ONE root the
+    /// seat's launcher environment names. `None` for [`SkillsDelivery::None`].
+    pub(crate) fn root(&self) -> Option<&Path> {
+        match self {
+            SkillsDelivery::None => None,
+            SkillsDelivery::ClaudePlugin(root)
+            | SkillsDelivery::PiSkillFlags { root, .. }
+            | SkillsDelivery::CopilotAddDir { root, .. }
+            | SkillsDelivery::OpencodeConfig { root, .. } => Some(root.as_path()),
+        }
+    }
+
+    /// The launcher environment a seat handed THIS delivery receives alongside it (F-079,
+    /// core#441): `WICKED_GARDEN_ROOT=<root>` and `PATH` with `<root>/scripts` pushed to the
+    /// front of `inherited_path` (the daemon's own, as the child would otherwise inherit it).
+    /// Both name read-only paths inside the fence's allowed slot — the generation the skills
+    /// themselves came from — and nothing is written anywhere. Empty for [`SkillsDelivery::None`]:
+    /// a seat handed no skills is handed no launcher either.
+    pub(crate) fn launcher_env(&self, inherited_path: Option<&std::ffi::OsStr>) -> EnvPairs {
+        let Some(root) = self.root() else {
+            return Vec::new();
+        };
+        vec![
+            (GARDEN_ROOT_ENV, root.as_os_str().to_os_string()),
+            (
+                "PATH",
+                prepend_path_entry(&root.join(SCRIPTS_DIR), inherited_path, PATH_LIST_SEPARATOR),
+            ),
+        ]
+    }
+
+    /// How this delivery rides the ACP carrier `carrier_binary` — `(argv flags, env)`: on the
+    /// carrier's own argv when the carrier IS the CLI the flags belong to (`copilot --acp`; pi
+    /// registered as its own carrier), and through the environment the bridge forwards when it is
+    /// a separate program — pi's [`PI_SKILL_DIRS_ENV`] behind `pi-acp` (the bridge spawns pi with
+    /// its own args, so flags on ITS argv would reach nothing). Claude's plugin rides `session/new`
+    /// and opencode's config its own composed variable, so both are `(∅, ∅)` here. `Err` when a
+    /// skill directory cannot be spelled in a path-list ([`join_path_list`]) — surfaced as a launch
+    /// refusal ([`SkillsError::LeverConfig`]), never a truncated delivery.
+    pub(crate) fn acp_transport(
+        &self,
+        carrier_binary: &str,
+    ) -> Result<(Vec<String>, EnvPairs), String> {
+        match self {
+            SkillsDelivery::PiSkillFlags { dirs, .. }
+                if SkillsLever::for_binary(carrier_binary) != SkillsLever::PiSkillFlags =>
+            {
+                let list = join_path_list(dirs, PATH_LIST_SEPARATOR)?;
+                Ok((Vec::new(), vec![(PI_SKILL_DIRS_ENV, list)]))
+            }
+            _ => Ok((self.argv_flags(), Vec::new())),
+        }
+    }
+
     /// The argv flags this delivery rides, for the levers that are flags: pi's
     /// `--no-skills --skill <dir> …` (discovery OFF first, so the user's `~/.pi/agent/skills` is
     /// never a side channel), copilot's `--add-dir <view>`. Empty for the rest.
     pub(crate) fn argv_flags(&self) -> Vec<String> {
         match self {
-            SkillsDelivery::PiSkillFlags(dirs) => std::iter::once("--no-skills".to_string())
+            SkillsDelivery::PiSkillFlags { dirs, .. } => std::iter::once("--no-skills".to_string())
                 .chain(
                     dirs.iter()
                         .flat_map(|d| ["--skill".to_string(), d.to_string_lossy().into_owned()]),
                 )
                 .collect(),
-            SkillsDelivery::CopilotAddDir(view) => {
+            SkillsDelivery::CopilotAddDir { view, .. } => {
                 vec!["--add-dir".to_string(), view.to_string_lossy().into_owned()]
             }
             _ => Vec::new(),
@@ -371,7 +523,7 @@ impl SkillsDelivery {
     /// governance content the seat depends on was dropped, and the contract requires composition
     /// WITH the existing content, never replacement.
     pub(crate) fn opencode_config(&self, existing: Option<&str>) -> Result<Option<String>, String> {
-        let SkillsDelivery::OpencodeConfig(dirs) = self else {
+        let SkillsDelivery::OpencodeConfig { dirs, .. } = self else {
             return Ok(None);
         };
         let mut doc = match existing {
@@ -885,14 +1037,21 @@ impl SkillsSnapshot {
         }
         match cli.lever() {
             SkillsLever::ClaudePlugin => SkillsDelivery::ClaudePlugin(self.root.clone()),
-            SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags(self.portable_skill_dirs()),
+            SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags {
+                root: self.root.clone(),
+                dirs: self.portable_skill_dirs(),
+            },
             SkillsLever::CopilotAddDir => match self.copilot_view_dir() {
-                Some(view) => SkillsDelivery::CopilotAddDir(view),
+                Some(view) => SkillsDelivery::CopilotAddDir {
+                    root: self.root.clone(),
+                    view,
+                },
                 None => SkillsDelivery::None,
             },
-            SkillsLever::OpencodeConfig => {
-                SkillsDelivery::OpencodeConfig(self.portable_skill_dirs())
-            }
+            SkillsLever::OpencodeConfig => SkillsDelivery::OpencodeConfig {
+                root: self.root.clone(),
+                dirs: self.portable_skill_dirs(),
+            },
             SkillsLever::Absent => SkillsDelivery::None,
         }
     }
@@ -1228,10 +1387,10 @@ pub(crate) enum SkillsError {
         var: &'static str,
         why: String,
     },
-    /// A seat whose launch has NO wicked-owned way to deliver skills (v3.2 §3) — codex, an ACP
-    /// bridge that forwards no flags, copilot when the generation publishes no `views/copilot` —
-    /// was asked for skills. No lever ⇒ no skills, never a side channel through the user's own
-    /// CLI directories.
+    /// A seat whose launch has NO wicked-owned way to deliver skills (v3.2 §3) — codex, a seat
+    /// with an argv-only lever behind an ACP bridge that forwards no flags, copilot when the
+    /// generation publishes no `views/copilot` — was asked for skills. No lever ⇒ no skills,
+    /// never a side channel through the user's own CLI directories.
     NoLever {
         cli: String,
         skills: Vec<String>,
@@ -4738,7 +4897,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             handed.delivery(&copilot),
-            SkillsDelivery::CopilotAddDir(view.clone())
+            SkillsDelivery::CopilotAddDir {
+                root: handed.root.clone(),
+                view: view.clone()
+            }
         );
         assert_eq!(
             handed.delivery(&copilot).argv_flags(),
@@ -4981,14 +5143,38 @@ mod tests {
             handed.delivery(&pi).opencode_config(Some("not json")),
             Ok(None)
         );
-        // The carrier decides the lever: pi's separate ACP bridge forwards no flags.
+        // F-079 (core#441): a lever that rides the ENVIRONMENT is the seat's, whatever carries
+        // it — pi behind its separate `pi-acp` bridge is judged as pi (the bridge forwards
+        // `WICKED_PI_SKILL_DIRS`), opencode behind `opencode acp` as opencode. An argv-only
+        // lever stays the carrier's: copilot behind a foreign bridge has none, copilot carrying
+        // itself (`copilot --acp`) keeps `--add-dir`. codex and agy have none either way.
         assert_eq!(
             WorkerCli::for_binaries("pi", "pi-acp", "pi").lever(),
-            SkillsLever::Absent
+            SkillsLever::PiSkillFlags
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("pi", "/opt/bridges/pi-acp", "pi-seat").lever(),
+            SkillsLever::PiSkillFlags
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("opencode", "opencode", "opencode").lever(),
+            SkillsLever::OpencodeConfig
         );
         assert_eq!(
             WorkerCli::for_binaries("copilot", "copilot", "copilot").lever(),
             SkillsLever::CopilotAddDir
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("copilot", "copilot-acp", "copilot").lever(),
+            SkillsLever::Absent
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("codex", "codex-acp", "codex").lever(),
+            SkillsLever::Absent
+        );
+        assert_eq!(
+            WorkerCli::for_binaries("agy", "agy-acp", "agy").lever(),
+            SkillsLever::Absent
         );
         assert_eq!(
             WorkerCli::for_binaries("claude", "claude-agent-acp", "claude"),
@@ -5427,7 +5613,10 @@ mod tests {
             .expect("handed");
         assert_eq!(
             handed.delivery(&copilot),
-            SkillsDelivery::CopilotAddDir(view.clone())
+            SkillsDelivery::CopilotAddDir {
+                root: handed.root.clone(),
+                view: view.clone()
+            }
         );
         assert!(
             matches!(
@@ -6462,5 +6651,169 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?} in: {text}");
         }
+    }
+
+    /// F-079 (core#441): every non-`None` delivery carries the pinned root it was derived from,
+    /// and the launcher environment derives from THAT root alone — `WICKED_GARDEN_ROOT=<root>`
+    /// and `<root>/scripts` pushed to the front of the inherited `PATH`; nothing for `None`. The
+    /// pure helpers are exercised with BOTH separators, so the Windows `;` shape is proven on
+    /// every host (the CI matrix's Windows leg proves the platform constant itself).
+    #[test]
+    fn a_delivery_hands_its_seat_the_launcher_root_and_a_path_prefix_of_the_same_generation() {
+        use std::ffi::{OsStr, OsString};
+        let root = PathBuf::from("/snap/000007");
+        let dirs = vec![
+            root.join("skills").join("a"),
+            root.join("skills").join("q").join("b"),
+        ];
+        let deliveries = [
+            SkillsDelivery::ClaudePlugin(root.clone()),
+            SkillsDelivery::PiSkillFlags {
+                root: root.clone(),
+                dirs: dirs.clone(),
+            },
+            SkillsDelivery::CopilotAddDir {
+                root: root.clone(),
+                view: root.join("views").join("copilot"),
+            },
+            SkillsDelivery::OpencodeConfig {
+                root: root.clone(),
+                dirs: dirs.clone(),
+            },
+        ];
+        let inherited = OsString::from(["/usr/bin", "/bin"].join(PATH_LIST_SEPARATOR));
+        for d in &deliveries {
+            assert_eq!(d.root(), Some(root.as_path()), "{d:?}");
+            let env = d.launcher_env(Some(inherited.as_os_str()));
+            assert_eq!(env.len(), 2, "{d:?}");
+            assert_eq!(env[0], (GARDEN_ROOT_ENV, root.as_os_str().to_os_string()));
+            let mut expected = OsString::from(root.join(SCRIPTS_DIR));
+            expected.push(PATH_LIST_SEPARATOR);
+            expected.push(&inherited);
+            assert_eq!(env[1], ("PATH", expected), "{d:?}");
+        }
+        // No inherited PATH, or an empty one: the prefix alone — never a trailing separator,
+        // which some shells read as "the current directory".
+        let env = deliveries[1].launcher_env(None);
+        assert_eq!(env[1].1, OsString::from(root.join(SCRIPTS_DIR)));
+        let env = deliveries[1].launcher_env(Some(OsStr::new("")));
+        assert_eq!(env[1].1, OsString::from(root.join(SCRIPTS_DIR)));
+        assert_eq!(SkillsDelivery::None.root(), None);
+        assert!(SkillsDelivery::None
+            .launcher_env(Some(inherited.as_os_str()))
+            .is_empty());
+
+        // The pure helper, both separators.
+        assert_eq!(
+            prepend_path_entry(
+                Path::new(r"C:\snap\scripts"),
+                Some(OsStr::new(r"C:\Windows;C:\bin")),
+                ";"
+            ),
+            OsString::from(r"C:\snap\scripts;C:\Windows;C:\bin")
+        );
+        assert_eq!(
+            prepend_path_entry(
+                Path::new("/snap/scripts"),
+                Some(OsStr::new("/usr/bin:/bin")),
+                ":"
+            ),
+            OsString::from("/snap/scripts:/usr/bin:/bin")
+        );
+        assert_eq!(
+            PATH_LIST_SEPARATOR,
+            if cfg!(windows) { ";" } else { ":" },
+            "the platform constant is the one `std::env::split_paths` splits on"
+        );
+    }
+
+    /// F-079 (core#441): pi's delivery rides `WICKED_PI_SKILL_DIRS` when the ACP carrier is a
+    /// separate bridge program (`pi-acp`) — the deliverable dirs as ONE path-list in `argv_flags`
+    /// order, and NO flag on the bridge's own argv — and the argv flags when the carrier IS pi.
+    /// Copilot's stays argv; claude's, opencode's and an empty delivery carry nothing here. An
+    /// entry that cannot be spelled in a path-list is an error, never a silently truncated list.
+    #[test]
+    fn pi_over_a_separate_bridge_is_handed_its_skill_dirs_as_one_path_list() {
+        use std::ffi::OsString;
+        let root = PathBuf::from("/snap/000007");
+        let a = root.join("skills").join("a");
+        let b = root.join("skills").join("q").join("b");
+        let pi = SkillsDelivery::PiSkillFlags {
+            root: root.clone(),
+            dirs: vec![a.clone(), b.clone()],
+        };
+        let (flags, env) = pi.acp_transport("pi-acp").unwrap();
+        assert!(flags.is_empty(), "{flags:?}");
+        let mut list = OsString::from(&a);
+        list.push(PATH_LIST_SEPARATOR);
+        list.push(&b);
+        assert_eq!(env, vec![(PI_SKILL_DIRS_ENV, list.clone())]);
+        // The same order the flags spell, and the consumer's split recovers the dirs.
+        let flag_dirs: Vec<String> = pi
+            .argv_flags()
+            .windows(2)
+            .filter(|w| w[0] == "--skill")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(
+            flag_dirs,
+            vec![
+                a.to_string_lossy().into_owned(),
+                b.to_string_lossy().into_owned()
+            ]
+        );
+        assert_eq!(
+            std::env::split_paths(&list).collect::<Vec<_>>(),
+            vec![a.clone(), b.clone()]
+        );
+        // A bridge under any path spelling; the carrier that IS pi gets the flags instead.
+        let (flags, env) = pi.acp_transport("/opt/bridges/pi-acp").unwrap();
+        assert!(flags.is_empty() && env.len() == 1);
+        let (flags, env) = pi.acp_transport("/usr/local/bin/pi").unwrap();
+        assert_eq!(flags, pi.argv_flags());
+        assert!(env.is_empty());
+        // The other levers: argv for copilot, nothing for the rest.
+        let copilot = SkillsDelivery::CopilotAddDir {
+            root: root.clone(),
+            view: root.join("views").join("copilot"),
+        };
+        assert_eq!(
+            copilot.acp_transport("copilot").unwrap(),
+            (copilot.argv_flags(), Vec::new())
+        );
+        for other in [
+            SkillsDelivery::ClaudePlugin(root.clone()),
+            SkillsDelivery::OpencodeConfig {
+                root: root.clone(),
+                dirs: vec![a.clone()],
+            },
+            SkillsDelivery::None,
+        ] {
+            assert_eq!(
+                other.acp_transport("whatever").unwrap(),
+                (Vec::new(), Vec::new()),
+                "{other:?}"
+            );
+        }
+        // Fail closed on an unspellable entry — both separators, pure.
+        let err = join_path_list(&[PathBuf::from("/a;b"), PathBuf::from("/c")], ";").unwrap_err();
+        assert!(err.contains("/a;b") && err.contains("`;`"), "{err}");
+        assert_eq!(
+            join_path_list(&[PathBuf::from(r"C:\x"), PathBuf::from(r"D:\y")], ";").unwrap(),
+            OsString::from(r"C:\x;D:\y")
+        );
+        assert_eq!(join_path_list(&[], ":").unwrap(), OsString::new());
+        let bad = SkillsDelivery::PiSkillFlags {
+            root: root.clone(),
+            dirs: vec![PathBuf::from(format!("/snap/a{PATH_LIST_SEPARATOR}b"))],
+        };
+        assert!(bad
+            .acp_transport("pi-acp")
+            .unwrap_err()
+            .contains("path-list separator"));
+        assert!(
+            bad.acp_transport("pi").is_ok(),
+            "the flags carrier spells each dir on its own"
+        );
     }
 }
