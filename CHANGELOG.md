@@ -799,6 +799,35 @@ Two release tracks share this file, newest entry first regardless of track:
   `rules eval --corpus` (and `--import <name> <path>`) now also take ONE corpus `*.json` file
   (the documented `{name, samples}` shape, a bare array, or a sample) so a script-derived
   corpus replays against a scratch store without an import (`CorpusSource::File`).
+- **core-ts 0.7.22** — npm release carrying the two engine changes since 0.7.21, all on main tip
+  18f1dab (plus #446, the 0.7.21 platform-lockfile re-stamp): **#448** — `scripts/finalize-dts.mjs`
+  parses again (the four unescaped backticks #444 left in its doc template broke `npm run build`
+  from source; the published 0.7.21 `index.d.ts` was intact) and CI now `node --check`s the
+  finalizer and reproduces the committed `index.d.ts` from it. **#449** (wave 6 — the governed
+  testing journey, acceptance findings F-7R2-005/006/012/013/019): the worker remote-write fence
+  (claude Bash deny rules, a segment-wise command filter on both carriers, and a credential/ssh
+  strip on every seat spawn) — exactly what layer 3 guarantees: a `git` running with the seat's
+  environment intact cannot push anywhere — https, `ssh://`, `git@host:`, `user@host:`, `host:`,
+  `git://`, `file://`, a path — whether the remote is spelled on its command line, in the
+  repository's config or through an operator `pushInsteadOf`, and cannot read a credential helper;
+  health-aware routing that benches signed-out / auth-failed seats for the run; the default
+  repo-checks floor + a judge distinct from the creator for prose-planned units, or an honest
+  UNGATED verdict; ACP auth fallback kinds with no wrapped retry; the run branch recorded and a
+  completed run's worktree retained. Wire shape, additive only: **`workerToolCallDenied`**
+  {session, ord, attempt, cli, carrier, role, tool, command, reason, remedy} (new event; a refusal
+  is advisory — one tool call, not the unit); **`gateEvaluated.ungated`** + **`ungatedReason`**,
+  **`floorNote`** (why the deterministic layer is absent) and **`judgeSkippedReason`** (why no
+  judge was convened); **`repoChecksEvaluated.sandboxLevel`**, **`sandboxError`**, **`detectError`**;
+  **`unitDistributed.degradedReason`** set on EVERY routing arm whenever eligible < configured
+  (the Council arm used to emit `null` unconditionally); **`councilConvened.clis`** names only the
+  eligible (unbenched) seats; **`acpFallback.fallbackKind`** gains `auth_failed` and
+  `unauthenticated`; **`runBaseResolved.runBranch`**; `AgentSession` gains `run_branch`,
+  `base_commit`, `finished_at` and `benched_seats [{cli, reason, source}]`; and on the INPUT side
+  `AgenticCli.health: {usable, reason} | null` (serde-default) carries the launcher's sign-in
+  verdict. Consumers: render `gateEvaluated.ungated: true` as UNGATED with its reason, and a
+  `repoChecksEvaluated` with `checks: []` as "0 checks detected", never "checks passed".
+  **Coupling to note:** wicked-crew 0.7.31 pins `wicked-core-ts ^0.7.22` with
+  `wicked-crew-api-types` 0.36.0.
 - **core-ts 0.7.21** — npm release carrying the three engine changes since 0.7.20, all on main tip
   d5b12bb: **#442** (core#441, acceptance finding F-079) — every seat that receives a skills
   delivery (pi, copilot, opencode, claude; both carriers) is also handed `WICKED_GARDEN_ROOT=<pinned
