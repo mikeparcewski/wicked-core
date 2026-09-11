@@ -211,10 +211,11 @@ impl SkillEntry {
 /// pulls at spawn — never a write into the user's own CLI directories (`~/.codex/skills`,
 /// `~/.pi/agent/skills`, `~/.config/opencode/skills`, `~/.copilot`, `~/.claude/plugins`), which
 /// the additive mirror of v3 would have been and which is withdrawn. Decided off the SEAT's
-/// binary when the lever rides the ENVIRONMENT (pi's `WICKED_PI_SKILL_DIRS`, which the ACP
+/// binary when the lever is CARRIER-INDEPENDENT (pi's `WICKED_PI_SKILL_DIRS`, which the ACP
 /// bridge forwards as `--no-skills --skill …`; opencode's `OPENCODE_CONFIG_CONTENT`, which the CLI
-/// reads itself), because the environment reaches the CLI through any carrier — the CLI on the
-/// wrapped path, a separate bridge program (`pi-acp`) on the ACP path (F-079, core#441). An
+/// reads itself; codex's engine-minted `CODEX_HOME/skills`, populated before either carrier
+/// spawns), because each reaches the CLI through any carrier — the CLI on the wrapped path, a
+/// separate bridge program (`pi-acp`, `codex-acp`) on the ACP path (F-079, core#441). An
 /// argv-only lever (copilot's `--add-dir`) is decided off the binary the launch actually runs: a
 /// bridge that is a separate program forwards no CLI flags, so such a lever exists only where the
 /// carrier IS the CLI (`copilot --acp`). See [`WorkerCli::for_binaries`].
@@ -234,17 +235,21 @@ pub(crate) enum SkillsLever {
     /// recursively for `**/SKILL.md`)"), composed WITH the governance content the seat already
     /// injects.
     OpencodeConfig,
-    /// No per-launch lever: codex 0.153 (`-c`/`--add-dir`/profiles load no skills), an ACP bridge
-    /// that is not the CLI itself carrying an argv-only lever (copilot behind a foreign bridge),
-    /// any unknown binary. No lever ⇒ no skills, never a side channel (v3.2 §3): a unit that
-    /// requires a skill on such a seat is refused by name.
-    ///
-    /// Documented residual (codex round 9, ADJUDICATED; follow-up core#400): "no skills" is what
-    /// WICKED delivers — nothing. The seat still runs under the operator's own configuration
-    /// directory (`~/.codex`), which v3.2 forbids the engine to touch, so whatever the operator
-    /// installed there is theirs to see, exactly like the rest of their codex settings; isolating
-    /// that ambient discovery needs an engine-minted `CODEX_HOME` worker home (auth relocation
-    /// included), tracked in core#400.
+    /// codex 0.153 (F-079, core#441; closes the core#400 residual): codex has no per-launch flag
+    /// for skills (`-c`/`--add-dir`/profiles load none) but discovers them under
+    /// `$CODEX_HOME/skills/<name>/SKILL.md`, and since core#426 every codex seat runs under an
+    /// ENGINE-MINTED `CODEX_HOME` (`<worker home>/codex`, private, never the operator's
+    /// `~/.codex`). The engine POPULATES that directory from the pinned snapshot before the seat
+    /// spawns — flat by frontmatter `name`, copies, a generation marker so an unchanged generation
+    /// is a no-op and stale generations are replaced, populations of one home serialized by an
+    /// exclusive lock and swapped in COMPLETE (a seat never spawns against a half-built tree),
+    /// nothing else under `CODEX_HOME` touched ([`crate::codex_skills`]). Under the
+    /// inherit-operator-config hatch there is no minted home, so there is no lever: admission
+    /// refuses a skill-bearing codex unit by name, and a skill-less one is handed nothing.
+    CodexSkillsDir,
+    /// No per-launch lever: an ACP bridge that is not the CLI itself carrying an argv-only lever
+    /// (copilot behind a foreign bridge), agy, any unknown binary. No lever ⇒ no skills, never a
+    /// side channel (v3.2 §3): a unit that requires a skill on such a seat is refused by name.
     Absent,
 }
 
@@ -259,6 +264,7 @@ impl SkillsLever {
         {
             "claude" => SkillsLever::ClaudePlugin,
             "pi" => SkillsLever::PiSkillFlags,
+            "codex" => SkillsLever::CodexSkillsDir,
             "copilot" => SkillsLever::CopilotAddDir,
             "opencode" => SkillsLever::OpencodeConfig,
             _ => SkillsLever::Absent,
@@ -279,16 +285,18 @@ impl SkillsLever {
         )
     }
 
-    /// Does this lever reach the CLI through its ENVIRONMENT — so a separate ACP bridge program
-    /// carries it (F-079, core#441)? pi's delivery rides [`PI_SKILL_DIRS_ENV`], which the bridge
-    /// turns into `--no-skills --skill …` on the CLI it spawns; opencode's rides
-    /// [`OPENCODE_CONFIG_ENV`], which opencode reads itself wherever it runs. Claude's plugin
-    /// rides `session/new` (its own bridge honours it) and copilot's `--add-dir` is argv the
-    /// bridge would have to forward — neither is judged here.
-    pub(crate) fn rides_environment(self) -> bool {
+    /// Does this lever reach the CLI whatever program carries it — so it is judged off the SEAT
+    /// binary, a separate ACP bridge included (F-079, core#441)? pi's delivery rides
+    /// [`PI_SKILL_DIRS_ENV`], which the bridge turns into `--no-skills --skill …` on the CLI it
+    /// spawns; opencode's rides [`OPENCODE_CONFIG_ENV`], which opencode reads itself wherever it
+    /// runs; codex's is the engine-minted `CODEX_HOME/skills`, populated before either carrier
+    /// spawns and read by codex under `codex-acp` exactly as under the wrapped `codex`. Claude's
+    /// plugin rides `session/new` (its own bridge honours it) and copilot's `--add-dir` is argv
+    /// the bridge would have to forward — neither is judged here.
+    pub(crate) fn carrier_independent(self) -> bool {
         matches!(
             self,
-            SkillsLever::PiSkillFlags | SkillsLever::OpencodeConfig
+            SkillsLever::PiSkillFlags | SkillsLever::OpencodeConfig | SkillsLever::CodexSkillsDir
         )
     }
 }
@@ -309,18 +317,20 @@ impl WorkerCli {
     /// spawns (the same CLI when wrapped; the ACP bridge when not), and `cli_key` names the seat
     /// in a refusal.
     ///
-    /// The lever is the SEAT's when it rides the environment ([`SkillsLever::rides_environment`]:
-    /// pi over `pi-acp` is judged as pi — the bridge forwards `WICKED_PI_SKILL_DIRS`; opencode
-    /// over `opencode acp` as opencode), and the CARRIER's otherwise (copilot's `--add-dir` is
-    /// argv only a carrier that IS copilot applies; codex and agy have none either way). Before
-    /// F-079 every ACP launch was judged on the carrier, so a pi seat behind `pi-acp` was
-    /// `Absent`: handed nothing, told its skill was "NOT loaded", and never reported a handoff.
+    /// The lever is the SEAT's when it is carrier-independent
+    /// ([`SkillsLever::carrier_independent`]: pi over `pi-acp` is judged as pi — the bridge
+    /// forwards `WICKED_PI_SKILL_DIRS`; codex over `codex-acp` as codex — its `CODEX_HOME/skills`
+    /// is populated before the spawn; opencode over `opencode acp` as opencode), and the
+    /// CARRIER's otherwise (copilot's `--add-dir` is argv only a carrier that IS copilot applies;
+    /// agy has none either way). Before F-079 every ACP launch was judged on the carrier, so a pi
+    /// seat behind `pi-acp` was `Absent`: handed nothing, told its skill was "NOT loaded", and
+    /// never reported a handoff.
     pub(crate) fn for_binaries(cli_binary: &str, carrier_binary: &str, cli_key: &str) -> Self {
         if crate::execute_wrapped::binary_is_claude(cli_binary) {
             return WorkerCli::Claude;
         }
         let seat = SkillsLever::for_binary(cli_binary);
-        let lever = if seat.rides_environment() {
+        let lever = if seat.carrier_independent() {
             seat
         } else {
             SkillsLever::for_binary(carrier_binary)
@@ -366,6 +376,14 @@ pub(crate) enum SkillsDelivery {
     CopilotAddDir { root: PathBuf, view: PathBuf },
     /// The portable skill directories, for opencode's `skills.paths`.
     OpencodeConfig { root: PathBuf, dirs: Vec<PathBuf> },
+    /// The skills to POPULATE into the seat's engine-minted `CODEX_HOME/skills` before it spawns
+    /// (F-079): flat by name, keyed by `generation` (the marker `crate::codex_skills` writes so an
+    /// unchanged generation is a no-op). Nothing rides the argv or the environment.
+    CodexSkillsDir {
+        root: PathBuf,
+        generation: String,
+        skills: Vec<crate::codex_skills::CodexSkill>,
+    },
 }
 
 /// The env var opencode reads its whole configuration from (the seat's governance content
@@ -384,6 +402,13 @@ pub(crate) const GARDEN_ROOT_ENV: &str = "WICKED_GARDEN_ROOT";
 /// (`pi-acp`): the deliverable portable skill directories as ONE OS path-list (`:` on unix, `;`
 /// on Windows), in the order [`SkillsDelivery::argv_flags`] would spell them. The crew-side
 /// bridge (wicked-crew#531) turns it into `--no-skills --skill <dir> …` on the pi it spawns.
+///
+/// Contract, spelled for the bridge: the variable being SET is the delivery — the bridge passes
+/// `--no-skills` (discovery OFF, so the seat's own skills directory is never a side channel,
+/// v3.2 §2), then one `--skill <dir>` per non-empty entry. An EMPTY value is a delivery of ZERO
+/// portable skills: `--no-skills` alone — exactly what the wrapped carrier spells for the same
+/// snapshot ([`SkillsDelivery::argv_flags`]), so the two carriers agree. UNSET means no delivery
+/// at all (a lever-less launch, a chat session): the bridge adds no skills flags.
 pub(crate) const PI_SKILL_DIRS_ENV: &str = "WICKED_PI_SKILL_DIRS";
 
 /// Where garden ships the `wicked-garden` / `wicked-garden.cmd` shim inside the bundle closure
@@ -437,6 +462,47 @@ pub(crate) fn join_path_list(entries: &[PathBuf], sep: &str) -> Result<std::ffi:
     Ok(out)
 }
 
+/// The codex lever's side effect (F-079, core#441), performed by BOTH runners before the seat
+/// spawns and before the handoff is reported: populate the seat's ENGINE-MINTED `CODEX_HOME`
+/// (`seat_root`, from the one seat-config resolver) with the delivery's skills — flat by name,
+/// copies, generation-keyed, nothing else under the home touched (`crate::codex_skills`). A no-op
+/// `Ok` for every other delivery. `Err` names the reason and the caller refuses the launch
+/// ([`SkillsError::SeatHome`]): a codex delivery with NO minted home (the inherit-operator-config
+/// hatch — the operator's own `~/.codex` is never written), or a population failure.
+pub(crate) fn populate_seat_home(
+    delivery: &SkillsDelivery,
+    seat_root: Option<&Path>,
+) -> Result<(), String> {
+    let SkillsDelivery::CodexSkillsDir {
+        root,
+        generation,
+        skills,
+    } = delivery
+    else {
+        return Ok(());
+    };
+    let Some(home) = seat_root else {
+        return Err(format!(
+            "codex skills ride an engine-minted CODEX_HOME and this launch has none ({} inherits \
+             the operator's own configuration, which wicked never writes into)",
+            crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV
+        ));
+    };
+    let populated = crate::codex_skills::populate(home, generation, skills)?;
+    eprintln!(
+        "skills.codex_home {} gen=[{generation}] skills={} dir={} root={}",
+        if populated.changed {
+            "populated"
+        } else {
+            "unchanged"
+        },
+        populated.names.len(),
+        populated.skills_dir.display(),
+        root.display()
+    );
+    Ok(())
+}
+
 impl SkillsDelivery {
     /// The pinned snapshot root every non-`None` delivery was derived from — the ONE root the
     /// seat's launcher environment names. `None` for [`SkillsDelivery::None`].
@@ -446,7 +512,8 @@ impl SkillsDelivery {
             SkillsDelivery::ClaudePlugin(root)
             | SkillsDelivery::PiSkillFlags { root, .. }
             | SkillsDelivery::CopilotAddDir { root, .. }
-            | SkillsDelivery::OpencodeConfig { root, .. } => Some(root.as_path()),
+            | SkillsDelivery::OpencodeConfig { root, .. }
+            | SkillsDelivery::CodexSkillsDir { root, .. } => Some(root.as_path()),
         }
     }
 
@@ -473,10 +540,13 @@ impl SkillsDelivery {
     /// carrier's own argv when the carrier IS the CLI the flags belong to (`copilot --acp`; pi
     /// registered as its own carrier), and through the environment the bridge forwards when it is
     /// a separate program — pi's [`PI_SKILL_DIRS_ENV`] behind `pi-acp` (the bridge spawns pi with
-    /// its own args, so flags on ITS argv would reach nothing). Claude's plugin rides `session/new`
-    /// and opencode's config its own composed variable, so both are `(∅, ∅)` here. `Err` when a
-    /// skill directory cannot be spelled in a path-list ([`join_path_list`]) — surfaced as a launch
-    /// refusal ([`SkillsError::LeverConfig`]), never a truncated delivery.
+    /// its own args, so flags on ITS argv would reach nothing). A delivery of ZERO portable skills
+    /// is still a delivery on both carriers — `--no-skills` alone on the argv, the variable SET
+    /// and EMPTY behind a bridge (see [`PI_SKILL_DIRS_ENV`]) — discovery is off either way.
+    /// Claude's plugin rides `session/new` and opencode's config its own composed variable, so
+    /// both are `(∅, ∅)` here. `Err` when a skill directory cannot be spelled in a path-list
+    /// ([`join_path_list`]) — surfaced as a launch refusal ([`SkillsError::LeverConfig`]), never
+    /// a truncated delivery.
     pub(crate) fn acp_transport(
         &self,
         carrier_binary: &str,
@@ -1032,10 +1102,24 @@ impl SkillsSnapshot {
     /// flags are an approximation with no publish-time verdict behind them, so only Claude's
     /// plugin loader — which does not depend on portability — is handed the root.
     pub(crate) fn delivery(&self, cli: &WorkerCli) -> SkillsDelivery {
+        self.delivery_with(cli, crate::execute_wrapped::inherits_operator_config())
+    }
+
+    /// [`delivery`](Self::delivery) with the inherit-operator-config hatch stated explicitly
+    /// (F-079 review): under the hatch no seat home is minted, so codex has nothing to populate
+    /// and is handed NOTHING — a skill-bearing codex unit was already refused by admission naming
+    /// the hatch ([`codex_hatch_reason`]); a skill-less one runs exactly as before the lever (no
+    /// population, no refusal, no handoff) — never a delivery whose population must fail.
+    pub(crate) fn delivery_with(
+        &self,
+        cli: &WorkerCli,
+        inherits_operator_config: bool,
+    ) -> SkillsDelivery {
         if self.source == SnapshotSource::LiveCache && !matches!(cli, WorkerCli::Claude) {
             return SkillsDelivery::None;
         }
         match cli.lever() {
+            SkillsLever::CodexSkillsDir if inherits_operator_config => SkillsDelivery::None,
             SkillsLever::ClaudePlugin => SkillsDelivery::ClaudePlugin(self.root.clone()),
             SkillsLever::PiSkillFlags => SkillsDelivery::PiSkillFlags {
                 root: self.root.clone(),
@@ -1052,8 +1136,51 @@ impl SkillsSnapshot {
                 root: self.root.clone(),
                 dirs: self.portable_skill_dirs(),
             },
+            SkillsLever::CodexSkillsDir => SkillsDelivery::CodexSkillsDir {
+                root: self.root.clone(),
+                generation: self.generation_label(),
+                skills: self.codex_skills(),
+            },
             SkillsLever::Absent => SkillsDelivery::None,
         }
+    }
+
+    /// The skills codex is handed (F-079): every DELIVERABLE portable skill
+    /// ([`deliverable_portable`](Self::deliverable_portable) — the same set the directory levers
+    /// deliver, so a portable parent nesting a Claude-only child is withheld here too, and
+    /// admission refuses a unit that invokes it exactly as for pi), each landing FLAT under its
+    /// frontmatter `name` with the indexed skills nested BELOW it excluded from its copy (they
+    /// land under their own names). Sorted by `dir`, like the flags.
+    pub(crate) fn codex_skills(&self) -> Vec<crate::codex_skills::CodexSkill> {
+        self.deliverable_portable()
+            .into_iter()
+            .map(|s| {
+                let prefix = format!("{}/", s.dir);
+                let mut excluded: Vec<PathBuf> = self
+                    .skills
+                    .iter()
+                    .filter(|o| o.dir.starts_with(prefix.as_str()))
+                    .map(|o| self.skill_path(&o.dir))
+                    .collect();
+                excluded.sort();
+                crate::codex_skills::CodexSkill {
+                    name: s.name.clone(),
+                    dir: self.skill_path(&s.dir),
+                    excluded,
+                }
+            })
+            .collect()
+    }
+
+    /// The generation label the codex marker is keyed by: the verified generation directory name
+    /// and the index's content hash (`-` where a fallback root has neither — which codex is never
+    /// handed).
+    fn generation_label(&self) -> String {
+        format!(
+            "{} {}",
+            self.gen.as_deref().unwrap_or("-"),
+            self.content_hash.as_deref().unwrap_or("-")
+        )
     }
 
     /// Exact INDEX/TREE PARITY over the whole delivered closure of a PUBLISHED generation (codex
@@ -1396,6 +1523,12 @@ pub(crate) enum SkillsError {
         skills: Vec<String>,
         why: String,
     },
+    /// The seat's engine-minted configuration home could not take its skills (F-079, core#441):
+    /// codex's `CODEX_HOME/skills` could not be prepared or populated from the pinned snapshot,
+    /// or the launch has no minted home at all. The launch is refused rather than run the seat
+    /// without the skills its directive names; nothing else under the home, and never the
+    /// operator's own `~/.codex`, is touched.
+    SeatHome { cli: String, why: String },
     /// A CACHED ACP session that was opened WITHOUT a snapshot (nothing pinned — no root on the
     /// ladder at the time) was asked, on a later turn, for skills. The plugin is handed at
     /// `session/new` and never afterwards, so the session cannot be given what a NOW-available
@@ -1550,8 +1683,16 @@ impl std::fmt::Display for SkillsError {
                 "'{cli}' cannot be handed skills on this launch ({why}) but the unit requires {}; \
                  wicked delivers skills only through a per-launch lever it owns — never through a \
                  CLI's own skills directory — so route this unit to a seat with one (claude, pi, \
-                 copilot with a published copilot view, opencode) or drop its skill_ref",
+                 codex under its engine-minted CODEX_HOME, copilot with a published copilot view, \
+                 opencode) or drop its skill_ref",
                 skills.join(", ")
+            ),
+            SkillsError::SeatHome { cli, why } => write!(
+                f,
+                "'{cli}' cannot be handed its skills: {why}; the engine populates the seat's \
+                 engine-minted CODEX_HOME/skills from the pinned snapshot at launch and refuses \
+                 the launch rather than run the seat without them (nothing else under that home, \
+                 and never the operator's own ~/.codex, is touched)"
             ),
             SkillsError::CarrierWithoutSkills { carrier, skills } => write!(
                 f,
@@ -2946,8 +3087,11 @@ pub(crate) fn admit_refs(
             // for the levers that hand over original directories (pi, opencode; codex round 4):
             // copilot is judged on the VIEW crew published, whose whole tree is validated below
             // (a child copied into it refuses there; one excluded from it does not refuse the
-            // parent), and an absent lever delivers no directory at all.
-            if lever.delivers_directories() {
+            // parent), and an absent lever delivers no directory at all. codex is populated from
+            // the SAME deliverable set the directory levers hand over (F-079), so the same
+            // refusal applies: a withheld parent would otherwise be named in the directive and
+            // absent from `CODEX_HOME/skills`.
+            if lever.delivers_directories() || *lever == SkillsLever::CodexSkillsDir {
                 let nesting: Vec<(String, String)> = invoked
                     .required
                     .iter()
@@ -2978,6 +3122,9 @@ pub(crate) fn admit_refs(
                     SkillsLever::Absent => Some(
                         "this CLI has no per-launch skills lever the engine can pull".to_string(),
                     ),
+                    SkillsLever::CodexSkillsDir => {
+                        codex_hatch_reason(crate::execute_wrapped::inherits_operator_config())
+                    }
                     SkillsLever::CopilotAddDir => {
                         match snapshot.copilot_view_for(&invoked.required)? {
                             Some(_) => None,
@@ -3003,6 +3150,20 @@ pub(crate) fn admit_refs(
         }
     }
     Ok(Some(snapshot))
+}
+
+/// F-079: codex's lever IS the engine-minted `CODEX_HOME`; the hatch that runs seats under the
+/// operator's own configuration leaves nothing to populate, so a skill-bearing codex unit is
+/// refused `NoLever` naming the hatch. `None` when the hatch is off — the lever stands. Pure, so
+/// the hatch branch is tested without touching the process environment.
+fn codex_hatch_reason(inherits_operator_config: bool) -> Option<String> {
+    inherits_operator_config.then(|| {
+        format!(
+            "codex skills ride an engine-minted CODEX_HOME, which the {} hatch disables (the \
+             operator's own ~/.codex is never written)",
+            crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV
+        )
+    })
 }
 
 /// EXISTENCE, plan-wide: every ref in `plan` — of ANY family — and everything it transitively
@@ -4681,12 +4842,15 @@ mod tests {
             ],
         );
         let s = load(&root);
-        // pi has a per-launch lever (`--no-skills --skill …`); codex has none (v3.2) — the
-        // portability rules are exercised on pi, the lever rule on codex below.
+        // pi has a per-launch lever (`--no-skills --skill …`); codex has its engine-minted home
+        // (F-079); agy has none (v3.2) — the portability rules are exercised on pi, the lever
+        // rule on agy below.
         let (claude, pi) = (WorkerCli::Claude, WorkerCli::for_binaries("pi", "pi", "pi"));
         let codex = WorkerCli::for_binaries("codex", "codex", "codex");
+        let agy = WorkerCli::for_binaries("agy", "agy", "agy");
         assert_eq!(pi.lever(), SkillsLever::PiSkillFlags);
-        assert_eq!(codex.lever(), SkillsLever::Absent);
+        assert_eq!(codex.lever(), SkillsLever::CodexSkillsDir);
+        assert_eq!(agy.lever(), SkillsLever::Absent);
 
         // Nested: refused for Claude (directly AND through a mandate), admitted for pi.
         let err = admit_refs(
@@ -4787,20 +4951,20 @@ mod tests {
             Err(SkillsError::Missing { .. })
         ));
 
-        // v3.2 §3 — no lever ⇒ no skills, never a side channel: a codex unit that INVOKES a skill
+        // v3.2 §3 — no lever ⇒ no skills, never a side channel: an agy unit that INVOKES a skill
         // is refused naming the skill and the reason; one that names none runs (the snapshot is
-        // handed for the record, the delivery is empty); a codex unit in a plan where OTHER seats
+        // handed for the record, the delivery is empty); an agy unit in a plan where OTHER seats
         // invoke skills is admitted (existence is plan-wide, the lever rule is seat-specific).
         let err = admit_refs(
             Some(s.clone()),
             &RequiredRefs::seat(["wicked-garden-domain"]),
-            &codex,
+            &agy,
         )
-        .expect_err("codex has no lever");
+        .expect_err("agy has no lever");
         let SkillsError::NoLever { cli, skills, why } = &err else {
             panic!("expected NoLever, got {err:?}");
         };
-        assert_eq!(cli, "codex");
+        assert_eq!(cli, "agy");
         assert_eq!(skills, &vec!["wicked-garden-domain".to_string()]);
         assert!(why.contains("no per-launch skills lever"), "{why}");
         assert!(
@@ -4808,17 +4972,107 @@ mod tests {
                 .contains("never through a CLI's own skills directory"),
             "{err}"
         );
-        let handed = admit_refs(Some(s.clone()), &RequiredRefs::seat([]), &codex)
+        let handed = admit_refs(Some(s.clone()), &RequiredRefs::seat([]), &agy)
             .unwrap()
             .expect("the root is still handed for the record");
-        assert_eq!(handed.delivery(&codex), SkillsDelivery::None);
+        assert_eq!(handed.delivery(&agy), SkillsDelivery::None);
         assert!(admit_refs(
             Some(s.clone()),
             &RequiredRefs::plan_and_seat(["wicked-garden-domain"], []),
-            &codex
+            &agy
         )
         .unwrap()
         .is_some());
+        // F-079: codex IS admitted for a portable skill, and its delivery names the DELIVERABLE
+        // portable skills flat by frontmatter name — the nested portable child on its own, the
+        // parent with that child's directory excluded from its copy, never the Claude-only
+        // extractor — keyed by the generation and the content hash, from the same root.
+        let handed = admit_refs(
+            Some(s.clone()),
+            &RequiredRefs::seat(["wicked-garden-domain"]),
+            &codex,
+        )
+        .unwrap()
+        .expect("codex is handed the root");
+        let SkillsDelivery::CodexSkillsDir {
+            root,
+            generation,
+            skills,
+        } = handed.delivery(&codex)
+        else {
+            panic!("codex delivery: {:?}", handed.delivery(&codex));
+        };
+        assert_eq!(root, handed.root);
+        assert_eq!(
+            generation,
+            format!("12 {}", handed.content_hash.as_deref().unwrap())
+        );
+        let names: Vec<&str> = skills.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "wicked-garden-domain",
+                "wicked-garden-engineering",
+                "wicked-garden-engineering-frontend"
+            ],
+            "portable only, sorted by dir, the extractor withheld"
+        );
+        let engineering = skills
+            .iter()
+            .find(|k| k.name == "wicked-garden-engineering")
+            .unwrap();
+        assert_eq!(
+            engineering.dir,
+            handed.root.join(SKILLS_DIR).join("engineering")
+        );
+        assert_eq!(
+            engineering.excluded,
+            vec![handed
+                .root
+                .join(SKILLS_DIR)
+                .join("engineering")
+                .join("frontend")],
+            "the nested indexed child is excluded from the parent's copy"
+        );
+        assert!(skills
+            .iter()
+            .all(|k| k.name != "wicked-garden-engineering-frontend" || k.excluded.is_empty()));
+        // Under the inherit-operator-config hatch there is no minted home, so no lever: the
+        // admission's reason names the hatch (judged pure — the process environment is shared
+        // with every parallel test), and the runtime population refuses a delivery with no seat
+        // root the same way.
+        assert!(codex_hatch_reason(false).is_none());
+        assert_eq!(
+            handed.delivery_with(&codex, true),
+            SkillsDelivery::None,
+            "no minted home ⇒ codex is handed nothing (a skill-less unit runs, nothing is populated)"
+        );
+        assert!(matches!(
+            handed.delivery_with(&codex, false),
+            SkillsDelivery::CodexSkillsDir { .. }
+        ));
+        assert_eq!(
+            handed.delivery_with(&pi, true),
+            handed.delivery_with(&pi, false),
+            "the hatch changes nothing for a lever that needs no minted home"
+        );
+        let why = codex_hatch_reason(true).unwrap();
+        assert!(
+            why.contains("engine-minted CODEX_HOME")
+                && why.contains(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV),
+            "{why}"
+        );
+        let no_home = populate_seat_home(&handed.delivery(&codex), None).unwrap_err();
+        assert!(
+            no_home.contains("engine-minted CODEX_HOME")
+                && no_home.contains(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV),
+            "{no_home}"
+        );
+        assert_eq!(
+            populate_seat_home(&handed.delivery(&pi), None),
+            Ok(()),
+            "every other delivery is a no-op here"
+        );
         // copilot's lever needs the generation to publish `views/copilot`; without it the unit is
         // refused naming the view. WITH one, the view is VERIFIED for what the seat invokes (codex
         // round 3 — pass 2 admitted an EMPTY view): an empty view is `Missing` naming the skill,
@@ -5170,7 +5424,8 @@ mod tests {
         );
         assert_eq!(
             WorkerCli::for_binaries("codex", "codex-acp", "codex").lever(),
-            SkillsLever::Absent
+            SkillsLever::CodexSkillsDir,
+            "codex's lever is its engine-minted home — carrier-independent (F-079)"
         );
         assert_eq!(
             WorkerCli::for_binaries("agy", "agy-acp", "agy").lever(),
@@ -5589,13 +5844,20 @@ mod tests {
         // codex round 4: the nesting rule is scoped to the DIRECTORY levers. Copilot is handed
         // the published VIEW and judged on it (v3.3 §2): a view whose copy of the parent EXCLUDES
         // the Claude-only child admits the parent with `--add-dir <view>`; one that carries the
-        // child refuses by path. Codex (no lever) is refused as NoLever, not NestsNonPortable.
+        // child refuses by path. agy (no lever) is refused as NoLever, not NestsNonPortable;
+        // codex (F-079) is populated from the same deliverable set as pi, so it is refused like
+        // pi — NestsNonPortable, parent and child named.
         let copilot = WorkerCli::for_binaries("copilot", "copilot", "copilot");
+        let agy = WorkerCli::for_binaries("agy", "agy", "agy");
         let codex = WorkerCli::for_binaries("codex", "codex", "codex");
         let parent = RequiredRefs::seat(["wicked-garden-engineering"]);
         assert!(matches!(
-            admit_refs(Some(s.clone()), &parent, &codex),
+            admit_refs(Some(s.clone()), &parent, &agy),
             Err(SkillsError::NoLever { .. })
+        ));
+        assert!(matches!(
+            admit_refs(Some(s.clone()), &parent, &codex),
+            Err(SkillsError::NestsNonPortable { .. })
         ));
         let view = root.join("views").join("copilot");
         let parent_copy = view
@@ -6815,5 +7077,20 @@ mod tests {
             bad.acp_transport("pi").is_ok(),
             "the flags carrier spells each dir on its own"
         );
+        // A delivery of ZERO portable skills is still a delivery, and the two carriers agree on
+        // it: `--no-skills` alone on the argv (discovery OFF, nothing added), the variable SET
+        // and EMPTY behind a bridge — never unset, which would read as "no delivery" and leave
+        // discovery ON where the wrapped carrier turns it off.
+        let empty = SkillsDelivery::PiSkillFlags {
+            root: root.clone(),
+            dirs: Vec::new(),
+        };
+        assert_eq!(empty.argv_flags(), vec!["--no-skills".to_string()]);
+        let (flags, env) = empty.acp_transport("pi-acp").unwrap();
+        assert!(flags.is_empty());
+        assert_eq!(env, vec![(PI_SKILL_DIRS_ENV, OsString::new())]);
+        let (flags, env) = empty.acp_transport("pi").unwrap();
+        assert_eq!(flags, vec!["--no-skills".to_string()]);
+        assert!(env.is_empty());
     }
 }

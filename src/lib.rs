@@ -22,6 +22,7 @@ mod campaign;
 mod cli_runner;
 mod clock;
 mod code_graph;
+mod codex_skills;
 mod command;
 mod deliver_lift;
 mod diagnostic;

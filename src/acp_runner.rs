@@ -5890,6 +5890,44 @@ impl AcpStepRunner {
                 },
             );
         }
+        // F-079 (core#441), the codex lever: populate the seat's ENGINE-MINTED `CODEX_HOME/skills`
+        // from the pinned snapshot BEFORE the spawn, through the same resolver the spawn applies
+        // (`seat_config_for(seat_cli)`, the same process inputs), so a population failure is a
+        // LAUNCH ERROR naming the seat — never a spawn failure that would fall back to the
+        // wrapped carrier and populate the same home again there. A relaunch on an unchanged
+        // generation is a no-op; every other delivery skips this.
+        if matches!(
+            delivery,
+            crate::skills_snapshot::SkillsDelivery::CodexSkillsDir { .. }
+        ) {
+            let seat_root = match wicked_apps_core::spawn::seat_config_for(seat_cli)
+                .and_then(|c| c.ensure_dirs().map(|()| c))
+            {
+                Ok(c) => c.root().map(std::path::Path::to_path_buf),
+                Err(e) => {
+                    return crate::execute_wrapped::skills_refusal(
+                        input,
+                        &crate::skills_snapshot::SkillsError::SeatHome {
+                            cli: cli_key.clone(),
+                            why: format!(
+                                "the seat's configuration root could not be prepared ({e})"
+                            ),
+                        },
+                    )
+                }
+            };
+            if let Err(why) =
+                crate::skills_snapshot::populate_seat_home(&delivery, seat_root.as_deref())
+            {
+                return crate::execute_wrapped::skills_refusal(
+                    input,
+                    &crate::skills_snapshot::SkillsError::SeatHome {
+                        cli: cli_key.clone(),
+                        why,
+                    },
+                );
+            }
+        }
 
         if acp_config.transport == AcpTransport::Http {
             let reason = format!(
@@ -15382,9 +15420,10 @@ transport = "stdio"
 
     /// The ACP carrier judges pi's lever off the SEAT binary: the REAL built-in pi record carries
     /// `[cli.acp] binary = "pi-acp"` (a separate bridge program), and its identity is now
-    /// `PiSkillFlags`, not `Absent` — while codex behind `codex-acp` and agy behind `agy-acp`
-    /// stay lever-less, copilot (`copilot --acp`) and opencode (`opencode acp`) keep theirs, and
-    /// an unregistered key is its own binary.
+    /// `PiSkillFlags`, not `Absent`; codex behind `codex-acp` is `CodexSkillsDir` (its lever is
+    /// its engine-minted home, carrier-independent) — while agy behind `agy-acp` stays lever-less,
+    /// copilot (`copilot --acp`) and opencode (`opencode acp`) keep theirs, and an unregistered
+    /// key is its own binary.
     #[test]
     fn the_acp_identity_of_a_pi_seat_behind_pi_acp_is_pi_with_its_skill_flags_lever() {
         use crate::skills_snapshot::{SkillsLever, WorkerCli};
@@ -15403,9 +15442,14 @@ transport = "stdio"
                 lever: SkillsLever::PiSkillFlags
             }
         );
+        let codex = record("codex");
         assert_eq!(
-            super::seat_identity_of(Some(record("codex")), "codex").lever(),
-            SkillsLever::Absent
+            codex.acp.as_ref().map(|a| a.binary.as_str()),
+            Some("codex-acp")
+        );
+        assert_eq!(
+            super::seat_identity_of(Some(codex), "codex").lever(),
+            SkillsLever::CodexSkillsDir
         );
         assert_eq!(
             super::seat_identity_of(Some(record("agy")), "agy").lever(),
@@ -15429,6 +15473,10 @@ transport = "stdio"
         );
         assert_eq!(
             super::seat_identity_of(None, "codex").lever(),
+            SkillsLever::CodexSkillsDir
+        );
+        assert_eq!(
+            super::seat_identity_of(None, "agy").lever(),
             SkillsLever::Absent
         );
     }
@@ -15600,7 +15648,7 @@ while True:
             "protocolVersion": "2025-03-26", "capabilities": {},
             "serverInfo": {"name": "recording", "version": "0"}}})
     elif method == "session/new":
-        keys = ("WICKED_PI_SKILL_DIRS", "WICKED_GARDEN_ROOT", "PATH")
+        keys = ("WICKED_PI_SKILL_DIRS", "WICKED_GARDEN_ROOT", "CODEX_HOME", "PATH")
         record({"new": req.get("params"),
                 "env": {k: os.environ.get(k, "UNSET") for k in keys},
                 "argv": sys.argv[2:]})
@@ -15780,6 +15828,188 @@ transport = "stdio"
             "exactly one handoff, on the ACP path, naming the seat key and the generation"
         );
         runner.drop_session("run-pi");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// F-079 (core#441), the codex lever through the real `AcpStepRunner` and the merged
+    /// registry: a codex seat whose `[cli.acp]` names a SEPARATE bridge (a recording bridge at
+    /// `…/bin/codex-acp`) is `CodexSkillsDir`, not `Absent` — its skill-bearing unit is admitted
+    /// (was refused `NoLever`), and BEFORE the bridge spawns the engine populates the seat's
+    /// engine-minted `CODEX_HOME/skills` (under this test's worker home, never `~/.codex`) with
+    /// the PORTABLE skills flat by name plus a `done` generation marker; the bridge sees that
+    /// `CODEX_HOME`, the launcher environment, and no delivery flag or path-list; the prompt asks
+    /// for the skill by its mirrored name; exactly one `skillsSnapshotHanded {path: "acp", cli:
+    /// <key>}` names the generation.
+    #[test]
+    #[cfg(unix)]
+    fn a_codex_seat_over_codex_acp_gets_its_minted_home_populated_and_reports_the_handoff() {
+        use crate::skills_snapshot::test_support::{
+            gen_dir, scratch as canonical_scratch, snapshot_root_with,
+        };
+        use crate::skills_snapshot::{GARDEN_ROOT_ENV, PATH_LIST_SEPARATOR, PI_SKILL_DIRS_ENV};
+        use crate::workflow::{StepInput, StepRunner};
+        if std::env::var_os(crate::execute_wrapped::INHERIT_OPERATOR_CONFIG_ENV).is_some() {
+            return;
+        }
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
+        let home = canonical_scratch("acp-codex-lever");
+        let _home = EnvPin::set("HOME", &home);
+        let worker = home.join("worker");
+        let _worker = EnvPin::set(wicked_apps_core::spawn::WORKER_HOME_ENV, &worker);
+        let snapshot = snapshot_root_with(
+            &gen_dir(&home.join(".wicked-crew"), "5"),
+            "5",
+            &[
+                ("domain", "wicked-garden-domain", true, &[]),
+                (
+                    "domain-extractor",
+                    "wicked-garden-domain-extractor",
+                    false,
+                    &[],
+                ),
+                ("qe/a11y", "wicked-garden-qe-a11y", true, &[]),
+            ],
+        );
+        let _snap = EnvPin::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let ledger = home.join("ledger.ndjson");
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bridge = bin.join("codex-acp");
+        std::fs::rename(write_env_recording_bridge(&home), &bridge).unwrap();
+        let council = home.join(".config").join("wicked-council");
+        std::fs::create_dir_all(&council).unwrap();
+        std::fs::write(
+            council.join("clis.toml"),
+            format!(
+                r#"
+[[cli]]
+key = "codex-seat"
+display_name = "codex seat"
+binary = "codex"
+headless_invocation = "codex exec {{PROMPT}}"
+
+[cli.acp]
+binary = "{bridge}"
+start_args = ["{ledger}"]
+transport = "stdio"
+"#,
+                bridge = bridge.display(),
+                ledger = ledger.display(),
+            ),
+        )
+        .unwrap();
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runner = AcpStepRunner::new(tx);
+        let input = {
+            let mut u = crate::domain::WorkUnit::pending("run-codex:u1", "run-codex", 1, "extract");
+            u.assigned_cli = Some("codex-seat".to_string());
+            u.skill_ref = Some("wicked-garden-domain".to_string());
+            StepInput {
+                run_id: "run-codex".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-codex".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            }
+        };
+        let out = runner.run_unit(&input);
+        assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+        let entries = ledger_entries(&ledger);
+        let new = entries
+            .iter()
+            .find(|e| e.get("new").is_some())
+            .expect("session/new reached the bridge over ACP");
+        let codex_home = std::path::PathBuf::from(
+            new["env"]["CODEX_HOME"]
+                .as_str()
+                .expect("the bridge saw CODEX_HOME"),
+        );
+        assert_eq!(
+            codex_home,
+            worker.join("codex"),
+            "the engine-minted seat home under THIS test's worker home"
+        );
+        let skills = codex_home.join("skills");
+        for name in ["wicked-garden-domain", "wicked-garden-qe-a11y"] {
+            let m = std::fs::symlink_metadata(skills.join(name).join("SKILL.md"))
+                .unwrap_or_else(|e| panic!("{name} populated before the spawn: {e}"));
+            assert!(m.is_file() && !m.file_type().is_symlink());
+        }
+        assert!(
+            std::fs::symlink_metadata(skills.join("wicked-garden-domain-extractor")).is_err(),
+            "the portable:false skill never lands"
+        );
+        let marker = std::fs::read_to_string(skills.join(crate::codex_skills::GEN_MARKER)).unwrap();
+        assert!(marker.starts_with("done 5 "), "{marker}");
+        assert_eq!(
+            new["env"][GARDEN_ROOT_ENV],
+            snapshot.to_string_lossy().as_ref()
+        );
+        assert_eq!(new["env"][PI_SKILL_DIRS_ENV], "UNSET");
+        assert!(
+            new["env"]["PATH"].as_str().unwrap().starts_with(&format!(
+                "{}{PATH_LIST_SEPARATOR}",
+                snapshot.join("scripts").display()
+            )),
+            "{new}"
+        );
+        let argv: Vec<&str> = new["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            !argv
+                .iter()
+                .any(|a| *a == "--skill" || *a == "--no-skills" || *a == "--add-dir"),
+            "nothing rides the bridge's argv: {argv:?}"
+        );
+        let prompt = entries
+            .iter()
+            .find_map(|e| e.get("prompt").and_then(Value::as_str))
+            .expect("one prompt reached the bridge");
+        assert!(
+            prompt.contains("Use your skill \"wicked-garden-domain\"")
+                && !prompt.contains("NOT loaded"),
+            "{prompt}"
+        );
+        let handed: Vec<(String, String, String, Option<String>)> = rx
+            .try_iter()
+            .filter_map(|c| match c {
+                Command::EmitEvent(CoreEvent::SkillsSnapshotHanded {
+                    session,
+                    path,
+                    cli,
+                    gen,
+                    ..
+                }) => Some((session, path, cli, gen)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            handed,
+            vec![(
+                "run-codex".to_string(),
+                "acp".to_string(),
+                "codex-seat".to_string(),
+                Some("5".to_string())
+            )]
+        );
+        // The operator's own ~/.codex (under the pinned HOME) was never created.
+        assert!(std::fs::symlink_metadata(home.join(".codex")).is_err());
+        runner.drop_session("run-codex");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
