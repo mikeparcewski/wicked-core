@@ -781,12 +781,13 @@ Two release tracks share this file, newest entry first regardless of track:
   is ahead of/diverged from the remote keeps its `HEAD`, disclosed), and before the `deliver` tool
   phase runs the engine LIFTS uncommitted work on a stale base onto the remote tip in memory
   (`git merge-tree --write-tree`, git ≥ 2.38) — `deliverLiftEvaluated {outcome: unchanged |
-  lifted | conflict | skipped, baseRef, baseBefore, baseAfter, treeBefore, treeAfter, conflicts,
-  note}`. A conflict fails the deliver unit with a `LIFT-CONFLICT` remedy naming the files and
-  leaves the worktree exactly as verified; a lift RE-RUNS the repository's own checks on the
-  lifted tree (`repoChecksEvaluated` for the deliver unit) and the push runs only when they pass —
-  the deliver gate never pushes a tree that was not verified. A branch carrying its own commits
-  is skipped (the deliver rebase replays that history, as before). (2) On
+  lifted | conflict | skipped | failed, baseRef, baseBefore, baseAfter, treeBefore, treeAfter,
+  conflicts, note}`. A conflict fails the deliver unit with a `LIFT-CONFLICT` remedy naming the
+  files and leaves the worktree exactly as verified; a lift RE-RUNS the repository's own checks on
+  the lifted tree (`repoChecksEvaluated` for the deliver unit) and the push runs only when they
+  pass; an apply-phase failure (`failed`) fails the unit closed rather than letting the script run
+  on a partial tree — the deliver gate never pushes a tree that was not verified. A branch
+  carrying its own commits is skipped (the deliver rebase replays that history, as before). (2) On
   `evaluatorMutatedWorktree` the only choices were Approve — which re-baselined on the CURRENT
   tree, silently adopting the evaluator's edit — or cancel, and the engine's remedy was a shell
   command. The worker thread now restores the creator's tree itself (`HEAD` reset when moved,
@@ -801,11 +802,18 @@ Two release tracks share this file, newest entry first regardless of track:
   wrapped argv path (`--exclude-tools edit,write`); a pi evaluator not admitted to input
   governance was answered `allow_result` and rewrote the fix under review. Every
   `executes_code: false` unit's ACP turn now refuses write-class `session/request_permission`
-  calls (edit/delete/move by ACP `kind`, or a write tool by name — pi's lower-case `edit`/`write`
-  included) with the agent's reject option, for admitted and unadmitted seats alike, disclosed
-  as `evaluatorToolCallDenied {cli, carrier: "acp", tool, kind, path, reason}`; `bash` stays
-  (posture, not guarantee — the worktree guard remains the backstop). core-ts `index.d.ts`
-  documents the new frames; the key sets are pinned by the binding's own tests.
+  calls (edit/delete/move by ACP `kind`, or a write tool by name or verb-first prefix — pi's
+  lower-case `edit`/`write` and the `str_replace_*` family included) with the agent's reject
+  option, disclosed as `evaluatorToolCallDenied {cli, carrier: "acp", tool, kind, path,
+  reason}`; and because an UNADMITTED adapter never asks (pi-acp executes with zero permission
+  round-trips, codex-acp auto-resolves edits), a guarded unit on such a seat is routed to the
+  wrapped carrier — where the read-only lever is an argv fact — with `acpFallback
+  {fallbackKind: "read_only_requires_wrapped"}`. `bash` stays (posture, not guarantee — the
+  worktree guard remains the backstop, and its restore now runs for every exit status, re-attaches
+  a switched/detached `HEAD` via the recorded `WorktreeSnapshot.head_ref`, and reports an unborn
+  baseline honestly). The deliver command receives `WICKED_DELIVER_VERIFIED_BASE` (the verified
+  remote-tip commit) so crew's script can refuse a base that moved after the re-verify. core-ts
+  `index.d.ts` documents the new frames; the key sets are pinned by the binding's own tests.
 - **Repo graphs live under the daemon state home; an in-tree `.codegraph/` is never adopted
   (#406; F-016 / F-024).** `registerRepo`/onboarding minted every repo's code graph under the
   OPERATOR's `~/.wicked-estate/repo-graphs/<key>` whatever `--db` said — two daemons on one host

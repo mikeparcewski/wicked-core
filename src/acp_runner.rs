@@ -4244,6 +4244,15 @@ pub(crate) mod fallback_kind {
     /// Emitting nothing here would make "governed units are slower" an unexplained mystery, which is
     /// how the ungoverned ACP path went unnoticed in the first place.
     pub const GOVERNANCE_REQUIRES_WRAPPED: &str = "governance_requires_wrapped";
+    /// (core#431, F-3R2-009; Copilot on #433) An `executes_code: false` unit on a seat whose ACP
+    /// adapter is NOT admitted to input governance — the admission proof is precisely that the
+    /// adapter blocks on `session/request_permission` for every tool call, and the registry
+    /// documents that `pi-acp` executes tools with ZERO permission round-trips and `codex-acp`
+    /// auto-resolves its edit intents. On such a seat the permission-boundary read-only posture
+    /// is unreachable, so the unit is routed to the WRAPPED carrier, where the seat's read-only
+    /// lever is an argv fact (`--exclude-tools edit,write`, `--sandbox read-only`; a lever-less
+    /// seat with a write grant is refused there — F-036). Not a failure; a disclosed route.
+    pub const READ_ONLY_REQUIRES_WRAPPED: &str = "read_only_requires_wrapped";
     // RETIRED: `handshake_failed`. Its only emitter was the governed-ACP branch removed with
     // FINDING-060. The shared session path reports every startup failure — spawn or handshake — as
     // `binary_unavailable`, so the slug is no longer produced; a consumer still switching on it is
@@ -5555,6 +5564,35 @@ impl AcpStepRunner {
         let acp_admitted = acp_cfg_probe
             .as_ref()
             .is_some_and(|c| c.acp_input_governance);
+        // core#431 (F-3R2-009), Copilot on #433: a READ-ONLY (executes_code:false) unit may run
+        // on this carrier only when the seat's adapter provably asks permission per tool call —
+        // which is exactly what `acp_input_governance` admission certifies. An unadmitted seat
+        // (pi-acp: zero permission round-trips; codex-acp: auto-resolved edits) would answer the
+        // posture with silence, so the unit takes the wrapped carrier, where the read-only lever
+        // is an argv fact and the worktree guard + restore still hold. Decided BEFORE the
+        // `gate_ctx` match below (Copilot, second pass): that match discloses `governanceUnenforced`
+        // ("answered by allow_result") for an unadmitted seat, which would be a false claim about
+        // a unit that never starts an ACP turn — the wrapped runner reports its own carrier.
+        if acp_read_only_requires_wrapped(acp_cfg_probe.as_ref(), &input.unit) {
+            let reason = format!(
+                "[wicked-core] unit {} (phase `{}`) declares executes_code:false, and seat \
+                 '{cli_key}' has an ACP adapter that is not admitted to input governance \
+                 (acp_input_governance=false) — its tool calls are not answered through \
+                 session/request_permission, so the ACP read-only posture cannot be applied; \
+                 running it single-shot on the wrapped carrier with the seat's read-only lever \
+                 (F-036 / core#431)",
+                input.unit.ord,
+                input.unit.phase_id().unwrap_or("?"),
+            );
+            self.emit_event(CoreEvent::AcpFallback {
+                session: run_id.clone(),
+                cli_key: cli_key.clone(),
+                reason: reason.clone(),
+                fallback_kind: fallback_kind::READ_ONLY_REQUIRES_WRAPPED.to_string(),
+            });
+            return fallback_with_warning(reason, input, emit, &self.fallback);
+        }
+
         let mut gate_ctx = match (&input.governance, acp_admitted) {
             (Some(g), true) => {
                 let scope =
@@ -6380,6 +6418,20 @@ fn acp_ungoverned_event(input: &StepInput, cli_key: &str) -> Option<CoreEvent> {
 /// registry state for testing.
 fn acp_unadmitted_but_configured(acp_cfg: Option<&AcpConfig>) -> bool {
     matches!(acp_cfg, Some(cfg) if !cfg.acp_input_governance)
+}
+
+/// (core#431, F-3R2-009; Copilot on #433) Must this unit leave the ACP carrier for the wrapped
+/// one to be READ-ONLY? True for a worktree-guarded (`executes_code: false`) unit on a seat that
+/// HAS an ACP config but is NOT admitted to input governance: admission is the proof that the
+/// adapter blocks on `session/request_permission` per tool call, and without it the permission-
+/// boundary posture never fires (pi-acp executes with zero round-trips). An admitted seat stays
+/// on ACP with the posture applied; a seat with no ACP config never enters this path at all; a
+/// creator unit is never rerouted (it must write). Pure — testable with a fabricated config.
+fn acp_read_only_requires_wrapped(
+    acp_cfg: Option<&AcpConfig>,
+    unit: &crate::domain::WorkUnit,
+) -> bool {
+    crate::worktree_guard::applies_to(unit) && acp_unadmitted_but_configured(acp_cfg)
 }
 
 #[cfg(test)]
@@ -10010,6 +10062,10 @@ headless_invocation = "claude -p \"{{PROMPT}}\""
 binary = "{bridge}"
 start_args = ["{ledger}"]
 transport = "stdio"
+# core#431: only an ADMITTED adapter carries an `executes_code: false` unit on this carrier (an
+# unadmitted one is routed to the wrapped carrier, where the read-only lever is an argv fact), so
+# the evaluator turn under test declares admission — the process-isolation contract is theirs.
+acp_input_governance = true
 "#,
                 bridge = bridge.display(),
                 ledger = ledger.display(),
@@ -12529,6 +12585,46 @@ transport = "stdio"
         assert!(!is_notification(&response));
     }
 
+    /// core#431 (F-3R2-009), Copilot on #433: the permission-boundary posture is only reachable
+    /// on a seat whose adapter ASKS — which admission certifies. A guarded unit on an unadmitted
+    /// ACP seat (pi-acp, codex-acp) must leave for the wrapped carrier; an admitted seat stays; a
+    /// seat with no ACP config never routes here; a creator unit is never rerouted.
+    #[test]
+    fn a_read_only_unit_on_an_unadmitted_acp_seat_is_routed_to_the_wrapped_carrier() {
+        let cfg = |admitted: bool| AcpConfig {
+            binary: "pi-acp".into(),
+            start_args: vec![],
+            transport: Default::default(),
+            auth_method: None,
+            acp_input_governance: admitted,
+            os_sandbox: false,
+            acp_governance_env: None,
+            verified_version: None,
+        };
+        let mut evaluator = crate::domain::WorkUnit::pending("r:verify", "r", 4, "verify");
+        evaluator.worktree_guarded = true;
+        let creator = crate::domain::WorkUnit::pending("r:fix", "r", 3, "fix");
+        assert!(super::acp_read_only_requires_wrapped(
+            Some(&cfg(false)),
+            &evaluator
+        ));
+        assert!(!super::acp_read_only_requires_wrapped(
+            Some(&cfg(true)),
+            &evaluator
+        ));
+        assert!(!super::acp_read_only_requires_wrapped(None, &evaluator));
+        assert!(!super::acp_read_only_requires_wrapped(
+            Some(&cfg(false)),
+            &creator
+        ));
+        let mut tool = evaluator.clone();
+        tool.tool_cmd = Some(vec!["true".into()]);
+        assert!(
+            !super::acp_read_only_requires_wrapped(Some(&cfg(false)), &tool),
+            "a tool unit is the engine's own command, never a seat's turn"
+        );
+    }
+
     /// core#431 (F-3R2-009): an `executes_code: false` unit on the ACP carrier is READ-ONLY even
     /// with NO governance gate (the unadmitted-seat shape that let pi rewrite the fix under
     /// review). A write-class request is answered with the agent's REJECT option and disclosed as
@@ -12575,6 +12671,7 @@ transport = "stdio"
         super::answer_permission_request(
             &mut sink,
             &lock,
+            None,
             None,
             Some(&ro),
             &frame("edit", "edit", 7),
@@ -12626,6 +12723,7 @@ transport = "stdio"
             &mut sink,
             &lock,
             None,
+            None,
             Some(&ro),
             &frame("read", "read", 8),
             &mut output,
@@ -12641,6 +12739,7 @@ transport = "stdio"
         super::answer_permission_request(
             &mut sink,
             &lock,
+            None,
             None,
             None,
             &frame("edit", "edit", 9),
@@ -12739,7 +12838,16 @@ transport = "stdio"
             "jsonrpc":"2.0","id":null,"method":"session/request_permission",
             "params":{"options":[{"optionId":"allow","kind":"allow_once"}]}
         });
-        answer_permission_request(&mut sink, &lock, None, None, &frame, &mut output, 4096);
+        answer_permission_request(
+            &mut sink,
+            &lock,
+            None,
+            None,
+            None,
+            &frame,
+            &mut output,
+            4096,
+        );
         let answered: serde_json::Value =
             serde_json::from_str(std::str::from_utf8(&sink).unwrap().trim_end())
                 .expect("an explicit null id must still be answered");
@@ -12753,6 +12861,7 @@ transport = "stdio"
         answer_permission_request(
             &mut sink2,
             &lock,
+            None,
             None,
             None,
             &note_frame,
@@ -12777,6 +12886,7 @@ transport = "stdio"
         answer_permission_request(
             &mut BrokenPipe,
             &lock,
+            None,
             None,
             None,
             &frame,

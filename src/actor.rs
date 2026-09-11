@@ -1751,7 +1751,7 @@ pub(crate) fn run(
                     &self_tx,
                     output,
                     agent_verdict,
-                    evidence,
+                    *evidence,
                     &path,
                     &lifecycle_maps,
                     &actor_maps,
@@ -5626,11 +5626,20 @@ fn dispatch_unit(
                     });
                     match lifted {
                         Some(Err(text)) => (text, crate::workflow::StepStatus::Failed),
-                        Some(Ok(report)) => {
-                            lift_checks = report;
-                            run_tool_cmd(&cmd, workdir.as_deref())
+                        Some(Ok(clearance)) => {
+                            lift_checks = clearance.checks;
+                            // The verified tip rides to the script (Copilot on #433): its own
+                            // fetch + rebase + push can still race a remote that advances in
+                            // the window; with this it can refuse or re-verify a moved base.
+                            let env: Vec<(String, String)> = clearance
+                                .verified_base
+                                .map(|b| {
+                                    vec![(crate::deliver_lift::VERIFIED_BASE_ENV.to_string(), b)]
+                                })
+                                .unwrap_or_default();
+                            run_tool_cmd(&cmd, workdir.as_deref(), &env)
                         }
-                        None => run_tool_cmd(&cmd, workdir.as_deref()),
+                        None => run_tool_cmd(&cmd, workdir.as_deref(), &[]),
                     }
                 }
                 Err(e) => {
@@ -5665,10 +5674,10 @@ fn dispatch_unit(
                 // A Tool unit is the engine's own command: no seat, no guard — and no repo
                 // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
                 // here so the fold persists it on the unit and names the floor on the gate.
-                evidence: crate::workflow::UnitEvidence {
+                evidence: Box::new(crate::workflow::UnitEvidence {
                     worktree_guard: None,
                     repo_checks: lift_checks,
-                },
+                }),
                 process_gen: None, // PTY path — not bus-dispatched; no stale-result guard needed
                 launch_seq: 0,
                 ack: None,
@@ -5731,7 +5740,7 @@ fn dispatch_unit(
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,
-            evidence,
+            evidence: Box::new(evidence),
             process_gen: None, // local-path worker; bus consumer sets these in T7
             launch_seq: 0,
             ack: None,
@@ -5763,8 +5772,13 @@ fn run_required_skills(units: &[crate::domain::WorkUnit]) -> Vec<String> {
 
 /// Spawn a tool command in `workdir` (session root), collect all stdout+stderr, and return
 /// `(output, StepStatus)`. Exit 0 → `StepStatus::Ok`; anything else → `StepStatus::Failed`.
-/// Called off the actor thread (blocking subprocess).
-fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workflow::StepStatus) {
+/// Called off the actor thread (blocking subprocess). `extra_env` rides on top of the hardened
+/// environment — the deliver lift's `WICKED_DELIVER_VERIFIED_BASE` (core#431), nothing else today.
+fn run_tool_cmd(
+    cmd: &[String],
+    workdir: Option<&str>,
+    extra_env: &[(String, String)],
+) -> (String, crate::workflow::StepStatus) {
     use std::process::Command;
     let Some(bin) = cmd.first() else {
         return (
@@ -5791,6 +5805,9 @@ fn run_tool_cmd(cmd: &[String], workdir: Option<&str>) -> (String, crate::workfl
     };
     let mut proc = Command::new(bin);
     proc.hardened().args(&cmd[1..]);
+    for (k, v) in extra_env {
+        proc.env(k, v);
+    }
     if let Some(wd) = workdir {
         proc.current_dir(wd);
     }

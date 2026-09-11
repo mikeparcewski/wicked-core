@@ -68,9 +68,15 @@ pub(crate) enum LiftOutcome {
     Lifted,
     /// The lift would conflict; the worktree was left exactly as verified.
     Conflict,
-    /// The lift could not be decided or applied (no remote, fetch failed, git too old, a
-    /// history the engine does not lift) — the deliver script's own rebase stands, as before.
+    /// The lift could not be DECIDED (no remote, fetch failed, git too old, a history the
+    /// engine does not lift) — the worktree was never touched, so the deliver script's own
+    /// rebase stands, as before.
     Skipped,
+    /// The lift was decided and its APPLICATION failed part-way (`read-tree`/`reset` refused, or
+    /// the post-lift snapshot is neither the verified nor the lifted tree). The worktree may be
+    /// in a partial state, so this FAILS the deliver unit — never a silent proceed (Copilot on
+    /// #433). The operator inspects the worktree; nothing was pushed.
+    Failed,
 }
 
 impl LiftOutcome {
@@ -80,6 +86,7 @@ impl LiftOutcome {
             LiftOutcome::Lifted => "lifted",
             LiftOutcome::Conflict => "conflict",
             LiftOutcome::Skipped => "skipped",
+            LiftOutcome::Failed => "failed",
         }
     }
 }
@@ -166,30 +173,34 @@ pub(crate) fn resolve_remote_default(cwd: &Path) -> Option<String> {
 }
 
 fn resolve_remote_default_env(cwd: &Path, env: &[(&str, &Path)]) -> Option<String> {
+    let resolves = |name: &str| {
+        git(
+            cwd,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{name}^{{commit}}"),
+            ],
+            env,
+        )
+        .is_ok()
+    };
+    // `origin/HEAD` is a symbolic ref; its TARGET can be gone (the remote renamed or deleted its
+    // default branch, and `fetch --prune` dropped the tracking ref) — accept it only when it
+    // resolves to a commit, else fall through to the fixed candidates (Copilot on #433).
     if let Ok(s) = git_string(
         cwd,
         &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
         env,
     ) {
-        if !s.is_empty() {
+        if !s.is_empty() && resolves(&s) {
             return Some(s);
         }
     }
     ["origin/main", "origin/master"]
         .into_iter()
-        .find(|cand| {
-            git(
-                cwd,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/remotes/{cand}"),
-                ],
-                env,
-            )
-            .is_ok()
-        })
+        .find(|cand| resolves(cand))
         .map(str::to_string)
 }
 
@@ -382,68 +393,70 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
     // Apply: content first (index + working tree = the lifted tree, judged against the OLD
     // base), then move the branch pointer under it. Ignored artifacts (node_modules, dist)
     // are in no tree and are untouched.
+    //
+    // From here on the worktree is being CHANGED: a failure is `Failed` (the deliver unit fails
+    // closed and the operator inspects the tree), never `Skipped` (which lets the script run)
+    // — Copilot on #433.
+    let failed = |tree_after: Option<String>, note: String| LiftReport {
+        outcome: LiftOutcome::Failed,
+        base_ref: Some(base_ref.clone()),
+        base_before: Some(head.clone()),
+        base_after: Some(tip.clone()),
+        tree_before: Some(before.tree.clone()),
+        tree_after,
+        conflicts: Vec::new(),
+        note: Some(note),
+    };
     if let Err(e) = git(
         worktree,
         &["read-tree", "--reset", "-u", &lifted_tree],
         &env,
     ) {
-        return LiftReport {
-            outcome: LiftOutcome::Skipped,
-            base_ref: Some(base_ref),
-            base_before: Some(head),
-            base_after: Some(tip),
-            tree_before: Some(before.tree),
-            tree_after: Some(lifted_tree),
-            conflicts: Vec::new(),
-            note: Some(format!(
-                "the lifted tree could not be checked out into the worktree ({e}); the deliver \
-                 rebase stands"
-            )),
-        };
+        return failed(
+            Some(lifted_tree),
+            format!(
+                "the lifted tree could not be checked out into the worktree ({e}); the worktree \
+                 may hold a partial checkout — inspect it before delivering"
+            ),
+        );
     }
     if let Err(e) = git(worktree, &["reset", "--soft", &tip], &env) {
-        return LiftReport {
-            outcome: LiftOutcome::Skipped,
+        return failed(
+            Some(lifted_tree),
+            format!(
+                "the worktree holds the lifted content but the run branch could not be moved to \
+                 the remote tip ({e}); inspect the branch before delivering"
+            ),
+        );
+    }
+    // Prove it: the content is what the merge produced, and HEAD is the tip. Anything else is
+    // a tree nobody verified — fail closed.
+    match snapshot_through(worktree, &git_dir) {
+        Ok(after) if after.tree == lifted_tree && after.head == tip => LiftReport {
+            outcome: LiftOutcome::Lifted,
             base_ref: Some(base_ref),
             base_before: Some(head),
             base_after: Some(tip),
             tree_before: Some(before.tree),
-            tree_after: Some(lifted_tree),
+            tree_after: Some(after.tree),
             conflicts: Vec::new(),
-            note: Some(format!(
-                "the worktree holds the lifted content but the run branch could not be moved to \
-                 the remote tip ({e}); the deliver rebase stands"
-            )),
-        };
-    }
-    // Prove it: the content is what the merge produced, and HEAD is the tip.
-    let (tree_after, note) = match snapshot_through(worktree, &git_dir) {
-        Ok(after) if after.tree == lifted_tree && after.head == tip => (after.tree, fetch_note),
-        Ok(after) => (
-            after.tree.clone(),
-            Some(format!(
-                "post-lift check: tree {} (merge said {}), HEAD {} (tip {}){}",
+            note: fetch_note,
+        },
+        Ok(after) => failed(
+            Some(after.tree.clone()),
+            format!(
+                "post-lift check failed: tree {} (the merge produced {}), HEAD {} (the tip is {}) \
+                 — the worktree holds a tree nobody verified",
                 short(&after.tree),
                 short(&lifted_tree),
                 short(&after.head),
                 short(&tip),
-                fetch_note
-                    .as_deref()
-                    .map(|f| format!("; {f}"))
-                    .unwrap_or_default()
-            )),
+            ),
         ),
-        Err(e) => (lifted_tree, Some(format!("post-lift snapshot failed: {e}"))),
-    };
-    LiftReport {
-        outcome: LiftOutcome::Lifted,
-        base_ref: Some(base_ref),
-        base_before: Some(head),
-        base_after: Some(tip),
-        tree_before: Some(before.tree),
-        tree_after: Some(tree_after),
-        conflicts: Vec::new(),
-        note,
+        Err(e) => failed(
+            Some(lifted_tree),
+            format!("post-lift snapshot failed: {e} — the worktree state cannot be proven"),
+        ),
     }
 }
 
@@ -472,18 +485,37 @@ pub(crate) fn lift_context(
     })
 }
 
+/// The env var the deliver command receives with the remote-tip commit the engine verified
+/// against (`WICKED_DELIVER_VERIFIED_BASE`, core#431; Copilot on #433). The engine's lift and
+/// re-verify happen BEFORE the deliver script's own `fetch` + `rebase` + `push`; if the remote
+/// advances in that window the script's rebase would move the base again, past what was
+/// verified. The script can close the window itself: after its fetch, refuse (or re-verify) when
+/// `origin/<default>` is no longer this commit. Absent when the lift was skipped (no remote /
+/// no default ref / a history the engine does not lift).
+pub(crate) const VERIFIED_BASE_ENV: &str = "WICKED_DELIVER_VERIFIED_BASE";
+
+/// What the deliver command may proceed with once the lift cleared it.
+pub(crate) struct LiftClearance {
+    /// The re-verify report when the tree was LIFTED and the checks passed — the unit's evidence.
+    pub checks: Option<crate::repo_checks::RepoChecksReport>,
+    /// The remote-tip commit the run's work now sits on and was verified against (`unchanged`
+    /// or `lifted`); `None` when the lift was skipped.
+    pub verified_base: Option<String>,
+}
+
 /// Lift + re-verify for the deliver unit, off the actor thread, emitting the record through
-/// `emit`. `Ok(None)` ⇒ proceed to the command (unchanged/skipped); `Ok(Some(report))` ⇒ the
-/// tree was lifted and the repository's checks PASSED on it (the report is the unit's evidence);
-/// `Err(text)` ⇒ do NOT run the command — the unit fails with `text` (a conflict, or a failed
-/// re-verify; `repoChecksEvaluated` was emitted for the latter).
+/// `emit`. `Ok(clearance)` ⇒ proceed to the command — `checks` is `Some` only when the tree was
+/// lifted and the repository's checks PASSED on it, `verified_base` names the tip the script
+/// should still see after its own fetch. `Err(text)` ⇒ do NOT run the command — the unit fails
+/// with `text` (a conflict, or a failed re-verify; `repoChecksEvaluated` was emitted for the
+/// latter).
 pub(crate) fn lift_and_reverify(
     ctx: &LiftContext,
     run_id: &str,
     ord: u32,
     attempt: u32,
     emit: &dyn Fn(CoreEvent),
-) -> Result<Option<crate::repo_checks::RepoChecksReport>, String> {
+) -> Result<LiftClearance, String> {
     let report = lift_onto_remote_default(&ctx.worktree, &ctx.repo_root);
     emit(report.to_event(run_id, ord, attempt));
     let base_ref = report
@@ -498,15 +530,28 @@ pub(crate) fn lift_and_reverify(
                  already at {base_ref} ({tip}); the verified tree ships",
                 report.base_before.as_deref().map(short).unwrap_or("?")
             );
-            Ok(None)
+            Ok(LiftClearance {
+                checks: None,
+                verified_base: report.base_after.clone(),
+            })
         }
         LiftOutcome::Skipped => {
             eprintln!(
                 "wicked-core: deliver lift for unit {ord}: skipped — {}",
                 report.note.as_deref().unwrap_or("no reason recorded")
             );
-            Ok(None)
+            Ok(LiftClearance {
+                checks: None,
+                verified_base: None,
+            })
         }
+        LiftOutcome::Failed => Err(format!(
+            "deliver: the lift onto {base_ref} ({tip}) could not be applied cleanly — {}. \
+             Nothing was pushed — the deliver gate never pushes a tree that was not verified. \
+             Inspect the worktree (it may hold a partial checkout), restore or fix it, and \
+             approve to retry the deliver phase.",
+            report.note.as_deref().unwrap_or("no reason recorded")
+        )),
         LiftOutcome::Conflict => Err(format!(
             "deliver: LIFT-CONFLICT — lifting the run's work onto {base_ref} ({tip}) would \
              conflict in: {}. The worktree was left exactly as verified (base {}); nothing was \
@@ -530,7 +575,10 @@ pub(crate) fn lift_and_reverify(
                 checks.summary()
             );
             if checks.passed {
-                Ok(Some(checks))
+                Ok(LiftClearance {
+                    checks: Some(checks),
+                    verified_base: report.base_after.clone(),
+                })
             } else {
                 emit(CoreEvent::RepoChecksEvaluated {
                     session: run_id.to_string(),
@@ -789,6 +837,38 @@ mod tests {
             r.note
         );
         assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), head, "nothing moved");
+    }
+
+    /// Copilot on #433: `origin/HEAD` pointing at a tracking ref that no longer exists (the remote
+    /// renamed its default branch; `fetch --prune` dropped the old ref) must not be accepted just
+    /// because `symbolic-ref` succeeded — the `origin/main` fallback is right there.
+    #[test]
+    fn a_dangling_origin_head_falls_through_to_the_fixed_candidates() {
+        let (clone, wt) = stale_base_layout("dangling-head");
+        run_git(
+            &clone,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/renamed-away",
+            ],
+        );
+        assert_eq!(
+            run_git(
+                &clone,
+                &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"]
+            ),
+            "origin/renamed-away",
+            "premise: origin/HEAD is dangling"
+        );
+        assert_eq!(
+            resolve_remote_default(&clone).as_deref(),
+            Some("origin/main"),
+            "the dangling symbolic ref is skipped for a candidate that resolves"
+        );
+        let r = lift_onto_remote_default(&wt, &clone);
+        assert_eq!(r.outcome, LiftOutcome::Unchanged, "{r:?}");
+        assert_eq!(r.base_ref.as_deref(), Some("origin/main"));
     }
 
     #[test]

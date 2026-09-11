@@ -101,6 +101,12 @@ use wicked_apps_core::spawn::HardenedCommand;
 pub struct WorktreeSnapshot {
     /// `HEAD`'s commit id; empty on an unborn branch.
     pub head: String,
+    /// The ref `HEAD` is attached to (`refs/heads/wicked/<run>`), or `None` when detached — or
+    /// when the snapshot predates this field (core#431; Copilot on #433). A guarded phase that
+    /// `git switch`es the worktree to another branch at the SAME commit moves nothing the commit
+    /// id can see; this is what catches it, and what the restore reattaches `HEAD` to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ref: Option<String>,
     /// The tree object id over tracked + untracked-not-ignored content.
     pub tree: String,
     /// Wall-clock millis when taken (informational).
@@ -332,6 +338,10 @@ pub(crate) fn snapshot_through(
         &pinned,
     )
     .unwrap_or_default();
+    // The symbolic ref, when attached (`symbolic-ref -q` exits 1 on a detached HEAD).
+    let head_ref = git_string(worktree, &["symbolic-ref", "-q", "HEAD"], &pinned)
+        .ok()
+        .filter(|r| !r.is_empty());
     let tmp_index = scratch_index_path();
     // A stale scratch file from a crashed run would seed the index — refuse to start from one.
     let _ = std::fs::remove_file(&tmp_index);
@@ -368,6 +378,7 @@ pub(crate) fn snapshot_through(
     let tree = result?;
     Ok(WorktreeSnapshot {
         head,
+        head_ref,
         tree,
         taken_at_ms: now_ms(),
         git_dir: Some(git_dir.to_string_lossy().into_owned()),
@@ -424,7 +435,11 @@ fn compare_with_after(
     };
     let git_dir = Path::new(git_dir);
     let after = snapshot_through(worktree, git_dir)?;
-    let head_moved = after.head != before.head;
+    // A moved commit id, OR a re-attached/detached `HEAD` at the same commit (`git switch -c
+    // other`, `git checkout --detach`): the run branch is no longer what the worktree is on.
+    // Only judged when the baseline recorded a ref (a pre-field baseline compares by commit).
+    let ref_moved = before.head_ref.is_some() && after.head_ref != before.head_ref;
+    let head_moved = after.head != before.head || ref_moved;
     if after.tree == before.tree && !head_moved {
         return Ok((after, None));
     }
@@ -491,7 +506,28 @@ pub(crate) fn restore_creator_tree(
         };
         let git_dir = Path::new(git_dir);
         let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
-        if m.head_moved && !m.before.head.is_empty() {
+        if m.head_moved {
+            // An unborn baseline (`head` empty) cannot be "reset to" — there is no commit to
+            // point at; say so instead of marking a still-moved HEAD restored (Copilot on #433).
+            // Run worktrees are always minted from a commit, so this is the generic guard.
+            if m.before.head.is_empty() {
+                anyhow::bail!(
+                    "HEAD moved off an unborn baseline branch — the engine cannot restore an \
+                     unborn HEAD; reset the run branch by hand"
+                );
+            }
+            // Re-attach HEAD to the run branch first when the phase switched or detached it
+            // (Copilot on #433): `reset --soft` moves whatever HEAD points at, and moving some
+            // OTHER branch would leave the worktree on the wrong ref with the right commit. A
+            // baseline from a pre-`head_ref` engine cannot say which ref that is — refuse
+            // rather than move whatever branch happens to be checked out (Copilot, second pass).
+            let Some(base_ref) = m.before.head_ref.as_deref() else {
+                anyhow::bail!(
+                    "HEAD moved and the baseline predates the run-branch record (no head_ref) — \
+                     the engine will not reset a branch it cannot name; restore by hand"
+                );
+            };
+            git(worktree, &["symbolic-ref", "HEAD", base_ref], &env)?;
             git(worktree, &["reset", "--soft", &m.before.head], &env)?;
         }
         git(
@@ -534,12 +570,21 @@ pub(crate) fn restore_creator_tree(
                 short(&m.before.tree)
             );
         }
-        if m.head_moved && !m.before.head.is_empty() && now.head != m.before.head {
-            anyhow::bail!(
-                "after the restore HEAD is {} but the baseline HEAD is {}",
-                short(&now.head),
-                short(&m.before.head)
-            );
+        if m.head_moved {
+            if now.head != m.before.head {
+                anyhow::bail!(
+                    "after the restore HEAD is {} but the baseline HEAD is {}",
+                    short(&now.head),
+                    short(&m.before.head)
+                );
+            }
+            if m.before.head_ref.is_some() && now.head_ref != m.before.head_ref {
+                anyhow::bail!(
+                    "after the restore HEAD is attached to {:?} but the baseline was {:?}",
+                    now.head_ref,
+                    m.before.head_ref
+                );
+            }
         }
         Ok(())
     })();
@@ -890,6 +935,54 @@ mod tests {
         );
     }
 
+    /// Copilot on #433: the phase `git switch -c other` (same commit) and edits there. The commit
+    /// id alone would call HEAD unmoved; the recorded symbolic ref catches the switch, and the
+    /// restore re-attaches HEAD to the run branch before resetting — never leaving the worktree
+    /// on the wrong branch with the right commit.
+    #[test]
+    fn a_restore_reattaches_a_head_the_evaluator_switched_or_detached() {
+        let wt = creator_worktree("restore-ref");
+        let before = snapshot(&wt, &repo_of(&wt)).unwrap();
+        assert_eq!(
+            before.head_ref.as_deref(),
+            Some("refs/heads/wicked/restore-ref"),
+            "the baseline records the run branch"
+        );
+        run_git(&wt, &["switch", "-q", "-c", "evaluators-branch"]);
+        std::fs::write(
+            wt.join("src/a.ts"),
+            "export const a = 7; // on another branch\n",
+        )
+        .unwrap();
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(m.head_moved, "a switched ref counts as a moved HEAD");
+        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        assert!(m.restored, "{:?}", m.restore_error);
+        assert_eq!(
+            run_git(&wt, &["symbolic-ref", "-q", "HEAD"]),
+            "refs/heads/wicked/restore-ref",
+            "HEAD is re-attached to the run branch"
+        );
+        assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), before.head);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "export const a = 2; // fixed\n"
+        );
+        assert!(compare(&wt, &before).unwrap().is_none(), "clean again");
+
+        // Detached at the same commit + an edit: same outcome.
+        run_git(&wt, &["checkout", "-q", "--detach"]);
+        std::fs::write(wt.join("src/a.ts"), "export const a = 8; // detached\n").unwrap();
+        let mut m = compare(&wt, &before).unwrap().expect("the tree changed");
+        assert!(m.head_moved, "a detached HEAD counts as moved");
+        restore_creator_tree(&wt, &mut m).expect("restore succeeds");
+        assert_eq!(
+            run_git(&wt, &["symbolic-ref", "-q", "HEAD"]),
+            "refs/heads/wicked/restore-ref"
+        );
+        assert!(compare(&wt, &before).unwrap().is_none());
+    }
+
     #[test]
     fn an_untouched_tree_is_clean_and_ignored_or_engine_scratch_files_never_count() {
         let wt = creator_worktree("clean");
@@ -1174,6 +1267,7 @@ mod tests {
         let dir = scratch("nongit");
         let mut unit = guarded_unit();
         unit.worktree_baseline = Some(WorktreeSnapshot {
+            head_ref: None,
             head: String::new(),
             tree: "0".repeat(40),
             taken_at_ms: 0,

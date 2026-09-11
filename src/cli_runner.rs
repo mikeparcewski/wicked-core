@@ -843,11 +843,12 @@ fn run_unit_and_judge_with_roster(
     // now (the seat's process group is killed when it exits; each check's group likewise), so
     // this is the tree the gate is actually judging. The first look above only decided whether
     // the checks were worth running; the fold sees THIS.
-    let mut worktree_guard = if output.status == StepStatus::Ok {
-        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
-    } else {
-        None
-    };
+    // Taken for EVERY status (Copilot on #433): a guarded seat that writes to the tree and then
+    // exits failed/cancelled/timed-out never reaches the gate, but a human's Approve on ITS
+    // failure clears the baseline and re-dispatches — against the leftover edit, unless it is
+    // undone here. The fold reads the outcome only for a unit that folded Ok (below).
+    let mut worktree_guard =
+        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref());
     // core#431 (F-3R2-010): a DENYING mutation is undone HERE, on the worker thread, before the
     // result reaches the gate — the engine runs the remedy its denial used to print for the
     // operator (`git read-tree --reset -u <before.tree>`), so the retry a human approves runs
@@ -877,6 +878,12 @@ fn run_unit_and_judge_with_roster(
                 ),
             }
         }
+    }
+    // A unit that did not fold Ok fails on its own account and never reaches the gate this
+    // evidence feeds — the outcome was taken (and any mutation undone) above; hand the fold
+    // exactly what it used to see.
+    if output.status != StepStatus::Ok {
+        worktree_guard = None;
     }
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
@@ -1455,7 +1462,7 @@ fn run_cli_runner(
                                 .send(Command::ApplyStepResult {
                                     output,
                                     agent_verdict,
-                                    evidence,
+                                    evidence: Box::new(evidence),
                                     process_gen: task.process_gen,
                                     launch_seq: task.launch_seq,
                                     ack: Some(ack_tx),
@@ -1791,7 +1798,7 @@ fn run_task_completed_poller(
                     .send(Command::ApplyStepResult {
                         output,
                         agent_verdict,
-                        evidence,
+                        evidence: Box::new(evidence),
                         process_gen: task.process_gen,
                         launch_seq: task.launch_seq,
                         ack: Some(ack_tx),
@@ -2164,6 +2171,111 @@ mod tests {
             capabilities: None,
             login_invocation: None,
         }
+    }
+
+    /// Copilot on #433 (core#431): a guarded seat that rewrites the tree and then exits FAILED
+    /// never reaches the gate — but a human's Approve on its failure re-dispatches it, and the
+    /// baseline is cleared on approve. The restore must therefore run for every status, not only
+    /// `Ok`: after this failed run the creator's file is back and the evaluator's is gone, while
+    /// the evidence handed to the fold is what it always was for a failed unit (no guard outcome).
+    #[test]
+    fn a_failed_evaluator_that_rewrote_the_tree_still_has_the_creators_tree_restored() {
+        use crate::workflow::{StepOutput, StepRunner};
+        use std::process::Command;
+
+        struct FailingRewriter;
+        impl StepRunner for FailingRewriter {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let wd = input.workdir.as_ref().expect("bound");
+                std::fs::write(wd.join("src/a.ts"), "evaluator's rewrite\n").unwrap();
+                std::fs::write(wd.join("src/evaluator.ts"), "left behind\n").unwrap();
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "crashed after editing".into(),
+                    status: StepStatus::Failed,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        fn sh(cwd: &std::path::Path, args: &[&str]) {
+            // spawn-audit: test-only — a git fixture building the layout under test; reads no engine state.
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        }
+        let base =
+            std::env::temp_dir().join(format!("wicked-core-failed-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        sh(&repo, &["init", "-q", "."]);
+        sh(&repo, &["config", "user.email", "t@example.invalid"]);
+        sh(&repo, &["config", "user.name", "t"]);
+        sh(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("src/a.ts"), "base\n").unwrap();
+        sh(&repo, &["add", "-A"]);
+        sh(&repo, &["commit", "-qm", "base"]);
+        let wt = base.join("wt");
+        sh(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "wicked/failed-restore",
+            ],
+        );
+        // The creator's uncommitted fix.
+        std::fs::write(wt.join("src/a.ts"), "fixed\n").unwrap();
+
+        let mut unit = crate::domain::WorkUnit::pending("r:verify", "r", 4, "verify");
+        unit.worktree_guarded = true;
+        unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 3,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(wt.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        let runner: Arc<dyn StepRunner> = Arc::new(FailingRewriter);
+        let (output, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &[]);
+        assert_eq!(output.status, StepStatus::Failed);
+        assert!(verdict.is_none(), "no judge runs for a failed unit");
+        assert!(
+            evidence.worktree_guard.is_none(),
+            "a failed unit hands the fold no guard outcome, as before"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/a.ts")).unwrap(),
+            "fixed\n",
+            "the creator's fix is back even though the evaluator crashed"
+        );
+        assert!(
+            !wt.join("src/evaluator.ts").exists(),
+            "the evaluator's leftover file is gone"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// C1 (self-grading in the real path): the agent judge must NOT be dispatched under the seat that

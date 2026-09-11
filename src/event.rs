@@ -678,9 +678,12 @@ pub enum CoreEvent {
     /// `tree_after`, and the repository's own checks were RE-RUN on the lifted tree — see the
     /// `repoChecksEvaluated` for this unit — before the push was allowed), `conflict` (the lift
     /// would conflict in `conflicts`; the worktree was left exactly as verified and the deliver
-    /// unit FAILED with a `LIFT-CONFLICT` remedy — nothing was rebased or pushed), or `skipped`
-    /// (no remote / fetch failed / git too old — `note` says why; the deliver script's own rebase
-    /// then stands, as before). The deliver gate never pushes a tree that was not verified.
+    /// unit FAILED with a `LIFT-CONFLICT` remedy — nothing was rebased or pushed), `skipped`
+    /// (the lift could not be DECIDED — no remote / fetch failed / git too old / a history the
+    /// engine does not lift; the worktree was never touched and the deliver script's own rebase
+    /// then stands, as before), or `failed` (the lift was decided but its APPLICATION failed
+    /// part-way — the worktree may hold a partial state, the deliver unit fails closed, nothing
+    /// was pushed). The deliver gate never pushes a tree that was not verified.
     DeliverLiftEvaluated {
         session: String,
         ord: u32,

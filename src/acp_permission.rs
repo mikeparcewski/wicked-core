@@ -119,18 +119,50 @@ const WRITE_TOOL_NAMES: [&str; 22] = [
     "editfile",
 ];
 
+/// Tool-name PREFIXES that write (Copilot on #433): the `str_replace_*` family has more members
+/// than the two exact spellings above (`str_replace_file`, `str_replace_edit`, …), and bridges
+/// that surface file tools as `write_to_file` / `edit_notebook` / `delete_path` / `move_path` /
+/// `rename_symbol_file` follow the same verb-first convention. A prefix match denies even when
+/// the agent sent `kind: "other"`.
+const WRITE_TOOL_PREFIXES: [&str; 9] = [
+    "str_replace",
+    "write_",
+    "edit_",
+    "delete_",
+    "remove_",
+    "move_",
+    "rename_",
+    "create_file",
+    "apply_patch",
+];
+
+/// Is `tool` (case-folded) a write tool by name — an exact member of [`WRITE_TOOL_NAMES`] or a
+/// [`WRITE_TOOL_PREFIXES`] match?
+fn is_write_tool_name(tool: &str) -> bool {
+    let lower = tool.to_ascii_lowercase();
+    WRITE_TOOL_NAMES.contains(&lower.as_str())
+        || WRITE_TOOL_PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
 /// Classify a permission request as a WRITE-class call, or `None` when it reads/searches/
 /// executes/thinks. Matches by ACP `kind` first (the protocol's vocabulary), then by tool name
 /// (a bridge that omits `kind`, or sends `other`, still names the tool).
 pub(crate) fn write_class_call(params: &Value) -> Option<WriteClassCall> {
-    let tool = tool_name(params)?;
     let kind = params
         .pointer("/toolCall/kind")
         .and_then(Value::as_str)
         .filter(|k| !k.is_empty())
         .map(|k| k.to_ascii_lowercase());
     let by_kind = kind.as_deref().is_some_and(|k| WRITE_KINDS.contains(&k));
-    let by_name = WRITE_TOOL_NAMES.contains(&tool.to_ascii_lowercase().as_str());
+    // A request that carries a write-class `kind` and NO tool name is still a write (Copilot on
+    // #433): the kind is the protocol's own classification, and a nameless request must not
+    // fall through to the allow path on a read-only unit.
+    let tool = match tool_name(params) {
+        Some(t) => t,
+        None if by_kind => "(unnamed)".to_string(),
+        None => return None,
+    };
+    let by_name = is_write_tool_name(&tool);
     if !(by_kind || by_name) {
         return None;
     }
@@ -767,6 +799,29 @@ mod tests {
         assert_eq!(w.kind.as_deref(), Some("delete"));
         assert_eq!(w.path.as_deref(), Some("a.ts"));
         assert!(write_class_call(&call("frobnicate", Some("MOVE"), json!({}))).is_some());
+        // Copilot on #433: the `str_replace_*` FAMILY and verb-first file tools, by prefix, even
+        // when the bridge labels the call `other`.
+        for name in [
+            "str_replace_file",
+            "Str_Replace_Edit",
+            "write_to_file",
+            "edit_notebook",
+            "delete_path",
+            "move_path",
+            "rename_symbol_file",
+            "create_file_v2",
+            "apply_patch_v4",
+        ] {
+            assert!(
+                write_class_call(&call(name, Some("other"), json!({}))).is_some(),
+                "{name} is a write tool by prefix"
+            );
+        }
+        // …but a read-ish tool that merely CONTAINS a verb is not (prefix, not substring).
+        assert!(
+            write_class_call(&call("read_write_lock_status", Some("other"), json!({}))).is_none()
+        );
+        assert!(write_class_call(&call("preview_edit_diff", Some("read"), json!({}))).is_none());
         // Reads, searches, thinking and bash stay allowed (posture, not guarantee).
         assert!(write_class_call(&call("read", Some("read"), json!({"path": "a"}))).is_none());
         assert!(write_class_call(&call("Read", None, json!({}))).is_none());
@@ -778,8 +833,21 @@ mod tests {
         ))
         .is_none());
         assert!(write_class_call(&call("frobnicate", Some("other"), json!({}))).is_none());
-        // No tool name at all ⇒ not classifiable (the caller's fail-closed rules apply).
+        // No tool name and no kind ⇒ not classifiable (the caller's fail-closed rules apply)…
         assert!(write_class_call(&json!({"sessionId": "s1"})).is_none());
+        // …but a write-class KIND with no name is still a write (Copilot on #433).
+        let nameless = write_class_call(&json!({
+            "sessionId": "s1",
+            "toolCall": {"toolCallId": "t9", "kind": "edit", "rawInput": {"path": "src/x.ts"}},
+        }))
+        .expect("kind-only edit is a write");
+        assert_eq!(nameless.tool, "(unnamed)");
+        assert_eq!(nameless.kind.as_deref(), Some("edit"));
+        assert_eq!(nameless.path.as_deref(), Some("src/x.ts"));
+        assert!(write_class_call(&json!({
+            "sessionId": "s1", "toolCall": {"toolCallId": "t9", "kind": "read"},
+        }))
+        .is_none());
     }
 
     #[test]
