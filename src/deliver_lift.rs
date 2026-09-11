@@ -559,6 +559,34 @@ pub(crate) fn lift_context(
 /// no default ref / a history the engine does not lift).
 pub(crate) const VERIFIED_BASE_ENV: &str = "WICKED_DELIVER_VERIFIED_BASE";
 
+/// Is the worktree's `HEAD` attached to THIS run's branch? Accepts the engine's spelling
+/// (`refs/heads/wicked/<sanitized run id>`, `repo::worktree_branch`) and the raw-id spelling a
+/// downstream may have pre-provisioned (crew#390/#391). A detached `HEAD`, or any other ref, is an
+/// `Err` naming what was found.
+fn require_run_branch(worktree: &Path, repo_root: &Path, run_id: &str) -> Result<(), String> {
+    let git_dir = pinned_git_dir(worktree, repo_root)
+        .map_err(|e| format!("could not pin the worktree's git dir: {e}"))?;
+    let env: [(&str, &Path); 2] = [("GIT_DIR", &git_dir), ("GIT_WORK_TREE", worktree)];
+    let head_ref = git_string(worktree, &["symbolic-ref", "-q", "HEAD"], &env)
+        .ok()
+        .filter(|r| !r.is_empty());
+    let expected = [
+        format!("refs/heads/{}", crate::repo::worktree_branch(run_id)),
+        format!("refs/heads/wicked/{run_id}"),
+    ];
+    match head_ref {
+        Some(r) if expected.contains(&r) => Ok(()),
+        Some(r) => Err(format!(
+            "the worktree's HEAD is attached to `{r}`, not the run branch `{}`",
+            crate::repo::worktree_branch(run_id)
+        )),
+        None => Err(format!(
+            "the worktree's HEAD is detached, not on the run branch `{}`",
+            crate::repo::worktree_branch(run_id)
+        )),
+    }
+}
+
 /// What the deliver command may proceed with once the lift cleared it.
 pub(crate) struct LiftClearance {
     /// The re-verify report when the repository's checks RAN on the current tree and passed —
@@ -619,6 +647,18 @@ pub(crate) fn lift_and_reverify(
     attempt: u32,
     emit: &dyn Fn(CoreEvent),
 ) -> Result<LiftClearance, String> {
+    // The worktree must be ON THE RUN BRANCH before anything is lifted, reset or cleared
+    // (Copilot on #433, fifth pass): a detached HEAD, or another branch switched in by hand at a
+    // commit behind the tip, would pass the ancestry test and `reset --soft <tip>` would move
+    // THAT branch — or the no-check fast path would clear a tree on the wrong ref. Identify the
+    // run by its ref, not by the commit it happens to be at.
+    if let Err(why) = require_run_branch(&ctx.worktree, &ctx.repo_root, run_id) {
+        return Err(format!(
+            "deliver: {why} — nothing was lifted, reset or pushed; the deliver script only pushes \
+             the run branch. Switch the worktree back to `{}` and approve to retry.",
+            crate::repo::worktree_branch(run_id)
+        ));
+    }
     let report = lift_onto_remote_default(&ctx.worktree, &ctx.repo_root);
     emit(report.to_event(run_id, ord, attempt));
     let base_ref = report
@@ -1186,7 +1226,7 @@ mod tests {
         let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
 
         // Attempt 0: lifted → checks run → refuse.
-        let first = lift_and_reverify(&ctx, "run-R", 5, 0, &emit);
+        let first = lift_and_reverify(&ctx, "reverify-retry", 5, 0, &emit);
         let err = first.err().expect("a failing check refuses the deliver");
         assert!(err.contains("Nothing was pushed"), "{err}");
         let checks_evaluated = |evs: &[CoreEvent]| {
@@ -1212,7 +1252,7 @@ mod tests {
 
         // Attempt 1 (the operator approved a retry): nothing to lift — and the tree is NOT the
         // verified one, so the checks run again and refuse again.
-        let second = lift_and_reverify(&ctx, "run-R", 5, 1, &emit);
+        let second = lift_and_reverify(&ctx, "reverify-retry", 5, 1, &emit);
         let err = second.err().expect("the retry must not be waved through");
         assert!(
             err.contains("is not the tree the run verified") || err.contains("FAILED"),
@@ -1230,6 +1270,52 @@ mod tests {
         );
     }
 
+    /// Copilot on #433 (fifth pass): the lift identifies the run by its BRANCH, not the commit.
+    /// A worktree switched to another branch (or detached) at a commit behind the tip must be
+    /// refused before anything is lifted or reset — else `reset --soft <tip>` would move that
+    /// other branch — and the refusal names what HEAD is on.
+    #[test]
+    fn a_worktree_not_on_the_run_branch_is_refused_before_any_lift() {
+        let (clone, wt) = stale_base_layout("wrong-branch");
+        land_on_origin("wrong-branch", &clone, |o| {
+            std::fs::write(o.join("src/landed.ts"), "export const landed = 1;\n").unwrap();
+        });
+        let head = run_git(&wt, &["rev-parse", "HEAD"]);
+        let verified = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
+        // The layout's run id is "wrong-branch" (branch `wicked/wrong-branch`); a different run
+        // id ⇒ HEAD is on the wrong ref for THAT run.
+        let ctx = ctx_for(&clone, &wt, Some(verified.clone()));
+        let emit = |_: CoreEvent| {};
+        let err = lift_and_reverify(&ctx, "some-other-run", 5, 0, &emit)
+            .err()
+            .expect("another run's branch is refused");
+        assert!(
+            err.contains("attached to `refs/heads/wicked/wrong-branch`")
+                && err.contains("nothing was lifted, reset or pushed"),
+            "{err}"
+        );
+        assert_eq!(
+            run_git(&wt, &["rev-parse", "HEAD"]),
+            head,
+            "the branch was not moved"
+        );
+        // Detached at the same commit: refused too, even though the tree IS the verified tree.
+        run_git(&wt, &["checkout", "-q", "--detach"]);
+        let err = lift_and_reverify(&ctx, "wrong-branch", 5, 0, &emit)
+            .err()
+            .expect("a detached HEAD is refused");
+        assert!(err.contains("detached"), "{err}");
+        // Back on the run branch, the same run id is accepted (and lifts).
+        run_git(&wt, &["checkout", "-q", "wicked/wrong-branch"]);
+        match lift_and_reverify(&ctx, "wrong-branch", 5, 0, &emit) {
+            Ok(_) => {}
+            Err(e) => assert!(
+                e.contains("checks"),
+                "on the run branch the lift proceeds to the checks: {e}"
+            ),
+        }
+    }
+
     /// The fast path: the worktree's tree IS the tree the run verified — no checks, clearance.
     #[test]
     fn a_tree_that_matches_the_verified_tree_needs_no_checks() {
@@ -1237,7 +1323,7 @@ mod tests {
         let verified = crate::worktree_guard::snapshot(&wt, &clone).unwrap().tree;
         let ctx = ctx_for(&clone, &wt, Some(verified.clone()));
         let emit = |_: CoreEvent| {};
-        let c = lift_and_reverify(&ctx, "run-M", 5, 0, &emit).expect("cleared");
+        let c = lift_and_reverify(&ctx, "verified-match", 5, 0, &emit).expect("cleared");
         assert!(c.checks.is_none(), "no checks ran on the verified tree");
         assert_eq!(c.verified_tree, verified);
         assert_eq!(
@@ -1260,7 +1346,7 @@ mod tests {
         );
         let events = std::cell::RefCell::new(Vec::new());
         let emit = |ev: CoreEvent| events.borrow_mut().push(ev);
-        let result = lift_and_reverify(&ctx, "run-X", 5, 0, &emit);
+        let result = lift_and_reverify(&ctx, "verified-mismatch", 5, 0, &emit);
         match result {
             Ok(c) => assert!(
                 c.checks.is_some(),

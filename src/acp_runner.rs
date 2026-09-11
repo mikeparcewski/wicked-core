@@ -5974,6 +5974,29 @@ impl AcpStepRunner {
         // specific binary did not prove — and say so on the audit wire, the same way an
         // unadmitted-but-configured seat already discloses (`acp_ungoverned_event`), so this
         // never silently reads as "governed" when it is not.
+        // Copilot on #433 (sixth pass): the read-only reroute above judged the STATIC admission;
+        // the process-level pin can still fail here and downgrade this binary to unproven. A
+        // guarded (executes_code:false) unit must not stay on an adapter whose permission
+        // behaviour was not proven — route it to the wrapped carrier, as the static case does.
+        if acp_read_only_unproven_at_spawn(proc.governance_verified, &input.unit) {
+            let reason = format!(
+                "[wicked-core] unit {} (phase `{}`) declares executes_code:false, and seat \
+                 '{cli_key}' is admitted to input governance but the resolved ACP binary did not \
+                 match its pinned verified_version at spawn time — its permission behaviour is \
+                 unproven for this build, so the ACP read-only posture cannot be relied on; \
+                 running it single-shot on the wrapped carrier with the seat's read-only lever \
+                 (F-036 / core#431)",
+                input.unit.ord,
+                input.unit.phase_id().unwrap_or("?"),
+            );
+            self.emit_event(CoreEvent::AcpFallback {
+                session: run_id.clone(),
+                cli_key: cli_key.clone(),
+                reason: reason.clone(),
+                fallback_kind: fallback_kind::READ_ONLY_REQUIRES_WRAPPED.to_string(),
+            });
+            return fallback_with_warning(reason, input, emit, &self.fallback);
+        }
         if gate_ctx.is_some() && !proc.governance_verified {
             self.emit_event(CoreEvent::GovernanceUnenforced {
                 session: run_id.clone(),
@@ -6432,6 +6455,18 @@ fn acp_read_only_requires_wrapped(
     unit: &crate::domain::WorkUnit,
 ) -> bool {
     crate::worktree_guard::applies_to(unit) && acp_unadmitted_but_configured(acp_cfg)
+}
+
+/// (Copilot on #433, sixth pass) The per-PROCESS half of [`acp_read_only_requires_wrapped`]: a
+/// statically admitted seat whose spawned binary failed its `verified_version` pin
+/// (`AcpProcess::governance_verified == false`) has an unproven permission behaviour for THIS
+/// build, so a worktree-guarded unit must leave for the wrapped carrier just as it does for an
+/// unadmitted seat. Pure — decided from the spawn-time flag and the unit alone.
+fn acp_read_only_unproven_at_spawn(
+    governance_verified: bool,
+    unit: &crate::domain::WorkUnit,
+) -> bool {
+    !governance_verified && crate::worktree_guard::applies_to(unit)
 }
 
 #[cfg(test)]
@@ -12623,6 +12658,13 @@ transport = "stdio"
             !super::acp_read_only_requires_wrapped(Some(&cfg(false)), &tool),
             "a tool unit is the engine's own command, never a seat's turn"
         );
+        // Sixth pass: an ADMITTED seat whose spawned process failed its version pin is unproven
+        // for this build — the guarded unit leaves for the wrapped carrier; a proven process
+        // stays; a creator unit is never rerouted on this ground either.
+        assert!(super::acp_read_only_unproven_at_spawn(false, &evaluator));
+        assert!(!super::acp_read_only_unproven_at_spawn(true, &evaluator));
+        assert!(!super::acp_read_only_unproven_at_spawn(false, &creator));
+        assert!(!super::acp_read_only_unproven_at_spawn(false, &tool));
     }
 
     /// core#431 (F-3R2-009): an `executes_code: false` unit on the ACP carrier is READ-ONLY even
