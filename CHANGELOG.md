@@ -769,6 +769,21 @@ Two release tracks share this file, newest entry first regardless of track:
   the remaining legacy graphs are `Deferred` — reported, untouched, copied at the next boot — so an
   upgrade with many stale or locked graphs cannot keep the daemon unavailable for N × 60 s. The
   STEERING guide's `rules fanout` example names `<state-home>/repo-graphs/<repo-key>/estate.db`.
+- **Worker deny rules are the ones the CLI enforces — no more inert `Write(<path>)` twins
+  (wicked-crew#524, acceptance finding F-3R2-004).** `execute_wrapped::deny_rules` /
+  `shared_deny_rules` emitted a `Write(<dir>/**)` rule beside every `Edit(<dir>/**)` for the
+  operator's `~/.claude`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.wicked*` and the
+  daemon's config dir — on BOTH carriers (`--disallowedTools` argv, the wrapped per-unit settings
+  file, the ACP worker home's shared `settings.json` and per-session options). Claude Code
+  (measured on 2.1.268) does not match `Write(path)` rules at all: every claude ballot's stderr
+  carried 12 `Permission deny rule … Write(…) is not matched by file permission checks — only
+  Edit(path) rules are` warnings, the rules cost ballot time, and an operator reading the settings
+  file saw a stronger fence than existed. The engine now emits `Read` + `Edit` only (`Edit` covers
+  every file-editing tool per the CLI), and a template's OWN `Write(<path>)` deny — templates may
+  add denies, never remove one — is lifted as the `Edit(<path>)` form that enforces it
+  (`enforceable_rule`); a bare `Write` (whole tool) is left as stated. Tests pin both generators,
+  the argv carrier and the settings-file carrier free of `Write(<path>)`; the live-CLI check is
+  documented on `enforceable_rule`.
 - **Repo graphs live under the daemon state home; an in-tree `.codegraph/` is never adopted
   (#406; F-016 / F-024).** `registerRepo`/onboarding minted every repo's code graph under the
   OPERATOR's `~/.wicked-estate/repo-graphs/<key>` whatever `--db` said — two daemons on one host
