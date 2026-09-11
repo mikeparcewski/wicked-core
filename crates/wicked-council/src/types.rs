@@ -304,7 +304,8 @@ pub fn default_login_invocation(key: &str) -> Option<String> {
         "opencode" => (SeatCli::Opencode, "opencode auth login"),
         "pi" => (SeatCli::Pi, "pi"),
         // No configuration-home variable is known for agy: it signs in where it runs (the
-        // operator's `~/.antigravitycli`) — a documented residual of core#410.
+        // operator's `~/.gemini/…` configuration) — a documented residual of core#410; its seats
+        // at least run quiet (`AGY_CLI_HIDE_LOGO` / `AGY_CLI_HIDE_ACCOUNT_INFO`).
         "agy" => return Some("agy".to_string()),
         _ => return None,
     };

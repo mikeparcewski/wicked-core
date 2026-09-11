@@ -2068,7 +2068,15 @@ fn start_acp_process_with_write_roots(
         None => true,
         Some(expected) => resolved_binary_version_matches(&config.binary, expected),
     };
-    let graph_write = crate::execute_wrapped::graph_write_dir(code_graph_db);
+    // The graph's own key dir joins the WRITE roots for a UNIT session only (an indexing phase
+    // writes it); a CHAT (no unit session) is grounded on its graph READ-ONLY — the MCP runs
+    // `--readonly` and the boundary treats the graph as read-only — so its key dir never becomes a
+    // kernel-floor write root (Copilot, #426).
+    let graph_write = if session.is_some() {
+        crate::execute_wrapped::graph_write_dir(code_graph_db)
+    } else {
+        None
+    };
     let worker_write_roots = crate::execute_wrapped::armed_write_root_paths(
         cwd,
         extra_write_roots,
@@ -4263,8 +4271,11 @@ fn canonical_ish(p: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Is `file` the SAME file (device + inode) as any top-level entry of `dir` — the operational store
-/// or one of its sidecars reached through a hard link or a symlink elsewhere? Unix only; other
-/// platforms rely on the canonical-path comparison.
+/// or one of its sidecars reached through a hard link or a symlink elsewhere? Unix only: on other
+/// platforms the canonical-path comparison covers symlinks and junctions, while a HARD link's
+/// identity needs `MetadataExt::file_index` (unstable) or a crate this workspace does not carry —
+/// a documented limitation (Copilot, #426): the chat opener is the daemon, and a hard link to the
+/// operational store would have to be planted by the operator's own account on that host.
 fn same_file_as_a_top_level_entry_of(file: &std::path::Path, dir: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
@@ -4300,9 +4311,10 @@ struct RecordedScope {
 /// its roots are read-only and that the seats see nothing else — a promise this engine can keep
 /// only through a channel the seat actually passes through: the chat boundary on
 /// `session/request_permission` (an adapter admitted to input governance asks for every tool
-/// call — claude, opencode, copilot) or the kernel write floor (`os_sandbox` armed on the seat's
-/// record). An adapter that asks no permissions and runs under no floor (pi-acp, codex-acp as
-/// registered) would run unbounded behind a read-only statement, so it is refused BY NAME for
+/// call — claude and opencode, as registered; copilot's `--acp` is NOT admitted) or the kernel
+/// write floor (`os_sandbox` armed on the seat's record). An adapter that asks no permissions and
+/// runs under no floor (pi-acp, codex-acp, copilot --acp, agy-acp as registered) would run
+/// unbounded behind a read-only statement, so it is refused BY NAME for
 /// scoped chats — the open still succeeds for the seats that can be held, and the per-seat
 /// outcome says why this one cannot. Read containment for such adapters needs a read jail this
 /// platform does not have; the residual is stated rather than hidden.
@@ -4814,10 +4826,23 @@ impl AcpStepRunner {
             ));
         }
         let cwd = canonical_ish(&scope.cwd);
+        // The temp bases: Rust's `temp_dir()` (unix: `TMPDIR`; Windows: `TMP` then `TEMP`), `/tmp`
+        // on unix, AND `TMP`/`TEMP` wherever set — Node's `os.tmpdir()`, which the daemon derives
+        // its base from, consults `TMPDIR`, `TMP`, `TEMP` in that order on unix and `TEMP` before
+        // `TMP` on Windows, so the two runtimes can disagree on which variable wins (independent
+        // review, C5); every spelling a caller could legitimately have used is accepted.
         let temps: Vec<std::path::PathBuf> = {
             let mut t = vec![canonical_ish(&std::env::temp_dir())];
             if cfg!(unix) {
                 t.push(canonical_ish(std::path::Path::new("/tmp")));
+            }
+            for var in ["TMP", "TEMP"] {
+                if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                    let p = std::path::PathBuf::from(v);
+                    if p.is_absolute() {
+                        t.push(canonical_ish(&p));
+                    }
+                }
             }
             t
         };
@@ -8203,9 +8228,16 @@ sleep 30
         }
         use wicked_apps_core::spawn::{
             SeatCli, CLAUDE_CONFIG_DIR_ENV, CODEX_HOME_ENV, COPILOT_HOME_ENV,
-            OPENCODE_CONFIG_DIR_ENV, PI_AGENT_DIR_ENV, XDG_CONFIG_HOME_ENV, XDG_DATA_HOME_ENV,
+            OPENCODE_AUTH_CONTENT_ENV, OPENCODE_CONFIG_CONTENT_ENV, OPENCODE_CONFIG_DIR_ENV,
+            OPENCODE_CONFIG_FILE_ENV, PI_AGENT_DIR_ENV, XDG_CONFIG_HOME_ENV, XDG_DATA_HOME_ENV,
             XDG_STATE_HOME_ENV,
         };
+        // ONE spelling of opencode's inline-config variable across the two crates (the strip in
+        // apps-core, the composition here).
+        assert_eq!(
+            OPENCODE_CONFIG_CONTENT_ENV,
+            crate::skills_snapshot::OPENCODE_CONFIG_ENV
+        );
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _serial = REAL_STARTS.lock().unwrap_or_else(|p| p.into_inner());
         let dir = scratch("seat-roots");
@@ -8222,12 +8254,21 @@ sleep 30
         let _d6 = EnvPin::set(XDG_CONFIG_HOME_ENV, &decoy);
         let _d7 = EnvPin::set(XDG_DATA_HOME_ENV, &decoy);
         let _d8 = EnvPin::set(XDG_STATE_HOME_ENV, &decoy);
+        // The operator's ambient INLINE opencode config (plugins, permission rules), extra config
+        // FILE and inline CREDENTIALS — none may reach an isolated seat, opencode's own included
+        // (Copilot, #426; independent review C2).
+        let _d9 = EnvPin::set(OPENCODE_CONFIG_CONTENT_ENV, &decoy);
+        let _d10 = EnvPin::set(OPENCODE_CONFIG_FILE_ENV, &decoy);
+        let _d11 = EnvPin::set(OPENCODE_AUTH_CONTENT_ENV, &decoy);
         let vars = [
             CLAUDE_CONFIG_DIR_ENV,
             CODEX_HOME_ENV,
             PI_AGENT_DIR_ENV,
             COPILOT_HOME_ENV,
             OPENCODE_CONFIG_DIR_ENV,
+            OPENCODE_CONFIG_CONTENT_ENV,
+            OPENCODE_CONFIG_FILE_ENV,
+            OPENCODE_AUTH_CONTENT_ENV,
             XDG_CONFIG_HOME_ENV,
             XDG_DATA_HOME_ENV,
             XDG_STATE_HOME_ENV,
@@ -10723,6 +10764,37 @@ transport = "stdio"
         );
         r.drop_scope_if_gen("c3", 7);
         assert!(r.chat_scopes.lock().unwrap().get("c3").is_none());
+    }
+
+    /// Independent review, C5: the daemon derives its scratch base from Node's `os.tmpdir()`,
+    /// which may follow `TMP`/`TEMP` where Rust's `temp_dir()` does not — a scratch root under a
+    /// set `TMP` is accepted, one under an arbitrary directory still refused.
+    #[test]
+    #[cfg(unix)]
+    fn a_scratch_root_under_tmp_or_temp_is_accepted_as_a_temp_base() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        // A root-level path that is under NO temp base (this checkout may itself live under /tmp,
+        // so nothing beneath it can serve). Validation never requires the cwd to exist, so nothing
+        // is created.
+        let alt =
+            std::path::PathBuf::from("/").join(format!("w2chat-not-a-temp-{}", std::process::id()));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let r = AcpStepRunner::new(tx);
+        let scope = ChatScope {
+            cwd: alt.join("chats").join("c1"),
+            code_graph_db: None,
+            read_roots: vec![],
+        };
+        let _unset_tmp = EnvPin::unset("TMP");
+        let _unset_temp = EnvPin::unset("TEMP");
+        let err = r
+            .validate_chat_scope(&scope)
+            .expect_err("outside every temp base");
+        assert!(err.contains("system temp"), "{err}");
+        let _tmp = EnvPin::set("TMP", &alt);
+        r.validate_chat_scope(&scope)
+            .expect("a root under $TMP is a temp root");
+        assert!(!alt.exists(), "validation creates nothing");
     }
 
     /// Copilot, #426: a seat whose adapter asks no permissions and runs under no kernel floor

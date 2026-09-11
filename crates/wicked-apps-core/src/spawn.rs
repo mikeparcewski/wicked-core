@@ -397,6 +397,27 @@ pub const XDG_STATE_HOME_ENV: &str = "XDG_STATE_HOME";
 /// opencode's extra-config-directory knob — STRIPPED from every seat: an opencode seat's
 /// configuration is the seat root's `XDG_CONFIG_HOME/opencode`, and a foreign seat never reads it.
 pub const OPENCODE_CONFIG_DIR_ENV: &str = "OPENCODE_CONFIG_DIR";
+/// opencode's INLINE configuration — a complete config document in the environment, plugins and
+/// permission rules included (Copilot, #426). Stripped from every isolated seat like the other
+/// seat variables; the spawn paths then set exactly the value they intend (the seat's registry
+/// governance content, or the skills-composed document) AFTER [`SeatConfig::apply`]. Spelled here,
+/// below the root crate (`wicked_core::skills_snapshot::OPENCODE_CONFIG_ENV` is the runtime
+/// spelling; a root-crate test pins the two equal).
+pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+/// opencode's ADDITIONAL config FILE (loaded after the global one — plugins, MCP servers, permission
+/// rules) and its INLINE credential store (consulted before `auth.json`) — both read by opencode
+/// 1.17.18 (independent review, C2) and both stripped from every isolated seat like the other seat
+/// variables.
+pub const OPENCODE_CONFIG_FILE_ENV: &str = "OPENCODE_CONFIG";
+/// See [`OPENCODE_CONFIG_FILE_ENV`].
+pub const OPENCODE_AUTH_CONTENT_ENV: &str = "OPENCODE_AUTH_CONTENT";
+/// agy (Antigravity) has no configuration-home variable, so it is isolated by stripping alone — but
+/// it does have quiet flags (brief §5: a CLI without a config-home override at least runs quiet):
+/// these hide its logo and account banner so neither reaches a transcript. Set on every isolated
+/// agy seat by [`SeatConfig::apply`]. Its configuration lives under the operator's `~/.gemini/…`.
+pub const AGY_HIDE_LOGO_ENV: &str = "AGY_CLI_HIDE_LOGO";
+/// See [`AGY_HIDE_LOGO_ENV`].
+pub const AGY_HIDE_ACCOUNT_INFO_ENV: &str = "AGY_CLI_HIDE_ACCOUNT_INFO";
 
 /// Every CLI-SPECIFIC configuration variable a seat spawn decides. A seat gets its OWN set and
 /// every other one STRIPPED — the daemon's `CODEX_HOME` must not ride into a pi bridge any more
@@ -409,6 +430,9 @@ pub const SEAT_CONFIG_ENV: &[&str] = &[
     PI_AGENT_DIR_ENV,
     COPILOT_HOME_ENV,
     OPENCODE_CONFIG_DIR_ENV,
+    OPENCODE_CONFIG_CONTENT_ENV,
+    OPENCODE_CONFIG_FILE_ENV,
+    OPENCODE_AUTH_CONTENT_ENV,
 ];
 
 /// Which agent CLI a seat runs — judged on the CLI binary's file STEM (the seat record's `binary`
@@ -423,6 +447,8 @@ pub enum SeatCli {
     Pi,
     Copilot,
     Opencode,
+    /// Antigravity: no configuration-home variable (isolated by stripping alone), quiet flags set.
+    Agy,
     Other,
 }
 
@@ -454,6 +480,8 @@ impl SeatCli {
             SeatCli::Copilot
         } else if is("opencode") {
             SeatCli::Opencode
+        } else if is("agy") {
+            SeatCli::Agy
         } else {
             SeatCli::Other
         }
@@ -468,7 +496,7 @@ impl SeatCli {
             SeatCli::Pi => Some("pi"),
             SeatCli::Copilot => Some("copilot"),
             SeatCli::Opencode => Some("opencode"),
-            SeatCli::Other => None,
+            SeatCli::Agy | SeatCli::Other => None,
         }
     }
 }
@@ -501,12 +529,20 @@ impl SeatConfig {
     /// Apply this decision to `cmd` — AFTER `hardened()`: strip the foreign variables, then set
     /// this seat's own. `Inherit` touches nothing.
     pub fn apply(&self, cmd: &mut Command) {
-        if let SeatConfig::Isolated { set, strip, .. } = self {
+        if let SeatConfig::Isolated {
+            cli, set, strip, ..
+        } = self
+        {
             for key in strip {
                 cmd.env_remove(key);
             }
             for (key, value) in set {
                 cmd.env(key, value);
+            }
+            if *cli == SeatCli::Agy {
+                // No config home to isolate; at least no banner in the transcript (brief §5).
+                cmd.env(AGY_HIDE_LOGO_ENV, "1");
+                cmd.env(AGY_HIDE_ACCOUNT_INFO_ENV, "1");
             }
         }
     }
@@ -635,8 +671,18 @@ pub fn seat_config_for(cli: SeatCli) -> anyhow::Result<SeatConfig> {
             (XDG_DATA_HOME_ENV, root.join("data")),
             (XDG_STATE_HOME_ENV, root.join("state")),
         ],
-        SeatCli::Other => unreachable!("rootless CLIs returned above"),
+        SeatCli::Agy | SeatCli::Other => unreachable!("rootless CLIs returned above"),
     };
+    // Every seat variable this seat does not SET is stripped — for opencode that includes its own
+    // inline document (`OPENCODE_CONFIG_CONTENT`), extra config file and inline credentials: the
+    // ambient operator values do not ride into the process by inheritance. The spawn then re-sets
+    // exactly what it intends AFTER `apply` — the seat's registry governance content, or the
+    // skills-composed document. Stated limit (independent review, C6): the skills COMPOSITION
+    // (`wicked-core::skills_snapshot`, v3.2 §2) still takes the daemon's ambient
+    // `OPENCODE_CONFIG_CONTENT` as its base when the registry names none, so a governed opencode
+    // unit WITH skills delivery still receives the operator's document through that path; chats,
+    // ballots and delivery-less units do not. Composing from the registry value or an empty
+    // document is a later change, not this one.
     let strip: Vec<&'static str> = SEAT_CONFIG_ENV
         .iter()
         .copied()
@@ -1054,7 +1100,8 @@ mod tests {
             ("pi", Pi),
             ("copilot", Copilot),
             ("opencode", Opencode),
-            ("agy", Other),
+            ("agy", Agy),
+            ("/Users/op/.local/bin/agy", Agy),
             ("pi-acp", Other),
             ("codex-acp", Other),
             ("claude-agent-acp", Other),
@@ -1087,6 +1134,11 @@ mod tests {
             );
         }
         assert_eq!(Other.root_name(), None);
+        assert_eq!(
+            Agy.root_name(),
+            None,
+            "no configuration-home variable is known for agy"
+        );
         assert_eq!(Opencode.root_name(), Some("opencode"));
     }
 
@@ -1097,7 +1149,7 @@ mod tests {
     fn every_known_seat_gets_its_own_root_and_every_foreign_seat_variable_is_stripped() {
         use std::path::PathBuf;
         use SeatCli::*;
-        let all = [Claude, Codex, Pi, Copilot, Opencode, Other];
+        let all = [Claude, Codex, Pi, Copilot, Opencode, Agy, Other];
         if inherits_operator_config() {
             for cli in all {
                 assert_eq!(
@@ -1157,18 +1209,24 @@ mod tests {
                 (XDG_STATE_HOME_ENV, base.join("opencode").join("state")),
             ],
         );
-        // An unknown CLI is isolated by stripping alone: nothing of its own to set.
-        match seat_config_for(Other).unwrap() {
-            SeatConfig::Isolated {
-                cli: Other,
-                root: None,
-                set,
-                strip,
-            } => {
-                assert!(set.is_empty());
-                assert_eq!(strip, SEAT_CONFIG_ENV.to_vec());
+        // An unknown CLI — and agy, which has no configuration-home variable — is isolated by
+        // stripping alone: nothing of its own to set.
+        for rootless in [Other, Agy] {
+            match seat_config_for(rootless).unwrap() {
+                SeatConfig::Isolated {
+                    cli,
+                    root: None,
+                    set,
+                    strip,
+                } => {
+                    assert_eq!(cli, rootless);
+                    assert!(set.is_empty());
+                    assert_eq!(strip, SEAT_CONFIG_ENV.to_vec());
+                }
+                other => {
+                    panic!("{rootless:?}: expected a rootless isolated decision, got {other:?}")
+                }
             }
-            other => panic!("expected a rootless isolated decision, got {other:?}"),
         }
         // The claude-only view agrees with the generalisation.
         assert_eq!(
@@ -1229,6 +1287,32 @@ mod tests {
             value(XDG_CONFIG_HOME_ENV),
             Some(Some("operator-xdg".to_string())),
             "a generic XDG base is left alone on a non-opencode seat"
+        );
+        // agy: nothing of its own to set, every seat variable stripped — and the two quiet flags
+        // (no logo, no account banner in the transcript) set; a pi seat gets neither flag.
+        let mut agy = Command::new("true");
+        agy.hardened();
+        SeatConfig::Isolated {
+            cli: SeatCli::Agy,
+            root: None,
+            set: Vec::new(),
+            strip: SEAT_CONFIG_ENV.to_vec(),
+        }
+        .apply(&mut agy);
+        let flag = |c: &Command, key: &str| -> Option<Option<String>> {
+            c.get_envs()
+                .find(|(k, _)| k.to_string_lossy() == key)
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        };
+        assert_eq!(flag(&agy, AGY_HIDE_LOGO_ENV), Some(Some("1".to_string())));
+        assert_eq!(
+            flag(&agy, AGY_HIDE_ACCOUNT_INFO_ENV),
+            Some(Some("1".to_string()))
+        );
+        assert_eq!(
+            flag(&cmd, AGY_HIDE_LOGO_ENV),
+            None,
+            "a pi seat gets no agy flag"
         );
         // `Inherit` touches nothing at all (hardened first, like every spawn site — the strip
         // there is the engine's own variables, never a seat's).

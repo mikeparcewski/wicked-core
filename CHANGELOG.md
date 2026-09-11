@@ -32,8 +32,13 @@ Two release tracks share this file, newest entry first regardless of track:
   config there too). Every FOREIGN seat variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
   `PI_CODING_AGENT_DIR`, `COPILOT_HOME`, `OPENCODE_CONFIG_DIR`) is STRIPPED; roots are created
   private (0700) and no-follow checked; the `WICKED_WORKER_INHERIT_OPERATOR_CONFIG` hatch inherits
-  everything, as before. **Behaviour change:** codex / pi / copilot / opencode seats now start
-  signed OUT until the operator signs in the seat root once — every seat's `login_invocation` names
+  everything, as before. opencode's extra config file (`OPENCODE_CONFIG`), inline document
+  (`OPENCODE_CONFIG_CONTENT`) and inline credentials (`OPENCODE_AUTH_CONTENT`) are stripped too
+  (the skills composition still bases itself on the daemon's ambient document for governed opencode
+  units with delivery — unchanged here); agy, which has no config-home variable, runs quiet
+  (`AGY_CLI_HIDE_LOGO=1`, `AGY_CLI_HIDE_ACCOUNT_INFO=1`). **Behaviour change:** codex / pi /
+  copilot / opencode seats now start signed OUT until the operator signs in the seat root once —
+  every seat's `login_invocation` names
   it (`CODEX_HOME="<root>" codex login --device-auth`, …), so the studio's Sign-in terminal signs in
   the directory the seats read; copilot's OAuth token stays in the per-user keychain (config
   isolated, keychain not). agy has no known configuration-home variable and is isolated by stripping
@@ -47,7 +52,11 @@ Two release tracks share this file, newest entry first regardless of track:
   private `<tmp>/wicked-core-chat-<id>` of the chat's own), their `session/new` advertises the
   READ-ONLY estate MCP over the scope's graph (DES-GROUNDING-001 — the grounding governed workers
   get) and the scoped repository roots as a claude seat's `additionalDirectories`; a seat re-warmed
-  after an eviction lands in the same scope; `chat_list` reports it. The read roots are read-only
+  after an eviction lands in the same scope; `chat_list` reports it. **Behaviour change:** a
+  SCOPED chat admits only seats that can be held to its read-only roots — an adapter admitted to
+  input governance (claude, opencode) or a seat whose `[cli.acp]` record arms `os_sandbox`;
+  pi / codex / copilot / agy (as registered: no permission requests, no floor) are refused for
+  scoped chats by name with the remedy, and admitted to unscoped chats. The read roots are read-only
   IN FACT, for every seat: a claude seat's session fence denies `Edit`/`Write`/`NotebookEdit` under
   them, and every seat's `session/request_permission` is judged against the chat's boundary (the
   scratch root writable, the roots readable, nothing path-bearing beyond either) — a chat turn used
